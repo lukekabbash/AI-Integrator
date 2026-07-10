@@ -1,0 +1,313 @@
+:root {
+  color-scheme: dark;
+
+  /* Graphite is the first-paint fallback; theme.ts replaces these atomically. */
+  --color-surface-canvas: #111315;
+  --color-surface-rail: #16191c;
+  --color-surface-panel: #1a1d21;
+  --color-surface-layer1: #1e2226;
+  --color-surface-layer2: #23282d;
+  --color-surface-elevated: #292f35;
+  --color-surface-overlay: #090a0bd9;
+  --color-text-primary: #f1f4f6;
+  --color-text-secondary: #bcc4ca;
+  --color-text-muted: #7f8a92;
+  --color-text-inverse: #0d1114;
+  --color-border-subtle: #2a3035;
+  --color-border-strong: #46515a;
+  --color-focus-ring: #7aaed6;
+  --color-selection-active: #284861;
+  --color-selection-text: #f5f9fc;
+  --color-accent-primary: #72a7d1;
+  --color-accent-hover: #8bb9dc;
+  --color-accent-pressed: #568db8;
+  --color-accent-subtle: #1c3447;
+  --color-accent-text: #09131b;
+  --color-status-success: #70b58a;
+  --color-status-warning: #d5a956;
+  --color-status-danger: #dc7771;
+  --color-status-info: #70a9ce;
+  --color-status-successSurface: #183125;
+  --color-status-warningSurface: #382d18;
+  --color-status-dangerSurface: #3c2020;
+  --color-status-infoSurface: #193247;
+  --color-diff-added: #173124;
+  --color-diff-addedStrong: #24533a;
+  --color-diff-addedText: #9bd3ae;
+  --color-diff-removed: #3a1e1e;
+  --color-diff-removedStrong: #612c2c;
+  --color-diff-removedText: #efaaa4;
+  --color-diff-context: #181b1e;
+  --color-syntax-keyword: #8eb7db;
+  --color-syntax-string: #a9c98f;
+  --color-syntax-type: #dbbd77;
+  --color-syntax-function: #79c6ba;
+  --color-syntax-variable: #d5dbe0;
+  --color-syntax-number: #d6a47b;
+  --color-syntax-comment: #77838c;
+  --color-terminal-ansi0: #171a1d;
+  --color-terminal-ansi1: #d46f6a;
+  --color-terminal-ansi2: #6fb287;
+  --color-terminal-ansi3: #cba14f;
+  --color-terminal-ansi4: #6e9fca;
+  --color-terminal-ansi5: #b58db6;
+  --color-terminal-ansi6: #68aaa8;
+  --color-terminal-ansi7: #c9ced2;
+  --color-terminal-ansi8: #68727a;
+  --color-terminal-ansi9: #ee8b84;
+  --color-terminal-ansi10: #8bcc9f;
+  --color-terminal-ansi11: #e3bd6d;
+  --color-terminal-ansi12: #8ab9df;
+  --color-terminal-ansi13: #c9a4c9;
+  --color-terminal-ansi14: #82c3c0;
+  --color-terminal-ansi15: #f3f5f6;
+  --color-chrome-background: #15181b;
+  --color-chrome-foreground: #d9dee2;
+
+  --font-interface:
+    Inter, "Segoe UI Variable", "SF Pro Text", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-code: "Cascadia Code", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --font-size-body: 14px;
+  --font-size-code: 13px;
+  --font-weight-body: 400;
+  --line-height-body: 1.55;
+  --line-height-code: 1.5;
+  --font-code-ligatures: normal;
+
+  --density-scale: 1;
+  --panel-gap: 12px;
+  --control-height-sm: 28px;
+  --control-height-md: 34px;
+  --control-height-lg: 40px;
+  --density-row: 36px;
+  --space-control-x: 10px;
+  --space-control-y: 7px;
+  --space-row: 8px;
+
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 12px;
+  --radius-full: 999px;
+
+  --motion-scale: 1;
+  --duration-instant: 80ms;
+  --duration-fast: 140ms;
+  --duration-moderate: 220ms;
+  --duration-slow: 340ms;
+  --duration-cursor: 900ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-emphasized: cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  --shadow-elevated: 0 10px 30px rgb(0 0 0 / 22%), 0 1px 2px rgb(0 0 0 / 28%);
+  --shadow-composer: 0 5px 18px rgb(0 0 0 / 16%), 0 0 0 1px var(--color-border-subtle);
+
+  /* Stable short aliases for component code. */
+  --color-canvas: var(--color-surface-canvas);
+  --color-rail: var(--color-surface-rail);
+  --color-layer-1: var(--color-surface-layer1);
+  --color-layer-2: var(--color-surface-layer2);
+  --color-overlay: var(--color-surface-overlay);
+  --color-text-tertiary: var(--color-text-muted);
+  --color-border-base: color-mix(
+    in srgb,
+    var(--color-border-subtle) 45%,
+    var(--color-border-strong)
+  );
+  --color-focus: var(--color-focus-ring);
+  --color-accent: var(--color-accent-primary);
+  --color-accent-soft: var(--color-accent-subtle);
+  --color-success: var(--color-status-success);
+  --color-warning: var(--color-status-warning);
+  --color-danger: var(--color-status-danger);
+  --color-info: var(--color-status-info);
+  --color-diff-add-bg: var(--color-diff-added);
+  --color-diff-add-text: var(--color-diff-addedText);
+  --color-diff-add-gutter: var(--color-diff-addedStrong);
+  --color-diff-delete-bg: var(--color-diff-removed);
+  --color-diff-delete-text: var(--color-diff-removedText);
+  --color-diff-delete-gutter: var(--color-diff-removedStrong);
+  --font-ui: var(--font-interface);
+  --radius-control: var(--radius-sm);
+  --radius-panel: var(--radius-md);
+  --radius-composer: var(--radius-md);
+  --motion-fast: var(--duration-fast);
+  --motion-panel: var(--duration-moderate);
+  --canvas: var(--color-surface-canvas);
+  --rail: var(--color-surface-rail);
+  --panel: var(--color-surface-panel);
+  --layer-1: var(--color-surface-layer1);
+  --layer-2: var(--color-surface-layer2);
+  --elevated: var(--color-surface-elevated);
+  --text: var(--color-text-primary);
+  --text-secondary: var(--color-text-secondary);
+  --text-muted: var(--color-text-muted);
+  --hairline: var(--color-border-subtle);
+  --border-strong: var(--color-border-strong);
+  --accent: var(--color-accent-primary);
+  --accent-hover: var(--color-accent-hover);
+  --accent-pressed: var(--color-accent-pressed);
+}
+
+:root[data-appearance="light"] {
+  color-scheme: light;
+  --shadow-elevated: 0 12px 32px rgb(37 42 45 / 13%), 0 1px 2px rgb(37 42 45 / 10%);
+  --shadow-composer: 0 5px 18px rgb(37 42 45 / 9%), 0 0 0 1px var(--color-border-subtle);
+}
+
+:root[data-density="compact"] {
+  --density-scale: 0.82;
+  --control-height-sm: 24px;
+  --control-height-md: 28px;
+  --control-height-lg: 34px;
+  --density-row: 30px;
+  --space-control-x: 8px;
+  --space-control-y: 5px;
+  --space-row: 6px;
+}
+
+:root[data-panel-spacing="tight"] {
+  --panel-gap: 8px;
+}
+
+:root[data-panel-spacing="airy"] {
+  --panel-gap: 20px;
+}
+
+html {
+  background: var(--color-surface-canvas);
+  color: var(--color-text-primary);
+  font-family: var(--font-interface);
+  font-size: var(--font-size-body);
+  font-synthesis: none;
+  font-weight: var(--font-weight-body);
+  line-height: var(--line-height-body);
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background: var(--color-surface-canvas);
+}
+
+button,
+input,
+textarea,
+select {
+  color: inherit;
+  font: inherit;
+}
+
+code,
+kbd,
+pre,
+samp,
+.xterm {
+  font-family: var(--font-code);
+  font-size: var(--font-size-code);
+  font-variant-ligatures: var(--font-code-ligatures);
+  line-height: var(--line-height-code);
+}
+
+::selection {
+  color: var(--color-selection-text);
+  background: var(--color-selection-active);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+* {
+  scrollbar-color: var(--color-border-strong) transparent;
+  scrollbar-width: thin;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  background-clip: padding-box;
+  border: 3px solid transparent;
+  border-radius: var(--radius-full);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--color-text-muted);
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+[data-streaming-cursor="false"] .streaming-cursor {
+  display: none;
+}
+
+.streaming-cursor {
+  animation: theme-cursor-blink var(--duration-cursor) steps(2, jump-none) infinite;
+}
+
+@keyframes theme-cursor-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root:not([data-motion="full"]) {
+    --motion-scale: 0.35;
+    --duration-instant: 28ms;
+    --duration-fast: 49ms;
+    --duration-moderate: 77ms;
+    --duration-slow: 119ms;
+    --duration-cursor: 900ms;
+  }
+
+  :root:not([data-motion="full"]) .streaming-cursor {
+    animation: none;
+  }
+}
+
+:root[data-motion="none"] .streaming-cursor {
+  animation: none;
+}
+
+@media (forced-colors: active) {
+  :root {
+    --color-surface-canvas: Canvas;
+    --color-surface-rail: Canvas;
+    --color-surface-panel: Canvas;
+    --color-surface-layer1: Canvas;
+    --color-surface-layer2: Canvas;
+    --color-surface-elevated: Canvas;
+    --color-surface-overlay: Canvas;
+    --color-text-primary: CanvasText;
+    --color-text-secondary: CanvasText;
+    --color-text-muted: GrayText;
+    --color-text-inverse: Canvas;
+    --color-border-subtle: ButtonBorder;
+    --color-border-strong: CanvasText;
+    --color-focus-ring: Highlight;
+    --color-selection-active: Highlight;
+    --color-selection-text: HighlightText;
+    --color-accent-primary: LinkText;
+    --color-accent-hover: LinkText;
+    --color-accent-pressed: VisitedText;
+    --color-accent-subtle: Canvas;
+    --color-accent-text: Canvas;
+    --shadow-elevated: none;
+    --shadow-composer: none;
+  }
+
+  :focus-visible {
+    outline-color: Highlight;
+  }
+}

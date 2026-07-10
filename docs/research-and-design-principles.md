@@ -232,7 +232,7 @@ Use neutral surfaces with one product accent and semantic colors reserved for st
 | `color.text.primary` | `#F1F3F5` | Primary copy |
 | `color.text.secondary` | `#A8AFBA` | Metadata |
 | `color.text.tertiary` | `#737B88` | Low-priority labels |
-| `color.accent` | `#9A8CFF` | Focused product accent |
+| `color.accent` | `#6DABFF` | Focused product accent; theme presets replace this through semantic tokens |
 | `color.success` | `#53B987` | Completed/passed |
 | `color.warning` | `#D7A756` | Budget/attention |
 | `color.danger` | `#E07178` | Failed/denied/destructive |

@@ -181,7 +181,7 @@ Exit: release-candidate gate passes on Windows x64, macOS arm64, and macOS Intel
 - PTY, filesystem/path identity, keychain, signing, notifications, shortcuts, IME, screen reader, window restoration, and updater behavior pass platform-specific fixtures.
 - A platform-specific limitation is labeled and capability-gated; it does not create a second product taxonomy.
 
-## 6. Decisions still required before coding
+## 6. Decisions still required before release certification
 
 1. Minimum supported Windows and macOS versions.
 2. Windows ARM64 day-one versus fast-follow.
@@ -189,4 +189,3 @@ Exit: release-candidate gate passes on Windows x64, macOS arm64, and macOS Intel
 4. Product license and whether v1 is free/open beta; paid licensing would introduce commerce/account infrastructure and is outside this accountless contract.
 5. Exact Cursor ACP version floor and Claude/Grok Preview certification targets.
 6. Local crash reporting policy: default off plus user-export is recommended; any automatic third-party reporting requires explicit opt-in and a privacy update.
-

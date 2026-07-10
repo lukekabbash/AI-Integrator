@@ -2,13 +2,13 @@
 
 **Status:** Definition-ready  
 **Audience:** Product, design, desktop engineering, runtime integration, security, and QA  
-**Primary platforms:** Windows first; macOS second; Linux after the local runtime abstraction is stable  
-**Initial runtimes:** Codex, Cursor Agent, Grok Build  
+**Primary platforms:** Windows and macOS from one shared v1 product and release train; Linux after the local runtime abstraction is stable
+**Certified v1 runtimes:** Codex app-server and Cursor ACP; other ACP runtimes remain capability-gated Preview until certified
 **Extension path:** Agent Client Protocol (ACP), structured CLI streams, user-configured local CLI skills
 
 ## 1. Executive summary
 
-AI Integrator is a local-first desktop workspace for directing coding agents through one restrained, task-centered interface. It does not replace the agents, proxy their model traffic, pool credentials, or pretend that the same named model behaves identically in every harness. It launches and supervises the official runtimes already installed on the user's computer, normalizes their observable activity, and adds a shared layer for:
+AI Integrator is an accountless, local-first desktop workspace for directing coding agents through one restrained, task-centered interface. It does not replace the agents, proxy their model traffic, pool credentials, require an AI Integrator backend, or pretend that the same named model behaves identically in every harness. It launches and supervises the official runtimes already installed on the user's computer, normalizes their observable activity, and adds a shared layer for:
 
 - Projects, tasks, worktrees, and cloned repositories.
 - Compact runtime, model, effort, environment, permission, and budget selection.
@@ -51,7 +51,7 @@ The user should feel that they are supervising one capable engineering workspace
 - Make runtime/model/effort selection visible but visually secondary to the task.
 - Treat permissions, worktree isolation, and deployment boundaries as first-class product controls.
 - Provide model- and runtime-level usage reporting with explicit confidence labels.
-- Deliver a premium Windows experience with fast keyboard navigation and excellent reduced-motion behavior.
+- Deliver one premium Windows/macOS experience with fast keyboard navigation, platform-native behavior, and excellent reduced-motion support.
 - Make adding an ACP agent mostly a manifest and compatibility-test exercise.
 
 ### 3.2 Non-goals
@@ -67,6 +67,7 @@ The user should feel that they are supervising one capable engineering workspace
 - Allowing unconstrained recursive agent spawning.
 - Committing task scratch, runtime projections, full transcripts, locks, or local coordination state into the user's repository automatically.
 - Giving every child the full parent or sibling transcript when a bounded assignment, result, evidence reference, or requested range is sufficient.
+- Requiring an AI Integrator account, hosted task database, cloud transcript sync, credential proxy, or mandatory telemetry pipeline.
 
 ## 4. Product principles
 
@@ -741,8 +742,8 @@ Before a writing run:
 
 Effective permission is the intersection of:
 
-1. Organization policy.
-2. User profile.
+1. Optional signed managed-machine policy.
+2. Local user profile.
 3. Project policy.
 4. Task contract.
 5. Parent-run access.
@@ -832,16 +833,16 @@ Do not notify for routine child completion when the parent remains active unless
 
 ## 17. First-release scope
 
-### 17.1 MVP
+### 17.1 Polished v1 MVP
 
-- Windows desktop application.
+- One signed Windows/macOS desktop application from a shared Tauri 2, Rust, React, and TypeScript codebase.
 - Local projects and standalone tasks.
 - Open folder and clone-and-start.
 - Hierarchical project/task sidebar.
 - Persistent composer and draft recovery.
 - Codex app-server adapter.
 - Cursor ACP adapter with structured-run and PTY fallbacks.
-- Grok ACP adapter.
+- Capability-gated Preview discovery for Grok and other ACP adapters; they do not enter the v1 release gate until certified.
 - Existing authenticated CLI reuse plus vendor-owned login through browser/device flow or a user-controlled Setup terminal when required.
 - Runtime/model/effort selector.
 - Lower-right execution-route and delegation-policy composer controls.
@@ -861,6 +862,9 @@ Do not notify for routine child completion when the parent remains active unless
 - Local measured usage and provider-reported usage where available.
 - Portable project/task skills.
 - Reduced motion and complete keyboard navigation.
+- Full-screen Settings whose category navigation replaces project/task navigation.
+- Twelve semantic theme presets plus customizable interface/code fonts, density, radius, motion, and accessible color tokens.
+- Local settings/task export and import, data-location controls, redacted diagnostics, and uninstall keep/delete choice.
 
 ### 17.2 Beta
 
@@ -871,12 +875,10 @@ Do not notify for routine child completion when the parent remains active unless
 - Preview/browser pane and screenshot comparison.
 - Side questions/task forks.
 - Optional user-configured local CLI skill.
-- macOS packaging.
 
 ### 17.3 Later
 
-- Team policy and audit export.
-- Remote daemon and mobile control.
+- Any Integrator account/backend re-architecture, including team identity, remote daemon, mobile control, cross-device sync, or hosted audit.
 - Schedules/automations.
 - Best-of-N worktree comparison.
 - Shared skill/delegation recipe marketplace.
@@ -918,18 +920,19 @@ The strongest signal is not number of installed agents. It is repeated use of th
 
 - The durable unit is a task.
 - Runtime/model selection is per turn and compact.
-- Codex, Cursor, and Grok are the first-class launch runtimes.
+- Codex and Cursor are the certified v1 launch runtimes; other ACP routes are capability-gated until their conformance suites pass.
 - ACP is the primary extension protocol.
 - Claude is available only through an optional user-configured local CLI skill in the initial product.
 - The broker mediates all cross-agent delegation.
 - Auto routing is transparent and deterministic before it becomes adaptive.
 - Usage numbers carry provenance/confidence.
 - Worktrees are the default isolation mechanism for parallel writers.
-- The visual tone is restrained, dark-first, and motion-light.
+- The visual tone is restrained, themeable, softly rounded, and motion-light; dark and light presets are equally supported and purple is not the product accent.
+- Tauri 2 with a Rust core and shared React/TypeScript UI is the v1 architecture. Electron is the bounded fallback only if the native PTY/WebView spike fails.
 
 ### 19.2 Decisions requiring prototype validation
 
-- Electron versus Tauri after validating PTY, process supervision, accessibility, updater, and Windows packaging.
+- Minimum supported Windows/macOS versions, Windows ARM64 launch timing, and signing/updater-key custody.
 - Whether the Inspector defaults open above 1600 px.
 - Whether standalone tasks live in a separate sidebar group or a synthetic project.
 - Whether a task fork appears as a sibling task or child run.

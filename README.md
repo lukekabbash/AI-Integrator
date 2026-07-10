@@ -10,6 +10,7 @@ This repository contains the normative v1 product contracts and the native appli
 - [Native architecture](docs/architecture.md) — one-codebase Tauri/Rust topology, security boundary, platform traits, packaging, signing, updating, and performance gates.
 - [Local-first contract](docs/local-first-contract.md) — identity, storage, network, vendor authentication, privacy, export/import, and no-backend rules.
 - [Design-system contract](docs/design-system-contract.md) — full-screen Settings, right-rail Git, theme/font customization, softer visual language, diffs, and usage presentation.
+- [Implementation plan](docs/implementation-plan.md) — parallel workstreams, evidence-gated milestones, local constraints, and completion requirements.
 
 - [Product specification](docs/product-spec.md) — product thesis, scope, information architecture, runtime architecture, workflows, security, usage accounting, phased delivery, and acceptance gates.
 - [User stories](docs/user-stories.md) — personas, journeys, epics, stories, acceptance criteria, edge cases, and launch priorities.

@@ -38,14 +38,14 @@ The existing item-level P0/P1 label remains local implementation importance. Del
 | 068 | MVP | Independent child stop semantics |
 | 069 | Later | Best-of-N candidate comparison |
 | 070–080 | MVP | Child evidence, lifecycle, recovery, authentication, and attention |
-| 081–088 | MVP | Windows-first keyboard/layout/accessibility; macOS parity gates its Beta package |
+| 081–088 | MVP | Windows/macOS keyboard, layout, accessibility, IME, and platform-native behavior gate the same v1 release |
 | 089 | Beta | Dictation/voice |
 | 090–107 | MVP | Platform path behavior, power-user access, usage/diagnostics, bootstrap, trust, and imports needed by launch runtimes |
 | 108 | Beta | Runtime installation/update assistance; launch still detects and explains missing runtimes |
 | 109–115 | MVP | Health, smoke test, instructions, and portable skills |
 | 116–120 | Beta | Full plugin/hook/MCP management UI; launch adapters may still use preconfigured MCP safely |
 | 121–129 | MVP | Effective settings, policy, and config safety |
-| 130 | Beta | Settings export/import package |
+| 130 | MVP | Local settings/theme export and import are required for an accountless, shareable product |
 | 131–138 | MVP | Tabs/panes/focus/view-state correctness for the launch shell |
 | 139–140 | Beta | Multi-window ownership and background-close breadth |
 | 141–150 | Beta | Browser, Computer Use, annotations, downloads, and CDP |
@@ -53,8 +53,8 @@ The existing item-level P0/P1 label remains local implementation importance. Del
 | 161–166 | MVP | Source and artifact provenance/version correctness |
 | 167–169 | Beta | Large/rich artifact viewer, regeneration comparison, and export package |
 | 170–175 | MVP | Reference integrity, unread state, notifications, and attention queue |
-| 176–179 | Later | Collaborative presence, device registry, acknowledged handoff ownership, mobile review |
-| 180–199 | MVP | Account boundaries, backpressure, storage, recovery, audit, and interaction grammar |
+| 176–179 | Later | Any future collaborative presence, device registry, acknowledged remote handoff, or mobile review requires a new backend/identity decision |
+| 180–199 | MVP | Vendor-auth-context boundaries, backpressure, local storage/export, recovery, audit, and interaction grammar |
 | 200 | MVP | Capability/update-change disclosure for launch runtimes and adapters |
 
 ## 4. Critical systems delivery assignment
@@ -84,7 +84,7 @@ open/clone project
 → create task and durable draft
 → reuse existing CLI login or complete vendor login in a user-owned Setup terminal
 → choose permission + delegation + execution route in the composer
-→ start Codex/Cursor/Grok run
+→ start a certified Codex/Cursor run or clearly capability-gated ACP Preview
 → read standardized task state, pair writers to visible worktrees, and supervise terminals/one child
 → message/read child evidence or scoped transcript without copying histories
 → review files/diff/tests/evidence, then stage/commit/publish/push in the selected worktree

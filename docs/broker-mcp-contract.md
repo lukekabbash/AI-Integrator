@@ -14,9 +14,9 @@ The local desktop/broker remains authoritative for task identity, policy interse
 
 - MVP transport is local stdio launched/supervised by Integrator for the active runtime session.
 - No unauthenticated TCP listener, LAN bind, or user-supplied bearer token is required for local MVP.
-- Each MCP connection is bound out-of-band to one account/workspace, task, parent run, runtime connection, policy snapshot, and control lease.
-- Tool callers cannot select an arbitrary parent task/run/account in arguments.
-- Remote HTTP transport is Later and requires authenticated device/host identity, replay protection, lease reconciliation, and the remote invariants in the critical systems contract.
+- Each MCP connection is bound out-of-band to one local installation/profile, project, task, parent run, runtime connection/vendor-auth-context fingerprint, policy snapshot, and control lease.
+- Tool callers cannot select an arbitrary installation, project, parent task, run, or vendor auth context in arguments.
+- v1 uses local process-bound stdio only. Any remote transport belongs to a future backend/identity re-architecture, not the current Broker contract.
 - Initialize exposes server name/version plus capabilities for transcript ranges, native steering, native child sessions, worktree isolation, usage attribution, and result schemas.
 
 ## 3. Tool surface

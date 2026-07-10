@@ -1,0 +1,19 @@
+{
+  "name": "ai-integrator",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-first native control plane for coding agents",
+  "packageManager": "npm@10.9.2",
+  "scripts": {
+    "dev": "npm --prefix apps/desktop run tauri -- dev",
+    "dev:web": "npm --prefix apps/desktop run dev",
+    "build": "npm --prefix apps/desktop run tauri -- build",
+    "build:web": "npm --prefix apps/desktop run build",
+    "check:bridge": "node scripts/check-bridge-contract.mjs",
+    "check:docs": "node scripts/check-docs.mjs",
+    "check": "npm run check:bridge && npm --prefix apps/desktop run check && cargo check --workspace",
+    "test": "npm --prefix apps/desktop run test && cargo test --workspace",
+    "format": "npm --prefix apps/desktop run format && cargo fmt --all -- --check",
+    "lint": "npm --prefix apps/desktop run lint && cargo clippy --workspace --all-targets -- -D warnings"
+  }
+}

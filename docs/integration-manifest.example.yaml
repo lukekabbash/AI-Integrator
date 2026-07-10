@@ -3,13 +3,24 @@
 # into argv; inject secret references through the supervisor's protected env API.
 schema_version: 1
 reviewed_at: 2026-07-10
+product_platforms: [windows, macos]
+application_identity: local_installation
+requires_integrator_account: false
+requires_integrator_backend: false
+
+runtime_shell:
+  framework: tauri_2
+  core: rust
+  ui: react_typescript
+  renderer_arbitrary_shell_access: false
+  renderer_arbitrary_filesystem_access: false
 
 defaults:
   startup_timeout_ms: 15000
   graceful_stop_timeout_ms: 3000
   max_event_bytes: 10485760
   unknown_fields: preserve
-  bind_host: 127.0.0.1
+  local_ipc_only: true
   credential_policy: vendor_owned
   raw_event_retention: redacted_local_only
 
@@ -51,10 +62,16 @@ coordination_contract:
 
 broker_mcp:
   transport: stdio
-  session_scope: [account, task, parent_run, policy_snapshot, control_lease]
+  session_scope: [local_installation, local_profile, project, task, parent_run, policy_snapshot, control_lease]
   tools: [peers_list, delegate_start, child_status, child_message, child_transcript_read, child_stop, child_result]
   mutating_requests_require: [idempotency_key, expected_policy_version]
-  remote_transport: later
+  remote_transport: outside_v1_contract
+
+usage_contract:
+  dimensions: [provider_allowance, tokens, api_equivalent_value, actual_incremental_spend]
+  sources: [vendor_exact, local_observed, estimated, unavailable]
+  missing_value: not_exposed
+  combine_dimensions_into_balance: false
 
 registry:
   acp_index: https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json

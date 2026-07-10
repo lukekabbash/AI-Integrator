@@ -1,0 +1,30 @@
+[package]
+name = "ai-integrator-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "ai_integrator_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+adapter-codex = { path = "../../../crates/adapter-codex" }
+chrono.workspace = true
+directories.workspace = true
+integrator-core = { path = "../../../crates/integrator-core" }
+integrator-runtime = { path = "../../../crates/integrator-runtime" }
+serde.workspace = true
+serde_json.workspace = true
+session-store = { path = "../../../crates/session-store" }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tokio.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

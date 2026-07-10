@@ -418,6 +418,8 @@ The shell supports five regions, of which only two are mandatory:
 
 The primary canvas is never replaced by an opaque “agent mode.” Files and diffs open beside it; terminal opens below or beside it; the inspector supplements it.
 
+Settings is the exception to ordinary workspace navigation: it is a full-screen application route whose category rail replaces the project/task rail. It is not an Inspector, modal, overlay, or right drawer. `Back to workspace` restores the previous project, task, canvas tab, scroll/focus, and right-rail state.
+
 ### 6.2 Window classes
 
 | Width | Shell behavior |
@@ -1752,7 +1754,7 @@ Sections:
 - Fallback/emulator behavior.
 - Handoff requirements.
 
-Every section records source: user prompt, attached file, project policy, organization policy, or derived summary. Derived text is editable and labeled.
+Every section records source: user prompt, attached file, project policy, optional signed managed-machine policy, or derived summary. Derived text is editable and labeled.
 
 ### 16.5 Completion ledger
 
@@ -1889,6 +1891,8 @@ The composer may show one quiet usage indicator when it affects choice:
 - `Usage unavailable` only inside details, not as constant chrome.
 
 If a ring is used, it represents exactly one dimension. Context and subscription-period usage require separate arcs with a legend or, preferably, separate bars in the popover.
+
+When available, the compact control may summarize `12% · 215k · ≈$1.84`. These are separate measurements, not a combined balance: provider-period allowance, tokens, API-equivalent value, and actual incremental spend each retain their own source, freshness, window, and reset. Never synthesize a percentage without a documented denominator and never present an API-equivalent estimate as spend.
 
 ### 18.3 Usage popover
 
@@ -2089,7 +2093,7 @@ Hairlines may render at 0.5 device-independent pixels only where the platform/re
 | Warning/waiting | amber | 8–12% | diamond or triangle |
 | Error/failed | red | 8–12% | octagon/error glyph |
 | Info/remote | cyan | 8–10% | circle/info glyph |
-| Plan | muted magenta | <= 8% | plan/document glyph |
+| Plan | muted cyan/blue | <= 8% | plan/document glyph |
 | Review | muted green | <= 8% | review glyph |
 
 Agent roles may use muted semantic accents in detailed views, but runtime brands never own success/error colors.
@@ -2148,6 +2152,8 @@ Repeated row spacing must use tokens; optical exceptions get comments and visual
 | `radius.pill` | 999 px | true pills only: compact filters/status |
 
 Not every rectangle is a pill. Sidebar selection uses 6–8 px, not a full capsule, unless the platform shell specifically calls for it.
+
+The default visual preset uses soft 8–12 px radii for interactive surfaces, composer, menus, terminal, and review panes. Users may select sharper or softer radius presets; transcript paragraphs and routine activity rows remain open surfaces rather than cards.
 
 ### 20.8 Elevation
 

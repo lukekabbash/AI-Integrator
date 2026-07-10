@@ -175,7 +175,7 @@ The broker validates size, type, references, redaction, ownership, and duplicate
 - A child receives the bounded assignment, selected context references, effective policy, worktree lease, and required return contract—not the full parent transcript.
 - A parent receives child status, typed questions, important notes, permission/attention events, and the structured result—not continuous copied transcript text.
 - Siblings do not read or message each other directly by default. The parent/broker may relay a scoped message or authorize a specific transcript/context request.
-- The user can inspect every observable child transcript from the child pane, subject to account/task authorization and redaction.
+- The local user can inspect every observable child transcript from the child pane, subject to installation/project/task authorization and redaction.
 
 ### 6.2 Messaging
 
@@ -203,7 +203,7 @@ Transcript reads are on-demand and range-based:
 - Sibling access requires explicit parent/user authorization and defaults to summary/result/evidence rather than raw transcript.
 - Reads use cursor, maximum items/bytes, density, and redaction class.
 - Returned content includes delivered user/assistant messages, structured tool/activity results, and runtime-provided reasoning summaries only when policy allows.
-- Hidden reasoning, secure terminal input, credentials, disallowed attachments, and unrelated account/project content are never exposed.
+- Hidden reasoning, secure terminal input, credentials, disallowed attachments, and unrelated vendor-auth-context/project content are never exposed.
 - Each grant records source sequence/hash and appears in both runs' context manifests.
 
 ## 7. Worktree pairing
@@ -308,7 +308,7 @@ All integrated terminals support a real PTY where the platform/runtime permits i
 - Every shared mutation has task/run identity, sequence, idempotency key, source, timestamp, and redaction state.
 - File paths are canonicalized; symlink/junction/case aliases cannot cross project, worktree, or secret boundaries.
 - `.aiintegrator/.runtime/` is excluded from Git and secret/staging scans verify that it is not committed.
-- Transcript references cannot escape task/account lineage.
+- Transcript references cannot escape local-installation/project/task lineage or cross a vendor-auth-context boundary without an explicit reconciled handoff.
 - Coordination storage never grants authority; policy/broker/runtime sandbox remains authoritative.
 - Deleting/archiving a task, transcript, worktree, branch, coordination ledger, or durable project knowledge are distinct operations.
 

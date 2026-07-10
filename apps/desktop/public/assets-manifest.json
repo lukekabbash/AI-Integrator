@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "policy": "Only assets listed here may ship in the desktop application. Provider marks require separate trademark review.",
+  "assets": [
+    {
+      "path": "brand/ai-integrator-mark-light.png",
+      "kind": "first-party-brand-mark",
+      "purpose": "AI Integrator lockup on dark and neutral application surfaces",
+      "source": "H:/Code/integrator-2/public/images/logos/aiintegrator-ai-mark-transparent.png",
+      "sourceCommit": "7836ad599a9deed05e240a9fbaff3158a5572993",
+      "sha256": "8B889F701BAAA5EC5087A2B494BF88A1F8D697364EFF773736DADA32C36129B8",
+      "dimensions": "400x277",
+      "approved": true,
+      "notes": "First-party raster source retained without modification. A padded vector master is still required before final platform icon generation."
+    }
+  ]
+}
