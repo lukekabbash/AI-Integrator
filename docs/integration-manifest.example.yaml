@@ -1,0 +1,325 @@
+# Illustrative adapter manifest. It is not executable configuration yet.
+# Commands are arrays so no shell parsing is required. Never interpolate secrets
+# into argv; inject secret references through the supervisor's protected env API.
+schema_version: 1
+reviewed_at: 2026-07-10
+
+defaults:
+  startup_timeout_ms: 15000
+  graceful_stop_timeout_ms: 3000
+  max_event_bytes: 10485760
+  unknown_fields: preserve
+  bind_host: 127.0.0.1
+  credential_policy: vendor_owned
+  raw_event_retention: redacted_local_only
+
+supervisor_contract:
+  executable_provenance: required
+  compatibility_probe: required_before_resume
+  route_identity: [connection, runtime, provider_model, tier, effort, billing_class]
+  context_manifest: required
+  stdin_ownership: exclusive_lease
+  secure_input: outside_model_context
+  process_tree_cleanup: required
+  secret_values_in_manifest: forbidden
+  secret_inheritance_to_children: deny
+  retry_policy: operation_specific
+  idempotency_unknown: require_review
+  checkpoint_uncertain_side_effects: preserve_and_block_replay
+  network_unknown_destination: deny
+
+delegation_contract:
+  default_mode: ask
+  default_max_depth: 1
+  default_max_concurrency: 1
+  child_may_widen_parent: false
+  child_secret_inheritance: deny
+  fallback_boundary_changes_require_consent: true
+  required_return: [summary, files_inspected, files_changed, commands, tests, risks, remaining_work]
+
+coordination_contract:
+  schema_version: 1
+  git_authoritative_root: git-common-dir/aiintegrator/v1
+  worktree_projection: .aiintegrator/.runtime/runs/{run_id}
+  projection_ignore_source: git-common-info-exclude
+  broker_is_shared_record_writer: true
+  agent_owned_files: [scratch.md, notes.jsonl]
+  transcripts: reference_only
+  artifacts: content_addressed
+  hidden_reasoning: forbidden
+  secure_input: forbidden
+
+broker_mcp:
+  transport: stdio
+  session_scope: [account, task, parent_run, policy_snapshot, control_lease]
+  tools: [peers_list, delegate_start, child_status, child_message, child_transcript_read, child_stop, child_result]
+  mutating_requests_require: [idempotency_key, expected_policy_version]
+  remote_transport: later
+
+registry:
+  acp_index: https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json
+  cache_max_age_hours: 24
+  require_install_confirmation: true
+  verify_archive_digest: true
+
+runtimes:
+  codex:
+    display_name: Codex
+    priority: launch
+    executable_candidates: [codex, codex.exe, codex.cmd]
+    version_command: [codex, --version]
+    transport:
+      kind: codex_app_server
+      command: [codex, app-server]
+      framing: jsonl
+      initialize_required: true
+      generate_schema:
+        typescript: [codex, app-server, generate-ts, --out, "{output_dir}"]
+        json_schema: [codex, app-server, generate-json-schema, --out, "{output_dir}"]
+    auth:
+      owner: runtime_protocol
+      supports_status: true
+      supports_login: true
+      supports_logout: true
+      forbidden_paths: ["~/.codex/auth.json"]
+    capabilities:
+      sessions: [create, list, read, resume, fork, rename, archive, unarchive, delete]
+      turns: [start, steer, interrupt, compact]
+      events: [messages, plans, reasoning, commands, file_changes, tools, review, collaboration]
+      permissions: bidirectional
+      models: discover
+      effort: discover
+      usage: provider_reported
+      subagents: native_threads
+      subagent_policy: [roles, max_depth, max_threads, runtime_timeout]
+      context: [status, compact, memories_config]
+      terminals: [exec, stdin, resize, interrupt, terminate, output_delta]
+      worktrees: native_app_and_git
+      checkpoints: [thread_fork, provider_neutral_snapshot]
+      review: native
+    fallback:
+      kind: pty
+      command: [codex]
+
+  cursor:
+    display_name: Cursor Agent
+    priority: launch
+    registry_id: cursor
+    executable_candidates: [cursor-agent, cursor-agent.exe, cursor-agent.cmd]
+    version_command: [cursor-agent, --version]
+    transport:
+      kind: acp
+      command: [cursor-agent, acp]
+      framing: jsonl
+      capabilities: negotiate
+    auth:
+      owner: vendor_command
+      status_command: [cursor-agent, status]
+      login_command: [cursor-agent, login]
+      logout_command: [cursor-agent, logout]
+      secret_env_refs: [CURSOR_API_KEY]
+    fallback:
+      - kind: structured_process
+        command: [cursor-agent, --print, "{prompt}", --output-format, stream-json]
+        framing: ndjson
+      - kind: pty
+        command: [cursor-agent]
+    claims:
+      usage: unavailable_until_reported
+      native_windows: conformance_test_required
+
+  grok_build:
+    display_name: Grok Build
+    priority: launch
+    registry_id: grok-build
+    executable_candidates: [grok, grok.exe, grok.cmd]
+    version_command: [grok, version]
+    transport:
+      kind: acp
+      command: [grok, agent, stdio]
+      framing: jsonl
+      capabilities: negotiate
+    auth:
+      owner: vendor_command
+      login_command: [grok, login]
+      device_login_command: [grok, login, --device-auth]
+      logout_command: [grok, logout]
+      secret_env_refs: [XAI_API_KEY]
+    discovery:
+      inspect_command: [grok, inspect, --json]
+      models_command: [grok, models]
+    fallback:
+      kind: structured_process
+      command: [grok, --print, "{prompt}", --output-format, streaming-json]
+      framing: ndjson
+
+  github_copilot:
+    display_name: GitHub Copilot
+    priority: next
+    registry_id: github-copilot-cli
+    executable_candidates: [copilot, copilot.exe, copilot.cmd]
+    version_command: [copilot, version]
+    transport:
+      kind: acp
+      command: [copilot, --acp]
+      framing: jsonl
+      capabilities: negotiate
+    auth:
+      owner: vendor_command
+      login_command: [copilot, login]
+      secret_env_refs: [COPILOT_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN]
+
+  kilo:
+    display_name: Kilo
+    priority: catalog
+    registry_id: kilo
+    executable_candidates: [kilo, kilo.exe, kilo.cmd]
+    version_command: [kilo, --version]
+    transport:
+      kind: acp
+      command: [kilo, acp]
+      framing: jsonl
+      capabilities: negotiate
+    auth:
+      owner: vendor_command
+      login_command: [kilo, auth, login]
+      logout_command: [kilo, auth, logout]
+      status_command: [kilo, auth, list]
+    usage_command: [kilo, stats]
+
+  opencode:
+    display_name: OpenCode
+    priority: catalog
+    registry_id: opencode
+    executable_candidates: [opencode, opencode.exe]
+    version_command: [opencode, --version]
+    transport:
+      kind: acp
+      command: [opencode, acp, --cwd, "{workspace}"]
+      framing: ndjson
+      capabilities: negotiate
+    auth:
+      owner: vendor_command
+      login_command: [opencode, auth, login]
+      logout_command: [opencode, auth, logout]
+      status_command: [opencode, auth, list]
+      forbidden_paths: ["~/.local/share/opencode/auth.json"]
+    usage_command: [opencode, stats]
+
+  gemini:
+    display_name: Gemini CLI
+    priority: catalog_restricted_auth
+    registry_id: gemini
+    executable_candidates: [gemini, gemini.exe, gemini.cmd]
+    transport:
+      kind: acp
+      command: [gemini, --acp]
+      framing: jsonl
+      capabilities: negotiate
+    auth:
+      owner: official_cli_only
+      do_not_reuse_oauth: true
+      secret_env_refs: [GEMINI_API_KEY, GOOGLE_APPLICATION_CREDENTIALS]
+    fallback:
+      kind: structured_process
+      command: [gemini, --prompt, "{prompt}", --output-format, stream-json]
+      framing: ndjson
+
+  cline:
+    display_name: Cline
+    priority: catalog
+    registry_id: cline
+    executable_candidates: [cline, cline.cmd]
+    transport:
+      kind: acp
+      command: [cline, --acp]
+      framing: jsonl
+      capabilities: negotiate
+    auth:
+      owner: vendor_command
+      login_command: [cline, auth]
+    claims:
+      native_windows: unsupported_in_reviewed_install_docs
+
+  goose:
+    display_name: Goose
+    priority: catalog
+    registry_id: goose
+    executable_candidates: [goose, goose.exe]
+    transport:
+      kind: acp
+      command: [goose, acp]
+      framing: jsonl
+      capabilities: negotiate
+    auth:
+      owner: official_cli_only
+
+  kiro:
+    display_name: Kiro CLI
+    priority: custom_manifest
+    executable_candidates: [kiro-cli, kiro-cli.exe]
+    version_command: [kiro-cli, --version]
+    transport:
+      kind: acp
+      command: [kiro-cli, acp]
+      framing: jsonl
+      capabilities: negotiate
+    auth:
+      owner: vendor_command
+      login_command: [kiro-cli, login]
+      logout_command: [kiro-cli, logout]
+      status_command: [kiro-cli, whoami]
+      secret_env_refs: [KIRO_API_KEY]
+
+  qwen_code:
+    display_name: Qwen Code
+    priority: catalog_experimental
+    registry_id: qwen-code
+    executable_candidates: [qwen, qwen.exe, qwen.cmd]
+    transport:
+      kind: acp
+      command: [qwen, --acp, --experimental-skills]
+      framing: jsonl
+      capabilities: negotiate
+    auth:
+      owner: official_cli_only
+    fallback:
+      kind: structured_process
+      command: [qwen, --prompt, "{prompt}", --output-format, stream-json]
+      framing: ndjson
+
+  claude_local_skill:
+    display_name: User-configured local Claude command
+    priority: restricted
+    user_must_enable: true
+    executable_candidates: [claude, claude.exe, claude.cmd]
+    version_command: [claude, --version]
+    transport:
+      kind: structured_process
+      command: [claude, --print, "{prompt}", --output-format, stream-json, --verbose]
+      framing: ndjson
+    auth:
+      owner: user_and_vendor
+      expose_login_ui: false
+      inspect_credential_files: false
+      forbidden_paths: ["~/.claude/.credentials.json", "%USERPROFILE%/.claude/.credentials.json"]
+    labels:
+      connection: User-configured local command
+      partnership_claim: forbidden
+
+  aider:
+    display_name: Aider
+    priority: fallback
+    executable_candidates: [aider, aider.exe, aider.cmd]
+    version_command: [aider, --version]
+    transport:
+      kind: pty
+      command: [aider]
+    auth:
+      owner: official_cli_only
+      inspect_dotenv: false
+      inspect_config: false
+    claims:
+      typed_events: false
+      bidirectional_permissions: false
+      usage: unavailable_or_estimated

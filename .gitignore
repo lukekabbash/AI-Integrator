@@ -1,0 +1,47 @@
+# JavaScript / Vite
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Rust / Tauri
+target/
+src-tauri/target/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+
+# AI Integrator local state
+.aiintegrator/.runtime/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+logs/
+diagnostics/
+
+# Editors and OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Test and coverage artifacts
+coverage/
+playwright-report/
+test-results/
+
+# Packaging
+src-tauri/gen/
+*.msi
+*.dmg
+*.app.tar.gz
+*.sig
+
