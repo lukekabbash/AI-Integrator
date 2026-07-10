@@ -8,6 +8,8 @@ pub enum IntegratorError {
     NotFound(String),
     #[error("operation unavailable: {0}")]
     Unavailable(String),
+    #[error("operation not authorized: {0}")]
+    Unauthorized(String),
     #[error("provider protocol error: {0}")]
     Protocol(String),
     #[error("storage error: {0}")]

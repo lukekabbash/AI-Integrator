@@ -3,6 +3,13 @@ import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import App from "./App";
+import { createDemoSnapshot, createEmptySnapshot } from "./demoData";
+
+const DEMO_STORAGE_KEY = "aiintegrator.demo.workspace.v1";
+
+function storeSnapshot(snapshot: ReturnType<typeof createDemoSnapshot>) {
+  window.localStorage.setItem(DEMO_STORAGE_KEY, JSON.stringify(snapshot));
+}
 
 afterEach(() => {
   window.localStorage.clear();
@@ -82,5 +89,66 @@ describe("AI Integrator desktop workspace", () => {
     expect(
       await screen.findByText(/Passwords and tokens are never imported into AI Integrator/),
     ).toBeInTheDocument();
+  });
+
+  it("offers a calm empty native state and opens a browser-demo project", async () => {
+    const empty = createEmptySnapshot();
+    empty.runtimes = createDemoSnapshot().runtimes;
+    storeSnapshot(empty);
+    render(<App />);
+
+    const heading = await screen.findByRole("heading", { name: "Open a local Git project" });
+    const emptyState = heading.closest("section");
+    expect(emptyState).not.toBeNull();
+    fireEvent.click(
+      within(emptyState as HTMLElement).getByRole("button", { name: /Open project/ }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "What should the first agent do?" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("demo-project", { selector: ".empty-task-kicker" }),
+    ).toBeInTheDocument();
+  });
+
+  it("creates a durable task before sending when a project has no active task", async () => {
+    const snapshot = createDemoSnapshot();
+    snapshot.tasks = [];
+    snapshot.activeTaskId = "";
+    snapshot.transcript = [];
+    storeSnapshot(snapshot);
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "What should the first agent do?" }),
+    ).toBeInTheDocument();
+    const composer = screen.getByRole("textbox", { name: "Task message" });
+    fireEvent.change(composer, { target: { value: "Audit the trusted project boundary" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "Audit the trusted project boundary" }),
+    ).toBeInTheDocument();
+    expect(
+      await screen.findByText("Audit the trusted project boundary", { selector: ".turn--user p" }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("Queued for execution")).toBeInTheDocument();
+  });
+
+  it("creates a real browser-demo task from New task when a project is selected", async () => {
+    const snapshot = createDemoSnapshot();
+    snapshot.tasks = [];
+    snapshot.activeTaskId = "";
+    snapshot.transcript = [];
+    storeSnapshot(snapshot);
+    render(<App />);
+
+    const newTaskLabel = await screen.findByText("New task", { selector: ".new-task-button span" });
+    fireEvent.click(newTaskLabel.closest("button") as HTMLButtonElement);
+    expect(await screen.findByRole("heading", { name: "New task" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "What should the first agent do?" }),
+    ).not.toBeInTheDocument();
   });
 });

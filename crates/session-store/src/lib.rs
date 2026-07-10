@@ -1,19 +1,24 @@
 #![forbid(unsafe_code)]
 
-use std::{path::Path, str::FromStr};
+use std::{
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use chrono::{DateTime, Utc};
 use integrator_core::{
-    IntegratorError, LocalExport, NewTask, ProviderKind, ProviderSession, ProviderSessionId,
-    Result, RuntimeSession, RuntimeSessionId, Setting, Task, TaskId, TaskState,
+    IntegratorError, LocalExport, NewTask, ProjectId, ProviderKind, ProviderSession,
+    ProviderSessionId, Result, RuntimeSession, RuntimeSessionId, Setting, Task, TaskId, TaskState,
+    TrustedProject,
 };
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
-const MIGRATIONS: &[(i64, &str)] = &[(
-    1,
-    r#"
+const MIGRATIONS: &[(i64, &str)] = &[
+    (
+        1,
+        r#"
         CREATE TABLE IF NOT EXISTS schema_migrations (
             version INTEGER PRIMARY KEY,
             applied_at TEXT NOT NULL
@@ -53,7 +58,25 @@ const MIGRATIONS: &[(i64, &str)] = &[(
         );
         CREATE INDEX IF NOT EXISTS runtime_sessions_task_idx ON runtime_sessions(task_id, started_at DESC);
         "#,
-)];
+    ),
+    (
+        2,
+        r#"
+        CREATE TABLE IF NOT EXISTS trusted_projects (
+            id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            repository_root TEXT NOT NULL UNIQUE,
+            git_common_directory TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_opened_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS trusted_projects_last_opened_idx
+            ON trusted_projects(last_opened_at DESC);
+        CREATE INDEX IF NOT EXISTS trusted_projects_common_dir_idx
+            ON trusted_projects(git_common_directory);
+        "#,
+    ),
+];
 
 pub struct LocalStore {
     connection: Mutex<Connection>,
@@ -156,6 +179,104 @@ impl LocalStore {
             )
             .map_err(storage_error)?;
         Ok(task)
+    }
+
+    pub fn upsert_trusted_project(
+        &self,
+        display_name: &str,
+        repository_root: &Path,
+        git_common_directory: &Path,
+    ) -> Result<TrustedProject> {
+        let display_name = display_name.trim();
+        if display_name.is_empty() || display_name.chars().count() > 120 {
+            return Err(IntegratorError::InvalidInput(
+                "project display name must contain 1 to 120 characters".into(),
+            ));
+        }
+        if !repository_root.is_absolute() || !git_common_directory.is_absolute() {
+            return Err(IntegratorError::InvalidInput(
+                "trusted project paths must be canonical absolute paths".into(),
+            ));
+        }
+        let repository_root = repository_root.to_string_lossy().into_owned();
+        let git_common_directory = git_common_directory.to_string_lossy().into_owned();
+        let now = Utc::now();
+        let connection = self.connection.lock();
+        let existing = connection
+            .query_row(
+                "SELECT id, created_at FROM trusted_projects WHERE repository_root = ?1",
+                [&repository_root],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        let (id, created_at) = match existing {
+            Some((id, created_at)) => (
+                ProjectId::from_str(&id).map_err(invalid_stored)?,
+                parse_time(&created_at)?,
+            ),
+            None => (ProjectId::new(), now),
+        };
+        connection
+            .execute(
+                "INSERT INTO trusted_projects(id, display_name, repository_root, git_common_directory, created_at, last_opened_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(repository_root) DO UPDATE SET display_name = excluded.display_name, git_common_directory = excluded.git_common_directory, last_opened_at = excluded.last_opened_at",
+                params![id.to_string(), display_name, repository_root, git_common_directory, created_at.to_rfc3339(), now.to_rfc3339()],
+            )
+            .map_err(storage_error)?;
+        Ok(TrustedProject {
+            id,
+            display_name: display_name.to_owned(),
+            repository_root: PathBuf::from(repository_root),
+            git_common_directory: PathBuf::from(git_common_directory),
+            created_at,
+            last_opened_at: now,
+        })
+    }
+
+    pub fn list_trusted_projects(&self) -> Result<Vec<TrustedProject>> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare("SELECT id, display_name, repository_root, git_common_directory, created_at, last_opened_at FROM trusted_projects ORDER BY last_opened_at DESC")
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(storage_error)?;
+        rows.map(|row| {
+            let (id, display_name, root, common, created, opened) = row.map_err(storage_error)?;
+            Ok(TrustedProject {
+                id: ProjectId::from_str(&id).map_err(invalid_stored)?,
+                display_name,
+                repository_root: PathBuf::from(root),
+                git_common_directory: PathBuf::from(common),
+                created_at: parse_time(&created)?,
+                last_opened_at: parse_time(&opened)?,
+            })
+        })
+        .collect()
+    }
+
+    pub fn remove_trusted_project(&self, project_id: ProjectId) -> Result<()> {
+        let changed = self
+            .connection
+            .lock()
+            .execute(
+                "DELETE FROM trusted_projects WHERE id = ?1",
+                [project_id.to_string()],
+            )
+            .map_err(storage_error)?;
+        if changed == 0 {
+            return Err(IntegratorError::NotFound(format!("project {project_id}")));
+        }
+        Ok(())
     }
 
     pub fn list_tasks(&self) -> Result<Vec<Task>> {
@@ -296,6 +417,7 @@ impl LocalStore {
         Ok(LocalExport {
             schema_version: integrator_core::DOMAIN_SCHEMA_VERSION,
             exported_at: Utc::now(),
+            projects: self.list_trusted_projects()?,
             tasks: self.list_tasks()?,
             settings: self.list_settings()?,
             provider_sessions: self.list_provider_sessions()?,
@@ -520,5 +642,40 @@ mod tests {
         let export = store.export().expect("export");
         assert_eq!(export.provider_sessions.len(), 1);
         assert_eq!(export.runtime_sessions.len(), 1);
+    }
+
+    #[test]
+    fn trusted_projects_persist_across_reopen_and_export() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let database = directory.path().join("integrator.sqlite3");
+        let repository = directory.path().join("repository");
+        let common = repository.join(".git");
+        std::fs::create_dir_all(&common).expect("fixture directories");
+
+        let first = LocalStore::open(&database).expect("first open");
+        let registered = first
+            .upsert_trusted_project("Repository", &repository, &common)
+            .expect("register project");
+        drop(first);
+
+        let reopened = LocalStore::open(&database).expect("reopen");
+        let projects = reopened.list_trusted_projects().expect("list projects");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, registered.id);
+        assert_eq!(projects[0].repository_root, repository);
+        assert_eq!(reopened.export().expect("export").projects, projects);
+        reopened
+            .remove_trusted_project(registered.id)
+            .expect("remove trust record");
+        assert!(
+            reopened
+                .list_trusted_projects()
+                .expect("list after removal")
+                .is_empty()
+        );
+        assert!(
+            repository.exists(),
+            "removal must never delete repository data"
+        );
     }
 }

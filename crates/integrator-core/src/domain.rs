@@ -43,6 +43,7 @@ macro_rules! uuid_id {
 uuid_id!(TaskId);
 uuid_id!(RuntimeSessionId);
 uuid_id!(ProviderSessionId);
+uuid_id!(ProjectId);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,7 +54,7 @@ pub struct Versioned<T> {
 
 impl<T> Versioned<T> {
     #[must_use]
-    pub fn v1(value: T) -> Self {
+    pub fn current(value: T) -> Self {
         Self {
             schema_version: crate::DOMAIN_SCHEMA_VERSION,
             value,
@@ -206,6 +207,17 @@ pub struct NewTask {
     pub worktree_path: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustedProject {
+    pub id: ProjectId,
+    pub display_name: String,
+    pub repository_root: PathBuf,
+    pub git_common_directory: PathBuf,
+    pub created_at: DateTime<Utc>,
+    pub last_opened_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Setting {
@@ -241,6 +253,7 @@ pub struct RuntimeSession {
 pub struct LocalExport {
     pub schema_version: u32,
     pub exported_at: DateTime<Utc>,
+    pub projects: Vec<TrustedProject>,
     pub tasks: Vec<Task>,
     pub settings: Vec<Setting>,
     pub provider_sessions: Vec<ProviderSession>,
@@ -260,8 +273,8 @@ mod tests {
     }
 
     #[test]
-    fn versioned_wrapper_marks_v1() {
-        let wrapped = Versioned::v1(TaskState::Ready);
-        assert_eq!(wrapped.schema_version, 1);
+    fn versioned_wrapper_marks_current_schema() {
+        let wrapped = Versioned::current(TaskState::Ready);
+        assert_eq!(wrapped.schema_version, DOMAIN_SCHEMA_VERSION);
     }
 }

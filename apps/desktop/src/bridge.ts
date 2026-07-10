@@ -1,5 +1,5 @@
 import type { WorkspaceSnapshot } from "./demoData";
-import { createDemoSnapshot } from "./demoData";
+import { createDemoSnapshot, createEmptySnapshot } from "./demoData";
 
 export type RuntimeId = "codex" | "cursor" | "claude" | "grok" | "gemini" | "custom";
 export type TaskStatus =
@@ -127,6 +127,9 @@ export interface SendTurnInput extends Omit<StartTaskInput, "projectId"> {
 
 export interface AppBridge {
   loadWorkspace(): Promise<WorkspaceSnapshot>;
+  openProject(): Promise<ProjectSummary | null>;
+  registerProject(path: string): Promise<ProjectSummary>;
+  listProjects(): Promise<ProjectSummary[]>;
   probeRuntimes(): Promise<RuntimeConnection[]>;
   beginRuntimeLogin(runtime: RuntimeId): Promise<RuntimeConnection>;
   startTask(input: StartTaskInput): Promise<TaskSummary>;
@@ -161,11 +164,21 @@ interface NativeProviderStatus {
 
 interface NativeExport {
   tasks: NativeTask[];
+  projects?: TrustedProject[];
   providerSessions: Array<{
     taskId: string;
     provider: NativeProviderStatus["provider"];
     providerThreadId: string;
   }>;
+}
+
+interface TrustedProject {
+  id: string;
+  displayName: string;
+  repositoryRoot: string;
+  gitCommonDirectory: string;
+  createdAt: string;
+  lastOpenedAt: string;
 }
 
 interface NativeRepository {
@@ -193,6 +206,7 @@ interface NativePushPreview {
 }
 
 const nativeTaskIds = new Map<string, string>();
+const repositoryByTaskId = new Map<string, string>();
 const codexThreadByTask = new Map<string, string>();
 const activeCodexThreads = new Set<string>();
 let cachedWorkspace: WorkspaceSnapshot | undefined;
@@ -213,7 +227,16 @@ function readDemoSnapshot(): WorkspaceSnapshot {
   if (typeof window === "undefined") return createDemoSnapshot();
   try {
     const stored = window.localStorage.getItem(DEMO_STORAGE_KEY);
-    return stored ? (JSON.parse(stored) as WorkspaceSnapshot) : createDemoSnapshot();
+    if (!stored) return createDemoSnapshot();
+    const parsed = JSON.parse(stored) as WorkspaceSnapshot;
+    return {
+      ...parsed,
+      activeProjectId:
+        parsed.activeProjectId ??
+        parsed.tasks.find((task) => task.id === parsed.activeTaskId)?.projectId ??
+        parsed.projects[0]?.id ??
+        "",
+    };
   } catch {
     return createDemoSnapshot();
   }
@@ -286,6 +309,17 @@ function mapTaskStatus(state: NativeTask["state"]): TaskStatus {
   return state;
 }
 
+function mapProject(project: TrustedProject): ProjectSummary {
+  return {
+    id: project.id,
+    name: project.displayName,
+    path: project.repositoryRoot,
+    branch: "",
+    dirtyFiles: 0,
+    expanded: true,
+  };
+}
+
 function projectForPath(snapshot: WorkspaceSnapshot, path?: string): ProjectSummary {
   const existing = snapshot.projects.find((project) => project.path === path);
   if (existing) return existing;
@@ -306,40 +340,13 @@ async function loadNativeWorkspace(): Promise<WorkspaceSnapshot> {
     nativeInvoke<NativeExport>("local_export"),
     nativeInvoke<NativeProviderStatus[]>("provider_discover"),
   ]);
-  const snapshot: WorkspaceSnapshot = {
-    projects: [],
-    tasks: [],
-    activeTaskId: "",
-    runtimes: [],
-    transcript: [],
-    children: [],
-    usage: {
-      tokens: 0,
-      equivalentUsd: 0,
-      metrics: [
-        {
-          label: "Usage",
-          value: "Unavailable",
-          provenance: "unavailable",
-          detail: "No provider usage telemetry has been observed yet.",
-        },
-      ],
-    },
-    git: {
-      branch: "",
-      upstream: "Not published",
-      ahead: 0,
-      behind: 0,
-      worktree: "",
-      files: [],
-      commits: [],
-    },
-  };
-  const projects: ProjectSummary[] = [];
+  const snapshot = createEmptySnapshot();
+  const projects: ProjectSummary[] = (local.projects ?? []).map(mapProject);
   const tasks = local.tasks.map((task) => {
     const project = projectForPath({ ...snapshot, projects }, task.repositoryPath);
     if (!projects.some((item) => item.id === project.id)) projects.push(project);
     nativeTaskIds.set(task.id, task.id);
+    if (task.repositoryPath) repositoryByTaskId.set(task.id, task.repositoryPath);
     return {
       id: task.id,
       projectId: project.id,
@@ -360,6 +367,7 @@ async function loadNativeWorkspace(): Promise<WorkspaceSnapshot> {
     projects,
     tasks,
     activeTaskId: tasks[0]?.id ?? "",
+    activeProjectId: tasks[0]?.projectId ?? projects[0]?.id ?? "",
     runtimes: providers.map(mapRuntime),
   };
   cachedWorkspace = merged;
@@ -367,6 +375,8 @@ async function loadNativeWorkspace(): Promise<WorkspaceSnapshot> {
 }
 
 function repositoryForTask(taskId: string): string {
+  const knownRepository = repositoryByTaskId.get(taskId);
+  if (knownRepository) return knownRepository;
   const snapshot = cachedWorkspace ?? readDemoSnapshot();
   const task = snapshot.tasks.find((item) => item.id === taskId);
   const project = snapshot.projects.find((item) => item.id === task?.projectId);
@@ -491,6 +501,46 @@ async function refreshNativeGit(taskId: string): Promise<GitSnapshot> {
 export const bridge: AppBridge = {
   loadWorkspace: () => (isTauri() ? loadNativeWorkspace() : Promise.resolve(readDemoSnapshot())),
 
+  openProject: async () => {
+    if (isTauri()) {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "Open a Git project",
+      });
+      if (typeof selected !== "string") return null;
+      return bridge.registerProject(selected);
+    }
+
+    return bridge.registerProject("C:\\Code\\demo-project");
+  },
+
+  registerProject: async (path) => {
+    if (isTauri()) {
+      const project = await nativeInvoke<TrustedProject>("project_register", { path });
+      return mapProject(project);
+    }
+    const snapshot = readDemoSnapshot();
+    const existing = snapshot.projects.find((project) => project.path === path);
+    if (existing) return existing;
+    return {
+      id: `project-${Date.now()}`,
+      name: path.split(/[\\/]/).filter(Boolean).at(-1) ?? "Demo project",
+      path,
+      branch: "main",
+      dirtyFiles: 0,
+      expanded: true,
+    };
+  },
+
+  listProjects: async () => {
+    if (isTauri()) {
+      return (await nativeInvoke<TrustedProject[]>("project_list")).map(mapProject);
+    }
+    return readDemoSnapshot().projects;
+  },
+
   probeRuntimes: () =>
     invokeOrDemo<NativeProviderStatus[]>("provider_discover", undefined, () => []).then(
       (statuses) => (isTauri() ? statuses.map(mapRuntime) : readDemoSnapshot().runtimes),
@@ -536,6 +586,7 @@ export const bridge: AppBridge = {
         },
       });
       nativeTaskIds.set(task.id, task.id);
+      repositoryByTaskId.set(task.id, project.path);
       return {
         id: task.id,
         projectId: input.projectId,

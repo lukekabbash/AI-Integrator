@@ -13,11 +13,45 @@ export interface WorkspaceSnapshot {
   projects: ProjectSummary[];
   tasks: TaskSummary[];
   activeTaskId: string;
+  activeProjectId: string;
   runtimes: RuntimeConnection[];
   transcript: TranscriptEvent[];
   children: ChildAgent[];
   usage: UsageSnapshot;
   git: GitSnapshot;
+}
+
+export function createEmptySnapshot(): WorkspaceSnapshot {
+  return {
+    projects: [],
+    tasks: [],
+    activeTaskId: "",
+    activeProjectId: "",
+    runtimes: [],
+    transcript: [],
+    children: [],
+    usage: {
+      tokens: 0,
+      equivalentUsd: 0,
+      metrics: [
+        {
+          label: "Usage",
+          value: "Unavailable",
+          provenance: "unavailable",
+          detail: "No provider usage telemetry has been observed yet.",
+        },
+      ],
+    },
+    git: {
+      branch: "",
+      upstream: "Not published",
+      ahead: 0,
+      behind: 0,
+      worktree: "",
+      files: [],
+      commits: [],
+    },
+  };
 }
 
 const diff: DiffFile[] = [
@@ -440,5 +474,15 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
     ],
   };
 
-  return { projects, tasks, activeTaskId: "v1-shell", runtimes, transcript, children, usage, git };
+  return {
+    projects,
+    tasks,
+    activeTaskId: "v1-shell",
+    activeProjectId: "integrator",
+    runtimes,
+    transcript,
+    children,
+    usage,
+    git,
+  };
 }

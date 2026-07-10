@@ -27,17 +27,17 @@ Subagent work is never accepted by status alone. Root reviews diffs, runs the re
 ### 1. Native shell and local data
 
 - [ ] Tauri 2 boots with the shared React UI.
-- [ ] Renderer capabilities are narrow and typed; no arbitrary shell/filesystem command.
+- [x] Renderer capabilities are narrow and typed; no arbitrary shell/filesystem command.
 - [ ] SQLite migrations persist settings, projects, tasks, runs, native session ids, usage, and checkpoints.
 - [ ] Data paths, export/import, delete, and recovery journals are tested.
 - [ ] Windows/macOS platform traits exist for PTY, process trees, paths, secure store, and native integration.
 
 ### 2. Runtime setup and Codex
 
-- [ ] Detect executable provenance/version and sanitized auth status.
+- [x] Detect executable provenance/version and sanitized auth status.
 - [ ] Setup screen reuses healthy vendor auth or opens a user-owned official login flow.
 - [ ] Codex app-server lifecycle: spawn, initialize, model list, thread list/read/start/resume, turn start, notifications, approvals, steer, stop, cleanup.
-- [ ] Persist normalized task/native-thread relationship without copying credentials.
+- [x] Persist normalized task/native-thread relationship without copying credentials.
 - [ ] Version/capability drift degrades visibly and exercises replay fixtures.
 
 ### 3. ACP and additional runtimes
@@ -65,8 +65,8 @@ Subagent work is never accepted by status alone. Root reviews diffs, runs the re
 ### 6. Setup and customization
 
 - [ ] No-signup onboarding and project/runtime readiness flow.
-- [ ] Full-screen Settings replaces project navigation and restores prior workspace state.
-- [ ] Twelve complete semantic themes; customizable interface/code fonts, type scale, density, radius, motion, accent, syntax, diff, and terminal tokens.
+- [x] Full-screen Settings replaces project navigation and restores prior workspace state.
+- [x] Twelve complete semantic themes; customizable interface/code fonts, type scale, density, radius, motion, accent, syntax, diff, and terminal tokens.
 - [ ] Usage shows provider percentage, tokens, API-equivalent value, actual spend, provenance, freshness, and reset independently.
 - [ ] Local settings/theme/task export/import and redacted diagnostics.
 
@@ -90,9 +90,10 @@ Subagent work is never accepted by status alone. Root reviews diffs, runs the re
 The polished browser preview is design evidence, not native-runtime evidence. The native bridge now invokes only registered Tauri commands and never converts a native failure into demo success. The browser fallback remains intentionally separate for UI development.
 
 - Implemented foundations: Tauri/Rust/React workspace, narrow command allowlist, SQLite migrations for basic tasks/settings/provider and runtime sessions, provider discovery/redaction, bounded Codex JSONL supervisor, file-level Git/worktree primitives, full workspace shell, Git rail/diff, setup, full-screen Settings, and twelve semantic themes.
-- Integrated native subset: bootstrap/export/provider discovery, basic task creation, Codex connect/thread/turn start, repository identity/status/diff, file stage/unstage, commit, and push preview.
-- Explicitly not yet certified: project picker/trust registry, durable transcript/event reduction, Codex event/approval/stop UI, restart reconciliation, real PTY, Broker/delegation ledger, Cursor ACP transport, confirmed push, hunk operations, native settings/export UX, and the complete M1 replay fixture.
+- Integrated native subset: bootstrap/export/provider discovery, user-owned project picker, persisted canonical project trust, real task creation, Codex connect/thread/turn start, repository identity/status/diff, file stage/unstage, commit, and push preview. Every Git/worktree command reauthorizes the exact trusted root or a listed paired worktree.
+- Explicitly not yet certified: durable transcript/event reduction, Codex event/approval/stop UI, restart reconciliation, real PTY, Broker/delegation ledger, Cursor ACP transport, confirmed push, hunk operations, native settings/export UX, and the complete M1 replay fixture.
 - CI enforces the renderer/Tauri command-name contract with `npm run check:bridge`; missing native behavior must fail visibly rather than appear successful through fixtures.
+- The next Codex persistence, approval, streaming, and restart slice is governed by [codex-event-reducer-contract.md](codex-event-reducer-contract.md).
 
 ## Commit policy
 

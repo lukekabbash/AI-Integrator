@@ -23,6 +23,8 @@ interface TaskSidebarProps {
   onToggleCollapsed: () => void;
   onSelectTask: (taskId: string) => void;
   onNewTask: () => void;
+  onOpenProject: () => void;
+  openingProject: boolean;
   onOpenSettings: () => void;
 }
 
@@ -44,12 +46,12 @@ export function TaskSidebar({
   onToggleCollapsed,
   onSelectTask,
   onNewTask,
+  onOpenProject,
+  openingProject,
   onOpenSettings,
 }: TaskSidebarProps) {
   const [query, setQuery] = useState("");
-  const [expandedProjects, setExpandedProjects] = useState(
-    () => new Set(projects.filter((project) => project.expanded).map((project) => project.id)),
-  );
+  const [projectExpansion, setProjectExpansion] = useState<Record<string, boolean>>({});
 
   const visibleTasks = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -59,12 +61,11 @@ export function TaskSidebar({
   }, [query, tasks]);
 
   const toggleProject = (projectId: string) => {
-    setExpandedProjects((current) => {
-      const next = new Set(current);
-      if (next.has(projectId)) next.delete(projectId);
-      else next.add(projectId);
-      return next;
-    });
+    const project = projects.find((item) => item.id === projectId);
+    setProjectExpansion((current) => ({
+      ...current,
+      [projectId]: !(current[projectId] ?? project?.expanded ?? false),
+    }));
   };
 
   if (collapsed) {
@@ -130,13 +131,35 @@ export function TaskSidebar({
       <div className="sidebar-scroll">
         <div className="rail-section-heading">
           <span>Projects</span>
-          <button type="button" className="icon-button tiny" aria-label="Open project">
+          <button
+            type="button"
+            className="icon-button tiny"
+            aria-label={openingProject ? "Opening project" : "Open project"}
+            onClick={onOpenProject}
+            disabled={openingProject}
+            aria-busy={openingProject}
+          >
             <Plus />
           </button>
         </div>
 
+        {projects.length === 0 ? (
+          <button
+            className="sidebar-empty-project"
+            type="button"
+            onClick={onOpenProject}
+            disabled={openingProject}
+          >
+            <Folder aria-hidden="true" />
+            <span>
+              <strong>{openingProject ? "Opening folder…" : "Open your first project"}</strong>
+              <small>Choose a local Git repository</small>
+            </span>
+          </button>
+        ) : null}
+
         {projects.map((project) => {
-          const expanded = expandedProjects.has(project.id);
+          const expanded = projectExpansion[project.id] ?? project.expanded;
           const projectTasks = visibleTasks.filter((task) => task.projectId === project.id);
           if (query && projectTasks.length === 0) return null;
           return (

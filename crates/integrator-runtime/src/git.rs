@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use integrator_core::{IntegratorError, Result};
+use integrator_core::{IntegratorError, Result, TrustedProject};
 use serde::{Deserialize, Serialize};
 
 use crate::safe_process::{ProcessOutput, redact_text, run_bounded_with_limits};
@@ -98,10 +98,11 @@ impl GitService {
     }
 
     pub fn repository(&self, path: &Path) -> Result<RepositoryIdentity> {
-        let root = self.required(path, &["rev-parse", "--show-toplevel"])?;
-        let root = PathBuf::from(root.trim());
+        let selected = canonical_directory(path)?;
+        let root = self.required(&selected, &["rev-parse", "--show-toplevel"])?;
+        let root = canonical_directory(Path::new(root.trim()))?;
         let common = self.required(&root, &["rev-parse", "--git-common-dir"])?;
-        let common = absolute_from(&root, Path::new(common.trim()));
+        let common = canonical_directory(&absolute_from(&root, Path::new(common.trim())))?;
         let branch = self.optional(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
         let head = self.optional(&root, &["rev-parse", "--verify", "HEAD"])?;
         Ok(RepositoryIdentity {
@@ -114,7 +115,15 @@ impl GitService {
 
     pub fn worktrees(&self, repository: &Path) -> Result<Vec<WorktreeInfo>> {
         let output = self.required(repository, &["worktree", "list", "--porcelain"])?;
-        Ok(parse_worktrees(&output))
+        Ok(parse_worktrees(&output)
+            .into_iter()
+            .map(|mut worktree| {
+                if let Ok(path) = canonical_directory(&worktree.path) {
+                    worktree.path = path;
+                }
+                worktree
+            })
+            .collect())
     }
 
     pub fn create_worktree(
@@ -365,6 +374,49 @@ impl GitService {
     }
 }
 
+pub fn authorize_repository(
+    git: &GitService,
+    projects: &[TrustedProject],
+    candidate: &Path,
+) -> Result<RepositoryIdentity> {
+    let identity = git.repository(candidate)?;
+    for project in projects {
+        let project_root = match canonical_directory(&project.repository_root) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        let common_directory = match canonical_directory(&project.git_common_directory) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        if common_directory != identity.common_directory {
+            continue;
+        }
+        if project_root == identity.root {
+            return Ok(identity);
+        }
+        if git
+            .worktrees(&project_root)?
+            .iter()
+            .any(|worktree| worktree.path == identity.root)
+        {
+            return Ok(identity);
+        }
+    }
+    Err(IntegratorError::Unauthorized(
+        "repository is not registered as a trusted project".into(),
+    ))
+}
+
+fn canonical_directory(path: &Path) -> Result<PathBuf> {
+    if !path.is_dir() {
+        return Err(IntegratorError::InvalidInput(
+            "path must be an existing directory".into(),
+        ));
+    }
+    dunce::canonicalize(path).map_err(IntegratorError::Io)
+}
+
 fn git_failure(output: ProcessOutput) -> IntegratorError {
     let message = if output.stderr.trim().is_empty() {
         output.stdout
@@ -499,7 +551,21 @@ fn sanitize_remote_url(value: &str) -> String {
 mod tests {
     use std::{fs, process::Command};
 
+    use chrono::Utc;
+    use integrator_core::ProjectId;
+
     use super::*;
+
+    fn initialize_repository(root: &Path) {
+        assert!(
+            Command::new("git")
+                .args(["init", "-b", "main"])
+                .current_dir(root)
+                .status()
+                .expect("git init")
+                .success()
+        );
+    }
 
     #[test]
     fn remote_credentials_are_removed() {
@@ -571,5 +637,111 @@ mod tests {
         assert!(validate_revision("main").is_ok());
         assert!(validate_revision("HEAD~2").is_ok());
         assert!(validate_revision("--force").is_err());
+    }
+
+    #[test]
+    fn repository_identity_is_canonical_from_nested_directory() {
+        if which::which("git").is_err() {
+            return;
+        }
+        let directory = tempfile::tempdir().expect("temp repo");
+        initialize_repository(directory.path());
+        let nested = directory.path().join("nested").join("child");
+        fs::create_dir_all(&nested).expect("nested fixture");
+        let identity = GitService::discover()
+            .expect("discover git")
+            .repository(&nested)
+            .expect("repository identity");
+        assert_eq!(
+            identity.root,
+            dunce::canonicalize(directory.path()).expect("canonical root")
+        );
+        assert_eq!(
+            identity.common_directory,
+            dunce::canonicalize(directory.path().join(".git")).expect("canonical git directory")
+        );
+    }
+
+    #[test]
+    fn untrusted_repository_is_rejected() {
+        if which::which("git").is_err() {
+            return;
+        }
+        let trusted_directory = tempfile::tempdir().expect("trusted repo");
+        let untrusted_directory = tempfile::tempdir().expect("untrusted repo");
+        initialize_repository(trusted_directory.path());
+        initialize_repository(untrusted_directory.path());
+        let git = GitService::discover().expect("discover git");
+        let identity = git
+            .repository(trusted_directory.path())
+            .expect("trusted identity");
+        let now = Utc::now();
+        let projects = vec![TrustedProject {
+            id: ProjectId::new(),
+            display_name: "Trusted".into(),
+            repository_root: identity.root,
+            git_common_directory: identity.common_directory,
+            created_at: now,
+            last_opened_at: now,
+        }];
+        let error = authorize_repository(&git, &projects, untrusted_directory.path())
+            .expect_err("untrusted repository must fail");
+        assert!(error.to_string().contains("trusted project"));
+    }
+
+    #[test]
+    fn listed_worktree_of_trusted_project_is_authorized() {
+        if which::which("git").is_err() {
+            return;
+        }
+        let directory = tempfile::tempdir().expect("trusted repo");
+        let worktree_parent = tempfile::tempdir().expect("worktree parent");
+        let worktree_path = worktree_parent.path().join("agent-worktree");
+        initialize_repository(directory.path());
+        for args in [
+            ["config", "user.name", "Test User"],
+            ["config", "user.email", "test@example.invalid"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(directory.path())
+                    .status()
+                    .expect("git config")
+                    .success()
+            );
+        }
+        fs::write(directory.path().join("fixture.txt"), "fixture\n").expect("write fixture");
+        let git = GitService::discover().expect("discover git");
+        git.stage(directory.path(), &[PathBuf::from("fixture.txt")])
+            .expect("stage fixture");
+        git.commit(directory.path(), "Initial fixture")
+            .expect("commit fixture");
+        let identity = git.repository(directory.path()).expect("trusted identity");
+        let now = Utc::now();
+        let projects = vec![TrustedProject {
+            id: ProjectId::new(),
+            display_name: "Trusted".into(),
+            repository_root: identity.root.clone(),
+            git_common_directory: identity.common_directory.clone(),
+            created_at: now,
+            last_opened_at: now,
+        }];
+        git.create_worktree(
+            &identity.root,
+            &CreateWorktree {
+                destination: worktree_path.clone(),
+                branch: "agent/fixture".into(),
+                base_ref: Some("HEAD".into()),
+            },
+        )
+        .expect("create worktree");
+
+        let authorized = authorize_repository(&git, &projects, &worktree_path)
+            .expect("listed worktree must be authorized");
+        assert_eq!(
+            authorized.root,
+            dunce::canonicalize(worktree_path).expect("canonical worktree")
+        );
     }
 }

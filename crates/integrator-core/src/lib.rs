@@ -6,4 +6,4 @@ mod error;
 pub use domain::*;
 pub use error::{IntegratorError, Result};
 
-pub const DOMAIN_SCHEMA_VERSION: u32 = 1;
+pub const DOMAIN_SCHEMA_VERSION: u32 = 2;
