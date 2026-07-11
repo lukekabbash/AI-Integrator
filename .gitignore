@@ -39,9 +39,8 @@ playwright-report/
 test-results/
 
 # Packaging
-src-tauri/gen/
+**/src-tauri/gen/
 *.msi
 *.dmg
 *.app.tar.gz
 *.sig
-

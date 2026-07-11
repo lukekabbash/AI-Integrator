@@ -1,13 +1,15 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { invokeMock, openMock } = vi.hoisted(() => ({
+const { invokeMock, listenMock, openMock } = vi.hoisted(() => ({
   invokeMock: vi.fn(),
+  listenMock: vi.fn(),
   openMock: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: openMock }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: listenMock }));
 
 import { bridge } from "./bridge";
 
@@ -18,6 +20,7 @@ describe("native trusted-project bridge", () => {
       value: {},
     });
     invokeMock.mockReset();
+    listenMock.mockReset();
     openMock.mockReset();
   });
 
@@ -54,5 +57,32 @@ describe("native trusted-project bridge", () => {
     expect(invokeMock).toHaveBeenCalledWith("project_register", {
       path: "H:\\Code\\sample",
     });
+  });
+
+  it("uses the normalized sequenced event and task-control command contracts", async () => {
+    const unlisten = vi.fn();
+    const listener = vi.fn();
+    listenMock.mockResolvedValue(unlisten);
+    invokeMock
+      .mockResolvedValueOnce({ events: [], watermarkSeq: 41 })
+      .mockResolvedValueOnce({ id: "approval-1", state: "responding" })
+      .mockResolvedValueOnce({ turnId: "turn-1", stopRequested: true, alreadyRequested: false });
+
+    await expect(bridge.subscribeRuntimeProjections(listener)).resolves.toBe(unlisten);
+    expect(listenMock).toHaveBeenCalledWith("runtime://projection", expect.any(Function));
+    await expect(bridge.loadTaskProjection("task-1")).resolves.toEqual({
+      events: [],
+      watermarkSeq: 41,
+    });
+    await bridge.respondToApproval("task-1", "approval-1", "acceptForSession");
+    await bridge.stopTurn("task-1");
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "task_snapshot", { taskId: "task-1" });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "codex_respond_approval", {
+      taskId: "task-1",
+      approvalId: "approval-1",
+      decision: "acceptForSession",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(3, "codex_stop_turn", { taskId: "task-1" });
   });
 });

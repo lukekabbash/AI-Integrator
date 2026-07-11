@@ -15,6 +15,9 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
+mod projection_store;
+pub use projection_store::{PersistedStopRequest, PreparedApprovalResponse};
+
 const MIGRATIONS: &[(i64, &str)] = &[
     (
         1,
@@ -74,6 +77,120 @@ const MIGRATIONS: &[(i64, &str)] = &[
             ON trusted_projects(last_opened_at DESC);
         CREATE INDEX IF NOT EXISTS trusted_projects_common_dir_idx
             ON trusted_projects(git_common_directory);
+        "#,
+    ),
+    (
+        3,
+        r#"
+        ALTER TABLE runtime_sessions ADD COLUMN process_id TEXT;
+        CREATE UNIQUE INDEX IF NOT EXISTS runtime_sessions_process_idx
+            ON runtime_sessions(process_id) WHERE process_id IS NOT NULL;
+        CREATE TABLE IF NOT EXISTS codex_turns (
+            provider_session_id TEXT NOT NULL REFERENCES provider_sessions(id) ON DELETE CASCADE,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            thread_id TEXT NOT NULL,
+            turn_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            stop_requested INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
+            started_at TEXT,
+            completed_at TEXT,
+            projection_json TEXT NOT NULL,
+            last_event_seq INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(provider_session_id, turn_id)
+        );
+        CREATE TABLE IF NOT EXISTS codex_items (
+            provider_session_id TEXT NOT NULL REFERENCES provider_sessions(id) ON DELETE CASCADE,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            thread_id TEXT NOT NULL,
+            turn_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            stable_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            title TEXT,
+            body TEXT,
+            command_text TEXT,
+            cwd TEXT,
+            output TEXT,
+            exit_code INTEGER,
+            file_changes_json TEXT,
+            mcp_server TEXT,
+            mcp_tool TEXT,
+            truncated INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            projection_json TEXT NOT NULL,
+            last_event_seq INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(provider_session_id, turn_id, item_id)
+        );
+        CREATE TABLE IF NOT EXISTS codex_approvals (
+            id TEXT PRIMARY KEY,
+            provider_session_id TEXT NOT NULL REFERENCES provider_sessions(id) ON DELETE CASCADE,
+            runtime_session_id TEXT NOT NULL REFERENCES runtime_sessions(id) ON DELETE CASCADE,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            process_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            turn_id TEXT,
+            item_id TEXT,
+            approval_id TEXT,
+            request_kind TEXT NOT NULL,
+            request_value TEXT NOT NULL,
+            approval_kind TEXT NOT NULL,
+            state TEXT NOT NULL,
+            decision TEXT,
+            reason TEXT,
+            command_text TEXT,
+            cwd TEXT,
+            file_changes_json TEXT,
+            updated_at TEXT NOT NULL,
+            projection_json TEXT NOT NULL,
+            last_event_seq INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS codex_approvals_transport_idx
+            ON codex_approvals(runtime_session_id, request_kind, request_value);
+        CREATE TABLE IF NOT EXISTS codex_task_projection (
+            task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+            provider_session_id TEXT NOT NULL REFERENCES provider_sessions(id) ON DELETE CASCADE,
+            thread_id TEXT NOT NULL,
+            current_turn_id TEXT,
+            plan_json TEXT,
+            plan_truncated INTEGER NOT NULL DEFAULT 0,
+            diff TEXT,
+            diff_truncated INTEGER NOT NULL DEFAULT 0,
+            usage_json TEXT,
+            connection_state TEXT NOT NULL DEFAULT 'disconnected',
+            connection_reason TEXT,
+            process_id TEXT,
+            plan_seq INTEGER NOT NULL DEFAULT 0,
+            diff_seq INTEGER NOT NULL DEFAULT 0,
+            usage_seq INTEGER NOT NULL DEFAULT 0,
+            connection_seq INTEGER NOT NULL DEFAULT 0,
+            last_event_seq INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS codex_event_log (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            provider_session_id TEXT NOT NULL REFERENCES provider_sessions(id) ON DELETE CASCADE,
+            runtime_session_id TEXT NOT NULL REFERENCES runtime_sessions(id) ON DELETE CASCADE,
+            process_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            turn_id TEXT,
+            method TEXT NOT NULL,
+            audit_json TEXT NOT NULL,
+            audit_truncated INTEGER NOT NULL DEFAULT 0,
+            projection_json TEXT,
+            occurred_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS codex_event_task_seq_idx ON codex_event_log(task_id, seq);
+        "#,
+    ),
+    (
+        4,
+        r#"
+        ALTER TABLE tasks ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE tasks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;
+        CREATE INDEX IF NOT EXISTS tasks_navigation_idx
+            ON tasks(archived, pinned DESC, updated_at DESC);
         "#,
     ),
 ];
@@ -160,19 +277,23 @@ impl LocalStore {
             repository_path: input.repository_path,
             worktree_path: input.worktree_path,
             state: TaskState::Draft,
+            pinned: false,
+            archived: false,
             created_at: now,
             updated_at: now,
         };
         self.connection
             .lock()
             .execute(
-                "INSERT INTO tasks(id, title, repository_path, worktree_path, state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO tasks(id, title, repository_path, worktree_path, state, pinned, archived, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     task.id.to_string(),
                     task.title,
                     path_text(task.repository_path.as_deref()),
                     path_text(task.worktree_path.as_deref()),
                     task.state.as_str(),
+                    task.pinned,
+                    task.archived,
                     task.created_at.to_rfc3339(),
                     task.updated_at.to_rfc3339(),
                 ],
@@ -282,7 +403,7 @@ impl LocalStore {
     pub fn list_tasks(&self) -> Result<Vec<Task>> {
         let connection = self.connection.lock();
         let mut statement = connection
-            .prepare("SELECT id, title, repository_path, worktree_path, state, created_at, updated_at FROM tasks ORDER BY updated_at DESC")
+            .prepare("SELECT id, title, repository_path, worktree_path, state, pinned, archived, created_at, updated_at FROM tasks ORDER BY pinned DESC, updated_at DESC")
             .map_err(storage_error)?;
         let rows = statement
             .query_map([], |row| {
@@ -292,8 +413,10 @@ impl LocalStore {
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
+                    row.get::<_, bool>(5)?,
+                    row.get::<_, bool>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
                 ))
             })
             .map_err(storage_error)?;
@@ -317,17 +440,49 @@ impl LocalStore {
         self.get_task(task_id)
     }
 
+    pub fn update_task_metadata(
+        &self,
+        task_id: TaskId,
+        title: Option<String>,
+        pinned: Option<bool>,
+        archived: Option<bool>,
+    ) -> Result<Task> {
+        let title = title.map(|value| value.trim().to_owned());
+        if title
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.chars().count() > 240)
+        {
+            return Err(IntegratorError::InvalidInput(
+                "task title must contain 1 to 240 characters".into(),
+            ));
+        }
+        let now = Utc::now();
+        let changed = self
+            .connection
+            .lock()
+            .execute(
+                "UPDATE tasks SET title = COALESCE(?1, title), pinned = COALESCE(?2, pinned), archived = COALESCE(?3, archived), updated_at = ?4 WHERE id = ?5",
+                params![title, pinned, archived, now.to_rfc3339(), task_id.to_string()],
+            )
+            .map_err(storage_error)?;
+        if changed == 0 {
+            return Err(IntegratorError::NotFound(format!("task {task_id}")));
+        }
+        self.get_task(task_id)
+    }
+
     pub fn get_task(&self, task_id: TaskId) -> Result<Task> {
         let connection = self.connection.lock();
         let row = connection
             .query_row(
-                "SELECT id, title, repository_path, worktree_path, state, created_at, updated_at FROM tasks WHERE id = ?1",
+                "SELECT id, title, repository_path, worktree_path, state, pinned, archived, created_at, updated_at FROM tasks WHERE id = ?1",
                 [task_id.to_string()],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?,
+                        row.get::<_, String>(4)?, row.get::<_, bool>(5)?,
+                        row.get::<_, bool>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?,
                     ))
                 },
             )
@@ -403,10 +558,10 @@ impl LocalStore {
         self.connection
             .lock()
             .execute(
-                "INSERT INTO runtime_sessions(id, task_id, provider_session_id, status, started_at, ended_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO runtime_sessions(id, task_id, provider_session_id, process_id, status, started_at, ended_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     session.id.to_string(), session.task_id.to_string(), session.provider_session_id.map(|id| id.to_string()),
-                    session.status, session.started_at.to_rfc3339(), session.ended_at.map(|time| time.to_rfc3339()),
+                    session.process_id, session.status, session.started_at.to_rfc3339(), session.ended_at.map(|time| time.to_rfc3339()),
                 ],
             )
             .map_err(storage_error)?;
@@ -459,7 +614,7 @@ impl LocalStore {
     pub fn list_runtime_sessions(&self) -> Result<Vec<RuntimeSession>> {
         let connection = self.connection.lock();
         let mut statement = connection
-            .prepare("SELECT id, task_id, provider_session_id, status, started_at, ended_at FROM runtime_sessions ORDER BY started_at DESC")
+            .prepare("SELECT id, task_id, provider_session_id, process_id, status, started_at, ended_at FROM runtime_sessions ORDER BY started_at DESC")
             .map_err(storage_error)?;
         let rows = statement
             .query_map([], |row| {
@@ -467,14 +622,15 @@ impl LocalStore {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             })
             .map_err(storage_error)?;
         rows.map(|row| {
-            let (id, task_id, provider_session_id, status, started, ended) =
+            let (id, task_id, provider_session_id, process_id, status, started, ended) =
                 row.map_err(storage_error)?;
             Ok(RuntimeSession {
                 id: RuntimeSessionId::from_str(&id).map_err(invalid_stored)?,
@@ -482,6 +638,7 @@ impl LocalStore {
                 provider_session_id: provider_session_id
                     .map(|id| ProviderSessionId::from_str(&id).map_err(invalid_stored))
                     .transpose()?,
+                process_id,
                 status,
                 started_at: parse_time(&started)?,
                 ended_at: ended.map(|time| parse_time(&time)).transpose()?,
@@ -498,17 +655,21 @@ fn parse_task_row(
         Option<String>,
         Option<String>,
         String,
+        bool,
+        bool,
         String,
         String,
     ),
 ) -> Result<Task> {
-    let (id, title, repository, worktree, state, created, updated) = row;
+    let (id, title, repository, worktree, state, pinned, archived, created, updated) = row;
     Ok(Task {
         id: TaskId::from_str(&id).map_err(invalid_stored)?,
         title,
         repository_path: repository.map(Into::into),
         worktree_path: worktree.map(Into::into),
         state: TaskState::from_str(&state)?,
+        pinned,
+        archived,
         created_at: parse_time(&created)?,
         updated_at: parse_time(&updated)?,
     })
@@ -578,11 +739,22 @@ mod tests {
             .update_task_state(task.id, TaskState::Running)
             .expect("update task");
         store
+            .update_task_metadata(
+                task.id,
+                Some("Renamed chat".into()),
+                Some(true),
+                Some(false),
+            )
+            .expect("update task metadata");
+        store
             .set_setting("appearance.theme", Value::String("graphite".into()))
             .expect("set setting");
         let exported = store.export().expect("export");
         assert_eq!(exported.tasks.len(), 1);
         assert_eq!(exported.tasks[0].state, TaskState::Running);
+        assert_eq!(exported.tasks[0].title, "Renamed chat");
+        assert!(exported.tasks[0].pinned);
+        assert!(!exported.tasks[0].archived);
         assert_eq!(exported.settings.len(), 1);
     }
 
@@ -633,6 +805,7 @@ mod tests {
                 id: RuntimeSessionId::new(),
                 task_id: task.id,
                 provider_session_id: Some(provider_session.id),
+                process_id: Some("process-fixture".into()),
                 status: "completed".into(),
                 started_at: now,
                 ended_at: Some(now),

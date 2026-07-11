@@ -37,6 +37,16 @@ export interface TaskSummary {
   updatedAt: string;
   unread?: boolean;
   worktree?: string;
+  pinned?: boolean;
+  archived?: boolean;
+}
+
+export interface TaskNavigationMetadata {
+  taskId: string;
+  title: string;
+  pinned: boolean;
+  archived: boolean;
+  updatedAt: string;
 }
 
 export interface TranscriptEvent {
@@ -125,6 +135,115 @@ export interface SendTurnInput extends Omit<StartTaskInput, "projectId"> {
   taskId: string;
 }
 
+export interface TurnProjection {
+  id: string;
+  status: "pending" | "inProgress" | "completed" | "failed" | "interrupted";
+  stopRequested: boolean;
+  error?: string;
+  startedAt?: string;
+  completedAt?: string;
+}
+
+export interface ItemProjection {
+  id: string;
+  providerItemId: string;
+  kind:
+    | "userMessage"
+    | "agentMessage"
+    | "reasoningSummary"
+    | "commandExecution"
+    | "fileChange"
+    | "mcpTool"
+    | "unknown";
+  status: "pending" | "inProgress" | "completed" | "failed" | "declined";
+  title?: string;
+  body?: string;
+  command?: string;
+  cwd?: string;
+  output?: string;
+  exitCode?: number;
+  fileChanges?: Array<{
+    path: string;
+    changeKind: "add" | "modify" | "delete" | "rename" | "unknown";
+    patch?: string;
+  }>;
+  mcpServer?: string;
+  mcpTool?: string;
+  truncated: boolean;
+  updatedAt: string;
+}
+
+export interface PlanStepProjection {
+  index: number;
+  text: string;
+  status: "pending" | "inProgress" | "completed";
+}
+
+export interface RuntimeUsageProjection {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+  totalTokens: number;
+  modelContextWindow?: number;
+}
+
+export interface ApprovalProjection {
+  id: string;
+  requestId: { kind: "number"; value: number } | { kind: "string"; value: string };
+  approvalKind: "commandExecution" | "fileChange";
+  state:
+    "pending" | "responding" | "resolved" | "declined" | "cancelled" | "expired" | "responseFailed";
+  decision?: "accept" | "acceptForSession" | "decline" | "cancel";
+  itemId?: string;
+  approvalId?: string;
+  reason?: string;
+  command?: string;
+  cwd?: string;
+  fileChanges?: ItemProjection["fileChanges"];
+  updatedAt: string;
+}
+
+export type ConnectionProjection = {
+  state: "connecting" | "connected" | "disconnected" | "reconciling" | "gap";
+  reason?: string;
+  processId?: string;
+};
+
+export type RuntimeProjection =
+  | { kind: "turnChanged"; turn: TurnProjection }
+  | { kind: "itemChanged"; item: ItemProjection }
+  | { kind: "planChanged"; steps: PlanStepProjection[]; truncated: boolean }
+  | { kind: "diffChanged"; diff: string; truncated: boolean }
+  | { kind: "usageChanged"; usage: RuntimeUsageProjection }
+  | { kind: "approvalChanged"; approval: ApprovalProjection }
+  | { kind: "turnError"; message: string; retryable: boolean }
+  | {
+      kind: "connectionChanged";
+      state: ConnectionProjection["state"];
+      reason?: string;
+      processId?: string;
+    }
+  | { kind: "projectionReset"; reason: string };
+
+export interface RuntimeProjectionEvent {
+  seq: number;
+  taskId: string;
+  providerSessionId: string;
+  provider: "codex" | "cursor" | "claude" | "gemini" | "grok" | "custom-acp";
+  threadId: string;
+  turnId?: string;
+  occurredAt: string;
+  projection: RuntimeProjection;
+}
+
+export interface TaskProjectionSnapshot {
+  events: RuntimeProjectionEvent[];
+  watermarkSeq: number;
+}
+
+export type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
+
 export interface AppBridge {
   loadWorkspace(): Promise<WorkspaceSnapshot>;
   openProject(): Promise<ProjectSummary | null>;
@@ -133,11 +252,32 @@ export interface AppBridge {
   probeRuntimes(): Promise<RuntimeConnection[]>;
   beginRuntimeLogin(runtime: RuntimeId): Promise<RuntimeConnection>;
   startTask(input: StartTaskInput): Promise<TaskSummary>;
+  loadTaskGit(taskId: string): Promise<GitSnapshot>;
+  supportsTaskMetadata(): boolean;
+  updateTaskMetadata(
+    taskId: string,
+    input: { title?: string; pinned?: boolean; archived?: boolean },
+  ): Promise<TaskNavigationMetadata>;
   sendTurn(input: SendTurnInput): Promise<TranscriptEvent>;
+  subscribeRuntimeProjections(
+    listener: (event: RuntimeProjectionEvent) => void,
+  ): Promise<() => void>;
+  loadTaskProjection(taskId: string): Promise<TaskProjectionSnapshot>;
+  respondToApproval(
+    taskId: string,
+    approvalId: string,
+    decision: ApprovalDecision,
+  ): Promise<ApprovalProjection>;
+  stopTurn(taskId: string): Promise<{
+    turnId: string;
+    stopRequested: true;
+    alreadyRequested: boolean;
+  }>;
   stageFiles(taskId: string, paths: string[], staged: boolean): Promise<GitSnapshot>;
   commit(taskId: string, message: string): Promise<GitSnapshot>;
   push(taskId: string): Promise<GitSnapshot>;
   persistSession(snapshot: WorkspaceSnapshot): Promise<void>;
+  listModels(runtime: RuntimeId): Promise<string[]>;
 }
 
 type TauriWindow = Window & { __TAURI_INTERNALS__?: unknown };
@@ -148,6 +288,8 @@ interface NativeTask {
   repositoryPath?: string;
   worktreePath?: string;
   state: "draft" | "ready" | "running" | "waiting" | "completed" | "failed" | "cancelled";
+  pinned: boolean;
+  archived: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -212,7 +354,49 @@ const activeCodexThreads = new Set<string>();
 let cachedWorkspace: WorkspaceSnapshot | undefined;
 let codexConnected = false;
 
+/// Placeholder that defers to the provider CLI's own configured model; it is
+/// intentionally spaced so the send path never forwards it as a model id.
+export const PROVIDER_DEFAULT_MODEL = "Provider default";
+const modelCatalogCache = new Map<RuntimeId, string[]>();
+const FALLBACK_MODELS: Partial<Record<RuntimeId, string[]>> = {
+  codex: [PROVIDER_DEFAULT_MODEL],
+  claude: [PROVIDER_DEFAULT_MODEL, "opus", "sonnet", "haiku"],
+  gemini: [PROVIDER_DEFAULT_MODEL, "gemini-2.5-pro", "gemini-2.5-flash"],
+  cursor: [PROVIDER_DEFAULT_MODEL],
+  grok: [PROVIDER_DEFAULT_MODEL],
+  custom: [PROVIDER_DEFAULT_MODEL],
+};
+
+function extractModelIds(response: unknown): string[] {
+  if (!response || typeof response !== "object") return [];
+  const container = response as { models?: unknown; items?: unknown; data?: unknown };
+  const entries = [container.models, container.items, container.data].find(Array.isArray) as
+    unknown[] | undefined;
+  if (!entries) return [];
+  const ids: string[] = [];
+  for (const entry of entries) {
+    if (typeof entry === "string") {
+      ids.push(entry);
+      continue;
+    }
+    if (entry && typeof entry === "object") {
+      const value = entry as { id?: unknown; model?: unknown; name?: unknown; slug?: unknown };
+      const id = [value.id, value.model, value.slug, value.name].find(
+        (candidate): candidate is string => typeof candidate === "string" && candidate.length > 0,
+      );
+      if (id) ids.push(id);
+    }
+  }
+  return [...new Set(ids)];
+}
+
 const DEMO_STORAGE_KEY = "aiintegrator.demo.workspace.v1";
+const NAVIGATION_STORAGE_KEY = "aiintegrator.navigation.v1";
+
+type StoredNavigation = Pick<
+  WorkspaceSnapshot,
+  "activeProjectId" | "activeTaskId" | "lastTaskByProject" | "centerViewByTask"
+>;
 
 function isTauri(): boolean {
   return typeof window !== "undefined" && Boolean((window as TauriWindow).__TAURI_INTERNALS__);
@@ -229,8 +413,21 @@ function readDemoSnapshot(): WorkspaceSnapshot {
     const stored = window.localStorage.getItem(DEMO_STORAGE_KEY);
     if (!stored) return createDemoSnapshot();
     const parsed = JSON.parse(stored) as WorkspaceSnapshot;
+    const activeContext = parsed.activeTaskId
+      ? {
+          [parsed.activeTaskId]: {
+            transcript: parsed.transcript ?? [],
+            git: parsed.git ?? createEmptySnapshot().git,
+            usage: parsed.usage ?? createEmptySnapshot().usage,
+            children: parsed.children ?? [],
+          },
+        }
+      : {};
     return {
       ...parsed,
+      taskContexts: parsed.taskContexts ?? activeContext,
+      lastTaskByProject: parsed.lastTaskByProject ?? {},
+      centerViewByTask: parsed.centerViewByTask ?? {},
       activeProjectId:
         parsed.activeProjectId ??
         parsed.tasks.find((task) => task.id === parsed.activeTaskId)?.projectId ??
@@ -248,6 +445,32 @@ function writeDemoSnapshot(snapshot: WorkspaceSnapshot): void {
     window.localStorage.setItem(DEMO_STORAGE_KEY, JSON.stringify(snapshot));
   } catch {
     // Storage is an enhancement in browser preview; native persistence remains authoritative.
+  }
+}
+
+function readStoredNavigation(): Partial<StoredNavigation> {
+  if (typeof window === "undefined") return {};
+  try {
+    return JSON.parse(
+      window.localStorage.getItem(NAVIGATION_STORAGE_KEY) ?? "{}",
+    ) as Partial<StoredNavigation>;
+  } catch {
+    return {};
+  }
+}
+
+function writeStoredNavigation(snapshot: WorkspaceSnapshot): void {
+  if (typeof window === "undefined") return;
+  try {
+    const value: StoredNavigation = {
+      activeProjectId: snapshot.activeProjectId,
+      activeTaskId: snapshot.activeTaskId,
+      lastTaskByProject: snapshot.lastTaskByProject,
+      centerViewByTask: snapshot.centerViewByTask,
+    };
+    window.localStorage.setItem(NAVIGATION_STORAGE_KEY, JSON.stringify(value));
+  } catch {
+    // Navigation persistence is best-effort and never contains credentials or provider payloads.
   }
 }
 
@@ -356,6 +579,8 @@ async function loadNativeWorkspace(): Promise<WorkspaceSnapshot> {
       model: "Provider default",
       updatedAt: task.updatedAt,
       worktree: task.worktreePath,
+      pinned: task.pinned,
+      archived: task.archived,
     };
   });
   for (const session of local.providerSessions) {
@@ -368,10 +593,28 @@ async function loadNativeWorkspace(): Promise<WorkspaceSnapshot> {
     tasks,
     activeTaskId: tasks[0]?.id ?? "",
     activeProjectId: tasks[0]?.projectId ?? projects[0]?.id ?? "",
+    lastTaskByProject: Object.fromEntries(
+      projects
+        .map((project) => [project.id, tasks.find((task) => task.projectId === project.id)?.id])
+        .filter((entry): entry is [string, string] => Boolean(entry[1])),
+    ),
+    centerViewByTask: Object.fromEntries(tasks.map((task) => [task.id, "task" as const])),
     runtimes: providers.map(mapRuntime),
   };
-  cachedWorkspace = merged;
-  return merged;
+  const storedNavigation = readStoredNavigation();
+  const storedTask = tasks.find((task) => task.id === storedNavigation.activeTaskId);
+  const storedProject = projects.find(
+    (project) => project.id === (storedTask?.projectId ?? storedNavigation.activeProjectId),
+  );
+  const restored: WorkspaceSnapshot = {
+    ...merged,
+    activeTaskId: storedTask?.id ?? merged.activeTaskId,
+    activeProjectId: storedProject?.id ?? merged.activeProjectId,
+    lastTaskByProject: { ...merged.lastTaskByProject, ...storedNavigation.lastTaskByProject },
+    centerViewByTask: { ...merged.centerViewByTask, ...storedNavigation.centerViewByTask },
+  };
+  cachedWorkspace = restored;
+  return restored;
 }
 
 function repositoryForTask(taskId: string): string {
@@ -405,23 +648,69 @@ function extractThreadId(response: unknown): string | undefined {
   return typeof id === "string" ? id : undefined;
 }
 
+const cursorSessionByTask = new Set<string>();
+let cursorConnected = false;
+
+async function ensureCursorSession(input: SendTurnInput): Promise<string> {
+  const nativeTaskId = await ensureNativeTask(input.taskId);
+  const cwd = repositoryForTask(input.taskId);
+  if (!cursorConnected) {
+    await nativeInvoke("cursor_connect", { workingDirectory: cwd });
+    cursorConnected = true;
+    cursorSessionByTask.clear();
+  }
+  if (!cursorSessionByTask.has(nativeTaskId)) {
+    const session = await nativeInvoke<unknown>("cursor_start_session", {
+      taskId: nativeTaskId,
+      cwd,
+    });
+    cursorSessionByTask.add(nativeTaskId);
+    const models = extractCursorModels(session);
+    if (models.length > 0) {
+      modelCatalogCache.set("cursor", [PROVIDER_DEFAULT_MODEL, ...models]);
+    }
+  }
+  return nativeTaskId;
+}
+
+function extractCursorModels(session: unknown): string[] {
+  if (!session || typeof session !== "object") return [];
+  const models = (session as { models?: { availableModels?: unknown } }).models?.availableModels;
+  if (!Array.isArray(models)) return [];
+  return [
+    ...new Set(
+      models
+        .map((model) =>
+          model && typeof model === "object" ? (model as { modelId?: unknown }).modelId : undefined,
+        )
+        .filter(
+          (id): id is string =>
+            typeof id === "string" && id.length > 0 && !id.startsWith("default"),
+        ),
+    ),
+  ];
+}
+
 async function ensureCodexThread(input: SendTurnInput): Promise<string> {
   const nativeTaskId = await ensureNativeTask(input.taskId);
   const existing = codexThreadByTask.get(nativeTaskId) ?? codexThreadByTask.get(input.taskId);
   const cwd = repositoryForTask(input.taskId);
   if (!codexConnected) {
-    await nativeInvoke("codex_connect", { workingDirectory: cwd });
+    await nativeInvoke("codex_connect", { workingDirectory: cwd, taskId: nativeTaskId });
     codexConnected = true;
     activeCodexThreads.clear();
   }
   if (existing) {
     if (!activeCodexThreads.has(existing)) {
-      await nativeInvoke("codex_resume_thread", { threadId: existing });
+      await nativeInvoke("codex_resume_thread", { taskId: nativeTaskId, threadId: existing });
       activeCodexThreads.add(existing);
     }
     return existing;
   }
-  const model = input.model.includes(" ") ? undefined : input.model;
+  // UI placeholders ("Auto", "Provider default", …) are not provider model
+  // ids; only forward names that look like real model identifiers.
+  const model =
+    input.model.includes(" ") || input.model.toLowerCase() === "auto" ? undefined : input.model;
   const started = await nativeInvoke<unknown>("codex_start_thread", {
     taskId: nativeTaskId,
     cwd,
@@ -546,6 +835,36 @@ export const bridge: AppBridge = {
       (statuses) => (isTauri() ? statuses.map(mapRuntime) : readDemoSnapshot().runtimes),
     ),
 
+  listModels: async (runtime) => {
+    const cached = modelCatalogCache.get(runtime);
+    if (cached) return cached;
+    if (runtime === "codex" && isTauri()) {
+      try {
+        if (!codexConnected) {
+          await nativeInvoke("codex_connect", {});
+          codexConnected = true;
+          activeCodexThreads.clear();
+        }
+        const response = await nativeInvoke<unknown>("codex_list_models", {
+          includeHidden: false,
+        });
+        const models = extractModelIds(response);
+        if (models.length > 0) {
+          const catalog = [PROVIDER_DEFAULT_MODEL, ...models];
+          modelCatalogCache.set(runtime, catalog);
+          return catalog;
+        }
+      } catch {
+        // Codex unavailable right now; fall through to the static catalog.
+      }
+    }
+    if (!isTauri()) {
+      const demoModels = readDemoSnapshot().runtimes.find((item) => item.id === runtime)?.models;
+      if (demoModels?.length) return demoModels;
+    }
+    return FALLBACK_MODELS[runtime] ?? [PROVIDER_DEFAULT_MODEL];
+  },
+
   beginRuntimeLogin: async (runtime) => {
     if (isTauri()) {
       if (runtime !== "codex") {
@@ -610,13 +929,52 @@ export const bridge: AppBridge = {
     };
   },
 
+  loadTaskGit: async (taskId) => {
+    if (isTauri()) return refreshNativeGit(taskId);
+    const snapshot = readDemoSnapshot();
+    return snapshot.taskContexts[taskId]?.git ?? createEmptySnapshot().git;
+  },
+
+  supportsTaskMetadata: () => true,
+
+  updateTaskMetadata: async (taskId, input) => {
+    if (isTauri()) {
+      const nativeTaskId = await ensureNativeTask(taskId);
+      const task = await nativeInvoke<NativeTask>("task_update_metadata", {
+        taskId: nativeTaskId,
+        input,
+      });
+      return {
+        taskId,
+        title: task.title,
+        pinned: task.pinned,
+        archived: task.archived,
+        updatedAt: task.updatedAt,
+      };
+    }
+    const snapshot = readDemoSnapshot();
+    const task = snapshot.tasks.find((item) => item.id === taskId);
+    if (!task) throw new Error(`Unknown chat: ${taskId}`);
+    return {
+      taskId,
+      title: input.title?.trim() || task.title,
+      pinned: input.pinned ?? task.pinned ?? false,
+      archived: input.archived ?? task.archived ?? false,
+      updatedAt: new Date().toISOString(),
+    };
+  },
+
   sendTurn: async (input) => {
     if (isTauri()) {
-      if (input.runtime !== "codex") {
+      if (input.runtime === "codex") {
+        const threadId = await ensureCodexThread(input);
+        await nativeInvoke("codex_start_turn", { threadId, prompt: input.prompt });
+      } else if (input.runtime === "cursor") {
+        const taskId = await ensureCursorSession(input);
+        await nativeInvoke("cursor_send_turn", { taskId, prompt: input.prompt });
+      } else {
         throw new Error(`${input.runtime} turn execution is not implemented by the native backend`);
       }
-      const threadId = await ensureCodexThread(input);
-      await nativeInvoke("codex_start_turn", { threadId, prompt: input.prompt });
     }
     return {
       id: `event-${Date.now()}`,
@@ -625,6 +983,41 @@ export const bridge: AppBridge = {
       timestamp: new Date().toISOString(),
       status: "neutral",
     };
+  },
+
+  subscribeRuntimeProjections: async (listener) => {
+    if (!isTauri()) return () => undefined;
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<RuntimeProjectionEvent>("runtime://projection", (event) => {
+      listener(event.payload);
+    });
+  },
+
+  loadTaskProjection: async (taskId) => {
+    if (!isTauri()) return { events: [], watermarkSeq: 0 };
+    return nativeInvoke<TaskProjectionSnapshot>("task_snapshot", { taskId });
+  },
+
+  respondToApproval: async (taskId, approvalId, decision) => {
+    if (!isTauri()) {
+      throw new Error("Approvals are only available during a native provider run");
+    }
+    return nativeInvoke<ApprovalProjection>("codex_respond_approval", {
+      taskId,
+      approvalId,
+      decision,
+    });
+  },
+
+  stopTurn: async (taskId) => {
+    if (!isTauri()) {
+      throw new Error("Stop is only available during a native provider run");
+    }
+    return nativeInvoke<{
+      turnId: string;
+      stopRequested: true;
+      alreadyRequested: boolean;
+    }>("codex_stop_turn", { taskId });
   },
 
   stageFiles: async (taskId, paths, staged) => {
@@ -669,6 +1062,7 @@ export const bridge: AppBridge = {
 
   persistSession: async (snapshot) => {
     cachedWorkspace = snapshot;
+    writeStoredNavigation(snapshot);
     if (!isTauri()) writeDemoSnapshot(snapshot);
   },
 };

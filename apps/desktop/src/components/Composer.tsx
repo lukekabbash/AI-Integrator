@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { motion } from "motion/react";
 import {
   ArrowUp,
@@ -10,7 +10,7 @@ import {
   Sparkles,
   Users,
 } from "lucide-react";
-import type { RuntimeConnection, RuntimeId } from "../bridge";
+import { bridge, type RuntimeConnection, type RuntimeId } from "../bridge";
 
 interface ComposerProps {
   runtimes: RuntimeConnection[];
@@ -36,10 +36,29 @@ export function Composer({ runtimes, defaultRuntime, defaultModel, onSend }: Com
     "balanced",
   );
   const [sending, setSending] = useState(false);
+  const [providerModels, setProviderModels] = useState<Record<string, string[]>>({});
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const selectedRuntime = runtimes.find((item) => item.id === runtime) ?? runtimes[0];
-  const modelOptions = selectedRuntime?.models ?? ["Auto"];
-  const activeModel = modelOptions.includes(model) ? model : (modelOptions[0] ?? "Auto");
+  const modelOptions = providerModels[runtime] ??
+    (selectedRuntime?.models.length ? selectedRuntime.models : undefined) ?? ["Provider default"];
+  const activeModel = modelOptions.includes(model)
+    ? model
+    : (modelOptions[0] ?? "Provider default");
+
+  useEffect(() => {
+    if (providerModels[runtime]) return;
+    let active = true;
+    void bridge
+      .listModels?.(runtime)
+      .then((models) => {
+        if (!active || !models?.length) return;
+        setProviderModels((current) => ({ ...current, [runtime]: models }));
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [runtime, providerModels]);
 
   const submit = async () => {
     const trimmed = prompt.trim();
@@ -116,6 +135,17 @@ export function Composer({ runtimes, defaultRuntime, defaultModel, onSend }: Com
             </label>
           </div>
           <div className="composer-controls-right">
+            <label className="model-select">
+              <span className="sr-only">Model</span>
+              <select value={activeModel} onChange={(event) => setModel(event.target.value)}>
+                {modelOptions.map((item) => (
+                  <option value={item} key={item}>
+                    {item}
+                  </option>
+                ))}
+              </select>
+              <ChevronDown />
+            </label>
             <label className="route-select">
               <span className={`provider-dot provider-dot--${runtime}`} aria-hidden="true" />
               <span className="sr-only">Runtime</span>
@@ -124,7 +154,11 @@ export function Composer({ runtimes, defaultRuntime, defaultModel, onSend }: Com
                 onChange={(event) => {
                   const nextRuntime = event.target.value as RuntimeId;
                   setRuntime(nextRuntime);
-                  setModel(runtimes.find((item) => item.id === nextRuntime)?.models[0] ?? "Auto");
+                  setModel(
+                    providerModels[nextRuntime]?.[0] ??
+                      runtimes.find((item) => item.id === nextRuntime)?.models[0] ??
+                      "Provider default",
+                  );
                 }}
               >
                 {runtimes
@@ -134,17 +168,6 @@ export function Composer({ runtimes, defaultRuntime, defaultModel, onSend }: Com
                       {item.name}
                     </option>
                   ))}
-              </select>
-              <ChevronDown />
-            </label>
-            <label className="model-select">
-              <span className="sr-only">Model</span>
-              <select value={activeModel} onChange={(event) => setModel(event.target.value)}>
-                {modelOptions.map((item) => (
-                  <option value={item} key={item}>
-                    {item}
-                  </option>
-                ))}
               </select>
               <ChevronDown />
             </label>

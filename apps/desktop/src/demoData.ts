@@ -19,6 +19,17 @@ export interface WorkspaceSnapshot {
   children: ChildAgent[];
   usage: UsageSnapshot;
   git: GitSnapshot;
+  taskContexts: Record<
+    string,
+    {
+      transcript: TranscriptEvent[];
+      git: GitSnapshot;
+      usage: UsageSnapshot;
+      children: ChildAgent[];
+    }
+  >;
+  lastTaskByProject: Record<string, string>;
+  centerViewByTask: Record<string, "task" | "review">;
 }
 
 export function createEmptySnapshot(): WorkspaceSnapshot {
@@ -51,6 +62,9 @@ export function createEmptySnapshot(): WorkspaceSnapshot {
       files: [],
       commits: [],
     },
+    taskContexts: {},
+    lastTaskByProject: {},
+    centerViewByTask: {},
   };
 }
 
@@ -484,5 +498,18 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
     children,
     usage,
     git,
+    taskContexts: {
+      "v1-shell": { transcript, git, usage, children },
+    },
+    lastTaskByProject: {
+      integrator: "v1-shell",
+      lotmind: "overnight",
+    },
+    centerViewByTask: {
+      "v1-shell": "task",
+      "adapter-audit": "task",
+      "theme-pass": "task",
+      overnight: "task",
+    },
   };
 }

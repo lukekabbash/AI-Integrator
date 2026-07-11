@@ -62,7 +62,7 @@ impl<T> Versioned<T> {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderKind {
     Codex,
@@ -195,6 +195,10 @@ pub struct Task {
     pub repository_path: Option<PathBuf>,
     pub worktree_path: Option<PathBuf>,
     pub state: TaskState,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub archived: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -243,6 +247,7 @@ pub struct RuntimeSession {
     pub id: RuntimeSessionId,
     pub task_id: TaskId,
     pub provider_session_id: Option<ProviderSessionId>,
+    pub process_id: Option<String>,
     pub status: String,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
@@ -275,6 +280,6 @@ mod tests {
     #[test]
     fn versioned_wrapper_marks_current_schema() {
         let wrapped = Versioned::current(TaskState::Ready);
-        assert_eq!(wrapped.schema_version, DOMAIN_SCHEMA_VERSION);
+        assert_eq!(wrapped.schema_version, crate::DOMAIN_SCHEMA_VERSION);
     }
 }

@@ -81,17 +81,18 @@ Subagent work is never accepted by status alone. Root reviews diffs, runs the re
 ## Local machine constraints currently tracked
 
 - `H:` is exFAT and does not support directory symlinks. Node workspaces are intentionally avoided; frontend dependencies live in `apps/desktop` and Rust remains a Cargo workspace.
-- Rust/Node/WebView2/Windows SDKs are installed.
-- Visual Studio C++ Build Tools (`cl.exe`/MSVC linker) are not installed in the current non-elevated session. Frontend and pure Rust verification can proceed; a local Windows Tauri package cannot be claimed until the native linker gate is satisfied. CI uses supported Windows/macOS runners in parallel.
+- Rust, Node, and WebView2 are installed.
+- Visual Studio C++ Build Tools (`cl.exe`/`link.exe`) and the Windows SDK import-library paths needed by `rust-lld` are unavailable in the current session. Frontend and source-level Rust verification can proceed; a local Windows Tauri package cannot be claimed until the native linker gate is satisfied. CI uses supported Windows/macOS runners in parallel.
 - Installed today: Codex is authenticated; Claude is installed but its OAuth session expired during a live review call; Gemini exposes ACP but the current tier rejects the client; Cursor desktop exists without the standalone agent CLI; Grok is absent. UI/adapters must display these facts rather than imply parity.
 
 ## Current integration truth
 
 The polished browser preview is design evidence, not native-runtime evidence. The native bridge now invokes only registered Tauri commands and never converts a native failure into demo success. The browser fallback remains intentionally separate for UI development.
 
-- Implemented foundations: Tauri/Rust/React workspace, narrow command allowlist, SQLite migrations for basic tasks/settings/provider and runtime sessions, provider discovery/redaction, bounded Codex JSONL supervisor, file-level Git/worktree primitives, full workspace shell, Git rail/diff, setup, full-screen Settings, and twelve semantic themes.
-- Integrated native subset: bootstrap/export/provider discovery, user-owned project picker, persisted canonical project trust, real task creation, Codex connect/thread/turn start, repository identity/status/diff, file stage/unstage, commit, and push preview. Every Git/worktree command reauthorizes the exact trusted root or a listed paired worktree.
-- Explicitly not yet certified: durable transcript/event reduction, Codex event/approval/stop UI, restart reconciliation, real PTY, Broker/delegation ledger, Cursor ACP transport, confirmed push, hunk operations, native settings/export UX, and the complete M1 replay fixture.
+- Implemented foundations: Tauri/Rust/React workspace, narrow command allowlist, SQLite migrations for tasks/settings/provider/runtime sessions and runtime projections, provider discovery/redaction, bounded Codex JSONL supervisor, Cursor ACP transport scaffolding, file-level Git/worktree primitives, full workspace shell, Git rail/diff, setup, full-screen Settings, and twelve semantic themes.
+- Daily-use navigation is implemented and tested: one-click project/chat selection, last-chat-per-project restoration, task-scoped transcript/Git/usage/child context, race-safe native hydration, empty New chat drafts that persist only on first Send, search and arrow-key focus, responsive sidebar/inspector behavior, and persistent rename/pin/archive metadata.
+- Integrated native subset: bootstrap/export/provider discovery, user-owned project picker, persisted canonical project trust, real task creation and navigation metadata, Codex connect/thread/turn start, persisted typed event projections, approvals/stop controls, repository identity/status/diff, file stage/unstage, commit, and push preview. Every Git/worktree command reauthorizes the exact trusted root or a listed paired worktree.
+- Explicitly not yet certified: real PTY, Broker/delegation ledger, Cursor ACP end-to-end conformance, confirmed push, fetch/sync and PR actions, hunk operations, native settings/export UX, signed packaging, and the complete M1 replay fixture.
 - CI enforces the renderer/Tauri command-name contract with `npm run check:bridge`; missing native behavior must fail visibly rather than appear successful through fixtures.
 - The next Codex persistence, approval, streaming, and restart slice is governed by [codex-event-reducer-contract.md](codex-event-reducer-contract.md).
 

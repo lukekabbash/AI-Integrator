@@ -1,21 +1,16 @@
-import { useState } from "react";
+import { useState, type KeyboardEvent } from "react";
 import {
   Activity,
-  Bot,
   ChevronDown,
   CircleDollarSign,
   FileCode2,
   FileText,
   GitBranch,
   GitCommitHorizontal,
-  GitPullRequestArrow,
-  MessageSquare,
   Minus,
-  MoreHorizontal,
+  PanelRightClose,
   Plus,
   Radio,
-  RefreshCw,
-  Send,
   SquareArrowOutUpRight,
   Users,
 } from "lucide-react";
@@ -32,6 +27,11 @@ interface RightRailProps {
   onStageFile: (file: DiffFile, staged: boolean) => Promise<void>;
   onCommit: (message: string) => Promise<void>;
   onPush: () => Promise<void>;
+  onClose: () => void;
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "The Git action could not be completed.";
 }
 
 function GitPanel({
@@ -47,24 +47,45 @@ function GitPanel({
 >) {
   const [message, setMessage] = useState("Build polished native v1 workspace");
   const [busy, setBusy] = useState<"commit" | "push" | null>(null);
+  const [stagingPath, setStagingPath] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const staged = git.files.filter((file) => file.staged);
   const unstaged = git.files.filter((file) => !file.staged);
 
+  const runStage = async (file: DiffFile, nextStaged: boolean) => {
+    setStagingPath(file.path);
+    setActionError(null);
+    try {
+      await onStageFile(file, nextStaged);
+    } catch (error) {
+      setActionError(getErrorMessage(error));
+    } finally {
+      setStagingPath(null);
+    }
+  };
+
   const runCommit = async () => {
-    if (!message.trim() || staged.length === 0) return;
+    if (!message.trim() || staged.length === 0 || busy !== null) return;
     setBusy("commit");
+    setActionError(null);
     try {
       await onCommit(message.trim());
       setMessage("");
+    } catch (error) {
+      setActionError(getErrorMessage(error));
     } finally {
       setBusy(null);
     }
   };
 
   const runPush = async () => {
+    if (busy !== null || git.ahead === 0) return;
     setBusy("push");
+    setActionError(null);
     try {
       await onPush();
+    } catch (error) {
+      setActionError(getErrorMessage(error));
     } finally {
       setBusy(null);
     }
@@ -75,7 +96,9 @@ function GitPanel({
       <button
         className="git-stage-button"
         type="button"
-        onClick={() => void onStageFile(file, !isStaged)}
+        onClick={() => void runStage(file, !isStaged)}
+        disabled={stagingPath !== null || busy !== null}
+        aria-busy={stagingPath === file.path}
         aria-label={`${isStaged ? "Unstage" : "Stage"} ${file.path}`}
       >
         {isStaged ? <Minus /> : <Plus />}
@@ -85,6 +108,7 @@ function GitPanel({
         type="button"
         onClick={() => onSelectFile(file)}
         title={file.path}
+        aria-pressed={activeFile?.path === file.path}
       >
         <FileCode2 />
         <span>{file.path.split("/").at(-1)}</span>
@@ -101,17 +125,10 @@ function GitPanel({
   return (
     <div className="rail-panel git-panel">
       <div className="branch-header">
-        <button type="button" className="branch-button">
+        <div className="branch-button" aria-label={`Current branch ${git.branch}`}>
           <GitBranch />
           <span>{git.branch}</span>
-          <ChevronDown />
-        </button>
-        <button className="icon-button subtle" type="button" aria-label="Fetch">
-          <RefreshCw />
-        </button>
-        <button className="icon-button subtle" type="button" aria-label="More Git actions">
-          <MoreHorizontal />
-        </button>
+        </div>
       </div>
       <div className="sync-status">
         <span>
@@ -125,12 +142,15 @@ function GitPanel({
         <textarea
           value={message}
           onChange={(event) => setMessage(event.target.value)}
+          onKeyDown={(event) => {
+            if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+              event.preventDefault();
+              void runCommit();
+            }
+          }}
           rows={2}
-          placeholder="Message (Ctrl Enter to commit)"
+          placeholder="Message (Ctrl/Cmd+Enter to commit)"
         />
-        <button className="sparkle-button" type="button" aria-label="Generate commit message">
-          <Bot />
-        </button>
       </label>
       <button
         className="primary-button commit-button"
@@ -141,6 +161,11 @@ function GitPanel({
         <GitCommitHorizontal />{" "}
         {busy === "commit" ? "Committing…" : `Commit ${staged.length || ""}`}
       </button>
+      {actionError ? (
+        <p className="empty-compact" role="alert">
+          {actionError}
+        </p>
+      ) : null}
 
       <div className="git-section">
         <div className="git-section-title">
@@ -162,7 +187,11 @@ function GitPanel({
           </span>
           <small>{unstaged.length}</small>
         </div>
-        {unstaged.map((file) => fileRow(file, false))}
+        {unstaged.length ? (
+          unstaged.map((file) => fileRow(file, false))
+        ) : (
+          <p className="empty-compact">No unstaged changes.</p>
+        )}
       </div>
 
       <div className="git-history">
@@ -170,25 +199,26 @@ function GitPanel({
           <span>
             <Activity /> Graph
           </span>
-          <button type="button">All branches</button>
+          <small>{git.branch}</small>
         </div>
-        {git.commits.map((commit, index) => (
-          <div className="commit-row" key={`${commit.id}-${index}`} data-current={commit.current}>
-            <span className="commit-node" />
-            <span>
-              <strong>{commit.subject}</strong>
-              <small>
-                {commit.id} · {commit.relativeTime}
-              </small>
-            </span>
-          </div>
-        ))}
+        {git.commits.length ? (
+          git.commits.map((commit, index) => (
+            <div className="commit-row" key={`${commit.id}-${index}`} data-current={commit.current}>
+              <span className="commit-node" />
+              <span>
+                <strong>{commit.subject}</strong>
+                <small>
+                  {commit.id} · {commit.relativeTime}
+                </small>
+              </span>
+            </div>
+          ))
+        ) : (
+          <p className="empty-compact">Commit history is not available for this task.</p>
+        )}
       </div>
 
       <div className="rail-sticky-actions">
-        <button className="secondary-button" type="button">
-          <GitPullRequestArrow /> Open PR
-        </button>
         <button
           className="primary-button"
           type="button"
@@ -216,41 +246,32 @@ function AgentPanel({ agents }: { agents: ChildAgent[] }) {
         <span>
           <Users /> Agent lineage
         </span>
-        <button type="button" className="secondary-button small">
-          <Plus /> Delegate
-        </button>
+        <small>Read-only</small>
       </header>
       <p className="rail-description">
-        Children receive bounded assignments and report evidence through the local broker.
+        Agents reported by the active task appear here. Delegation controls are not connected yet.
       </p>
-      {roots.map((root) => (
-        <div className="agent-tree" key={root.id}>
-          <AgentRow agent={root} root />
-          <div className="agent-children">
-            {(childMap.get(root.id) ?? []).map((agent) => (
-              <AgentRow agent={agent} key={agent.id} />
-            ))}
+      {roots.length ? (
+        roots.map((root) => (
+          <div className="agent-tree" key={root.id}>
+            <AgentRow agent={root} root />
+            <div className="agent-children">
+              {(childMap.get(root.id) ?? []).map((agent) => (
+                <AgentRow agent={agent} key={agent.id} />
+              ))}
+            </div>
           </div>
-        </div>
-      ))}
-      <div className="broker-message-box">
-        <MessageSquare />
-        <span>
-          <strong>Broker mailbox</strong>
-          <small>3 delivered · all transcripts scoped</small>
-        </span>
-        <button type="button">
-          <Send />
-          <span className="sr-only">Message agent</span>
-        </button>
-      </div>
+        ))
+      ) : (
+        <p className="empty-compact">No child agents have been reported for this task.</p>
+      )}
     </div>
   );
 }
 
 function AgentRow({ agent, root = false }: { agent: ChildAgent; root?: boolean }) {
   return (
-    <button className="agent-row" type="button" data-root={root}>
+    <div className="agent-row" data-root={root}>
       <span className={`agent-avatar agent-avatar--${agent.runtime}`}>
         {agent.name.slice(0, 1)}
       </span>
@@ -260,57 +281,56 @@ function AgentRow({ agent, root = false }: { agent: ChildAgent; root?: boolean }
           <i>{agent.role}</i>
         </strong>
         <span>{agent.activity}</span>
-        <small>
-          {agent.model} · {agent.elapsed} · {agent.worktree}
-        </small>
+        <small>{[agent.model, agent.elapsed, agent.worktree].filter(Boolean).join(" · ")}</small>
       </span>
       <span className={`status-dot status-dot--${agent.status}`}>
         <span className="sr-only">{agent.status}</span>
       </span>
-    </button>
+    </div>
   );
 }
 
 function FilePanel({ git, onSelectFile }: Pick<RightRailProps, "git" | "onSelectFile">) {
+  const [filter, setFilter] = useState("");
+  const normalizedFilter = filter.trim().toLocaleLowerCase();
+  const files = normalizedFilter
+    ? git.files.filter((file) => file.path.toLocaleLowerCase().includes(normalizedFilter))
+    : git.files;
+
   return (
     <div className="rail-panel file-panel">
       <header className="rail-panel-header">
         <span>
           <FileText /> Files
         </span>
-        <button className="icon-button subtle" type="button">
-          <Plus />
-          <span className="sr-only">New file</span>
-        </button>
+        <small>{files.length}</small>
       </header>
       <label className="rail-filter">
         <span className="sr-only">Filter files</span>
-        <input placeholder="Filter by name" />
+        <input
+          placeholder="Filter by name"
+          value={filter}
+          onChange={(event) => setFilter(event.target.value)}
+        />
       </label>
       <div className="file-tree">
-        <div className="tree-folder">
-          <ChevronDown />
-          <span>src</span>
-        </div>
-        {git.files.map((file) => (
-          <button type="button" key={file.path} onClick={() => onSelectFile(file)}>
+        {files.map((file) => (
+          <button
+            type="button"
+            key={file.path}
+            onClick={() => onSelectFile(file)}
+            title={file.path}
+          >
             <FileCode2 />
-            <span>{file.path.replace("src/", "")}</span>
+            <span>{file.path}</span>
             <small>{file.status.at(0)?.toUpperCase()}</small>
           </button>
         ))}
-        <div className="tree-folder">
-          <ChevronDown />
-          <span>docs</span>
-        </div>
-        <button type="button">
-          <FileText />
-          <span>v1-scope.md</span>
-        </button>
-        <button type="button">
-          <FileText />
-          <span>repo-coordination-protocol.md</span>
-        </button>
+        {files.length === 0 ? (
+          <p className="empty-compact">
+            {git.files.length === 0 ? "No changed files." : "No changed files match this filter."}
+          </p>
+        ) : null}
       </div>
     </div>
   );
@@ -329,7 +349,9 @@ function UsagePanel({ usage }: { usage: UsageSnapshot }) {
           className="usage-ring"
           style={{ "--usage": `${usage.subscriptionPercent ?? 0}%` } as React.CSSProperties}
         >
-          <strong>{usage.subscriptionPercent ?? "—"}%</strong>
+          <strong>
+            {usage.subscriptionPercent === undefined ? "—" : `${usage.subscriptionPercent}%`}
+          </strong>
           <span>plan window</span>
         </div>
         <div>
@@ -368,28 +390,57 @@ export function RightRail(props: RightRailProps) {
     { id: "files", label: "Files", icon: FileText },
     { id: "usage", label: "Usage", icon: Radio },
   ];
+
+  const moveTabFocus = (event: KeyboardEvent<HTMLButtonElement>, currentIndex: number) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const nextIndex =
+      event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? tabs.length - 1
+          : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    const nextTab = tabs[nextIndex];
+    setTab(nextTab.id);
+    document.getElementById(`task-tools-tab-${nextTab.id}`)?.focus();
+  };
+
   return (
     <aside className="right-rail" aria-label="Task tools">
       <div className="rail-tabs" role="tablist" aria-label="Task tools">
-        {tabs.map((item) => (
+        {tabs.map((item, index) => (
           <button
             key={item.id}
+            id={`task-tools-tab-${item.id}`}
             type="button"
             role="tab"
             aria-selected={tab === item.id}
+            aria-controls={`task-tools-panel-${item.id}`}
+            tabIndex={tab === item.id ? 0 : -1}
             data-active={tab === item.id}
             onClick={() => setTab(item.id)}
+            onKeyDown={(event) => moveTabFocus(event, index)}
           >
             <item.icon />
             <span>{item.label}</span>
-            {item.count ? <small>{item.count}</small> : null}
+            {item.count !== undefined ? <small>{item.count}</small> : null}
           </button>
         ))}
+        <button
+          className="rail-close-button"
+          type="button"
+          aria-label="Close task tools"
+          onClick={props.onClose}
+        >
+          <PanelRightClose />
+        </button>
       </div>
-      {tab === "git" ? <GitPanel {...props} /> : null}
-      {tab === "agents" ? <AgentPanel agents={props.children} /> : null}
-      {tab === "files" ? <FilePanel git={props.git} onSelectFile={props.onSelectFile} /> : null}
-      {tab === "usage" ? <UsagePanel usage={props.usage} /> : null}
+      <div id={`task-tools-panel-${tab}`} role="tabpanel" aria-labelledby={`task-tools-tab-${tab}`}>
+        {tab === "git" ? <GitPanel {...props} /> : null}
+        {tab === "agents" ? <AgentPanel agents={props.children} /> : null}
+        {tab === "files" ? <FilePanel git={props.git} onSelectFile={props.onSelectFile} /> : null}
+        {tab === "usage" ? <UsagePanel usage={props.usage} /> : null}
+      </div>
     </aside>
   );
 }

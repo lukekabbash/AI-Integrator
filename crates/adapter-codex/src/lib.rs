@@ -12,16 +12,63 @@ use std::{
 
 use integrator_core::{IntegratorError, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Number, Value, json};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, ChildStdin, Command},
     sync::{Mutex, broadcast, oneshot},
 };
 
-pub const CODEX_PROTOCOL_VERSION: u32 = 2;
+pub const CODEX_PROTOCOL_VERSION: u32 = 3;
 const EVENT_CAPACITY: usize = 256;
 const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SERVER_REQUEST_ID_BYTES: usize = 512;
+
+/// A JSON-RPC server-request identifier as presented by Codex.
+///
+/// The tagged representation is used at Integrator's own API boundary. Protocol
+/// reads and writes deliberately go through `from_protocol_value` and
+/// `to_protocol_value` so the scalar sent back to Codex remains byte-for-byte
+/// equivalent at the JSON value level (number versus string is never coerced).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "camelCase")]
+pub enum ServerRequestId {
+    Number(Number),
+    String(String),
+}
+
+impl ServerRequestId {
+    pub fn from_protocol_value(value: &Value) -> Result<Self> {
+        let id = match value {
+            Value::Number(value) => Self::Number(value.clone()),
+            Value::String(value) => Self::String(value.clone()),
+            _ => {
+                return Err(IntegratorError::InvalidInput(
+                    "Codex server request id must be a string or number".into(),
+                ));
+            }
+        };
+        id.validate()?;
+        Ok(id)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if matches!(self, Self::String(value) if value.len() > MAX_SERVER_REQUEST_ID_BYTES) {
+            return Err(IntegratorError::InvalidInput(
+                "Codex server request id exceeds safety limit".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn to_protocol_value(&self) -> Value {
+        match self {
+            Self::Number(value) => Value::Number(value.clone()),
+            Self::String(value) => Value::String(value.clone()),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -31,7 +78,7 @@ pub enum CodexEvent {
         params: Value,
     },
     ServerRequest {
-        id: u64,
+        id: ServerRequestId,
         method: String,
         params: Value,
     },
@@ -157,16 +204,17 @@ impl CodexClient {
                 "thread working directory does not exist".into(),
             ));
         }
-        self.request(
-            "thread/start",
-            json!({
-                "cwd": cwd.to_string_lossy(),
-                "model": model,
-                "approvalPolicy": "on-request",
-                "sandbox": "workspace-write"
-            }),
-        )
-        .await
+        let mut params = json!({
+            "cwd": cwd.to_string_lossy(),
+            "approvalPolicy": "on-request",
+            "sandbox": "workspace-write"
+        });
+        if let Some(model) = model {
+            // "model": null makes the app-server fall back to "Auto", which
+            // ChatGPT-account sessions reject — omit the key entirely instead.
+            params["model"] = Value::String(model.into());
+        }
+        self.request("thread/start", params).await
     }
 
     pub async fn resume_thread(&self, thread_id: &str) -> Result<Value> {
@@ -203,8 +251,13 @@ impl CodexClient {
         .await
     }
 
-    pub async fn respond_to_server_request(&self, id: u64, result: Value) -> Result<()> {
-        self.write_message(json!({ "id": id, "result": result }))
+    pub async fn respond_to_server_request(
+        &self,
+        id: &ServerRequestId,
+        result: Value,
+    ) -> Result<()> {
+        id.validate()?;
+        self.write_message(json!({ "id": id.to_protocol_value(), "result": result }))
             .await
     }
 
@@ -249,18 +302,23 @@ impl CodexClient {
     }
 
     async fn write_message(&self, value: Value) -> Result<()> {
-        let mut encoded = serde_json::to_vec(&value)?;
-        if encoded.len() > MAX_MESSAGE_BYTES {
-            return Err(IntegratorError::InvalidInput(
-                "Codex protocol message exceeds safety limit".into(),
-            ));
-        }
-        encoded.push(b'\n');
+        let encoded = encode_message(&value)?;
         let mut stdin = self.inner.stdin.lock().await;
         stdin.write_all(&encoded).await?;
         stdin.flush().await?;
         Ok(())
     }
+}
+
+fn encode_message(value: &Value) -> Result<Vec<u8>> {
+    let mut encoded = serde_json::to_vec(value)?;
+    if encoded.len() > MAX_MESSAGE_BYTES {
+        return Err(IntegratorError::InvalidInput(
+            "Codex protocol message exceeds safety limit".into(),
+        ));
+    }
+    encoded.push(b'\n');
+    Ok(encoded)
 }
 
 fn spawn_stdout_reader(
@@ -355,6 +413,14 @@ where
             }
         }
     }
+    if discarding {
+        on_message(JsonlFrame::TooLarge).await;
+    } else if !line.is_empty() {
+        match serde_json::from_slice::<Value>(&line) {
+            Ok(value) => on_message(JsonlFrame::Message(value)).await,
+            Err(_) => on_message(JsonlFrame::Invalid).await,
+        }
+    }
 }
 
 enum JsonlFrame {
@@ -368,17 +434,35 @@ async fn route_message(
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
     events: broadcast::Sender<CodexEvent>,
 ) {
-    let id = message.get("id").and_then(Value::as_u64);
+    let id_value = message.get("id");
     let method = message.get("method").and_then(Value::as_str);
-    if let (Some(id), Some(method)) = (id, method) {
-        let _ = events.send(CodexEvent::ServerRequest {
-            id,
-            method: method.to_owned(),
-            params: message.get("params").cloned().unwrap_or(Value::Null),
-        });
+    if let (Some(id_value), Some(method)) = (id_value, method) {
+        match ServerRequestId::from_protocol_value(id_value) {
+            Ok(id) => {
+                let _ = events.send(CodexEvent::ServerRequest {
+                    id,
+                    method: method.to_owned(),
+                    params: message.get("params").cloned().unwrap_or(Value::Null),
+                });
+            }
+            Err(_) => {
+                let _ = events.send(CodexEvent::ProtocolViolation {
+                    code: "invalid-server-request-id".into(),
+                });
+            }
+        }
         return;
     }
-    if let Some(id) = id {
+    if let Some(id_value) = id_value {
+        let Some(id) = id_value.as_u64() else {
+            let code = if ServerRequestId::from_protocol_value(id_value).is_ok() {
+                "unknown-response-id"
+            } else {
+                "invalid-response-id"
+            };
+            let _ = events.send(CodexEvent::ProtocolViolation { code: code.into() });
+            return;
+        };
         if let Some(sender) = pending.lock().await.remove(&id) {
             let result = if let Some(error) = message.get("error") {
                 Err(IntegratorError::Protocol(protocol_error(error)))
@@ -386,6 +470,10 @@ async fn route_message(
                 Ok(message.get("result").cloned().unwrap_or(Value::Null))
             };
             let _ = sender.send(result);
+        } else {
+            let _ = events.send(CodexEvent::ProtocolViolation {
+                code: "unknown-response-id".into(),
+            });
         }
         return;
     }
@@ -470,6 +558,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn numeric_server_request_id_is_preserved() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, mut receiver) = broadcast::channel(4);
+        route_message(
+            serde_json::from_str(r#"{"id":42.5,"method":"item/tool/call","params":{}}"#)
+                .expect("numeric request fixture"),
+            pending,
+            events,
+        )
+        .await;
+
+        let event = receiver.recv().await.expect("server request");
+        assert!(matches!(
+            event,
+            CodexEvent::ServerRequest {
+                id: ServerRequestId::Number(ref value),
+                ..
+            } if value.to_string() == "42.5"
+        ));
+    }
+
+    #[tokio::test]
+    async fn string_server_request_id_is_preserved_without_numeric_coercion() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, mut receiver) = broadcast::channel(4);
+        route_message(
+            serde_json::from_str(r#"{"id":"00042","method":"item/tool/call","params":{}}"#)
+                .expect("string request fixture"),
+            pending,
+            events,
+        )
+        .await;
+
+        let event = receiver.recv().await.expect("server request");
+        assert!(matches!(
+            event,
+            CodexEvent::ServerRequest {
+                id: ServerRequestId::String(ref value),
+                ..
+            } if value == "00042"
+        ));
+        let id = ServerRequestId::String("00042".into());
+        assert_eq!(id.to_protocol_value(), json!("00042"));
+        assert_eq!(
+            serde_json::to_value(&id).expect("tagged application representation"),
+            json!({ "kind": "string", "value": "00042" })
+        );
+        assert_eq!(
+            serde_json::to_value(ServerRequestId::Number(Number::from(42)))
+                .expect("tagged numeric application representation"),
+            json!({ "kind": "number", "value": 42 })
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_and_oversized_server_request_ids_are_rejected() {
+        for id in [json!(null), json!(true), json!({ "nested": 1 })] {
+            let pending = Arc::new(Mutex::new(HashMap::new()));
+            let (events, mut receiver) = broadcast::channel(4);
+            route_message(
+                json!({ "id": id, "method": "item/tool/call", "params": {} }),
+                pending,
+                events,
+            )
+            .await;
+            assert!(matches!(
+                receiver.recv().await.expect("protocol violation"),
+                CodexEvent::ProtocolViolation { code }
+                    if code == "invalid-server-request-id"
+            ));
+        }
+
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, mut receiver) = broadcast::channel(4);
+        route_message(
+            json!({
+                "id": "x".repeat(MAX_SERVER_REQUEST_ID_BYTES + 1),
+                "method": "item/tool/call"
+            }),
+            pending,
+            events,
+        )
+        .await;
+        assert!(matches!(
+            receiver.recv().await.expect("protocol violation"),
+            CodexEvent::ProtocolViolation { code }
+                if code == "invalid-server-request-id"
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_and_unknown_responses_are_reported() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (sender, receiver) = oneshot::channel();
+        pending.lock().await.insert(7, sender);
+        let (events, mut event_receiver) = broadcast::channel(8);
+
+        route_message(
+            json!({ "id": 7, "result": { "ok": true } }),
+            Arc::clone(&pending),
+            events.clone(),
+        )
+        .await;
+        receiver
+            .await
+            .expect("receive response")
+            .expect("successful response");
+
+        route_message(
+            json!({ "id": 7, "result": { "duplicate": true } }),
+            Arc::clone(&pending),
+            events.clone(),
+        )
+        .await;
+        assert!(matches!(
+            event_receiver.recv().await.expect("duplicate violation"),
+            CodexEvent::ProtocolViolation { code } if code == "unknown-response-id"
+        ));
+
+        route_message(json!({ "id": "not-ours", "result": null }), pending, events).await;
+        assert!(matches!(
+            event_receiver.recv().await.expect("unknown violation"),
+            CodexEvent::ProtocolViolation { code } if code == "unknown-response-id"
+        ));
+    }
+
+    #[tokio::test]
     async fn notifications_are_broadcast() {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (events, mut receiver) = broadcast::channel(4);
@@ -532,5 +747,34 @@ mod tests {
         })
         .await;
         assert_eq!(oversized_frames.lock().await.as_slice(), &[true]);
+
+        let unterminated_oversized = vec![b'x'; MAX_MESSAGE_BYTES + 1];
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&observed);
+        read_jsonl(unterminated_oversized.as_slice(), move |frame| {
+            let captured = Arc::clone(&captured);
+            async move {
+                captured
+                    .lock()
+                    .await
+                    .push(matches!(frame, JsonlFrame::TooLarge));
+            }
+        })
+        .await;
+        assert_eq!(observed.lock().await.as_slice(), &[true]);
+    }
+
+    #[test]
+    fn oversized_outbound_payload_is_rejected_before_write() {
+        let payload = json!({ "payload": "x".repeat(MAX_MESSAGE_BYTES) });
+        let error = encode_message(&payload).expect_err("payload must exceed safety limit");
+        assert!(matches!(error, IntegratorError::InvalidInput(_)));
+
+        let bounded = encode_message(&json!({ "id": "request-1", "result": null }))
+            .expect("small response is accepted");
+        assert_eq!(bounded.last(), Some(&b'\n'));
+
+        let oversized_id = ServerRequestId::String("x".repeat(MAX_SERVER_REQUEST_ID_BYTES + 1));
+        assert!(oversized_id.validate().is_err());
     }
 }

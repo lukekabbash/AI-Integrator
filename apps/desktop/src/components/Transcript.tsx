@@ -24,29 +24,44 @@ function EventIcon({ event }: { event: TranscriptEvent }) {
 }
 
 function ActivityEvent({ event }: { event: TranscriptEvent }) {
-  const [expanded, setExpanded] = useState(event.status === "running");
+  const [expanded, setExpanded] = useState(false);
   const hasChildren = Boolean(event.children?.length);
+  const hasLongBody = Boolean(
+    event.title && event.body && (event.body.length > 96 || event.body.includes("\n")),
+  );
+  const expandable = hasChildren || hasLongBody;
   return (
     <div className="activity-event" data-status={event.status ?? "neutral"}>
       <button
         className="activity-event-summary"
         type="button"
-        onClick={() => hasChildren && setExpanded((value) => !value)}
-        aria-expanded={hasChildren ? expanded : undefined}
+        onClick={() => expandable && setExpanded((value) => !value)}
+        aria-expanded={expandable ? expanded : undefined}
       >
         <span className="activity-icon">
           <EventIcon event={event} />
         </span>
         <span className="activity-copy">
           <strong>{event.title ?? event.body}</strong>
-          {event.title ? <span>{event.body}</span> : null}
+          {event.title ? <span>{firstLine(event.body)}</span> : null}
         </span>
         {event.meta ? <span className="activity-meta">{event.meta}</span> : null}
-        {hasChildren ? (
+        {expandable ? (
           <ChevronRight className={expanded ? "disclosure disclosure--open-right" : "disclosure"} />
         ) : null}
       </button>
       <AnimatePresence initial={false}>
+        {expanded && hasLongBody && !event.children ? (
+          <motion.div
+            className="activity-body"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.18 }}
+          >
+            <pre>{event.body}</pre>
+          </motion.div>
+        ) : null}
         {expanded && event.children ? (
           <motion.div
             className="activity-children"
@@ -75,16 +90,28 @@ function ActivityEvent({ event }: { event: TranscriptEvent }) {
   );
 }
 
-export function Transcript({ events }: { events: TranscriptEvent[] }) {
+export function Transcript({
+  events,
+  running = false,
+  runningSince,
+}: {
+  events: TranscriptEvent[];
+  running?: boolean;
+  runningSince?: string;
+}) {
   return (
     <div className="transcript" aria-label="Task transcript">
-      <div className="task-now" role="status" aria-live="polite">
-        <span className="live-indicator" aria-hidden="true" />
-        <span>Building the shared workspace</span>
-        <span className="task-now-meta">
-          <Clock3 /> 18m
-        </span>
-      </div>
+      {running ? (
+        <div className="task-now" role="status" aria-live="polite">
+          <span className="live-indicator" aria-hidden="true" />
+          <span>Turn in progress</span>
+          {runningSince ? (
+            <span className="task-now-meta">
+              <Clock3 /> {formatElapsed(runningSince)}
+            </span>
+          ) : null}
+        </div>
+      ) : null}
 
       {events.map((event) => {
         if (event.kind === "user") {
@@ -120,15 +147,32 @@ export function Transcript({ events }: { events: TranscriptEvent[] }) {
         return <ActivityEvent event={event} key={event.id} />;
       })}
 
-      <motion.div
-        className="running-cursor"
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        transition={{ delay: 0.2 }}
-      >
-        <span className="live-indicator" aria-hidden="true" />
-        <span>Implementing accessible controls and native session recovery…</span>
-      </motion.div>
+      {running ? (
+        <motion.div
+          className="running-cursor"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          transition={{ delay: 0.2 }}
+        >
+          <span className="live-indicator" aria-hidden="true" />
+          <span>Working…</span>
+        </motion.div>
+      ) : null}
     </div>
   );
+}
+
+function firstLine(body?: string): string {
+  if (!body) return "";
+  const line = body.split("\n", 1)[0] ?? "";
+  return line.length > 140 ? `${line.slice(0, 140)}…` : line;
+}
+
+function formatElapsed(since: string): string {
+  const elapsedMs = Date.now() - new Date(since).getTime();
+  if (!Number.isFinite(elapsedMs) || elapsedMs < 0) return "";
+  const minutes = Math.floor(elapsedMs / 60_000);
+  if (minutes < 1) return "<1m";
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }

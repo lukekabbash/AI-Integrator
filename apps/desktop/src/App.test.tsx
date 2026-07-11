@@ -33,9 +33,11 @@ describe("AI Integrator desktop workspace", () => {
   it("opens Settings as a full replacement view and applies a theme preset", async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Open Settings" }));
-    expect(await screen.findByRole("heading", { name: "Appearance" })).toBeInTheDocument();
     expect(
-      screen.queryByRole("complementary", { name: "Project navigation" }),
+      await screen.findByRole("heading", { name: "Appearance" }, { timeout: 5000 }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("complementary", { name: "Chat navigation" }),
     ).not.toBeInTheDocument();
 
     const themeGroup = screen.getByRole("radiogroup", { name: "Theme preset" });
@@ -46,7 +48,7 @@ describe("AI Integrator desktop workspace", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /Back to workspace/i }));
     expect(
-      await screen.findByRole("complementary", { name: "Project navigation" }),
+      await screen.findByRole("complementary", { name: "Chat navigation" }),
     ).toBeInTheDocument();
   });
 
@@ -136,7 +138,7 @@ describe("AI Integrator desktop workspace", () => {
     expect(await screen.findByText("Queued for execution")).toBeInTheDocument();
   });
 
-  it("creates a real browser-demo task from New task when a project is selected", async () => {
+  it("starts a clean local draft from New chat without creating durable chat junk", async () => {
     const snapshot = createDemoSnapshot();
     snapshot.tasks = [];
     snapshot.activeTaskId = "";
@@ -144,11 +146,79 @@ describe("AI Integrator desktop workspace", () => {
     storeSnapshot(snapshot);
     render(<App />);
 
-    const newTaskLabel = await screen.findByText("New task", { selector: ".new-task-button span" });
-    fireEvent.click(newTaskLabel.closest("button") as HTMLButtonElement);
-    expect(await screen.findByRole("heading", { name: "New task" })).toBeInTheDocument();
+    const composer = await screen.findByRole("textbox", { name: "Task message" });
+    fireEvent.change(composer, { target: { value: "unsent draft" } });
+    const newChatLabel = await screen.findByText("New chat", {
+      selector: ".new-task-button span",
+    });
+    fireEvent.click(newChatLabel.closest("button") as HTMLButtonElement);
+    expect(await screen.findByRole("heading", { name: "New chat" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Task message" })).toHaveValue("");
     expect(
-      screen.queryByRole("heading", { name: "What should the first agent do?" }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("heading", { name: "What should the first agent do?" }),
+    ).toBeInTheDocument();
+  });
+
+  it("switches projects in one click and restores each project's last chat and center view", async () => {
+    const snapshot = createDemoSnapshot();
+    snapshot.taskContexts["v1-shell"] = {
+      transcript: [
+        {
+          id: "integrator-message",
+          kind: "user",
+          body: "Integrator transcript",
+          timestamp: "2026-07-10T10:00:00Z",
+        },
+      ],
+      git: { ...snapshot.git, branch: "integrator-branch" },
+      usage: { ...snapshot.usage, tokens: 111_000 },
+      children: [],
+    };
+    snapshot.taskContexts.overnight = {
+      transcript: [
+        {
+          id: "lotmind-message",
+          kind: "user",
+          body: "Lotmind transcript",
+          timestamp: "2026-07-10T11:00:00Z",
+        },
+      ],
+      git: { ...snapshot.git, branch: "lotmind-branch" },
+      usage: { ...snapshot.usage, tokens: 222_000 },
+      children: [],
+    };
+    storeSnapshot(snapshot);
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("tab", { name: "Review" }));
+    expect(
+      await screen.findByRole("region", { name: /Diff for src\/runtime\/router\.ts/i }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open project Lotmind AI" }));
+    expect(
+      await screen.findByRole("heading", { name: "Mobile intake overnight agent" }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("Lotmind transcript")).toBeInTheDocument();
+    expect(screen.queryByText("Integrator transcript")).not.toBeInTheDocument();
+    expect(screen.getByTitle("Subscription plan usage")).toHaveTextContent("222k");
+
+    fireEvent.click(screen.getByRole("button", { name: "Open project AI Integrator" }));
+    expect(
+      await screen.findByRole("region", { name: /Diff for src\/runtime\/router\.ts/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /Construct the native v1 workspace/ }),
+    ).toHaveAttribute("aria-current", "page");
+  });
+
+  it("opens keyboard search and moves focus into unique chat results", async () => {
+    render(<App />);
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    const search = await screen.findByRole("textbox", { name: "Search chats" });
+    await waitFor(() => expect(search).toHaveFocus());
+    fireEvent.change(search, { target: { value: "adapter" } });
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    expect(screen.getByRole("button", { name: /Certify Codex and ACP adapters/ })).toHaveFocus();
   });
 });

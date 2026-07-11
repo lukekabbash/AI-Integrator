@@ -314,7 +314,7 @@ impl GitService {
                     .ok()
                     .flatten()
             })
-            .and_then(clean_optional)
+            .and_then(|url| clean_optional(Some(url)))
             .map(|url| sanitize_remote_url(&url));
         let (ahead, behind) = if upstream.is_some() {
             let counts = self.optional(

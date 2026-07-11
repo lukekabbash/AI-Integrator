@@ -10,10 +10,20 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // A second launch focuses the existing window instead of spawning a
+        // competing process against the same local store.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let state = AppState::initialize()
-                .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
+            let state = AppState::initialize().map_err(|error| {
+                let boxed: Box<dyn std::error::Error> = Box::new(error);
+                boxed
+            })?;
             app.manage(state);
             Ok(())
         })
@@ -23,6 +33,7 @@ pub fn run() {
             task_create,
             task_list,
             task_set_state,
+            task_update_metadata,
             setting_list,
             setting_set,
             session_list,
@@ -48,7 +59,12 @@ pub fn run() {
             codex_resume_thread,
             codex_start_turn,
             codex_interrupt_turn,
-            codex_resolve_approval,
+            task_snapshot,
+            codex_respond_approval,
+            codex_stop_turn,
+            cursor_connect,
+            cursor_start_session,
+            cursor_send_turn,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run AI Integrator");
