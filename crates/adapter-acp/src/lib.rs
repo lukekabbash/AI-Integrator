@@ -152,9 +152,8 @@ impl AcpClient {
             ));
         }
 
-        let mut command = Command::new(&options.executable);
+        let mut command = launch_command(&options.executable, &options.arguments);
         command
-            .args(&options.arguments)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -199,10 +198,13 @@ impl AcpClient {
         self.inner.events.subscribe()
     }
 
-    pub async fn new_session(&self, cwd: &Path) -> Result<Value> {
+    /// `mcp_servers` entries follow the ACP `session/new` schema:
+    /// `{ name, command, args, env: [{ name, value }] }`. Pass an empty list
+    /// for sessions without injected tool surfaces.
+    pub async fn new_session(&self, cwd: &Path, mcp_servers: Vec<Value>) -> Result<Value> {
         self.request(
             "session/new",
-            json!({ "cwd": cwd.to_string_lossy(), "mcpServers": [] }),
+            json!({ "cwd": cwd.to_string_lossy(), "mcpServers": mcp_servers }),
         )
         .await
     }
@@ -219,6 +221,32 @@ impl AcpClient {
             }),
         )
         .await
+    }
+
+    /// Update a stable ACP session config option, such as the model or its
+    /// thought-level parameter.
+    pub async fn set_config_option(
+        &self,
+        session_id: &str,
+        config_id: &str,
+        value: &str,
+    ) -> Result<Value> {
+        validate_session_id(session_id)?;
+        validate_short_token(config_id, "config option id")?;
+        validate_short_token(value, "config option value")?;
+        self.request(
+            "session/set_config_option",
+            json!({ "sessionId": session_id, "configId": config_id, "value": value }),
+        )
+        .await
+    }
+
+    /// Cursor extension RPC: the per-account model list with each model's
+    /// config options (thought level, context, fast mode). The stable
+    /// `session/new` surface only advertises model ids, so this is the only
+    /// source for per-model reasoning-effort choices.
+    pub async fn list_cursor_models(&self) -> Result<Value> {
+        self.request("cursor/list_available_models", json!({})).await
     }
 
     /// Fire-and-forget cancellation; the in-flight prompt resolves with a
@@ -253,22 +281,39 @@ impl AcpClient {
     }
 
     async fn initialize(&self, client_version: &str) -> Result<Value> {
-        self.request(
-            "initialize",
-            json!({
-                "protocolVersion": ACP_PROTOCOL_VERSION,
-                "clientInfo": {
-                    "name": "ai-integrator",
-                    "title": "AI Integrator",
-                    "version": client_version
-                },
-                "clientCapabilities": {
-                    "fs": { "readTextFile": false, "writeTextFile": false },
-                    "terminal": false
-                }
-            }),
-        )
-        .await
+        let response = self
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": ACP_PROTOCOL_VERSION,
+                    "clientInfo": {
+                        "name": "ai-integrator",
+                        "title": "AI Integrator",
+                        "version": client_version
+                    },
+                    "clientCapabilities": {
+                        "fs": { "readTextFile": false, "writeTextFile": false },
+                        "terminal": false,
+                        // Cursor: without this, sessions run in "variants"
+                        // mode — model parameters are baked into bracketed
+                        // model ids and `session/set_config_option` rejects
+                        // thought-level config ids with -32602.
+                        "_meta": { "parameterizedModelPicker": true }
+                    }
+                }),
+            )
+            .await?;
+
+        // Stable ACP uses an explicit initialized notification before
+        // session/new or any other session request.
+        self.write_message(json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        }))
+        .await?;
+
+        Ok(response)
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
@@ -298,11 +343,115 @@ impl AcpClient {
     }
 }
 
+fn launch_command(executable: &Path, arguments: &[String]) -> Command {
+    #[cfg(windows)]
+    {
+        if is_windows_script(executable) {
+            // Cursor's installed `agent.cmd` is a batch wrapper around a
+            // same-stem PowerShell launcher. Running the batch file through
+            // `cmd /c` is fine for bounded probes, but it does not preserve
+            // the long-lived duplex stdio channel ACP requires on this host.
+            // Prefer the vendor-owned sibling script directly when present.
+            let powershell_launcher = executable.with_extension("ps1");
+            if powershell_launcher.is_file() {
+                let mut command = Command::new(
+                    std::env::var_os("SystemRoot")
+                        .map(PathBuf::from)
+                        .map(|root| {
+                            root.join("System32")
+                                .join("WindowsPowerShell")
+                                .join("v1.0")
+                                .join("powershell.exe")
+                        })
+                        .unwrap_or_else(|| PathBuf::from("powershell.exe")),
+                );
+                command.args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                ]);
+                command.arg(powershell_launcher);
+                command.args(arguments);
+                return command;
+            }
+            let mut command =
+                Command::new(std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into()));
+            command.args(["/d", "/s", "/c"]);
+            command.arg(windows_command_line(executable, arguments));
+            return command;
+        }
+    }
+
+    let mut command = Command::new(executable);
+    command.args(arguments);
+    command
+}
+
+#[cfg(windows)]
+fn is_windows_script(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some("bat" | "cmd")
+    )
+}
+
+#[cfg(windows)]
+fn windows_command_line(executable: &Path, arguments: &[String]) -> String {
+    std::iter::once(executable.to_string_lossy().into_owned())
+        .chain(arguments.iter().cloned())
+        .map(|value| quote_windows_arg(&value))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(windows)]
+fn quote_windows_arg(value: &str) -> String {
+    if value.is_empty() {
+        return "\"\"".into();
+    }
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0;
+    for character in value.chars() {
+        match character {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes));
+                quoted.push(character);
+                backslashes = 0;
+            }
+        }
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
 fn validate_session_id(value: &str) -> Result<()> {
     if value.is_empty() || value.len() > 512 {
         return Err(IntegratorError::InvalidInput(
             "invalid ACP session identity".into(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_short_token(value: &str, label: &str) -> Result<()> {
+    if value.is_empty() || value.len() > 256 {
+        return Err(IntegratorError::InvalidInput(format!(
+            "invalid ACP {label}"
+        )));
     }
     Ok(())
 }
@@ -496,6 +645,7 @@ fn protocol_error(error: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::broadcast;
 
     #[test]
     fn stop_reason_maps_protocol_values() {
@@ -517,5 +667,168 @@ mod tests {
         let number_id = AcpRequestId::from_protocol_value(&json!(42)).expect("number id");
         assert_eq!(number_id.to_protocol_value(), json!(42));
         assert!(AcpRequestId::from_protocol_value(&json!(null)).is_err());
+    }
+
+    #[test]
+    fn protocol_messages_are_newline_delimited_and_bounded() {
+        let encoded = encode_message(&json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": { "sessionId": "session-1" }
+        }))
+        .expect("encoded ACP message");
+        assert_eq!(encoded.last(), Some(&b'\n'));
+        assert_eq!(encoded.iter().filter(|byte| **byte == b'\n').count(), 1);
+
+        let oversized = json!({ "value": "x".repeat(MAX_MESSAGE_BYTES) });
+        assert!(encode_message(&oversized).is_err());
+    }
+
+    #[test]
+    fn adversarial_session_and_config_identifiers_are_rejected() {
+        assert!(validate_session_id("").is_err());
+        assert!(validate_session_id(&"s".repeat(513)).is_err());
+        assert!(validate_short_token("", "config option id").is_err());
+        assert!(validate_short_token(&"m".repeat(257), "config option value").is_err());
+    }
+
+    #[tokio::test]
+    async fn happy_response_is_delivered_to_the_matching_request() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (sender, receiver) = oneshot::channel();
+        pending.lock().await.insert(7, sender);
+        let (events, _) = broadcast::channel(4);
+
+        route_message(
+            json!({ "jsonrpc": "2.0", "id": 7, "result": { "stopReason": "end_turn" } }),
+            Arc::clone(&pending),
+            events,
+        )
+        .await;
+
+        assert_eq!(
+            receiver
+                .await
+                .expect("pending response")
+                .expect("ACP result"),
+            json!({ "stopReason": "end_turn" })
+        );
+        assert!(pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn degraded_error_response_preserves_only_protocol_error() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (sender, receiver) = oneshot::channel();
+        pending.lock().await.insert(8, sender);
+        let (events, _) = broadcast::channel(4);
+
+        route_message(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "error": { "code": -32000, "message": "session expired" }
+            }),
+            Arc::clone(&pending),
+            events,
+        )
+        .await;
+
+        let error = receiver
+            .await
+            .expect("pending response")
+            .expect_err("protocol error");
+        assert_eq!(
+            error.to_string(),
+            "provider protocol error: session expired (code -32000)"
+        );
+        assert!(pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn permission_request_keeps_string_identity_for_the_reply() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, mut receiver) = broadcast::channel(4);
+        route_message(
+            json!({
+                "jsonrpc": "2.0",
+                "id": "permission-1",
+                "method": "session/request_permission",
+                "params": { "sessionId": "session-1", "options": [] }
+            }),
+            pending,
+            events,
+        )
+        .await;
+
+        match receiver.recv().await.expect("server request event") {
+            AcpEvent::ServerRequest { id, method, .. } => {
+                assert_eq!(id, AcpRequestId::String("permission-1".into()));
+                assert_eq!(method, "session/request_permission");
+            }
+            event => panic!("unexpected ACP event: {event:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_response_after_restart_is_a_protocol_violation() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, mut receiver) = broadcast::channel(4);
+        route_message(
+            json!({ "jsonrpc": "2.0", "id": 99, "result": {} }),
+            pending,
+            events,
+        )
+        .await;
+
+        assert_eq!(
+            receiver.recv().await.expect("protocol violation"),
+            AcpEvent::ProtocolViolation {
+                code: "unknown-response-id".into()
+            }
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cursor_shim_launch_is_quoted_without_shell_injection() {
+        let command = windows_command_line(
+            Path::new(r"C:\Program Files\Cursor Agent\agent.cmd"),
+            &["acp".into(), "value with spaces".into(), "&whoami".into()],
+        );
+        assert_eq!(
+            command,
+            r#""C:\Program Files\Cursor Agent\agent.cmd" "acp" "value with spaces" "&whoami""#
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cursor_shim_prefers_sibling_powershell_for_duplex_stdio() {
+        let directory =
+            std::env::temp_dir().join(format!("ai-integrator-acp-launch-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("create launcher fixture");
+        let batch = directory.join("agent.cmd");
+        let powershell = directory.join("agent.ps1");
+        std::fs::write(&batch, "@echo off\r\n").expect("write batch fixture");
+        std::fs::write(&powershell, "exit 0\r\n").expect("write PowerShell fixture");
+
+        let command = launch_command(&batch, &["acp".into()]);
+        let standard = command.as_std();
+        assert!(
+            standard
+                .get_program()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with("powershell.exe")
+        );
+        assert!(
+            standard
+                .get_args()
+                .any(|argument| argument == powershell.as_os_str())
+        );
+        assert!(standard.get_args().any(|argument| argument == "acp"));
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

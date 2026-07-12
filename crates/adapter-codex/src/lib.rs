@@ -176,6 +176,14 @@ impl CodexClient {
             .await
     }
 
+    /// Reads the account's subscription rate-limit windows. Codex is the only
+    /// provider that publishes quota (`usedPercent`, `resetsAt`) first-class;
+    /// callers persist it so the UI can show subscription pressure without
+    /// inferring it.
+    pub async fn read_rate_limits(&self) -> Result<Value> {
+        self.request("account/rateLimits/read", json!({})).await
+    }
+
     pub async fn list_threads(&self, cursor: Option<String>, limit: u32) -> Result<Value> {
         if !(1..=100).contains(&limit) {
             return Err(IntegratorError::InvalidInput(
@@ -198,7 +206,54 @@ impl CodexClient {
         .await
     }
 
-    pub async fn start_thread(&self, cwd: &Path, model: Option<&str>) -> Result<Value> {
+    pub async fn start_thread(
+        &self,
+        cwd: &Path,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+    ) -> Result<Value> {
+        self.start_thread_with_policies(cwd, model, reasoning_effort, "on-request", "workspace-write")
+            .await
+    }
+
+    /// `approval_policy` variant used for delegated subagent threads: those
+    /// run unattended, so `"never"` keeps them inside the workspace-write
+    /// sandbox instead of blocking forever on an approval nobody answers.
+    pub async fn start_thread_with_approval(
+        &self,
+        cwd: &Path,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+        approval_policy: &str,
+    ) -> Result<Value> {
+        self.start_thread_with_policies(cwd, model, reasoning_effort, approval_policy, "workspace-write")
+            .await
+    }
+
+    /// Full policy control for user-selected permission profiles. Both values
+    /// are validated against the app-server vocabulary so a stale UI string
+    /// cannot smuggle in an unexpected policy.
+    pub async fn start_thread_with_policies(
+        &self,
+        cwd: &Path,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+        approval_policy: &str,
+        sandbox: &str,
+    ) -> Result<Value> {
+        if !matches!(
+            approval_policy,
+            "untrusted" | "on-request" | "on-failure" | "never"
+        ) {
+            return Err(IntegratorError::InvalidInput(
+                "unsupported approval policy".into(),
+            ));
+        }
+        if !matches!(sandbox, "read-only" | "workspace-write" | "danger-full-access") {
+            return Err(IntegratorError::InvalidInput(
+                "unsupported sandbox mode".into(),
+            ));
+        }
         if !cwd.is_dir() {
             return Err(IntegratorError::InvalidInput(
                 "thread working directory does not exist".into(),
@@ -206,13 +261,16 @@ impl CodexClient {
         }
         let mut params = json!({
             "cwd": cwd.to_string_lossy(),
-            "approvalPolicy": "on-request",
-            "sandbox": "workspace-write"
+            "approvalPolicy": approval_policy,
+            "sandbox": sandbox
         });
         if let Some(model) = model {
             // "model": null makes the app-server fall back to "Auto", which
             // ChatGPT-account sessions reject — omit the key entirely instead.
             params["model"] = Value::String(model.into());
+        }
+        if let Some(effort) = reasoning_effort {
+            params["reasoningEffort"] = Value::String(effort.into());
         }
         self.request("thread/start", params).await
     }
@@ -271,18 +329,29 @@ impl CodexClient {
     }
 
     async fn initialize(&self, client_version: &str) -> Result<Value> {
-        self.request(
-            "initialize",
-            json!({
-                "clientInfo": {
-                    "name": "ai-integrator",
-                    "title": "AI Integrator",
-                    "version": client_version
-                },
-                "capabilities": { "experimentalApi": false }
-            }),
-        )
-        .await
+        let response = self
+            .request(
+                "initialize",
+                json!({
+                    "clientInfo": {
+                        "name": "ai-integrator",
+                        "title": "AI Integrator",
+                        "version": client_version
+                    },
+                    "capabilities": { "experimentalApi": false }
+                }),
+            )
+            .await?;
+
+        // Codex app-server completes the JSON-RPC handshake only after this
+        // notification.
+        self.write_message(json!({
+            "method": "initialized",
+            "params": {}
+        }))
+        .await?;
+
+        Ok(response)
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value> {

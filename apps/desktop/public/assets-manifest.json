@@ -12,6 +12,56 @@
       "dimensions": "400x277",
       "approved": true,
       "notes": "First-party raster source retained without modification. A padded vector master is still required before final platform icon generation."
+    },
+    {
+      "path": "brand/providers/openai.png",
+      "kind": "provider-favicon",
+      "purpose": "Codex provider identity in runtime and model selectors",
+      "source": "https://www.google.com/s2/favicons?domain=openai.com&sz=64",
+      "sha256": "2FF9B8CFCA7058061442EB0FBF62141A1C15EBC64F4D4FC17137CBFDD4F753A5",
+      "dimensions": "64x64",
+      "approved": true,
+      "notes": "Official OpenAI domain favicon resolved through Google's favicon endpoint."
+    },
+    {
+      "path": "brand/providers/cursor.ico",
+      "kind": "provider-favicon",
+      "purpose": "Cursor provider identity in runtime and model selectors",
+      "source": "https://cursor.com/favicon.ico",
+      "sha256": "0F128813AE8F4360FBE6B5C85E5E9D13B25C6B54DA5E9F57FD8F19F965BDA773",
+      "dimensions": "256x256",
+      "approved": true,
+      "notes": "Downloaded from Cursor's official favicon endpoint."
+    },
+    {
+      "path": "brand/providers/anthropic.ico",
+      "kind": "provider-favicon",
+      "purpose": "Claude Code provider identity in runtime and model selectors",
+      "source": "https://www.anthropic.com/favicon.ico",
+      "sha256": "45FA55283B0671B71451D4E067932E3D4AE57EEB7B59582C4C3C1AB21558B0A4",
+      "dimensions": "48x48",
+      "approved": true,
+      "notes": "Downloaded from Anthropic's official favicon endpoint."
+    },
+    {
+      "path": "brand/providers/gemini.png",
+      "kind": "provider-favicon",
+      "purpose": "Gemini provider identity in runtime and model selectors",
+      "source": "https://www.google.com/s2/favicons?domain=gemini.google.com&sz=64",
+      "sha256": "69DDB188BF3705889BD16C26F945EFC878556CB5AE926A645FD33B3EC8E053AB",
+      "dimensions": "64x64",
+      "approved": true,
+      "notes": "Official Gemini domain favicon resolved through Google's favicon endpoint."
+    },
+    {
+      "path": "brand/providers/xai.ico",
+      "kind": "provider-favicon",
+      "purpose": "Grok provider identity in runtime and model selectors",
+      "source": "https://x.ai/favicon.ico",
+      "sha256": "FB0AD1C3708C11CD6C569608F4FC14FD5D51A5B29EB9309CF83916D40D0B6852",
+      "dimensions": "48x48",
+      "approved": true,
+      "notes": "Downloaded from xAI's official favicon endpoint."
     }
   ]
 }

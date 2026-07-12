@@ -1,5 +1,5 @@
-import { useMemo, useRef, useState } from "react";
-import { AnimatePresence, motion } from "motion/react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence, LayoutGroup, motion, useReducedMotion } from "motion/react";
 import {
   Archive,
   ArchiveRestore,
@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 import type { ProjectSummary, TaskSummary } from "../bridge";
 import { BrandMark } from "./BrandMark";
+import { ResizeHandle } from "./ResizeHandle";
 
 interface TaskSidebarProps {
   projects: ProjectSummary[];
@@ -32,12 +33,14 @@ interface TaskSidebarProps {
   onSelectProject: (projectId: string) => void;
   onSelectTask: (taskId: string) => void;
   onNewTask: () => void;
+  onNewTaskInProject?: (projectId: string) => void;
   onOpenProject: () => void;
   onUpdateTask: (
     taskId: string,
     patch: { title?: string; pinned?: boolean; archived?: boolean },
   ) => void;
   onOpenSettings: () => void;
+  onResize?: (delta: number) => void;
 }
 
 const statusLabel: Record<TaskSummary["status"], string> = {
@@ -50,9 +53,73 @@ const statusLabel: Record<TaskSummary["status"], string> = {
   stopped: "Stopped",
 };
 
+const ACTIVE_STATUSES = new Set<TaskSummary["status"]>([
+  "starting",
+  "running",
+  "waiting",
+  "failed",
+]);
+
 function sortTasks(tasks: TaskSummary[]): TaskSummary[] {
   return [...tasks].sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
 }
+
+function isApplePlatform(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const platform =
+    (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform ??
+    navigator.platform ??
+    "";
+  return /mac|iphone|ipad|ipod/i.test(platform);
+}
+
+function modKeyLabel(): string {
+  return isApplePlatform() ? "⌘" : "Ctrl";
+}
+
+function formatRelativeUpdated(value: string): string {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return "";
+  const deltaMs = Date.now() - timestamp;
+  if (deltaMs < 45_000) return "Just now";
+  const minutes = Math.round(deltaMs / 60_000);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  return new Date(timestamp).toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+  });
+}
+
+function chatMeta(
+  task: TaskSummary,
+  options?: { showProject?: boolean; projectName?: string },
+): string {
+  const prefix = options?.showProject ? `${options.projectName ?? "Project"} · ` : "";
+  if (ACTIVE_STATUSES.has(task.status)) return `${prefix}${statusLabel[task.status]}`;
+  const relative = formatRelativeUpdated(task.updatedAt);
+  return relative ? `${prefix}${relative}` : `${prefix}${statusLabel[task.status]}`;
+}
+
+const expandTransition = {
+  duration: 0.22,
+  ease: [0.2, 0.8, 0.2, 1] as const,
+};
+
+const menuTransition = {
+  duration: 0.16,
+  ease: [0.2, 0, 0, 1] as const,
+};
+
+const activeSpring = {
+  type: "spring" as const,
+  stiffness: 460,
+  damping: 38,
+  mass: 0.7,
+};
 
 export function TaskSidebar({
   projects,
@@ -67,19 +134,51 @@ export function TaskSidebar({
   onSelectProject,
   onSelectTask,
   onNewTask,
+  onNewTaskInProject,
   onOpenProject,
   onUpdateTask,
   onOpenSettings,
+  onResize,
 }: TaskSidebarProps) {
+  const reduceMotion = useReducedMotion();
   const [query, setQuery] = useState("");
-  const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>({});
+  const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>(() =>
+    activeProjectId ? { [activeProjectId]: true } : {},
+  );
   const [openMenuId, setOpenMenuId] = useState("");
   const [renamingId, setRenamingId] = useState("");
   const [renameValue, setRenameValue] = useState("");
   const [showArchived, setShowArchived] = useState(false);
   const chatListRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const mod = modKeyLabel();
 
-  const activeProject = projects.find((project) => project.id === activeProjectId);
+  // Adjust-during-render (not an effect): the active project's group opens
+  // the moment it changes, without an extra committed render in between.
+  const [lastActiveProjectId, setLastActiveProjectId] = useState(activeProjectId);
+  if (activeProjectId !== lastActiveProjectId) {
+    setLastActiveProjectId(activeProjectId);
+    if (activeProjectId && !expandedProjects[activeProjectId]) {
+      setExpandedProjects({ ...expandedProjects, [activeProjectId]: true });
+    }
+  }
+
+  useEffect(() => {
+    if (!openMenuId) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (!menuRef.current?.contains(event.target as Node)) setOpenMenuId("");
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpenMenuId("");
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [openMenuId]);
+
   const normalizedQuery = query.trim().toLowerCase();
   const searchResults = useMemo(
     () =>
@@ -93,21 +192,20 @@ export function TaskSidebar({
         : [],
     [normalizedQuery, projects, tasks],
   );
-  const projectTasks = useMemo(
-    () => sortTasks(tasks.filter((task) => task.projectId === activeProjectId)),
-    [activeProjectId, tasks],
-  );
-  const pinnedTasks = projectTasks.filter((task) => task.pinned && !task.archived);
-  const recentTasks = projectTasks.filter((task) => !task.pinned && !task.archived);
-  const archivedTasks = projectTasks.filter((task) => task.archived);
-  const displayedSections = normalizedQuery
-    ? [{ label: "Search results", tasks: searchResults }]
-    : showArchived
-      ? [{ label: "Archived", tasks: archivedTasks }]
-      : [
-          { label: "Pinned", tasks: pinnedTasks },
-          { label: "Recent chats", tasks: recentTasks },
-        ];
+
+  const tasksByProject = useMemo(() => {
+    const map = new Map<string, TaskSummary[]>();
+    for (const project of projects) map.set(project.id, []);
+    for (const task of tasks) {
+      const list = map.get(task.projectId);
+      if (list) list.push(task);
+      else map.set(task.projectId, [task]);
+    }
+    for (const [id, list] of map) map.set(id, sortTasks(list));
+    return map;
+  }, [projects, tasks]);
+
+  const archivedCount = useMemo(() => tasks.filter((task) => task.archived).length, [tasks]);
 
   const focusRelativeChat = (direction: 1 | -1) => {
     const buttons = Array.from(
@@ -136,13 +234,22 @@ export function TaskSidebar({
     setRenamingId("");
   };
 
-  const renderChat = (task: TaskSummary) => {
+  const chatsForProject = (projectId: string): TaskSummary[] => {
+    const all = tasksByProject.get(projectId) ?? [];
+    if (showArchived) return all.filter((task) => task.archived);
+    const pinned = all.filter((task) => task.pinned && !task.archived);
+    const recent = all.filter((task) => !task.pinned && !task.archived);
+    return [...pinned, ...recent];
+  };
+
+  const renderChat = (task: TaskSummary, options?: { showProject?: boolean; nested?: boolean }) => {
     const project = projects.find((candidate) => candidate.id === task.projectId);
     const busy = taskActionBusyId === task.id;
+    const active = task.id === activeTaskId;
     if (renamingId === task.id) {
       return (
         <form
-          className="chat-rename-row"
+          className={`chat-rename-row${options?.nested ? " chat-rename-row--nested" : ""}`}
           key={task.id}
           onSubmit={(event) => {
             event.preventDefault();
@@ -163,20 +270,44 @@ export function TaskSidebar({
       );
     }
     return (
-      <div className="chat-row-shell" data-active={task.id === activeTaskId} key={task.id}>
+      <div
+        className={`chat-row-shell${options?.nested ? " chat-row-shell--nested" : ""}${options?.showProject ? " chat-row-shell--search" : ""}`}
+        data-active={active}
+        data-menu-open={openMenuId === task.id}
+        key={task.id}
+      >
+        {active ? (
+          <motion.span
+            className="chat-row-active"
+            layoutId={reduceMotion ? undefined : "sidebar-active-chat"}
+            transition={reduceMotion ? { duration: 0 } : activeSpring}
+            aria-hidden="true"
+          />
+        ) : null}
         <button
           className="chat-row"
           data-chat-select
           type="button"
           onClick={() => onSelectTask(task.id)}
-          aria-current={task.id === activeTaskId ? "page" : undefined}
+          aria-current={active ? "page" : undefined}
+          title={chatMeta(task, {
+            showProject: options?.showProject,
+            projectName: project?.name,
+          })}
+          data-status={task.status}
         >
-          <span className={`status-dot status-dot--${task.status}`} aria-hidden="true" />
+          <span
+            className={`status-dot status-dot--${task.status}`}
+            role="img"
+            aria-label={`Status: ${task.status}`}
+          />
           <span className="chat-row-copy">
             <span>{task.title}</span>
             <small>
-              {normalizedQuery ? `${project?.name ?? "Project"} · ` : ""}
-              {statusLabel[task.status]}
+              {chatMeta(task, {
+                showProject: options?.showProject,
+                projectName: project?.name,
+              })}
             </small>
           </span>
           {task.pinned ? <Pin className="chat-pin" aria-label="Pinned" /> : null}
@@ -198,10 +329,11 @@ export function TaskSidebar({
             <motion.div
               className="chat-action-menu"
               role="menu"
-              initial={{ opacity: 0, y: -4, scale: 0.98 }}
+              ref={menuRef}
+              initial={reduceMotion ? false : { opacity: 0, y: -4, scale: 0.98 }}
               animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, y: -3, scale: 0.98 }}
-              transition={{ duration: 0.12 }}
+              exit={reduceMotion ? undefined : { opacity: 0, y: -3, scale: 0.98 }}
+              transition={menuTransition}
             >
               <button
                 role="menuitem"
@@ -267,6 +399,9 @@ export function TaskSidebar({
         >
           <Settings />
         </button>
+        {onResize ? (
+          <ResizeHandle axis="horizontal" label="Resize chat sidebar" onResize={onResize} />
+        ) : null}
       </aside>
     );
   }
@@ -285,11 +420,17 @@ export function TaskSidebar({
         </button>
       </div>
 
-      <button className="new-task-button" type="button" onClick={onNewTask}>
+      <motion.button
+        className="new-task-button"
+        type="button"
+        onClick={onNewTask}
+        whileTap={reduceMotion ? undefined : { scale: 0.985 }}
+        transition={{ duration: 0.12 }}
+      >
         <Plus aria-hidden="true" />
         <span>New chat</span>
-        <kbd>Ctrl N</kbd>
-      </button>
+        <kbd>{mod} N</kbd>
+      </motion.button>
 
       <label className="sidebar-search">
         <Search aria-hidden="true" />
@@ -309,10 +450,19 @@ export function TaskSidebar({
           }}
           placeholder="Search chats"
         />
-        <kbd>⌘ K</kbd>
+        <kbd>{mod} K</kbd>
       </label>
 
-      <div className="sidebar-scroll">
+      <div
+        className="sidebar-scroll"
+        ref={chatListRef}
+        onKeyDown={(event) => {
+          if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault();
+            focusRelativeChat(event.key === "ArrowDown" ? 1 : -1);
+          }
+        }}
+      >
         <div className="rail-section-heading">
           <span>Projects</span>
           <button
@@ -326,116 +476,113 @@ export function TaskSidebar({
             <Plus />
           </button>
         </div>
-        <div className="project-switcher" aria-label="Projects">
-          {projects.map((project) => {
-            const expanded = expandedProjects[project.id] ?? false;
-            const count = tasks.filter(
-              (task) => task.projectId === project.id && !task.archived,
-            ).length;
-            return (
-              <div
-                className="project-switch-row"
-                data-active={project.id === activeProjectId}
-                key={project.id}
-              >
-                <button
-                  className="project-disclosure"
-                  type="button"
-                  aria-label={`${expanded ? "Collapse" : "Expand"} ${project.name}`}
-                  aria-expanded={expanded}
-                  onClick={() =>
-                    setExpandedProjects((current) => ({
-                      ...current,
-                      [project.id]: !expanded,
-                    }))
-                  }
-                >
-                  <ChevronDown
-                    className={expanded ? "disclosure disclosure--open" : "disclosure"}
-                  />
-                </button>
-                <button
-                  className="project-select-button"
-                  type="button"
-                  onClick={() => onSelectProject(project.id)}
-                  aria-label={`Open project ${project.name}`}
-                  aria-current={project.id === activeProjectId ? "true" : undefined}
-                >
-                  <Folder />
-                  <span>{project.name}</span>
-                  <small>{count}</small>
-                </button>
-                <AnimatePresence initial={false}>
-                  {expanded ? (
-                    <motion.div
-                      className="project-switch-detail"
-                      initial={{ height: 0, opacity: 0 }}
-                      animate={{ height: "auto", opacity: 1 }}
-                      exit={{ height: 0, opacity: 0 }}
-                      transition={{ duration: 0.14 }}
-                    >
-                      <span>{project.branch || "Local repository"}</span>
-                      <button type="button" onClick={() => onSelectProject(project.id)}>
-                        Open chats
-                      </button>
-                    </motion.div>
-                  ) : null}
-                </AnimatePresence>
-              </div>
-            );
-          })}
-          {projects.length === 0 ? (
-            <button className="sidebar-empty-project" type="button" onClick={onOpenProject}>
-              <Folder />
-              <span>
-                <strong>Open your first project</strong>
-                <small>Choose a local Git repository</small>
-              </span>
-            </button>
-          ) : null}
-        </div>
 
-        <div
-          className="chat-list"
-          ref={chatListRef}
-          onKeyDown={(event) => {
-            if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-              event.preventDefault();
-              focusRelativeChat(event.key === "ArrowDown" ? 1 : -1);
-            }
-          }}
-        >
-          {displayedSections.map((section) =>
-            section.tasks.length > 0 ? (
-              <section className="chat-section" key={section.label}>
-                <div className="rail-section-heading rail-section-heading--later">
-                  <span>{section.label}</span>
-                  <small>{section.tasks.length}</small>
+        <LayoutGroup id="sidebar-chats">
+          {normalizedQuery ? (
+            <section className="chat-section" aria-label="Search results">
+              <div className="rail-section-heading rail-section-heading--later">
+                <span>Search results</span>
+                <small>{searchResults.length}</small>
+              </div>
+              {searchResults.length ? (
+                searchResults.map((task) => renderChat(task, { showProject: true }))
+              ) : (
+                <div className="sidebar-chat-empty" role="status">
+                  <History />
+                  <strong>No matching chats</strong>
+                  <span>Try a project name or a shorter phrase.</span>
                 </div>
-                {section.tasks.map(renderChat)}
-              </section>
-            ) : null,
-          )}
-          {displayedSections.every((section) => section.tasks.length === 0) ? (
-            <div className="sidebar-chat-empty" role="status">
-              <History />
-              <strong>
-                {normalizedQuery
-                  ? "No matching chats"
-                  : showArchived
-                    ? "No archived chats"
-                    : "No chats yet"}
-              </strong>
-              <span>
-                {normalizedQuery
-                  ? "Try a project name or a shorter phrase."
-                  : showArchived
-                    ? "Archived chats will appear here."
-                    : `Start a chat in ${activeProject?.name ?? "this project"}.`}
-              </span>
+              )}
+            </section>
+          ) : (
+            <div className="project-tree" aria-label="Projects">
+              {projects.map((project) => {
+                const expanded = expandedProjects[project.id] ?? false;
+                const projectChats = chatsForProject(project.id);
+                const visibleCount = showArchived
+                  ? projectChats.length
+                  : (tasksByProject.get(project.id) ?? []).filter((task) => !task.archived).length;
+                return (
+                  <div
+                    className="project-group"
+                    data-active={project.id === activeProjectId}
+                    key={project.id}
+                  >
+                    <div className="project-group-header">
+                      <button
+                        className="project-disclosure"
+                        type="button"
+                        aria-label={`${expanded ? "Collapse" : "Expand"} ${project.name}`}
+                        aria-expanded={expanded}
+                        onClick={() =>
+                          setExpandedProjects((current) => ({
+                            ...current,
+                            [project.id]: !expanded,
+                          }))
+                        }
+                      >
+                        <ChevronDown
+                          className={expanded ? "disclosure disclosure--open" : "disclosure"}
+                        />
+                      </button>
+                      <button
+                        className="project-select-button"
+                        type="button"
+                        onClick={() => onSelectProject(project.id)}
+                        aria-label={`Open project ${project.name}`}
+                        aria-current={project.id === activeProjectId ? "true" : undefined}
+                      >
+                        <Folder />
+                        <span>{project.name}</span>
+                        <small>{visibleCount}</small>
+                      </button>
+                      {onNewTaskInProject ? (
+                        <button
+                          className="project-new-chat"
+                          type="button"
+                          aria-label={`New chat in ${project.name}`}
+                          title={`New chat in ${project.name}`}
+                          onClick={() => onNewTaskInProject(project.id)}
+                        >
+                          <Plus aria-hidden="true" />
+                        </button>
+                      ) : null}
+                    </div>
+                    <AnimatePresence initial={false}>
+                      {expanded ? (
+                        <motion.div
+                          className="project-chat-list"
+                          data-menu-open={openMenuId ? "true" : "false"}
+                          initial={reduceMotion ? false : { height: 0, opacity: 0 }}
+                          animate={{ height: "auto", opacity: 1 }}
+                          exit={reduceMotion ? undefined : { height: 0, opacity: 0 }}
+                          transition={expandTransition}
+                        >
+                          {projectChats.length ? (
+                            projectChats.map((task) => renderChat(task, { nested: true }))
+                          ) : (
+                            <p className="project-chat-empty" role="status">
+                              {showArchived ? "No archived chats" : "No chats yet"}
+                            </p>
+                          )}
+                        </motion.div>
+                      ) : null}
+                    </AnimatePresence>
+                  </div>
+                );
+              })}
+              {projects.length === 0 ? (
+                <button className="sidebar-empty-project" type="button" onClick={onOpenProject}>
+                  <Folder />
+                  <span>
+                    <strong>Open your first project</strong>
+                    <small>Choose a local Git repository</small>
+                  </span>
+                </button>
+              ) : null}
             </div>
-          ) : null}
-        </div>
+          )}
+        </LayoutGroup>
 
         <button
           className="utility-row archived-toggle"
@@ -445,7 +592,7 @@ export function TaskSidebar({
         >
           <Archive />
           <span>{showArchived ? "Back to chats" : "Archived"}</span>
-          {archivedTasks.length ? <small>{archivedTasks.length}</small> : null}
+          {archivedCount ? <small>{archivedCount}</small> : null}
         </button>
       </div>
 
@@ -461,6 +608,9 @@ export function TaskSidebar({
           <small>Appearance, agents, Git</small>
         </span>
       </button>
+      {onResize ? (
+        <ResizeHandle axis="horizontal" label="Resize chat sidebar" onResize={onResize} />
+      ) : null}
     </aside>
   );
 }

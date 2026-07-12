@@ -1,14 +1,29 @@
 #![forbid(unsafe_code)]
 
+mod broker_mcp;
 mod commands;
+mod delegation;
 mod state;
 
 use commands::*;
+use delegation::{
+    delegation_approve, delegation_deny, delegation_list, delegation_send_message,
+    delegation_stop_cmd,
+};
 use state::AppState;
 use tauri::Manager;
 
+/// `--broker-mcp` mode: run the stdio MCP bridge instead of the app. Spawned
+/// by provider CLIs; must never touch Tauri or the local store.
+pub fn run_broker_mcp() -> i32 {
+    broker_mcp::run()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // rustls 0.23 panics on the first TLS connection (voice typing's
+    // websocket) unless a process-wide crypto provider is installed.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     tauri::Builder::default()
         // A second launch focuses the existing window instead of spawning a
         // competing process against the same local store.
@@ -25,26 +40,45 @@ pub fn run() {
                 boxed
             })?;
             app.manage(state);
+            delegation::start_broker_host(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             app_bootstrap,
+            open_external_url,
             provider_discover,
             task_create,
             task_list,
             task_set_state,
             task_update_metadata,
+            task_update_routing,
             setting_list,
             setting_set,
             session_list,
             local_export,
+            local_clear,
+            storage_totals,
+            usage_summary,
+            voice_typing_credential_status,
+            voice_typing_credential_set,
+            voice_typing_credential_clear,
+            voice_typing_start,
+            voice_typing_append,
+            voice_typing_stop,
             project_register,
+            project_create,
             project_list,
             project_remove,
             git_repository,
             git_worktrees,
             git_worktree_create,
+            project_file_list,
+            project_file_read,
             git_status,
+            terminal_open,
+            terminal_run,
+            terminal_interrupt,
+            terminal_close,
             git_diff,
             git_stage,
             git_unstage,
@@ -62,9 +96,17 @@ pub fn run() {
             task_snapshot,
             codex_respond_approval,
             codex_stop_turn,
-            cursor_connect,
-            cursor_start_session,
-            cursor_send_turn,
+            acp_connect,
+            acp_start_session,
+            acp_send_turn,
+            acp_set_config_option,
+            acp_list_cursor_models,
+            structured_cli_start_turn,
+            delegation_list,
+            delegation_approve,
+            delegation_deny,
+            delegation_send_message,
+            delegation_stop_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run AI Integrator");

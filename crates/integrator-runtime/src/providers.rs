@@ -31,21 +31,23 @@ fn definitions() -> [ProbeDefinition; 5] {
             transport: ProviderTransport::JsonlStdio,
         },
         ProbeDefinition {
-            provider: ProviderKind::Gemini,
-            executables: &["gemini"],
+            provider: ProviderKind::Antigravity,
+            executables: &["agy"],
             version_args: &["--version"],
-            transport: ProviderTransport::AcpStdio,
+            transport: ProviderTransport::JsonlStdio,
         },
         ProbeDefinition {
             provider: ProviderKind::Cursor,
-            executables: &["cursor-agent", "agent"],
+            // Cursor documents `agent` as the primary CLI entrypoint and
+            // keeps `cursor-agent` as a compatibility alias.
+            executables: &["agent", "cursor-agent"],
             version_args: &["--version"],
             transport: ProviderTransport::AcpStdio,
         },
         ProbeDefinition {
             provider: ProviderKind::Grok,
             executables: &["grok"],
-            version_args: &["--version"],
+            version_args: &["version"],
             transport: ProviderTransport::AcpStdio,
         },
     ]
@@ -55,7 +57,8 @@ fn discover_one(definition: ProbeDefinition) -> ProviderStatus {
     let executable = definition
         .executables
         .iter()
-        .find_map(|candidate| which::which(candidate).ok());
+        .find_map(|candidate| which::which(candidate).ok().map(prefer_windows_launcher))
+        .or_else(|| find_known_install(&definition.provider));
     let Some(executable) = executable else {
         return ProviderStatus {
             provider: definition.provider,
@@ -86,6 +89,47 @@ fn discover_one(definition: ProbeDefinition) -> ProviderStatus {
         authentication,
         transport: Some(definition.transport),
         diagnostic_code: auth_code.or(probe_code),
+    }
+}
+
+/// Fallback for processes launched with a stale `PATH` (e.g. a dev shell or
+/// IDE opened before the CLI's installer added its PATH entry): probe the
+/// provider's documented default install locations directly.
+fn prefer_windows_launcher(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if path.extension().is_none() {
+            for extension in ["cmd", "bat", "exe"] {
+                let candidate = path.with_extension(extension);
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+    }
+    path
+}
+
+fn find_known_install(provider: &ProviderKind) -> Option<PathBuf> {
+    known_install_candidates(provider)
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+}
+
+fn known_install_candidates(provider: &ProviderKind) -> Vec<PathBuf> {
+    match provider {
+        ProviderKind::Cursor => {
+            let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+                return Vec::new();
+            };
+            let root = PathBuf::from(local_app_data).join("cursor-agent");
+            vec![
+                root.join("agent.cmd"),
+                root.join("cursor-agent.cmd"),
+                root.join("dist-package").join("cursor-agent.cmd"),
+            ]
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -133,20 +177,66 @@ fn authentication_status(
                 ),
             }
         }
-        ProviderKind::Gemini
-        | ProviderKind::Cursor
-        | ProviderKind::Grok
-        | ProviderKind::CustomAcp => (AuthenticationState::Unknown, Some("auth-not-probed".into())),
+        // `agy` exposes no auth-status command and its `models` panel needs a
+        // TTY, so the probe checks the on-disk Google OAuth credential the
+        // CLI itself maintains (`~/.gemini/oauth_creds.json`, cleared by
+        // `/logout`). This can read stale until agy's next refresh, so a
+        // present credential reports Authenticated with that caveat.
+        ProviderKind::Antigravity => match antigravity_credentials_path() {
+            Some(path) if path.is_file() => (AuthenticationState::Authenticated, None),
+            Some(_) => (
+                AuthenticationState::LoggedOut,
+                Some("login-required".into()),
+            ),
+            None => (
+                AuthenticationState::Unknown,
+                Some("auth-probe-failed".into()),
+            ),
+        },
+        ProviderKind::Cursor => match run_bounded(executable, &["status"], None) {
+            Ok(output) => {
+                let combined = format!("{} {}", output.stdout, output.stderr);
+                parse_cli_auth_text(&combined)
+            }
+            Err(_) => (
+                AuthenticationState::Unknown,
+                Some("auth-probe-failed".into()),
+            ),
+        },
+        ProviderKind::Grok | ProviderKind::CustomAcp => {
+            (AuthenticationState::Unknown, Some("auth-not-probed".into()))
+        }
     }
 }
 
+fn antigravity_credentials_path() -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    Some(PathBuf::from(home).join(".gemini").join("oauth_creds.json"))
+}
+
 fn parse_codex_auth_text(value: &str) -> (AuthenticationState, Option<String>) {
+    parse_cli_auth_text(value)
+}
+
+fn parse_cli_auth_text(value: &str) -> (AuthenticationState, Option<String>) {
+    let value = value.to_ascii_lowercase();
     if value.contains("not logged in") || value.contains("logged out") {
         (
             AuthenticationState::LoggedOut,
             Some("login-required".into()),
         )
-    } else if value.contains("logged in") {
+    } else if value.contains("not authenticated")
+        || value.contains("not signed in")
+        || value.contains("login required")
+    {
+        (
+            AuthenticationState::LoggedOut,
+            Some("login-required".into()),
+        )
+    } else if value.contains("logged in")
+        || value.contains("authenticated")
+        || value.contains("signed in")
+    {
         (AuthenticationState::Authenticated, None)
     } else {
         (
@@ -190,12 +280,60 @@ mod tests {
         let providers = definitions().map(|definition| definition.provider);
         assert!(providers.contains(&ProviderKind::Codex));
         assert!(providers.contains(&ProviderKind::Claude));
-        assert!(providers.contains(&ProviderKind::Gemini));
+        assert!(providers.contains(&ProviderKind::Antigravity));
+    }
+
+    #[test]
+    fn current_cli_entrypoints_are_preferred() {
+        let cursor = definitions()
+            .into_iter()
+            .find(|definition| definition.provider == ProviderKind::Cursor)
+            .expect("Cursor definition");
+        assert_eq!(cursor.executables, &["agent", "cursor-agent"]);
+
+        let grok = definitions()
+            .into_iter()
+            .find(|definition| definition.provider == ProviderKind::Grok)
+            .expect("Grok Build definition");
+        assert_eq!(grok.version_args, &["version"]);
+    }
+
+    #[test]
+    fn cursor_known_install_candidates_use_local_app_data() {
+        if std::env::var_os("LOCALAPPDATA").is_none() {
+            return;
+        }
+        let candidates = known_install_candidates(&ProviderKind::Cursor);
+        assert!(!candidates.is_empty());
+        assert!(candidates.iter().all(|path| {
+            path.components()
+                .any(|part| part.as_os_str().to_string_lossy() == "cursor-agent")
+        }));
+    }
+
+    #[test]
+    fn non_cursor_providers_have_no_known_install_fallback() {
+        assert!(known_install_candidates(&ProviderKind::Codex).is_empty());
+        assert!(known_install_candidates(&ProviderKind::Claude).is_empty());
     }
 
     #[test]
     fn logged_out_text_is_not_misclassified_as_logged_in() {
         let (state, code) = parse_codex_auth_text("not logged in");
+        assert_eq!(state, AuthenticationState::LoggedOut);
+        assert_eq!(code.as_deref(), Some("login-required"));
+    }
+
+    #[test]
+    fn cursor_status_text_maps_to_authenticated() {
+        let (state, code) = parse_cli_auth_text("Logged in");
+        assert_eq!(state, AuthenticationState::Authenticated);
+        assert_eq!(code, None);
+    }
+
+    #[test]
+    fn cursor_status_text_maps_to_logged_out() {
+        let (state, code) = parse_cli_auth_text("Not authenticated. Run agent login.");
         assert_eq!(state, AuthenticationState::LoggedOut);
         assert_eq!(code.as_deref(), Some("login-required"));
     }

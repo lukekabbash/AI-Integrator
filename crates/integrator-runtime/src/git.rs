@@ -113,6 +113,17 @@ impl GitService {
         })
     }
 
+    /// Initialize a fresh repository in an existing empty directory and
+    /// return its identity so it can be registered like any opened project.
+    pub fn init(&self, directory: &Path) -> Result<RepositoryIdentity> {
+        let directory = canonical_directory(directory)?;
+        self.required(&directory, &["init"])?;
+        // Normalize the unborn default branch to `main` regardless of the
+        // user's init.defaultBranch; best-effort on older git versions.
+        let _ = self.optional(&directory, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        self.repository(&directory)
+    }
+
     pub fn worktrees(&self, repository: &Path) -> Result<Vec<WorktreeInfo>> {
         let output = self.required(repository, &["worktree", "list", "--porcelain"])?;
         Ok(parse_worktrees(&output)

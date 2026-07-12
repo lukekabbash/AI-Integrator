@@ -17,7 +17,9 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 anyhow = "1"
+base64 = "0.22"
 async-trait = "0.1"
+futures-util = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6"
 dunce = "1"
@@ -29,6 +31,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["serde", "v4"] }
+url = "2"
 which = "8"
 
 [workspace.lints.rust]

@@ -128,6 +128,9 @@ pub struct ItemProjection {
     pub file_changes: Option<Vec<FileChangeProjection>>,
     pub mcp_server: Option<String>,
     pub mcp_tool: Option<String>,
+    /// Redacted, bounded rendering of the tool call's input arguments.
+    #[serde(default)]
+    pub tool_input: Option<String>,
     pub truncated: bool,
     pub updated_at: DateTime<Utc>,
 }
@@ -157,6 +160,11 @@ pub struct UsageProjection {
     pub reasoning_output_tokens: u64,
     pub total_tokens: u64,
     pub model_context_window: Option<u64>,
+    /// Vendor-computed API-equivalent cost in micro-USD (only Claude reports
+    /// one today). Kept as an integer so the projection stays `Eq`; `default`
+    /// keeps usage_json rows persisted before this field deserializable.
+    #[serde(default)]
+    pub vendor_cost_micro_usd: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -328,6 +336,10 @@ pub struct StopRequestResult {
     pub turn_id: String,
     pub stop_requested: bool,
     pub already_requested: bool,
+    /// True when no live provider owned the turn and the store force-marked
+    /// it interrupted so a dead session still stops cleanly.
+    #[serde(default)]
+    pub settled: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

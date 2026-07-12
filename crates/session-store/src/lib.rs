@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -9,13 +10,15 @@ use chrono::{DateTime, Utc};
 use integrator_core::{
     IntegratorError, LocalExport, NewTask, ProjectId, ProviderKind, ProviderSession,
     ProviderSessionId, Result, RuntimeSession, RuntimeSessionId, Setting, Task, TaskId, TaskState,
-    TrustedProject,
+    TrustedProject, UsageProjection,
 };
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
+mod delegation_store;
 mod projection_store;
+pub use delegation_store::NewDelegation;
 pub use projection_store::{PersistedStopRequest, PreparedApprovalResponse};
 
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -193,6 +196,50 @@ const MIGRATIONS: &[(i64, &str)] = &[
             ON tasks(archived, pinned DESC, updated_at DESC);
         "#,
     ),
+    (
+        5,
+        r#"
+        ALTER TABLE tasks ADD COLUMN runtime TEXT;
+        ALTER TABLE tasks ADD COLUMN model TEXT;
+        ALTER TABLE tasks ADD COLUMN effort TEXT;
+        "#,
+    ),
+    (
+        6,
+        r#"
+        ALTER TABLE tasks ADD COLUMN parent_task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE;
+        CREATE INDEX IF NOT EXISTS tasks_parent_idx ON tasks(parent_task_id);
+        CREATE TABLE IF NOT EXISTS delegations (
+            id TEXT PRIMARY KEY,
+            parent_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            child_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+            profile_id TEXT NOT NULL,
+            profile_label TEXT NOT NULL,
+            runtime TEXT NOT NULL,
+            model TEXT,
+            effort TEXT,
+            title TEXT NOT NULL,
+            brief TEXT NOT NULL,
+            status TEXT NOT NULL,
+            result TEXT,
+            child_session_ref TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS delegations_parent_idx
+            ON delegations(parent_task_id, created_at);
+        CREATE TABLE IF NOT EXISTS delegation_messages (
+            id TEXT PRIMARY KEY,
+            delegation_id TEXT NOT NULL REFERENCES delegations(id) ON DELETE CASCADE,
+            sender TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            delivered_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS delegation_messages_queue_idx
+            ON delegation_messages(delegation_id, delivered_at, created_at);
+        "#,
+    ),
 ];
 
 pub struct LocalStore {
@@ -263,6 +310,96 @@ impl LocalStore {
         Ok(())
     }
 
+    /// Delete all user-owned local records while retaining the schema and its
+    /// migration history. The order is intentional: child projection and
+    /// session records are removed before their task and provider parents,
+    /// while foreign-key enforcement remains enabled for the transaction.
+    pub fn clear_all_data(&self) -> Result<()> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(storage_error)?;
+        transaction
+            .execute_batch(
+                "DELETE FROM delegation_messages;
+                 DELETE FROM delegations;
+                 DELETE FROM codex_event_log;
+                 DELETE FROM codex_approvals;
+                 DELETE FROM codex_items;
+                 DELETE FROM codex_turns;
+                 DELETE FROM codex_task_projection;
+                 DELETE FROM runtime_sessions;
+                 DELETE FROM provider_sessions;
+                 DELETE FROM tasks;
+                 DELETE FROM settings;
+                 DELETE FROM trusted_projects;",
+            )
+            .map_err(storage_error)?;
+        transaction.commit().map_err(storage_error)
+    }
+
+    /// Returns the persisted provider usage projections grouped by the runtime
+    /// selected for each task. Missing provider usage remains a zero-valued
+    /// projection so callers can label it as unavailable rather than infer it.
+    pub fn provider_usage_rows(&self) -> Result<Vec<(String, u64, u64, UsageProjection)>> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT COALESCE(tasks.runtime, 'unknown'),
+                       COUNT(DISTINCT codex_turns.turn_id),
+                       codex_task_projection.usage_json
+                FROM tasks
+                LEFT JOIN codex_turns ON codex_turns.task_id = tasks.id
+                LEFT JOIN codex_task_projection ON codex_task_projection.task_id = tasks.id
+                GROUP BY tasks.id, tasks.runtime, codex_task_projection.usage_json
+                "#,
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                let provider = row.get::<_, String>(0)?;
+                let turn_count = row.get::<_, u64>(1)?;
+                let usage_json = row.get::<_, Option<String>>(2)?;
+                let usage = usage_json
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<UsageProjection>(value).ok())
+                    .unwrap_or_default();
+                Ok((provider, turn_count, usage))
+            })
+            .map_err(storage_error)?;
+        let mut grouped: BTreeMap<String, (u64, u64, UsageProjection)> = BTreeMap::new();
+        for row in rows {
+            let (provider, turn_count, usage) = row.map_err(storage_error)?;
+            let entry = grouped
+                .entry(provider)
+                .or_insert_with(|| (0, 0, UsageProjection::default()));
+            entry.0 += 1;
+            entry.1 += turn_count;
+            entry.2.input_tokens += usage.input_tokens;
+            entry.2.cached_input_tokens += usage.cached_input_tokens;
+            entry.2.output_tokens += usage.output_tokens;
+            entry.2.reasoning_output_tokens += usage.reasoning_output_tokens;
+            entry.2.total_tokens += usage.total_tokens;
+            entry.2.model_context_window =
+                match (entry.2.model_context_window, usage.model_context_window) {
+                    (Some(current), Some(next)) => Some(current.max(next)),
+                    (current, next) => current.or(next),
+                };
+            entry.2.vendor_cost_micro_usd =
+                match (entry.2.vendor_cost_micro_usd, usage.vendor_cost_micro_usd) {
+                    (None, None) => None,
+                    (current, next) => {
+                        Some(current.unwrap_or(0).saturating_add(next.unwrap_or(0)))
+                    }
+                };
+        }
+        Ok(grouped
+            .into_iter()
+            .map(|(provider, (task_count, turn_count, usage))| {
+                (provider, task_count, turn_count, usage)
+            })
+            .collect())
+    }
+
     pub fn create_task(&self, input: NewTask) -> Result<Task> {
         let title = input.title.trim();
         if title.is_empty() || title.chars().count() > 240 {
@@ -279,13 +416,17 @@ impl LocalStore {
             state: TaskState::Draft,
             pinned: false,
             archived: false,
+            runtime: normalize_optional_text(input.runtime, 64)?,
+            model: normalize_optional_text(input.model, 120)?,
+            effort: normalize_optional_text(input.effort, 64)?,
+            parent_task_id: input.parent_task_id,
             created_at: now,
             updated_at: now,
         };
         self.connection
             .lock()
             .execute(
-                "INSERT INTO tasks(id, title, repository_path, worktree_path, state, pinned, archived, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO tasks(id, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     task.id.to_string(),
                     task.title,
@@ -294,6 +435,10 @@ impl LocalStore {
                     task.state.as_str(),
                     task.pinned,
                     task.archived,
+                    task.runtime,
+                    task.model,
+                    task.effort,
+                    task.parent_task_id.map(|id| id.to_string()),
                     task.created_at.to_rfc3339(),
                     task.updated_at.to_rfc3339(),
                 ],
@@ -403,7 +548,7 @@ impl LocalStore {
     pub fn list_tasks(&self) -> Result<Vec<Task>> {
         let connection = self.connection.lock();
         let mut statement = connection
-            .prepare("SELECT id, title, repository_path, worktree_path, state, pinned, archived, created_at, updated_at FROM tasks ORDER BY pinned DESC, updated_at DESC")
+            .prepare("SELECT id, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at FROM tasks ORDER BY pinned DESC, updated_at DESC")
             .map_err(storage_error)?;
         let rows = statement
             .query_map([], |row| {
@@ -415,8 +560,12 @@ impl LocalStore {
                     row.get::<_, String>(4)?,
                     row.get::<_, bool>(5)?,
                     row.get::<_, bool>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
                 ))
             })
             .map_err(storage_error)?;
@@ -471,18 +620,61 @@ impl LocalStore {
         self.get_task(task_id)
     }
 
+    /// Persist the composer's last provider/model/effort selection for this chat.
+    pub fn update_task_routing(
+        &self,
+        task_id: TaskId,
+        runtime: &str,
+        model: &str,
+        effort: Option<&str>,
+    ) -> Result<Task> {
+        let runtime = normalize_optional_text(Some(runtime.to_owned()), 64)?
+            .ok_or_else(|| IntegratorError::InvalidInput("runtime is required".into()))?;
+        let model = normalize_optional_text(Some(model.to_owned()), 120)?
+            .ok_or_else(|| IntegratorError::InvalidInput("model is required".into()))?;
+        let effort = normalize_optional_text(effort.map(str::to_owned), 64)?;
+        let now = Utc::now();
+        let changed = self
+            .connection
+            .lock()
+            .execute(
+                "UPDATE tasks SET runtime = ?1, model = ?2, effort = ?3, updated_at = ?4 WHERE id = ?5",
+                params![
+                    runtime,
+                    model,
+                    effort,
+                    now.to_rfc3339(),
+                    task_id.to_string()
+                ],
+            )
+            .map_err(storage_error)?;
+        if changed == 0 {
+            return Err(IntegratorError::NotFound(format!("task {task_id}")));
+        }
+        self.get_task(task_id)
+    }
+
     pub fn get_task(&self, task_id: TaskId) -> Result<Task> {
         let connection = self.connection.lock();
         let row = connection
             .query_row(
-                "SELECT id, title, repository_path, worktree_path, state, pinned, archived, created_at, updated_at FROM tasks WHERE id = ?1",
+                "SELECT id, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at FROM tasks WHERE id = ?1",
                 [task_id.to_string()],
                 |row| {
                     Ok((
-                        row.get::<_, String>(0)?, row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?, row.get::<_, bool>(5)?,
-                        row.get::<_, bool>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?,
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, bool>(5)?,
+                        row.get::<_, bool>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, String>(12)?,
                     ))
                 },
             )
@@ -648,6 +840,7 @@ impl LocalStore {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn parse_task_row(
     row: (
         String,
@@ -657,11 +850,29 @@ fn parse_task_row(
         String,
         bool,
         bool,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
         String,
         String,
     ),
 ) -> Result<Task> {
-    let (id, title, repository, worktree, state, pinned, archived, created, updated) = row;
+    let (
+        id,
+        title,
+        repository,
+        worktree,
+        state,
+        pinned,
+        archived,
+        runtime,
+        model,
+        effort,
+        parent_task_id,
+        created,
+        updated,
+    ) = row;
     Ok(Task {
         id: TaskId::from_str(&id).map_err(invalid_stored)?,
         title,
@@ -670,9 +881,33 @@ fn parse_task_row(
         state: TaskState::from_str(&state)?,
         pinned,
         archived,
+        runtime,
+        model,
+        effort,
+        parent_task_id: parent_task_id
+            .as_deref()
+            .map(TaskId::from_str)
+            .transpose()
+            .map_err(invalid_stored)?,
         created_at: parse_time(&created)?,
         updated_at: parse_time(&updated)?,
     })
+}
+
+fn normalize_optional_text(value: Option<String>, max_chars: usize) -> Result<Option<String>> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().count() > max_chars {
+        return Err(IntegratorError::InvalidInput(format!(
+            "value must contain at most {max_chars} characters"
+        )));
+    }
+    Ok(Some(trimmed.to_owned()))
 }
 
 fn validate_setting_key(key: &str) -> Result<()> {
@@ -733,6 +968,10 @@ mod tests {
                 title: "Implement adapter".into(),
                 repository_path: Some("C:/repo".into()),
                 worktree_path: Some("C:/worktree".into()),
+                runtime: None,
+                model: None,
+                effort: None,
+                parent_task_id: None,
             })
             .expect("create task");
         store
@@ -747,15 +986,112 @@ mod tests {
             )
             .expect("update task metadata");
         store
+            .update_task_routing(task.id, "cursor", "composer-2.5", Some("high"))
+            .expect("update task routing");
+        store
             .set_setting("appearance.theme", Value::String("graphite".into()))
             .expect("set setting");
         let exported = store.export().expect("export");
         assert_eq!(exported.tasks.len(), 1);
         assert_eq!(exported.tasks[0].state, TaskState::Running);
         assert_eq!(exported.tasks[0].title, "Renamed chat");
+        assert_eq!(exported.tasks[0].runtime.as_deref(), Some("cursor"));
+        assert_eq!(exported.tasks[0].model.as_deref(), Some("composer-2.5"));
+        assert_eq!(exported.tasks[0].effort.as_deref(), Some("high"));
         assert!(exported.tasks[0].pinned);
         assert!(!exported.tasks[0].archived);
         assert_eq!(exported.settings.len(), 1);
+
+        let usage_rows = store.provider_usage_rows().expect("provider usage rows");
+        assert_eq!(usage_rows.len(), 1);
+        assert_eq!(usage_rows[0].0, "cursor");
+        assert_eq!(usage_rows[0].1, 1);
+        assert_eq!(usage_rows[0].2, 0);
+        assert_eq!(usage_rows[0].3.total_tokens, 0);
+    }
+
+    #[test]
+    fn clear_all_data_preserves_schema_and_migration_history() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let task = store
+            .create_task(NewTask {
+                title: "Clearable task".into(),
+                repository_path: None,
+                worktree_path: None,
+                runtime: None,
+                model: None,
+                effort: None,
+                parent_task_id: None,
+            })
+            .expect("create task");
+        store
+            .set_setting("appearance.theme", Value::String("graphite".into()))
+            .expect("set setting");
+        let directory = tempfile::tempdir().expect("temp directory");
+        store
+            .upsert_trusted_project(
+                "Clearable project",
+                directory.path(),
+                &directory.path().join(".git"),
+            )
+            .expect("register project");
+        let now = Utc::now();
+        let provider_session = ProviderSession {
+            id: ProviderSessionId::new(),
+            task_id: task.id,
+            provider: ProviderKind::Codex,
+            provider_thread_id: "clearable-thread".into(),
+            created_at: now,
+            updated_at: now,
+        };
+        store
+            .upsert_provider_session(&provider_session)
+            .expect("provider session");
+        store
+            .insert_runtime_session(&RuntimeSession {
+                id: RuntimeSessionId::new(),
+                task_id: task.id,
+                provider_session_id: Some(provider_session.id),
+                process_id: Some("clearable-process".into()),
+                status: "completed".into(),
+                started_at: now,
+                ended_at: Some(now),
+            })
+            .expect("runtime session");
+
+        store.clear_all_data().expect("clear local data");
+
+        let export = store.export().expect("export after clear");
+        assert!(export.projects.is_empty());
+        assert!(export.tasks.is_empty());
+        assert!(export.settings.is_empty());
+        assert!(export.provider_sessions.is_empty());
+        assert!(export.runtime_sessions.is_empty());
+
+        let connection = store.connection.lock();
+        let migration_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("migration history");
+        assert_eq!(migration_count, MIGRATIONS.len() as i64);
+        let foreign_keys: i64 = connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("foreign key setting");
+        assert_eq!(foreign_keys, 1);
+        drop(connection);
+
+        store
+            .create_task(NewTask {
+                title: "Schema remains usable".into(),
+                repository_path: None,
+                worktree_path: None,
+                runtime: None,
+                model: None,
+                effort: None,
+                parent_task_id: None,
+            })
+            .expect("create task after clear");
     }
 
     #[test]
@@ -786,6 +1122,10 @@ mod tests {
                 title: "Persist a provider session".into(),
                 repository_path: None,
                 worktree_path: None,
+                runtime: None,
+                model: None,
+                effort: None,
+                parent_task_id: None,
             })
             .expect("create task");
         let now = Utc::now();

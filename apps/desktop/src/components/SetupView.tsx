@@ -4,17 +4,16 @@ import {
   ArrowLeft,
   ArrowRight,
   Check,
-  Command,
-  ExternalLink,
   HardDrive,
-  KeyRound,
   LoaderCircle,
+  RefreshCw,
   ShieldCheck,
   TerminalSquare,
   WifiOff,
 } from "lucide-react";
 import type { RuntimeConnection, RuntimeId } from "../bridge";
 import { BrandMark } from "./BrandMark";
+import { ProviderIcon } from "./Dropdown";
 
 interface SetupViewProps {
   runtimes: RuntimeConnection[];
@@ -113,7 +112,7 @@ export function SetupView({ runtimes, onBack, onLogin, onFinish }: SetupViewProp
                 {runtimes.map((runtime) => (
                   <div className="runtime-row" key={runtime.id} data-status={runtime.status}>
                     <span className={`runtime-logo runtime-logo--${runtime.id}`}>
-                      {runtime.name.slice(0, 1)}
+                      <ProviderIcon provider={runtime.id} label={runtime.name} />
                     </span>
                     <span className="runtime-copy">
                       <strong>
@@ -133,8 +132,14 @@ export function SetupView({ runtimes, onBack, onLogin, onFinish }: SetupViewProp
                         className="secondary-button"
                         type="button"
                         onClick={() => void login(runtime.id)}
+                        disabled={loggingIn !== null}
                       >
-                        <Command /> Finish setup
+                        {loggingIn === runtime.id ? (
+                          <LoaderCircle className="spin-slow" />
+                        ) : (
+                          <RefreshCw />
+                        )}{" "}
+                        Check status
                       </button>
                     ) : null}
                     {runtime.status === "login_required" ? (
@@ -147,15 +152,15 @@ export function SetupView({ runtimes, onBack, onLogin, onFinish }: SetupViewProp
                         {loggingIn === runtime.id ? (
                           <LoaderCircle className="spin-slow" />
                         ) : (
-                          <KeyRound />
+                          <RefreshCw />
                         )}{" "}
-                        Log in
+                        Sign in
                       </button>
                     ) : null}
                     {runtime.status === "not_installed" ? (
-                      <button className="secondary-button" type="button">
-                        <ExternalLink /> Install
-                      </button>
+                      <span className="runtime-install-hint">
+                        Install the vendor CLI to connect
+                      </span>
                     ) : null}
                   </div>
                 ))}

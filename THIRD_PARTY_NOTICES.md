@@ -6,7 +6,11 @@ This file covers assets and frontend packages used by the native desktop applica
 
 `apps/desktop/public/brand/ai-integrator-mark-light.png` is copied without modification from `H:/Code/integrator-2/public/images/logos/aiintegrator-ai-mark-transparent.png` at source commit `7836ad599a9deed05e240a9fbaff3158a5572993` (`Rebrand app to AI Integrator`). Its SHA-256 digest is `8B889F701BAAA5EC5087A2B494BF88A1F8D697364EFF773736DADA32C36129B8`.
 
-The mark is treated as first-party AI Integrator branding. It is not a general-purpose open-source asset. No provider logos, generated marketing images, voice samples, sounds, or unverified fonts from `integrator-2` are bundled in this desktop asset surface.
+The mark is treated as first-party AI Integrator branding. It is not a general-purpose open-source asset.
+
+## Provider favicon marks
+
+The runtime and model selectors include small, unmodified favicon files from the official provider domains listed in `apps/desktop/public/assets-manifest.json` for quick visual identification. They are trademarks of OpenAI/Codex, Cursor, Anthropic/Claude, Google/Gemini, and xAI/Grok; they are not AI Integrator branding. A release owner should complete the providers' trademark review before distributing a signed production build.
 
 ## Frontend packages
 

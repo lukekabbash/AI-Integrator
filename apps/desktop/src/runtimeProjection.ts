@@ -21,6 +21,12 @@ export interface RuntimeProjectionState {
   approvals: ApprovalProjection[];
   connection: ConnectionProjection;
   errors: Array<{ seq: number; message: string; retryable: boolean; occurredAt: string }>;
+  /**
+   * When each item/approval id was first observed. A streaming item keeps
+   * bumping its updatedAt, so the transcript orders by first appearance to
+   * keep events where they originally happened.
+   */
+  firstSeen: Record<string, string>;
 }
 
 export function createRuntimeProjectionState(taskId: string): RuntimeProjectionState {
@@ -33,7 +39,17 @@ export function createRuntimeProjectionState(taskId: string): RuntimeProjectionS
     approvals: [],
     connection: { state: "reconciling", reason: "Loading persisted task state" },
     errors: [],
+    firstSeen: {},
   };
+}
+
+function recordFirstSeen(
+  firstSeen: Record<string, string>,
+  id: string,
+  occurredAt: string,
+): Record<string, string> {
+  if (firstSeen[id]) return firstSeen;
+  return { ...firstSeen, [id]: occurredAt };
 }
 
 function replaceById<T extends { id: string }>(items: T[], item: T): T[] {
@@ -65,7 +81,11 @@ export function applyRuntimeProjection(
             : state.errors,
       };
     case "itemChanged":
-      return { ...next, items: replaceById(state.items, projection.item) };
+      return {
+        ...next,
+        items: replaceById(state.items, projection.item),
+        firstSeen: recordFirstSeen(state.firstSeen, projection.item.id, event.occurredAt),
+      };
     case "planChanged":
       return { ...next, plan: projection.steps, planTruncated: projection.truncated };
     case "diffChanged":
@@ -81,7 +101,11 @@ export function applyRuntimeProjection(
     case "usageChanged":
       return { ...next, usage: projection.usage };
     case "approvalChanged":
-      return { ...next, approvals: replaceById(state.approvals, projection.approval) };
+      return {
+        ...next,
+        approvals: replaceById(state.approvals, projection.approval),
+        firstSeen: recordFirstSeen(state.firstSeen, projection.approval.id, event.occurredAt),
+      };
     case "turnError":
       // Only the most recent error is actionable; older ones read as noise.
       return {
@@ -130,9 +154,21 @@ function itemBody(item: ItemProjection): string {
     return files.join("\n") || item.body || "File changes";
   }
   if (item.kind === "mcpTool") {
-    return item.body || [item.mcpServer, item.mcpTool].filter(Boolean).join(" · ") || "MCP tool";
+    return (
+      item.body ||
+      [item.mcpServer, item.mcpTool].filter(Boolean).join(" · ") ||
+      item.toolInput?.split("\n", 1)[0] ||
+      "Tool call"
+    );
   }
   return item.body || item.title || "Activity";
+}
+
+function itemDetails(item: ItemProjection): TranscriptEvent["details"] {
+  const details: NonNullable<TranscriptEvent["details"]> = [];
+  if (item.toolInput) details.push({ label: "Input", body: item.toolInput });
+  if (item.kind === "mcpTool" && item.output) details.push({ label: "Output", body: item.output });
+  return details.length > 0 ? details : undefined;
 }
 
 export function runtimeTranscript(state: RuntimeProjectionState): TranscriptEvent[] {
@@ -165,7 +201,7 @@ export function runtimeTranscript(state: RuntimeProjectionState): TranscriptEven
     const common = {
       id: item.id,
       body: itemBody(item),
-      timestamp: item.updatedAt,
+      timestamp: state.firstSeen[item.id] ?? item.updatedAt,
       status: itemStatus(item),
       meta: item.truncated ? "Output truncated" : undefined,
     };
@@ -184,8 +220,9 @@ export function runtimeTranscript(state: RuntimeProjectionState): TranscriptEven
             : item.kind === "fileChange"
               ? "File changes"
               : item.kind === "mcpTool"
-                ? "MCP tool"
+                ? [item.mcpServer, item.mcpTool].filter(Boolean).join(" · ") || "Tool call"
                 : "Activity"),
+        details: itemDetails(item),
       });
     }
   }
@@ -196,7 +233,7 @@ export function runtimeTranscript(state: RuntimeProjectionState): TranscriptEven
       kind: "approval",
       title: approval.approvalKind === "commandExecution" ? "Command approval" : "File approval",
       body: approval.reason ?? `Approval is ${approval.state}.`,
-      timestamp: approval.updatedAt,
+      timestamp: state.firstSeen[approval.id] ?? approval.updatedAt,
       status:
         approval.state === "pending" || approval.state === "responding"
           ? "warning"
@@ -217,20 +254,9 @@ export function runtimeTranscript(state: RuntimeProjectionState): TranscriptEven
     });
   }
 
-  for (const error of state.errors) {
-    events.push({
-      id: `runtime-error-${error.seq}`,
-      kind: "notice",
-      title: error.retryable ? "Provider retrying" : "Turn error",
-      body: error.message,
-      timestamp: error.occurredAt,
-      status: error.retryable ? "warning" : "error",
-    });
-  }
-
-  // Interleave everything chronologically: a streaming agent message keeps
-  // receiving updates, so ordering by last-update time keeps it below the
-  // tool activity that preceded it — the same reading order as the wire.
+  // Interleave chronologically by FIRST appearance: a streaming item keeps
+  // receiving updates, so ordering by last-update time would make growing
+  // text hop below tool activity that actually happened after it started.
   return events
     .map((event, index) => ({ event, index, time: Date.parse(event.timestamp) || 0 }))
     .sort((a, b) => a.time - b.time || a.index - b.index)

@@ -1,17 +1,19 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
+import { bridge } from "./bridge";
 import { createDemoSnapshot, createEmptySnapshot } from "./demoData";
 
-const DEMO_STORAGE_KEY = "aiintegrator.demo.workspace.v1";
+const DEMO_STORAGE_KEY = "aiintegrator.demo.workspace.v2";
 
 function storeSnapshot(snapshot: ReturnType<typeof createDemoSnapshot>) {
   window.localStorage.setItem(DEMO_STORAGE_KEY, JSON.stringify(snapshot));
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   window.localStorage.clear();
   document.documentElement.removeAttribute("style");
 });
@@ -26,8 +28,10 @@ describe("AI Integrator desktop workspace", () => {
       "aria-selected",
       "true",
     );
-    expect(screen.getByTitle("Subscription plan usage")).toHaveTextContent("34%");
-    expect(screen.getByDisplayValue("Build polished native v1 workspace")).toBeInTheDocument();
+    expect(screen.getByTitle("Subscription plan usage")).toHaveTextContent("—%");
+    expect(
+      screen.getByPlaceholderText("Message (Ctrl/Cmd+Enter to commit)"),
+    ).toBeInTheDocument();
   });
 
   it("opens Settings as a full replacement view and applies a theme preset", async () => {
@@ -52,6 +56,172 @@ describe("AI Integrator desktop workspace", () => {
     ).toBeInTheDocument();
   });
 
+  it("keeps Settings out of the workspace view tabs and reachable from the sidebar", async () => {
+    render(<App />);
+    await screen.findByRole("tab", { name: "Task" });
+    expect(screen.queryByRole("tab", { name: "Settings" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open Settings" }));
+    expect(await screen.findByRole("heading", { name: "Appearance" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Back to workspace/i })).toBeInTheDocument();
+  });
+
+  it("exposes only real, wired settings categories and persists local policy choices", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Open Settings" }));
+    await screen.findByRole("heading", { name: "Appearance" });
+    const categoryLabels = [
+      "General",
+      "Appearance",
+      "Composer",
+      "Models",
+      "Runtimes",
+      "Permissions",
+      "Usage & budgets",
+    ];
+    for (const label of categoryLabels) {
+      expect(screen.getByRole("button", { name: new RegExp(label, "i") })).toBeInTheDocument();
+    }
+    // Placeholder categories with no consuming behavior must not resurface.
+    for (const removed of [
+      "Delegation",
+      "Skills",
+      "Memory & context",
+      "Notifications",
+      "Advanced",
+    ]) {
+      expect(
+        screen.queryByRole("button", { name: new RegExp(removed, "i") }),
+      ).not.toBeInTheDocument();
+    }
+
+    fireEvent.click(screen.getByRole("button", { name: /General/i }));
+    expect(
+      await screen.findByRole("heading", { name: /Voice typing.*bring your own key/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("OpenAI API key for voice typing")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Save key" })).toBeDisabled();
+    expect(screen.getByText("Native app storage required")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Storage totals" })).toBeInTheDocument();
+    const restore = screen.getByRole("switch", { name: "Restore last workspace" });
+    expect(restore).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(restore);
+    expect(restore).toHaveAttribute("aria-checked", "false");
+    expect(window.localStorage.getItem("aiintegrator.settings.v1")).toContain(
+      "general.openLastWorkspace",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Appearance/i }));
+    expect(
+      await screen.findByRole("heading", { name: "Semantic color overrides" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("slider", { name: "Body weight" })).toBeInTheDocument();
+    expect(screen.getByRole("slider", { name: "Body line height" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Search Settings" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Models/ }));
+    expect(await screen.findByRole("heading", { name: "Models" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Default model" }));
+    fireEvent.click(screen.getByRole("option", { name: "GPT-5.4" }));
+    expect(window.localStorage.getItem("aiintegrator.settings.v1")).toContain(
+      "models.defaultModel",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Default runtime" }));
+    fireEvent.click(screen.getByRole("option", { name: "Claude Code" }));
+    expect(screen.queryByText("Vendor login warning")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Usage & budgets/i }));
+    expect(await screen.findByRole("heading", { name: "Per-provider usage" })).toBeInTheDocument();
+    expect(screen.getByText("Codex")).toBeInTheDocument();
+  });
+
+  it("uses each selected model's advertised effort list in Settings", async () => {
+    vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
+      { id: "Provider default", label: "Provider default" },
+      {
+        id: "GPT-5.4",
+        label: "GPT-5.4",
+        efforts: [
+          { id: "none", label: "None" },
+          { id: "minimal", label: "Minimal" },
+          { id: "low", label: "Low" },
+          { id: "medium", label: "Medium" },
+          { id: "high", label: "High" },
+          { id: "xhigh", label: "Extra high" },
+        ],
+        defaultEffort: "none",
+      },
+      { id: "gpt-5-mini", label: "GPT-5 mini" },
+    ]);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Open Settings" }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Models/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Default model" }));
+    fireEvent.click(screen.getByRole("option", { name: "GPT-5.4" }));
+    const effort = await screen.findByRole("button", { name: "Default effort" });
+    expect(effort).toHaveTextContent("Medium");
+
+    fireEvent.click(effort);
+    expect(screen.getByRole("option", { name: "None" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Minimal" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Extra high" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Default model" }));
+    fireEvent.click(screen.getByRole("option", { name: "GPT-5 mini" }));
+    expect(await screen.findByLabelText("Default effort unavailable")).toHaveTextContent(
+      "Not exposed by this model",
+    );
+  });
+
+  it("applies saved default runtime and model to a new chat", async () => {
+    window.localStorage.setItem(
+      "aiintegrator.settings.v1",
+      JSON.stringify({
+        "settings.models.defaultRuntime": "claude",
+        "settings.models.defaultModel": "Claude Fable 5",
+      }),
+    );
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /^New chat(?! in)/ }));
+
+    expect(await screen.findByRole("button", { name: "Runtime" })).toHaveTextContent("Claude Code");
+    expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("Claude Fable 5");
+  });
+
+  it("uses Settings changes when the next chat is created", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Open Settings" }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Models/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Default runtime" }));
+    fireEvent.click(screen.getByRole("option", { name: "Claude Code" }));
+    fireEvent.click(screen.getByRole("button", { name: "Default model" }));
+    fireEvent.click(screen.getByRole("option", { name: "Claude Sonnet 5" }));
+    fireEvent.click(screen.getByRole("button", { name: /Back to workspace/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /^New chat(?! in)/ }));
+
+    expect(await screen.findByRole("button", { name: "Runtime" })).toHaveTextContent("Claude Code");
+    expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("Claude Sonnet 5");
+  });
+
+  it("repairs a stale model default after a runtime change", async () => {
+    window.localStorage.setItem(
+      "aiintegrator.settings.v1",
+      JSON.stringify({
+        "settings.models.defaultRuntime": "claude",
+        "settings.models.defaultModel": "GPT-5.4",
+      }),
+    );
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /^New chat(?! in)/ }));
+
+    expect(await screen.findByRole("button", { name: "Runtime" })).toHaveTextContent("Claude Code");
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("Claude Fable 5"),
+    );
+  });
+
   it("opens a syntax-aware review from the Git rail", async () => {
     render(<App />);
     const fileButton = await screen.findByTitle("src/runtime/router.ts");
@@ -64,9 +234,25 @@ describe("AI Integrator desktop workspace", () => {
     ).toBeInTheDocument();
     expect(document.querySelectorAll(".diff-line--add").length).toBeGreaterThan(0);
     expect(document.querySelectorAll(".diff-line--delete").length).toBeGreaterThan(0);
-    const commentButton = screen.getAllByRole("button", { name: /Comment on line 43/ })[0];
-    commentButton.focus();
-    expect(document.activeElement).toBe(commentButton);
+    expect(screen.queryByRole("button", { name: /Comment on line 43/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Mark reviewed" }));
+    expect(screen.getByRole("button", { name: "Reviewed" })).toBeInTheDocument();
+  });
+
+  it("offers reasoning effort only for models that support it and follows the picker", async () => {
+    render(<App />);
+    const effortTrigger = await screen.findByRole("button", { name: "Reasoning effort" });
+    expect(effortTrigger).toHaveTextContent("Medium");
+
+    fireEvent.click(effortTrigger);
+    fireEvent.click(await screen.findByRole("option", { name: "High" }));
+    expect(screen.getByRole("button", { name: "Reasoning effort" })).toHaveTextContent("High");
+
+    fireEvent.click(screen.getByRole("button", { name: "Runtime" }));
+    fireEvent.click(await screen.findByRole("option", { name: /Cursor/ }));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Reasoning effort" })).not.toBeInTheDocument(),
+    );
   });
 
   it("sends a composer turn through the typed bridge fallback", async () => {
@@ -80,9 +266,104 @@ describe("AI Integrator desktop workspace", () => {
     expect(await screen.findByText("Queued for execution")).toBeInTheDocument();
   });
 
+  it("honors the persisted Enter-key setting in the composer", async () => {
+    window.localStorage.setItem(
+      "aiintegrator.settings.v1",
+      JSON.stringify({ "settings.composer.enterToSend": false }),
+    );
+    render(<App />);
+
+    const composer = await screen.findByRole("textbox", { name: "Task message" });
+    expect(await screen.findByText(/Ctrl Enter to send/)).toBeInTheDocument();
+    fireEvent.change(composer, { target: { value: "draft stays put" } });
+    fireEvent.keyDown(composer, { key: "Enter" });
+    expect(composer).toHaveValue("draft stays put");
+
+    fireEvent.keyDown(composer, { key: "Enter", ctrlKey: true });
+    await waitFor(() =>
+      expect(
+        screen.getByText("draft stays put", { selector: ".turn--user p" }),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  it("keeps provider model and effort on a chat when switching away and back", async () => {
+    render(<App />);
+
+    const effortTrigger = await screen.findByRole("button", { name: "Reasoning effort" });
+    expect(effortTrigger).toHaveTextContent("Medium");
+    fireEvent.click(effortTrigger);
+    fireEvent.click(await screen.findByRole("option", { name: "High" }));
+    expect(screen.getByRole("button", { name: "Reasoning effort" })).toHaveTextContent("High");
+
+    const sidebar = screen.getByRole("complementary", { name: "Chat navigation" });
+    fireEvent.click(within(sidebar).getByText("Certify Codex and ACP adapters"));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Runtime" })).toHaveTextContent(/Cursor/i),
+    );
+
+    fireEvent.click(within(sidebar).getByText("Construct the native v1 workspace"));
+    expect(await screen.findByRole("button", { name: "Reasoning effort" })).toHaveTextContent(
+      "High",
+    );
+    expect(screen.getByRole("button", { name: "Runtime" })).toHaveTextContent(/Codex/i);
+  });
+
+  it("preselects the persisted default permission profile for new chats", async () => {
+    window.localStorage.setItem(
+      "aiintegrator.settings.v1",
+      JSON.stringify({ "settings.permissions.defaultProfile": "read-only" }),
+    );
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Permission" });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Permission" })).toHaveTextContent("Read only"),
+    );
+  });
+
+  it("opens a trusted project file from the Files tree into the rail reader", async () => {
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("tab", { name: "Files" }));
+    fireEvent.click(await screen.findByTitle("Open src/runtime/router.ts"));
+    expect(await screen.findByRole("tab", { name: /router\.ts/ })).toBeInTheDocument();
+    expect(await screen.findByLabelText("Contents of src/runtime/router.ts")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: "Task" }));
+    const composer = screen.getByRole("textbox", { name: "Task message" });
+    fireEvent.change(composer, { target: { value: "Measure a local usage event" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await screen.findByText("Measure a local usage event");
+
+    fireEvent.click(screen.getByRole("tab", { name: "Usage" }));
+    expect(await screen.findByText("Local turns")).toBeInTheDocument();
+    expect(screen.getByText("Input tokens (estimate)")).toBeInTheDocument();
+    expect(screen.getByText("Subscription usage")).toBeInTheDocument();
+  });
+
+  it("turns the top File, Edit, and View labels into workspace actions", async () => {
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "File" }));
+    expect(screen.getByRole("menu", { name: "File" })).toHaveTextContent("Open project");
+    expect(screen.getByRole("menu", { name: "File" })).toHaveTextContent("New chat");
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Focus composer" }));
+    await waitFor(() =>
+      expect(screen.getByRole("textbox", { name: "Task message" })).toHaveFocus(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "View" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Review changes" }));
+    expect(await screen.findByRole("region", { name: /Diff for / })).toBeInTheDocument();
+  });
+
   it("keeps vendor login inside the guided setup flow", async () => {
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Runtime setup" }));
+    fireEvent.click(screen.getByRole("button", { name: "View" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Runtime setup" }));
     expect(await screen.findByRole("heading", { name: /coding agents/i })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Find my agents/i }));
     expect(
@@ -106,11 +387,38 @@ describe("AI Integrator desktop workspace", () => {
       within(emptyState as HTMLElement).getByRole("button", { name: /Open project/ }),
     );
 
+    const chooser = await screen.findByRole("dialog", { name: "Add a project" });
+    fireEvent.click(within(chooser).getByRole("button", { name: /Open local folder/ }));
+
     expect(
-      await screen.findByRole("heading", { name: "What should the first agent do?" }),
+      await screen.findByRole("heading", { name: "What are we working on?" }),
     ).toBeInTheDocument();
     expect(
       screen.getByText("demo-project", { selector: ".empty-task-kicker" }),
+    ).toBeInTheDocument();
+  });
+
+  it("creates a brand-new project from scratch through the add-project modal", async () => {
+    const empty = createEmptySnapshot();
+    empty.runtimes = createDemoSnapshot().runtimes;
+    storeSnapshot(empty);
+    render(<App />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: /Open project/ }),
+    );
+    const chooser = await screen.findByRole("dialog", { name: "Add a project" });
+    fireEvent.click(within(chooser).getByRole("button", { name: /Create from scratch/ }));
+
+    const nameField = await screen.findByLabelText("Project name");
+    fireEvent.change(nameField, { target: { value: "fresh-idea" } });
+    fireEvent.click(screen.getByRole("button", { name: /Choose location & create/ }));
+
+    expect(
+      await screen.findByRole("heading", { name: "What are we working on?" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("fresh-idea", { selector: ".empty-task-kicker" }),
     ).toBeInTheDocument();
   });
 
@@ -123,7 +431,7 @@ describe("AI Integrator desktop workspace", () => {
     render(<App />);
 
     expect(
-      await screen.findByRole("heading", { name: "What should the first agent do?" }),
+      await screen.findByRole("heading", { name: "What are we working on?" }),
     ).toBeInTheDocument();
     const composer = screen.getByRole("textbox", { name: "Task message" });
     fireEvent.change(composer, { target: { value: "Audit the trusted project boundary" } });
@@ -155,7 +463,7 @@ describe("AI Integrator desktop workspace", () => {
     expect(await screen.findByRole("heading", { name: "New chat" })).toBeInTheDocument();
     expect(screen.getByRole("textbox", { name: "Task message" })).toHaveValue("");
     expect(
-      screen.getByRole("heading", { name: "What should the first agent do?" }),
+      screen.getByRole("heading", { name: "What are we working on?" }),
     ).toBeInTheDocument();
   });
 
@@ -208,7 +516,42 @@ describe("AI Integrator desktop workspace", () => {
       await screen.findByRole("region", { name: /Diff for src\/runtime\/router\.ts/i }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /Construct the native v1 workspace/ }),
+      within(screen.getByRole("complementary", { name: "Chat navigation" })).getByRole("button", {
+        name: /Construct the native v1 workspace/,
+      }),
+    ).toHaveAttribute("aria-current", "page");
+  });
+
+  it("uses the sidebar as the sole project and chat navigation", async () => {
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Construct the native v1 workspace" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText("Open workspace items")).not.toBeInTheDocument();
+    expect(screen.queryByRole("navigation", { name: "Open projects" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("navigation", { name: "Open chats" })).not.toBeInTheDocument();
+
+    const sidebar = screen.getByRole("complementary", { name: "Chat navigation" });
+    expect(
+      within(sidebar).getByRole("button", { name: /Construct the native v1 workspace/ }),
+    ).toHaveAttribute("aria-current", "page");
+
+    fireEvent.click(
+      within(sidebar).getByRole("button", { name: /Certify Codex and ACP adapters/ }),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "Certify Codex and ACP adapters" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open project Lotmind AI" }));
+    expect(
+      await screen.findByRole("heading", { name: "Mobile intake overnight agent" }),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("complementary", { name: "Chat navigation" })).getByRole("button", {
+        name: /Mobile intake overnight agent/,
+      }),
     ).toHaveAttribute("aria-current", "page");
   });
 

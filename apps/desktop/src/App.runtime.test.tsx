@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { bridgeMock } = vi.hoisted(() => ({
@@ -18,8 +18,11 @@ const { bridgeMock } = vi.hoisted(() => ({
     listProjects: vi.fn(),
     startTask: vi.fn(),
     loadTaskGit: vi.fn(),
+    listProjectFiles: vi.fn(),
+    readProjectFile: vi.fn(),
     supportsTaskMetadata: vi.fn(),
     updateTaskMetadata: vi.fn(),
+    updateTaskRouting: vi.fn(),
     sendTurn: vi.fn(),
     stageFiles: vi.fn(),
     commit: vi.fn(),
@@ -89,6 +92,7 @@ describe("native runtime recovery UI", () => {
     workspace.activeProjectId = "project-1";
     workspace.activeTaskId = "task-1";
     bridgeMock.loadWorkspace.mockResolvedValue(workspace);
+    bridgeMock.listProjectFiles.mockResolvedValue([]);
     bridgeMock.loadTaskProjection.mockImplementation(async () => {
       runtimeListener?.(
         projection(9, {
@@ -170,5 +174,48 @@ describe("native runtime recovery UI", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "Stop" }));
     await waitFor(() => expect(bridgeMock.stopTurn).toHaveBeenCalledWith("task-1"));
+  });
+
+  it("docks native turn errors above the composer and allows dismissal", async () => {
+    render(<App />);
+    await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
+
+    act(() => {
+      runtimeListener?.(
+        projection(10, {
+          kind: "turnError",
+          message: "gemini turn execution is not implemented by the native backend",
+          retryable: false,
+        }),
+      );
+    });
+
+    const notice = await screen.findByRole("alert");
+    expect(notice).toHaveTextContent("gemini turn execution is not implemented");
+    expect(
+      notice.compareDocumentPosition(screen.getByRole("textbox", { name: "Task message" })) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss Turn error" }));
+    expect(screen.queryByText("gemini turn execution is not implemented")).not.toBeInTheDocument();
+  });
+
+  it("shows the serialized Cursor failure instead of replacing it with a generic turn error", async () => {
+    bridgeMock.sendTurn.mockRejectedValue({
+      code: "provider-disconnected",
+      message: "Cursor session is not bound to this task",
+    });
+
+    render(<App />);
+    await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
+    fireEvent.change(screen.getByRole("textbox", { name: "Task message" }), {
+      target: { value: "Try Cursor again" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    const notice = await screen.findByRole("alert");
+    expect(notice).toHaveTextContent("Cursor session is not bound to this task");
+    expect(notice).toHaveTextContent("provider-disconnected");
+    expect(notice).not.toHaveTextContent("The turn could not be started");
   });
 });

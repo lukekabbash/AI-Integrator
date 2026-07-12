@@ -34,9 +34,8 @@ pub(crate) fn run_bounded_with_limits(
     max_output_bytes: u64,
     timeout: Duration,
 ) -> Result<ProcessOutput> {
-    let mut command = Command::new(executable);
+    let mut command = probe_command(executable, args);
     command
-        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -101,6 +100,71 @@ fn read_limited(mut reader: impl Read, max_output_bytes: u64) -> Result<(String,
         }
     }
     Ok((String::from_utf8_lossy(&retained).into_owned(), truncated))
+}
+
+fn probe_command(executable: &Path, args: &[&str]) -> Command {
+    #[cfg(windows)]
+    {
+        if is_windows_script(executable) {
+            let mut command =
+                Command::new(std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into()));
+            command.args(["/d", "/s", "/c"]);
+            command.arg(windows_command_line(executable, args));
+            return command;
+        }
+    }
+
+    let mut command = Command::new(executable);
+    command.args(args);
+    command
+}
+
+#[cfg(windows)]
+fn is_windows_script(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some("bat" | "cmd")
+    )
+}
+
+#[cfg(windows)]
+fn windows_command_line(executable: &Path, args: &[&str]) -> String {
+    std::iter::once(executable.to_string_lossy().into_owned())
+        .chain(args.iter().map(|arg| (*arg).to_owned()))
+        .map(|value| quote_windows_arg(&value))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(windows)]
+fn quote_windows_arg(value: &str) -> String {
+    if value.is_empty() {
+        return "\"\"".into();
+    }
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0;
+    for character in value.chars() {
+        match character {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes));
+                quoted.push(character);
+                backslashes = 0;
+            }
+        }
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
 }
 
 pub(crate) fn redact_text(value: &str) -> String {

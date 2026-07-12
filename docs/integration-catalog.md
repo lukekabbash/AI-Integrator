@@ -1,7 +1,7 @@
 # Integration catalog
 
 **Product:** AI Integrator  
-**Last source review:** 2026-07-10  
+**Last source review:** 2026-07-11
 **Purpose:** Make provider-adapter implementation possible without rediscovering install, login, protocol, session, permission, usage, and policy details.
 
 This is an implementation notebook, not a promise that every vendor surface is stable or contractually available. Commands and protocol fields must be re-probed against the installed version during adapter startup. Do not copy credentials out of a vendor's store, synthesize private APIs, or call a consumer web endpoint when an official CLI, ACP server, SDK, or app-server exists.
@@ -13,8 +13,8 @@ This is an implementation notebook, not a promise that every vendor surface is s
 | Priority | Runtime | Primary path | Why |
 |---|---|---|---|
 | P0 | Codex | `codex app-server` | Richest documented client protocol: login, models, threads, turns, steering, approvals, typed items, review, usage, skills, and subagents. |
-| P0 | Cursor Agent | `cursor-agent acp` | First-class product requirement and now present in the official ACP registry, including Windows distributions. |
-| P0 | Grok Build | `grok agent stdio` | Native ACP, browser or API-key auth, models, effort, sessions, worktrees, skills, plugins, and structured fallback. |
+| P0 | Cursor Agent | `agent acp` (`cursor-agent` compatibility alias) | First-class product requirement and the current Cursor CLI entrypoint; model/config discovery is ACP-negotiated. |
+| P0 | Grok Build | `grok agent stdio` | Grok Build is the product/runtime name; `grok` is only the executable. Native ACP, browser or API-key auth, models, effort, sessions, worktrees, skills, plugins, and structured fallback. |
 | P1 | Generic ACP | Official ACP registry + custom command | One adapter unlocks Copilot, Gemini, Kilo, OpenCode, Cline, Goose, Qwen Code, and other registered agents. |
 | P1 | GitHub Copilot CLI | `copilot --acp` | Broad subscription footprint, official ACP server, multi-model picker, sessions, permissions, skills, and GitHub context. |
 | P1 | OpenCode or Kilo | Native ACP | Open source, multi-provider, strong session/model/usage surfaces, useful reference implementations. |
@@ -83,7 +83,7 @@ AI Integrator is a client and process supervisor, not a credential broker.
 | Runtime | Native client protocol | Structured fallback | Login/status | Sessions | Models/effort | Permissions | Usage |
 |---|---|---|---|---|---|---|---|
 | Codex | App-server JSON-RPC | `codex exec --json`, PTY | App-server account API; `codex login` | Start/read/list/resume/fork/archive/delete | Model list, effort and service tier | Bidirectional approvals and sandbox profiles | Turn usage, rate limits, account usage |
-| Cursor | ACP | `-p --output-format stream-json`, PTY | `login`, `status`, `logout`; API key | `ls`, `resume`, `--resume` | `--model`; probe ACP modes/models | ACP when advertised; CLI allow/deny config otherwise | Treat as unknown unless protocol/result reports it |
+| Cursor | ACP | `-p --output-format stream-json`, PTY | `agent login`, `agent status`, `agent logout`; API key | `ls`, `resume`, `--resume` | `agent models`; ACP `configOptions` for model and thought level | ACP when advertised; CLI allow/deny config otherwise | Treat as unknown unless protocol/result reports it |
 | Grok Build | ACP | `-p --output-format streaming-json`, PTY | Browser login, `grok login`, device auth, `XAI_API_KEY` | Resume/continue/fork, sessions list/search/delete | `--model`, `--effort`, custom model config | ACP permissions; allow/deny/sandbox flags | Capability-probe; never infer subscription quota |
 | Copilot CLI | ACP | Programmatic JSON/JSONL | `copilot login`; token env vars | Resume/continue; SDK session APIs | Model and reasoning effort | ACP or allow/deny tool rules | Capability-probe and preserve vendor billing labels |
 | Gemini CLI | ACP registry path | `gemini -p --output-format stream-json` | First-run Google login or `GEMINI_API_KEY`/Vertex | Session ID in events; CLI resume support must be probed | CLI/config model selection | ACP or headless policy flags | JSON result includes statistics and per-model tokens |
@@ -157,11 +157,15 @@ Sources: [Codex app-server](https://learn.chatgpt.com/docs/app-server), [configu
 
 ```bash
 curl https://cursor.com/install -fsS | bash
-cursor-agent --version
-cursor-agent login
-cursor-agent status
-cursor-agent acp
+agent --version
+agent login
+agent status
+agent acp
 ```
+
+`agent` is the current primary Cursor CLI command. `cursor-agent` remains a
+backward-compatible alias and must be accepted during discovery when it is the
+only installed executable.
 
 The older standard install page names macOS, Linux, and Windows through WSL. The ACP registry snapshot reviewed on 2026-07-10 also provides native Windows x64 and arm64 packages and launches them with `cursor-agent acp`. The adapter must test native Windows end to end before marketing it as supported; registry availability alone is not enough.
 
@@ -176,7 +180,16 @@ cursor-agent --resume="chat-id"
 
 `stream-json` is NDJSON with initialization, user, assistant, tool, and terminal result events. Unknown fields are forward-compatible and must be ignored. A failed run may exit without a terminal result object.
 
-**Authentication:** `cursor-agent login` opens Cursor's browser flow; `status` checks it; `logout` clears it. Automation can use `CURSOR_API_KEY`. AI Integrator should invoke these commands and never open Cursor's credential files.
+**Authentication:** `agent login` opens Cursor's browser flow; `status` checks it; `logout` clears it. Automation can use `CURSOR_API_KEY`. AI Integrator should invoke these commands and never open Cursor's credential files.
+
+**Model and effort selection:** `agent models` is the CLI discovery fallback.
+For ACP, prefer the stable `configOptions` returned by `session/new`, with
+`category: "model"` for model choices and `category: "thought_level"` for
+reasoning choices. Change them with `session/set_config_option`; do not depend
+on the removed/non-portable `cursor/list_available_models` extension or invent
+model IDs. The negotiated Cursor catalog is authoritative and may include
+Composer 2.5, frontier providers, and open-weight models available to that
+Cursor account.
 
 **Permissions:** Prefer ACP permission requests. For CLI fallback, preserve Cursor's own allow/deny rules under `~/.cursor/cli-config.json` or `.cursor/cli.json`; do not claim per-tool interactive approval parity unless observed. Do not silently add `--force`.
 
@@ -192,6 +205,9 @@ grok version
 grok login
 grok agent stdio
 ```
+
+The user-facing runtime is **Grok Build**. Keep `grok` only as the literal
+binary name in process launch and probe code.
 
 Alternative package install for managed environments:
 
@@ -359,6 +375,25 @@ However, Anthropic's legal documentation says third-party developers must not of
 - should prefer Anthropic API-key/Agent SDK commercial terms if Claude becomes a first-class product integration.
 
 Sources: [headless mode](https://code.claude.com/docs/en/headless), [CLI reference](https://code.claude.com/docs/en/cli-usage), [authentication](https://code.claude.com/docs/en/authentication), [legal and compliance](https://code.claude.com/docs/en/legal-and-compliance), [Desktop](https://code.claude.com/docs/en/desktop).
+
+### 5.14 Model and reasoning policy
+
+Model availability belongs to the installed vendor runtime, not a global
+AI Integrator hard-coded list. The client should display the provider's
+negotiated catalog and preserve provider IDs exactly:
+
+| Runtime | Current documented model examples | Correct discovery/selection surface | Reasoning/hidden-thought rule |
+|---|---|---|---|
+| Codex | GPT-family models, including the model IDs returned by the current Codex build | Local app-server `model/list`; pass the selected `model` and advertised `reasoningEffort` to `thread/start` or the documented turn override | Store/render `reasoning.summary`; never persist raw `reasoning.content` as a handoff or audit payload |
+| Cursor Agent | Composer 2.5, frontier-provider models, and account-visible open-weight models | ACP `session/new` `configOptions`; `session/set_config_option`; `agent models` only as a structured fallback | Use provider-advertised `thought_level` options; do not infer effort suffixes from model names |
+| Grok Build | `grok-4.5` and the Grok Build model exposed by the installed CLI | `grok agent stdio` ACP; CLI `grok models`, `--model`, and `--effort` for fallback/probing | Preserve the ACP capability/effort contract; never infer subscription quota or expose hidden reasoning |
+| Claude Code | `claude-opus-4-8`, `claude-fable-5`, `claude-sonnet-5`, and `claude-haiku-4-5` where the user's Claude Code surface exposes them | User-owned `claude -p` structured CLI; `--model` plus Claude Code's `/effort` control; no AI Integrator account/login path | Do not store raw `thinking`/hidden chain-of-thought events; only retain provider-labeled summaries or observable final/tool activity |
+| Gemini CLI | Account/config-visible Gemini models | `gemini --acp` (or the installed CLI's current ACP flag); ACP config options when advertised | Treat thought events as provider content and apply the same raw-thought boundary |
+
+The exact catalog is entitlement- and version-dependent. A model shown in a
+vendor announcement is not proof that a particular local CLI account can use
+it; a failed or missing catalog must produce a degraded/unknown state rather
+than a fabricated model choice.
 
 ### 5.13 Aider — P2 PTY/one-shot fallback
 

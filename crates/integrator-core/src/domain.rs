@@ -67,7 +67,11 @@ impl<T> Versioned<T> {
 pub enum ProviderKind {
     Codex,
     Claude,
-    Gemini,
+    /// Google Antigravity CLI (`agy`). Replaces the retired Gemini CLI;
+    /// `"gemini"` is accepted as a legacy alias when deserializing so older
+    /// stored sessions keep parsing.
+    #[serde(alias = "gemini")]
+    Antigravity,
     Cursor,
     Grok,
     CustomAcp,
@@ -79,7 +83,7 @@ impl ProviderKind {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
-            Self::Gemini => "gemini",
+            Self::Antigravity => "antigravity",
             Self::Cursor => "cursor",
             Self::Grok => "grok",
             Self::CustomAcp => "custom-acp",
@@ -100,7 +104,7 @@ impl FromStr for ProviderKind {
         match value {
             "codex" => Ok(Self::Codex),
             "claude" => Ok(Self::Claude),
-            "gemini" => Ok(Self::Gemini),
+            "antigravity" | "gemini" => Ok(Self::Antigravity),
             "cursor" => Ok(Self::Cursor),
             "grok" => Ok(Self::Grok),
             "custom-acp" => Ok(Self::CustomAcp),
@@ -199,6 +203,20 @@ pub struct Task {
     pub pinned: bool,
     #[serde(default)]
     pub archived: bool,
+    /// Last composer runtime id for this chat (`codex`, `cursor`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    /// Last composer model id for this chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Last composer reasoning-effort id when the model advertises levels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Set when this task is a delegated subagent spawned on behalf of
+    /// another task. Child tasks are hidden from the primary task list and
+    /// surfaced through the parent's delegation lineage instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<TaskId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -209,6 +227,14 @@ pub struct NewTask {
     pub title: String,
     pub repository_path: Option<PathBuf>,
     pub worktree_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<TaskId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -263,6 +289,155 @@ pub struct LocalExport {
     pub settings: Vec<Setting>,
     pub provider_sessions: Vec<ProviderSession>,
     pub runtime_sessions: Vec<RuntimeSession>,
+}
+
+uuid_id!(DelegationId);
+
+/// Lifecycle of one delegated subagent. Delegation is fully asynchronous:
+/// state changes never interrupt the orchestrator's conversation; they are
+/// pulled via broker tools or surfaced in the UI lineage panel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DelegationStatus {
+    /// Created under `manual` mode; waiting for the user to approve.
+    PendingApproval,
+    Starting,
+    Running,
+    /// Idle: the child settled a turn without completing and has no queued
+    /// work. Nudges wake it back to `Running`.
+    Waiting,
+    Completed,
+    Failed,
+    Stopped,
+    /// The user declined a `manual`-mode delegation.
+    Denied,
+}
+
+impl DelegationStatus {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::PendingApproval => "pending-approval",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Waiting => "waiting",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+            Self::Denied => "denied",
+        }
+    }
+
+    /// Statuses that count against the concurrency cap.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        matches!(self, Self::Starting | Self::Running | Self::Waiting)
+    }
+}
+
+impl FromStr for DelegationStatus {
+    type Err = crate::IntegratorError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending-approval" => Ok(Self::PendingApproval),
+            "starting" => Ok(Self::Starting),
+            "running" => Ok(Self::Running),
+            "waiting" => Ok(Self::Waiting),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "stopped" => Ok(Self::Stopped),
+            "denied" => Ok(Self::Denied),
+            _ => Err(crate::IntegratorError::InvalidInput(format!(
+                "unknown delegation status: {value}"
+            ))),
+        }
+    }
+}
+
+/// Who authored a delegation message. `User` messages travel the same
+/// direction as orchestrator messages (into the child).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DelegationSender {
+    Orchestrator,
+    Child,
+    User,
+}
+
+impl DelegationSender {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Orchestrator => "orchestrator",
+            Self::Child => "child",
+            Self::User => "user",
+        }
+    }
+
+    /// Messages from the child flow to the orchestrator; everything else
+    /// flows to the child.
+    #[must_use]
+    pub const fn to_child(&self) -> bool {
+        !matches!(self, Self::Child)
+    }
+}
+
+impl FromStr for DelegationSender {
+    type Err = crate::IntegratorError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "orchestrator" => Ok(Self::Orchestrator),
+            "child" => Ok(Self::Child),
+            "user" => Ok(Self::User),
+            _ => Err(crate::IntegratorError::InvalidInput(format!(
+                "unknown delegation sender: {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Delegation {
+    pub id: DelegationId,
+    pub parent_task_id: TaskId,
+    /// The child task holding the subagent's transcript. Absent until the
+    /// delegation is approved and spawned.
+    pub child_task_id: Option<TaskId>,
+    /// Delegation-profile identity resolved from user settings at start time.
+    pub profile_id: String,
+    pub profile_label: String,
+    pub runtime: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub title: String,
+    /// The work brief the orchestrator handed over.
+    pub brief: String,
+    pub status: DelegationStatus,
+    /// Deliverable reported by the child via `task_complete`, or a failure
+    /// diagnostic.
+    pub result: Option<String>,
+    /// Provider-side session/thread reference used to resume the child for
+    /// follow-up turns (structured CLI session id or Codex thread id).
+    pub child_session_ref: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegationMessage {
+    pub id: String,
+    pub delegation_id: DelegationId,
+    pub sender: DelegationSender,
+    pub body: String,
+    pub created_at: DateTime<Utc>,
+    /// When the message reached its recipient: injected into a child turn,
+    /// returned through an orchestrator broker tool, or prepended to the
+    /// orchestrator's next wire prompt.
+    pub delivered_at: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]

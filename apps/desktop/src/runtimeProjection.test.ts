@@ -96,4 +96,96 @@ describe("runtime projection reducer", () => {
       expect.objectContaining({ id: "runtime-approval-approval-1", kind: "approval" }),
     );
   });
+
+  it("orders transcript events by first appearance, not last update", () => {
+    let state = createRuntimeProjectionState("task-1");
+    const message = {
+      id: "codex:thread-1:turn-1:msg-1",
+      providerItemId: "msg-1",
+      kind: "agentMessage" as const,
+      status: "inProgress" as const,
+      body: "Starting…",
+      truncated: false,
+      updatedAt: "2026-07-10T16:00:00Z",
+    };
+    state = applyRuntimeProjection(state, {
+      ...event(40, { kind: "itemChanged", item: message }),
+      occurredAt: "2026-07-10T16:00:00Z",
+    });
+    state = applyRuntimeProjection(state, {
+      ...event(41, {
+        kind: "itemChanged",
+        item: {
+          id: "codex:thread-1:turn-1:tool-1",
+          providerItemId: "tool-1",
+          kind: "mcpTool",
+          status: "completed",
+          mcpServer: "github",
+          mcpTool: "search",
+          truncated: false,
+          updatedAt: "2026-07-10T16:00:05Z",
+        },
+      }),
+      occurredAt: "2026-07-10T16:00:05Z",
+    });
+    // The message keeps streaming after the tool call completed.
+    state = applyRuntimeProjection(state, {
+      ...event(42, {
+        kind: "itemChanged",
+        item: { ...message, body: "Starting… and more text", updatedAt: "2026-07-10T16:00:10Z" },
+      }),
+      occurredAt: "2026-07-10T16:00:10Z",
+    });
+
+    const transcript = runtimeTranscript(state);
+    expect(transcript.map((entry) => entry.id)).toEqual([
+      "codex:thread-1:turn-1:msg-1",
+      "codex:thread-1:turn-1:tool-1",
+    ]);
+  });
+
+  it("surfaces tool call details for expansion", () => {
+    const state = applyRuntimeProjection(
+      createRuntimeProjectionState("task-1"),
+      event(50, {
+        kind: "itemChanged",
+        item: {
+          id: "codex:thread-1:turn-1:tool-2",
+          providerItemId: "tool-2",
+          kind: "mcpTool",
+          status: "completed",
+          title: "github · search",
+          mcpServer: "github",
+          mcpTool: "search",
+          toolInput: '{\n  "query": "flaky tests"\n}',
+          output: "3 results",
+          truncated: false,
+          updatedAt: "2026-07-10T16:00:00Z",
+        },
+      }),
+    );
+
+    const [tool] = runtimeTranscript(state);
+    expect(tool).toMatchObject({ kind: "tool", title: "github · search" });
+    expect(tool.details).toEqual([
+      { label: "Input", body: '{\n  "query": "flaky tests"\n}' },
+      { label: "Output", body: "3 results" },
+    ]);
+  });
+
+  it("keeps turn errors out of the transcript for the composer dock", () => {
+    const state = applyRuntimeProjection(
+      createRuntimeProjectionState("task-1"),
+      event(30, {
+        kind: "turnError",
+        message: "gemini turn execution is not implemented by the native backend",
+        retryable: false,
+      }),
+    );
+
+    expect(state.errors).toHaveLength(1);
+    expect(runtimeTranscript(state)).not.toContainEqual(
+      expect.objectContaining({ id: "runtime-error-30" }),
+    );
+  });
 });

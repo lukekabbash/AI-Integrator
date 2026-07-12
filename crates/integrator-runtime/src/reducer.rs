@@ -13,6 +13,7 @@ const TEXT_LIMIT: usize = 16 * 1024;
 const PATH_LIMIT: usize = 4 * 1024;
 const PLAN_STEP_LIMIT: usize = 4 * 1024;
 const PLAN_STEPS_LIMIT: usize = 256;
+const TOOL_DETAIL_LIMIT: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ProviderEventInput {
@@ -53,6 +54,11 @@ pub enum ProjectionMutation {
         truncated: bool,
     },
     Usage(UsageProjection),
+    /// Adds per-turn usage onto the task's stored projection instead of
+    /// replacing it. Codex streams cumulative thread totals (`Usage`
+    /// replaces); structured CLIs report each turn in isolation, so their
+    /// numbers must accumulate or later turns would erase earlier ones.
+    UsageDelta(UsageProjection),
     ApprovalRequested {
         request_id: TransportRequestId,
         approval_kind: ApprovalKind,
@@ -74,6 +80,9 @@ pub enum ProjectionMutation {
         reason: Option<String>,
     },
     NeutralItem(ItemProjection),
+    /// Overlay the populated fields onto an existing item, keeping detail a
+    /// partial provider update (e.g. an ACP `tool_call_update`) omitted.
+    MergeItem(ItemProjection),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,7 +92,7 @@ pub enum ItemTextField {
 }
 
 pub fn reduce_provider_event(input: ProviderEventInput) -> Result<Option<ReducedProviderEvent>> {
-    let (audit_json, audit_truncated) = bounded_audit(&input.params);
+    let (audit_json, audit_truncated) = bounded_event_audit(&input.params);
     let method = input.method.as_str();
     if method == "item/commandExecution/terminalInteraction" {
         return Ok(None);
@@ -161,6 +170,7 @@ pub fn reduce_provider_event(input: ProviderEventInput) -> Result<Option<Reduced
                 file_changes: Some(parse_file_changes(input.params.get("changes"))),
                 mcp_server: None,
                 mcp_tool: None,
+                tool_input: None,
                 truncated: false,
                 updated_at: input.occurred_at,
             })
@@ -321,6 +331,7 @@ fn parse_item(
         file_changes: None,
         mcp_server: None,
         mcp_tool: None,
+        tool_input: None,
         truncated: false,
         updated_at: now,
     };
@@ -383,11 +394,26 @@ fn parse_item(
         "mcpToolCall" | "dynamicToolCall" => {
             projection.kind = ItemKind::McpTool;
             projection.status = item_status(value.get("status"), completed);
-            projection.title = Some("Tool call".into());
             projection.mcp_server =
                 optional_string(value, "server").map(|text| bound_and_redact(&text, TEXT_LIMIT).0);
             projection.mcp_tool =
                 optional_string(value, "tool").map(|text| bound_and_redact(&text, TEXT_LIMIT).0);
+            projection.title = Some(match (&projection.mcp_server, &projection.mcp_tool) {
+                (Some(server), Some(tool)) => format!("{server} · {tool}"),
+                (None, Some(tool)) => tool.clone(),
+                _ => "Tool call".into(),
+            });
+            projection.tool_input = json_detail(
+                value.get("arguments").or_else(|| value.get("input")),
+                TOOL_DETAIL_LIMIT,
+            );
+            projection.output = json_detail(
+                value
+                    .get("result")
+                    .or_else(|| value.get("output"))
+                    .or_else(|| value.get("error")),
+                TOOL_DETAIL_LIMIT,
+            );
         }
         _ => {
             projection.title = Some("Provider activity".into());
@@ -440,6 +466,7 @@ fn parse_usage(value: Option<&Value>) -> UsageProjection {
         model_context_window: value
             .and_then(|value| value.get("modelContextWindow"))
             .and_then(Value::as_u64),
+        vendor_cost_micro_usd: None,
     }
 }
 
@@ -570,6 +597,30 @@ fn bounded_audit(value: &Value) -> (String, bool) {
     truncate_utf8(&redacted.to_string(), AUDIT_LIMIT)
 }
 
+/// Keep provider-labeled reasoning summaries available for diagnostics while
+/// ensuring raw reasoning blocks never enter the persisted audit stream.
+fn bounded_event_audit(value: &Value) -> (String, bool) {
+    let is_reasoning_item = value
+        .get("item")
+        .and_then(|item| item.get("type"))
+        .and_then(Value::as_str)
+        == Some("reasoning")
+        || (value.get("type").and_then(Value::as_str) == Some("reasoning"));
+    if !is_reasoning_item {
+        return bounded_audit(value);
+    }
+    let mut sanitized = value.clone();
+    let item = if sanitized.get("item").is_some() {
+        sanitized.get_mut("item")
+    } else {
+        Some(&mut sanitized)
+    };
+    if let Some(item) = item.and_then(Value::as_object_mut) {
+        item.remove("content");
+    }
+    bounded_audit(&sanitized)
+}
+
 fn redact_json(value: &Value, key: Option<&str>) -> Value {
     let sensitive_key = key.is_some_and(|key| {
         matches!(
@@ -673,6 +724,22 @@ fn timestamp_seconds(value: Option<&Value>) -> Option<DateTime<Utc>> {
         .and_then(Value::as_i64)
         .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single())
 }
+/// Render a provider JSON payload as bounded, redacted display text. Strings
+/// pass through verbatim; everything else is pretty-printed JSON.
+fn json_detail(value: Option<&Value>, limit: usize) -> Option<String> {
+    let value = value?;
+    let text = match value {
+        Value::Null => return None,
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string_pretty(other).ok()?,
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(bound_and_redact(trimmed, limit).0)
+}
+
 fn u64_field(value: &Value, key: &str) -> u64 {
     value.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
@@ -705,34 +772,33 @@ fn strip_context_primer(text: &str) -> &str {
 pub fn reduce_acp_update(
     session_id: &str,
     turn_id: &str,
+    agent_segment: u32,
     update: &Value,
     occurred_at: DateTime<Utc>,
 ) -> Result<Option<ReducedProviderEvent>> {
-    let (audit_json, audit_truncated) = bounded_audit(update);
     let kind = update
         .get("sessionUpdate")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    // ACP calls this stream `agent_thought_chunk`, but it is raw thought
+    // content rather than a provider-labeled summary. Do not persist or
+    // forward it as a transcript item or audit payload.
+    if kind == "agent_thought_chunk" {
+        return Ok(None);
+    }
+    let (audit_json, audit_truncated) = bounded_audit(update);
     let mutation = match kind {
-        "agent_message_chunk" | "agent_thought_chunk" => {
+        "agent_message_chunk" => {
             let text = update
                 .pointer("/content/text")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             ProjectionMutation::AppendItem {
-                provider_item_id: format!(
-                    "{turn_id}-{}",
-                    if kind == "agent_thought_chunk" {
-                        "thought"
-                    } else {
-                        "agent"
-                    }
-                ),
-                item_kind: if kind == "agent_thought_chunk" {
-                    ItemKind::ReasoningSummary
-                } else {
-                    ItemKind::AgentMessage
-                },
+                // The segment counter opens a fresh transcript item whenever
+                // tool activity interrupted the message stream, so text and
+                // tool calls interleave in wire order instead of coalescing.
+                provider_item_id: format!("{turn_id}-agent-{agent_segment}"),
+                item_kind: ItemKind::AgentMessage,
                 field: ItemTextField::Body,
                 delta: text.to_owned(),
                 updated_at: occurred_at,
@@ -746,36 +812,68 @@ pub fn reduce_acp_update(
             let title = update
                 .get("title")
                 .and_then(Value::as_str)
-                .unwrap_or("Tool call");
+                .map(|title| bound_and_redact(title, TEXT_LIMIT).0);
             let status = match update.get("status").and_then(Value::as_str) {
                 Some("completed") => ItemStatus::Completed,
                 Some("failed") => ItemStatus::Failed,
                 Some("pending") => ItemStatus::Pending,
                 _ => ItemStatus::InProgress,
             };
-            let raw_output = update
-                .pointer("/content/0/content/text")
-                .and_then(Value::as_str);
-            ProjectionMutation::ReplaceItem(ItemProjection {
+            // Join every text content block; fall back to the structured
+            // rawOutput payload when the agent sent no display content.
+            let content_text = update
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .filter_map(|block| {
+                            block
+                                .pointer("/content/text")
+                                .or_else(|| block.get("text"))
+                                .and_then(Value::as_str)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .filter(|text| !text.trim().is_empty());
+            let output = content_text
+                .map(|text| bound_and_redact(&text, TOOL_DETAIL_LIMIT).0)
+                .or_else(|| json_detail(update.get("rawOutput"), TOOL_DETAIL_LIMIT));
+            let item = ItemProjection {
                 id: format!("acp:{session_id}:{turn_id}:{tool_call_id}"),
                 provider_item_id: tool_call_id.to_owned(),
                 kind: ItemKind::McpTool,
                 status,
-                title: Some(bound_and_redact(title, TEXT_LIMIT).0),
+                title: if kind == "tool_call" {
+                    Some(title.unwrap_or_else(|| "Tool call".into()))
+                } else {
+                    title
+                },
                 body: None,
                 command: None,
                 cwd: None,
-                output: raw_output.map(|text| bound_and_redact(text, TEXT_LIMIT).0),
+                output,
                 exit_code: None,
                 file_changes: None,
-                mcp_server: update
+                mcp_server: None,
+                // ACP reports a tool category ("read", "execute", ...) rather
+                // than a server/tool pair; surface it as the tool label.
+                mcp_tool: update
                     .get("kind")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
-                mcp_tool: None,
+                tool_input: json_detail(update.get("rawInput"), TOOL_DETAIL_LIMIT),
                 truncated: false,
                 updated_at: occurred_at,
-            })
+            };
+            if kind == "tool_call" {
+                ProjectionMutation::ReplaceItem(item)
+            } else {
+                // Updates are partial: merge so a bare status change does not
+                // wipe the title, input, and output captured at call time.
+                ProjectionMutation::MergeItem(item)
+            }
         }
         "plan" => {
             let entries = update
@@ -930,6 +1028,148 @@ mod tests {
         assert!(!audit.contains("abc"));
         assert!(!audit.contains("secret"));
         assert!(audit.contains("redacted"));
+    }
+
+    #[test]
+    fn raw_codex_reasoning_content_is_not_written_to_audit() {
+        let event = reduce_provider_event(ProviderEventInput {
+            method: "item/completed".into(),
+            params: json!({
+                "threadId": "th1",
+                "turnId": "tu1",
+                "item": {
+                    "type": "reasoning",
+                    "id": "reasoning-1",
+                    "summary": [{"text": "Safe provider summary"}],
+                    "content": [{"text": "Raw hidden chain of thought"}]
+                }
+            }),
+            request_id: None,
+            occurred_at: Utc::now(),
+        })
+        .expect("reduce")
+        .expect("accepted");
+        assert!(event.audit_json.contains("Safe provider summary"));
+        assert!(!event.audit_json.contains("Raw hidden chain of thought"));
+    }
+
+    #[test]
+    fn raw_acp_thought_chunks_are_dropped() {
+        let event = reduce_acp_update(
+            "session-1",
+            "turn-1",
+            0,
+            &json!({
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": "Raw hidden chain of thought"}
+            }),
+            Utc::now(),
+        )
+        .expect("reduce");
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn acp_tool_call_captures_input_output_and_merges_updates() {
+        let event = reduce_acp_update(
+            "session-1",
+            "turn-1",
+            0,
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-1",
+                "title": "Read main.rs",
+                "kind": "read",
+                "status": "in_progress",
+                "rawInput": {"path": "src/main.rs"}
+            }),
+            Utc::now(),
+        )
+        .expect("reduce")
+        .expect("accepted");
+        let ProjectionMutation::ReplaceItem(item) = &event.mutation else {
+            panic!("expected replace mutation");
+        };
+        assert_eq!(item.title.as_deref(), Some("Read main.rs"));
+        assert_eq!(item.mcp_tool.as_deref(), Some("read"));
+        assert!(item.tool_input.as_deref().unwrap().contains("src/main.rs"));
+
+        let update = reduce_acp_update(
+            "session-1",
+            "turn-1",
+            0,
+            &json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-1",
+                "status": "completed",
+                "content": [{"type": "content", "content": {"type": "text", "text": "fn main() {}"}}]
+            }),
+            Utc::now(),
+        )
+        .expect("reduce")
+        .expect("accepted");
+        let ProjectionMutation::MergeItem(item) = &update.mutation else {
+            panic!("expected merge mutation");
+        };
+        assert_eq!(item.status, ItemStatus::Completed);
+        assert_eq!(
+            item.title, None,
+            "partial update must not fabricate a title"
+        );
+        assert_eq!(item.output.as_deref(), Some("fn main() {}"));
+    }
+
+    #[test]
+    fn acp_agent_segments_open_distinct_items() {
+        let chunk = json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "hello"}
+        });
+        let first = reduce_acp_update("session-1", "turn-1", 0, &chunk, Utc::now())
+            .expect("reduce")
+            .expect("accepted");
+        let second = reduce_acp_update("session-1", "turn-1", 1, &chunk, Utc::now())
+            .expect("reduce")
+            .expect("accepted");
+        let ids: Vec<_> = [first, second]
+            .iter()
+            .map(|event| match &event.mutation {
+                ProjectionMutation::AppendItem {
+                    provider_item_id, ..
+                } => provider_item_id.clone(),
+                _ => panic!("expected append mutation"),
+            })
+            .collect();
+        assert_eq!(ids, vec!["turn-1-agent-0", "turn-1-agent-1"]);
+    }
+
+    #[test]
+    fn codex_mcp_tool_call_captures_arguments_and_named_title() {
+        let event = reduce_provider_event(ProviderEventInput {
+            method: "item/completed".into(),
+            params: json!({
+                "threadId": "th1",
+                "turnId": "tu1",
+                "item": {
+                    "type": "mcpToolCall",
+                    "id": "tool-1",
+                    "server": "github",
+                    "tool": "search",
+                    "arguments": {"query": "flaky tests"},
+                    "result": {"matches": 3}
+                }
+            }),
+            request_id: None,
+            occurred_at: Utc::now(),
+        })
+        .expect("reduce")
+        .expect("accepted");
+        let ProjectionMutation::ReplaceItem(item) = &event.mutation else {
+            panic!("expected replace mutation");
+        };
+        assert_eq!(item.title.as_deref(), Some("github · search"));
+        assert!(item.tool_input.as_deref().unwrap().contains("flaky tests"));
+        assert!(item.output.as_deref().unwrap().contains("matches"));
     }
 
     #[test]
