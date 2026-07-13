@@ -361,14 +361,13 @@ fn provider_args(options: &StructuredCliLaunchOptions) -> Vec<String> {
         };
         args.extend(["--model".into(), model]);
     }
-    if matches!(options.provider, StructuredCliProvider::Claude) {
-        if let Some(effort) = options
+    if matches!(options.provider, StructuredCliProvider::Claude)
+        && let Some(effort) = options
             .effort
             .as_deref()
             .filter(|value| CLAUDE_EFFORT_LEVELS.contains(value))
-        {
-            args.extend(["--effort".into(), effort.into()]);
-        }
+    {
+        args.extend(["--effort".into(), effort.into()]);
     }
     if let Some(session) = options
         .resume_session_id
@@ -381,18 +380,18 @@ fn provider_args(options: &StructuredCliLaunchOptions) -> Vec<String> {
         };
         args.extend([resume_flag.into(), session.into()]);
     }
-    if matches!(options.provider, StructuredCliProvider::Claude) {
-        if let Some(mcp_config) = options.mcp_config_path.as_deref() {
-            // `--allowed-tools mcp__integrator` pre-approves the injected
-            // broker server's tools; print mode has no interactive prompt to
-            // approve them otherwise.
-            args.extend([
-                "--mcp-config".into(),
-                mcp_config.to_string_lossy().into_owned(),
-                "--allowed-tools".into(),
-                "mcp__integrator".into(),
-            ]);
-        }
+    if matches!(options.provider, StructuredCliProvider::Claude)
+        && let Some(mcp_config) = options.mcp_config_path.as_deref()
+    {
+        // `--allowed-tools mcp__integrator` pre-approves the injected
+        // broker server's tools; print mode has no interactive prompt to
+        // approve them otherwise.
+        args.extend([
+            "--mcp-config".into(),
+            mcp_config.to_string_lossy().into_owned(),
+            "--allowed-tools".into(),
+            "mcp__integrator".into(),
+        ]);
     }
     args
 }
@@ -505,8 +504,7 @@ async fn run_child(
     let mut session_id = None;
     let mut cancelled = false;
     let mut saw_text_delta = false;
-    loop {
-        let Some(reader) = stdout.as_mut() else { break };
+    while let Some(reader) = stdout.as_mut() {
         line.clear();
         tokio::select! {
             read = reader.read_line(&mut line) => match read {
@@ -542,19 +540,18 @@ async fn run_child(
     }
     stdin_slot.lock().await.take();
     let status = child.wait().await.ok();
-    if !cancelled && status.as_ref().is_some_and(|status| !status.success()) {
-        if let Some(task) = stderr_task {
-            if let Ok(diagnostic) = task.await {
-                if !diagnostic.trim().is_empty() {
-                    let message = redact_and_bound(diagnostic.trim(), DIAGNOSTIC_LIMIT).0;
-                    let _ = events.send(StructuredCliEvent {
-                        turn_id: turn_id.clone(),
-                        session_id: session_id.clone(),
-                        event: StructuredCliEventKind::Diagnostic { message },
-                    });
-                }
-            }
-        }
+    if !cancelled
+        && status.as_ref().is_some_and(|status| !status.success())
+        && let Some(task) = stderr_task
+        && let Ok(diagnostic) = task.await
+        && !diagnostic.trim().is_empty()
+    {
+        let message = redact_and_bound(diagnostic.trim(), DIAGNOSTIC_LIMIT).0;
+        let _ = events.send(StructuredCliEvent {
+            turn_id: turn_id.clone(),
+            session_id: session_id.clone(),
+            event: StructuredCliEventKind::Diagnostic { message },
+        });
     }
     let _ = events.send(StructuredCliEvent {
         turn_id,

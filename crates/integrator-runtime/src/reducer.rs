@@ -1419,7 +1419,12 @@ mod tests {
         };
         assert_eq!(item.title.as_deref(), Some("Read main.rs"));
         assert_eq!(item.mcp_tool.as_deref(), Some("read"));
-        assert!(item.tool_input.as_deref().unwrap().contains("src/main.rs"));
+        assert!(
+            item.tool_input
+                .as_deref()
+                .expect("tool input")
+                .contains("src/main.rs")
+        );
 
         let update = reduce_acp_update(
             "session-1",
@@ -1570,8 +1575,18 @@ mod tests {
             panic!("expected replace mutation");
         };
         assert_eq!(item.title.as_deref(), Some("github · search"));
-        assert!(item.tool_input.as_deref().unwrap().contains("flaky tests"));
-        assert!(item.output.as_deref().unwrap().contains("matches"));
+        assert!(
+            item.tool_input
+                .as_deref()
+                .expect("tool input")
+                .contains("flaky tests")
+        );
+        assert!(
+            item.output
+                .as_deref()
+                .expect("tool output")
+                .contains("matches")
+        );
     }
 
     #[test]

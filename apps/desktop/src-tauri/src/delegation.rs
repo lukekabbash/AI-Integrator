@@ -721,10 +721,10 @@ fn delegation_status(
     let delegations = state.store.list_delegations(parent_task_id)?;
     let mut rows = Vec::new();
     for delegation in delegations {
-        if let Some(filter) = &filter {
-            if delegation.id.to_string() != *filter {
-                continue;
-            }
+        if let Some(filter) = &filter
+            && delegation.id.to_string() != *filter
+        {
+            continue;
         }
         let messages = state
             .store
@@ -829,7 +829,7 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
     let statuses = tauri::async_runtime::spawn_blocking(discover_providers)
         .await
         .map_err(|_| IntegratorError::Unavailable("provider discovery failed".into()))?;
-    let executable = provider_executable(&statuses, provider.clone()).ok_or_else(|| {
+    let executable = provider_executable(&statuses, provider).ok_or_else(|| {
         IntegratorError::Unavailable(format!("{} CLI is not installed", provider.as_str()))
     })?;
 
@@ -857,7 +857,7 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
                 profile,
                 &preferred_children,
             ));
-            let mcp_config = match (&broker, provider.clone()) {
+            let mcp_config = match (&broker, provider) {
                 (Some(info), ProviderKind::Claude) => Some(write_mcp_config(
                     &app,
                     info,
@@ -937,13 +937,13 @@ async fn respawn_existing_child(
     let statuses = tauri::async_runtime::spawn_blocking(discover_providers)
         .await
         .map_err(|_| IntegratorError::Unavailable("provider discovery failed".into()))?;
-    let executable = provider_executable(&statuses, provider.clone()).ok_or_else(|| {
+    let executable = provider_executable(&statuses, provider).ok_or_else(|| {
         IntegratorError::Unavailable(format!("{} CLI is not installed", provider.as_str()))
     })?;
     let broker = state.broker.lock().expect("broker lock").clone();
     let child = match provider {
         ProviderKind::Claude | ProviderKind::Antigravity => {
-            let mcp_config = match (&broker, provider.clone()) {
+            let mcp_config = match (&broker, provider) {
                 (Some(info), ProviderKind::Claude) => Some(write_mcp_config(
                     app,
                     info,
@@ -990,10 +990,9 @@ async fn spawn_structured_child(
     let client = integrator_runtime::StructuredCliClient::new();
     let process_id = uuid::Uuid::new_v4().to_string();
     let thread_id = format!("structured.{}.{}", provider.as_str(), uuid::Uuid::new_v4());
-    let binding =
-        state
-            .store
-            .create_runtime_binding(child_task_id, &process_id, provider.clone())?;
+    let binding = state
+        .store
+        .create_runtime_binding(child_task_id, &process_id, provider)?;
     let binding = state.store.attach_provider_thread(&binding, &thread_id)?;
     let session_ref = Arc::new(std::sync::Mutex::new(None));
     let runtime = StructuredRuntime {
@@ -1373,17 +1372,16 @@ async fn deliver_queued_messages_with_context(
         return Ok(false);
     }
     let mut prompt = String::new();
-    if include_continuation_context {
-        if let Some(digest) = state
+    if include_continuation_context
+        && let Some(digest) = state
             .store
             .task_conversation_digest(child.child_task_id, CHILD_DIGEST_BYTES)
             .ok()
             .flatten()
-        {
-            prompt.push_str(&format!(
-                "<continuation-context>\nYou are continuing the same delegated conversation through a fresh provider session. Recent locally persisted transcript:\n\n{digest}\n</continuation-context>\n\n"
-            ));
-        }
+    {
+        prompt.push_str(&format!(
+            "<continuation-context>\nYou are continuing the same delegated conversation through a fresh provider session. Recent locally persisted transcript:\n\n{digest}\n</continuation-context>\n\n"
+        ));
     }
     prompt.push_str("<orchestrator-message>\nNew guidance from your orchestrator:\n");
     for message in &messages {
@@ -1492,11 +1490,11 @@ pub async fn queue_message_to_child(
             .lock()
             .await
             .remove(&delegation_id.to_string());
-        if let Some(previous) = previous {
-            if let DelegationChildDriver::Codex { runtime, .. } = &previous.driver {
-                let _ = state.store.expire_process_approvals(&runtime.process_id);
-                let _ = runtime.client.shutdown().await;
-            }
+        if let Some(previous) = previous
+            && let DelegationChildDriver::Codex { runtime, .. } = &previous.driver
+        {
+            let _ = state.store.expire_process_approvals(&runtime.process_id);
+            let _ = runtime.client.shutdown().await;
         }
         let child = match respawn_existing_child(app, &delegation).await {
             Ok(child) => child,

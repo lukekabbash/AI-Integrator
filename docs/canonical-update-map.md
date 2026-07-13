@@ -1,6 +1,6 @@
 # Canonical documentation update map
 
-**Target:** `H:\Code\integrator-3`  
+**Target:** this repository root
 **Purpose:** integrate the v1 decisions without creating duplicate authority.
 
 ## 1. New canonical documents
@@ -189,4 +189,3 @@ Implementation may start when:
 - [ ] Tauri/PTY/Git/recovery/accessibility/packaging spike passes on Windows and macOS.
 - [ ] M1 tickets map to v1 acceptance fixtures; non-v1 primitives do not accidentally gate release.
 - [ ] Interactive prototypes for the nine design acceptance states are approved.
-

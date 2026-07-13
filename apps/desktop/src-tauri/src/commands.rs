@@ -176,7 +176,7 @@ pub async fn provider_action_list(
             }
         }
         ProviderKind::Claude | ProviderKind::Antigravity => {
-            let scan_provider = provider.clone();
+            let scan_provider = provider;
             let scan_repository = repository.clone();
             tauri::async_runtime::spawn_blocking(move || {
                 discover_file_actions(&scan_provider, &scan_repository)
@@ -349,11 +349,10 @@ async fn probe_acp_actions(
     let statuses = tauri::async_runtime::spawn_blocking(discover_providers)
         .await
         .map_err(|_| worker_error())?;
-    let executable =
-        provider_executable(&statuses, provider.clone()).ok_or_else(|| CommandError {
-            code: "provider-unavailable",
-            message: format!("{} CLI is not installed", provider.as_str()),
-        })?;
+    let executable = provider_executable(&statuses, *provider).ok_or_else(|| CommandError {
+        code: "provider-unavailable",
+        message: format!("{} CLI is not installed", provider.as_str()),
+    })?;
     let client = adapter_acp::AcpClient::spawn(adapter_acp::AcpLaunchOptions {
         executable,
         arguments: acp_launch_arguments(provider)?,
@@ -460,7 +459,7 @@ fn reconcile_native_action_handles(
     let mut public_actions = Vec::new();
     for mut resolved in resolved.into_iter().take(512) {
         let handle = NativeActionHandle {
-            provider: provider.clone(),
+            provider,
             repository: repository.clone(),
             name: resolved.public.name.clone(),
             source: resolved.public.source.clone(),
@@ -1064,10 +1063,10 @@ pub async fn voice_typing_start(app: AppHandle, state: State<'_, AppState>) -> C
     let cleanup_app = app.clone();
     tauri::async_runtime::spawn(async move {
         run_voice_typing(socket, receiver, app).await;
-        if let Some(state) = cleanup_app.try_state::<AppState>() {
-            if let Ok(mut active) = state.voice_typing.lock() {
-                active.take();
-            }
+        if let Some(state) = cleanup_app.try_state::<AppState>()
+            && let Ok(mut active) = state.voice_typing.lock()
+        {
+            active.take();
         }
     });
     Ok(())
@@ -1889,10 +1888,10 @@ pub fn terminal_close(state: State<'_, AppState>, session_id: String) -> Command
         .lock()
         .expect("terminal lock")
         .remove(&session_id);
-    if let Some(session) = session {
-        if let Some(run) = session.running {
-            let _ = run.kill.send(());
-        }
+    if let Some(session) = session
+        && let Some(run) = session.running
+    {
+        let _ = run.kill.send(());
     }
     Ok(())
 }
@@ -2915,11 +2914,10 @@ pub async fn acp_connect(
     let statuses = tauri::async_runtime::spawn_blocking(discover_providers)
         .await
         .map_err(|_| worker_error())?;
-    let executable =
-        provider_executable(&statuses, provider.clone()).ok_or_else(|| CommandError {
-            code: "provider-unavailable",
-            message: format!("{} CLI is not installed", provider.as_str()),
-        })?;
+    let executable = provider_executable(&statuses, provider).ok_or_else(|| CommandError {
+        code: "provider-unavailable",
+        message: format!("{} CLI is not installed", provider.as_str()),
+    })?;
     let client = adapter_acp::AcpClient::spawn(adapter_acp::AcpLaunchOptions {
         executable,
         arguments,
@@ -2934,7 +2932,7 @@ pub async fn acp_connect(
     }
     let runtime = AcpRuntime {
         client,
-        provider: provider.clone(),
+        provider,
         process_id: uuid::Uuid::new_v4().to_string(),
         alive: Arc::new(AtomicBool::new(true)),
         binding: Arc::new(std::sync::Mutex::new(None)),
@@ -2989,24 +2987,24 @@ pub async fn acp_start_session(
 ) -> CommandResult<Value> {
     state.store.get_task(task_id).map_err(CommandError::from)?;
     let runtime = acp_runtime(&state, Some(task_id), None).await?;
-    let provider = runtime.provider.clone();
+    let provider = runtime.provider;
     let provider_name = provider.as_str().to_owned();
     // Delegation broker injection: ACP's `session/new` carries MCP servers
     // natively. The tool preamble is queued one-shot for the first turn.
     let mut mcp_servers = Vec::new();
     if let Some(mode) = delegation.as_deref().filter(|mode| *mode != "off") {
         let broker = state.broker.lock().expect("broker lock").clone();
-        if let Some(info) = broker {
-            if let Ok(entry) = crate::delegation::acp_mcp_server_entry(
+        if let Some(info) = broker
+            && let Ok(entry) = crate::delegation::acp_mcp_server_entry(
                 &info,
                 "orchestrator",
                 &task_id.to_string(),
                 mode,
-            ) {
-                mcp_servers.push(entry);
-                *runtime.delegation_preamble.lock().expect("preamble lock") =
-                    Some(crate::delegation::orchestrator_preamble(&state.store, mode));
-            }
+            )
+        {
+            mcp_servers.push(entry);
+            *runtime.delegation_preamble.lock().expect("preamble lock") =
+                Some(crate::delegation::orchestrator_preamble(&state.store, mode));
         }
     }
     let response = runtime
@@ -3346,6 +3344,8 @@ pub async fn acp_list_cursor_models(
         .map_err(Into::into)
 }
 
+// The argument list is the typed renderer-to-Tauri command protocol.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn structured_cli_start_turn(
     app: AppHandle<tauri::Wry>,
@@ -3438,11 +3438,10 @@ pub async fn structured_cli_start_turn(
     let statuses = tauri::async_runtime::spawn_blocking(discover_providers)
         .await
         .map_err(|_| worker_error())?;
-    let executable =
-        provider_executable(&statuses, provider.clone()).ok_or_else(|| CommandError {
-            code: "provider-unavailable",
-            message: format!("{} CLI is not installed", provider.as_str()),
-        })?;
+    let executable = provider_executable(&statuses, provider).ok_or_else(|| CommandError {
+        code: "provider-unavailable",
+        message: format!("{} CLI is not installed", provider.as_str()),
+    })?;
 
     // A task owns at most one structured provider process, but other tasks keep
     // running independently in the background. Replacing a process is scoped
@@ -3529,7 +3528,7 @@ pub async fn structured_cli_start_turn(
     let store = Arc::clone(&state.store);
     let stored_process = process_id.clone();
     let stored_thread = thread_id.clone();
-    let stored_provider = provider.clone();
+    let stored_provider = provider;
     let binding = tauri::async_runtime::spawn_blocking(move || {
         let binding = store.create_runtime_binding(task_id, &stored_process, stored_provider)?;
         store.attach_provider_thread(&binding, &stored_thread)
@@ -3823,7 +3822,7 @@ pub(crate) fn spawn_structured_cli_pump(
                     // session" approves the plan and auto-accepts the edits
                     // that implement it.
                     let suggestions = if plan_review
-                        && !suggestions.as_array().is_some_and(|list| !list.is_empty())
+                        && suggestions.as_array().is_none_or(|list| list.is_empty())
                     {
                         serde_json::json!([
                             { "type": "setMode", "mode": "acceptEdits", "destination": "session" }
@@ -4140,10 +4139,10 @@ fn spawn_acp_pump(app: AppHandle<tauri::Wry>, store: Arc<LocalStore>, runtime: A
                         }
                         _ => {}
                     }
-                    match reduce_acp_update(session_id, turn_id, agent_segment, update, Utc::now())
+                    if let Ok(Some(reduced)) =
+                        reduce_acp_update(session_id, turn_id, agent_segment, update, Utc::now())
                     {
-                        Ok(Some(reduced)) => apply_and_emit(&app, &store, binding, &reduced),
-                        Ok(None) | Err(_) => {}
+                        apply_and_emit(&app, &store, binding, &reduced);
                     }
                 }
                 adapter_acp::AcpEvent::ServerRequest { id, method, params } => {
@@ -4845,7 +4844,7 @@ fn reveal_project_file(root: &Path, requested_path: &str) -> CommandResult<()> {
         } else {
             command.arg(path);
         }
-        return spawn_quiet(command, "could not show the file in File Explorer");
+        spawn_quiet(command, "could not show the file in File Explorer")
     }
     #[cfg(target_os = "macos")]
     {
@@ -4854,7 +4853,7 @@ fn reveal_project_file(root: &Path, requested_path: &str) -> CommandResult<()> {
             command.arg("-R");
         }
         command.arg(path);
-        return spawn_quiet(command, "could not reveal the file in Finder");
+        spawn_quiet(command, "could not reveal the file in Finder")
     }
     #[cfg(target_os = "linux")]
     {
@@ -4865,10 +4864,10 @@ fn reveal_project_file(root: &Path, requested_path: &str) -> CommandResult<()> {
         };
         let mut command = Command::new("xdg-open");
         command.arg(target);
-        return spawn_quiet(
+        spawn_quiet(
             command,
             "could not show the file in the system file manager",
-        );
+        )
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
@@ -5286,7 +5285,7 @@ mod tests {
 
     #[test]
     fn unchanged_native_actions_keep_their_opaque_handle_across_catalog_refreshes() {
-        let repository = PathBuf::from(r"H:\Code\integrator-3");
+        let repository = PathBuf::from("fixture-repository");
         let skill_path = repository.join(".codex").join("skills").join("openai-docs");
         let action = ResolvedNativeAction {
             public: NativeProviderAction {

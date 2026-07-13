@@ -191,7 +191,7 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
     {
       id: "integrator",
       name: "AI Integrator",
-      path: "H:\\Code\\integrator-3",
+      path: "Projects/AI Integrator",
       branch: "feature/v1-native-app",
       dirtyFiles: 3,
       expanded: true,
@@ -199,7 +199,7 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
     {
       id: "lotmind",
       name: "Lotmind AI",
-      path: "H:\\Code\\Lotmind AI",
+      path: "Projects/Lotmind AI",
       branch: "main",
       dirtyFiles: 0,
       expanded: false,
@@ -207,7 +207,7 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
     {
       id: "eve",
       name: "EVE OS",
-      path: "F:\\Code\\eve-os-2",
+      path: "Projects/EVE OS",
       branch: "dev",
       dirtyFiles: 1,
       expanded: false,
@@ -505,7 +505,7 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
     upstream: "origin/feature/v1-native-app",
     ahead: 2,
     behind: 0,
-    worktree: "H:\\Code\\integrator-3",
+    worktree: "Projects/AI Integrator",
     files: diff,
     commits: [
       { id: "working", subject: "Working tree changes", relativeTime: "now", current: true },

@@ -725,7 +725,10 @@ mod tests {
 
     #[test]
     fn goal_objective_uses_the_provider_character_limit() {
-        assert_eq!(validate_goal_objective("  ship it  ").unwrap(), "ship it");
+        assert_eq!(
+            validate_goal_objective("  ship it  ").expect("valid goal objective"),
+            "ship it"
+        );
         assert!(validate_goal_objective("").is_err());
         assert!(validate_goal_objective(&"x".repeat(4_000)).is_ok());
         assert!(validate_goal_objective(&"x".repeat(4_001)).is_err());

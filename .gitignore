@@ -7,6 +7,7 @@ dist/
 # Rust / Tauri
 target/
 src-tauri/target/
+/temp/
 
 # Local environment and credentials
 .env
@@ -16,6 +17,10 @@ src-tauri/target/
 *.key
 *.pfx
 *.p12
+.cargo/credentials
+.cargo/credentials.toml
+.npmrc
+!.npmrc.example
 
 # AI Integrator local state
 .aiintegrator/.runtime/
@@ -24,14 +29,73 @@ src-tauri/target/
 *.db-wal
 *.sqlite
 *.sqlite3
+*.db-journal
+*.sqlite-journal
+*.sqlite3-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
 logs/
 diagnostics/
+
+# Local agent runtime state
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.json
+.claude/routines/.state/
+.claude/worktrees/
+.claude/checkpoints/
+.claude/mailbox/
+.claude/agent-registry.json
+.claude/agent-memory-local
+.claude/first-run
+.claude/assistant-daemon-state.json
+.claude/settings.local.json
+/.codex/auth.json
+/.codex/history.jsonl
+/.codex/session_index.jsonl
+/.codex/sessions/
+/.codex/archived_sessions/
+/.codex/attachments/
+/.codex/ambient-suggestions/
+/.codex/automations/
+/.codex/browser/
+/.codex/cache/
+/.codex/codex-remote-attachments/
+/.codex/computer-use*/
+/.codex/generated_images/
+/.codex/log/
+/.codex/mcp-oauth-locks/
+/.codex/memories/
+/.codex/node_repl/
+/.codex/plugins/
+/.codex/process_manager/
+/.codex/sqlite/
+/.codex/tmp/
+/.codex/vendor_imports/
+/.codex/visualizations/
+/.codex/worktrees/
+/.codex/.sandbox*/
+/.codex/.tmp/
+/.codex/*oauth*.lock
+/.codex/.codex-global-state.json*
+/.codex/.app-server-state-reconciled-v1
+/.codex/cap_sid
+/.codex/installation_id
+/.codex/internal_storage.json
+/.codex/models_cache.json
+/.codex/transcription-history.jsonl
 
 # Editors and OS
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
+*.codexpatch
+*.log
+*.bak
+*.orig
+*.rej
 
 # Test and coverage artifacts
 coverage/

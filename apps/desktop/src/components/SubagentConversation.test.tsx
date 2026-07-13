@@ -49,7 +49,7 @@ const childGit: GitSnapshot = {
   upstream: "origin/feature/subagent",
   ahead: 1,
   behind: 0,
-  worktree: "H:/Code/integrator-3-child",
+  worktree: "fixture/integrator-3-child",
   commits: [],
   files: [
     {

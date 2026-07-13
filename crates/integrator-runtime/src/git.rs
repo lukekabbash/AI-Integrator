@@ -1142,10 +1142,10 @@ fn sanitize_remote_url(value: &str) -> String {
             );
         }
     }
-    if let Some(at) = value.find('@') {
-        if value[..at].find(':').is_none() {
-            return value[at + 1..].to_owned();
-        }
+    if let Some(at) = value.find('@')
+        && value[..at].find(':').is_none()
+    {
+        return value[at + 1..].to_owned();
     }
     value.to_owned()
 }

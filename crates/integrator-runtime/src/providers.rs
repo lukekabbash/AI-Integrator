@@ -220,12 +220,9 @@ fn parse_codex_auth_text(value: &str) -> (AuthenticationState, Option<String>) {
 
 fn parse_cli_auth_text(value: &str) -> (AuthenticationState, Option<String>) {
     let value = value.to_ascii_lowercase();
-    if value.contains("not logged in") || value.contains("logged out") {
-        (
-            AuthenticationState::LoggedOut,
-            Some("login-required".into()),
-        )
-    } else if value.contains("not authenticated")
+    if value.contains("not logged in")
+        || value.contains("logged out")
+        || value.contains("not authenticated")
         || value.contains("not signed in")
         || value.contains("login required")
     {

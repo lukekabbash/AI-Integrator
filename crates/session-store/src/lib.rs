@@ -1600,7 +1600,7 @@ mod tests {
                     .expect("record pre-snapshot migration");
                 transaction.commit().expect("commit pre-snapshot migration");
             }
-            connection.execute("INSERT INTO tasks(id,title,state,created_at,updated_at) VALUES (?1,'Legacy fixture','active',?2,?2)", params![task_id.to_string(), occurred_at.to_rfc3339()]).expect("insert legacy task");
+            connection.execute("INSERT INTO tasks(id,title,state,created_at,updated_at) VALUES (?1,'Legacy fixture','ready',?2,?2)", params![task_id.to_string(), occurred_at.to_rfc3339()]).expect("insert legacy task");
             connection.execute("INSERT INTO provider_sessions(id,task_id,provider,provider_thread_id,created_at,updated_at) VALUES (?1,?2,'codex','legacy-thread',?3,?3)", params![provider_session_id.to_string(), task_id.to_string(), occurred_at.to_rfc3339()]).expect("insert legacy provider session");
             connection.execute("INSERT INTO runtime_sessions(id,task_id,provider_session_id,status,started_at,process_id) VALUES (?1,?2,?3,'running',?4,'legacy-process')", params![runtime_session_id.to_string(), task_id.to_string(), provider_session_id.to_string(), occurred_at.to_rfc3339()]).expect("insert legacy runtime session");
             connection.execute("INSERT INTO codex_task_projection(task_id,provider_session_id,thread_id,process_id,last_event_seq) VALUES (?1,?2,'legacy-thread','legacy-process',1)", params![task_id.to_string(), provider_session_id.to_string()]).expect("insert legacy task projection");
@@ -1669,7 +1669,9 @@ mod tests {
         drop(migrated);
 
         let reopened = LocalStore::open(&path).expect("reopen migrated fixture");
-        let snapshot = reopened.task_snapshot(task_id).expect("hydrate after reopen");
+        let snapshot = reopened
+            .task_snapshot(task_id)
+            .expect("hydrate after reopen");
         assert_eq!(snapshot.watermark_seq, appended.seq);
         assert_eq!(snapshot.events.len(), 2);
         assert!(snapshot.events.iter().any(|event| matches!(

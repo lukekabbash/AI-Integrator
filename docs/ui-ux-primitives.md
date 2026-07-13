@@ -693,7 +693,7 @@ The clone flow is inline and resumable:
 
 ```text
 Repository URL        [________________________________]
-Destination           [H:\Code\________________________]
+Destination           [Choose a destination folder]
 Branch                 [Default branch ▾]
 After clone            [Use current branch ▾]
 ```

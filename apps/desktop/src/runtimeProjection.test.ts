@@ -263,7 +263,7 @@ describe("runtime projection reducer", () => {
         kind: "commandExecution" as const,
         status: "completed" as const,
         command: "pnpm test",
-        cwd: "H:/Code/integrator-3",
+        cwd: "fixture/integrator-3",
         output: "passed",
         truncated: false,
         updatedAt: "2026-07-10T16:00:02Z",

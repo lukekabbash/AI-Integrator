@@ -358,14 +358,13 @@ fn scan_plugin_tree(
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned();
-                if looks_like_version(&plugin_name) {
-                    if let Some(name) = parent
+                if looks_like_version(&plugin_name)
+                    && let Some(name) = parent
                         .as_deref()
                         .and_then(Path::parent)
                         .and_then(Path::file_name)
-                    {
-                        plugin_name = name.to_string_lossy().into_owned();
-                    }
+                {
+                    plugin_name = name.to_string_lossy().into_owned();
                 }
                 scan_skill_root(
                     &entry.path(),

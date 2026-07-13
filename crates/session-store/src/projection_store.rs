@@ -1610,7 +1610,7 @@ mod tests {
                 approval_id: Some("provider-approval-1".into()),
                 reason: Some("run tests".into()),
                 command: Some("cargo test".into()),
-                cwd: Some("H:/Code/integrator-3".into()),
+                cwd: Some("fixture/integrator-3".into()),
                 plan_markdown: None,
             },
             ProjectionMutation::TurnError {
@@ -1699,7 +1699,7 @@ mod tests {
                         approval_id: Some("provider-approval".into()),
                         reason: Some("run focused tests".into()),
                         command: Some("cargo test -p session-store".into()),
-                        cwd: Some("H:/Code/integrator-3".into()),
+                        cwd: Some("fixture/integrator-3".into()),
                         plan_markdown: None,
                     },
                     occurred_at: Utc::now(),

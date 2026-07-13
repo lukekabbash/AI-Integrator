@@ -15,7 +15,7 @@ const codex: RuntimeConnection = {
   models: ["Provider default"],
   detail: "Ready",
 };
-const repository = String.raw`H:\Code\integrator-3`;
+const repository = "fixture-repository";
 
 beforeEach(() => {
   document.documentElement.dataset.motion = "none";
