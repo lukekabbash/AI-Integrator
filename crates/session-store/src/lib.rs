@@ -240,6 +240,339 @@ const MIGRATIONS: &[(i64, &str)] = &[
             ON delegation_messages(delegation_id, delivered_at, created_at);
         "#,
     ),
+    (
+        7,
+        r#"
+        CREATE VIRTUAL TABLE codex_items_fts USING fts5(
+            body,
+            task_id UNINDEXED,
+            item_id UNINDEXED,
+            content='codex_items',
+            content_rowid='rowid',
+            tokenize='unicode61 remove_diacritics 2'
+        );
+        INSERT INTO codex_items_fts(rowid, body, task_id, item_id)
+            SELECT rowid, body, task_id, item_id
+            FROM codex_items
+            WHERE kind IN ('user_message', 'agent_message')
+              AND status IN ('completed', 'failed', 'declined')
+              AND body IS NOT NULL
+              AND trim(body) <> '';
+
+        CREATE TRIGGER codex_items_fts_insert AFTER INSERT ON codex_items
+        WHEN new.kind IN ('user_message', 'agent_message')
+          AND new.status IN ('completed', 'failed', 'declined')
+          AND new.body IS NOT NULL
+          AND trim(new.body) <> ''
+        BEGIN
+            INSERT INTO codex_items_fts(rowid, body, task_id, item_id)
+            VALUES (new.rowid, new.body, new.task_id, new.item_id);
+        END;
+
+        CREATE TRIGGER codex_items_fts_delete AFTER DELETE ON codex_items
+        WHEN old.kind IN ('user_message', 'agent_message')
+          AND old.status IN ('completed', 'failed', 'declined')
+          AND old.body IS NOT NULL
+          AND trim(old.body) <> ''
+        BEGIN
+            INSERT INTO codex_items_fts(codex_items_fts, rowid, body, task_id, item_id)
+            VALUES ('delete', old.rowid, old.body, old.task_id, old.item_id);
+        END;
+
+        CREATE TRIGGER codex_items_fts_update_delete AFTER UPDATE ON codex_items
+        WHEN old.kind IN ('user_message', 'agent_message')
+          AND old.status IN ('completed', 'failed', 'declined')
+          AND old.body IS NOT NULL
+          AND trim(old.body) <> ''
+        BEGIN
+            INSERT INTO codex_items_fts(codex_items_fts, rowid, body, task_id, item_id)
+            VALUES ('delete', old.rowid, old.body, old.task_id, old.item_id);
+        END;
+
+        CREATE TRIGGER codex_items_fts_update_insert AFTER UPDATE ON codex_items
+        WHEN new.kind IN ('user_message', 'agent_message')
+          AND new.status IN ('completed', 'failed', 'declined')
+          AND new.body IS NOT NULL
+          AND trim(new.body) <> ''
+        BEGIN
+            INSERT INTO codex_items_fts(rowid, body, task_id, item_id)
+            VALUES (new.rowid, new.body, new.task_id, new.item_id);
+        END;
+        "#,
+    ),
+    (
+        8,
+        r#"
+        ALTER TABLE codex_turns ADD COLUMN first_event_seq INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE codex_turns ADD COLUMN first_occurred_at TEXT;
+        ALTER TABLE codex_turns ADD COLUMN snapshot_event_json TEXT;
+
+        ALTER TABLE codex_items ADD COLUMN first_event_seq INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE codex_items ADD COLUMN first_occurred_at TEXT;
+        ALTER TABLE codex_items ADD COLUMN snapshot_event_json TEXT;
+
+        ALTER TABLE codex_approvals ADD COLUMN first_event_seq INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE codex_approvals ADD COLUMN first_occurred_at TEXT;
+        ALTER TABLE codex_approvals ADD COLUMN snapshot_event_json TEXT;
+
+        DROP TRIGGER codex_items_fts_update_delete;
+        DROP TRIGGER codex_items_fts_update_insert;
+        CREATE TRIGGER codex_items_fts_update_delete BEFORE UPDATE ON codex_items
+        WHEN old.kind IN ('user_message', 'agent_message')
+          AND old.status IN ('completed', 'failed', 'declined')
+          AND old.body IS NOT NULL
+          AND trim(old.body) <> ''
+        BEGIN
+            INSERT INTO codex_items_fts(codex_items_fts, rowid, body, task_id, item_id)
+            VALUES ('delete', old.rowid, old.body, old.task_id, old.item_id);
+        END;
+        CREATE TRIGGER codex_items_fts_update_insert AFTER UPDATE ON codex_items
+        WHEN new.kind IN ('user_message', 'agent_message')
+          AND new.status IN ('completed', 'failed', 'declined')
+          AND new.body IS NOT NULL
+          AND trim(new.body) <> ''
+        BEGIN
+            INSERT INTO codex_items_fts(rowid, body, task_id, item_id)
+            VALUES (new.rowid, new.body, new.task_id, new.item_id);
+        END;
+
+        ALTER TABLE codex_task_projection ADD COLUMN plan_event_json TEXT;
+        ALTER TABLE codex_task_projection ADD COLUMN turn_seq INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE codex_task_projection ADD COLUMN turn_event_json TEXT;
+        ALTER TABLE codex_task_projection ADD COLUMN diff_event_json TEXT;
+        ALTER TABLE codex_task_projection ADD COLUMN usage_event_json TEXT;
+        ALTER TABLE codex_task_projection ADD COLUMN mode_seq INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE codex_task_projection ADD COLUMN mode_event_json TEXT;
+        ALTER TABLE codex_task_projection ADD COLUMN error_seq INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE codex_task_projection ADD COLUMN error_event_json TEXT;
+        ALTER TABLE codex_task_projection ADD COLUMN connection_event_json TEXT;
+        ALTER TABLE codex_task_projection ADD COLUMN reset_seq INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE codex_task_projection ADD COLUMN reset_event_json TEXT;
+
+        CREATE INDEX codex_turns_task_snapshot_idx
+            ON codex_turns(task_id, last_event_seq);
+        CREATE INDEX codex_items_task_snapshot_idx
+            ON codex_items(task_id, last_event_seq);
+        CREATE INDEX codex_approvals_task_snapshot_idx
+            ON codex_approvals(task_id, last_event_seq);
+
+        -- Normalize the append-only projection history once for this migration.
+        -- The previous backfill repeatedly parsed JSON while scanning the same
+        -- task history once per materialized row, making startup quadratic.
+        CREATE TEMP TABLE integrator_projection_event_backfill (
+            seq INTEGER PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            provider_session_id TEXT NOT NULL,
+            turn_id TEXT,
+            occurred_at TEXT NOT NULL,
+            event_kind TEXT,
+            item_id TEXT,
+            approval_id TEXT
+        );
+        INSERT INTO integrator_projection_event_backfill(
+            seq,task_id,provider_session_id,turn_id,occurred_at,
+            event_kind,item_id,approval_id
+        )
+        SELECT seq,task_id,provider_session_id,turn_id,occurred_at,
+               json_extract(projection_json, '$.projection.kind'),
+               json_extract(projection_json, '$.projection.item.id'),
+               json_extract(projection_json, '$.projection.approval.id')
+        FROM codex_event_log
+        WHERE projection_json IS NOT NULL;
+        CREATE INDEX integrator_projection_event_task_kind_idx
+            ON integrator_projection_event_backfill(task_id,event_kind,seq);
+        CREATE INDEX integrator_projection_event_turn_idx
+            ON integrator_projection_event_backfill(provider_session_id,event_kind,turn_id,seq);
+        CREATE INDEX integrator_projection_event_item_idx
+            ON integrator_projection_event_backfill(provider_session_id,event_kind,item_id,seq);
+        CREATE INDEX integrator_projection_event_approval_idx
+            ON integrator_projection_event_backfill(task_id,event_kind,approval_id,seq);
+
+        UPDATE codex_task_projection
+        SET reset_seq = COALESCE((
+                SELECT MAX(e.seq)
+                FROM integrator_projection_event_backfill e
+                WHERE e.task_id = codex_task_projection.task_id
+                  AND e.event_kind = 'projectionReset'
+            ), 0);
+        UPDATE codex_task_projection
+        SET reset_event_json = (
+                SELECT e.projection_json
+                FROM codex_event_log e
+                WHERE e.seq = codex_task_projection.reset_seq
+            )
+        WHERE reset_seq > 0;
+
+        DELETE FROM codex_turns
+        WHERE last_event_seq <= COALESCE((
+            SELECT p.reset_seq FROM codex_task_projection p
+            WHERE p.task_id = codex_turns.task_id
+        ), 0);
+        DELETE FROM codex_items
+        WHERE last_event_seq <= COALESCE((
+            SELECT p.reset_seq FROM codex_task_projection p
+            WHERE p.task_id = codex_items.task_id
+        ), 0);
+        DELETE FROM codex_approvals
+        WHERE last_event_seq <= COALESCE((
+            SELECT p.reset_seq FROM codex_task_projection p
+            WHERE p.task_id = codex_approvals.task_id
+        ), 0);
+
+        UPDATE codex_turns
+        SET first_event_seq = COALESCE((
+                SELECT MIN(e.seq)
+                FROM integrator_projection_event_backfill e
+                WHERE e.task_id = codex_turns.task_id
+                  AND e.provider_session_id = codex_turns.provider_session_id
+                  AND e.turn_id = codex_turns.turn_id
+                  AND e.seq > COALESCE((
+                      SELECT p.reset_seq FROM codex_task_projection p
+                      WHERE p.task_id = codex_turns.task_id
+                  ), 0)
+                  AND e.event_kind = 'turnChanged'
+            ), last_event_seq),
+            first_occurred_at = COALESCE((
+                SELECT e.occurred_at
+                FROM integrator_projection_event_backfill e
+                WHERE e.task_id = codex_turns.task_id
+                  AND e.provider_session_id = codex_turns.provider_session_id
+                  AND e.turn_id = codex_turns.turn_id
+                  AND e.seq > COALESCE((
+                      SELECT p.reset_seq FROM codex_task_projection p
+                      WHERE p.task_id = codex_turns.task_id
+                  ), 0)
+                  AND e.event_kind = 'turnChanged'
+                ORDER BY e.seq LIMIT 1
+            ), started_at, completed_at),
+            snapshot_event_json = (
+                SELECT e.projection_json FROM codex_event_log e
+                WHERE e.seq = codex_turns.last_event_seq
+            );
+
+        UPDATE codex_items
+        SET first_event_seq = COALESCE((
+                SELECT MIN(e.seq)
+                FROM integrator_projection_event_backfill e
+                WHERE e.task_id = codex_items.task_id
+                  AND e.provider_session_id = codex_items.provider_session_id
+                  AND e.seq > COALESCE((
+                      SELECT p.reset_seq FROM codex_task_projection p
+                      WHERE p.task_id = codex_items.task_id
+                  ), 0)
+                  AND e.event_kind = 'itemChanged'
+                  AND e.item_id = codex_items.stable_id
+            ), last_event_seq),
+            first_occurred_at = COALESCE((
+                SELECT e.occurred_at
+                FROM integrator_projection_event_backfill e
+                WHERE e.task_id = codex_items.task_id
+                  AND e.provider_session_id = codex_items.provider_session_id
+                  AND e.seq > COALESCE((
+                      SELECT p.reset_seq FROM codex_task_projection p
+                      WHERE p.task_id = codex_items.task_id
+                  ), 0)
+                  AND e.event_kind = 'itemChanged'
+                  AND e.item_id = codex_items.stable_id
+                ORDER BY e.seq LIMIT 1
+            ), updated_at),
+            snapshot_event_json = json_set((
+                SELECT e.projection_json FROM codex_event_log e
+                WHERE e.seq = codex_items.last_event_seq
+            ), '$.occurredAt', COALESCE((
+                SELECT e.occurred_at
+                FROM integrator_projection_event_backfill e
+                WHERE e.task_id = codex_items.task_id
+                  AND e.provider_session_id = codex_items.provider_session_id
+                  AND e.seq > COALESCE((
+                      SELECT p.reset_seq FROM codex_task_projection p
+                      WHERE p.task_id = codex_items.task_id
+                  ), 0)
+                  AND e.event_kind = 'itemChanged'
+                  AND e.item_id = codex_items.stable_id
+                ORDER BY e.seq LIMIT 1
+            ), updated_at));
+
+        UPDATE codex_approvals
+        SET first_event_seq = COALESCE((
+                SELECT MIN(e.seq)
+                FROM integrator_projection_event_backfill e
+                WHERE e.task_id = codex_approvals.task_id
+                  AND e.seq > COALESCE((
+                      SELECT p.reset_seq FROM codex_task_projection p
+                      WHERE p.task_id = codex_approvals.task_id
+                  ), 0)
+                  AND e.event_kind = 'approvalChanged'
+                  AND e.approval_id = codex_approvals.id
+            ), last_event_seq),
+            first_occurred_at = COALESCE((
+                SELECT e.occurred_at
+                FROM integrator_projection_event_backfill e
+                WHERE e.task_id = codex_approvals.task_id
+                  AND e.seq > COALESCE((
+                      SELECT p.reset_seq FROM codex_task_projection p
+                      WHERE p.task_id = codex_approvals.task_id
+                  ), 0)
+                  AND e.event_kind = 'approvalChanged'
+                  AND e.approval_id = codex_approvals.id
+                ORDER BY e.seq LIMIT 1
+            ), updated_at),
+            snapshot_event_json = json_set((
+                SELECT e.projection_json FROM codex_event_log e
+                WHERE e.seq = codex_approvals.last_event_seq
+            ), '$.occurredAt', COALESCE((
+                SELECT e.occurred_at
+                FROM integrator_projection_event_backfill e
+                WHERE e.task_id = codex_approvals.task_id
+                  AND e.seq > COALESCE((
+                      SELECT p.reset_seq FROM codex_task_projection p
+                      WHERE p.task_id = codex_approvals.task_id
+                  ), 0)
+                  AND e.event_kind = 'approvalChanged'
+                  AND e.approval_id = codex_approvals.id
+                ORDER BY e.seq LIMIT 1
+            ), updated_at));
+
+        UPDATE codex_task_projection
+        SET turn_seq = COALESCE((
+                SELECT MAX(e.seq) FROM integrator_projection_event_backfill e
+                WHERE e.task_id = codex_task_projection.task_id
+                  AND e.seq > codex_task_projection.reset_seq
+                  AND e.event_kind = 'turnChanged'
+            ), 0),
+            plan_event_json = (SELECT projection_json FROM codex_event_log WHERE seq = plan_seq),
+            diff_event_json = (SELECT projection_json FROM codex_event_log WHERE seq = diff_seq),
+            usage_event_json = (SELECT projection_json FROM codex_event_log WHERE seq = usage_seq),
+            connection_event_json = (SELECT projection_json FROM codex_event_log WHERE seq = connection_seq),
+            mode_seq = COALESCE((
+                SELECT MAX(e.seq) FROM integrator_projection_event_backfill e
+                WHERE e.task_id = codex_task_projection.task_id
+                  AND e.seq > codex_task_projection.reset_seq
+                  AND e.event_kind = 'modeChanged'
+            ), 0),
+            error_seq = COALESCE((
+                SELECT MAX(e.seq) FROM integrator_projection_event_backfill e
+                WHERE e.task_id = codex_task_projection.task_id
+                  AND e.seq > codex_task_projection.reset_seq
+                  AND e.event_kind = 'turnError'
+            ), 0);
+        UPDATE codex_task_projection
+        SET turn_event_json = (SELECT projection_json FROM codex_event_log WHERE seq = turn_seq),
+            mode_event_json = (SELECT projection_json FROM codex_event_log WHERE seq = mode_seq),
+            error_event_json = (SELECT projection_json FROM codex_event_log WHERE seq = error_seq);
+        DROP TABLE integrator_projection_event_backfill;
+        "#,
+    ),
+    (
+        9,
+        r#"
+        CREATE INDEX codex_items_provider_stable_seq_idx
+            ON codex_items(provider_session_id, stable_id, last_event_seq DESC);
+        CREATE INDEX codex_approvals_active_process_idx
+            ON codex_approvals(process_id)
+            WHERE state IN ('pending', 'responding', 'response_failed');
+        "#,
+    ),
 ];
 
 pub struct LocalStore {
@@ -387,9 +720,7 @@ impl LocalStore {
             entry.2.vendor_cost_micro_usd =
                 match (entry.2.vendor_cost_micro_usd, usage.vendor_cost_micro_usd) {
                     (None, None) => None,
-                    (current, next) => {
-                        Some(current.unwrap_or(0).saturating_add(next.unwrap_or(0)))
-                    }
+                    (current, next) => Some(current.unwrap_or(0).saturating_add(next.unwrap_or(0))),
                 };
         }
         Ok(grouped
@@ -702,6 +1033,34 @@ impl LocalStore {
         Ok(setting)
     }
 
+    pub fn get_setting(&self, key: &str) -> Result<Option<Setting>> {
+        validate_setting_key(key)?;
+        let row = self
+            .connection
+            .lock()
+            .query_row(
+                "SELECT key, value_json, updated_at FROM settings WHERE key=?1",
+                [key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?;
+        row.map(|(key, json, updated_at)| {
+            Ok(Setting {
+                key,
+                value: serde_json::from_str(&json)?,
+                updated_at: parse_time(&updated_at)?,
+            })
+        })
+        .transpose()
+    }
+
     pub fn list_settings(&self) -> Result<Vec<Setting>> {
         let connection = self.connection.lock();
         let mut statement = connection
@@ -758,6 +1117,19 @@ impl LocalStore {
             )
             .map_err(storage_error)?;
         Ok(())
+    }
+
+    /// Reconcile process-owned sessions left unfinished by a prior app exit.
+    /// App startup calls this only after single-instance ownership is acquired,
+    /// so a secondary database reader cannot interrupt a live process record.
+    pub fn interrupt_unfinished_runtime_sessions(&self) -> Result<usize> {
+        self.connection
+            .lock()
+            .execute(
+                "UPDATE runtime_sessions SET status='interrupted',ended_at=?1 WHERE ended_at IS NULL",
+                [Utc::now().to_rfc3339()],
+            )
+            .map_err(storage_error)
     }
 
     pub fn export(&self) -> Result<LocalExport> {
@@ -959,6 +1331,11 @@ fn storage_error(error: rusqlite::Error) -> IntegratorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use integrator_core::{
+        ItemKind, ItemProjection, ItemStatus, RuntimeBinding, RuntimeProjection,
+        RuntimeProjectionEvent,
+    };
+    use integrator_runtime::{ProjectionMutation, ReducedProviderEvent};
 
     #[test]
     fn migration_and_local_round_trip() {
@@ -1115,6 +1492,199 @@ mod tests {
     }
 
     #[test]
+    fn materialized_snapshot_schema_migration_is_idempotent() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("snapshot.sqlite3");
+        let store = LocalStore::open(&path).expect("first open");
+        {
+            let connection = store.connection.lock();
+            let columns = connection
+                .prepare("PRAGMA table_info(codex_task_projection)")
+                .expect("projection columns")
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("query columns")
+                .collect::<std::result::Result<std::collections::HashSet<_>, _>>()
+                .expect("collect columns");
+            for column in [
+                "turn_event_json",
+                "mode_seq",
+                "mode_event_json",
+                "error_seq",
+                "error_event_json",
+                "reset_seq",
+                "reset_event_json",
+            ] {
+                assert!(columns.contains(column), "missing {column}");
+            }
+            let item_indexes = connection
+                .prepare("PRAGMA index_list(codex_items)")
+                .expect("item indexes")
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("query indexes")
+                .collect::<std::result::Result<std::collections::HashSet<_>, _>>()
+                .expect("collect indexes");
+            assert!(item_indexes.contains("codex_items_task_snapshot_idx"));
+            assert!(item_indexes.contains("codex_items_provider_stable_seq_idx"));
+            let approval_indexes = connection
+                .prepare("PRAGMA index_list(codex_approvals)")
+                .expect("approval indexes")
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("query approval indexes")
+                .collect::<std::result::Result<std::collections::HashSet<_>, _>>()
+                .expect("collect approval indexes");
+            assert!(approval_indexes.contains("codex_approvals_active_process_idx"));
+        }
+        drop(store);
+        LocalStore::open(&path).expect("idempotent reopen");
+    }
+
+    #[test]
+    fn legacy_projection_rows_migrate_before_new_audit_rows_omit_the_copy() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("legacy-snapshot.sqlite3");
+        let task_id = TaskId::new();
+        let provider_session_id = ProviderSessionId::new();
+        let runtime_session_id = RuntimeSessionId::new();
+        let occurred_at = Utc::now();
+        let legacy_item = ItemProjection {
+            id: "legacy-stable-item".into(),
+            provider_item_id: "legacy-provider-item".into(),
+            kind: ItemKind::AgentMessage,
+            status: ItemStatus::Completed,
+            title: None,
+            body: Some("legacy materialized message".into()),
+            native_skill: None,
+            command: None,
+            cwd: None,
+            output: None,
+            exit_code: None,
+            file_changes: None,
+            mcp_server: None,
+            mcp_tool: None,
+            tool_input: None,
+            truncated: false,
+            updated_at: occurred_at,
+        };
+        let legacy_event = RuntimeProjectionEvent {
+            seq: 1,
+            task_id,
+            provider_session_id,
+            provider: "codex".into(),
+            thread_id: "legacy-thread".into(),
+            turn_id: Some("legacy-turn".into()),
+            occurred_at,
+            projection: RuntimeProjection::ItemChanged {
+                item: legacy_item.clone(),
+            },
+        };
+
+        {
+            let mut connection = Connection::open(&path).expect("open v7 fixture");
+            LocalStore::configure(&connection).expect("configure v7 fixture");
+            connection
+                .execute(
+                    "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+                    [],
+                )
+                .expect("create migration ledger");
+            for (version, sql) in MIGRATIONS.iter().filter(|(version, _)| *version < 8) {
+                let transaction = connection.transaction().expect("v7 migration transaction");
+                transaction
+                    .execute_batch(sql)
+                    .expect("apply pre-snapshot migration");
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES (?1,?2)",
+                        params![version, occurred_at.to_rfc3339()],
+                    )
+                    .expect("record pre-snapshot migration");
+                transaction.commit().expect("commit pre-snapshot migration");
+            }
+            connection.execute("INSERT INTO tasks(id,title,state,created_at,updated_at) VALUES (?1,'Legacy fixture','active',?2,?2)", params![task_id.to_string(), occurred_at.to_rfc3339()]).expect("insert legacy task");
+            connection.execute("INSERT INTO provider_sessions(id,task_id,provider,provider_thread_id,created_at,updated_at) VALUES (?1,?2,'codex','legacy-thread',?3,?3)", params![provider_session_id.to_string(), task_id.to_string(), occurred_at.to_rfc3339()]).expect("insert legacy provider session");
+            connection.execute("INSERT INTO runtime_sessions(id,task_id,provider_session_id,status,started_at,process_id) VALUES (?1,?2,?3,'running',?4,'legacy-process')", params![runtime_session_id.to_string(), task_id.to_string(), provider_session_id.to_string(), occurred_at.to_rfc3339()]).expect("insert legacy runtime session");
+            connection.execute("INSERT INTO codex_task_projection(task_id,provider_session_id,thread_id,process_id,last_event_seq) VALUES (?1,?2,'legacy-thread','legacy-process',1)", params![task_id.to_string(), provider_session_id.to_string()]).expect("insert legacy task projection");
+            connection.execute("INSERT INTO codex_items(provider_session_id,task_id,thread_id,turn_id,item_id,stable_id,kind,status,body,updated_at,projection_json,last_event_seq) VALUES (?1,?2,'legacy-thread','legacy-turn',?3,?4,'agent_message','completed',?5,?6,?7,1)", params![provider_session_id.to_string(), task_id.to_string(), legacy_item.provider_item_id, legacy_item.id, legacy_item.body, occurred_at.to_rfc3339(), serde_json::to_string(&legacy_item).expect("serialize legacy item")]).expect("insert legacy current item");
+            connection.execute("INSERT INTO codex_event_log(seq,task_id,provider_session_id,runtime_session_id,process_id,thread_id,turn_id,method,audit_json,audit_truncated,projection_json,occurred_at) VALUES (1,?1,?2,?3,'legacy-process','legacy-thread','legacy-turn','item/completed','{}',0,?4,?5)", params![task_id.to_string(), provider_session_id.to_string(), runtime_session_id.to_string(), serde_json::to_string(&legacy_event).expect("serialize legacy event"), occurred_at.to_rfc3339()]).expect("insert legacy event projection");
+        }
+
+        let migrated = LocalStore::open(&path).expect("migrate v7 fixture");
+        let migrated_snapshot = migrated
+            .task_snapshot(task_id)
+            .expect("hydrate migrated legacy snapshot");
+        assert_eq!(migrated_snapshot.events, vec![legacy_event]);
+
+        let binding = RuntimeBinding {
+            task_id,
+            provider: ProviderKind::Codex,
+            provider_session_id: Some(provider_session_id),
+            runtime_session_id,
+            process_id: "legacy-process".into(),
+            thread_id: Some("legacy-thread".into()),
+        };
+        let new_item = ItemProjection {
+            id: "new-stable-item".into(),
+            provider_item_id: "new-provider-item".into(),
+            kind: ItemKind::AgentMessage,
+            status: ItemStatus::Completed,
+            title: None,
+            body: Some("post-migration message".into()),
+            native_skill: None,
+            command: None,
+            cwd: None,
+            output: None,
+            exit_code: None,
+            file_changes: None,
+            mcp_server: None,
+            mcp_tool: None,
+            tool_input: None,
+            truncated: false,
+            updated_at: occurred_at + chrono::Duration::seconds(1),
+        };
+        let appended = migrated
+            .apply_reduced_event(
+                &binding,
+                &ReducedProviderEvent {
+                    method: "item/completed".into(),
+                    thread_id: "legacy-thread".into(),
+                    turn_id: Some("legacy-turn".into()),
+                    audit_json: "{}".into(),
+                    audit_truncated: false,
+                    mutation: ProjectionMutation::ReplaceItem(new_item),
+                    occurred_at: occurred_at + chrono::Duration::seconds(1),
+                },
+            )
+            .expect("append post-migration event");
+        {
+            let connection = migrated.connection.lock();
+            let projection_copy: Option<String> = connection
+                .query_row(
+                    "SELECT projection_json FROM codex_event_log WHERE seq=?1",
+                    [appended.seq],
+                    |row| row.get(0),
+                )
+                .expect("read post-migration audit row");
+            assert!(projection_copy.is_none());
+        }
+        drop(migrated);
+
+        let reopened = LocalStore::open(&path).expect("reopen migrated fixture");
+        let snapshot = reopened.task_snapshot(task_id).expect("hydrate after reopen");
+        assert_eq!(snapshot.watermark_seq, appended.seq);
+        assert_eq!(snapshot.events.len(), 2);
+        assert!(snapshot.events.iter().any(|event| matches!(
+            &event.projection,
+            RuntimeProjection::ItemChanged { item }
+                if item.body.as_deref() == Some("legacy materialized message")
+        )));
+        assert!(snapshot.events.iter().any(|event| matches!(
+            &event.projection,
+            RuntimeProjection::ItemChanged { item }
+                if item.body.as_deref() == Some("post-migration message")
+        )));
+    }
+
+    #[test]
     fn provider_and_runtime_sessions_are_exported() {
         let store = LocalStore::open_in_memory().expect("open store");
         let task = store
@@ -1155,6 +1725,97 @@ mod tests {
         let export = store.export().expect("export");
         assert_eq!(export.provider_sessions.len(), 1);
         assert_eq!(export.runtime_sessions.len(), 1);
+    }
+
+    #[test]
+    fn setting_lookup_uses_the_primary_key_and_distinguishes_missing_values() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let expected = serde_json::json!({"primary": {"usedPercent": 42}});
+        store
+            .set_setting("provider-quota.codex", expected.clone())
+            .expect("set quota");
+
+        assert_eq!(
+            store
+                .get_setting("provider-quota.codex")
+                .expect("get quota")
+                .expect("stored quota")
+                .value,
+            expected
+        );
+        assert!(
+            store
+                .get_setting("provider-quota.cursor")
+                .expect("get missing quota")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn startup_reconciliation_interrupts_only_unfinished_runtime_sessions_once() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let task = store
+            .create_task(NewTask {
+                title: "Runtime reconciliation".into(),
+                repository_path: None,
+                worktree_path: None,
+                runtime: None,
+                model: None,
+                effort: None,
+                parent_task_id: None,
+            })
+            .expect("create task");
+        let now = Utc::now();
+        let running_id = RuntimeSessionId::new();
+        let completed_id = RuntimeSessionId::new();
+        store
+            .insert_runtime_session(&RuntimeSession {
+                id: running_id,
+                task_id: task.id,
+                provider_session_id: None,
+                process_id: Some("startup-running".into()),
+                status: "running".into(),
+                started_at: now,
+                ended_at: None,
+            })
+            .expect("insert unfinished session");
+        store
+            .insert_runtime_session(&RuntimeSession {
+                id: completed_id,
+                task_id: task.id,
+                provider_session_id: None,
+                process_id: Some("startup-completed".into()),
+                status: "completed".into(),
+                started_at: now,
+                ended_at: Some(now),
+            })
+            .expect("insert completed session");
+
+        assert_eq!(
+            store
+                .interrupt_unfinished_runtime_sessions()
+                .expect("first reconciliation"),
+            1
+        );
+        assert_eq!(
+            store
+                .interrupt_unfinished_runtime_sessions()
+                .expect("idempotent reconciliation"),
+            0
+        );
+        let sessions = store.list_runtime_sessions().expect("list sessions");
+        let running = sessions
+            .iter()
+            .find(|session| session.id == running_id)
+            .expect("reconciled session");
+        assert_eq!(running.status, "interrupted");
+        assert!(running.ended_at.is_some());
+        let completed = sessions
+            .iter()
+            .find(|session| session.id == completed_id)
+            .expect("completed session");
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.ended_at, Some(now));
     }
 
     #[test]

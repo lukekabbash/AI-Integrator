@@ -184,6 +184,45 @@ impl LocalStore {
         Ok(())
     }
 
+    /// Changes the route used by the delegation's next turn. A route change
+    /// starts a fresh provider session while retaining the child task and its
+    /// locally persisted transcript.
+    pub fn update_delegation_routing(
+        &self,
+        id: DelegationId,
+        runtime: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<Delegation> {
+        let changed = self
+            .connection
+            .lock()
+            .execute(
+                "UPDATE delegations SET runtime = ?1, model = ?2, effort = ?3, child_session_ref = NULL, updated_at = ?4 WHERE id = ?5",
+                params![runtime, model, effort, Utc::now().to_rfc3339(), id.to_string()],
+            )
+            .map_err(storage_error)?;
+        if changed == 0 {
+            return Err(IntegratorError::NotFound(format!("delegation {id}")));
+        }
+        self.get_delegation(id)
+    }
+
+    pub fn reopen_delegation(&self, id: DelegationId) -> Result<Delegation> {
+        let changed = self
+            .connection
+            .lock()
+            .execute(
+                "UPDATE delegations SET status = 'running', result = NULL, updated_at = ?1 WHERE id = ?2",
+                params![Utc::now().to_rfc3339(), id.to_string()],
+            )
+            .map_err(storage_error)?;
+        if changed == 0 {
+            return Err(IntegratorError::NotFound(format!("delegation {id}")));
+        }
+        self.get_delegation(id)
+    }
+
     pub fn set_delegation_result(
         &self,
         id: DelegationId,
@@ -541,5 +580,36 @@ mod tests {
                 .expect("after delivery")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn completed_delegation_can_reroute_and_reopen_without_losing_identity() {
+        let (store, parent) = store_with_task();
+        let delegation = store
+            .create_delegation(new_delegation(parent))
+            .expect("create delegation");
+        store
+            .set_delegation_session_ref(delegation.id, "old-thread")
+            .expect("session ref");
+        store
+            .set_delegation_result(delegation.id, DelegationStatus::Completed, "first result")
+            .expect("complete");
+
+        let rerouted = store
+            .update_delegation_routing(
+                delegation.id,
+                "claude",
+                Some("claude-fable-5"),
+                Some("high"),
+            )
+            .expect("reroute");
+        assert_eq!(rerouted.id, delegation.id);
+        assert_eq!(rerouted.runtime, "claude");
+        assert_eq!(rerouted.model.as_deref(), Some("claude-fable-5"));
+        assert_eq!(rerouted.child_session_ref, None);
+
+        let reopened = store.reopen_delegation(delegation.id).expect("reopen");
+        assert_eq!(reopened.status, DelegationStatus::Running);
+        assert_eq!(reopened.result, None);
     }
 }

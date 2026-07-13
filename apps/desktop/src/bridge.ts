@@ -18,6 +18,23 @@ export interface RuntimeConnection {
   detail: string;
 }
 
+export interface NativeProviderAction {
+  /** Opaque native-host handle. Filesystem paths never cross into the renderer. */
+  id: string;
+  name: string;
+  description: string;
+  source: string;
+  kind: "skill" | "command";
+  invocation: "direct" | "interactiveOnly";
+  inputHint?: string;
+}
+
+/** Renderer-safe identity for an action selected from the provider-owned catalog. */
+export interface NativeActionReference {
+  name: string;
+  kind: NativeProviderAction["kind"];
+}
+
 /**
  * Keep auth messaging tied to the native probe result. A provider that has
  * been verified should not carry a generic warning merely because it is not
@@ -83,15 +100,31 @@ export interface TaskNavigationMetadata {
   updatedAt: string;
 }
 
+export interface TaskMessageSearchHit {
+  taskId: string;
+  snippet: string;
+}
+
 export interface TranscriptEvent {
   id: string;
   kind: "user" | "assistant" | "activity" | "tool" | "approval" | "checkpoint" | "notice";
+  /** Observable subtype used to summarize contiguous activity loops. */
+  activityType?: "reasoning" | "command" | "tool" | "file" | "plan" | "approval" | "other";
+  /** File identity and review surface for observable file edits. */
+  filePath?: string;
+  diff?: DiffFile;
   title?: string;
   body: string;
+  /** Present only when the native host verified that this user message invoked a real skill. */
+  nativeSkill?: string;
   timestamp: string;
   status?: "running" | "success" | "warning" | "error" | "neutral";
   meta?: string;
+  /** Optional source-control style line counts for file/tool activity. */
+  changeStats?: { additions: number; deletions: number };
   children?: TranscriptEvent[];
+  /** Explicit initial disclosure state; activity groups default to collapsed. */
+  expandedByDefault?: boolean;
   /** Labeled expandable sections (tool input, output, ...) shown on demand. */
   details?: Array<{ label: string; body: string }>;
 }
@@ -142,6 +175,13 @@ export interface DelegationView {
   unreadFromChild: number;
   /** Bodies of the undelivered child messages, e.g. questions awaiting an answer. */
   pendingQuestions: string[];
+}
+
+/** Provider route selected for a delegated agent's next turn. */
+export interface DelegationRouting {
+  runtime: RuntimeId;
+  model: string;
+  effort?: string;
 }
 
 export interface UsageMetric {
@@ -200,8 +240,9 @@ export interface ProviderUsageSummary {
   totalTokens: number;
   modelContextWindow?: number;
   /** Vendor-computed API-equivalent cost in USD. An estimate, not a bill;
-   * only providers that report one (Claude) populate it. */
-  estimatedCostUsd?: number;
+   * only providers that report one (Claude) populate it. Serialized as null
+   * by the native store when absent. */
+  estimatedCostUsd?: number | null;
   /** Provider-reported subscription windows; only providers that publish
    * quota (Codex) populate it. Never inferred. */
   subscription?: SubscriptionQuota;
@@ -259,7 +300,7 @@ export interface DiffLine {
   content: string;
   tokens?: Array<{
     text: string;
-    kind: "keyword" | "string" | "type" | "comment" | "plain" | "function";
+    kind: "keyword" | "string" | "type" | "comment" | "plain" | "function" | "variable" | "number";
   }>;
 }
 
@@ -270,6 +311,10 @@ export interface DiffFile {
   deletions: number;
   staged: boolean;
   lines: DiffLine[];
+  /** False only for a native status row whose patch is loaded on first open. */
+  diffLoaded?: boolean;
+  /** Native Git bounded the patch before returning it; the review is partial. */
+  truncated?: boolean;
 }
 
 export interface ProjectFileEntry {
@@ -283,6 +328,12 @@ export interface ProjectFileContent {
   isBinary: boolean;
 }
 
+export interface ProjectFileOpener {
+  id: string;
+  label: string;
+  description: string;
+}
+
 export interface GitSnapshot {
   branch: string;
   upstream: string;
@@ -291,6 +342,36 @@ export interface GitSnapshot {
   worktree: string;
   files: DiffFile[];
   commits: Array<{ id: string; subject: string; relativeTime: string; current?: boolean }>;
+}
+
+export interface PushPreview {
+  head: string;
+  branch: string;
+  remote?: string | null;
+  sanitizedRemoteUrl?: string | null;
+  upstream?: string | null;
+  ahead: number;
+  behind: number;
+  refspec: string;
+  force: false;
+}
+
+export interface PushConfirmation {
+  expectedHead: string;
+  expectedBranch: string;
+  expectedRemote: string;
+  expectedRemoteUrl?: string | null;
+  expectedUpstream: string;
+  expectedRefspec: string;
+}
+
+export interface PushResult {
+  outcome: "pushed" | "upToDate" | "outcomeUncertain";
+  head: string;
+  branch: string;
+  remote: string;
+  refspec: string;
+  summary: string;
 }
 
 export interface StartTaskInput {
@@ -336,6 +417,8 @@ export function resolveModelEffort(
 
 export interface SendTurnInput extends Omit<StartTaskInput, "projectId"> {
   taskId: string;
+  /** Opaque selection returned by listNativeProviderActions. */
+  nativeActionId?: string;
 }
 
 export interface TurnProjection {
@@ -361,6 +444,8 @@ export interface ItemProjection {
   status: "pending" | "inProgress" | "completed" | "failed" | "declined";
   title?: string;
   body?: string;
+  /** Verified provider-native skill invoked by this user item. */
+  nativeSkill?: string;
   command?: string;
   cwd?: string;
   output?: string;
@@ -397,7 +482,7 @@ export interface RuntimeUsageProjection {
 export interface ApprovalProjection {
   id: string;
   requestId: { kind: "number"; value: number } | { kind: "string"; value: string };
-  approvalKind: "commandExecution" | "fileChange";
+  approvalKind: "commandExecution" | "fileChange" | "planReview";
   state:
     "pending" | "responding" | "resolved" | "declined" | "cancelled" | "expired" | "responseFailed";
   decision?: "accept" | "acceptForSession" | "decline" | "cancel";
@@ -407,7 +492,22 @@ export interface ApprovalProjection {
   command?: string;
   cwd?: string;
   fileChanges?: ItemProjection["fileChanges"];
+  /** Full plan document (markdown) for planReview approvals. */
+  planMarkdown?: string;
   updatedAt: string;
+}
+
+/** One agent-advertised session mode (ACP) or synthesized equivalent. */
+export interface ModeOption {
+  id: string;
+  name: string;
+  description?: string;
+}
+
+/** The session's current mode plus every mode it can switch into. */
+export interface ModeProjection {
+  currentModeId: string;
+  availableModes: ModeOption[];
 }
 
 export type ConnectionProjection = {
@@ -423,6 +523,7 @@ export type RuntimeProjection =
   | { kind: "diffChanged"; diff: string; truncated: boolean }
   | { kind: "usageChanged"; usage: RuntimeUsageProjection }
   | { kind: "approvalChanged"; approval: ApprovalProjection }
+  | { kind: "modeChanged"; mode: ModeProjection }
   | { kind: "turnError"; message: string; retryable: boolean }
   | {
       kind: "connectionChanged";
@@ -487,17 +588,26 @@ export interface AppBridge {
   exportLocalData(): Promise<unknown>;
   clearLocalData(): Promise<void>;
   loadWorkspace(): Promise<WorkspaceSnapshot>;
+  /** Search locally persisted user/assistant message text without loading chat snapshots. */
+  searchTaskMessages(query: string, limit?: number): Promise<TaskMessageSearchHit[]>;
   openProject(): Promise<ProjectSummary | null>;
-  /** Pick a parent folder, create `<parent>/<name>`, git-init it, and register it. */
-  createProject(name: string): Promise<ProjectSummary | null>;
+  /** Create `Documents/AI Integrator/Projects/<name>` (deduped), git-init it, and register it. */
+  createProject(name: string): Promise<ProjectSummary>;
   registerProject(path: string): Promise<ProjectSummary>;
   listProjects(): Promise<ProjectSummary[]>;
   probeRuntimes(): Promise<RuntimeConnection[]>;
   beginRuntimeLogin(runtime: RuntimeId): Promise<RuntimeConnection>;
   startTask(input: StartTaskInput): Promise<TaskSummary>;
   loadTaskGit(taskId: string): Promise<GitSnapshot>;
+  loadTaskGitFile(taskId: string, file: DiffFile): Promise<DiffFile>;
   listProjectFiles(projectId: string): Promise<ProjectFileEntry[]>;
   readProjectFile(projectId: string, path: string): Promise<ProjectFileContent>;
+  /** Rename a file in place inside the trusted project (native builds only). */
+  renameProjectFile(projectId: string, path: string, newName: string): Promise<ProjectFileEntry>;
+  /** Native-detected, allowlisted file-opening targets for one trusted project. */
+  listProjectFileOpeners(projectId: string): Promise<ProjectFileOpener[]>;
+  openProjectFileExternal(projectId: string, path: string, openerId: string): Promise<void>;
+  revealProjectFile(projectId: string, path: string): Promise<void>;
   openTerminal(projectId: string): Promise<TerminalSessionInfo>;
   runTerminalCommand(sessionId: string, command: string): Promise<TerminalCommandStarted>;
   interruptTerminal(sessionId: string): Promise<void>;
@@ -513,13 +623,19 @@ export interface AppBridge {
     taskId: string,
     input: { runtime: RuntimeId; model: string; effort?: string },
   ): Promise<TaskSummary>;
+  /** Persists a terminal task lifecycle state; live running/waiting remains projection-owned. */
+  setTaskStatus?(taskId: string, status: TaskStatus): Promise<void>;
   sendTurn(input: SendTurnInput): Promise<TranscriptEvent>;
   /** Delegated subagents of a task (native delegation broker; empty in browser mode). */
   listDelegations(taskId: string): Promise<DelegationView[]>;
   approveDelegation(delegationId: string): Promise<void>;
   denyDelegation(delegationId: string): Promise<void>;
-  /** User nudge to a running subagent; queued and delivered when it is idle. */
-  sendDelegationMessage(delegationId: string, message: string): Promise<void>;
+  /** User message to a subagent. Terminal children are resumed; active children queue it. */
+  sendDelegationMessage(
+    delegationId: string,
+    message: string,
+    routing?: DelegationRouting,
+  ): Promise<void>;
   stopDelegation(delegationId: string): Promise<void>;
   subscribeDelegationUpdates(listener: (parentTaskId: string) => void): Promise<() => void>;
   subscribeRuntimeProjections(
@@ -531,6 +647,8 @@ export interface AppBridge {
     approvalId: string,
     decision: ApprovalDecision,
   ): Promise<ApprovalProjection>;
+  /** Switch the live agent session's mode (e.g. Cursor Agent/Plan/Ask). */
+  setSessionMode(taskId: string, modeId: string): Promise<void>;
   stopTurn(taskId: string): Promise<{
     turnId: string;
     stopRequested: true;
@@ -540,10 +658,19 @@ export interface AppBridge {
   }>;
   stageFiles(taskId: string, paths: string[], staged: boolean): Promise<GitSnapshot>;
   commit(taskId: string, message: string): Promise<GitSnapshot>;
+  /** Read-only push data used to render an explicit confirmation surface. */
+  previewPush(taskId: string): Promise<PushPreview>;
+  /** Execute only the exact push state returned by previewPush. */
+  confirmPush(taskId: string, confirmation: PushConfirmation): Promise<PushResult>;
   push(taskId: string): Promise<GitSnapshot>;
   persistSession(snapshot: WorkspaceSnapshot): Promise<void>;
   listModels(runtime: RuntimeId): Promise<string[]>;
   listModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]>;
+  /** Provider-owned skills/commands for one explicitly trusted repository. */
+  listNativeProviderActions(
+    runtime: RuntimeId,
+    repository: string,
+  ): Promise<NativeProviderAction[]>;
 }
 
 /**
@@ -646,20 +773,30 @@ interface NativeDiff {
   truncated: boolean;
 }
 
-interface NativePushPreview {
-  branch: string;
-  remote?: string;
-  upstream?: string;
-  ahead: number;
-  behind: number;
+interface NativeGitCommit {
+  id: string;
+  subject: string;
+  relativeTime: string;
+  current?: boolean;
+}
+
+interface NativeGitOverview {
+  identity: NativeRepository;
+  files: NativeFileStatus[];
+  history: NativeGitCommit[];
+  pushPreview?: PushPreview;
 }
 
 const nativeTaskIds = new Map<string, string>();
 const repositoryByTaskId = new Map<string, string>();
+const repositoryByProjectId = new Map<string, string>();
+const nativeGitByTask = new Map<string, GitSnapshot>();
 const codexThreadByTask = new Map<string, string>();
 const activeCodexThreads = new Set<string>();
+const codexConnectedTasks = new Set<string>();
 let cachedWorkspace: WorkspaceSnapshot | undefined;
-let codexConnected = false;
+let cachedNativeSettings: LocalSetting[] | undefined;
+let codexCatalogConnected = false;
 
 /// Placeholder that defers to the provider CLI's own configured model; it is
 /// intentionally spaced so the send path never forwards it as a model id.
@@ -985,7 +1122,7 @@ const LOCAL_USAGE_METRIC_LABELS = new Set([
 type StoredNavigation = Pick<
   WorkspaceSnapshot,
   "activeProjectId" | "activeTaskId" | "lastTaskByProject" | "centerViewByTask"
->;
+> & { unreadTaskIds?: string[] };
 
 function isTauri(): boolean {
   return typeof window !== "undefined" && Boolean((window as TauriWindow).__TAURI_INTERNALS__);
@@ -1230,6 +1367,7 @@ function writeStoredNavigation(snapshot: WorkspaceSnapshot): void {
       activeTaskId: snapshot.activeTaskId,
       lastTaskByProject: snapshot.lastTaskByProject,
       centerViewByTask: snapshot.centerViewByTask,
+      unreadTaskIds: snapshot.tasks.filter((task) => task.unread).map((task) => task.id),
     };
     window.localStorage.setItem(NAVIGATION_STORAGE_KEY, JSON.stringify(value));
   } catch {
@@ -1297,6 +1435,7 @@ function mapTaskStatus(state: NativeTask["state"]): TaskStatus {
 }
 
 function mapProject(project: TrustedProject): ProjectSummary {
+  repositoryByProjectId.set(project.id, project.repositoryRoot);
   return {
     id: project.id,
     name: project.displayName,
@@ -1339,23 +1478,39 @@ function mapStoredRuntime(value: string | undefined): RuntimeId | undefined {
 }
 
 async function loadNativeWorkspace(): Promise<WorkspaceSnapshot> {
-  await nativeInvoke("app_bootstrap");
-  const [local, providers] = await Promise.all([
-    nativeInvoke<NativeExport>("local_export"),
-    nativeInvoke<NativeProviderStatus[]>("provider_discover"),
-  ]);
+  // Workspace hydration is local SQLite only. Provider discovery may launch
+  // version/auth probes and must not hold the first useful paint hostage.
+  // App starts that refresh after the shell is visible; opening a workspace
+  // never starts or resumes a provider session.
+  const local = await nativeInvoke<NativeExport>("local_export");
+  const bootstrapSettings = [...(local.settings ?? [])];
+  cachedNativeSettings = bootstrapSettings;
+  // The app consumes these immediately after loadWorkspace. Expire the
+  // one-turn handoff so later settings reads still observe native changes.
+  window.setTimeout(() => {
+    if (cachedNativeSettings === bootstrapSettings) cachedNativeSettings = undefined;
+  }, 0);
   const snapshot = createEmptySnapshot();
   const projects: ProjectSummary[] = (local.projects ?? []).map(mapProject);
+  const projectByPath = new Map(projects.map((project) => [project.path, project]));
   const runtimeByTask = new Map<string, RuntimeId>();
   for (const session of local.providerSessions) {
     const mapped = mapStoredRuntime(session.provider);
     if (mapped) runtimeByTask.set(session.taskId, mapped);
   }
   const tasks = local.tasks.map((task) => {
-    const project = projectForPath({ ...snapshot, projects }, task.repositoryPath);
-    if (!projects.some((item) => item.id === project.id)) projects.push(project);
+    const projectPath = task.repositoryPath ?? "Local workspace";
+    let project = projectByPath.get(projectPath);
+    if (!project) {
+      project = projectForPath({ ...snapshot, projects }, task.repositoryPath);
+      projects.push(project);
+      projectByPath.set(projectPath, project);
+    }
     nativeTaskIds.set(task.id, task.id);
-    if (task.repositoryPath) repositoryByTaskId.set(task.id, task.repositoryPath);
+    // A writing task is reviewed in its assigned worktree, not the base
+    // checkout. Project identity still derives from repositoryPath above.
+    const reviewRoot = task.worktreePath ?? task.repositoryPath;
+    if (reviewRoot) repositoryByTaskId.set(task.id, reviewRoot);
     return {
       id: task.id,
       projectId: project.id,
@@ -1371,23 +1526,23 @@ async function loadNativeWorkspace(): Promise<WorkspaceSnapshot> {
       parentId: task.parentTaskId,
     };
   });
+  const lastTaskByProject: Record<string, string> = {};
+  for (const task of tasks) lastTaskByProject[task.projectId] ??= task.id;
   for (const session of local.providerSessions) {
     if (session.provider === "codex")
       codexThreadByTask.set(session.taskId, session.providerThreadId);
   }
+  const storedNavigation = readStoredNavigation();
+  const unreadTaskIds = new Set(storedNavigation.unreadTaskIds ?? []);
   const merged: WorkspaceSnapshot = {
     ...snapshot,
     projects,
-    tasks,
+    tasks: tasks.map((task) => ({ ...task, unread: unreadTaskIds.has(task.id) })),
     activeTaskId: tasks[0]?.id ?? "",
     activeProjectId: tasks[0]?.projectId ?? projects[0]?.id ?? "",
-    lastTaskByProject: Object.fromEntries(
-      projects
-        .map((project) => [project.id, tasks.find((task) => task.projectId === project.id)?.id])
-        .filter((entry): entry is [string, string] => Boolean(entry[1])),
-    ),
+    lastTaskByProject,
     centerViewByTask: Object.fromEntries(tasks.map((task) => [task.id, "task" as const])),
-    runtimes: providers.map(mapRuntime),
+    runtimes: [],
   };
   // "Restore last workspace" is honored here: when disabled the app starts
   // with nothing active instead of reopening the previous project and chat.
@@ -1399,7 +1554,6 @@ async function loadNativeWorkspace(): Promise<WorkspaceSnapshot> {
     cachedWorkspace = fresh;
     return fresh;
   }
-  const storedNavigation = readStoredNavigation();
   const storedTask = tasks.find((task) => task.id === storedNavigation.activeTaskId);
   const storedProject = projects.find(
     (project) => project.id === (storedTask?.projectId ?? storedNavigation.activeProjectId),
@@ -1411,6 +1565,9 @@ async function loadNativeWorkspace(): Promise<WorkspaceSnapshot> {
     lastTaskByProject: { ...merged.lastTaskByProject, ...storedNavigation.lastTaskByProject },
     centerViewByTask: { ...merged.centerViewByTask, ...storedNavigation.centerViewByTask },
   };
+  restored.tasks = restored.tasks.map((task) =>
+    task.id === restored.activeTaskId ? { ...task, unread: false } : task,
+  );
   cachedWorkspace = restored;
   return restored;
 }
@@ -1426,6 +1583,8 @@ function repositoryForTask(taskId: string): string {
 }
 
 function repositoryForProject(projectId: string): string {
+  const knownRepository = repositoryByProjectId.get(projectId);
+  if (knownRepository) return knownRepository;
   const snapshot = cachedWorkspace ?? readDemoSnapshot();
   const project = snapshot.projects.find((item) => item.id === projectId);
   if (!project?.path) throw new Error(`Project ${projectId} is not registered`);
@@ -1482,8 +1641,11 @@ function extractThreadId(response: unknown): string | undefined {
 const cursorSessionByTask = new Set<string>();
 /** The model and effort last applied to each Cursor session, to skip redundant protocol calls. */
 const cursorAppliedSelection = new Map<string, { model?: string; effort?: string }>();
-let cursorConnected = false;
-let cursorBoundTaskId: string | undefined;
+const cursorConnectedTasks = new Set<string>();
+const activeAcpProviderByTask = new Map<string, "cursor" | "grok">();
+let cursorCatalogConnected = false;
+const grokSessionByTask = new Set<string>();
+const grokConnectedTasks = new Set<string>();
 // Model discovery and Send can ask for the same ACP session at nearly the
 // same time. Serialize those transitions so a second `acp_connect` cannot
 // replace and shut down the process whose `session/new` is still in flight.
@@ -1492,19 +1654,46 @@ let cursorSessionQueue: Promise<void> = Promise.resolve();
 /** Cursor only: per-model reasoning parameters from the model-list RPC. */
 let cursorModelParams = new Map<string, CursorModelParams>();
 
-function clearCursorSessionCaches(): void {
+function clearCursorSessionCaches(taskId?: string): void {
+  if (taskId) {
+    cursorSessionByTask.delete(taskId);
+    cursorAppliedSelection.delete(taskId);
+    return;
+  }
   cursorSessionByTask.clear();
   cursorAppliedSelection.clear();
   modelCatalogCache.delete("cursor");
   cursorModelConfigId = undefined;
   cursorEffortConfigByModel.clear();
   cursorModelParams = new Map();
-  cursorBoundTaskId = undefined;
 }
 
-function resetCursorConnectionState(): void {
-  cursorConnected = false;
+function resetCursorConnectionState(taskId?: string): void {
+  if (taskId) {
+    cursorConnectedTasks.delete(taskId);
+    if (activeAcpProviderByTask.get(taskId) === "cursor") activeAcpProviderByTask.delete(taskId);
+    clearCursorSessionCaches(taskId);
+    return;
+  }
+  cursorConnectedTasks.clear();
+  for (const [task, provider] of activeAcpProviderByTask) {
+    if (provider === "cursor") activeAcpProviderByTask.delete(task);
+  }
   clearCursorSessionCaches();
+}
+
+function resetGrokConnectionState(taskId?: string): void {
+  if (taskId) {
+    grokConnectedTasks.delete(taskId);
+    grokSessionByTask.delete(taskId);
+    if (activeAcpProviderByTask.get(taskId) === "grok") activeAcpProviderByTask.delete(taskId);
+    return;
+  }
+  grokConnectedTasks.clear();
+  grokSessionByTask.clear();
+  for (const [task, provider] of activeAcpProviderByTask) {
+    if (provider === "grok") activeAcpProviderByTask.delete(task);
+  }
 }
 
 function updateCursorCatalog(response: unknown): ModelCatalogEntry[] {
@@ -1521,9 +1710,9 @@ function updateCursorCatalog(response: unknown): ModelCatalogEntry[] {
  * `session/new` catalog has no thought-level data, so a failed extension call
  * only means the effort picker stays hidden; models still work.
  */
-async function refreshCursorModelParams(): Promise<void> {
+async function refreshCursorModelParams(taskId?: string): Promise<void> {
   try {
-    const response = await nativeInvoke<unknown>("acp_list_cursor_models", {});
+    const response = await nativeInvoke<unknown>("acp_list_cursor_models", { taskId });
     const params = extractCursorModelParams(response);
     if (params.size > 0) cursorModelParams = params;
   } catch {
@@ -1538,10 +1727,19 @@ async function ensureCursorSessionForTaskUnlocked(
   const nativeTaskId = await ensureNativeTask(taskId);
   const cwd = repositoryForTask(taskId);
   try {
-    if (!cursorConnected || (cursorBoundTaskId && cursorBoundTaskId !== nativeTaskId)) {
-      await nativeInvoke("acp_connect", { provider: "cursor", workingDirectory: cwd });
-      cursorConnected = true;
-      clearCursorSessionCaches();
+    if (
+      !cursorConnectedTasks.has(nativeTaskId) ||
+      activeAcpProviderByTask.get(nativeTaskId) !== "cursor"
+    ) {
+      await nativeInvoke("acp_connect", {
+        provider: "cursor",
+        workingDirectory: cwd,
+        taskId: nativeTaskId,
+      });
+      resetGrokConnectionState(nativeTaskId);
+      cursorConnectedTasks.add(nativeTaskId);
+      activeAcpProviderByTask.set(nativeTaskId, "cursor");
+      clearCursorSessionCaches(nativeTaskId);
     }
     if (!cursorSessionByTask.has(nativeTaskId)) {
       const session = await nativeInvoke<unknown>("acp_start_session", {
@@ -1550,16 +1748,15 @@ async function ensureCursorSessionForTaskUnlocked(
         delegation,
       });
       cursorSessionByTask.add(nativeTaskId);
-      cursorBoundTaskId = nativeTaskId;
       cursorAppliedSelection.delete(nativeTaskId);
-      await refreshCursorModelParams();
+      await refreshCursorModelParams(nativeTaskId);
       updateCursorCatalog(session);
     }
     return nativeTaskId;
   } catch (error) {
     // A failed ACP handshake/session bind leaves the native process unusable
     // for the cached frontend state. The next attempt must replace it.
-    resetCursorConnectionState();
+    resetCursorConnectionState(nativeTaskId);
     throw error;
   }
 }
@@ -1577,6 +1774,34 @@ async function ensureCursorSessionForTask(taskId: string, delegation?: string): 
 
 async function ensureCursorSession(input: SendTurnInput): Promise<string> {
   return ensureCursorSessionForTask(input.taskId, input.delegation);
+}
+
+async function ensureGrokSession(input: SendTurnInput): Promise<string> {
+  const nativeTaskId = await ensureNativeTask(input.taskId);
+  const cwd = repositoryForTask(input.taskId);
+  if (
+    !grokConnectedTasks.has(nativeTaskId) ||
+    activeAcpProviderByTask.get(nativeTaskId) !== "grok"
+  ) {
+    await nativeInvoke("acp_connect", {
+      provider: "grok",
+      workingDirectory: cwd,
+      taskId: nativeTaskId,
+    });
+    resetCursorConnectionState(nativeTaskId);
+    grokConnectedTasks.add(nativeTaskId);
+    activeAcpProviderByTask.set(nativeTaskId, "grok");
+    grokSessionByTask.delete(nativeTaskId);
+  }
+  if (!grokSessionByTask.has(nativeTaskId)) {
+    await nativeInvoke("acp_start_session", {
+      taskId: nativeTaskId,
+      cwd,
+      delegation: input.delegation,
+    });
+    grokSessionByTask.add(nativeTaskId);
+  }
+  return nativeTaskId;
 }
 
 /// A model id from the picker that can be forwarded to a provider verbatim.
@@ -1694,10 +1919,9 @@ async function loadModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]
   if (runtime === "antigravity") return ANTIGRAVITY_CATALOG;
   if (isTauri() && runtime === "codex") {
     try {
-      if (!codexConnected) {
+      if (!codexCatalogConnected) {
         await nativeInvoke("codex_connect", {});
-        codexConnected = true;
-        activeCodexThreads.clear();
+        codexCatalogConnected = true;
       }
       const response = await nativeInvoke<unknown>("codex_list_models", {
         includeHidden: false,
@@ -1719,12 +1943,12 @@ async function loadModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]
         await ensureCursorSessionForTask(snapshot.activeTaskId);
         const catalog = modelCatalogCache.get("cursor");
         if (catalog?.length) return catalog;
-      } else if (!cursorConnected) {
+      } else if (!cursorCatalogConnected) {
         await nativeInvoke("acp_connect", { provider: "cursor" });
-        cursorConnected = true;
+        cursorCatalogConnected = true;
       }
     } catch {
-      resetCursorConnectionState();
+      cursorCatalogConnected = false;
       // Cursor unavailable or logged out; fall through to the static catalog.
     }
   }
@@ -1756,18 +1980,52 @@ async function ensureCodexThread(input: SendTurnInput): Promise<string> {
   const nativeTaskId = await ensureNativeTask(input.taskId);
   const existing = codexThreadByTask.get(nativeTaskId) ?? codexThreadByTask.get(input.taskId);
   const cwd = repositoryForTask(input.taskId);
-  if (!codexConnected) {
+  if (!codexConnectedTasks.has(nativeTaskId)) {
     await nativeInvoke("codex_connect", { workingDirectory: cwd, taskId: nativeTaskId });
-    codexConnected = true;
-    activeCodexThreads.clear();
+    codexConnectedTasks.add(nativeTaskId);
+    if (existing) activeCodexThreads.delete(existing);
   }
   if (existing) {
     if (!activeCodexThreads.has(existing)) {
-      await nativeInvoke("codex_resume_thread", { taskId: nativeTaskId, threadId: existing });
-      activeCodexThreads.add(existing);
+      try {
+        await nativeInvoke("codex_resume_thread", { taskId: nativeTaskId, threadId: existing });
+        activeCodexThreads.add(existing);
+      } catch (error) {
+        if (!isMissingCodexThreadError(error)) throw error;
+        forgetCodexThread(input.taskId, nativeTaskId, existing);
+      }
     }
-    return existing;
+    if (activeCodexThreads.has(existing)) return existing;
   }
+  return startNewCodexThread(input, nativeTaskId, cwd);
+}
+
+function isMissingCodexThreadError(error: unknown): boolean {
+  const message = formatBridgeError(error, "").toLowerCase();
+  return (
+    message.includes("no rollout found for thread id") ||
+    /(?:thread|rollout).*(?:not found|does not exist|unknown)/i.test(message)
+  );
+}
+
+function isCodexConnectionError(error: unknown): boolean {
+  const message = formatBridgeError(error, "").toLowerCase();
+  return /provider-disconnected|transport (?:closed|failed)|broken pipe|app-server.*(?:closed|exited)/i.test(
+    message,
+  );
+}
+
+function forgetCodexThread(taskId: string, nativeTaskId: string, threadId: string): void {
+  if (codexThreadByTask.get(taskId) === threadId) codexThreadByTask.delete(taskId);
+  if (codexThreadByTask.get(nativeTaskId) === threadId) codexThreadByTask.delete(nativeTaskId);
+  activeCodexThreads.delete(threadId);
+}
+
+async function startNewCodexThread(
+  input: SendTurnInput,
+  nativeTaskId: string,
+  cwd: string,
+): Promise<string> {
   // UI placeholders ("Auto", "Provider default", …) are not provider model
   // ids; only forward names that look like real model identifiers.
   const model =
@@ -1787,67 +2045,139 @@ async function ensureCodexThread(input: SendTurnInput): Promise<string> {
   return threadId;
 }
 
-function diffLines(patch: string): DiffLine[] {
-  return patch
-    .split(/\r?\n/)
-    .filter((line) => line && !line.startsWith("diff --git") && !line.startsWith("index "))
-    .map((line) => {
-      if (line.startsWith("@@")) return { kind: "hunk" as const, content: line };
-      if (line.startsWith("+++") || line.startsWith("---")) {
-        return { kind: "context" as const, content: line };
-      }
-      if (line.startsWith("+")) return { kind: "add" as const, content: line.slice(1) };
-      if (line.startsWith("-")) return { kind: "delete" as const, content: line.slice(1) };
-      return { kind: "context" as const, content: line.startsWith(" ") ? line.slice(1) : line };
+export function parseDiffLines(patch: string): DiffLine[] {
+  let oldNumber = 0;
+  let newNumber = 0;
+  const lines: DiffLine[] = [];
+  for (const line of patch.split(/\r?\n/)) {
+    if (
+      !line ||
+      line.startsWith("diff --git") ||
+      line.startsWith("index ") ||
+      line.startsWith("+++ ") ||
+      line.startsWith("--- ") ||
+      line.startsWith("\\ No newline")
+    ) {
+      continue;
+    }
+    if (line.startsWith("@@")) {
+      const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      oldNumber = hunk ? Number(hunk[1]) : 0;
+      newNumber = hunk ? Number(hunk[2]) : 0;
+      lines.push({ kind: "hunk", content: line });
+      continue;
+    }
+    if (line.startsWith("+")) {
+      lines.push({ kind: "add", newNumber: newNumber || undefined, content: line.slice(1) });
+      if (newNumber) newNumber += 1;
+      continue;
+    }
+    if (line.startsWith("-")) {
+      lines.push({ kind: "delete", oldNumber: oldNumber || undefined, content: line.slice(1) });
+      if (oldNumber) oldNumber += 1;
+      continue;
+    }
+    lines.push({
+      kind: "context",
+      oldNumber: oldNumber || undefined,
+      newNumber: newNumber || undefined,
+      content: line.startsWith(" ") ? line.slice(1) : line,
     });
+    if (oldNumber) oldNumber += 1;
+    if (newNumber) newNumber += 1;
+  }
+  return lines;
+}
+
+function summarizeNativeGitFile(status: NativeFileStatus): DiffFile {
+  const staged = status.indexStatus !== " " && status.indexStatus !== "?";
+  const code = staged ? status.indexStatus : status.worktreeStatus;
+  return {
+    path: status.path,
+    status:
+      code === "A" || code === "?"
+        ? "added"
+        : code === "D"
+          ? "deleted"
+          : code === "R"
+            ? "renamed"
+            : "modified",
+    additions: 0,
+    deletions: 0,
+    staged,
+    lines: [],
+    diffLoaded: false,
+  };
 }
 
 async function refreshNativeGit(taskId: string): Promise<GitSnapshot> {
   const repository = repositoryForTask(taskId);
-  const [identity, statuses] = await Promise.all([
-    nativeInvoke<NativeRepository>("git_repository", { path: repository }),
-    nativeInvoke<NativeFileStatus[]>("git_status", { repository }),
-  ]);
-  const preview = await nativeInvoke<NativePushPreview>("git_push_preview", { repository }).catch(
-    () => undefined,
-  );
-  const files = await Promise.all(
-    statuses.map(async (status): Promise<DiffFile> => {
-      const staged = status.indexStatus !== " " && status.indexStatus !== "?";
-      const scope = staged ? "staged" : "unstaged";
-      const diff = await nativeInvoke<NativeDiff>("git_diff", {
-        repository,
-        scope,
-        path: status.path,
-      }).catch(() => ({ patch: "", truncated: false }));
-      const lines = diffLines(diff.patch);
-      const code = staged ? status.indexStatus : status.worktreeStatus;
-      return {
-        path: status.path,
-        status:
-          code === "A" || code === "?"
-            ? "added"
-            : code === "D"
-              ? "deleted"
-              : code === "R"
-                ? "renamed"
-                : "modified",
-        additions: lines.filter((line) => line.kind === "add").length,
-        deletions: lines.filter((line) => line.kind === "delete").length,
-        staged,
-        lines,
-      };
-    }),
-  );
-  return {
+  const overview = await nativeInvoke<NativeGitOverview>("git_overview", { repository });
+  const { identity, history: commits, pushPreview: preview } = overview;
+  const files = overview.files.map(summarizeNativeGitFile);
+  const snapshot = {
     branch: identity.branch ?? preview?.branch ?? "detached",
     upstream: preview?.upstream ?? "Not published",
     ahead: preview?.ahead ?? 0,
     behind: preview?.behind ?? 0,
     worktree: identity.root,
     files,
-    commits: [],
+    commits,
   };
+  nativeGitByTask.set(taskId, snapshot);
+  return snapshot;
+}
+
+async function loadNativeGitFile(taskId: string, file: DiffFile): Promise<DiffFile> {
+  const repository = repositoryForTask(taskId);
+  const diff = await nativeInvoke<NativeDiff>("git_diff", {
+    repository,
+    scope:
+      file.status === "added" && !file.staged ? "untracked" : file.staged ? "staged" : "unstaged",
+    path: file.path,
+  });
+  const lines = parseDiffLines(diff.patch);
+  const loaded = {
+    ...file,
+    additions: lines.filter((line) => line.kind === "add").length,
+    deletions: lines.filter((line) => line.kind === "delete").length,
+    lines,
+    diffLoaded: true,
+    truncated: diff.truncated,
+  };
+  const snapshot = nativeGitByTask.get(taskId);
+  if (snapshot) {
+    nativeGitByTask.set(taskId, {
+      ...snapshot,
+      files: snapshot.files.map((candidate) =>
+        candidate.path === loaded.path ? loaded : candidate,
+      ),
+    });
+  }
+  return loaded;
+}
+
+function browserMessageSearchSnippet(events: TranscriptEvent[], query: string): string | undefined {
+  const terms = query
+    .toLocaleLowerCase()
+    .split(/[^\p{L}\p{N}_]+/u)
+    .filter(Boolean)
+    .slice(0, 8);
+  if (!terms.length) return undefined;
+  const pending = [...events];
+  while (pending.length) {
+    const event = pending.shift()!;
+    if (event.children?.length) pending.push(...event.children);
+    if (event.kind !== "user" && event.kind !== "assistant") continue;
+    const text = event.body.replace(/\s+/g, " ").trim();
+    const normalized = text.toLocaleLowerCase();
+    if (!terms.every((term) => normalized.includes(term))) continue;
+    const matchAt = Math.max(0, normalized.indexOf(terms[0]));
+    const start = Math.max(0, matchAt - 54);
+    const end = Math.min(text.length, matchAt + 116);
+    return `${start ? "…" : ""}${text.slice(start, end)}${end < text.length ? "…" : ""}`;
+  }
+  return undefined;
 }
 
 export const bridge: AppBridge = {
@@ -1918,12 +2248,28 @@ export const bridge: AppBridge = {
   },
 
   listSettings: async () => {
-    if (isTauri()) return nativeInvoke<LocalSetting[]>("setting_list");
+    if (isTauri()) {
+      if (cachedNativeSettings) {
+        const settings = cachedNativeSettings;
+        cachedNativeSettings = undefined;
+        return [...settings];
+      }
+      return nativeInvoke<LocalSetting[]>("setting_list");
+    }
     return readBrowserSettings();
   },
 
   setSetting: async (key, value) => {
-    if (isTauri()) return nativeInvoke<LocalSetting>("setting_set", { key, value });
+    if (isTauri()) {
+      const setting = await nativeInvoke<LocalSetting>("setting_set", { key, value });
+      if (cachedNativeSettings) {
+        cachedNativeSettings = [
+          setting,
+          ...cachedNativeSettings.filter((candidate) => candidate.key !== setting.key),
+        ];
+      }
+      return setting;
+    }
     return writeBrowserSetting(key, value);
   },
 
@@ -1986,6 +2332,8 @@ export const bridge: AppBridge = {
   clearLocalData: async () => {
     if (isTauri()) {
       await nativeInvoke("local_clear");
+      cachedNativeSettings = undefined;
+      cachedWorkspace = undefined;
       return;
     }
     try {
@@ -2006,6 +2354,25 @@ export const bridge: AppBridge = {
     return restoreLastWorkspace ? snapshot : { ...snapshot, activeTaskId: "", activeProjectId: "" };
   },
 
+  searchTaskMessages: async (query, requestedLimit = 30) => {
+    const limit = Math.min(50, Math.max(1, Math.trunc(requestedLimit) || 30));
+    if (query.trim().length < 2) return [];
+    if (isTauri()) {
+      return nativeInvoke<TaskMessageSearchHit[]>("task_search_messages", { query, limit });
+    }
+    const snapshot = readDemoSnapshot();
+    const hits: TaskMessageSearchHit[] = [];
+    for (const task of snapshot.tasks) {
+      const snippet = browserMessageSearchSnippet(
+        snapshot.taskContexts[task.id]?.transcript ?? [],
+        query,
+      );
+      if (snippet) hits.push({ taskId: task.id, snippet });
+      if (hits.length === limit) break;
+    }
+    return hits;
+  },
+
   openProject: async () => {
     if (isTauri()) {
       const { open } = await import("@tauri-apps/plugin-dialog");
@@ -2023,20 +2390,10 @@ export const bridge: AppBridge = {
 
   createProject: async (name) => {
     if (isTauri()) {
-      const { open } = await import("@tauri-apps/plugin-dialog");
-      const selected = await open({
-        directory: true,
-        multiple: false,
-        title: "Choose where to create the project",
-      });
-      if (typeof selected !== "string") return null;
-      const project = await nativeInvoke<TrustedProject>("project_create", {
-        parent: selected,
-        name,
-      });
+      const project = await nativeInvoke<TrustedProject>("project_create", { name });
       return mapProject(project);
     }
-    return bridge.registerProject(`C:\\Code\\${name}`);
+    return bridge.registerProject(`C:\\Users\\demo\\Documents\\AI Integrator\\Projects\\${name}`);
   },
 
   registerProject: async (path) => {
@@ -2073,6 +2430,36 @@ export const bridge: AppBridge = {
 
   listModelCatalog: loadModelCatalog,
 
+  listNativeProviderActions: async (runtime, repository) => {
+    if (isTauri()) {
+      return nativeInvoke<NativeProviderAction[]>("provider_action_list", {
+        provider: runtime,
+        repository,
+      });
+    }
+    return runtime === "antigravity"
+      ? [
+          {
+            id: "demo-antigravity-guide",
+            name: "antigravity-guide",
+            description: "Use Antigravity's built-in guide",
+            source: "builtin",
+            kind: "skill",
+            invocation: "interactiveOnly",
+          },
+        ]
+      : [
+          {
+            id: `demo-${runtime}-review`,
+            name: "review",
+            description: `Review changes with ${runtime}`,
+            source: "provider",
+            kind: "skill",
+            invocation: "direct",
+          },
+        ];
+  },
+
   beginRuntimeLogin: async (runtime) => {
     if (isTauri()) {
       if (runtime !== "codex") {
@@ -2086,8 +2473,7 @@ export const bridge: AppBridge = {
       const active = snapshot.tasks.find((task) => task.id === snapshot.activeTaskId);
       const workingDirectory = active ? repositoryForTask(active.id) : undefined;
       await nativeInvoke("codex_connect", { workingDirectory });
-      codexConnected = true;
-      activeCodexThreads.clear();
+      codexCatalogConnected = true;
       const status = (await nativeInvoke<NativeProviderStatus[]>("provider_discover")).find(
         (item) => item.provider === "codex",
       );
@@ -2152,6 +2538,11 @@ export const bridge: AppBridge = {
     return snapshot.taskContexts[taskId]?.git ?? createEmptySnapshot().git;
   },
 
+  loadTaskGitFile: async (taskId, file) => {
+    if (isTauri()) return loadNativeGitFile(taskId, file);
+    return file;
+  },
+
   listProjectFiles: async (projectId) => {
     if (isTauri()) {
       return nativeInvoke<ProjectFileEntry[]>("project_file_list", {
@@ -2180,6 +2571,43 @@ export const bridge: AppBridge = {
       content: file.lines.map((line) => line.content).join("\n"),
       isBinary: false,
     };
+  },
+
+  renameProjectFile: async (projectId, path, newName) => {
+    if (isTauri()) {
+      return nativeInvoke<ProjectFileEntry>("project_file_rename", {
+        repository: repositoryForProject(projectId),
+        input: { path, newName },
+      });
+    }
+    throw new Error("Renaming project files requires the native desktop app.");
+  },
+
+  listProjectFileOpeners: async (projectId) => {
+    if (!isTauri()) return [];
+    return nativeInvoke<ProjectFileOpener[]>("project_file_opener_list", {
+      repository: repositoryForProject(projectId),
+    });
+  },
+
+  openProjectFileExternal: async (projectId, path, openerId) => {
+    if (!isTauri()) {
+      throw new Error("External file opening requires the native desktop app.");
+    }
+    await nativeInvoke("project_file_open", {
+      repository: repositoryForProject(projectId),
+      input: { path, openerId },
+    });
+  },
+
+  revealProjectFile: async (projectId, path) => {
+    if (!isTauri()) {
+      throw new Error("Revealing project files requires the native desktop app.");
+    }
+    await nativeInvoke("project_file_reveal", {
+      repository: repositoryForProject(projectId),
+      input: { path },
+    });
   },
 
   openTerminal: async (projectId) => {
@@ -2291,11 +2719,64 @@ export const bridge: AppBridge = {
     return updated;
   },
 
+  setTaskStatus: async (taskId, status) => {
+    const taskState: NativeTask["state"] =
+      status === "stopped"
+        ? "cancelled"
+        : status === "starting"
+          ? "running"
+          : status === "draft"
+            ? "ready"
+            : status;
+    if (isTauri()) {
+      const nativeTaskId = await ensureNativeTask(taskId);
+      await nativeInvoke<NativeTask>("task_set_state", {
+        taskId: nativeTaskId,
+        taskState,
+      });
+      return;
+    }
+    const snapshot = cachedWorkspace ?? readDemoSnapshot();
+    const next = {
+      ...snapshot,
+      tasks: snapshot.tasks.map((task) =>
+        task.id === taskId ? { ...task, status, updatedAt: new Date().toISOString() } : task,
+      ),
+    };
+    cachedWorkspace = next;
+    writeDemoSnapshot(next);
+  },
+
   sendTurn: async (input) => {
     if (isTauri()) {
       if (input.runtime === "codex") {
-        const threadId = await ensureCodexThread(input);
-        await nativeInvoke("codex_start_turn", { threadId, prompt: input.prompt });
+        const nativeTaskId = await ensureNativeTask(input.taskId);
+        let threadId: string | undefined;
+        const startTurn = async (targetThreadId: string) =>
+          nativeInvoke("codex_start_turn", {
+            taskId: nativeTaskId,
+            threadId: targetThreadId,
+            prompt: input.prompt,
+            repository: repositoryForTask(input.taskId),
+            nativeActionId: input.nativeActionId,
+          });
+        try {
+          threadId = await ensureCodexThread(input);
+          try {
+            await startTurn(threadId);
+          } catch (error) {
+            if (!isMissingCodexThreadError(error)) throw error;
+            forgetCodexThread(input.taskId, nativeTaskId, threadId);
+            threadId = await ensureCodexThread(input);
+            await startTurn(threadId);
+          }
+        } catch (error) {
+          if (isCodexConnectionError(error)) {
+            codexConnectedTasks.delete(nativeTaskId);
+            if (threadId) activeCodexThreads.delete(threadId);
+          }
+          throw error;
+        }
       } else if (input.runtime === "cursor") {
         try {
           const taskId = await ensureCursorSession(input);
@@ -2304,9 +2785,23 @@ export const bridge: AppBridge = {
             taskId,
             prompt: input.prompt,
             delegation: input.delegation,
+            nativeActionId: input.nativeActionId,
           });
         } catch (error) {
-          resetCursorConnectionState();
+          resetCursorConnectionState(input.taskId);
+          throw error;
+        }
+      } else if (input.runtime === "grok") {
+        try {
+          const taskId = await ensureGrokSession(input);
+          await nativeInvoke("acp_send_turn", {
+            taskId,
+            prompt: input.prompt,
+            delegation: input.delegation,
+            nativeActionId: input.nativeActionId,
+          });
+        } catch (error) {
+          resetGrokConnectionState(input.taskId);
           throw error;
         }
       } else if (input.runtime === "claude" || input.runtime === "antigravity") {
@@ -2320,6 +2815,7 @@ export const bridge: AppBridge = {
           permission: input.permission,
           prompt: input.prompt,
           delegation: input.delegation,
+          nativeActionId: input.nativeActionId,
         });
       } else {
         throw new Error(`${input.runtime} turn execution is not implemented by the native backend`);
@@ -2362,7 +2858,11 @@ export const bridge: AppBridge = {
 
   listDelegations: async (taskId) => {
     if (!isTauri()) return [];
-    const nativeTaskId = await ensureNativeTask(taskId);
+    // Delegated child tasks are intentionally hidden from the sidebar
+    // snapshot, so their native ids may not be present in nativeTaskIds.
+    // delegation_list is read-only and can safely accept that authoritative
+    // child task id directly when walking descendant lineage.
+    const nativeTaskId = nativeTaskIds.get(taskId) ?? taskId;
     return nativeInvoke<DelegationView[]>("delegation_list", { taskId: nativeTaskId });
   },
 
@@ -2376,9 +2876,19 @@ export const bridge: AppBridge = {
     await nativeInvoke("delegation_deny", { delegationId });
   },
 
-  sendDelegationMessage: async (delegationId, message) => {
+  sendDelegationMessage: async (delegationId, message, routing) => {
     if (!isTauri()) throw new Error("Delegation requires the native app");
-    await nativeInvoke("delegation_send_message", { delegationId, message });
+    await nativeInvoke("delegation_send_message", {
+      delegationId,
+      message,
+      routing: routing
+        ? {
+            runtime: routing.runtime,
+            model: realModelId(routing.model),
+            effort: routing.effort,
+          }
+        : undefined,
+    });
   },
 
   stopDelegation: async (delegationId) => {
@@ -2418,6 +2928,14 @@ export const bridge: AppBridge = {
     });
   },
 
+  setSessionMode: async (taskId, modeId) => {
+    if (!isTauri()) {
+      throw new Error("Session modes are only available during a native provider run");
+    }
+    const nativeTaskId = await ensureNativeTask(taskId);
+    await nativeInvoke("acp_set_mode", { taskId: nativeTaskId, modeId });
+  },
+
   stopTurn: async (taskId) => {
     if (!isTauri()) {
       throw new Error("Stop is only available during a native provider run");
@@ -2433,8 +2951,18 @@ export const bridge: AppBridge = {
   stageFiles: async (taskId, paths, staged) => {
     if (isTauri()) {
       const repository = repositoryForTask(taskId);
-      await nativeInvoke(staged ? "git_stage" : "git_unstage", { repository, paths });
-      return refreshNativeGit(taskId);
+      const statuses = await nativeInvoke<NativeFileStatus[]>(
+        staged ? "git_stage" : "git_unstage",
+        { repository, paths },
+      );
+      const current = nativeGitByTask.get(taskId);
+      if (!current) return refreshNativeGit(taskId);
+      // Stage/unstage already returns the authoritative post-action status.
+      // Branch, history and divergence cannot change here, so rebuilding them
+      // (and every patch) is wasted work on the hottest Git interaction.
+      const git = { ...current, files: statuses.map(summarizeNativeGitFile) };
+      nativeGitByTask.set(taskId, git);
+      return git;
     }
     const git = readDemoSnapshot().git;
     return {
@@ -2459,6 +2987,22 @@ export const bridge: AppBridge = {
         ...git.commits.map((commit) => ({ ...commit, current: false })),
       ],
     };
+  },
+
+  previewPush: async (taskId) => {
+    if (!isTauri()) {
+      throw new Error("Push preview is available only in the native desktop app");
+    }
+    const repository = repositoryForTask(taskId);
+    return nativeInvoke<PushPreview>("git_push_preview", { repository });
+  },
+
+  confirmPush: async (taskId, confirmation) => {
+    if (!isTauri()) {
+      throw new Error("Confirmed push is available only in the native desktop app");
+    }
+    const repository = repositoryForTask(taskId);
+    return nativeInvoke<PushResult>("git_push_confirmed", { repository, confirmation });
   },
 
   push: async (taskId) => {

@@ -13,7 +13,27 @@ const event = (id: string, kind: TranscriptEvent["kind"], body: string): Transcr
 });
 
 describe("Transcript", () => {
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("styles only a verified native skill in a user message", () => {
+    const verified = {
+      ...event("user-skill", "user", "/skill-creator add release checks"),
+      nativeSkill: "skill-creator",
+    };
+    const plain = event("user-plain", "user", "/skill-creator this is only slash text");
+
+    render(<Transcript events={[verified, plain]} />);
+
+    const messages = screen.getAllByLabelText("Your message");
+    const skill = screen.getByLabelText("Native skill /skill-creator");
+    expect(skill.tagName).toBe("STRONG");
+    expect(skill).toHaveClass("native-skill-token");
+    expect(messages[0]).toHaveTextContent("/skill-creator add release checks");
+    expect(messages[1].querySelector(".native-skill-token")).toBeNull();
+  });
 
   it("opens Markdown links in a new main-browser tab after consent", async () => {
     const open = vi.spyOn(window, "open").mockReturnValue({} as Window);
@@ -133,5 +153,307 @@ describe("Transcript", () => {
 
     await waitFor(() => expect(scrollContainer.scrollTop).toBe(220));
     expect(screen.queryByRole("button", { name: /Jump to latest/ })).not.toBeInTheDocument();
+  });
+
+  it("opens an already-populated chat scrolled to the latest message", async () => {
+    const scrollContainerRef = { current: null as HTMLDivElement | null };
+    // Opening a chat mounts the scroll container and the fully loaded
+    // transcript in the same commit; the initial follow must still land.
+    render(
+      <div data-testid="transcript-scroll" ref={scrollContainerRef}>
+        <Transcript
+          events={[
+            event("user-1", "user", "Earlier question."),
+            event("assistant-1", "assistant", "Earlier answer."),
+            event("assistant-2", "assistant", "Latest answer."),
+          ]}
+          scrollContainerRef={scrollContainerRef}
+        />
+      </div>,
+    );
+    const scrollContainer = screen.getByTestId("transcript-scroll");
+    Object.defineProperty(scrollContainer, "scrollHeight", { configurable: true, value: 500 });
+    Object.defineProperty(scrollContainer, "clientHeight", { configurable: true, value: 100 });
+
+    await waitFor(() => expect(scrollContainer.scrollTop).toBe(400));
+    expect(screen.queryByRole("button", { name: /Jump to latest/ })).not.toBeInTheDocument();
+  });
+
+  it("ignores reconstructed history while still flagging a changed tail", () => {
+    const scrollContainerRef = { current: null as HTMLDivElement | null };
+    const firstResponse = event("assistant-1", "assistant", "First response.");
+    const { rerender } = render(
+      <div data-testid="transcript-scroll" ref={scrollContainerRef}>
+        <Transcript events={[firstResponse]} scrollContainerRef={scrollContainerRef} />
+      </div>,
+    );
+    const scrollContainer = screen.getByTestId("transcript-scroll");
+    Object.defineProperty(scrollContainer, "scrollHeight", { configurable: true, value: 220 });
+    Object.defineProperty(scrollContainer, "clientHeight", { configurable: true, value: 100 });
+    scrollContainer.scrollTop = 0;
+    fireEvent.scroll(scrollContainer);
+
+    rerender(
+      <div data-testid="transcript-scroll" ref={scrollContainerRef}>
+        <Transcript events={[{ ...firstResponse }]} scrollContainerRef={scrollContainerRef} />
+      </div>,
+    );
+    expect(screen.queryByRole("button", { name: /Jump to latest/ })).not.toBeInTheDocument();
+
+    rerender(
+      <div data-testid="transcript-scroll" ref={scrollContainerRef}>
+        <Transcript
+          events={[{ ...firstResponse, body: "First response, now with more detail." }]}
+          scrollContainerRef={scrollContainerRef}
+        />
+      </div>,
+    );
+    expect(screen.getByRole("button", { name: /Jump to latest/ })).toBeInTheDocument();
+  });
+
+  it("detects streamed text behind the compact live activity row", () => {
+    const scrollContainerRef = { current: null as HTMLDivElement | null };
+    const liveActivity: TranscriptEvent = {
+      ...event("activity-1", "activity", "1 tool"),
+      title: "Activity",
+      status: "running",
+    };
+    const { rerender } = render(
+      <div data-testid="transcript-scroll" ref={scrollContainerRef}>
+        <Transcript
+          events={[event("assistant-1", "assistant", "Starting"), liveActivity]}
+          running
+          scrollContainerRef={scrollContainerRef}
+        />
+      </div>,
+    );
+    const scrollContainer = screen.getByTestId("transcript-scroll");
+    Object.defineProperty(scrollContainer, "scrollHeight", { configurable: true, value: 220 });
+    Object.defineProperty(scrollContainer, "clientHeight", { configurable: true, value: 100 });
+    scrollContainer.scrollTop = 0;
+    fireEvent.scroll(scrollContainer);
+
+    rerender(
+      <div data-testid="transcript-scroll" ref={scrollContainerRef}>
+        <Transcript
+          events={[event("assistant-1", "assistant", "Starting with more detail"), liveActivity]}
+          running
+          scrollContainerRef={scrollContainerRef}
+        />
+      </div>,
+    );
+
+    expect(screen.getByRole("button", { name: /Jump to latest/ })).toBeInTheDocument();
+  });
+
+  it("observes layout size without installing a transcript subtree observer", () => {
+    const observe = vi.fn();
+    const disconnect = vi.fn();
+    const resizeObserver = vi.fn();
+    const mutationObserver = vi.fn();
+    class TestResizeObserver {
+      constructor() {
+        resizeObserver();
+      }
+      observe = observe;
+      unobserve = vi.fn();
+      disconnect = disconnect;
+    }
+    class TestMutationObserver {
+      constructor() {
+        mutationObserver();
+      }
+      observe = vi.fn();
+      takeRecords = vi.fn(() => []);
+      disconnect = vi.fn();
+    }
+    vi.stubGlobal("ResizeObserver", TestResizeObserver);
+    vi.stubGlobal("MutationObserver", TestMutationObserver);
+    const scrollContainerRef = { current: null as HTMLDivElement | null };
+
+    render(
+      <div ref={scrollContainerRef}>
+        <Transcript
+          events={[event("assistant-1", "assistant", "First response.")]}
+          scrollContainerRef={scrollContainerRef}
+        />
+      </div>,
+    );
+
+    expect(resizeObserver).toHaveBeenCalledTimes(1);
+    expect(observe).toHaveBeenCalledTimes(2);
+    expect(mutationObserver).not.toHaveBeenCalled();
+  });
+
+  it("keeps the active run status compact while the response arrives", () => {
+    const runningSince = "2026-07-11T12:01:00.000Z";
+    const { rerender } = render(
+      <Transcript
+        events={[event("user-1", "user", "Start the task")]}
+        running
+        runningSince={runningSince}
+      />,
+    );
+
+    expect(screen.getByText("Thinking…")).toBeInTheDocument();
+    rerender(
+      <Transcript
+        events={[
+          event("user-1", "user", "Start the task"),
+          {
+            ...event("assistant-1", "assistant", "The response is streaming."),
+            timestamp: runningSince,
+          },
+        ]}
+        running
+        runningSince={runningSince}
+      />,
+    );
+
+    expect(screen.getByText("Thinking…")).toBeInTheDocument();
+  });
+
+  it("shows the current command, live tokens, and agent count", () => {
+    render(
+      <Transcript
+        events={[
+          event("user-1", "user", "Run the checks"),
+          {
+            ...event("command-1", "tool", "pnpm test\nstill running"),
+            activityType: "command",
+            title: "Command",
+            status: "running",
+          },
+        ]}
+        running
+        runningSince="2026-07-11T12:00:00.000Z"
+        usage={{
+          inputTokens: 100,
+          cachedInputTokens: 0,
+          outputTokens: 384,
+          reasoningOutputTokens: 0,
+          totalTokens: 784,
+        }}
+        activeAgentCount={1}
+      />,
+    );
+
+    expect(screen.getByText("Working on pnpm test")).toBeInTheDocument();
+    expect(screen.getByText("784 tokens")).toBeInTheDocument();
+    expect(screen.getByText("1 agent")).toBeInTheDocument();
+  });
+
+  it("moves a trailing activity batch into the single live status row", () => {
+    render(
+      <Transcript
+        events={[
+          event("assistant-1", "assistant", "I will make the changes."),
+          {
+            id: "activity-1",
+            kind: "activity",
+            title: "Activity",
+            body: "3 tools",
+            timestamp: "2026-07-11T12:00:01.000Z",
+            status: "success",
+            children: [
+              {
+                ...event("tool-1", "tool", "Tool activity"),
+                title: "Tool call",
+                status: "success",
+              },
+            ],
+          },
+        ]}
+        running
+        runningSince="2026-07-11T12:00:00.000Z"
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: /Activity.*3 tools/ })).not.toBeInTheDocument();
+    expect(screen.getByText("Activity")).toBeInTheDocument();
+    expect(screen.getByText("3 tools")).toBeInTheDocument();
+    expect(document.querySelector(".task-now-current")).toHaveTextContent(
+      "Working on Tool call · Tool activity",
+    );
+  });
+
+  it("expands a grouped activity loop and preserves nested tool details", () => {
+    render(
+      <Transcript
+        events={[
+          event("assistant-1", "assistant", "I will inspect the project."),
+          {
+            id: "group-1",
+            kind: "activity",
+            title: "Activity",
+            body: "2 commands · 1 tool",
+            timestamp: "2026-07-11T12:00:01.000Z",
+            status: "success",
+            children: [
+              {
+                ...event("command-1", "tool", "pnpm test"),
+                activityType: "command",
+                title: "Command",
+                details: [{ label: "Output", body: "passed" }],
+                status: "success",
+              },
+              {
+                ...event("tool-1", "tool", "src/App.tsx"),
+                activityType: "tool",
+                title: "Read file",
+                details: [{ label: "Input", body: "src/App.tsx" }],
+                status: "success",
+              },
+            ],
+          },
+          event("assistant-2", "assistant", "The checks passed."),
+        ]}
+      />,
+    );
+
+    const group = screen.getByRole("button", { name: /Activity.*2 commands/ });
+    expect(screen.queryByText("passed")).not.toBeInTheDocument();
+    fireEvent.click(group);
+    expect(screen.getByText("pnpm test")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Command.*pnpm test/ }));
+    expect(screen.getByText("passed")).toBeInTheDocument();
+  });
+
+  it("shows an edited-file diff inline by default and exposes the Files quick action", () => {
+    const onOpenFile = vi.fn();
+    render(
+      <Transcript
+        events={[
+          {
+            ...event("file-1", "tool", "src/App.tsx"),
+            activityType: "file",
+            filePath: "src/App.tsx",
+            title: "Edited",
+            status: "success",
+            expandedByDefault: true,
+            diff: {
+              path: "src/App.tsx",
+              status: "modified",
+              additions: 1,
+              deletions: 1,
+              staged: false,
+              lines: [
+                { kind: "hunk", content: "@@ -1,1 +1,1 @@" },
+                { kind: "delete", oldNumber: 1, content: "old" },
+                { kind: "add", newNumber: 1, content: "new" },
+              ],
+            },
+          },
+        ]}
+        onOpenFile={onOpenFile}
+      />,
+    );
+
+    expect(screen.getByRole("region", { name: "Diff for src/App.tsx" })).toBeInTheDocument();
+    expect(document.querySelectorAll(".diff-line--add")).toHaveLength(1);
+    expect(document.querySelectorAll(".diff-line--delete")).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open src/App.tsx in Files" }));
+    expect(onOpenFile).toHaveBeenCalledWith("src/App.tsx");
   });
 });

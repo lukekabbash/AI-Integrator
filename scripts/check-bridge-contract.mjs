@@ -5,10 +5,17 @@ import { dirname, resolve } from "node:path";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const bridgePath = resolve(root, "apps/desktop/src/bridge.ts");
 const tauriPath = resolve(root, "apps/desktop/src-tauri/src/lib.rs");
+const tauriBuildPath = resolve(root, "apps/desktop/src-tauri/build.rs");
+const capabilityPath = resolve(
+  root,
+  "apps/desktop/src-tauri/capabilities/default.json",
+);
 
-const [bridge, tauri] = await Promise.all([
+const [bridge, tauri, tauriBuild, capabilitySource] = await Promise.all([
   readFile(bridgePath, "utf8"),
   readFile(tauriPath, "utf8"),
+  readFile(tauriBuildPath, "utf8"),
+  readFile(capabilityPath, "utf8"),
 ]);
 
 const handler = tauri.match(/generate_handler!\[([\s\S]*?)\]/)?.[1];
@@ -18,6 +25,33 @@ const registered = new Set(
   [...handler.matchAll(/\b([a-z][a-z0-9_]+)\s*,/g)].map((match) => match[1]),
 );
 if (registered.size === 0) fail("Tauri command registration is empty");
+
+const manifest = tauriBuild.match(
+  /const APP_COMMANDS:\s*&\[&str\]\s*=\s*&\[([\s\S]*?)\];/,
+)?.[1];
+if (!manifest) fail("could not locate build.rs APP_COMMANDS manifest");
+const manifested = new Set(
+  [...manifest.matchAll(/"([a-z][a-z0-9_]*)"/g)].map((match) => match[1]),
+);
+if (manifested.size === 0) fail("Tauri app command manifest is empty");
+
+const missingFromManifest = [...registered]
+  .filter((command) => !manifested.has(command))
+  .sort();
+if (missingFromManifest.length > 0) {
+  fail(
+    `registered command(s) missing from Tauri app manifest: ${missingFromManifest.join(", ")}`,
+  );
+}
+
+const staleManifestCommands = [...manifested]
+  .filter((command) => !registered.has(command))
+  .sort();
+if (staleManifestCommands.length > 0) {
+  fail(
+    `stale Tauri app manifest command(s): ${staleManifestCommands.join(", ")}`,
+  );
+}
 
 const invoked = new Set();
 for (const match of bridge.matchAll(
@@ -40,6 +74,52 @@ const unregistered = [...invoked]
   .sort();
 if (unregistered.length > 0) {
   fail(`unregistered native invoke command(s): ${unregistered.join(", ")}`);
+}
+
+let capability;
+try {
+  capability = JSON.parse(capabilitySource);
+} catch (error) {
+  fail(`could not parse desktop capability: ${error.message}`);
+}
+if (!Array.isArray(capability.permissions)) {
+  fail("desktop capability permissions must be an array");
+}
+
+const commandPermission = (command) => `allow-${command.replaceAll("_", "-")}`;
+const allowedAppPermissions = new Set(
+  capability.permissions.filter((permission) =>
+    /^allow-[a-z][a-z0-9-]*$/.test(permission),
+  ),
+);
+const expectedAppPermissions = new Set([...invoked].map(commandPermission));
+
+const missingPermissions = [...expectedAppPermissions]
+  .filter((permission) => !allowedAppPermissions.has(permission))
+  .sort();
+if (missingPermissions.length > 0) {
+  fail(
+    `native invoke permission(s) missing from desktop capability: ${missingPermissions.join(", ")}`,
+  );
+}
+
+const staleOrOverbroadPermissions = [...allowedAppPermissions]
+  .filter((permission) => !expectedAppPermissions.has(permission))
+  .sort();
+if (staleOrOverbroadPermissions.length > 0) {
+  fail(
+    `stale or uninvoked app permission(s) in desktop capability: ${staleOrOverbroadPermissions.join(", ")}`,
+  );
+}
+
+const deniedInvokedCommands = [...invoked]
+  .map((command) => `deny-${command.replaceAll("_", "-")}`)
+  .filter((permission) => capability.permissions.includes(permission))
+  .sort();
+if (deniedInvokedCommands.length > 0) {
+  fail(
+    `invoked command(s) explicitly denied: ${deniedInvokedCommands.join(", ")}`,
+  );
 }
 
 const legacyCommands = [
@@ -82,7 +162,7 @@ const unused = [...registered]
   .filter((command) => !invoked.has(command))
   .sort();
 console.log(
-  `bridge contract: PASS (${invoked.size} invoked, ${registered.size} registered, ${unused.length} registered for future UI use)`,
+  `bridge contract: PASS (${invoked.size} invoked and allowed, ${registered.size} registered and manifested, ${unused.length} registered for future UI use)`,
 );
 
 function fail(message) {

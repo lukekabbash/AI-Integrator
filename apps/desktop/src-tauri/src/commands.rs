@@ -1,26 +1,33 @@
 use std::{
     fs,
     path::{Component, Path, PathBuf},
-    process::Command,
-    sync::Arc,
+    process::{Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
-use adapter_codex::{CodexEvent, CodexLaunchOptions, ServerRequestId};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+use adapter_codex::{CodexEvent, CodexLaunchOptions, CodexSkillSelection, ServerRequestId};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use integrator_core::{
-    ApprovalDecision, ApprovalProjection, ConnectionState, IntegratorError, LocalExport, NewTask,
-    ProjectId, ProviderKind, RuntimeBinding, RuntimeProjection, RuntimeSession, Setting,
-    StopRequestResult, Task, TaskId, TaskSnapshot, TaskState, TransportRequestId, TrustedProject,
-    TurnStatus, Versioned,
+    ApprovalDecision, ApprovalKind, ApprovalProjection, ConnectionState, IntegratorError,
+    LocalExport, ModeOption, ModeProjection, NewTask, ProjectId, ProviderKind, RuntimeBinding,
+    RuntimeProjection, RuntimeSession, Setting, StopRequestResult, Task, TaskId, TaskSnapshot,
+    TaskState, TransportRequestId, TrustedProject, TurnStatus, Versioned,
 };
 use integrator_runtime::{
-    CommitResult, CreateWorktree, DiffResult, DiffScope, FileStatus, GitService,
-    ProjectionMutation, ProviderEventInput, PushPreview, ReducedProviderEvent, RepositoryIdentity,
-    StructuredCliEventKind, StructuredCliLaunchOptions, StructuredCliProvider,
-    StructuredPermissionMode, StructuredUsage, WorktreeInfo, acp_turn_projection,
-    authorize_repository, discover_providers, provider_executable, reduce_acp_permission_request,
+    CommitResult, CreateWorktree, DiffResult, DiffScope, FileStatus, GitOverview, GitService,
+    HistoryCommit, ProjectionMutation, ProviderEventInput, PushConfirmation, PushPreview,
+    PushResult, ReducedProviderEvent, RepositoryIdentity, StructuredCliEventKind,
+    StructuredCliLaunchOptions, StructuredCliProvider, StructuredPermissionMode, StructuredUsage,
+    WorktreeInfo, acp_mode_event, acp_turn_projection, discover_providers, parse_acp_mode_state,
+    provider_executable, reduce_acp_permission_request, reduce_acp_plan_review_request,
     reduce_acp_update, reduce_connection_event, reduce_provider_event,
 };
 use serde::{Deserialize, Serialize};
@@ -34,9 +41,14 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest, http::header};
 
+use crate::native_actions::{
+    NativeActionHandle, NativeActionInvocation, NativeActionKind, NativeProviderAction,
+    discover_file_actions, parse_acp_actions,
+};
 use crate::state::{
-    AcpPermissionOption, AcpRuntime, AppState, CodexRuntime, PendingStructuredPermission,
-    StructuredRuntime, VoiceTypingCommand, VoiceTypingSession,
+    AcpPermissionOption, AcpRuntime, AppState, CodexRuntime, PendingNativeSkill,
+    PendingStructuredPermission, StructuredRuntime, VoiceTypingCommand, VoiceTypingSession,
+    remove_task_runtime, replace_task_runtime,
 };
 
 pub(crate) type CommandResult<T> = std::result::Result<T, CommandError>;
@@ -131,6 +143,395 @@ pub async fn provider_discover() -> CommandResult<Vec<integrator_core::ProviderS
     Ok(statuses)
 }
 
+#[derive(Clone, Debug)]
+struct ResolvedNativeAction {
+    public: NativeProviderAction,
+    provider_path: Option<PathBuf>,
+}
+
+/// Returns the active provider's own skill/command inventory for one trusted
+/// repository. Discovery uses the provider protocol where one exists and a
+/// bounded native scan of documented provider-owned roots otherwise.
+#[tauri::command]
+pub async fn provider_action_list(
+    state: State<'_, AppState>,
+    provider: ProviderKind,
+    repository: PathBuf,
+) -> CommandResult<Vec<NativeProviderAction>> {
+    let (_, identity) = authorized_git(&state, repository).await?;
+    let repository = identity.root;
+    let resolved = match &provider {
+        ProviderKind::Codex => codex_native_actions(&state, &repository).await?,
+        ProviderKind::Cursor | ProviderKind::Grok => {
+            if let Some(actions) = current_acp_actions(&state, &provider).await {
+                actions
+                    .into_iter()
+                    .map(|public| ResolvedNativeAction {
+                        public,
+                        provider_path: None,
+                    })
+                    .collect()
+            } else {
+                probe_acp_actions(&provider, &repository).await?
+            }
+        }
+        ProviderKind::Claude | ProviderKind::Antigravity => {
+            let scan_provider = provider.clone();
+            let scan_repository = repository.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                discover_file_actions(&scan_provider, &scan_repository)
+                    .into_iter()
+                    .map(|public| ResolvedNativeAction {
+                        public,
+                        provider_path: None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .map_err(|_| worker_error())?
+        }
+        ProviderKind::CustomAcp => Vec::new(),
+    };
+    Ok(register_native_actions(
+        &state, provider, repository, resolved,
+    ))
+}
+
+async fn codex_native_actions(
+    state: &State<'_, AppState>,
+    repository: &Path,
+) -> CommandResult<Vec<ResolvedNativeAction>> {
+    let task_client = state
+        .codex
+        .lock()
+        .await
+        .values()
+        .find(|runtime| runtime.alive.load(Ordering::Acquire))
+        .map(|runtime| runtime.client.clone());
+    let existing = match task_client {
+        Some(client) => Some(client),
+        None => state
+            .codex_catalog
+            .lock()
+            .await
+            .as_ref()
+            .filter(|runtime| runtime.alive.load(Ordering::Acquire))
+            .map(|runtime| runtime.client.clone()),
+    };
+    let (client, ephemeral) = match existing {
+        Some(client) => (client, false),
+        None => {
+            let statuses = tauri::async_runtime::spawn_blocking(discover_providers)
+                .await
+                .map_err(|_| worker_error())?;
+            let executable =
+                provider_executable(&statuses, ProviderKind::Codex).ok_or_else(|| {
+                    CommandError {
+                        code: "provider-unavailable",
+                        message: "Codex CLI is not installed".into(),
+                    }
+                })?;
+            let client = adapter_codex::CodexClient::spawn(CodexLaunchOptions {
+                executable,
+                working_directory: Some(repository.to_path_buf()),
+                client_version: env!("CARGO_PKG_VERSION").into(),
+            })
+            .await
+            .map_err(CommandError::from)?;
+            (client, true)
+        }
+    };
+    let response = client
+        .list_skills(repository, false)
+        .await
+        .map_err(CommandError::from);
+    if ephemeral {
+        let _ = client.shutdown().await;
+    }
+    let mut actions = parse_codex_actions(&response?)?;
+    actions.insert(0, codex_goal_action());
+    Ok(actions)
+}
+
+fn codex_goal_action() -> ResolvedNativeAction {
+    ResolvedNativeAction {
+        public: NativeProviderAction {
+            id: String::new(),
+            name: "goal".into(),
+            description: "Keep working until a completion condition is met".into(),
+            source: "built-in".into(),
+            kind: NativeActionKind::Command,
+            invocation: NativeActionInvocation::Direct,
+            input_hint: Some("completion condition".into()),
+        },
+        provider_path: None,
+    }
+}
+
+fn parse_codex_actions(value: &Value) -> CommandResult<Vec<ResolvedNativeAction>> {
+    let skills = value
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|data| data.first())
+        .and_then(|entry| entry.get("skills"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| CommandError {
+            code: "provider-protocol",
+            message: "Codex returned an invalid skill inventory".into(),
+        })?;
+    let mut actions = Vec::new();
+    for skill in skills.iter().take(512) {
+        if skill.get("enabled").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let Some(name) = skill.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(path) = skill.get("path").and_then(Value::as_str).map(PathBuf::from) else {
+            continue;
+        };
+        let description = skill
+            .get("shortDescription")
+            .or_else(|| skill.pointer("/interface/shortDescription"))
+            .or_else(|| skill.get("description"))
+            .and_then(Value::as_str)
+            .unwrap_or("Codex skill");
+        let source = skill
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or("codex");
+        let Some(mut public) = NativeProviderAction::acp(name, description, None) else {
+            continue;
+        };
+        public.kind = NativeActionKind::Skill;
+        public.source = source.chars().take(64).collect();
+        actions.push(ResolvedNativeAction {
+            public,
+            provider_path: Some(path),
+        });
+    }
+    Ok(actions)
+}
+
+async fn current_acp_actions(
+    state: &State<'_, AppState>,
+    provider: &ProviderKind,
+) -> Option<Vec<NativeProviderAction>> {
+    let task_runtime = state
+        .acp
+        .lock()
+        .await
+        .values()
+        .find(|runtime| &runtime.provider == provider && runtime.alive.load(Ordering::Acquire))
+        .cloned();
+    let runtime = match task_runtime {
+        Some(runtime) => runtime,
+        None => state.acp_catalog.lock().await.get(provider).cloned()?,
+    };
+    for _ in 0..12 {
+        let actions = runtime
+            .available_actions
+            .lock()
+            .expect("action lock")
+            .clone();
+        if !actions.is_empty() {
+            return Some(actions);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    None
+}
+
+async fn probe_acp_actions(
+    provider: &ProviderKind,
+    repository: &Path,
+) -> CommandResult<Vec<ResolvedNativeAction>> {
+    let statuses = tauri::async_runtime::spawn_blocking(discover_providers)
+        .await
+        .map_err(|_| worker_error())?;
+    let executable =
+        provider_executable(&statuses, provider.clone()).ok_or_else(|| CommandError {
+            code: "provider-unavailable",
+            message: format!("{} CLI is not installed", provider.as_str()),
+        })?;
+    let client = adapter_acp::AcpClient::spawn(adapter_acp::AcpLaunchOptions {
+        executable,
+        arguments: acp_launch_arguments(provider)?,
+        working_directory: Some(repository.to_path_buf()),
+        client_version: env!("CARGO_PKG_VERSION").into(),
+    })
+    .await
+    .map_err(CommandError::from)?;
+    if let Err(error) = authenticate_acp_provider(&client, provider).await {
+        let _ = client.shutdown().await;
+        return Err(error);
+    }
+    let mut receiver = client.subscribe();
+    let session = client.new_session(repository, Vec::new()).await;
+    if let Err(error) = session {
+        let _ = client.shutdown().await;
+        return Err(CommandError::from(error));
+    }
+    let mut actions = Vec::new();
+    for _ in 0..8 {
+        let event = timeout(Duration::from_millis(250), receiver.recv()).await;
+        let Ok(Ok(adapter_acp::AcpEvent::Notification { method, params })) = event else {
+            continue;
+        };
+        if method != "session/update" {
+            continue;
+        }
+        if let Some(parsed) = params.get("update").and_then(parse_acp_actions) {
+            actions = parsed;
+            break;
+        }
+    }
+    let _ = client.shutdown().await;
+    Ok(actions
+        .into_iter()
+        .map(|public| ResolvedNativeAction {
+            public,
+            provider_path: None,
+        })
+        .collect())
+}
+
+async fn authenticate_acp_provider(
+    client: &adapter_acp::AcpClient,
+    provider: &ProviderKind,
+) -> CommandResult<()> {
+    if *provider != ProviderKind::Grok {
+        return Ok(());
+    }
+    let initialization = client.initialization().await;
+    let cached_token = acp_has_auth_method(&initialization, "cached_token");
+    if !cached_token {
+        return Err(CommandError {
+            code: "provider-login-required",
+            message: "Grok has no vendor-owned cached login; run `grok login` first".into(),
+        });
+    }
+    client
+        .authenticate("cached_token", true)
+        .await
+        .map(|_| ())
+        .map_err(CommandError::from)
+}
+
+fn acp_has_auth_method(initialization: &Value, expected: &str) -> bool {
+    initialization
+        .get("authMethods")
+        .or_else(|| initialization.get("auth_methods"))
+        .and_then(Value::as_array)
+        .is_some_and(|methods| {
+            methods.iter().any(|method| {
+                method.as_str() == Some(expected)
+                    || method.get("id").and_then(Value::as_str) == Some(expected)
+                    || method.get("methodId").and_then(Value::as_str) == Some(expected)
+            })
+        })
+}
+
+fn register_native_actions(
+    state: &State<'_, AppState>,
+    provider: ProviderKind,
+    repository: PathBuf,
+    resolved: Vec<ResolvedNativeAction>,
+) -> Vec<NativeProviderAction> {
+    let mut handles = state
+        .native_action_handles
+        .lock()
+        .expect("action handle lock");
+    reconcile_native_action_handles(&mut handles, provider, repository, resolved)
+}
+
+fn reconcile_native_action_handles(
+    handles: &mut std::collections::HashMap<String, NativeActionHandle>,
+    provider: ProviderKind,
+    repository: PathBuf,
+    resolved: Vec<ResolvedNativeAction>,
+) -> Vec<NativeProviderAction> {
+    let mut reusable = handles
+        .iter()
+        .filter(|(_, handle)| handle.provider == provider && handle.repository == repository)
+        .map(|(id, handle)| (id.clone(), handle.clone()))
+        .collect::<Vec<_>>();
+    handles.retain(|_, handle| handle.provider != provider || handle.repository != repository);
+    let mut public_actions = Vec::new();
+    for mut resolved in resolved.into_iter().take(512) {
+        let handle = NativeActionHandle {
+            provider: provider.clone(),
+            repository: repository.clone(),
+            name: resolved.public.name.clone(),
+            source: resolved.public.source.clone(),
+            kind: resolved.public.kind,
+            invocation: resolved.public.invocation,
+            provider_path: resolved.provider_path,
+        };
+        let id = reusable
+            .iter()
+            .position(|(_, existing)| existing == &handle)
+            .map(|index| reusable.swap_remove(index).0)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        resolved.public.id.clone_from(&id);
+        handles.insert(id, handle);
+        public_actions.push(resolved.public);
+    }
+    public_actions
+}
+
+fn resolve_native_action_handle(
+    state: &State<'_, AppState>,
+    provider: &ProviderKind,
+    repository: &Path,
+    action_id: &str,
+) -> CommandResult<NativeActionHandle> {
+    let handle = state
+        .native_action_handles
+        .lock()
+        .expect("action handle lock")
+        .get(action_id)
+        .cloned()
+        .ok_or_else(|| CommandError {
+            code: "stale-native-action",
+            message: "This provider action changed; open the slash menu and choose it again".into(),
+        })?;
+    if &handle.provider != provider || handle.repository != repository {
+        return Err(CommandError {
+            code: "unauthorized",
+            message: "provider action does not belong to this runtime and repository".into(),
+        });
+    }
+    if handle.invocation != NativeActionInvocation::Direct {
+        return Err(CommandError {
+            code: "interactive-only",
+            message: "This provider action requires the provider's interactive terminal".into(),
+        });
+    }
+    Ok(handle)
+}
+
+fn native_slash_prompt<'a>(prompt: &'a str, name: &str) -> CommandResult<&'a str> {
+    let prefix = format!("/{name}");
+    let Some(rest) = prompt.strip_prefix(&prefix) else {
+        return Err(CommandError {
+            code: "invalid-input",
+            message: "selected provider action no longer matches the draft".into(),
+        });
+    };
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|character| !character.is_whitespace())
+    {
+        return Err(CommandError {
+            code: "invalid-input",
+            message: "selected provider action no longer matches the draft".into(),
+        });
+    }
+    Ok(rest)
+}
+
 #[tauri::command]
 pub async fn task_create(state: State<'_, AppState>, input: NewTask) -> CommandResult<Task> {
     let store = Arc::clone(&state.store);
@@ -147,6 +548,35 @@ pub async fn task_list(state: State<'_, AppState>) -> CommandResult<Vec<Task>> {
         .await
         .map_err(|_| worker_error())?
         .map_err(Into::into)
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskMessageSearchHit {
+    task_id: TaskId,
+    snippet: String,
+}
+
+#[tauri::command]
+pub async fn task_search_messages(
+    state: State<'_, AppState>,
+    query: String,
+    limit: Option<usize>,
+) -> CommandResult<Vec<TaskMessageSearchHit>> {
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || {
+        store
+            .search_task_messages(&query, limit.unwrap_or(30))
+            .map(|matches| {
+                matches
+                    .into_iter()
+                    .map(|(task_id, snippet)| TaskMessageSearchHit { task_id, snippet })
+                    .collect()
+            })
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -256,10 +686,16 @@ pub async fn local_export(state: State<'_, AppState>) -> CommandResult<LocalExpo
 #[tauri::command]
 pub async fn local_clear(state: State<'_, AppState>) -> CommandResult<()> {
     let store = Arc::clone(&state.store);
-    tauri::async_runtime::spawn_blocking(move || store.clear_all_data())
-        .await
-        .map_err(|_| worker_error())?
-        .map_err(Into::into)
+    let authorizations = Arc::clone(&state.git_authorizations);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut authorizations = authorizations.lock().expect("git authorization cache lock");
+        store.clear_all_data()?;
+        authorizations.clear();
+        Ok::<(), IntegratorError>(())
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -417,9 +853,9 @@ fn store_provider_quota(store: &LocalStore, provider: ProviderKind, params: &Val
     };
     let key = format!("provider-quota.{}", provider.as_str());
     let existing = store
-        .list_settings()
+        .get_setting(&key)
         .ok()
-        .and_then(|settings| settings.into_iter().find(|setting| setting.key == key))
+        .flatten()
         .map(|setting| setting.value)
         .unwrap_or(Value::Null);
     let window = |name: &str| -> Value {
@@ -819,7 +1255,9 @@ pub async fn project_register(
 ) -> CommandResult<TrustedProject> {
     let git = state.git.clone().ok_or_else(git_unavailable)?;
     let store = Arc::clone(&state.store);
+    let authorizations = Arc::clone(&state.git_authorizations);
     tauri::async_runtime::spawn_blocking(move || {
+        let mut authorizations = authorizations.lock().expect("git authorization cache lock");
         let identity = git.repository(&path)?;
         let display_name = identity
             .root
@@ -829,7 +1267,13 @@ pub async fn project_register(
             .chars()
             .take(120)
             .collect::<String>();
-        store.upsert_trusted_project(&display_name, &identity.root, &identity.common_directory)
+        let project = store.upsert_trusted_project(
+            &display_name,
+            &identity.root,
+            &identity.common_directory,
+        )?;
+        authorizations.clear();
+        Ok::<TrustedProject, IntegratorError>(project)
     })
     .await
     .map_err(|_| worker_error())?
@@ -861,36 +1305,52 @@ fn validate_project_name(name: &str) -> Result<(), IntegratorError> {
     Ok(())
 }
 
-/// Create a brand-new project folder under `parent`, initialize a Git
-/// repository inside it, and register it as a trusted project.
+/// Create a brand-new project folder under `Documents\AI Integrator\Projects`,
+/// initialize a Git repository inside it, and register it as a trusted
+/// project. Name collisions are resolved by appending `-2`, `-3`, … so the
+/// flow never needs a folder picker.
 #[tauri::command]
 pub async fn project_create(
+    app: AppHandle,
     state: State<'_, AppState>,
-    parent: PathBuf,
     name: String,
 ) -> CommandResult<TrustedProject> {
     let git = state.git.clone().ok_or_else(git_unavailable)?;
     let store = Arc::clone(&state.store);
+    let authorizations = Arc::clone(&state.git_authorizations);
+    let documents = app.path().document_dir().map_err(|_| {
+        CommandError::from(IntegratorError::Unavailable(
+            "could not locate the Documents folder".into(),
+        ))
+    })?;
     tauri::async_runtime::spawn_blocking(move || {
+        let mut authorizations = authorizations.lock().expect("git authorization cache lock");
         let name = name.trim().to_string();
         validate_project_name(&name)?;
-        if !parent.is_dir() {
-            return Err(IntegratorError::InvalidInput(
-                "the chosen location is not an existing folder".into(),
-            ));
-        }
-        let destination = parent.join(&name);
-        fs::create_dir(&destination).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                IntegratorError::InvalidInput(format!(
-                    "a folder named \"{name}\" already exists here"
-                ))
-            } else {
-                IntegratorError::Io(error)
+        let projects_root = documents.join("AI Integrator").join("Projects");
+        fs::create_dir_all(&projects_root).map_err(IntegratorError::Io)?;
+        let mut display_name = name.clone();
+        let mut destination = projects_root.join(&display_name);
+        let mut counter = 2;
+        while destination.exists() {
+            if counter > 500 {
+                return Err(IntegratorError::InvalidInput(format!(
+                    "too many projects already share the name \"{name}\""
+                )));
             }
-        })?;
+            display_name = format!("{name}-{counter}");
+            destination = projects_root.join(&display_name);
+            counter += 1;
+        }
+        fs::create_dir(&destination).map_err(IntegratorError::Io)?;
         let identity = git.init(&destination)?;
-        store.upsert_trusted_project(&name, &identity.root, &identity.common_directory)
+        let project = store.upsert_trusted_project(
+            &display_name,
+            &identity.root,
+            &identity.common_directory,
+        )?;
+        authorizations.clear();
+        Ok(project)
     })
     .await
     .map_err(|_| worker_error())?
@@ -912,10 +1372,16 @@ pub async fn project_remove(
     project_id: ProjectId,
 ) -> CommandResult<()> {
     let store = Arc::clone(&state.store);
-    tauri::async_runtime::spawn_blocking(move || store.remove_trusted_project(project_id))
-        .await
-        .map_err(|_| worker_error())?
-        .map_err(Into::into)
+    let authorizations = Arc::clone(&state.git_authorizations);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut authorizations = authorizations.lock().expect("git authorization cache lock");
+        store.remove_trusted_project(project_id)?;
+        authorizations.clear();
+        Ok::<(), IntegratorError>(())
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -923,8 +1389,11 @@ pub async fn git_repository(
     state: State<'_, AppState>,
     path: PathBuf,
 ) -> CommandResult<RepositoryIdentity> {
-    let (_, identity) = authorized_git(&state, path).await?;
-    Ok(identity)
+    let (git, identity) = authorized_git(&state, path).await?;
+    tauri::async_runtime::spawn_blocking(move || git.refresh_identity(&identity))
+        .await
+        .map_err(|_| worker_error())?
+        .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -946,10 +1415,16 @@ pub async fn git_worktree_create(
     request: CreateWorktree,
 ) -> CommandResult<Vec<WorktreeInfo>> {
     let (git, identity) = authorized_git(&state, repository).await?;
-    tauri::async_runtime::spawn_blocking(move || git.create_worktree(&identity.root, &request))
-        .await
-        .map_err(|_| worker_error())?
-        .map_err(Into::into)
+    let authorizations = Arc::clone(&state.git_authorizations);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut authorizations = authorizations.lock().expect("git authorization cache lock");
+        let result = git.create_worktree(&identity.root, &request);
+        authorizations.clear();
+        result
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -959,6 +1434,30 @@ pub async fn git_status(
 ) -> CommandResult<Vec<FileStatus>> {
     let (git, identity) = authorized_git(&state, repository).await?;
     tauri::async_runtime::spawn_blocking(move || git.status(&identity.root))
+        .await
+        .map_err(|_| worker_error())?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn git_overview(
+    state: State<'_, AppState>,
+    repository: PathBuf,
+) -> CommandResult<GitOverview> {
+    let (git, identity) = authorized_git(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(move || git.overview(&identity))
+        .await
+        .map_err(|_| worker_error())?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn git_history(
+    state: State<'_, AppState>,
+    repository: PathBuf,
+) -> CommandResult<Vec<HistoryCommit>> {
+    let (git, identity) = authorized_git(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(move || git.history(&identity.root))
         .await
         .map_err(|_| worker_error())?
         .map_err(Into::into)
@@ -988,6 +1487,34 @@ pub struct ProjectFileContent {
     is_binary: bool,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectFileRenameInput {
+    path: String,
+    new_name: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectFileOpener {
+    id: String,
+    label: String,
+    description: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectFileOpenInput {
+    path: String,
+    opener_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectFileRevealInput {
+    path: String,
+}
+
 /// Lists ordinary files inside an explicitly trusted repository. We do not
 /// follow symlinks or descend into generated/dependency directories, which
 /// keeps the UI tree bounded and prevents a project from exposing arbitrary
@@ -1015,6 +1542,65 @@ pub async fn project_file_read(
         .await
         .map_err(|_| worker_error())?
         .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn project_file_rename(
+    state: State<'_, AppState>,
+    repository: PathBuf,
+    input: ProjectFileRenameInput,
+) -> CommandResult<ProjectFileEntry> {
+    let (_, identity) = authorized_git(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        rename_project_file(&identity.root, &input.path, &input.new_name)
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
+}
+
+/// Reports only file openers that the native host can resolve. The renderer
+/// receives stable ids and labels, never executable paths or shell authority.
+#[tauri::command]
+pub async fn project_file_opener_list(
+    state: State<'_, AppState>,
+    repository: PathBuf,
+) -> CommandResult<Vec<ProjectFileOpener>> {
+    let _ = authorized_git(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(discover_project_file_openers)
+        .await
+        .map_err(|_| worker_error())
+}
+
+/// Opens one repository-relative file through a closed, native-resolved
+/// target. Executable names and arbitrary command arguments never come from
+/// the renderer.
+#[tauri::command]
+pub async fn project_file_open(
+    state: State<'_, AppState>,
+    repository: PathBuf,
+    input: ProjectFileOpenInput,
+) -> CommandResult<()> {
+    let (_, identity) = authorized_git(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        open_project_file_external(&identity.root, &input.path, &input.opener_id)
+    })
+    .await
+    .map_err(|_| worker_error())?
+}
+
+/// Reveals a repository-relative file in the platform file manager. Deleted
+/// Git paths fall back to their nearest existing containing directory.
+#[tauri::command]
+pub async fn project_file_reveal(
+    state: State<'_, AppState>,
+    repository: PathBuf,
+    input: ProjectFileRevealInput,
+) -> CommandResult<()> {
+    let (_, identity) = authorized_git(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(move || reveal_project_file(&identity.root, &input.path))
+        .await
+        .map_err(|_| worker_error())?
 }
 
 #[tauri::command]
@@ -1077,6 +1663,19 @@ pub async fn git_push_preview(
 ) -> CommandResult<PushPreview> {
     let (git, identity) = authorized_git(&state, repository).await?;
     tauri::async_runtime::spawn_blocking(move || git.push_preview(&identity.root))
+        .await
+        .map_err(|_| worker_error())?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn git_push_confirmed(
+    state: State<'_, AppState>,
+    repository: PathBuf,
+    confirmation: PushConfirmation,
+) -> CommandResult<PushResult> {
+    let (git, identity) = authorized_git(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(move || git.push_confirmed(&identity.root, &confirmation))
         .await
         .map_err(|_| worker_error())?
         .map_err(Into::into)
@@ -1478,8 +2077,10 @@ pub async fn codex_connect(
     let runtime = CodexRuntime {
         client,
         process_id: uuid::Uuid::new_v4().to_string(),
+        alive: Arc::new(AtomicBool::new(true)),
         binding: Arc::new(std::sync::Mutex::new(None)),
         context_primer: Arc::new(std::sync::Mutex::new(None)),
+        pending_native_skill: Arc::new(std::sync::Mutex::new(None)),
     };
     if let Some(task_id) = task_id {
         let store = Arc::clone(&state.store);
@@ -1504,8 +2105,14 @@ pub async fn codex_connect(
             }
         });
     }
-    let previous = state.codex.lock().await.replace(runtime);
+    let previous = if let Some(task_id) = task_id {
+        let mut runtimes = state.codex.lock().await;
+        replace_task_runtime(&mut *runtimes, task_id, runtime)
+    } else {
+        state.codex_catalog.lock().await.replace(runtime)
+    };
     if let Some(previous) = previous {
+        previous.alive.store(false, Ordering::Release);
         let _ = state.store.expire_process_approvals(&previous.process_id);
         let _ = previous.client.shutdown().await;
     }
@@ -1547,13 +2154,29 @@ pub(crate) fn spawn_projection_pump(
                         store_provider_quota(&store, ProviderKind::Codex, &params);
                         continue;
                     }
-                    pump_provider_event(&app, &store, binding.as_ref(), method, params, None);
+                    if method == "skills/changed" {
+                        let _ = app.emit(
+                            "provider://native-actions-changed",
+                            serde_json::json!({ "provider": "codex" }),
+                        );
+                        continue;
+                    }
+                    pump_provider_event(
+                        &app,
+                        &store,
+                        &runtime,
+                        binding.as_ref(),
+                        method,
+                        params,
+                        None,
+                    );
                 }
                 CodexEvent::ServerRequest { id, method, params } => {
                     let request_id = transport_from_server_request(&id);
                     pump_provider_event(
                         &app,
                         &store,
+                        &runtime,
                         binding.as_ref(),
                         method,
                         params,
@@ -1585,19 +2208,21 @@ pub(crate) fn spawn_projection_pump(
                 }
             }
         }
+        runtime.alive.store(false, Ordering::Release);
     });
 }
 
 fn pump_provider_event(
     app: &AppHandle<tauri::Wry>,
     store: &LocalStore,
+    runtime: &CodexRuntime,
     binding: Option<&RuntimeBinding>,
     method: String,
     params: Value,
     request_id: Option<TransportRequestId>,
 ) {
     let Some(binding) = binding else { return };
-    let reduced = match reduce_provider_event(ProviderEventInput {
+    let mut reduced = match reduce_provider_event(ProviderEventInput {
         method,
         params,
         request_id,
@@ -1613,9 +2238,47 @@ fn pump_provider_event(
             Utc::now(),
         ),
     };
+    annotate_codex_native_skill(runtime, &mut reduced);
     if let Ok(event) = store.apply_reduced_event(binding, &reduced) {
         let _ = app.emit("runtime://projection", &event);
     }
+}
+
+fn annotate_codex_native_skill(runtime: &CodexRuntime, reduced: &mut ReducedProviderEvent) {
+    let mut pending = runtime
+        .pending_native_skill
+        .lock()
+        .expect("native skill lock");
+    annotate_pending_native_skill(&mut pending, reduced);
+}
+
+fn annotate_pending_native_skill(
+    pending: &mut Option<PendingNativeSkill>,
+    reduced: &mut ReducedProviderEvent,
+) {
+    let item = match &mut reduced.mutation {
+        ProjectionMutation::ReplaceItem(item)
+        | ProjectionMutation::NeutralItem(item)
+        | ProjectionMutation::MergeItem(item) => item,
+        _ => return,
+    };
+    if item.kind != integrator_core::ItemKind::UserMessage {
+        return;
+    }
+    let Some(pending) = pending.as_mut() else {
+        return;
+    };
+    let same_item = pending.provider_item_id.as_deref() == Some(item.provider_item_id.as_str());
+    let same_prompt = item
+        .body
+        .as_deref()
+        .is_some_and(|body| body == pending.wire_prompt || body == pending.visible_prompt);
+    if !same_item && !same_prompt {
+        return;
+    }
+    pending.provider_item_id = Some(item.provider_item_id.clone());
+    item.body = Some(pending.visible_prompt.clone());
+    item.native_skill = Some(pending.name.clone());
 }
 
 fn pump_connection_event(
@@ -1656,7 +2319,18 @@ fn server_request_from_transport(id: &TransportRequestId) -> Result<ServerReques
 
 #[tauri::command]
 pub async fn codex_disconnect(state: State<'_, AppState>) -> CommandResult<()> {
-    if let Some(runtime) = state.codex.lock().await.take() {
+    let mut runtimes = state
+        .codex
+        .lock()
+        .await
+        .drain()
+        .map(|(_, runtime)| runtime)
+        .collect::<Vec<_>>();
+    if let Some(runtime) = state.codex_catalog.lock().await.take() {
+        runtimes.push(runtime);
+    }
+    for runtime in runtimes {
+        runtime.alive.store(false, Ordering::Release);
         let _ = state.store.expire_process_approvals(&runtime.process_id);
         runtime
             .client
@@ -1672,7 +2346,7 @@ pub async fn codex_list_models(
     state: State<'_, AppState>,
     include_hidden: bool,
 ) -> CommandResult<Value> {
-    codex_client(&state)
+    codex_client(&state, None)
         .await?
         .list_models(include_hidden)
         .await
@@ -1685,7 +2359,7 @@ pub async fn codex_list_threads(
     cursor: Option<String>,
     limit: u32,
 ) -> CommandResult<Value> {
-    codex_client(&state)
+    codex_client(&state, None)
         .await?
         .list_threads(cursor, limit)
         .await
@@ -1698,7 +2372,7 @@ pub async fn codex_read_thread(
     thread_id: String,
     include_turns: bool,
 ) -> CommandResult<Value> {
-    codex_client(&state)
+    codex_client(&state, None)
         .await?
         .read_thread(&thread_id, include_turns)
         .await
@@ -1731,7 +2405,7 @@ pub async fn codex_start_thread(
             });
         }
     };
-    let runtime = codex_runtime(&state).await?;
+    let runtime = codex_runtime(&state, Some(task_id)).await?;
     let response = runtime
         .client
         .start_thread_with_policies(
@@ -1797,7 +2471,7 @@ pub async fn codex_resume_thread(
     thread_id: String,
 ) -> CommandResult<Value> {
     state.store.get_task(task_id).map_err(CommandError::from)?;
-    let runtime = codex_runtime(&state).await?;
+    let runtime = codex_runtime(&state, Some(task_id)).await?;
     let response = runtime
         .client
         .resume_thread(&thread_id)
@@ -1851,17 +2525,117 @@ async fn bind_thread(
 pub async fn codex_start_turn(
     app: AppHandle<tauri::Wry>,
     state: State<'_, AppState>,
+    task_id: TaskId,
     thread_id: String,
     prompt: String,
+    repository: PathBuf,
+    native_action_id: Option<String>,
 ) -> CommandResult<Value> {
-    let runtime = codex_runtime(&state).await?;
-    let wire_prompt =
-        apply_context_primer(&runtime.context_primer, &prompt).unwrap_or_else(|| prompt.clone());
+    let (_, identity) = authorized_git(&state, repository).await?;
+    let runtime = codex_runtime(&state, Some(task_id)).await?;
+    let mut goal_objective = None;
+    let skill = if let Some(action_id) = native_action_id.as_deref() {
+        let handle =
+            resolve_native_action_handle(&state, &ProviderKind::Codex, &identity.root, action_id)?;
+        let rest = native_slash_prompt(&prompt, &handle.name)?;
+        if handle.kind == NativeActionKind::Command {
+            if handle.name != "goal" {
+                return Err(CommandError {
+                    code: "provider-protocol",
+                    message: "This Codex command has no native app-server route".into(),
+                });
+            }
+            let objective = rest.trim();
+            if objective.is_empty() || objective.chars().count() > 4_000 {
+                return Err(CommandError {
+                    code: "invalid-input",
+                    message: "Add a goal after /goal using at most 4,000 characters".into(),
+                });
+            }
+            runtime
+                .client
+                .set_goal(&thread_id, objective)
+                .await
+                .map_err(CommandError::from)?;
+            goal_objective = Some(objective.to_owned());
+            None
+        } else {
+            let path = handle.provider_path.clone().ok_or_else(|| CommandError {
+                code: "stale-native-action",
+                message: "Codex skill path is no longer available; choose the skill again".into(),
+            })?;
+            let current = runtime
+                .client
+                .list_skills(&identity.root, true)
+                .await
+                .map_err(CommandError::from)?;
+            let still_enabled = parse_codex_actions(&current)?.into_iter().any(|candidate| {
+                candidate.public.name == handle.name
+                    && candidate.provider_path.as_deref() == Some(path.as_path())
+            });
+            if !still_enabled {
+                return Err(CommandError {
+                    code: "stale-native-action",
+                    message: "This Codex skill changed; choose it again from the slash menu".into(),
+                });
+            }
+            Some((
+                CodexSkillSelection {
+                    name: handle.name.clone(),
+                    path,
+                },
+                format!("${}{}", handle.name, rest),
+            ))
+        }
+    } else {
+        None
+    };
+    let visible_wire = goal_objective.as_deref().unwrap_or_else(|| {
+        skill
+            .as_ref()
+            .map(|(_, text)| text.as_str())
+            .unwrap_or(prompt.as_str())
+    });
+    let wire_prompt = if native_action_id.is_some() {
+        // Preserve Codex's recommended `$name` text at byte zero alongside
+        // a typed skill item, or the exact goal objective after setting goal
+        // state. Native actions must not be silently converted back into a
+        // generic prompt by hidden context.
+        visible_wire.to_owned()
+    } else {
+        apply_context_primer(&runtime.context_primer, visible_wire)
+            .unwrap_or_else(|| visible_wire.to_owned())
+    };
+    *runtime
+        .pending_native_skill
+        .lock()
+        .expect("native skill lock") =
+        skill
+            .as_ref()
+            .map(|(selection, skill_prompt)| PendingNativeSkill {
+                name: selection.name.clone(),
+                wire_prompt: skill_prompt.clone(),
+                visible_prompt: prompt.clone(),
+                provider_item_id: None,
+            });
     let response = runtime
         .client
-        .start_turn(&thread_id, &wire_prompt)
-        .await
-        .map_err(CommandError::from)?;
+        .start_turn_with_skill(
+            &thread_id,
+            &wire_prompt,
+            skill.as_ref().map(|(selection, _)| selection),
+        )
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            *runtime
+                .pending_native_skill
+                .lock()
+                .expect("native skill lock") = None;
+            return Err(CommandError::from(error));
+        }
+    };
     reconcile_turn_response(&app, &state.store, &runtime, &thread_id, &response);
     Ok(response)
 }
@@ -1872,11 +2646,57 @@ pub async fn codex_interrupt_turn(
     thread_id: String,
     turn_id: String,
 ) -> CommandResult<Value> {
-    codex_client(&state)
+    codex_runtime_for_thread(&state, &thread_id)
         .await?
+        .client
         .interrupt_turn(&thread_id, &turn_id)
         .await
         .map_err(Into::into)
+}
+
+/// True when a runtime in this process is currently bound to the task. Only
+/// a bound live runtime can still be streaming a turn for it.
+async fn task_has_live_runtime(state: &State<'_, AppState>, task_id: TaskId) -> bool {
+    fn bound(binding: &std::sync::Mutex<Option<RuntimeBinding>>, task_id: TaskId) -> bool {
+        binding
+            .lock()
+            .expect("binding lock")
+            .as_ref()
+            .is_some_and(|binding| binding.task_id == task_id)
+    }
+    if state
+        .codex
+        .lock()
+        .await
+        .get(&task_id)
+        .is_some_and(|runtime| {
+            runtime.alive.load(Ordering::Acquire) && bound(&runtime.binding, task_id)
+        })
+    {
+        return true;
+    }
+    if state.acp.lock().await.get(&task_id).is_some_and(|runtime| {
+        runtime.alive.load(Ordering::Acquire) && bound(&runtime.binding, task_id)
+    }) {
+        return true;
+    }
+    if state
+        .structured
+        .lock()
+        .await
+        .get(&task_id)
+        .is_some_and(|runtime| {
+            runtime.alive.load(Ordering::Acquire) && bound(&runtime.binding, task_id)
+        })
+    {
+        return true;
+    }
+    state
+        .delegation_children
+        .lock()
+        .await
+        .values()
+        .any(|child| child.child_task_id == task_id)
 }
 
 #[tauri::command]
@@ -1884,6 +2704,15 @@ pub async fn task_snapshot(
     state: State<'_, AppState>,
     task_id: TaskId,
 ) -> CommandResult<TaskSnapshot> {
+    // A turn left pending/in-progress by a previous app run can never finish:
+    // provider processes do not survive the app. Settle it as interrupted
+    // before reading, so reopening a task does not rehydrate a phantom
+    // streaming turn whose timer counts from hours ago.
+    if !task_has_live_runtime(&state, task_id).await {
+        let store = Arc::clone(&state.store);
+        let _ =
+            tauri::async_runtime::spawn_blocking(move || store.settle_stopped_turn(task_id)).await;
+    }
     let store = Arc::clone(&state.store);
     tauri::async_runtime::spawn_blocking(move || store.task_snapshot(task_id))
         .await
@@ -1915,18 +2744,36 @@ pub async fn codex_respond_approval(
         _ => unreachable!("prepared approval emits an approval projection"),
     };
     // Route the wire response to whichever live process issued the request.
-    let acp = state.acp.lock().await.clone();
-    let structured = state.structured.lock().await.clone();
-    let result = if let Some(acp) = acp.filter(|runtime| runtime.process_id == prepared.process_id)
-    {
+    let acp = state
+        .acp
+        .lock()
+        .await
+        .values()
+        .find(|runtime| runtime.process_id == prepared.process_id)
+        .cloned();
+    let structured = state
+        .structured
+        .lock()
+        .await
+        .values()
+        .find(|runtime| runtime.process_id == prepared.process_id)
+        .cloned();
+    let result = if let Some(acp) = acp {
         let request_id = acp_request_from_transport(&prepared.request_id)?;
-        let outcome = acp_permission_outcome(&acp, &prepared.request_id, decision);
+        let is_plan_request = acp
+            .plan_requests
+            .lock()
+            .expect("plan lock")
+            .remove(&transport_key(&prepared.request_id));
+        let outcome = if is_plan_request {
+            acp_plan_review_result(decision)
+        } else {
+            acp_permission_outcome(&acp, &prepared.request_id, decision)
+        };
         acp.client
             .respond_to_server_request(&request_id, outcome)
             .await
-    } else if let Some(structured) =
-        structured.filter(|runtime| runtime.process_id == prepared.process_id)
-    {
+    } else if let Some(structured) = structured {
         let request_id = match &prepared.request_id {
             TransportRequestId::String(text) => text.clone(),
             TransportRequestId::Number(number) => number.to_string(),
@@ -1942,13 +2789,7 @@ pub async fn codex_respond_approval(
             .respond_permission(&request_id, response)
             .await
     } else {
-        let runtime = codex_runtime(&state).await?;
-        if runtime.process_id != prepared.process_id {
-            return Err(CommandError {
-                code: "stale-approval",
-                message: "approval belongs to an expired provider process".into(),
-            });
-        }
+        let runtime = codex_runtime_for_process(&state, &prepared.process_id).await?;
         let request_id = server_request_from_transport(&prepared.request_id)?;
         runtime
             .client
@@ -1990,7 +2831,7 @@ pub async fn codex_stop_turn(
         // The persisted stop is provider-neutral; route the wire-level
         // interrupt to whichever runtime owns this task.
         let routed: Result<(), CommandError> = async {
-            let acp = state.acp.lock().await.clone();
+            let acp = state.acp.lock().await.get(&task_id).cloned();
             let acp_session = acp.as_ref().and_then(|runtime| {
                 runtime
                     .binding
@@ -2006,14 +2847,7 @@ pub async fn codex_stop_turn(
                     .cancel(&session_id)
                     .await
                     .map_err(CommandError::from)?;
-            } else if let Some(runtime) = state.structured.lock().await.clone().filter(|runtime| {
-                runtime
-                    .binding
-                    .lock()
-                    .expect("binding lock")
-                    .as_ref()
-                    .is_some_and(|binding| binding.task_id == task_id)
-            }) {
+            } else if let Some(runtime) = state.structured.lock().await.get(&task_id).cloned() {
                 let turn_id = runtime
                     .current_turn
                     .lock()
@@ -2029,7 +2863,7 @@ pub async fn codex_stop_turn(
                     .await
                     .map_err(CommandError::from)?;
             } else {
-                let runtime = codex_runtime(&state).await?;
+                let runtime = codex_runtime(&state, Some(task_id)).await?;
                 let binding = runtime.binding.lock().expect("binding lock").clone();
                 let thread_id = binding
                     .filter(|binding| binding.task_id == task_id)
@@ -2075,6 +2909,7 @@ pub async fn acp_connect(
     state: State<'_, AppState>,
     provider: ProviderKind,
     working_directory: Option<PathBuf>,
+    task_id: Option<TaskId>,
 ) -> CommandResult<()> {
     let arguments = acp_launch_arguments(&provider)?;
     let statuses = tauri::async_runtime::spawn_blocking(discover_providers)
@@ -2093,19 +2928,33 @@ pub async fn acp_connect(
     })
     .await
     .map_err(CommandError::from)?;
+    if let Err(error) = authenticate_acp_provider(&client, &provider).await {
+        let _ = client.shutdown().await;
+        return Err(error);
+    }
     let runtime = AcpRuntime {
         client,
-        provider,
+        provider: provider.clone(),
         process_id: uuid::Uuid::new_v4().to_string(),
+        alive: Arc::new(AtomicBool::new(true)),
         binding: Arc::new(std::sync::Mutex::new(None)),
         current_turn: Arc::new(std::sync::Mutex::new(None)),
         permission_options: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        session_modes: Arc::new(std::sync::Mutex::new(None)),
+        plan_requests: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        available_actions: Arc::new(std::sync::Mutex::new(Vec::new())),
         context_primer: Arc::new(std::sync::Mutex::new(None)),
         delegation_preamble: Arc::new(std::sync::Mutex::new(None)),
     };
     spawn_acp_pump(app, Arc::clone(&state.store), runtime.clone());
-    let previous = state.acp.lock().await.replace(runtime);
+    let previous = if let Some(task_id) = task_id {
+        let mut runtimes = state.acp.lock().await;
+        replace_task_runtime(&mut *runtimes, task_id, runtime)
+    } else {
+        state.acp_catalog.lock().await.insert(provider, runtime)
+    };
     if let Some(previous) = previous {
+        previous.alive.store(false, Ordering::Release);
         let _ = state.store.expire_process_approvals(&previous.process_id);
         let _ = previous.client.shutdown().await;
     }
@@ -2115,6 +2964,9 @@ pub async fn acp_connect(
 fn acp_launch_arguments(provider: &ProviderKind) -> CommandResult<Vec<String>> {
     Ok(match provider {
         ProviderKind::Cursor => vec!["acp".into()],
+        // Scripted ACP starts disable implicit self-updates; the vendor CLI
+        // and its vendor-owned cached login remain the authority.
+        ProviderKind::Grok => vec!["--no-auto-update".into(), "agent".into(), "stdio".into()],
         _ => {
             return Err(CommandError {
                 code: "provider-unavailable",
@@ -2136,7 +2988,7 @@ pub async fn acp_start_session(
     delegation: Option<String>,
 ) -> CommandResult<Value> {
     state.store.get_task(task_id).map_err(CommandError::from)?;
-    let runtime = acp_runtime(&state).await?;
+    let runtime = acp_runtime(&state, Some(task_id), None).await?;
     let provider = runtime.provider.clone();
     let provider_name = provider.as_str().to_owned();
     // Delegation broker injection: ACP's `session/new` carries MCP servers
@@ -2198,6 +3050,14 @@ pub async fn acp_start_session(
         Utc::now(),
     );
     apply_and_emit(&app, &state.store, &binding, &connected);
+    // Agents that support session modes advertise them on session/new; keep
+    // the state for later current_mode_update merges and surface it now so
+    // the composer can render the mode picker immediately.
+    if let Some(mode) = parse_acp_mode_state(&response) {
+        *runtime.session_modes.lock().expect("modes lock") = Some(mode.clone());
+        let event = acp_mode_event(&session_id, None, mode, Utc::now());
+        apply_and_emit(&app, &state.store, &binding, &event);
+    }
     queue_context_primer(&state, task_id, &runtime.context_primer).await;
     Ok(response)
 }
@@ -2209,9 +3069,49 @@ pub async fn acp_send_turn(
     task_id: TaskId,
     prompt: String,
     delegation: Option<String>,
+    native_action_id: Option<String>,
 ) -> CommandResult<Value> {
-    let runtime = acp_runtime(&state).await?;
+    let runtime = acp_runtime(&state, Some(task_id), None).await?;
     let provider_name = runtime.provider.as_str();
+    if let Some(action_id) = native_action_id.as_deref() {
+        let task = state.store.get_task(task_id).map_err(CommandError::from)?;
+        let repository = task
+            .worktree_path
+            .as_ref()
+            .or(task.repository_path.as_ref())
+            .ok_or_else(|| CommandError {
+                code: "invalid-input",
+                message: "task has no explicit repository/worktree identity".into(),
+            })?;
+        let repository = dunce::canonicalize(repository).map_err(|_| CommandError {
+            code: "invalid-input",
+            message: "task repository/worktree is unavailable".into(),
+        })?;
+        let handle =
+            resolve_native_action_handle(&state, &runtime.provider, &repository, action_id)?;
+        native_slash_prompt(&prompt, &handle.name)?;
+        let mut advertised = false;
+        for _ in 0..12 {
+            advertised = runtime
+                .available_actions
+                .lock()
+                .expect("action lock")
+                .iter()
+                .any(|action| action.name == handle.name);
+            if advertised {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if !advertised {
+            return Err(CommandError {
+                code: "stale-native-action",
+                message: format!(
+                    "{provider_name} no longer advertises this command; choose it again"
+                ),
+            });
+        }
+    }
     let binding = runtime
         .binding
         .lock()
@@ -2245,6 +3145,7 @@ pub async fn acp_send_turn(
             status: integrator_core::ItemStatus::Completed,
             title: None,
             body: Some(integrator_runtime::redact_and_bound(&prompt, 2 * 1024 * 1024).0),
+            native_skill: None,
             command: None,
             cwd: None,
             output: None,
@@ -2362,7 +3263,7 @@ pub async fn acp_set_config_option(
     config_id: String,
     value: String,
 ) -> CommandResult<Value> {
-    let runtime = acp_runtime(&state).await?;
+    let runtime = acp_runtime(&state, Some(task_id), None).await?;
     let session_id = acp_bound_session(&runtime, task_id)?;
     runtime
         .client
@@ -2371,9 +3272,67 @@ pub async fn acp_set_config_option(
         .map_err(Into::into)
 }
 
+/// Switch the ACP session's mode (e.g. Cursor Agent/Plan/Ask). The mode must
+/// be one the agent advertised at session start. The refreshed mode state is
+/// persisted and emitted immediately; agents that also echo a
+/// `current_mode_update` produce a harmless duplicate.
 #[tauri::command]
-pub async fn acp_list_cursor_models(state: State<'_, AppState>) -> CommandResult<Value> {
-    let runtime = acp_runtime(&state).await?;
+pub async fn acp_set_mode(
+    app: AppHandle<tauri::Wry>,
+    state: State<'_, AppState>,
+    task_id: TaskId,
+    mode_id: String,
+) -> CommandResult<Value> {
+    let runtime = acp_runtime(&state, Some(task_id), None).await?;
+    let session_id = acp_bound_session(&runtime, task_id)?;
+    let known = runtime
+        .session_modes
+        .lock()
+        .expect("modes lock")
+        .as_ref()
+        .is_some_and(|modes| modes.available_modes.iter().any(|mode| mode.id == mode_id));
+    if !known {
+        return Err(CommandError {
+            code: "invalid-input",
+            message: format!(
+                "{} did not advertise a \"{mode_id}\" session mode",
+                runtime.provider.as_str()
+            ),
+        });
+    }
+    let response = runtime
+        .client
+        .set_mode(&session_id, &mode_id)
+        .await
+        .map_err(CommandError::from)?;
+    let mode = {
+        let mut modes = runtime.session_modes.lock().expect("modes lock");
+        let Some(mode_state) = modes.as_mut() else {
+            return Ok(response);
+        };
+        mode_state.current_mode_id = mode_id;
+        mode_state.clone()
+    };
+    if let Some(binding) = runtime
+        .binding
+        .lock()
+        .expect("binding lock")
+        .clone()
+        .filter(|binding| binding.task_id == task_id)
+    {
+        let turn_id = runtime.current_turn.lock().expect("turn lock").clone();
+        let event = acp_mode_event(&session_id, turn_id.as_deref(), mode, Utc::now());
+        apply_and_emit(&app, &state.store, &binding, &event);
+    }
+    Ok(response)
+}
+
+#[tauri::command]
+pub async fn acp_list_cursor_models(
+    state: State<'_, AppState>,
+    task_id: Option<TaskId>,
+) -> CommandResult<Value> {
+    let runtime = acp_runtime(&state, task_id, Some(ProviderKind::Cursor)).await?;
     if runtime.provider != ProviderKind::Cursor {
         return Err(CommandError {
             code: "invalid-input",
@@ -2399,6 +3358,7 @@ pub async fn structured_cli_start_turn(
     permission: String,
     prompt: String,
     delegation: Option<String>,
+    native_action_id: Option<String>,
 ) -> CommandResult<Value> {
     let task = state.store.get_task(task_id).map_err(CommandError::from)?;
     let (_, repository) = authorized_git(&state, cwd.clone()).await?;
@@ -2421,6 +3381,32 @@ pub async fn structured_cli_start_turn(
                 .into(),
         });
     }
+    let native_action = native_action_id
+        .as_deref()
+        .map(|action_id| {
+            resolve_native_action_handle(&state, &provider, &repository.root, action_id)
+        })
+        .transpose()?;
+    if let Some(action) = native_action.as_ref() {
+        native_slash_prompt(&prompt, &action.name)?;
+        let still_present = discover_file_actions(&provider, &repository.root)
+            .into_iter()
+            .any(|candidate| {
+                candidate.name == action.name
+                    && candidate.source == action.source
+                    && candidate.invocation == NativeActionInvocation::Direct
+            });
+        if !still_present {
+            return Err(CommandError {
+                code: "stale-native-action",
+                message: "This provider skill changed; choose it again from the slash menu".into(),
+            });
+        }
+    }
+    let native_skill = native_action
+        .as_ref()
+        .filter(|action| action.kind == NativeActionKind::Skill)
+        .map(|action| action.name.clone());
     let structured_provider = structured_provider(&provider)?;
     let permission_mode = match permission.as_str() {
         "read-only" => StructuredPermissionMode::ReadOnly,
@@ -2458,13 +3444,30 @@ pub async fn structured_cli_start_turn(
             message: format!("{} CLI is not installed", provider.as_str()),
         })?;
 
-    // Only one structured provider process may own the local control route.
-    // Cancel the previous process before spawning its replacement.
-    if let Some(previous) = state.structured.lock().await.take() {
+    // A task owns at most one structured provider process, but other tasks keep
+    // running independently in the background. Replacing a process is scoped
+    // to this task only (for a retry, provider change, or resumed next turn).
+    let mut resume_session_id = None;
+    let previous = {
+        let mut runtimes = state.structured.lock().await;
+        remove_task_runtime(&mut *runtimes, task_id)
+    };
+    if let Some(previous) = previous {
+        if matches!(structured_provider, StructuredCliProvider::Claude)
+            && previous
+                .binding
+                .lock()
+                .expect("binding lock")
+                .as_ref()
+                .is_some_and(|binding| binding.task_id == task_id && binding.provider == provider)
+        {
+            resume_session_id = previous.session_ref.lock().expect("session lock").clone();
+        }
         let turn = { previous.current_turn.lock().expect("turn lock").clone() };
         if let Some(turn) = turn {
             let _ = previous.client.cancel(&turn).await;
         }
+        previous.alive.store(false, Ordering::Release);
         let _ = state.store.expire_process_approvals(&previous.process_id);
     }
 
@@ -2475,11 +3478,18 @@ pub async fn structured_cli_start_turn(
     .await
     .map_err(|_| worker_error())?
     .map_err(CommandError::from)?;
-    let mut wire_prompt = match digest {
-        Some(digest) => format!(
-            "<conversation-context>\nEarlier conversation in this task (possibly from another assistant session). Treat it as prior chat history, not as part of the new request:\n\n{digest}\n</conversation-context>\n\n{prompt}"
-        ),
-        None => prompt.clone(),
+    let mut wire_prompt = if native_action.is_some() {
+        // Native slash parsing requires `/name` at byte zero. A resumed
+        // Claude session already owns its history; on a first native turn we
+        // prefer exact provider semantics over silently de-nativizing it.
+        prompt.clone()
+    } else {
+        match digest {
+            Some(digest) => format!(
+                "<conversation-context>\nEarlier conversation in this task (possibly from another assistant session). Treat it as prior chat history, not as part of the new request:\n\n{digest}\n</conversation-context>\n\n{prompt}"
+            ),
+            None => prompt.clone(),
+        }
     };
 
     // Delegation broker injection: each structured turn is a fresh provider
@@ -2493,7 +3503,9 @@ pub async fn structured_cli_start_turn(
         if let Some(updates) = crate::delegation::pending_updates_block(&store, task_id) {
             preface.push_str(&updates);
         }
-        wire_prompt = format!("{preface}{wire_prompt}");
+        if native_action.is_none() {
+            wire_prompt = format!("{preface}{wire_prompt}");
+        }
         if matches!(structured_provider, StructuredCliProvider::Claude) {
             let broker = state.broker.lock().expect("broker lock").clone();
             if let Some(info) = broker {
@@ -2528,10 +3540,12 @@ pub async fn structured_cli_start_turn(
     let runtime = StructuredRuntime {
         client: client.clone(),
         process_id,
+        alive: Arc::new(AtomicBool::new(true)),
         binding: Arc::new(std::sync::Mutex::new(Some(binding.clone()))),
         current_turn: Arc::new(std::sync::Mutex::new(None)),
         last_diagnostic: Arc::new(std::sync::Mutex::new(None)),
         permission_requests: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        session_ref: Arc::new(std::sync::Mutex::new(resume_session_id.clone())),
     };
     spawn_structured_cli_pump(app.clone(), Arc::clone(&state.store), runtime.clone());
     let turn_id = client
@@ -2542,7 +3556,7 @@ pub async fn structured_cli_start_turn(
                 working_directory: cwd,
                 model: model.filter(|value| value != "Provider default"),
                 effort: effort.filter(|value| !value.is_empty()),
-                resume_session_id: None,
+                resume_session_id,
                 permission_mode,
                 mcp_config_path,
             },
@@ -2569,6 +3583,7 @@ pub async fn structured_cli_start_turn(
                 status: integrator_core::ItemStatus::Completed,
                 title: None,
                 body: Some(integrator_runtime::redact_and_bound(&prompt, 2 * 1024 * 1024).0),
+                native_skill,
                 command: None,
                 cwd: None,
                 output: None,
@@ -2603,7 +3618,34 @@ pub async fn structured_cli_start_turn(
             occurred_at: now,
         },
     );
-    state.structured.lock().await.replace(runtime);
+    if matches!(structured_provider, StructuredCliProvider::Claude) {
+        // Surface the launch permission mode so the composer reflects the
+        // session's mode before any status update arrives.
+        let mode_id = match permission_mode {
+            StructuredPermissionMode::Prompt => "default",
+            StructuredPermissionMode::ReadOnly => "plan",
+            StructuredPermissionMode::AcceptEdits => "acceptEdits",
+            StructuredPermissionMode::BypassPermissions => "bypassPermissions",
+        };
+        apply_and_emit(
+            &app,
+            &state.store,
+            &binding,
+            &ReducedProviderEvent {
+                method: "client/structured/permissionMode".into(),
+                thread_id: binding.thread_id.clone().unwrap_or_default(),
+                turn_id: Some(turn_id.clone()),
+                audit_json: "{}".into(),
+                audit_truncated: false,
+                mutation: ProjectionMutation::Mode(claude_mode_projection(mode_id)),
+                occurred_at: now,
+            },
+        );
+    }
+    {
+        let mut runtimes = state.structured.lock().await;
+        replace_task_runtime(&mut *runtimes, task_id, runtime);
+    }
     Ok(serde_json::json!({ "turnId": turn_id }))
 }
 
@@ -2625,6 +3667,12 @@ pub(crate) fn spawn_structured_cli_pump(
 ) {
     let mut receiver = runtime.client.subscribe();
     tauri::async_runtime::spawn(async move {
+        // Claude can emit text -> tool -> text within one turn. Keep each
+        // post-tool text segment in a distinct projected item so the renderer
+        // can place one activity stack between the two text blocks.
+        let mut agent_segment: u32 = 0;
+        let mut segment_has_text = false;
+        let mut segment_turn = String::new();
         while let Ok(event) = receiver.recv().await {
             let Some(binding) = runtime.binding.lock().expect("binding lock").clone() else {
                 continue;
@@ -2632,12 +3680,31 @@ pub(crate) fn spawn_structured_cli_pump(
             let Some(thread_id) = binding.thread_id.clone() else {
                 continue;
             };
+            if let Some(session_id) = event.session_id.as_ref() {
+                *runtime.session_ref.lock().expect("session lock") = Some(session_id.clone());
+            }
             let now = Utc::now();
+            if segment_turn != event.turn_id {
+                segment_turn = event.turn_id.clone();
+                agent_segment = 0;
+                segment_has_text = false;
+            }
+            if matches!(
+                &event.event,
+                StructuredCliEventKind::ToolUse { .. }
+                    | StructuredCliEventKind::ToolResult { .. }
+                    | StructuredCliEventKind::PermissionRequest { .. }
+            ) && segment_has_text
+            {
+                agent_segment += 1;
+                segment_has_text = false;
+            }
             let mutation = match event.event {
                 StructuredCliEventKind::Init { .. } => None,
                 StructuredCliEventKind::Text { text, delta } => Some(if delta {
+                    segment_has_text = true;
                     ProjectionMutation::AppendItem {
-                        provider_item_id: format!("{}-agent", event.turn_id),
+                        provider_item_id: format!("{}-agent-{agent_segment}", event.turn_id),
                         item_kind: integrator_core::ItemKind::AgentMessage,
                         field: integrator_runtime::ItemTextField::Body,
                         delta: integrator_runtime::redact_and_bound(&text, 2 * 1024 * 1024).0,
@@ -2647,16 +3714,17 @@ pub(crate) fn spawn_structured_cli_pump(
                     ProjectionMutation::ReplaceItem(structured_item(
                         &thread_id,
                         &event.turn_id,
-                        "agent",
+                        &format!("{}-agent-{agent_segment}", event.turn_id),
                         integrator_core::ItemKind::AgentMessage,
                         None,
                         Some(text),
+                        None,
                         None,
                         integrator_core::ItemStatus::Completed,
                         now,
                     ))
                 }),
-                StructuredCliEventKind::ToolUse { id, name, input: _ } => {
+                StructuredCliEventKind::ToolUse { id, name, input } => {
                     Some(ProjectionMutation::ReplaceItem(structured_item(
                         &thread_id,
                         &event.turn_id,
@@ -2665,6 +3733,7 @@ pub(crate) fn spawn_structured_cli_pump(
                         Some(name),
                         None,
                         None,
+                        structured_json_detail(&input),
                         integrator_core::ItemStatus::InProgress,
                         now,
                     )))
@@ -2672,14 +3741,15 @@ pub(crate) fn spawn_structured_cli_pump(
                 StructuredCliEventKind::ToolResult {
                     id,
                     is_error,
-                    content: _,
-                } => Some(ProjectionMutation::ReplaceItem(structured_item(
+                    content,
+                } => Some(ProjectionMutation::MergeItem(structured_item(
                     &thread_id,
                     &event.turn_id,
                     &id,
                     integrator_core::ItemKind::McpTool,
-                    Some("Tool result".into()),
                     None,
+                    None,
+                    Some(content),
                     None,
                     if is_error {
                         integrator_core::ItemStatus::Failed
@@ -2740,6 +3810,27 @@ pub(crate) fn spawn_structured_cli_pump(
                         tool_name.as_str(),
                         "Edit" | "Write" | "MultiEdit" | "NotebookEdit"
                     );
+                    // ExitPlanMode is Claude's plan-approval gate: the tool
+                    // input carries the finished plan, and allowing the tool
+                    // exits plan mode so implementation can start.
+                    let plan_review = tool_name == "ExitPlanMode";
+                    let plan_markdown = plan_review
+                        .then(|| input.get("plan").and_then(Value::as_str))
+                        .flatten()
+                        .map(|text| integrator_runtime::redact_and_bound(text, 256 * 1024).0);
+                    // The CLI sends no suggestions with ExitPlanMode; synthesize
+                    // the session-scoped acceptEdits switch so "allow for
+                    // session" approves the plan and auto-accepts the edits
+                    // that implement it.
+                    let suggestions = if plan_review
+                        && !suggestions.as_array().is_some_and(|list| !list.is_empty())
+                    {
+                        serde_json::json!([
+                            { "type": "setMode", "mode": "acceptEdits", "destination": "session" }
+                        ])
+                    } else {
+                        suggestions
+                    };
                     runtime
                         .permission_requests
                         .lock()
@@ -2750,27 +3841,36 @@ pub(crate) fn spawn_structured_cli_pump(
                         );
                     Some(ProjectionMutation::ApprovalRequested {
                         request_id: integrator_core::TransportRequestId::String(request_id),
-                        approval_kind: if file_tool {
-                            integrator_core::ApprovalKind::FileChange
+                        approval_kind: if plan_review {
+                            ApprovalKind::PlanReview
+                        } else if file_tool {
+                            ApprovalKind::FileChange
                         } else {
-                            integrator_core::ApprovalKind::CommandExecution
+                            ApprovalKind::CommandExecution
                         },
                         item_id: tool_use_id,
                         approval_id: None,
-                        reason: Some(
+                        reason: Some(if plan_review {
+                            "The agent finished planning and wants to start implementing.".into()
+                        } else {
                             description
                                 .filter(|text| !text.is_empty())
-                                .unwrap_or_else(|| format!("Use the {tool_name} tool")),
-                        ),
+                                .unwrap_or_else(|| format!("Use the {tool_name} tool"))
+                        }),
                         command,
                         cwd: None,
+                        plan_markdown,
                     })
+                }
+                StructuredCliEventKind::PermissionModeChanged { mode } => {
+                    Some(ProjectionMutation::Mode(claude_mode_projection(&mode)))
                 }
                 StructuredCliEventKind::Diagnostic { message } => {
                     *runtime.last_diagnostic.lock().expect("diagnostic lock") = Some(message);
                     None
                 }
                 StructuredCliEventKind::Exited { code, cancelled } => {
+                    runtime.alive.store(false, Ordering::Release);
                     let diagnostic = runtime
                         .last_diagnostic
                         .lock()
@@ -2817,7 +3917,53 @@ pub(crate) fn spawn_structured_cli_pump(
                 );
             }
         }
+        runtime.alive.store(false, Ordering::Release);
     });
+}
+
+/// Claude's permission modes as a canonical mode projection. The vocabulary
+/// is fixed by the CLI (`--permission-mode`), so unlike ACP agents the
+/// available list is synthesized rather than advertised. The CLI reports the
+/// launch flag's `manual` back as `default`; both map to the same mode.
+pub(crate) fn claude_mode_projection(current: &str) -> ModeProjection {
+    let current = if current == "manual" {
+        "default"
+    } else {
+        current
+    };
+    let mut available = vec![
+        ModeOption {
+            id: "plan".into(),
+            name: "Plan".into(),
+            description: Some("Read-only planning; implementation waits for plan approval".into()),
+        },
+        ModeOption {
+            id: "default".into(),
+            name: "Ask".into(),
+            description: Some("Prompt for approval before edits and commands".into()),
+        },
+        ModeOption {
+            id: "acceptEdits".into(),
+            name: "Accept edits".into(),
+            description: Some("Auto-accept file edits; still ask for commands".into()),
+        },
+        ModeOption {
+            id: "bypassPermissions".into(),
+            name: "Bypass permissions".into(),
+            description: Some("Run without permission prompts".into()),
+        },
+    ];
+    if !available.iter().any(|mode| mode.id == current) {
+        available.push(ModeOption {
+            id: current.into(),
+            name: current.into(),
+            description: None,
+        });
+    }
+    ModeProjection {
+        current_mode_id: current.into(),
+        available_modes: available,
+    }
 }
 
 /// Maps a structured CLI turn's usage onto an accumulating projection delta.
@@ -2863,6 +4009,7 @@ fn structured_item(
     title: Option<String>,
     body: Option<String>,
     output: Option<String>,
+    tool_input: Option<String>,
     status: integrator_core::ItemStatus,
     updated_at: DateTime<Utc>,
 ) -> integrator_core::ItemProjection {
@@ -2873,6 +4020,7 @@ fn structured_item(
         status,
         title: title.map(|value| integrator_runtime::redact_and_bound(&value, 64 * 1024).0),
         body: body.map(|value| integrator_runtime::redact_and_bound(&value, 2 * 1024 * 1024).0),
+        native_skill: None,
         command: None,
         cwd: None,
         output: output.map(|value| integrator_runtime::redact_and_bound(&value, 2 * 1024 * 1024).0),
@@ -2880,10 +4028,23 @@ fn structured_item(
         file_changes: None,
         mcp_server: None,
         mcp_tool: None,
-        tool_input: None,
+        tool_input: tool_input
+            .map(|value| integrator_runtime::redact_and_bound(&value, 256 * 1024).0),
         truncated: false,
         updated_at,
     }
+}
+
+fn structured_json_detail(value: &Value) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    let text = serde_json::to_string_pretty(value).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(integrator_runtime::redact_and_bound(trimmed, 256 * 1024).0)
 }
 
 /// Forwards ACP agent events through the ACP reducer into SQLite and the
@@ -2920,8 +4081,15 @@ fn spawn_acp_pump(app: AppHandle<tauri::Wry>, store: Arc<LocalStore>, runtime: A
                     if method != "session/update" {
                         continue;
                     }
-                    let (Some(binding), Some(turn_id)) = (binding.as_ref(), turn_id.as_deref())
-                    else {
+                    if let Some(actions) = params.get("update").and_then(parse_acp_actions) {
+                        *runtime.available_actions.lock().expect("action lock") = actions;
+                        let _ = app.emit(
+                            "provider://native-actions-changed",
+                            serde_json::json!({ "provider": runtime.provider.as_str() }),
+                        );
+                        continue;
+                    }
+                    let Some(binding) = binding.as_ref() else {
                         continue;
                     };
                     let Some(session_id) = binding.thread_id.as_deref() else {
@@ -2931,6 +4099,32 @@ fn spawn_acp_pump(app: AppHandle<tauri::Wry>, store: Arc<LocalStore>, runtime: A
                         continue;
                     }
                     let Some(update) = params.get("update") else {
+                        continue;
+                    };
+                    // Mode changes are session metadata and can land between
+                    // turns (e.g. a set_mode echo), so they are handled before
+                    // the in-flight-turn guard below.
+                    if update.get("sessionUpdate").and_then(Value::as_str)
+                        == Some("current_mode_update")
+                    {
+                        let Some(current) = update.get("currentModeId").and_then(Value::as_str)
+                        else {
+                            continue;
+                        };
+                        let mode = {
+                            let mut modes = runtime.session_modes.lock().expect("modes lock");
+                            let Some(state) = modes.as_mut() else {
+                                continue;
+                            };
+                            state.current_mode_id = current.to_owned();
+                            state.clone()
+                        };
+                        let event =
+                            acp_mode_event(session_id, turn_id.as_deref(), mode, Utc::now());
+                        apply_and_emit(&app, &store, binding, &event);
+                        continue;
+                    }
+                    let Some(turn_id) = turn_id.as_deref() else {
                         continue;
                     };
                     if segment_turn.as_deref() != Some(turn_id) {
@@ -2953,6 +4147,41 @@ fn spawn_acp_pump(app: AppHandle<tauri::Wry>, store: Arc<LocalStore>, runtime: A
                     }
                 }
                 adapter_acp::AcpEvent::ServerRequest { id, method, params } => {
+                    // Cursor's plan-review extension: the agent blocks until
+                    // the client accepts or rejects the finished plan. It is
+                    // surfaced as a plan-review approval; the response shape
+                    // is resolved in `codex_respond_approval`.
+                    if method == "cursor/create_plan" {
+                        let (Some(binding), Some(turn_id)) = (binding.as_ref(), turn_id.as_deref())
+                        else {
+                            let _ = runtime
+                                .client
+                                .respond_to_server_request(
+                                    &id,
+                                    serde_json::json!({ "result": { "success": {} } }),
+                                )
+                                .await;
+                            continue;
+                        };
+                        let Some(session_id) = binding.thread_id.as_deref() else {
+                            continue;
+                        };
+                        let request_id = acp_transport_id(&id);
+                        runtime
+                            .plan_requests
+                            .lock()
+                            .expect("plan lock")
+                            .insert(transport_key(&request_id));
+                        let reduced = reduce_acp_plan_review_request(
+                            session_id,
+                            turn_id,
+                            request_id,
+                            &params,
+                            Utc::now(),
+                        );
+                        apply_and_emit(&app, &store, binding, &reduced);
+                        continue;
+                    }
                     if method != "session/request_permission" {
                         // Unsupported client capability; refuse politely.
                         let _ = runtime
@@ -3033,6 +4262,7 @@ fn spawn_acp_pump(app: AppHandle<tauri::Wry>, store: Arc<LocalStore>, runtime: A
                 }
             }
         }
+        runtime.alive.store(false, Ordering::Release);
     });
 }
 
@@ -3123,6 +4353,20 @@ fn structured_permission_response(
     }
 }
 
+/// Build the response for a Cursor `cursor/create_plan` extension request.
+/// Success tells the agent the plan was accepted; the error result carries
+/// the rejection back so the agent keeps planning instead of building.
+fn acp_plan_review_result(decision: ApprovalDecision) -> Value {
+    match decision {
+        ApprovalDecision::Accept | ApprovalDecision::AcceptForSession => {
+            serde_json::json!({ "result": { "success": {} } })
+        }
+        ApprovalDecision::Decline | ApprovalDecision::Cancel => serde_json::json!({
+            "result": { "error": { "error": "The user rejected this plan. Stay in plan mode and revise it based on their feedback." } }
+        }),
+    }
+}
+
 /// Map the UI approval decision onto the option set the ACP agent advertised
 /// for this request. Options live only as long as the agent process.
 fn acp_permission_outcome(
@@ -3166,27 +4410,93 @@ fn acp_permission_outcome(
     }
 }
 
-async fn acp_runtime(state: &State<'_, AppState>) -> CommandResult<AcpRuntime> {
-    state.acp.lock().await.clone().ok_or_else(|| CommandError {
-        code: "provider-disconnected",
-        message: "Cursor is not connected".into(),
-    })
+async fn acp_runtime(
+    state: &State<'_, AppState>,
+    task_id: Option<TaskId>,
+    provider: Option<ProviderKind>,
+) -> CommandResult<AcpRuntime> {
+    let runtime = if let Some(task_id) = task_id {
+        state.acp.lock().await.get(&task_id).cloned()
+    } else if let Some(provider) = provider.as_ref() {
+        state.acp_catalog.lock().await.get(provider).cloned()
+    } else {
+        None
+    };
+    runtime
+        .filter(|runtime| runtime.alive.load(Ordering::Acquire))
+        .ok_or_else(|| CommandError {
+            code: "provider-disconnected",
+            message: provider
+                .map(|provider| format!("{} is not connected", provider.as_str()))
+                .unwrap_or_else(|| "ACP session is not connected for this task".into()),
+        })
 }
 
-async fn codex_runtime(state: &State<'_, AppState>) -> CommandResult<CodexRuntime> {
+async fn codex_runtime(
+    state: &State<'_, AppState>,
+    task_id: Option<TaskId>,
+) -> CommandResult<CodexRuntime> {
+    let runtime = if let Some(task_id) = task_id {
+        state.codex.lock().await.get(&task_id).cloned()
+    } else {
+        state.codex_catalog.lock().await.clone()
+    };
+    runtime
+        .filter(|runtime| runtime.alive.load(Ordering::Acquire))
+        .ok_or_else(|| CommandError {
+            code: "provider-disconnected",
+            message: "Codex is not connected for this task".into(),
+        })
+}
+
+async fn codex_runtime_for_thread(
+    state: &State<'_, AppState>,
+    thread_id: &str,
+) -> CommandResult<CodexRuntime> {
     state
         .codex
         .lock()
         .await
-        .clone()
+        .values()
+        .find(|runtime| {
+            runtime.alive.load(Ordering::Acquire)
+                && runtime
+                    .binding
+                    .lock()
+                    .expect("binding lock")
+                    .as_ref()
+                    .and_then(|binding| binding.thread_id.as_deref())
+                    == Some(thread_id)
+        })
+        .cloned()
         .ok_or_else(|| CommandError {
             code: "provider-disconnected",
-            message: "Codex is not connected".into(),
+            message: "Codex thread is not connected".into(),
         })
 }
 
-async fn codex_client(state: &State<'_, AppState>) -> CommandResult<adapter_codex::CodexClient> {
-    Ok(codex_runtime(state).await?.client)
+async fn codex_runtime_for_process(
+    state: &State<'_, AppState>,
+    process_id: &str,
+) -> CommandResult<CodexRuntime> {
+    state
+        .codex
+        .lock()
+        .await
+        .values()
+        .find(|runtime| runtime.alive.load(Ordering::Acquire) && runtime.process_id == process_id)
+        .cloned()
+        .ok_or_else(|| CommandError {
+            code: "stale-approval",
+            message: "approval belongs to an expired provider process".into(),
+        })
+}
+
+async fn codex_client(
+    state: &State<'_, AppState>,
+    task_id: Option<TaskId>,
+) -> CommandResult<adapter_codex::CodexClient> {
+    Ok(codex_runtime(state, task_id).await?.client)
 }
 
 fn reconcile_turn_response(
@@ -3203,6 +4513,7 @@ fn reconcile_turn_response(
     pump_provider_event(
         app,
         store,
+        runtime,
         binding.as_ref(),
         "turn/started".into(),
         serde_json::json!({ "threadId": thread_id, "turn": turn }),
@@ -3238,6 +4549,7 @@ fn reconcile_thread_response(
         pump_provider_event(
             app,
             store,
+            runtime,
             binding.as_ref(),
             method.into(),
             serde_json::json!({ "threadId": thread_id, "turn": turn }),
@@ -3252,6 +4564,7 @@ fn reconcile_thread_response(
             pump_provider_event(
                 app,
                 store,
+                runtime,
                 binding.as_ref(),
                 "item/completed".into(),
                 serde_json::json!({
@@ -3281,9 +4594,11 @@ async fn authorized_git(
     let git = state.git.clone().ok_or_else(git_unavailable)?;
     let authorization_git = git.clone();
     let store = Arc::clone(&state.store);
+    let authorizations = Arc::clone(&state.git_authorizations);
     let identity = tauri::async_runtime::spawn_blocking(move || {
+        let mut authorizations = authorizations.lock().expect("git authorization cache lock");
         let projects = store.list_trusted_projects()?;
-        authorize_repository(&authorization_git, &projects, &repository)
+        authorizations.authorize(&authorization_git, &projects, &repository)
     })
     .await
     .map_err(|_| worker_error())?
@@ -3385,6 +4700,349 @@ fn read_project_file(
     })
 }
 
+/// Renames a file in place inside an explicitly trusted repository. The new
+/// name must be a plain file name (no separators), and neither the source nor
+/// the resulting name may be a protected sensitive file.
+fn rename_project_file(
+    root: &Path,
+    requested_path: &str,
+    new_name: &str,
+) -> integrator_core::Result<ProjectFileEntry> {
+    let relative = validate_project_relative_path(requested_path)?;
+    if is_sensitive_project_file(&relative) {
+        return Err(IntegratorError::Unauthorized(
+            "sensitive project files cannot be renamed".into(),
+        ));
+    }
+    let trimmed = new_name.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.contains(['/', '\\', '\0'])
+    {
+        return Err(IntegratorError::InvalidInput(
+            "the new name must be a plain file name without path separators".into(),
+        ));
+    }
+    let source = root.join(&relative);
+    let canonical = dunce::canonicalize(&source).map_err(io_error)?;
+    if !canonical.starts_with(root) {
+        return Err(IntegratorError::Unauthorized(
+            "file is outside the trusted repository".into(),
+        ));
+    }
+    if !fs::metadata(&canonical).map_err(io_error)?.is_file() {
+        return Err(IntegratorError::InvalidInput(
+            "requested path is not a file".into(),
+        ));
+    }
+    let target_relative = match relative.parent() {
+        Some(parent) if parent != Path::new("") => parent.join(trimmed),
+        _ => PathBuf::from(trimmed),
+    };
+    if is_sensitive_project_file(&target_relative) {
+        return Err(IntegratorError::Unauthorized(
+            "files cannot be renamed to protected sensitive names".into(),
+        ));
+    }
+    let target = root.join(&target_relative);
+    if target.exists() {
+        return Err(IntegratorError::InvalidInput(
+            "a file with that name already exists in this folder".into(),
+        ));
+    }
+    fs::rename(&canonical, &target).map_err(io_error)?;
+    let size = fs::metadata(&target).map_err(io_error)?.len();
+    Ok(ProjectFileEntry {
+        path: normalized_relative_path(&target_relative),
+        size,
+    })
+}
+
+fn discover_project_file_openers() -> Vec<ProjectFileOpener> {
+    let mut openers = [
+        (
+            "cursor",
+            "Cursor",
+            "Open this file in the installed Cursor editor",
+        ),
+        (
+            "codex",
+            "Codex (workspace)",
+            "Open this repository in the Codex desktop app",
+        ),
+        (
+            "vscode",
+            "Visual Studio Code",
+            "Open this file in the installed Visual Studio Code editor",
+        ),
+        (
+            "windsurf",
+            "Windsurf",
+            "Open this file in the installed Windsurf editor",
+        ),
+        ("zed", "Zed", "Open this file in the installed Zed editor"),
+    ]
+    .into_iter()
+    .filter(|(id, _, _)| project_file_opener_executable(id).is_some())
+    .map(|(id, label, description)| ProjectFileOpener {
+        id: id.into(),
+        label: label.into(),
+        description: description.into(),
+    })
+    .collect::<Vec<_>>();
+    openers.push(ProjectFileOpener {
+        id: "system".into(),
+        label: "System default".into(),
+        description: "Open this file with its operating-system default app".into(),
+    });
+    openers
+}
+
+fn open_project_file_external(
+    root: &Path,
+    requested_path: &str,
+    opener_id: &str,
+) -> CommandResult<()> {
+    let file = resolve_existing_project_file(root, requested_path).map_err(CommandError::from)?;
+    if opener_id == "system" {
+        return open_with_system_default(&file);
+    }
+    let executable = project_file_opener_executable(opener_id).ok_or_else(|| CommandError {
+        code: "file-opener-unavailable",
+        message: "that file opener is no longer available on this computer".into(),
+    })?;
+    let mut command = Command::new(executable);
+    match opener_id {
+        "cursor" | "vscode" | "windsurf" | "zed" => {
+            command.arg(&file);
+        }
+        "codex" => {
+            // Codex Desktop currently accepts a workspace path, not a file
+            // path. The menu describes that distinction instead of implying a
+            // line-level editor handoff.
+            command.arg("app").arg(root);
+        }
+        _ => {
+            return Err(CommandError {
+                code: "invalid-input",
+                message: "unknown file opener".into(),
+            });
+        }
+    }
+    spawn_quiet(command, "could not open the selected file")
+}
+
+fn reveal_project_file(root: &Path, requested_path: &str) -> CommandResult<()> {
+    let (path, select_file) =
+        resolve_project_file_reveal_target(root, requested_path).map_err(CommandError::from)?;
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = Command::new("explorer.exe");
+        if select_file {
+            command.arg(format!("/select,{}", path.display()));
+        } else {
+            command.arg(path);
+        }
+        return spawn_quiet(command, "could not show the file in File Explorer");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = Command::new("open");
+        if select_file {
+            command.arg("-R");
+        }
+        command.arg(path);
+        return spawn_quiet(command, "could not reveal the file in Finder");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let target = if select_file {
+            path.parent().unwrap_or(root).to_path_buf()
+        } else {
+            path
+        };
+        let mut command = Command::new("xdg-open");
+        command.arg(target);
+        return spawn_quiet(
+            command,
+            "could not show the file in the system file manager",
+        );
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (path, select_file);
+        Err(CommandError {
+            code: "file-reveal-unavailable",
+            message: "revealing files is not supported on this platform".into(),
+        })
+    }
+}
+
+fn resolve_existing_project_file(
+    root: &Path,
+    requested_path: &str,
+) -> integrator_core::Result<PathBuf> {
+    let relative = validate_project_relative_path(requested_path)?;
+    let canonical_root = dunce::canonicalize(root).map_err(io_error)?;
+    let canonical = dunce::canonicalize(canonical_root.join(relative)).map_err(io_error)?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(IntegratorError::Unauthorized(
+            "file is outside the trusted repository".into(),
+        ));
+    }
+    if !fs::metadata(&canonical).map_err(io_error)?.is_file() {
+        return Err(IntegratorError::InvalidInput(
+            "requested path is not a file".into(),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn resolve_project_file_reveal_target(
+    root: &Path,
+    requested_path: &str,
+) -> integrator_core::Result<(PathBuf, bool)> {
+    let relative = validate_project_relative_path(requested_path)?;
+    let canonical_root = dunce::canonicalize(root).map_err(io_error)?;
+    let candidate = canonical_root.join(&relative);
+    if candidate.exists() {
+        let canonical = dunce::canonicalize(&candidate).map_err(io_error)?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err(IntegratorError::Unauthorized(
+                "file is outside the trusted repository".into(),
+            ));
+        }
+        return Ok((canonical.clone(), canonical.is_file()));
+    }
+
+    // Deleted or renamed Git entries still get a useful action: reveal the
+    // closest directory that still exists, never a path outside the root.
+    let mut parent = relative
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_path_buf();
+    while !canonical_root.join(&parent).exists() && parent.pop() {}
+    let canonical = dunce::canonicalize(canonical_root.join(parent)).map_err(io_error)?;
+    if !canonical.starts_with(&canonical_root) || !canonical.is_dir() {
+        return Err(IntegratorError::Unauthorized(
+            "file location is outside the trusted repository".into(),
+        ));
+    }
+    Ok((canonical, false))
+}
+
+fn open_with_system_default(file: &Path) -> CommandResult<()> {
+    #[cfg(target_os = "windows")]
+    let mut command = Command::new("explorer.exe");
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    #[cfg(target_os = "linux")]
+    let mut command = Command::new("xdg-open");
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    return Err(CommandError {
+        code: "file-open-unavailable",
+        message: "opening files is not supported on this platform".into(),
+    });
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    {
+        command.arg(file);
+        spawn_quiet(command, "could not open the selected file")
+    }
+}
+
+fn spawn_quiet(mut command: Command, failure_message: &'static str) -> CommandResult<()> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(target_os = "windows")]
+    command.creation_flags(0x0800_0000);
+    command.spawn().map(|_| ()).map_err(|error| CommandError {
+        code: "external-open-failed",
+        message: format!("{failure_message}: {error}"),
+    })
+}
+
+fn project_file_opener_executable(id: &str) -> Option<PathBuf> {
+    let (command, windows_relative, macos_bundle) = match id {
+        "cursor" => (
+            "cursor",
+            Some(Path::new("Programs/Cursor/Cursor.exe")),
+            Some(Path::new("/Applications/Cursor.app/Contents/MacOS/Cursor")),
+        ),
+        "codex" => ("codex", None, None),
+        "vscode" => (
+            "code",
+            Some(Path::new("Programs/Microsoft VS Code/Code.exe")),
+            Some(Path::new(
+                "/Applications/Visual Studio Code.app/Contents/MacOS/Electron",
+            )),
+        ),
+        "windsurf" => (
+            "windsurf",
+            Some(Path::new("Programs/Windsurf/Windsurf.exe")),
+            Some(Path::new(
+                "/Applications/Windsurf.app/Contents/MacOS/Windsurf",
+            )),
+        ),
+        "zed" => (
+            "zed",
+            Some(Path::new("Programs/Zed/Zed.exe")),
+            Some(Path::new("/Applications/Zed.app/Contents/MacOS/zed")),
+        ),
+        _ => return None,
+    };
+
+    #[cfg(target_os = "windows")]
+    if let Some(relative) = windows_relative {
+        if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+            let candidate = PathBuf::from(base).join(relative);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        let system_relative = relative.strip_prefix("Programs").unwrap_or(relative);
+        for base in [
+            std::env::var_os("ProgramFiles"),
+            std::env::var_os("ProgramFiles(x86)"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let candidate = PathBuf::from(base).join(system_relative);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(bundle) = macos_bundle {
+        if bundle.is_file() {
+            return Some(bundle.to_path_buf());
+        }
+    }
+    let _ = (windows_relative, macos_bundle);
+    native_executable_on_path(command)
+}
+
+fn native_executable_on_path(command: &str) -> Option<PathBuf> {
+    let mut matches = which::which_all(command).ok()?;
+    #[cfg(target_os = "windows")]
+    {
+        matches.find(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        matches.next()
+    }
+}
+
 fn validate_project_relative_path(value: &str) -> integrator_core::Result<PathBuf> {
     let path = Path::new(value);
     if value.trim().is_empty()
@@ -3464,6 +5122,120 @@ fn worker_error() -> CommandError {
 mod tests {
     use super::*;
 
+    fn codex_user_item(provider_item_id: &str, body: &str) -> integrator_core::ItemProjection {
+        integrator_core::ItemProjection {
+            id: format!("codex:{provider_item_id}"),
+            provider_item_id: provider_item_id.into(),
+            kind: integrator_core::ItemKind::UserMessage,
+            status: integrator_core::ItemStatus::Completed,
+            title: None,
+            body: Some(body.into()),
+            native_skill: None,
+            command: None,
+            cwd: None,
+            output: None,
+            exit_code: None,
+            file_changes: None,
+            mcp_server: None,
+            mcp_tool: None,
+            tool_input: None,
+            truncated: false,
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn codex_native_skill_annotation_restores_visible_text_and_tracks_the_provider_item() {
+        let mut pending = Some(PendingNativeSkill {
+            name: "skill-creator".into(),
+            wire_prompt: "$skill-creator build one".into(),
+            visible_prompt: "/skill-creator build one".into(),
+            provider_item_id: None,
+        });
+        let occurred_at = Utc::now();
+        let mut reduced = ReducedProviderEvent {
+            method: "item/completed".into(),
+            thread_id: "thread-1".into(),
+            turn_id: Some("turn-1".into()),
+            audit_json: "{}".into(),
+            audit_truncated: false,
+            mutation: ProjectionMutation::ReplaceItem(codex_user_item(
+                "user-1",
+                "$skill-creator build one",
+            )),
+            occurred_at,
+        };
+
+        annotate_pending_native_skill(&mut pending, &mut reduced);
+
+        let ProjectionMutation::ReplaceItem(item) = &reduced.mutation else {
+            panic!("expected replaced user item");
+        };
+        assert_eq!(item.body.as_deref(), Some("/skill-creator build one"));
+        assert_eq!(item.native_skill.as_deref(), Some("skill-creator"));
+        assert_eq!(
+            pending
+                .as_ref()
+                .and_then(|value| value.provider_item_id.as_deref()),
+            Some("user-1")
+        );
+
+        let mut update = ReducedProviderEvent {
+            method: "item/updated".into(),
+            thread_id: "thread-1".into(),
+            turn_id: Some("turn-1".into()),
+            audit_json: "{}".into(),
+            audit_truncated: false,
+            mutation: ProjectionMutation::MergeItem(codex_user_item("user-1", "normalized")),
+            occurred_at,
+        };
+        annotate_pending_native_skill(&mut pending, &mut update);
+        let ProjectionMutation::MergeItem(item) = &update.mutation else {
+            panic!("expected merged user item");
+        };
+        assert_eq!(item.body.as_deref(), Some("/skill-creator build one"));
+        assert_eq!(item.native_skill.as_deref(), Some("skill-creator"));
+    }
+
+    #[test]
+    fn codex_native_skill_annotation_ignores_unrelated_user_text() {
+        let mut pending = Some(PendingNativeSkill {
+            name: "skill-creator".into(),
+            wire_prompt: "$skill-creator build one".into(),
+            visible_prompt: "/skill-creator build one".into(),
+            provider_item_id: None,
+        });
+        let mut reduced = ReducedProviderEvent {
+            method: "item/completed".into(),
+            thread_id: "thread-1".into(),
+            turn_id: Some("turn-1".into()),
+            audit_json: "{}".into(),
+            audit_truncated: false,
+            mutation: ProjectionMutation::ReplaceItem(codex_user_item(
+                "user-other",
+                "/unknown-command leave this plain",
+            )),
+            occurred_at: Utc::now(),
+        };
+
+        annotate_pending_native_skill(&mut pending, &mut reduced);
+
+        let ProjectionMutation::ReplaceItem(item) = &reduced.mutation else {
+            panic!("expected replaced user item");
+        };
+        assert_eq!(
+            item.body.as_deref(),
+            Some("/unknown-command leave this plain")
+        );
+        assert_eq!(item.native_skill, None);
+        assert_eq!(
+            pending
+                .as_ref()
+                .and_then(|value| value.provider_item_id.as_deref()),
+            None
+        );
+    }
+
     #[test]
     fn thread_id_is_extracted_from_supported_shapes() {
         assert_eq!(
@@ -3482,8 +5254,96 @@ mod tests {
             acp_launch_arguments(&ProviderKind::Cursor).expect("Cursor ACP route"),
             vec!["acp"]
         );
+        assert_eq!(
+            acp_launch_arguments(&ProviderKind::Grok).expect("Grok ACP route"),
+            vec!["--no-auto-update", "agent", "stdio"]
+        );
         assert!(acp_launch_arguments(&ProviderKind::Antigravity).is_err());
         assert!(acp_launch_arguments(&ProviderKind::Claude).is_err());
+    }
+
+    #[test]
+    fn grok_auth_selects_only_the_vendor_owned_cached_token_method() {
+        assert!(acp_has_auth_method(
+            &serde_json::json!({ "authMethods": [{ "id": "cached_token" }, { "id": "xai.api_key" }] }),
+            "cached_token"
+        ));
+        assert!(!acp_has_auth_method(
+            &serde_json::json!({ "authMethods": [{ "id": "xai.api_key" }] }),
+            "cached_token"
+        ));
+    }
+
+    #[test]
+    fn native_slash_selection_must_still_match_the_leading_draft_token() {
+        assert_eq!(
+            native_slash_prompt("/skill-name do work", "skill-name").expect("matching action"),
+            " do work"
+        );
+        assert!(native_slash_prompt("prefix /skill-name", "skill-name").is_err());
+        assert!(native_slash_prompt("/skill-name-forged", "skill-name").is_err());
+    }
+
+    #[test]
+    fn unchanged_native_actions_keep_their_opaque_handle_across_catalog_refreshes() {
+        let repository = PathBuf::from(r"H:\Code\integrator-3");
+        let skill_path = repository.join(".codex").join("skills").join("openai-docs");
+        let action = ResolvedNativeAction {
+            public: NativeProviderAction {
+                id: String::new(),
+                name: "openai-docs".into(),
+                description: "Use current OpenAI docs".into(),
+                source: "bundled".into(),
+                kind: NativeActionKind::Skill,
+                invocation: NativeActionInvocation::Direct,
+                input_hint: None,
+            },
+            provider_path: Some(skill_path.clone()),
+        };
+        let mut handles = std::collections::HashMap::new();
+
+        let first = reconcile_native_action_handles(
+            &mut handles,
+            ProviderKind::Codex,
+            repository.clone(),
+            vec![action.clone()],
+        );
+        let first_id = first[0].id.clone();
+
+        let mut refreshed = action.clone();
+        refreshed.public.description = "Updated display copy".into();
+        let second = reconcile_native_action_handles(
+            &mut handles,
+            ProviderKind::Codex,
+            repository.clone(),
+            vec![refreshed],
+        );
+        assert_eq!(second[0].id, first_id);
+        assert_eq!(handles.len(), 1);
+
+        let mut moved = action;
+        moved.provider_path = Some(skill_path.join("moved"));
+        let third = reconcile_native_action_handles(
+            &mut handles,
+            ProviderKind::Codex,
+            repository,
+            vec![moved],
+        );
+        assert_ne!(third[0].id, first_id);
+        assert!(!handles.contains_key(&first_id));
+    }
+
+    #[test]
+    fn codex_goal_is_a_pathless_direct_command() {
+        let goal = codex_goal_action();
+        assert_eq!(goal.public.name, "goal");
+        assert_eq!(goal.public.kind, NativeActionKind::Command);
+        assert_eq!(goal.public.invocation, NativeActionInvocation::Direct);
+        assert_eq!(
+            goal.public.input_hint.as_deref(),
+            Some("completion condition")
+        );
+        assert!(goal.provider_path.is_none());
     }
 
     #[test]
@@ -3497,6 +5357,35 @@ mod tests {
             StructuredCliProvider::Antigravity
         );
         assert!(structured_provider(&ProviderKind::Cursor).is_err());
+    }
+
+    #[test]
+    fn claude_modes_normalize_manual_and_keep_unknown_ids_selectable() {
+        let mode = claude_mode_projection("manual");
+        assert_eq!(mode.current_mode_id, "default");
+        assert!(mode.available_modes.iter().any(|m| m.id == "plan"));
+
+        let mode = claude_mode_projection("acceptEdits");
+        assert_eq!(mode.current_mode_id, "acceptEdits");
+
+        // A mode id this build does not know about must still render as the
+        // current selection instead of leaving the picker inconsistent.
+        let mode = claude_mode_projection("dontAsk");
+        assert_eq!(mode.current_mode_id, "dontAsk");
+        assert!(mode.available_modes.iter().any(|m| m.id == "dontAsk"));
+    }
+
+    #[test]
+    fn plan_review_decisions_map_to_cursor_create_plan_results() {
+        let accepted = acp_plan_review_result(ApprovalDecision::Accept);
+        assert!(accepted.pointer("/result/success").is_some());
+        let declined = acp_plan_review_result(ApprovalDecision::Decline);
+        assert!(
+            declined
+                .pointer("/result/error/error")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("rejected"))
+        );
     }
 
     #[test]
@@ -3544,5 +5433,58 @@ mod tests {
         assert!(!content.is_binary);
 
         fs::remove_dir_all(&root).expect("clean up project directory");
+    }
+
+    #[test]
+    fn external_file_paths_stay_project_relative() {
+        let root = std::env::temp_dir().join(format!("file-actions-{}", uuid::Uuid::new_v4()));
+        let nested = root.join("src");
+        fs::create_dir_all(&nested).expect("create file action fixture");
+        fs::write(nested.join("main.rs"), "fn main() {}\n").expect("write file action fixture");
+
+        let resolved =
+            resolve_existing_project_file(&root, "src/main.rs").expect("resolve nested file");
+        assert_eq!(
+            resolved,
+            dunce::canonicalize(nested.join("main.rs")).expect("canonical fixture file")
+        );
+        assert!(resolve_existing_project_file(&root, "../outside.txt").is_err());
+        assert!(
+            resolve_existing_project_file(&root, &root.join("src/main.rs").display().to_string())
+                .is_err()
+        );
+
+        fs::remove_dir_all(&root).expect("clean up file action fixture");
+    }
+
+    #[test]
+    fn external_file_opener_inventory_is_closed_and_keeps_system_fallback() {
+        let openers = discover_project_file_openers();
+        assert_eq!(
+            openers.last().map(|opener| opener.id.as_str()),
+            Some("system")
+        );
+        assert!(openers.iter().all(|opener| matches!(
+            opener.id.as_str(),
+            "cursor" | "codex" | "vscode" | "windsurf" | "zed" | "system"
+        )));
+    }
+
+    #[test]
+    fn reveal_deleted_project_file_stays_inside_the_repository() {
+        let root = std::env::temp_dir().join(format!("file-reveal-{}", uuid::Uuid::new_v4()));
+        let nested = root.join("src");
+        fs::create_dir_all(&nested).expect("create reveal fixture");
+
+        let (target, select_file) = resolve_project_file_reveal_target(&root, "src/deleted.rs")
+            .expect("resolve deleted file's parent");
+        assert_eq!(
+            target,
+            dunce::canonicalize(&nested).expect("canonical fixture directory")
+        );
+        assert!(!select_file);
+        assert!(resolve_project_file_reveal_target(&root, "../../outside.rs").is_err());
+
+        fs::remove_dir_all(&root).expect("clean up reveal fixture");
     }
 }

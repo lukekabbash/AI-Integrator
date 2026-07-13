@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-codex-start-turn"
+description = "Enables the codex_start_turn command without any pre-configured scope."
+commands.allow = ["codex_start_turn"]
+
+[[permission]]
+identifier = "deny-codex-start-turn"
+description = "Denies the codex_start_turn command without any pre-configured scope."
+commands.deny = ["codex_start_turn"]

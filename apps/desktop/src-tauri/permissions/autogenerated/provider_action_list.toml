@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-provider-action-list"
+description = "Enables the provider_action_list command without any pre-configured scope."
+commands.allow = ["provider_action_list"]
+
+[[permission]]
+identifier = "deny-provider-action-list"
+description = "Denies the provider_action_list command without any pre-configured scope."
+commands.deny = ["provider_action_list"]

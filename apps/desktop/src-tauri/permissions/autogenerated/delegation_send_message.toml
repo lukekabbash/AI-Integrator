@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-delegation-send-message"
+description = "Enables the delegation_send_message command without any pre-configured scope."
+commands.allow = ["delegation_send_message"]
+
+[[permission]]
+identifier = "deny-delegation-send-message"
+description = "Denies the delegation_send_message command without any pre-configured scope."
+commands.deny = ["delegation_send_message"]

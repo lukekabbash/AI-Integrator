@@ -31,9 +31,12 @@ Every renderer event contains a monotonic database sequence, task and provider-s
 - diff changed;
 - usage changed;
 - approval changed;
+- mode changed;
 - turn error;
 - connection changed;
 - projection reset.
+
+Mode changed carries the session's current mode plus every advertised mode (id, name, optional description) as a full snapshot. Sources: the ACP `session/new` `modes` field and `current_mode_update` notifications (Cursor Agent/Plan/Ask), client-side `session/set_mode` calls, and Claude's stream-json `system`/`status` permission-mode reports (synthesized from the CLI's fixed vocabulary). Providers without modes emit none and the renderer hides the mode picker.
 
 Stable UI identifiers derive from provider identity, for example `codex:{thread}:{turn}:{item}`. React deduplicates by sequence only; equal consecutive delta text is valid and must not be hash-deduplicated.
 
@@ -67,6 +70,8 @@ pending -> responding -> resolved
 ```
 
 The reducer persists `responding` and the decision before sending the JSON-RPC response. `serverRequest/resolved` is final confirmation. Requests belonging to a dead app-server process expire and may be superseded by a newly issued transport request.
+
+Approval kinds are command execution, file change, and plan review. Plan-review approvals carry the full plan document (markdown, bounded at 256 KiB) and gate the transition from planning to implementation: Claude's `ExitPlanMode` `can_use_tool` control request (allow exits plan mode; allow-for-session additionally switches the session to `acceptEdits`) and Cursor's blocking `cursor/create_plan` extension request (success accepts the plan; the error result carries the rejection so the agent keeps planning). Plan reviews are never auto-approved by the full-access profile — the user chose plan mode to read the plan before anything is built.
 
 ## Stop and completion authority
 

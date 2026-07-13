@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-delegation-deny"
+description = "Enables the delegation_deny command without any pre-configured scope."
+commands.allow = ["delegation_deny"]
+
+[[permission]]
+identifier = "deny-delegation-deny"
+description = "Denies the delegation_deny command without any pre-configured scope."
+commands.deny = ["delegation_deny"]

@@ -3,6 +3,7 @@
 mod broker_mcp;
 mod commands;
 mod delegation;
+mod native_actions;
 mod state;
 
 use commands::*;
@@ -47,8 +48,10 @@ pub fn run() {
             app_bootstrap,
             open_external_url,
             provider_discover,
+            provider_action_list,
             task_create,
             task_list,
+            task_search_messages,
             task_set_state,
             task_update_metadata,
             task_update_routing,
@@ -74,7 +77,13 @@ pub fn run() {
             git_worktree_create,
             project_file_list,
             project_file_read,
+            project_file_rename,
+            project_file_opener_list,
+            project_file_open,
+            project_file_reveal,
             git_status,
+            git_overview,
+            git_history,
             terminal_open,
             terminal_run,
             terminal_interrupt,
@@ -84,6 +93,7 @@ pub fn run() {
             git_unstage,
             git_commit,
             git_push_preview,
+            git_push_confirmed,
             codex_connect,
             codex_disconnect,
             codex_list_models,
@@ -100,6 +110,7 @@ pub fn run() {
             acp_start_session,
             acp_send_turn,
             acp_set_config_option,
+            acp_set_mode,
             acp_list_cursor_models,
             structured_cli_start_turn,
             delegation_list,

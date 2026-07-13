@@ -96,6 +96,14 @@ pub struct CodexLaunchOptions {
     pub client_version: String,
 }
 
+/// A skill already resolved by the trusted native host from `skills/list`.
+/// The renderer never supplies the filesystem path directly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexSkillSelection {
+    pub name: String,
+    pub path: PathBuf,
+}
+
 #[derive(Clone)]
 pub struct CodexClient {
     inner: Arc<Inner>,
@@ -176,6 +184,39 @@ impl CodexClient {
             .await
     }
 
+    /// Returns Codex's native skill inventory for the effective working
+    /// directory. The app-server owns precedence, plugin expansion, and
+    /// system/default skill discovery.
+    pub async fn list_skills(&self, cwd: &Path, force_reload: bool) -> Result<Value> {
+        if !cwd.is_dir() {
+            return Err(IntegratorError::InvalidInput(
+                "skill working directory does not exist".into(),
+            ));
+        }
+        self.request(
+            "skills/list",
+            json!({ "cwds": [cwd.to_string_lossy()], "forceReload": force_reload }),
+        )
+        .await
+    }
+
+    /// Sets the persisted goal state surfaced by Codex `/goal`. Starting the
+    /// first turn remains a separate request so callers can use the objective
+    /// as both the completion condition and the initial prompt.
+    pub async fn set_goal(&self, thread_id: &str, objective: &str) -> Result<Value> {
+        validate_protocol_id(thread_id, "thread")?;
+        let objective = validate_goal_objective(objective)?;
+        self.request(
+            "thread/goal/set",
+            json!({
+                "threadId": thread_id,
+                "objective": objective,
+                "status": "active",
+            }),
+        )
+        .await
+    }
+
     /// Reads the account's subscription rate-limit windows. Codex is the only
     /// provider that publishes quota (`usedPercent`, `resetsAt`) first-class;
     /// callers persist it so the UI can show subscription pressure without
@@ -212,8 +253,14 @@ impl CodexClient {
         model: Option<&str>,
         reasoning_effort: Option<&str>,
     ) -> Result<Value> {
-        self.start_thread_with_policies(cwd, model, reasoning_effort, "on-request", "workspace-write")
-            .await
+        self.start_thread_with_policies(
+            cwd,
+            model,
+            reasoning_effort,
+            "on-request",
+            "workspace-write",
+        )
+        .await
     }
 
     /// `approval_policy` variant used for delegated subagent threads: those
@@ -226,8 +273,14 @@ impl CodexClient {
         reasoning_effort: Option<&str>,
         approval_policy: &str,
     ) -> Result<Value> {
-        self.start_thread_with_policies(cwd, model, reasoning_effort, approval_policy, "workspace-write")
-            .await
+        self.start_thread_with_policies(
+            cwd,
+            model,
+            reasoning_effort,
+            approval_policy,
+            "workspace-write",
+        )
+        .await
     }
 
     /// Full policy control for user-selected permission profiles. Both values
@@ -249,7 +302,10 @@ impl CodexClient {
                 "unsupported approval policy".into(),
             ));
         }
-        if !matches!(sandbox, "read-only" | "workspace-write" | "danger-full-access") {
+        if !matches!(
+            sandbox,
+            "read-only" | "workspace-write" | "danger-full-access"
+        ) {
             return Err(IntegratorError::InvalidInput(
                 "unsupported sandbox mode".into(),
             ));
@@ -282,6 +338,18 @@ impl CodexClient {
     }
 
     pub async fn start_turn(&self, thread_id: &str, prompt: &str) -> Result<Value> {
+        self.start_turn_with_skill(thread_id, prompt, None).await
+    }
+
+    /// Starts a turn with an optional native Codex skill reference. Codex
+    /// recommends sending both the visible `$name` text and the typed skill
+    /// item so it can inject the exact instructions without model-side lookup.
+    pub async fn start_turn_with_skill(
+        &self,
+        thread_id: &str,
+        prompt: &str,
+        skill: Option<&CodexSkillSelection>,
+    ) -> Result<Value> {
         validate_protocol_id(thread_id, "thread")?;
         let prompt = prompt.trim();
         if prompt.is_empty() || prompt.len() > 2 * 1024 * 1024 {
@@ -289,12 +357,18 @@ impl CodexClient {
                 "prompt must contain 1 byte to 2 MiB".into(),
             ));
         }
+        let mut input = vec![json!({ "type": "text", "text": prompt, "text_elements": [] })];
+        if let Some(skill) = skill {
+            validate_skill_selection(skill)?;
+            input.push(json!({
+                "type": "skill",
+                "name": skill.name,
+                "path": skill.path.to_string_lossy(),
+            }));
+        }
         self.request(
             "turn/start",
-            json!({
-                "threadId": thread_id,
-                "input": [{ "type": "text", "text": prompt }]
-            }),
+            json!({ "threadId": thread_id, "input": input }),
         )
         .await
     }
@@ -603,9 +677,59 @@ fn validate_protocol_id(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_skill_selection(skill: &CodexSkillSelection) -> Result<()> {
+    if skill.name.trim().is_empty() || skill.name.len() > 256 || skill.name.contains(['\r', '\n']) {
+        return Err(IntegratorError::InvalidInput(
+            "invalid Codex skill name".into(),
+        ));
+    }
+    if !skill.path.is_absolute() || skill.path.as_os_str().len() > 32 * 1024 {
+        return Err(IntegratorError::InvalidInput(
+            "invalid Codex skill path".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_goal_objective(objective: &str) -> Result<&str> {
+    let objective = objective.trim();
+    if objective.is_empty() || objective.chars().count() > 4_000 {
+        return Err(IntegratorError::InvalidInput(
+            "Codex goal must contain 1 to 4,000 characters".into(),
+        ));
+    }
+    Ok(objective)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skill_selection_rejects_renderer_style_relative_paths_and_control_text() {
+        assert!(
+            validate_skill_selection(&CodexSkillSelection {
+                name: "skill-creator".into(),
+                path: PathBuf::from("relative/SKILL.md"),
+            })
+            .is_err()
+        );
+        assert!(
+            validate_skill_selection(&CodexSkillSelection {
+                name: "bad\nname".into(),
+                path: std::env::temp_dir().join("SKILL.md"),
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn goal_objective_uses_the_provider_character_limit() {
+        assert_eq!(validate_goal_objective("  ship it  ").unwrap(), "ship it");
+        assert!(validate_goal_objective("").is_err());
+        assert!(validate_goal_objective(&"x".repeat(4_000)).is_ok());
+        assert!(validate_goal_objective(&"x".repeat(4_001)).is_err());
+    }
 
     #[tokio::test]
     async fn response_routes_to_pending_request() {

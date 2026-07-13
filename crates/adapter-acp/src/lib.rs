@@ -135,6 +135,7 @@ struct Inner {
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
     events: broadcast::Sender<AcpEvent>,
     next_id: AtomicU64,
+    initialization: Mutex<Value>,
 }
 
 impl AcpClient {
@@ -187,15 +188,36 @@ impl AcpClient {
                 pending,
                 events,
                 next_id: AtomicU64::new(1),
+                initialization: Mutex::new(Value::Null),
             }),
         };
-        client.initialize(&options.client_version).await?;
+        let initialization = client.initialize(&options.client_version).await?;
+        *client.inner.initialization.lock().await = initialization;
         Ok(client)
     }
 
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<AcpEvent> {
         self.inner.events.subscribe()
+    }
+
+    /// Sanitized callers use this only to inspect advertised protocol
+    /// capabilities such as auth method ids. It never contains credential
+    /// values supplied by Integrator.
+    pub async fn initialization(&self) -> Value {
+        self.inner.initialization.lock().await.clone()
+    }
+
+    /// Runs ACP's provider-owned authentication handshake. Integrator passes
+    /// only a method id the agent advertised (for Grok, `cached_token`) and
+    /// never transports API keys or token contents.
+    pub async fn authenticate(&self, method_id: &str, headless: bool) -> Result<Value> {
+        validate_short_token(method_id, "authentication method id")?;
+        self.request(
+            "authenticate",
+            json!({ "methodId": method_id, "_meta": { "headless": headless } }),
+        )
+        .await
     }
 
     /// `mcp_servers` entries follow the ACP `session/new` schema:
@@ -241,12 +263,26 @@ impl AcpClient {
         .await
     }
 
+    /// Switch the session's mode (e.g. Cursor agent/plan/ask). `mode_id` must
+    /// be one of the ids the agent advertised in `session/new`'s `modes`
+    /// field; the spec allows this any time, including mid-turn.
+    pub async fn set_mode(&self, session_id: &str, mode_id: &str) -> Result<Value> {
+        validate_session_id(session_id)?;
+        validate_short_token(mode_id, "mode id")?;
+        self.request(
+            "session/set_mode",
+            json!({ "sessionId": session_id, "modeId": mode_id }),
+        )
+        .await
+    }
+
     /// Cursor extension RPC: the per-account model list with each model's
     /// config options (thought level, context, fast mode). The stable
     /// `session/new` surface only advertises model ids, so this is the only
     /// source for per-model reasoning-effort choices.
     pub async fn list_cursor_models(&self) -> Result<Value> {
-        self.request("cursor/list_available_models", json!({})).await
+        self.request("cursor/list_available_models", json!({}))
+            .await
     }
 
     /// Fire-and-forget cancellation; the in-flight prompt resolves with a

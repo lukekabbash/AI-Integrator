@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{collections::HashSet, str::FromStr};
 
 use chrono::Utc;
 use integrator_core::{
@@ -189,12 +189,12 @@ impl LocalStore {
             occurred_at: reduced.occurred_at,
             projection,
         };
-        transaction
-            .execute(
-                "UPDATE codex_event_log SET projection_json = ?1 WHERE seq = ?2",
-                params![serde_json::to_string(&event)?, seq],
-            )
-            .map_err(storage_error)?;
+        persist_snapshot_event(&transaction, &event)?;
+        // Migration 8 consumes legacy projection_json values once to seed the
+        // materialized snapshot tables. New audit rows intentionally omit that
+        // duplicate full-event payload: task_snapshot reads the materialized
+        // rows above, while the append-only log retains identity, ordering,
+        // method, time, and the provider's bounded audit payload.
         transaction.commit().map_err(storage_error)?;
         Ok(event)
     }
@@ -209,9 +209,43 @@ impl LocalStore {
                 |row| row.get::<_, i64>(0),
             )
             .map_err(storage_error)?;
-        let mut statement = connection.prepare(
-            "SELECT projection_json FROM codex_event_log WHERE task_id = ?1 AND projection_json IS NOT NULL AND seq <= ?2 ORDER BY seq",
-        ).map_err(storage_error)?;
+        // The append-only event log remains the audit source and sequence
+        // watermark. Renderer hydration reads only the transactionally updated
+        // current rows, so repeated streaming deltas do not cross SQLite/IPC.
+        let mut statement = connection
+            .prepare(
+                r#"
+            WITH boundary AS (
+                SELECT COALESCE(reset_seq, 0) AS reset_seq
+                FROM codex_task_projection WHERE task_id = ?1
+            ), current_events(seq, event_json) AS (
+                SELECT reset_seq, reset_event_json FROM codex_task_projection
+                    WHERE task_id=?1 AND reset_seq > 0
+                UNION ALL SELECT turn_seq, turn_event_json FROM codex_task_projection
+                    WHERE task_id=?1 AND turn_seq > (SELECT reset_seq FROM boundary)
+                UNION ALL SELECT plan_seq, plan_event_json FROM codex_task_projection
+                    WHERE task_id=?1 AND plan_seq > (SELECT reset_seq FROM boundary)
+                UNION ALL SELECT diff_seq, diff_event_json FROM codex_task_projection
+                    WHERE task_id=?1 AND diff_seq > (SELECT reset_seq FROM boundary)
+                UNION ALL SELECT usage_seq, usage_event_json FROM codex_task_projection
+                    WHERE task_id=?1 AND usage_seq > (SELECT reset_seq FROM boundary)
+                UNION ALL SELECT mode_seq, mode_event_json FROM codex_task_projection
+                    WHERE task_id=?1 AND mode_seq > (SELECT reset_seq FROM boundary)
+                UNION ALL SELECT error_seq, error_event_json FROM codex_task_projection
+                    WHERE task_id=?1 AND error_seq > (SELECT reset_seq FROM boundary)
+                UNION ALL SELECT connection_seq, connection_event_json FROM codex_task_projection
+                    WHERE task_id=?1 AND connection_seq > (SELECT reset_seq FROM boundary)
+                UNION ALL SELECT last_event_seq, snapshot_event_json FROM codex_items
+                    WHERE task_id=?1 AND last_event_seq > (SELECT reset_seq FROM boundary)
+                UNION ALL SELECT last_event_seq, snapshot_event_json FROM codex_approvals
+                    WHERE task_id=?1 AND last_event_seq > (SELECT reset_seq FROM boundary)
+            )
+            SELECT event_json FROM current_events
+            WHERE event_json IS NOT NULL AND seq <= ?2
+            ORDER BY seq
+            "#,
+            )
+            .map_err(storage_error)?;
         let events = statement
             .query_map(params![task_id.to_string(), watermark], |row| {
                 row.get::<_, String>(0)
@@ -255,7 +289,16 @@ impl LocalStore {
         approval.decision = Some(decision);
         approval.updated_at = Utc::now();
         let request_id = request_id_from_parts(&row.1, &row.2)?;
-        transaction.execute("INSERT INTO codex_event_log(task_id, provider_session_id, runtime_session_id, process_id, thread_id, turn_id, method, audit_json, audit_truncated, occurred_at) VALUES (?1,?2,?3,?4,?5,?6,'client/approval/responding','{}',0,?7)", params![task_id.to_string(), row.4, row.5, row.3, row.6, row.7, approval.updated_at.to_rfc3339()]).map_err(storage_error)?;
+        let audit_json = serde_json::json!({
+            "approvalId": approval.id.as_str(),
+            "decision": approval
+                .decision
+                .as_ref()
+                .map(ApprovalDecision::as_protocol_str),
+            "state": approval.state.as_str(),
+        })
+        .to_string();
+        transaction.execute("INSERT INTO codex_event_log(task_id, provider_session_id, runtime_session_id, process_id, thread_id, turn_id, method, audit_json, audit_truncated, occurred_at) VALUES (?1,?2,?3,?4,?5,?6,'client/approval/responding',?7,0,?8)", params![task_id.to_string(), row.4, row.5, row.3, row.6, row.7, audit_json, approval.updated_at.to_rfc3339()]).map_err(storage_error)?;
         let seq = transaction.last_insert_rowid();
         let event = RuntimeProjectionEvent {
             seq,
@@ -269,13 +312,8 @@ impl LocalStore {
                 approval: approval.clone(),
             },
         };
+        persist_snapshot_event(&transaction, &event)?;
         transaction.execute("UPDATE codex_approvals SET state='responding', decision=?1, updated_at=?2, last_event_seq=?3, projection_json=?4 WHERE id=?5", params![approval.decision.as_ref().map(ApprovalDecision::as_protocol_str), approval.updated_at.to_rfc3339(), seq, serde_json::to_string(&approval)?, approval_id]).map_err(storage_error)?;
-        transaction
-            .execute(
-                "UPDATE codex_event_log SET projection_json=?1 WHERE seq=?2",
-                params![serde_json::to_string(&event)?, seq],
-            )
-            .map_err(storage_error)?;
         transaction.commit().map_err(storage_error)?;
         Ok(PreparedApprovalResponse {
             event,
@@ -351,12 +389,7 @@ impl LocalStore {
             occurred_at,
             projection: RuntimeProjection::TurnChanged { turn },
         };
-        transaction
-            .execute(
-                "UPDATE codex_event_log SET projection_json=?1 WHERE seq=?2",
-                params![serde_json::to_string(&event)?, seq],
-            )
-            .map_err(storage_error)?;
+        persist_snapshot_event(&transaction, &event)?;
         transaction.commit().map_err(storage_error)?;
         Ok(PersistedStopRequest {
             result: StopRequestResult {
@@ -446,6 +479,49 @@ impl LocalStore {
         Ok(Some(lines.join("\n\n")))
     }
 
+    /// Search locally materialized user/assistant messages without loading
+    /// task snapshots or waking a provider session. Results are bounded and
+    /// deduplicated to one representative snippet per task.
+    pub fn search_task_messages(&self, query: &str, limit: usize) -> Result<Vec<(TaskId, String)>> {
+        let Some(expression) = message_search_expression(query) else {
+            return Ok(Vec::new());
+        };
+        let limit = limit.clamp(1, 50);
+        let candidate_limit = (limit * 8).clamp(limit, 400) as i64;
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT task_id,
+                       snippet(codex_items_fts, 0, '', '', ' ... ', 22)
+                FROM codex_items_fts
+                WHERE codex_items_fts MATCH ?1
+                ORDER BY bm25(codex_items_fts), rowid DESC
+                LIMIT ?2
+                "#,
+            )
+            .map_err(storage_error)?;
+        let candidates = statement
+            .query_map(params![expression, candidate_limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(storage_error)?;
+
+        let mut seen = HashSet::with_capacity(limit);
+        let mut results = Vec::with_capacity(limit);
+        for candidate in candidates {
+            let (task_id, snippet) = candidate.map_err(storage_error)?;
+            if !seen.insert(task_id.clone()) {
+                continue;
+            }
+            results.push((TaskId::from_str(&task_id).map_err(invalid_stored)?, snippet));
+            if results.len() == limit {
+                break;
+            }
+        }
+        Ok(results)
+    }
+
     pub fn expire_process_approvals(&self, process_id: &str) -> Result<usize> {
         let approval_ids = {
             let connection = self.connection.lock();
@@ -509,10 +585,19 @@ impl LocalStore {
         approval.state = target;
         approval.updated_at = Utc::now();
         let method = format!("client/approval/{}", approval.state.as_str());
+        let audit_json = serde_json::json!({
+            "approvalId": approval.id.as_str(),
+            "decision": approval
+                .decision
+                .as_ref()
+                .map(ApprovalDecision::as_protocol_str),
+            "state": approval.state.as_str(),
+        })
+        .to_string();
         transaction
             .execute(
-                "INSERT INTO codex_event_log(task_id,provider_session_id,runtime_session_id,process_id,thread_id,turn_id,method,audit_json,audit_truncated,occurred_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'{}',0,?8)",
-                params![row.1, row.2, row.3, row.4, row.5, row.6, method, approval.updated_at.to_rfc3339()],
+                "INSERT INTO codex_event_log(task_id,provider_session_id,runtime_session_id,process_id,thread_id,turn_id,method,audit_json,audit_truncated,occurred_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,?9)",
+                params![row.1, row.2, row.3, row.4, row.5, row.6, method, audit_json, approval.updated_at.to_rfc3339()],
             )
             .map_err(storage_error)?;
         let seq = transaction.last_insert_rowid();
@@ -528,16 +613,11 @@ impl LocalStore {
                 approval: approval.clone(),
             },
         };
+        persist_snapshot_event(&transaction, &event)?;
         transaction
             .execute(
                 "UPDATE codex_approvals SET state=?1,updated_at=?2,projection_json=?3,last_event_seq=?4 WHERE id=?5",
                 params![approval.state.as_str(), approval.updated_at.to_rfc3339(), serde_json::to_string(&approval)?, seq, approval_id],
-            )
-            .map_err(storage_error)?;
-        transaction
-            .execute(
-                "UPDATE codex_event_log SET projection_json=?1 WHERE seq=?2",
-                params![serde_json::to_string(&event)?, seq],
             )
             .map_err(storage_error)?;
         transaction.commit().map_err(storage_error)?;
@@ -587,12 +667,7 @@ fn settle_stale_turn(
         occurred_at,
         projection: RuntimeProjection::TurnChanged { turn },
     };
-    transaction
-        .execute(
-            "UPDATE codex_event_log SET projection_json=?1 WHERE seq=?2",
-            params![serde_json::to_string(&event)?, seq],
-        )
-        .map_err(storage_error)?;
+    persist_snapshot_event(transaction, &event)?;
     Ok(Some(event))
 }
 
@@ -615,7 +690,7 @@ fn apply_mutation(
             let stop_requested = transaction.query_row("SELECT stop_requested FROM codex_turns WHERE provider_session_id=?1 AND turn_id=?2", params![provider_session_id.to_string(), turn.id], |row| row.get::<_, bool>(0)).optional().map_err(storage_error)?.unwrap_or(false);
             let mut turn = turn.clone();
             turn.stop_requested |= stop_requested;
-            transaction.execute("INSERT INTO codex_turns(provider_session_id,task_id,thread_id,turn_id,status,stop_requested,error,started_at,completed_at,projection_json,last_event_seq) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(provider_session_id,turn_id) DO UPDATE SET status=excluded.status,stop_requested=excluded.stop_requested,error=excluded.error,started_at=excluded.started_at,completed_at=excluded.completed_at,projection_json=excluded.projection_json,last_event_seq=excluded.last_event_seq", params![provider_session_id.to_string(),binding.task_id.to_string(),thread_id,turn.id,turn.status.as_str(),turn.stop_requested,turn.error,turn.started_at.map(|v|v.to_rfc3339()),turn.completed_at.map(|v|v.to_rfc3339()),serde_json::to_string(&turn)?,seq]).map_err(storage_error)?;
+            transaction.execute("INSERT INTO codex_turns(provider_session_id,task_id,thread_id,turn_id,status,stop_requested,error,started_at,completed_at,projection_json,last_event_seq,first_event_seq,first_occurred_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11,?12) ON CONFLICT(provider_session_id,turn_id) DO UPDATE SET status=excluded.status,stop_requested=excluded.stop_requested,error=excluded.error,started_at=excluded.started_at,completed_at=excluded.completed_at,projection_json=excluded.projection_json,last_event_seq=excluded.last_event_seq", params![provider_session_id.to_string(),binding.task_id.to_string(),thread_id,turn.id,turn.status.as_str(),turn.stop_requested,turn.error,turn.started_at.map(|v|v.to_rfc3339()),turn.completed_at.map(|v|v.to_rfc3339()),serde_json::to_string(&turn)?,seq,reduced.occurred_at.to_rfc3339()]).map_err(storage_error)?;
             transaction.execute("UPDATE codex_task_projection SET current_turn_id=?1,last_event_seq=?2 WHERE task_id=?3", params![turn.id,seq,binding.task_id.to_string()]).map_err(storage_error)?;
             Ok(RuntimeProjection::TurnChanged { turn })
         }
@@ -639,11 +714,17 @@ fn apply_mutation(
             if update.body.is_some() {
                 item.body = update.body.clone();
             }
+            if update.native_skill.is_some() {
+                item.native_skill = update.native_skill.clone();
+            }
             if update.output.is_some() {
                 item.output = update.output.clone();
             }
             if update.tool_input.is_some() {
                 item.tool_input = update.tool_input.clone();
+            }
+            if update.file_changes.is_some() {
+                item.file_changes = update.file_changes.clone();
             }
             if update.mcp_server.is_some() {
                 item.mcp_server = update.mcp_server.clone();
@@ -677,6 +758,7 @@ fn apply_mutation(
                 status: ItemStatus::InProgress,
                 title: None,
                 body: None,
+                native_skill: None,
                 command: None,
                 cwd: None,
                 output: None,
@@ -762,6 +844,15 @@ fn apply_mutation(
             transaction.execute("UPDATE codex_task_projection SET usage_json=?1,usage_seq=?2,last_event_seq=?2 WHERE task_id=?3",params![serde_json::to_string(&usage)?,seq,binding.task_id.to_string()]).map_err(storage_error)?;
             Ok(RuntimeProjection::UsageChanged { usage })
         }
+        ProjectionMutation::Mode(mode) => {
+            transaction
+                .execute(
+                    "UPDATE codex_task_projection SET last_event_seq=?1 WHERE task_id=?2",
+                    params![seq, binding.task_id.to_string()],
+                )
+                .map_err(storage_error)?;
+            Ok(RuntimeProjection::ModeChanged { mode: mode.clone() })
+        }
         ProjectionMutation::ApprovalRequested {
             request_id,
             approval_kind,
@@ -770,6 +861,7 @@ fn apply_mutation(
             reason,
             command,
             cwd,
+            plan_markdown,
         } => {
             let (request_kind, request_value) = request_id_parts(request_id);
             let existing=transaction.query_row("SELECT projection_json FROM codex_approvals WHERE runtime_session_id=?1 AND request_kind=?2 AND request_value=?3 AND approval_kind=?4 AND COALESCE(approval_id,'')=COALESCE(?5,'') ORDER BY updated_at DESC LIMIT 1",params![binding.runtime_session_id.to_string(),request_kind,request_value,approval_kind.as_str(),approval_id],|row|row.get::<_,String>(0)).optional().map_err(storage_error)?;
@@ -794,17 +886,19 @@ fn apply_mutation(
                         item_id,
                     )?
                     .and_then(|item| item.file_changes),
+                    plan_markdown: plan_markdown.clone(),
                     updated_at: reduced.occurred_at,
                 }
             };
             approval.state = ApprovalState::Pending;
+            approval.plan_markdown = plan_markdown.clone().or(approval.plan_markdown);
             approval.updated_at = reduced.occurred_at;
             let file_changes_json = approval
                 .file_changes
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
-            transaction.execute("INSERT INTO codex_approvals(id,provider_session_id,runtime_session_id,task_id,process_id,thread_id,turn_id,item_id,approval_id,request_kind,request_value,approval_kind,state,decision,reason,command_text,cwd,file_changes_json,updated_at,projection_json,last_event_seq) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'pending',NULL,?13,?14,?15,?16,?17,?18,?19) ON CONFLICT(id) DO UPDATE SET state='pending',reason=excluded.reason,command_text=excluded.command_text,cwd=excluded.cwd,file_changes_json=excluded.file_changes_json,updated_at=excluded.updated_at,projection_json=excluded.projection_json,last_event_seq=excluded.last_event_seq",params![approval.id,provider_session_id.to_string(),binding.runtime_session_id.to_string(),binding.task_id.to_string(),binding.process_id,thread_id,reduced.turn_id,item_id,approval_id,request_kind,request_value,approval_kind.as_str(),reason,command,cwd,file_changes_json,reduced.occurred_at.to_rfc3339(),serde_json::to_string(&approval)?,seq]).map_err(storage_error)?;
+            transaction.execute("INSERT INTO codex_approvals(id,provider_session_id,runtime_session_id,task_id,process_id,thread_id,turn_id,item_id,approval_id,request_kind,request_value,approval_kind,state,decision,reason,command_text,cwd,file_changes_json,updated_at,projection_json,last_event_seq,first_event_seq,first_occurred_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'pending',NULL,?13,?14,?15,?16,?17,?18,?19,?19,?17) ON CONFLICT(id) DO UPDATE SET state='pending',reason=excluded.reason,command_text=excluded.command_text,cwd=excluded.cwd,file_changes_json=excluded.file_changes_json,updated_at=excluded.updated_at,projection_json=excluded.projection_json,last_event_seq=excluded.last_event_seq",params![approval.id,provider_session_id.to_string(),binding.runtime_session_id.to_string(),binding.task_id.to_string(),binding.process_id,thread_id,reduced.turn_id,item_id,approval_id,request_kind,request_value,approval_kind.as_str(),reason,command,cwd,file_changes_json,reduced.occurred_at.to_rfc3339(),serde_json::to_string(&approval)?,seq]).map_err(storage_error)?;
             Ok(RuntimeProjection::ApprovalChanged { approval })
         }
         ProjectionMutation::ApprovalResolved { request_id } => {
@@ -829,6 +923,168 @@ fn apply_mutation(
             })
         }
     }
+}
+
+/// Store one renderer-safe current event alongside the materialized row it
+/// describes. The audit event remains untouched; item and approval snapshots
+/// retain the timestamp of their first appearance in the current reset epoch.
+fn persist_snapshot_event(
+    transaction: &Transaction<'_>,
+    event: &RuntimeProjectionEvent,
+) -> Result<()> {
+    let mut snapshot = event.clone();
+    snapshot.projection = renderer_safe_projection(snapshot.projection);
+    let task_id = event.task_id.to_string();
+    let provider_session_id = event.provider_session_id.to_string();
+    match &event.projection {
+        RuntimeProjection::ItemChanged { item } => {
+            let (first_seq, first_at, reset_seq) = transaction.query_row(
+                "SELECT i.first_event_seq,i.first_occurred_at,COALESCE(p.reset_seq,0) FROM codex_items i JOIN codex_task_projection p ON p.task_id=i.task_id WHERE i.provider_session_id=?1 AND i.stable_id=?2 ORDER BY i.last_event_seq DESC LIMIT 1",
+                params![provider_session_id, item.id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, i64>(2)?)),
+            ).map_err(storage_error)?;
+            let (first_seq, first_at) = if first_seq == 0 || first_seq <= reset_seq {
+                (event.seq, event.occurred_at)
+            } else {
+                (
+                    first_seq,
+                    first_at
+                        .as_deref()
+                        .map(parse_time)
+                        .transpose()?
+                        .unwrap_or(event.occurred_at),
+                )
+            };
+            snapshot.occurred_at = first_at;
+            transaction.execute(
+                "UPDATE codex_items SET first_event_seq=?1,first_occurred_at=?2,snapshot_event_json=?3 WHERE provider_session_id=?4 AND stable_id=?5",
+                params![first_seq, first_at.to_rfc3339(), serde_json::to_string(&snapshot)?, provider_session_id, item.id],
+            ).map_err(storage_error)?;
+        }
+        RuntimeProjection::ApprovalChanged { approval } => {
+            let (first_seq, first_at, reset_seq) = transaction.query_row(
+                "SELECT a.first_event_seq,a.first_occurred_at,COALESCE(p.reset_seq,0) FROM codex_approvals a JOIN codex_task_projection p ON p.task_id=a.task_id WHERE a.id=?1",
+                [approval.id.as_str()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, i64>(2)?)),
+            ).map_err(storage_error)?;
+            let (first_seq, first_at) = if first_seq == 0 || first_seq <= reset_seq {
+                (event.seq, event.occurred_at)
+            } else {
+                (
+                    first_seq,
+                    first_at
+                        .as_deref()
+                        .map(parse_time)
+                        .transpose()?
+                        .unwrap_or(event.occurred_at),
+                )
+            };
+            snapshot.occurred_at = first_at;
+            transaction.execute(
+                "UPDATE codex_approvals SET first_event_seq=?1,first_occurred_at=?2,snapshot_event_json=?3 WHERE id=?4",
+                params![first_seq, first_at.to_rfc3339(), serde_json::to_string(&snapshot)?, approval.id],
+            ).map_err(storage_error)?;
+        }
+        RuntimeProjection::TurnChanged { turn } => {
+            let json = serde_json::to_string(&snapshot)?;
+            transaction.execute(
+                "UPDATE codex_turns SET first_event_seq=CASE WHEN first_event_seq=0 THEN ?1 ELSE first_event_seq END,first_occurred_at=COALESCE(first_occurred_at,?2),snapshot_event_json=?3 WHERE provider_session_id=?4 AND turn_id=?5",
+                params![event.seq, event.occurred_at.to_rfc3339(), json, provider_session_id, turn.id],
+            ).map_err(storage_error)?;
+            transaction.execute(
+                "UPDATE codex_task_projection SET turn_seq=?1,turn_event_json=?2 WHERE task_id=?3",
+                params![event.seq, serde_json::to_string(&snapshot)?, task_id],
+            ).map_err(storage_error)?;
+        }
+        RuntimeProjection::PlanChanged { .. } => update_singleton_snapshot(
+            transaction,
+            &task_id,
+            "plan_seq",
+            "plan_event_json",
+            &snapshot,
+        )?,
+        RuntimeProjection::DiffChanged { .. } => update_singleton_snapshot(
+            transaction,
+            &task_id,
+            "diff_seq",
+            "diff_event_json",
+            &snapshot,
+        )?,
+        RuntimeProjection::UsageChanged { .. } => update_singleton_snapshot(
+            transaction,
+            &task_id,
+            "usage_seq",
+            "usage_event_json",
+            &snapshot,
+        )?,
+        RuntimeProjection::ModeChanged { .. } => update_singleton_snapshot(
+            transaction,
+            &task_id,
+            "mode_seq",
+            "mode_event_json",
+            &snapshot,
+        )?,
+        RuntimeProjection::TurnError { .. } => update_singleton_snapshot(
+            transaction,
+            &task_id,
+            "error_seq",
+            "error_event_json",
+            &snapshot,
+        )?,
+        RuntimeProjection::ConnectionChanged { .. } => update_singleton_snapshot(
+            transaction,
+            &task_id,
+            "connection_seq",
+            "connection_event_json",
+            &snapshot,
+        )?,
+        RuntimeProjection::ProjectionReset { .. } => {
+            transaction
+                .execute(
+                    "DELETE FROM codex_turns WHERE task_id=?1",
+                    [task_id.as_str()],
+                )
+                .map_err(storage_error)?;
+            transaction
+                .execute(
+                    "DELETE FROM codex_items WHERE task_id=?1",
+                    [task_id.as_str()],
+                )
+                .map_err(storage_error)?;
+            transaction
+                .execute(
+                    "DELETE FROM codex_approvals WHERE task_id=?1",
+                    [task_id.as_str()],
+                )
+                .map_err(storage_error)?;
+            transaction.execute(
+                "UPDATE codex_task_projection SET current_turn_id=NULL,plan_json=NULL,plan_truncated=0,plan_seq=0,plan_event_json=NULL,diff=NULL,diff_truncated=0,diff_seq=0,diff_event_json=NULL,usage_json=NULL,usage_seq=0,usage_event_json=NULL,turn_seq=0,turn_event_json=NULL,mode_seq=0,mode_event_json=NULL,error_seq=0,error_event_json=NULL,connection_seq=0,connection_event_json=NULL,reset_seq=?1,reset_event_json=?2,last_event_seq=?1 WHERE task_id=?3",
+                params![event.seq, serde_json::to_string(&snapshot)?, task_id],
+            ).map_err(storage_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn update_singleton_snapshot(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+    seq_column: &str,
+    json_column: &str,
+    event: &RuntimeProjectionEvent,
+) -> Result<()> {
+    // Column names are closed over at compile time by the match above; no
+    // provider- or renderer-controlled identifier reaches this statement.
+    let sql = format!(
+        "UPDATE codex_task_projection SET {seq_column}=?1,{json_column}=?2 WHERE task_id=?3"
+    );
+    transaction
+        .execute(
+            &sql,
+            params![event.seq, serde_json::to_string(event)?, task_id],
+        )
+        .map_err(storage_error)?;
+    Ok(())
 }
 
 fn provider_for_session(
@@ -903,7 +1159,7 @@ fn upsert_item(
         .thread_id
         .as_deref()
         .ok_or_else(|| IntegratorError::Storage("runtime thread identity is missing".into()))?;
-    transaction.execute("INSERT INTO codex_items(provider_session_id,task_id,thread_id,turn_id,item_id,stable_id,kind,status,title,body,command_text,cwd,output,exit_code,file_changes_json,mcp_server,mcp_tool,truncated,updated_at,projection_json,last_event_seq) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21) ON CONFLICT(provider_session_id,turn_id,item_id) DO UPDATE SET stable_id=excluded.stable_id,kind=excluded.kind,status=excluded.status,title=excluded.title,body=excluded.body,command_text=excluded.command_text,cwd=excluded.cwd,output=excluded.output,exit_code=excluded.exit_code,file_changes_json=excluded.file_changes_json,mcp_server=excluded.mcp_server,mcp_tool=excluded.mcp_tool,truncated=excluded.truncated,updated_at=excluded.updated_at,projection_json=excluded.projection_json,last_event_seq=excluded.last_event_seq",params![provider_session_id.to_string(),binding.task_id.to_string(),thread_id,reduced.turn_id,item.provider_item_id,item.id,item.kind.as_str(),item.status.as_str(),item.title,item.body,item.command,item.cwd,item.output,item.exit_code,item.file_changes.as_ref().map(serde_json::to_string).transpose()?,item.mcp_server,item.mcp_tool,item.truncated,item.updated_at.to_rfc3339(),serde_json::to_string(item)?,seq]).map_err(storage_error)?;
+    transaction.execute("INSERT INTO codex_items(provider_session_id,task_id,thread_id,turn_id,item_id,stable_id,kind,status,title,body,command_text,cwd,output,exit_code,file_changes_json,mcp_server,mcp_tool,truncated,updated_at,projection_json,last_event_seq,first_event_seq,first_occurred_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?21,?22) ON CONFLICT(provider_session_id,turn_id,item_id) DO UPDATE SET stable_id=excluded.stable_id,kind=excluded.kind,status=excluded.status,title=excluded.title,body=excluded.body,command_text=excluded.command_text,cwd=excluded.cwd,output=excluded.output,exit_code=excluded.exit_code,file_changes_json=excluded.file_changes_json,mcp_server=excluded.mcp_server,mcp_tool=excluded.mcp_tool,truncated=excluded.truncated,updated_at=excluded.updated_at,projection_json=excluded.projection_json,last_event_seq=excluded.last_event_seq",params![provider_session_id.to_string(),binding.task_id.to_string(),thread_id,reduced.turn_id,item.provider_item_id,item.id,item.kind.as_str(),item.status.as_str(),item.title,item.body,item.command,item.cwd,item.output,item.exit_code,item.file_changes.as_ref().map(serde_json::to_string).transpose()?,item.mcp_server,item.mcp_tool,item.truncated,item.updated_at.to_rfc3339(),serde_json::to_string(item)?,seq,reduced.occurred_at.to_rfc3339()]).map_err(storage_error)?;
     Ok(())
 }
 fn load_item(
@@ -986,6 +1242,9 @@ fn renderer_safe_projection(mut projection: RuntimeProjection) -> RuntimeProject
                     }
                 }
             }
+            if let Some(plan) = approval.plan_markdown.take() {
+                approval.plan_markdown = Some(redact_and_bound(&plan, RENDERER_CONTENT_LIMIT).0)
+            }
         }
         _ => {}
     }
@@ -1005,10 +1264,37 @@ fn validate_identity(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn message_search_expression(query: &str) -> Option<String> {
+    if query.trim().chars().count() < 2 {
+        return None;
+    }
+    let normalized = query
+        .chars()
+        .take(200)
+        .map(|character| {
+            if character.is_alphanumeric() || character == '_' {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+    let terms = normalized
+        .split_whitespace()
+        .take(8)
+        .map(|term| format!(r#""{term}"*"#))
+        .collect::<Vec<_>>();
+    (!terms.is_empty()).then(|| terms.join(" AND "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use integrator_core::{NewTask, TurnStatus};
+    use chrono::DateTime;
+    use integrator_core::{
+        ApprovalKind, ConnectionState, ItemKind, ModeOption, ModeProjection, NewTask,
+        TransportRequestId, TurnStatus,
+    };
 
     fn bound_store(provider: ProviderKind) -> (LocalStore, RuntimeBinding) {
         let store = LocalStore::open_in_memory().expect("open store");
@@ -1030,6 +1316,173 @@ mod tests {
             .attach_provider_thread(&binding, "thread-fixture")
             .expect("attach thread");
         (store, binding)
+    }
+
+    fn redundant_event_projection_count(store: &LocalStore, task_id: TaskId) -> i64 {
+        let connection = store.connection.lock();
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM codex_event_log WHERE task_id=?1 AND projection_json IS NOT NULL",
+                [task_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("count redundant event projections")
+    }
+
+    fn completed_message(
+        provider_item_id: &str,
+        kind: ItemKind,
+        body: &str,
+    ) -> ReducedProviderEvent {
+        let occurred_at = Utc::now();
+        ReducedProviderEvent {
+            method: "item/completed".into(),
+            thread_id: "thread-fixture".into(),
+            turn_id: Some("turn-search".into()),
+            audit_json: "{}".into(),
+            audit_truncated: false,
+            mutation: ProjectionMutation::ReplaceItem(ItemProjection {
+                id: format!("fixture:{provider_item_id}"),
+                provider_item_id: provider_item_id.into(),
+                kind,
+                status: ItemStatus::Completed,
+                title: None,
+                body: Some(body.into()),
+                native_skill: None,
+                command: None,
+                cwd: None,
+                output: None,
+                exit_code: None,
+                file_changes: None,
+                mcp_server: None,
+                mcp_tool: None,
+                tool_input: None,
+                truncated: false,
+                updated_at: occurred_at,
+            }),
+            occurred_at,
+        }
+    }
+
+    fn append_message(
+        provider_item_id: &str,
+        delta: &str,
+        item_updated_at: DateTime<Utc>,
+        occurred_at: DateTime<Utc>,
+    ) -> ReducedProviderEvent {
+        ReducedProviderEvent {
+            method: "item/agentMessage/delta".into(),
+            thread_id: "thread-fixture".into(),
+            turn_id: Some("turn-1".into()),
+            audit_json: "{}".into(),
+            audit_truncated: false,
+            mutation: ProjectionMutation::AppendItem {
+                provider_item_id: provider_item_id.into(),
+                item_kind: ItemKind::AgentMessage,
+                field: ItemTextField::Body,
+                delta: delta.into(),
+                updated_at: item_updated_at,
+            },
+            occurred_at,
+        }
+    }
+
+    fn persist_reset(
+        store: &LocalStore,
+        binding: &RuntimeBinding,
+        occurred_at: DateTime<Utc>,
+    ) -> RuntimeProjectionEvent {
+        let provider_session_id = binding
+            .provider_session_id
+            .expect("attached provider session");
+        let thread_id = binding.thread_id.as_deref().expect("attached thread");
+        let mut connection = store.connection.lock();
+        let transaction = connection.transaction().expect("reset transaction");
+        transaction
+            .execute(
+                "INSERT INTO codex_event_log(task_id,provider_session_id,runtime_session_id,process_id,thread_id,turn_id,method,audit_json,audit_truncated,occurred_at) VALUES (?1,?2,?3,?4,?5,NULL,'client/projection/reset','{}',0,?6)",
+                params![
+                    binding.task_id.to_string(),
+                    provider_session_id.to_string(),
+                    binding.runtime_session_id.to_string(),
+                    binding.process_id,
+                    thread_id,
+                    occurred_at.to_rfc3339()
+                ],
+            )
+            .expect("insert reset audit event");
+        let seq = transaction.last_insert_rowid();
+        ensure_task_projection(&transaction, binding, seq).expect("ensure task projection");
+        let event = RuntimeProjectionEvent {
+            seq,
+            task_id: binding.task_id,
+            provider_session_id,
+            provider: binding.provider.as_str().into(),
+            thread_id: thread_id.into(),
+            turn_id: None,
+            occurred_at,
+            projection: RuntimeProjection::ProjectionReset {
+                reason: "test reset".into(),
+            },
+        };
+        persist_snapshot_event(&transaction, &event).expect("materialize reset");
+        transaction.commit().expect("commit reset");
+        event
+    }
+
+    #[test]
+    fn message_search_is_indexed_bounded_and_provider_independent() {
+        let (store, binding) = bound_store(ProviderKind::Codex);
+        store
+            .apply_reduced_event(
+                &binding,
+                &completed_message(
+                    "user-search",
+                    ItemKind::UserMessage,
+                    "Please retry the SQLite migration safely",
+                ),
+            )
+            .expect("persist user message");
+        store
+            .apply_reduced_event(
+                &binding,
+                &completed_message(
+                    "agent-search",
+                    ItemKind::AgentMessage,
+                    "The retry now keeps every local projection intact",
+                ),
+            )
+            .expect("persist agent message");
+        store
+            .apply_reduced_event(
+                &binding,
+                &completed_message(
+                    "tool-search",
+                    ItemKind::CommandExecution,
+                    "secret-tool-only-needle",
+                ),
+            )
+            .expect("persist tool output");
+
+        let matches = store
+            .search_task_messages("retry SQLite", 20)
+            .expect("search messages");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].0, binding.task_id);
+        assert!(matches[0].1.to_lowercase().contains("retry"));
+        assert!(
+            store
+                .search_task_messages("secret-tool-only-needle", 20)
+                .expect("search tool-only text")
+                .is_empty()
+        );
+        assert!(
+            store
+                .search_task_messages("retry OR \\\"migration", 20)
+                .expect("sanitize FTS syntax")
+                .len()
+                <= 1
+        );
     }
 
     #[test]
@@ -1062,6 +1515,432 @@ mod tests {
     }
 
     #[test]
+    fn verified_native_skill_survives_snapshot_persistence() {
+        let (store, binding) = bound_store(ProviderKind::Codex);
+        let mut event = completed_message(
+            "user-native-skill",
+            ItemKind::UserMessage,
+            "/skill-creator build one",
+        );
+        let ProjectionMutation::ReplaceItem(item) = &mut event.mutation else {
+            panic!("expected completed message replacement");
+        };
+        item.native_skill = Some("skill-creator".into());
+
+        store
+            .apply_reduced_event(&binding, &event)
+            .expect("persist verified native skill");
+
+        let snapshot = store.task_snapshot(binding.task_id).expect("load snapshot");
+        let RuntimeProjection::ItemChanged { item } = &snapshot.events[0].projection else {
+            panic!("expected item snapshot");
+        };
+        assert_eq!(item.body.as_deref(), Some("/skill-creator build one"));
+        assert_eq!(item.native_skill.as_deref(), Some("skill-creator"));
+    }
+
+    #[test]
+    fn snapshot_collapses_streaming_item_deltas_to_the_latest_projection() {
+        let (store, binding) = bound_store(ProviderKind::Codex);
+        let occurred_at = Utc::now();
+
+        store
+            .apply_reduced_event(
+                &binding,
+                &append_message("message-1", "hello ", occurred_at, occurred_at),
+            )
+            .expect("persist first delta");
+        let latest = store
+            .apply_reduced_event(
+                &binding,
+                &append_message(
+                    "message-1",
+                    "world",
+                    occurred_at,
+                    occurred_at + chrono::Duration::milliseconds(10),
+                ),
+            )
+            .expect("persist second delta");
+        let other = store
+            .apply_reduced_event(
+                &binding,
+                &append_message(
+                    "message-2",
+                    "another item",
+                    occurred_at,
+                    occurred_at + chrono::Duration::milliseconds(20),
+                ),
+            )
+            .expect("persist other item");
+
+        let snapshot = store.task_snapshot(binding.task_id).expect("load snapshot");
+        assert_eq!(snapshot.watermark_seq, other.seq);
+        assert_eq!(snapshot.events.len(), 2);
+        assert_eq!(snapshot.events[0].seq, latest.seq);
+        assert_eq!(snapshot.events[0].occurred_at, occurred_at);
+        match &snapshot.events[0].projection {
+            RuntimeProjection::ItemChanged { item } => {
+                assert_eq!(item.body.as_deref(), Some("helloworld"));
+            }
+            projection => panic!("expected item projection, got {projection:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_keeps_singletons_and_approval_current_without_replaying_audit_json() {
+        let (store, binding) = bound_store(ProviderKind::Cursor);
+        let at = Utc::now();
+        let mutations = [
+            ProjectionMutation::Connection {
+                state: ConnectionState::Connected,
+                reason: None,
+            },
+            ProjectionMutation::Mode(ModeProjection {
+                current_mode_id: "agent".into(),
+                available_modes: vec![ModeOption {
+                    id: "agent".into(),
+                    name: "Agent".into(),
+                    description: Some("Provider-owned mode".into()),
+                }],
+            }),
+            ProjectionMutation::ApprovalRequested {
+                request_id: TransportRequestId::String("approval-request".into()),
+                approval_kind: ApprovalKind::CommandExecution,
+                item_id: "command-1".into(),
+                approval_id: Some("provider-approval-1".into()),
+                reason: Some("run tests".into()),
+                command: Some("cargo test".into()),
+                cwd: Some("H:/Code/integrator-3".into()),
+                plan_markdown: None,
+            },
+            ProjectionMutation::TurnError {
+                message: "provider disconnected".into(),
+                retryable: true,
+            },
+        ];
+        for (offset, mutation) in mutations.into_iter().enumerate() {
+            store
+                .apply_reduced_event(
+                    &binding,
+                    &ReducedProviderEvent {
+                        method: format!("fixture/{offset}"),
+                        thread_id: "thread-fixture".into(),
+                        turn_id: Some("turn-1".into()),
+                        audit_json: format!(r#"{{"offset":{offset}}}"#),
+                        audit_truncated: false,
+                        mutation,
+                        occurred_at: at + chrono::Duration::milliseconds(offset as i64),
+                    },
+                )
+                .expect("persist projection");
+        }
+
+        let snapshot = store.task_snapshot(binding.task_id).expect("load snapshot");
+        assert_eq!(snapshot.events.len(), 4);
+        assert!(snapshot.events.iter().any(|event| matches!(
+            &event.projection,
+            RuntimeProjection::ConnectionChanged {
+                state: ConnectionState::Connected,
+                ..
+            }
+        )));
+        assert!(snapshot.events.iter().any(|event| matches!(
+            &event.projection,
+            RuntimeProjection::ModeChanged { mode } if mode.current_mode_id == "agent"
+        )));
+        assert!(snapshot.events.iter().any(|event| matches!(
+            &event.projection,
+            RuntimeProjection::ApprovalChanged { approval }
+                if approval.state == ApprovalState::Pending
+        )));
+        assert!(snapshot.events.iter().any(|event| matches!(
+            &event.projection,
+            RuntimeProjection::TurnError {
+                retryable: true,
+                ..
+            }
+        )));
+        let connection = store.connection.lock();
+        let audit_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM codex_event_log WHERE task_id=?1",
+                [binding.task_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("audit count");
+        assert_eq!(
+            audit_count, 4,
+            "every accepted event remains in the audit log"
+        );
+        drop(connection);
+        assert_eq!(
+            redundant_event_projection_count(&store, binding.task_id),
+            0,
+            "current snapshots must not be copied into the append-only audit log"
+        );
+    }
+
+    #[test]
+    fn approval_client_events_keep_compact_audit_identity_without_projection_copies() {
+        let (store, binding) = bound_store(ProviderKind::Codex);
+        let requested = store
+            .apply_reduced_event(
+                &binding,
+                &ReducedProviderEvent {
+                    method: "item/commandExecution/requestApproval".into(),
+                    thread_id: "thread-fixture".into(),
+                    turn_id: Some("turn-approval".into()),
+                    audit_json: "{}".into(),
+                    audit_truncated: false,
+                    mutation: ProjectionMutation::ApprovalRequested {
+                        request_id: TransportRequestId::String("request-approval".into()),
+                        approval_kind: ApprovalKind::CommandExecution,
+                        item_id: "command-approval".into(),
+                        approval_id: Some("provider-approval".into()),
+                        reason: Some("run focused tests".into()),
+                        command: Some("cargo test -p session-store".into()),
+                        cwd: Some("H:/Code/integrator-3".into()),
+                        plan_markdown: None,
+                    },
+                    occurred_at: Utc::now(),
+                },
+            )
+            .expect("persist approval request");
+        let RuntimeProjection::ApprovalChanged { approval } = requested.projection else {
+            panic!("expected approval projection");
+        };
+
+        store
+            .prepare_approval_response(binding.task_id, &approval.id, ApprovalDecision::Accept)
+            .expect("prepare approval response");
+        store
+            .mark_approval_response_failed(&approval.id)
+            .expect("record provider response failure");
+
+        let audit_rows = {
+            let connection = store.connection.lock();
+            let mut statement = connection
+                .prepare(
+                    "SELECT method,audit_json FROM codex_event_log WHERE task_id=?1 AND method LIKE 'client/approval/%' ORDER BY seq",
+                )
+                .expect("prepare compact audit query");
+            statement
+                .query_map([binding.task_id.to_string()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .expect("query compact audit rows")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("collect compact audit rows")
+        };
+        assert_eq!(audit_rows.len(), 2);
+        assert_eq!(audit_rows[0].0, "client/approval/responding");
+        assert_eq!(audit_rows[1].0, "client/approval/response_failed");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&audit_rows[0].1)
+                .expect("parse responding audit"),
+            serde_json::json!({
+                "approvalId": approval.id,
+                "decision": "accept",
+                "state": "responding",
+            })
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&audit_rows[1].1)
+                .expect("parse response-failed audit"),
+            serde_json::json!({
+                "approvalId": approval.id,
+                "decision": "accept",
+                "state": "response_failed",
+            })
+        );
+        assert_eq!(redundant_event_projection_count(&store, binding.task_id), 0);
+    }
+
+    #[test]
+    fn reset_excludes_old_rows_and_restarts_first_seen_ordering() {
+        let (store, binding) = bound_store(ProviderKind::Codex);
+        let at = Utc::now();
+        store
+            .apply_reduced_event(&binding, &append_message("old-only", "old", at, at))
+            .expect("persist old-only item");
+        store
+            .apply_reduced_event(
+                &binding,
+                &append_message(
+                    "reused",
+                    "before reset",
+                    at,
+                    at + chrono::Duration::milliseconds(1),
+                ),
+            )
+            .expect("persist reused item");
+        let reset_at = at + chrono::Duration::milliseconds(2);
+        let reset = persist_reset(&store, &binding, reset_at);
+        let after_at = at + chrono::Duration::milliseconds(3);
+        let reused = store
+            .apply_reduced_event(
+                &binding,
+                &append_message("reused", " after reset", after_at, after_at),
+            )
+            .expect("persist post-reset item");
+
+        let snapshot = store.task_snapshot(binding.task_id).expect("load snapshot");
+        assert_eq!(snapshot.events.len(), 2);
+        assert_eq!(snapshot.events[0], reset);
+        assert_eq!(snapshot.events[1].seq, reused.seq);
+        assert_eq!(snapshot.events[1].occurred_at, after_at);
+        match &snapshot.events[1].projection {
+            RuntimeProjection::ItemChanged { item } => {
+                assert_eq!(item.body.as_deref(), Some("after reset"));
+            }
+            projection => panic!("expected item projection, got {projection:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_deltas_are_audited_and_current_rows_follow_latest_seq_order() {
+        let (store, binding) = bound_store(ProviderKind::Codex);
+        let at = Utc::now();
+        store
+            .apply_reduced_event(&binding, &append_message("a", "same", at, at))
+            .expect("persist first delta");
+        let b = store
+            .apply_reduced_event(
+                &binding,
+                &append_message("b", "middle", at, at + chrono::Duration::milliseconds(1)),
+            )
+            .expect("persist second item");
+        let a_latest = store
+            .apply_reduced_event(
+                &binding,
+                &append_message("a", "same", at, at + chrono::Duration::milliseconds(2)),
+            )
+            .expect("persist duplicate delta");
+
+        let snapshot = store.task_snapshot(binding.task_id).expect("load snapshot");
+        assert_eq!(snapshot.events.len(), 2);
+        assert_eq!(snapshot.events[0].seq, b.seq);
+        assert_eq!(snapshot.events[1].seq, a_latest.seq);
+        assert_eq!(snapshot.events[1].occurred_at, at);
+        match &snapshot.events[1].projection {
+            RuntimeProjection::ItemChanged { item } => {
+                assert_eq!(item.body.as_deref(), Some("samesame"));
+            }
+            projection => panic!("expected item projection, got {projection:?}"),
+        }
+        let connection = store.connection.lock();
+        let audit_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM codex_event_log WHERE task_id=?1",
+                [binding.task_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("audit count");
+        assert_eq!(audit_count, 3);
+    }
+
+    #[test]
+    fn stale_turn_settlement_survives_snapshot_restart() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let database = directory.path().join("projection.sqlite3");
+        let store = LocalStore::open(&database).expect("open store");
+        let task = store
+            .create_task(NewTask {
+                title: "Restart fixture".into(),
+                repository_path: None,
+                worktree_path: None,
+                runtime: None,
+                model: None,
+                effort: None,
+                parent_task_id: None,
+            })
+            .expect("create task");
+        let binding = store
+            .create_runtime_binding(task.id, "restart-process", ProviderKind::Codex)
+            .and_then(|binding| store.attach_provider_thread(&binding, "restart-thread"))
+            .expect("attach runtime");
+        let at = Utc::now();
+        store
+            .apply_reduced_event(
+                &binding,
+                &ReducedProviderEvent {
+                    method: "turn/started".into(),
+                    thread_id: "restart-thread".into(),
+                    turn_id: Some("restart-turn".into()),
+                    audit_json: "{}".into(),
+                    audit_truncated: false,
+                    mutation: ProjectionMutation::Turn(TurnProjection {
+                        id: "restart-turn".into(),
+                        status: TurnStatus::InProgress,
+                        stop_requested: false,
+                        error: None,
+                        started_at: Some(at),
+                        completed_at: None,
+                    }),
+                    occurred_at: at,
+                },
+            )
+            .expect("persist running turn");
+        let settled = store
+            .settle_stopped_turn(task.id)
+            .expect("settle stale turn")
+            .expect("settlement event");
+        drop(store);
+
+        let reopened = LocalStore::open(&database).expect("reopen store");
+        let snapshot = reopened.task_snapshot(task.id).expect("load snapshot");
+        assert_eq!(snapshot.watermark_seq, settled.seq);
+        assert_eq!(snapshot.events, vec![settled.clone()]);
+        assert!(matches!(
+            settled.projection,
+            RuntimeProjection::TurnChanged {
+                turn: TurnProjection {
+                    status: TurnStatus::Interrupted,
+                    stop_requested: true,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(redundant_event_projection_count(&reopened, task.id), 0);
+    }
+
+    #[test]
+    fn snapshot_does_not_parse_unmaterialized_adversarial_audit_rows() {
+        let (store, binding) = bound_store(ProviderKind::Codex);
+        let event = store
+            .apply_reduced_event(
+                &binding,
+                &append_message("message", "safe", Utc::now(), Utc::now()),
+            )
+            .expect("persist item");
+        let watermark = {
+            let connection = store.connection.lock();
+            connection
+                .execute(
+                    "INSERT INTO codex_event_log(task_id,provider_session_id,runtime_session_id,process_id,thread_id,turn_id,method,audit_json,audit_truncated,occurred_at,projection_json) VALUES (?1,?2,?3,?4,?5,NULL,'fixture/adversarial','not-json',1,?6,'{')",
+                    params![
+                        binding.task_id.to_string(),
+                        binding.provider_session_id.expect("provider session").to_string(),
+                        binding.runtime_session_id.to_string(),
+                        binding.process_id,
+                        binding.thread_id.as_deref().expect("thread"),
+                        Utc::now().to_rfc3339()
+                    ],
+                )
+                .expect("insert adversarial audit row");
+            connection.last_insert_rowid()
+        };
+        let snapshot = store.task_snapshot(binding.task_id).expect("load snapshot");
+        assert_eq!(snapshot.watermark_seq, watermark);
+        assert_eq!(snapshot.events, vec![event]);
+        assert_eq!(
+            redundant_event_projection_count(&store, binding.task_id),
+            1,
+            "only the deliberately malformed legacy fixture carries projection_json"
+        );
+    }
+
+    #[test]
     fn stop_request_is_state_idempotent_for_acp_sessions() {
         let (store, binding) = bound_store(ProviderKind::Cursor);
         let occurred_at = Utc::now();
@@ -1091,5 +1970,6 @@ mod tests {
         assert!(!first.result.already_requested);
         assert!(second.result.already_requested);
         assert_eq!(second.event.expect("stop event").provider, "cursor");
+        assert_eq!(redundant_event_projection_count(&store, binding.task_id), 0);
     }
 }

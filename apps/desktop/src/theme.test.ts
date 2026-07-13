@@ -9,9 +9,9 @@ import {
 } from "./theme";
 
 describe("semantic theme catalog", () => {
-  it("ships twelve coordinated presets with a complete semantic palette", () => {
-    expect(THEME_PRESETS).toHaveLength(12);
-    expect(new Set(THEME_PRESETS.map((preset) => preset.id)).size).toBe(12);
+  it("ships the full preset catalog with a complete semantic palette", () => {
+    expect(THEME_PRESETS).toHaveLength(19);
+    expect(new Set(THEME_PRESETS.map((preset) => preset.id)).size).toBe(19);
     for (const preset of THEME_PRESETS) {
       expect(Object.keys(preset.colors)).toHaveLength(THEME_COLOR_TOKENS.length);
       expect(preset.colors["diff.added"]).not.toBe(preset.colors["diff.removed"]);
@@ -40,7 +40,7 @@ describe("semantic theme catalog", () => {
   it("applies semantic compatibility aliases to a document root", () => {
     const root = document.createElement("div");
     applyThemePreferences(DEFAULT_THEME_PREFERENCES, root);
-    expect(root.dataset.theme).toBe("graphite");
+    expect(root.dataset.theme).toBe("integrator");
     expect(root.style.getPropertyValue("--color-accent-primary")).toBeTruthy();
     expect(root.style.getPropertyValue("--color-diff-added")).toBeTruthy();
   });

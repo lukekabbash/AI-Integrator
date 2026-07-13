@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProjectSummary, TerminalOutputEvent } from "../bridge";
 
 const { terminalMock } = vi.hoisted(() => ({
@@ -33,6 +33,8 @@ const project: ProjectSummary = {
 let outputListener: ((event: TerminalOutputEvent) => void) | undefined;
 
 describe("TerminalDrawer", () => {
+  afterEach(() => vi.restoreAllMocks());
+
   beforeEach(() => {
     for (const mock of Object.values(terminalMock)) mock.mockReset();
     outputListener = undefined;
@@ -63,23 +65,27 @@ describe("TerminalDrawer", () => {
     await waitFor(() =>
       expect(terminalMock.runTerminalCommand).toHaveBeenCalledWith("term-1", "npm test"),
     );
-    expect(screen.getByText(/npm test/)).toBeInTheDocument();
+    expect(await screen.findByText(/npm test/)).toBeInTheDocument();
 
-    outputListener?.({
-      sessionId: "term-1",
-      runId: "run-1",
-      stream: "stdout",
-      line: "1 passed",
-      cwd: "H:\\Code\\integrator-3",
+    act(() => {
+      outputListener?.({
+        sessionId: "term-1",
+        runId: "run-1",
+        stream: "stdout",
+        line: "1 passed",
+        cwd: "H:\\Code\\integrator-3",
+      });
     });
     expect(await screen.findByText("1 passed")).toBeInTheDocument();
 
-    outputListener?.({
-      sessionId: "term-1",
-      runId: "run-1",
-      stream: "exit",
-      exitCode: 2,
-      cwd: "H:\\Code\\integrator-3",
+    act(() => {
+      outputListener?.({
+        sessionId: "term-1",
+        runId: "run-1",
+        stream: "exit",
+        exitCode: 2,
+        cwd: "H:\\Code\\integrator-3",
+      });
     });
     expect(await screen.findByText("Exited with code 2")).toBeInTheDocument();
     expect(screen.getByRole("textbox", { name: "Terminal command" })).not.toBeDisabled();
@@ -107,8 +113,90 @@ describe("TerminalDrawer", () => {
     expect(
       await screen.findByText("The terminal is available in the native desktop app."),
     ).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "Terminal command" })).not.toBeInTheDocument();
+  });
+
+  it("batches burst output into one frame and progressively exposes full scrollback", async () => {
+    const frames: FrameRequestCallback[] = [];
+    const requestFrame = vi
+      .spyOn(window, "requestAnimationFrame")
+      .mockImplementation((callback) => {
+        frames.push(callback);
+        return frames.length;
+      });
+    vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => undefined);
+    render(<TerminalDrawer open project={project} onClose={() => undefined} />);
+    await screen.findByRole("textbox", { name: "Terminal command" });
+
+    act(() => {
+      for (let index = 0; index < 1_000; index += 1) {
+        outputListener?.({
+          sessionId: "term-1",
+          runId: "run-1",
+          stream: "stdout",
+          line: `burst-line-${index}`,
+          cwd: project.path,
+        });
+      }
+    });
+    expect(requestFrame).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("burst-line-999")).not.toBeInTheDocument();
+
+    act(() => frames.shift()?.(performance.now()));
+    const log = screen.getByRole("log");
+    expect(log.querySelectorAll("p")).toHaveLength(400);
+    expect(screen.getByText("Showing 400 of 1,000 saved lines")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show all 1,000 saved lines" }));
+    expect(log.querySelectorAll("p")).toHaveLength(1_000);
+    expect(screen.getByText("burst-line-999")).toBeInTheDocument();
+  });
+
+  it("freezes visible output when scrolled away and exposes queued latest lines", async () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => undefined);
+    render(<TerminalDrawer open project={project} onClose={() => undefined} />);
+    await screen.findByRole("textbox", { name: "Terminal command" });
+
+    act(() => {
+      for (let index = 0; index < 500; index += 1) {
+        outputListener?.({
+          sessionId: "term-1",
+          runId: "run-1",
+          stream: "stdout",
+          line: `anchored-line-${index}`,
+          cwd: project.path,
+        });
+      }
+      frames.shift()?.(performance.now());
+    });
+    const log = screen.getByRole("log");
+    Object.defineProperty(log, "scrollHeight", { configurable: true, value: 1_000 });
+    Object.defineProperty(log, "clientHeight", { configurable: true, value: 100 });
+    log.scrollTop = 0;
+    fireEvent.scroll(log);
+
+    act(() => {
+      for (let index = 500; index < 510; index += 1) {
+        outputListener?.({
+          sessionId: "term-1",
+          runId: "run-1",
+          stream: "stdout",
+          line: `anchored-line-${index}`,
+          cwd: project.path,
+        });
+      }
+      frames.shift()?.(performance.now());
+    });
+
     expect(
-      screen.queryByRole("textbox", { name: "Terminal command" }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("button", { name: "10 new lines · Jump to latest" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("anchored-line-509")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "10 new lines · Jump to latest" }));
+    expect(screen.getByText("anchored-line-509")).toBeInTheDocument();
   });
 });

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-acp-list-cursor-models"
+description = "Enables the acp_list_cursor_models command without any pre-configured scope."
+commands.allow = ["acp_list_cursor_models"]
+
+[[permission]]
+identifier = "deny-acp-list-cursor-models"
+description = "Denies the acp_list_cursor_models command without any pre-configured scope."
+commands.deny = ["acp_list_cursor_models"]

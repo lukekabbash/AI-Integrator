@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-task-set-state"
+description = "Enables the task_set_state command without any pre-configured scope."
+commands.allow = ["task_set_state"]
+
+[[permission]]
+identifier = "deny-task-set-state"
+description = "Denies the task_set_state command without any pre-configured scope."
+commands.deny = ["task_set_state"]

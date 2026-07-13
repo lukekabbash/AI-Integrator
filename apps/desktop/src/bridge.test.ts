@@ -19,9 +19,39 @@ import {
   extractCursorModelParams,
   formatBridgeError,
   mergeCursorModelParams,
+  parseDiffLines,
   resolveModelEffort,
   runtimeAuthWarning,
 } from "./bridge";
+
+describe("native Git diff parsing", () => {
+  it("preserves hunk line numbers for the review workspace", () => {
+    expect(
+      parseDiffLines(
+        "diff --git a/src/App.tsx b/src/App.tsx\nindex 1..2 100644\n--- a/src/App.tsx\n+++ b/src/App.tsx\n@@ -10,3 +10,4 @@ function App() {\n const ready = true;\n-old line\n+new line\n+second line\n }",
+      ),
+    ).toEqual([
+      { kind: "hunk", content: "@@ -10,3 +10,4 @@ function App() {" },
+      { kind: "context", oldNumber: 10, newNumber: 10, content: "const ready = true;" },
+      { kind: "delete", oldNumber: 11, content: "old line" },
+      { kind: "add", newNumber: 11, content: "new line" },
+      { kind: "add", newNumber: 12, content: "second line" },
+      { kind: "context", oldNumber: 12, newNumber: 13, content: "}" },
+    ]);
+  });
+
+  it("keeps source lines whose content begins with diff header markers", () => {
+    expect(
+      parseDiffLines(
+        "--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n---- removed heading\n++++ added heading",
+      ),
+    ).toEqual([
+      { kind: "hunk", content: "@@ -1 +1 @@" },
+      { kind: "delete", oldNumber: 1, content: "--- removed heading" },
+      { kind: "add", newNumber: 1, content: "+++ added heading" },
+    ]);
+  });
+});
 
 describe("local chat title derivation", () => {
   it("turns the first message into a compact goal label", () => {
@@ -350,6 +380,38 @@ describe("native trusted-project bridge", () => {
     expect(invokeMock).not.toHaveBeenCalled();
   });
 
+  it("uses the bounded local message-search command", async () => {
+    invokeMock.mockResolvedValue([{ taskId: "task-1", snippet: "matching local message" }]);
+
+    await expect(bridge.searchTaskMessages("local message", 40)).resolves.toEqual([
+      { taskId: "task-1", snippet: "matching local message" },
+    ]);
+    expect(invokeMock).toHaveBeenCalledWith("task_search_messages", {
+      query: "local message",
+      limit: 40,
+    });
+  });
+
+  it("keeps settings reads live after the startup handoff is consumed", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    await bridge.clearLocalData();
+    invokeMock.mockReset();
+    invokeMock
+      .mockResolvedValueOnce([{ key: "sample", value: "first", updatedAt: "2026-07-13T00:00:00Z" }])
+      .mockResolvedValueOnce([
+        { key: "sample", value: "second", updatedAt: "2026-07-13T00:00:01Z" },
+      ]);
+
+    await expect(bridge.listSettings()).resolves.toEqual([
+      { key: "sample", value: "first", updatedAt: "2026-07-13T00:00:00Z" },
+    ]);
+    await expect(bridge.listSettings()).resolves.toEqual([
+      { key: "sample", value: "second", updatedAt: "2026-07-13T00:00:01Z" },
+    ]);
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "setting_list", undefined);
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "setting_list", undefined);
+  });
+
   it("preserves serialized native error details", async () => {
     invokeMock.mockRejectedValue({
       code: "provider-disconnected",
@@ -365,6 +427,82 @@ describe("native trusted-project bridge", () => {
         "fallback",
       ),
     ).toBe("Cursor session is not bound to this task (provider-disconnected)");
+  });
+
+  it("keeps push preview and confirmed push as separate guarded commands", async () => {
+    const preview = {
+      head: "0123456789abcdef0123456789abcdef01234567",
+      branch: "main",
+      remote: "origin",
+      sanitizedRemoteUrl: "https://example.test/org/repo.git",
+      upstream: "origin/main",
+      ahead: 1,
+      behind: 0,
+      refspec: "refs/heads/main:refs/heads/main",
+      force: false as const,
+    };
+    const confirmation = {
+      expectedHead: preview.head,
+      expectedBranch: preview.branch,
+      expectedRemote: preview.remote,
+      expectedRemoteUrl: preview.sanitizedRemoteUrl,
+      expectedUpstream: preview.upstream,
+      expectedRefspec: preview.refspec,
+    };
+    const result = {
+      outcome: "pushed" as const,
+      head: preview.head,
+      branch: preview.branch,
+      remote: preview.remote,
+      refspec: preview.refspec,
+      summary: "Pushed to origin.",
+    };
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "local_export") {
+        return {
+          projects: [
+            {
+              id: "project-push",
+              displayName: "integrator-3",
+              repositoryRoot: "H:\\Code\\integrator-3",
+              gitCommonDirectory: "H:\\Code\\integrator-3\\.git",
+              createdAt: "2026-07-13T00:00:00Z",
+              lastOpenedAt: "2026-07-13T00:00:00Z",
+            },
+          ],
+          tasks: [
+            {
+              id: "task-push",
+              title: "Push guard",
+              repositoryPath: "H:\\Code\\integrator-3",
+              state: "ready",
+              pinned: false,
+              archived: false,
+              createdAt: "2026-07-13T00:00:00Z",
+              updatedAt: "2026-07-13T00:00:00Z",
+            },
+          ],
+          settings: [],
+          providerSessions: [],
+          runtimeSessions: [],
+        };
+      }
+      if (command === "git_push_preview") return preview;
+      if (command === "git_push_confirmed") return result;
+      return undefined;
+    });
+
+    await bridge.loadWorkspace();
+    await expect(bridge.previewPush("task-push")).resolves.toEqual(preview);
+    await expect(bridge.confirmPush("task-push", confirmation)).resolves.toEqual(result);
+
+    expect(invokeMock).toHaveBeenCalledWith("git_push_preview", {
+      repository: "H:\\Code\\integrator-3",
+    });
+    expect(invokeMock).toHaveBeenCalledWith("git_push_confirmed", {
+      repository: "H:\\Code\\integrator-3",
+      confirmation,
+    });
   });
 
   it("registers only the directory returned by the user-owned dialog", async () => {
@@ -388,6 +526,41 @@ describe("native trusted-project bridge", () => {
     );
     expect(invokeMock).toHaveBeenCalledWith("project_register", {
       path: "H:\\Code\\sample",
+    });
+  });
+
+  it("keeps external file actions typed and repository-scoped", async () => {
+    openMock.mockResolvedValue("H:\\Code\\file-actions");
+    invokeMock.mockResolvedValueOnce({
+      id: "project-file-actions",
+      displayName: "file-actions",
+      repositoryRoot: "H:\\Code\\file-actions",
+      gitCommonDirectory: "H:\\Code\\file-actions\\.git",
+      createdAt: "2026-07-13T09:00:00Z",
+      lastOpenedAt: "2026-07-13T09:00:00Z",
+    });
+    await bridge.openProject();
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValueOnce([
+      { id: "cursor", label: "Cursor", description: "Open in Cursor" },
+    ]);
+
+    await expect(bridge.listProjectFileOpeners("project-file-actions")).resolves.toEqual([
+      { id: "cursor", label: "Cursor", description: "Open in Cursor" },
+    ]);
+    await bridge.openProjectFileExternal("project-file-actions", "src/App.tsx", "cursor");
+    await bridge.revealProjectFile("project-file-actions", "src/App.tsx");
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "project_file_opener_list", {
+      repository: "H:\\Code\\file-actions",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "project_file_open", {
+      repository: "H:\\Code\\file-actions",
+      input: { path: "src/App.tsx", openerId: "cursor" },
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(3, "project_file_reveal", {
+      repository: "H:\\Code\\file-actions",
+      input: { path: "src/App.tsx" },
     });
   });
 
@@ -492,7 +665,9 @@ describe("native trusted-project bridge", () => {
 
     await bridge.loadWorkspace();
     const catalogPromise = bridge.listModelCatalog("cursor");
-    await vi.waitFor(() => expect(invokeMock).toHaveBeenCalledWith("acp_connect", expect.anything()));
+    await vi.waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("acp_connect", expect.anything()),
+    );
     const sendPromise = bridge.sendTurn({
       taskId: "task-cursor",
       prompt: "Reply with OK",
@@ -513,14 +688,392 @@ describe("native trusted-project bridge", () => {
     );
     await expect(sendPromise).resolves.toMatchObject({ kind: "user" });
     expect(invokeMock.mock.calls.filter(([command]) => command === "acp_connect")).toHaveLength(1);
-    expect(invokeMock.mock.calls.filter(([command]) => command === "acp_start_session")).toHaveLength(
-      1,
-    );
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "acp_start_session"),
+    ).toHaveLength(1);
     expect(invokeMock).toHaveBeenCalledWith("acp_send_turn", {
       taskId: "task-cursor",
       prompt: "Reply with OK",
       delegation: "off",
     });
+  });
+
+  it("keeps two Cursor chats on independent native runtimes", async () => {
+    invokeMock.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "app_bootstrap") return { value: {} };
+      if (command === "local_export") {
+        return {
+          projects: [
+            {
+              id: "project-durable",
+              displayName: "integrator-3",
+              repositoryRoot: "H:\\Code\\integrator-3",
+              gitCommonDirectory: "H:\\Code\\integrator-3\\.git",
+              createdAt: "2026-07-13T00:00:00Z",
+              lastOpenedAt: "2026-07-13T00:00:00Z",
+            },
+          ],
+          tasks: ["task-durable-a", "task-durable-b"].map((id) => ({
+            id,
+            title: id,
+            repositoryPath: "H:\\Code\\integrator-3",
+            state: "ready",
+            pinned: false,
+            archived: false,
+            runtime: "cursor",
+            model: "Provider default",
+            createdAt: "2026-07-13T00:00:00Z",
+            updatedAt: "2026-07-13T00:00:00Z",
+          })),
+          settings: [],
+          providerSessions: [],
+          runtimeSessions: [],
+        };
+      }
+      if (command === "acp_start_session") {
+        return { sessionId: `session-${String(args?.taskId)}` };
+      }
+      if (command === "acp_send_turn") return { turnId: `turn-${String(args?.taskId)}` };
+      return undefined;
+    });
+
+    await bridge.loadWorkspace();
+    const base = {
+      runtime: "cursor" as const,
+      model: "Provider default",
+      permission: "project-write" as const,
+      delegation: "off" as const,
+    };
+    await bridge.sendTurn({ ...base, taskId: "task-durable-a", prompt: "Run A" });
+    await bridge.sendTurn({ ...base, taskId: "task-durable-b", prompt: "Run B" });
+
+    expect(invokeMock.mock.calls.filter(([command]) => command === "acp_connect")).toEqual([
+      [
+        "acp_connect",
+        {
+          provider: "cursor",
+          workingDirectory: "H:\\Code\\integrator-3",
+          taskId: "task-durable-a",
+        },
+      ],
+      [
+        "acp_connect",
+        {
+          provider: "cursor",
+          workingDirectory: "H:\\Code\\integrator-3",
+          taskId: "task-durable-b",
+        },
+      ],
+    ]);
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "acp_start_session"),
+    ).toHaveLength(2);
+    expect(invokeMock.mock.calls.filter(([command]) => command === "acp_send_turn")).toHaveLength(
+      2,
+    );
+  });
+
+  it("scopes Codex connections and turns to their owning chat", async () => {
+    invokeMock.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "app_bootstrap") return { value: {} };
+      if (command === "local_export") {
+        return {
+          projects: [
+            {
+              id: "project-codex-durable",
+              displayName: "integrator-3",
+              repositoryRoot: "H:\\Code\\integrator-3",
+              gitCommonDirectory: "H:\\Code\\integrator-3\\.git",
+              createdAt: "2026-07-13T00:00:00Z",
+              lastOpenedAt: "2026-07-13T00:00:00Z",
+            },
+          ],
+          tasks: ["task-codex-a", "task-codex-b"].map((id) => ({
+            id,
+            title: id,
+            repositoryPath: "H:\\Code\\integrator-3",
+            state: "ready",
+            pinned: false,
+            archived: false,
+            runtime: "codex",
+            model: "Provider default",
+            createdAt: "2026-07-13T00:00:00Z",
+            updatedAt: "2026-07-13T00:00:00Z",
+          })),
+          settings: [],
+          providerSessions: [],
+          runtimeSessions: [],
+        };
+      }
+      if (command === "codex_start_thread") {
+        return { thread: { id: `thread-${String(args?.taskId)}` } };
+      }
+      if (command === "codex_start_turn") return { turn: { id: `turn-${String(args?.taskId)}` } };
+      return undefined;
+    });
+
+    await bridge.loadWorkspace();
+    const base = {
+      runtime: "codex" as const,
+      model: "Provider default",
+      permission: "project-write" as const,
+      delegation: "off" as const,
+    };
+    await bridge.sendTurn({ ...base, taskId: "task-codex-a", prompt: "Run Codex A" });
+    await bridge.sendTurn({ ...base, taskId: "task-codex-b", prompt: "Run Codex B" });
+
+    expect(invokeMock.mock.calls.filter(([command]) => command === "codex_connect")).toEqual([
+      ["codex_connect", { workingDirectory: "H:\\Code\\integrator-3", taskId: "task-codex-a" }],
+      ["codex_connect", { workingDirectory: "H:\\Code\\integrator-3", taskId: "task-codex-b" }],
+    ]);
+    expect(invokeMock).toHaveBeenCalledWith("codex_start_turn", {
+      taskId: "task-codex-a",
+      threadId: "thread-task-codex-a",
+      prompt: "Run Codex A",
+      repository: "H:\\Code\\integrator-3",
+    });
+    expect(invokeMock).toHaveBeenCalledWith("codex_start_turn", {
+      taskId: "task-codex-b",
+      threadId: "thread-task-codex-b",
+      prompt: "Run Codex B",
+      repository: "H:\\Code\\integrator-3",
+    });
+  });
+
+  it("replaces a persisted Codex thread that the provider no longer recognizes", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "app_bootstrap") return { value: {} };
+      if (command === "local_export") {
+        return {
+          projects: [
+            {
+              id: "project-codex-recovery",
+              displayName: "integrator-3",
+              repositoryRoot: "H:\\Code\\integrator-3",
+              gitCommonDirectory: "H:\\Code\\integrator-3\\.git",
+              createdAt: "2026-07-13T00:00:00Z",
+              lastOpenedAt: "2026-07-13T00:00:00Z",
+            },
+          ],
+          tasks: [
+            {
+              id: "task-codex-recovery",
+              title: "Recover Codex",
+              repositoryPath: "H:\\Code\\integrator-3",
+              state: "ready",
+              pinned: false,
+              archived: false,
+              runtime: "codex",
+              model: "Provider default",
+              createdAt: "2026-07-13T00:00:00Z",
+              updatedAt: "2026-07-13T00:00:00Z",
+            },
+          ],
+          settings: [],
+          providerSessions: [
+            {
+              taskId: "task-codex-recovery",
+              provider: "codex",
+              providerThreadId: "thread-missing-rollout",
+            },
+          ],
+          runtimeSessions: [],
+        };
+      }
+      if (command === "codex_resume_thread") {
+        throw {
+          code: "provider-protocol",
+          message:
+            "provider protocol error: -32600: no rollout found for thread id thread-missing-rollout",
+        };
+      }
+      if (command === "codex_start_thread") {
+        return { thread: { id: "thread-recovered" } };
+      }
+      if (command === "codex_start_turn") return { turn: { id: "turn-recovered" } };
+      return undefined;
+    });
+
+    await bridge.loadWorkspace();
+    await expect(
+      bridge.sendTurn({
+        taskId: "task-codex-recovery",
+        prompt: "/openai-docs build the chat app",
+        runtime: "codex",
+        model: "Provider default",
+        permission: "project-write",
+        delegation: "off",
+        nativeActionId: "opaque-openai-docs",
+      }),
+    ).resolves.toMatchObject({ kind: "user" });
+
+    expect(invokeMock).toHaveBeenCalledWith("codex_resume_thread", {
+      taskId: "task-codex-recovery",
+      threadId: "thread-missing-rollout",
+    });
+    expect(invokeMock).toHaveBeenCalledWith(
+      "codex_start_thread",
+      expect.objectContaining({ taskId: "task-codex-recovery" }),
+    );
+    expect(invokeMock).toHaveBeenCalledWith("codex_start_turn", {
+      taskId: "task-codex-recovery",
+      threadId: "thread-recovered",
+      prompt: "/openai-docs build the chat app",
+      repository: "H:\\Code\\integrator-3",
+      nativeActionId: "opaque-openai-docs",
+    });
+  });
+
+  it("retries once on a Codex thread lost between resume and turn start", async () => {
+    let threadStarts = 0;
+    let turnStarts = 0;
+    invokeMock.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "app_bootstrap") return { value: {} };
+      if (command === "local_export") {
+        return {
+          projects: [
+            {
+              id: "project-codex-race-recovery",
+              displayName: "integrator-3",
+              repositoryRoot: "H:\\Code\\integrator-3",
+              gitCommonDirectory: "H:\\Code\\integrator-3\\.git",
+              createdAt: "2026-07-13T00:00:00Z",
+              lastOpenedAt: "2026-07-13T00:00:00Z",
+            },
+          ],
+          tasks: [
+            {
+              id: "task-codex-race-recovery",
+              title: "Recover a Codex race",
+              repositoryPath: "H:\\Code\\integrator-3",
+              state: "ready",
+              pinned: false,
+              archived: false,
+              runtime: "codex",
+              model: "Provider default",
+              createdAt: "2026-07-13T00:00:00Z",
+              updatedAt: "2026-07-13T00:00:00Z",
+            },
+          ],
+          settings: [],
+          providerSessions: [],
+          runtimeSessions: [],
+        };
+      }
+      if (command === "codex_start_thread") {
+        threadStarts += 1;
+        return { thread: { id: `thread-race-${threadStarts}` } };
+      }
+      if (command === "codex_start_turn") {
+        turnStarts += 1;
+        if (turnStarts === 1) {
+          throw {
+            code: "provider-protocol",
+            message: `provider protocol error: -32600: no rollout found for thread id ${String(
+              args?.threadId,
+            )}`,
+          };
+        }
+        return { turn: { id: "turn-after-race" } };
+      }
+      return undefined;
+    });
+
+    await bridge.loadWorkspace();
+    await expect(
+      bridge.sendTurn({
+        taskId: "task-codex-race-recovery",
+        prompt: "/openai-docs build the chat app",
+        runtime: "codex",
+        model: "Provider default",
+        permission: "project-write",
+        delegation: "off",
+        nativeActionId: "opaque-openai-docs-race",
+      }),
+    ).resolves.toMatchObject({ kind: "user" });
+
+    expect(threadStarts).toBe(2);
+    expect(turnStarts).toBe(2);
+    expect(invokeMock).toHaveBeenLastCalledWith("codex_start_turn", {
+      taskId: "task-codex-race-recovery",
+      threadId: "thread-race-2",
+      prompt: "/openai-docs build the chat app",
+      repository: "H:\\Code\\integrator-3",
+      nativeActionId: "opaque-openai-docs-race",
+    });
+  });
+
+  it("does not discard a healthy Codex connection for a stale action error", async () => {
+    let turnStarts = 0;
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "app_bootstrap") return { value: {} };
+      if (command === "local_export") {
+        return {
+          projects: [
+            {
+              id: "project-codex-stale-action",
+              displayName: "integrator-3",
+              repositoryRoot: "H:\\Code\\integrator-3",
+              gitCommonDirectory: "H:\\Code\\integrator-3\\.git",
+              createdAt: "2026-07-13T00:00:00Z",
+              lastOpenedAt: "2026-07-13T00:00:00Z",
+            },
+          ],
+          tasks: [
+            {
+              id: "task-codex-stale-action",
+              title: "Keep Codex connected",
+              repositoryPath: "H:\\Code\\integrator-3",
+              state: "ready",
+              pinned: false,
+              archived: false,
+              runtime: "codex",
+              model: "Provider default",
+              createdAt: "2026-07-13T00:00:00Z",
+              updatedAt: "2026-07-13T00:00:00Z",
+            },
+          ],
+          settings: [],
+          providerSessions: [],
+          runtimeSessions: [],
+        };
+      }
+      if (command === "codex_start_thread") return { thread: { id: "thread-stale-action" } };
+      if (command === "codex_start_turn") {
+        turnStarts += 1;
+        if (turnStarts === 1) {
+          throw {
+            code: "stale-native-action",
+            message: "This provider action changed; open the slash menu and choose it again",
+          };
+        }
+        return { turn: { id: "turn-after-reselection" } };
+      }
+      return undefined;
+    });
+    const input = {
+      taskId: "task-codex-stale-action",
+      prompt: "/openai-docs build the chat app",
+      runtime: "codex" as const,
+      model: "Provider default",
+      permission: "project-write" as const,
+      delegation: "off" as const,
+      nativeActionId: "opaque-openai-docs-stale",
+    };
+
+    await bridge.loadWorkspace();
+    await expect(bridge.sendTurn(input)).rejects.toThrow("This provider action changed");
+    await expect(bridge.sendTurn(input)).resolves.toMatchObject({ kind: "user" });
+
+    expect(invokeMock.mock.calls.filter(([command]) => command === "codex_connect")).toHaveLength(
+      1,
+    );
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "codex_start_thread"),
+    ).toHaveLength(1);
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "codex_resume_thread"),
+    ).toHaveLength(0);
   });
 
   it("opens an HTTP(S) link through the narrow native browser command after consent", async () => {
@@ -695,6 +1248,16 @@ describe("browser fallback usage evidence", () => {
         expect.objectContaining({ label: "Subscription usage", provenance: "unavailable" }),
       ]),
     );
+  });
+
+  it("searches only user and assistant message text in browser-local history", async () => {
+    await expect(bridge.searchTaskMessages("typed local bridge")).resolves.toEqual([
+      expect.objectContaining({
+        taskId: "v1-shell",
+        snippet: expect.stringMatching(/typed local bridge/i),
+      }),
+    ]);
+    await expect(bridge.searchTaskMessages("Read 12 product contracts")).resolves.toEqual([]);
   });
 
   it("does not offer browser storage for the BYOK key", async () => {

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-project-file-reveal"
+description = "Enables the project_file_reveal command without any pre-configured scope."
+commands.allow = ["project_file_reveal"]
+
+[[permission]]
+identifier = "deny-project-file-reveal"
+description = "Denies the project_file_reveal command without any pre-configured scope."
+commands.deny = ["project_file_reveal"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-delegation-approve"
+description = "Enables the delegation_approve command without any pre-configured scope."
+commands.allow = ["delegation_approve"]
+
+[[permission]]
+identifier = "deny-delegation-approve"
+description = "Denies the delegation_approve command without any pre-configured scope."
+commands.deny = ["delegation_approve"]

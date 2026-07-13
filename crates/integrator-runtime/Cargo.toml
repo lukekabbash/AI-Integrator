@@ -12,6 +12,7 @@ dunce.workspace = true
 integrator-core = { path = "../integrator-core" }
 serde.workspace = true
 serde_json.workspace = true
+similar.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true

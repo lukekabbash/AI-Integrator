@@ -53,10 +53,24 @@ pub struct DelegationProfile {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
+    #[serde(default)]
+    pub instruction: Option<String>,
+    #[serde(default)]
+    pub preferred_child_profile_ids: Vec<String>,
     #[serde(default = "default_cost_tier")]
     pub cost_tier: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegationRoutingInput {
+    pub runtime: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 fn default_cost_tier() -> String {
@@ -86,6 +100,8 @@ fn default_profiles() -> Vec<DelegationProfile> {
             runtime: "codex".into(),
             model: None,
             effort: None,
+            instruction: None,
+            preferred_child_profile_ids: Vec::new(),
             cost_tier: "low".into(),
             enabled: true,
         },
@@ -95,6 +111,8 @@ fn default_profiles() -> Vec<DelegationProfile> {
             runtime: "claude".into(),
             model: None,
             effort: None,
+            instruction: None,
+            preferred_child_profile_ids: Vec::new(),
             cost_tier: "high".into(),
             enabled: true,
         },
@@ -104,6 +122,8 @@ fn default_profiles() -> Vec<DelegationProfile> {
             runtime: "antigravity".into(),
             model: None,
             effort: None,
+            instruction: None,
+            preferred_child_profile_ids: Vec::new(),
             cost_tier: "medium".into(),
             enabled: true,
         },
@@ -209,11 +229,32 @@ pub fn pending_updates_block(store: &LocalStore, parent_task_id: TaskId) -> Opti
     Some(block)
 }
 
-fn child_preamble(delegation: &Delegation, has_tools: bool) -> String {
+fn child_preamble(
+    delegation: &Delegation,
+    has_tools: bool,
+    profile: Option<&DelegationProfile>,
+    preferred_children: &[String],
+) -> String {
     let mut block = format!(
         "<subagent-brief>\nYou are a delegated subagent working on behalf of an orchestrator agent in this repository. Your assignment: {}\n\n{}\n",
         delegation.title, delegation.brief
     );
+    if let Some(instruction) = profile
+        .and_then(|profile| profile.instruction.as_deref())
+        .map(str::trim)
+        .filter(|instruction| !instruction.is_empty())
+    {
+        block.push_str("\n<specialist-instructions>\n");
+        block.push_str(&redact_and_bound(instruction, 64 * 1024).0);
+        block.push_str("\n</specialist-instructions>\n");
+    }
+    if !preferred_children.is_empty() {
+        block.push_str("\nPreferred downstream helper profiles: ");
+        block.push_str(&preferred_children.join(", "));
+        block.push_str(
+            ". Recursive launching is policy-gated; use this preference when proposing or reporting follow-up delegation.\n",
+        );
+    }
     if has_tools {
         block.push_str(
             "Use the `integrator` MCP tools: task_complete(summary) when your assignment is done (always call it — the summary is your deliverable), orchestrator_ask(message) to queue a question (asynchronous — finish what you can while waiting), orchestrator_report(message) for progress notes on long work.\n",
@@ -433,8 +474,14 @@ async fn dispatch_tool(
             let delegation = scoped_delegation(app, task_id, params)?;
             let message = text_param(params, "message")
                 .ok_or_else(|| IntegratorError::InvalidInput("message is required".into()))?;
-            queue_message_to_child(app, delegation.id, DelegationSender::Orchestrator, &message)
-                .await
+            queue_message_to_child(
+                app,
+                delegation.id,
+                DelegationSender::Orchestrator,
+                &message,
+                None,
+            )
+            .await
         }
         ("orchestrator", "delegation_result") => {
             let task_id = orchestrator_scope(session)?;
@@ -539,6 +586,8 @@ fn peers_list(app: &AppHandle<tauri::Wry>, task_id: TaskId, mode: &str) -> Resul
             "runtime": profile.runtime,
             "model": profile.model,
             "reasoningEffort": profile.effort,
+            "specialistInstruction": profile.instruction.as_deref().map(|value| redact_and_bound(value, 64 * 1024).0),
+            "preferredChildProfileIds": profile.preferred_child_profile_ids,
             "costTier": profile.cost_tier,
         })).collect::<Vec<_>>(),
         "mode": mode,
@@ -697,6 +746,24 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
         })?;
 
     let provider = ProviderKind::from_str(&delegation.runtime)?;
+    let configured_profiles = delegation_profiles(&state.store);
+    let profile = configured_profiles
+        .iter()
+        .find(|profile| profile.id == delegation.profile_id);
+    let preferred_children = profile
+        .map(|profile| {
+            profile
+                .preferred_child_profile_ids
+                .iter()
+                .filter_map(|id| {
+                    configured_profiles
+                        .iter()
+                        .find(|candidate| candidate.id == *id && candidate.enabled)
+                        .map(|candidate| candidate.label.clone())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let child_task = state.store.create_task(integrator_core::NewTask {
         title: format!("Subagent · {}", delegation.title),
         repository_path: parent.repository_path.clone(),
@@ -735,7 +802,12 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
     let child = match provider {
         ProviderKind::Claude | ProviderKind::Antigravity => {
             let has_tools = matches!(provider, ProviderKind::Claude) && broker.is_some();
-            first_prompt.push_str(&child_preamble(&delegation, has_tools));
+            first_prompt.push_str(&child_preamble(
+                &delegation,
+                has_tools,
+                profile,
+                &preferred_children,
+            ));
             let mcp_config = match (&broker, provider.clone()) {
                 (Some(info), ProviderKind::Claude) => Some(write_mcp_config(
                     &app,
@@ -758,7 +830,12 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
             .await?
         }
         ProviderKind::Codex => {
-            first_prompt.push_str(&child_preamble(&delegation, false));
+            first_prompt.push_str(&child_preamble(
+                &delegation,
+                false,
+                profile,
+                &preferred_children,
+            ));
             spawn_codex_child(&app, &delegation, child_task.id, executable, cwd).await?
         }
         other => {
@@ -786,6 +863,71 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
     Ok(())
 }
 
+/// Recreates a provider driver for an existing child task. This is used after
+/// app/process closure, an explicit Stop, a failed child, or a user-selected
+/// provider/model change. The durable child task remains the transcript owner.
+async fn respawn_existing_child(
+    app: &AppHandle<tauri::Wry>,
+    delegation: &Delegation,
+) -> Result<Arc<DelegationChild>> {
+    let state = app.state::<AppState>();
+    let child_task_id = delegation.child_task_id.ok_or_else(|| {
+        IntegratorError::InvalidInput("delegation has no child task to resume".into())
+    })?;
+    let parent = state.store.get_task(delegation.parent_task_id)?;
+    let cwd = parent
+        .worktree_path
+        .clone()
+        .or_else(|| parent.repository_path.clone())
+        .ok_or_else(|| {
+            IntegratorError::InvalidInput(
+                "parent task has no repository/worktree for delegation".into(),
+            )
+        })?;
+    let provider = ProviderKind::from_str(&delegation.runtime)?;
+    let statuses = tauri::async_runtime::spawn_blocking(discover_providers)
+        .await
+        .map_err(|_| IntegratorError::Unavailable("provider discovery failed".into()))?;
+    let executable = provider_executable(&statuses, provider.clone()).ok_or_else(|| {
+        IntegratorError::Unavailable(format!("{} CLI is not installed", provider.as_str()))
+    })?;
+    let broker = state.broker.lock().expect("broker lock").clone();
+    let child = match provider {
+        ProviderKind::Claude | ProviderKind::Antigravity => {
+            let mcp_config = match (&broker, provider.clone()) {
+                (Some(info), ProviderKind::Claude) => Some(write_mcp_config(
+                    app,
+                    info,
+                    "child",
+                    &delegation.id.to_string(),
+                    "off",
+                )?),
+                _ => None,
+            };
+            spawn_structured_child(
+                app,
+                delegation,
+                child_task_id,
+                provider,
+                executable,
+                cwd,
+                mcp_config,
+            )
+            .await?
+        }
+        ProviderKind::Codex => {
+            spawn_codex_child(app, delegation, child_task_id, executable, cwd).await?
+        }
+        other => {
+            return Err(IntegratorError::InvalidInput(format!(
+                "{} is not a supported delegation target in v1",
+                other.as_str()
+            )));
+        }
+    };
+    Ok(Arc::new(child))
+}
+
 async fn spawn_structured_child(
     app: &AppHandle<tauri::Wry>,
     delegation: &Delegation,
@@ -804,13 +946,16 @@ async fn spawn_structured_child(
             .store
             .create_runtime_binding(child_task_id, &process_id, provider.clone())?;
     let binding = state.store.attach_provider_thread(&binding, &thread_id)?;
+    let session_ref = Arc::new(std::sync::Mutex::new(None));
     let runtime = StructuredRuntime {
         client: client.clone(),
         process_id,
+        alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         binding: Arc::new(std::sync::Mutex::new(Some(binding.clone()))),
         current_turn: Arc::new(std::sync::Mutex::new(None)),
         last_diagnostic: Arc::new(std::sync::Mutex::new(None)),
         permission_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        session_ref: Arc::clone(&session_ref),
     };
     crate::commands::spawn_structured_cli_pump(
         app.clone(),
@@ -831,7 +976,7 @@ async fn spawn_structured_child(
             model: delegation.model.clone(),
             effort: delegation.effort.clone(),
             mcp_config,
-            session_ref: Arc::new(std::sync::Mutex::new(None)),
+            session_ref,
         },
     };
     watch_structured_child(app.clone(), &child, client);
@@ -887,8 +1032,10 @@ async fn spawn_codex_child(
     let runtime = CodexRuntime {
         client: client.clone(),
         process_id,
+        alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         binding: Arc::new(std::sync::Mutex::new(Some(binding))),
         context_primer: Arc::new(std::sync::Mutex::new(None)),
+        pending_native_skill: Arc::new(std::sync::Mutex::new(None)),
     };
     crate::commands::spawn_projection_pump(app.clone(), Arc::clone(&state.store), runtime.clone());
     let child = DelegationChild {
@@ -912,42 +1059,49 @@ async fn start_child_turn(
     prompt: String,
 ) -> Result<()> {
     *child.busy.lock().expect("busy lock") = true;
-    match &child.driver {
-        DelegationChildDriver::Structured {
-            runtime,
-            provider,
-            executable,
-            cwd,
-            model,
-            effort,
-            mcp_config,
-            session_ref,
-        } => {
-            let structured_provider = match provider {
-                ProviderKind::Claude => StructuredCliProvider::Claude,
-                _ => StructuredCliProvider::Antigravity,
-            };
-            let options = StructuredCliLaunchOptions {
-                provider: structured_provider,
-                executable: executable.clone(),
-                working_directory: cwd.clone(),
-                model: model.clone(),
-                effort: effort.clone(),
-                resume_session_id: session_ref.lock().expect("session lock").clone(),
-                permission_mode: StructuredPermissionMode::AcceptEdits,
-                mcp_config_path: mcp_config.clone(),
-            };
-            let turn_id = runtime.client.start_turn(options, prompt.clone()).await?;
-            *runtime.current_turn.lock().expect("turn lock") = Some(turn_id.clone());
-            if let Some(binding) = runtime.binding.lock().expect("binding lock").clone() {
-                emit_child_turn_started(app, &binding, &turn_id, &prompt);
+    let result: Result<()> = async {
+        match &child.driver {
+            DelegationChildDriver::Structured {
+                runtime,
+                provider,
+                executable,
+                cwd,
+                model,
+                effort,
+                mcp_config,
+                session_ref,
+            } => {
+                let structured_provider = match provider {
+                    ProviderKind::Claude => StructuredCliProvider::Claude,
+                    _ => StructuredCliProvider::Antigravity,
+                };
+                let options = StructuredCliLaunchOptions {
+                    provider: structured_provider,
+                    executable: executable.clone(),
+                    working_directory: cwd.clone(),
+                    model: model.clone(),
+                    effort: effort.clone(),
+                    resume_session_id: session_ref.lock().expect("session lock").clone(),
+                    permission_mode: StructuredPermissionMode::AcceptEdits,
+                    mcp_config_path: mcp_config.clone(),
+                };
+                let turn_id = runtime.client.start_turn(options, prompt.clone()).await?;
+                *runtime.current_turn.lock().expect("turn lock") = Some(turn_id.clone());
+                if let Some(binding) = runtime.binding.lock().expect("binding lock").clone() {
+                    emit_child_turn_started(app, &binding, &turn_id, &prompt);
+                }
+            }
+            DelegationChildDriver::Codex { runtime, thread_id } => {
+                runtime.client.start_turn(thread_id, &prompt).await?;
             }
         }
-        DelegationChildDriver::Codex { runtime, thread_id } => {
-            runtime.client.start_turn(thread_id, &prompt).await?;
-        }
+        Ok(())
     }
-    Ok(())
+    .await;
+    if result.is_err() {
+        *child.busy.lock().expect("busy lock") = false;
+    }
+    result
 }
 
 fn emit_child_turn_started(
@@ -974,6 +1128,7 @@ fn emit_child_turn_started(
             status: ItemStatus::Completed,
             title: None,
             body: Some(redact_and_bound(prompt, 2 * 1024 * 1024).0),
+            native_skill: None,
             command: None,
             cwd: None,
             output: None,
@@ -1015,6 +1170,7 @@ fn watch_structured_child(
     client: integrator_runtime::StructuredCliClient,
 ) {
     let delegation_id = child.delegation_id;
+    let child_identity = Arc::clone(&child.busy);
     let session_ref = match &child.driver {
         DelegationChildDriver::Structured { session_ref, .. } => Arc::clone(session_ref),
         DelegationChildDriver::Codex { .. } => return,
@@ -1041,7 +1197,7 @@ fn watch_structured_child(
             }
             if let StructuredCliEventKind::Exited { code, cancelled } = &event.event {
                 let failed = !cancelled && *code != Some(0);
-                child_turn_settled(app.clone(), delegation_id, failed).await;
+                child_turn_settled(app.clone(), delegation_id, failed, &child_identity).await;
             }
         }
     });
@@ -1055,6 +1211,7 @@ fn watch_codex_child(
     client: adapter_codex::CodexClient,
 ) {
     let delegation_id = child.delegation_id;
+    let child_identity = Arc::clone(&child.busy);
     let mut receiver = client.subscribe();
     tauri::async_runtime::spawn(async move {
         while let Ok(event) = receiver.recv().await {
@@ -1066,11 +1223,12 @@ fn watch_codex_child(
                             .and_then(|turn| turn.get("status"))
                             .and_then(Value::as_str)
                             == Some("failed");
-                        child_turn_settled(app.clone(), delegation_id, failed).await;
+                        child_turn_settled(app.clone(), delegation_id, failed, &child_identity)
+                            .await;
                     }
                 }
                 adapter_codex::CodexEvent::Exited => {
-                    child_turn_settled(app.clone(), delegation_id, true).await;
+                    child_turn_settled(app.clone(), delegation_id, true, &child_identity).await;
                     break;
                 }
                 _ => {}
@@ -1082,7 +1240,12 @@ fn watch_codex_child(
 /// The delegation state machine tick that runs whenever a child turn ends:
 /// deliver queued orchestrator/user messages as the next turn, otherwise go
 /// idle (`waiting`), or settle terminal states.
-async fn child_turn_settled(app: AppHandle<tauri::Wry>, delegation_id: DelegationId, failed: bool) {
+async fn child_turn_settled(
+    app: AppHandle<tauri::Wry>,
+    delegation_id: DelegationId,
+    failed: bool,
+    child_identity: &Arc<std::sync::Mutex<bool>>,
+) {
     let state = app.state::<AppState>();
     let Some(child) = state
         .delegation_children
@@ -1093,6 +1256,11 @@ async fn child_turn_settled(app: AppHandle<tauri::Wry>, delegation_id: Delegatio
     else {
         return;
     };
+    // A provider being replaced can emit one final settlement after its new
+    // driver is registered. Ignore that stale generation completely.
+    if !Arc::ptr_eq(&child.busy, child_identity) {
+        return;
+    }
     *child.busy.lock().expect("busy lock") = false;
     let completed = *child.completed.lock().expect("completed lock");
     let Ok(delegation) = state.store.get_delegation(delegation_id) else {
@@ -1137,6 +1305,14 @@ async fn deliver_queued_messages(
     app: &AppHandle<tauri::Wry>,
     child: &Arc<DelegationChild>,
 ) -> Result<bool> {
+    deliver_queued_messages_with_context(app, child, false).await
+}
+
+async fn deliver_queued_messages_with_context(
+    app: &AppHandle<tauri::Wry>,
+    child: &Arc<DelegationChild>,
+    include_continuation_context: bool,
+) -> Result<bool> {
     let state = app.state::<AppState>();
     if *child.busy.lock().expect("busy lock") {
         return Ok(true);
@@ -1147,21 +1323,35 @@ async fn deliver_queued_messages(
     if messages.is_empty() {
         return Ok(false);
     }
-    let mut prompt = String::from("<orchestrator-message>\nNew guidance from your orchestrator:\n");
+    let mut prompt = String::new();
+    if include_continuation_context {
+        if let Some(digest) = state
+            .store
+            .task_conversation_digest(child.child_task_id, CHILD_DIGEST_BYTES)
+            .ok()
+            .flatten()
+        {
+            prompt.push_str(&format!(
+                "<continuation-context>\nYou are continuing the same delegated conversation through a fresh provider session. Recent locally persisted transcript:\n\n{digest}\n</continuation-context>\n\n"
+            ));
+        }
+    }
+    prompt.push_str("<orchestrator-message>\nNew guidance from your orchestrator:\n");
     for message in &messages {
         prompt.push_str(&format!("- {}\n", message.body));
     }
     prompt.push_str("</orchestrator-message>\nContinue your assignment accordingly.");
-    state.store.mark_delegation_messages_delivered(
-        &messages
-            .iter()
-            .map(|message| message.id.clone())
-            .collect::<Vec<_>>(),
-    )?;
+    let message_ids = messages
+        .iter()
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
     let _ = state
         .store
         .update_delegation_status(child.delegation_id, DelegationStatus::Running);
     start_child_turn(app, child, prompt).await?;
+    state
+        .store
+        .mark_delegation_messages_delivered(&message_ids)?;
     Ok(true)
 }
 
@@ -1172,39 +1362,137 @@ pub async fn queue_message_to_child(
     delegation_id: DelegationId,
     sender: DelegationSender,
     message: &str,
+    routing: Option<DelegationRoutingInput>,
 ) -> Result<Value> {
     let state = app.state::<AppState>();
-    let delegation = state.store.get_delegation(delegation_id)?;
-    if !matches!(
+    let mut delegation = state.store.get_delegation(delegation_id)?;
+    if matches!(
         delegation.status,
-        DelegationStatus::Running | DelegationStatus::Waiting | DelegationStatus::Starting
+        DelegationStatus::PendingApproval | DelegationStatus::Denied | DelegationStatus::Starting
     ) {
         return Err(IntegratorError::InvalidInput(format!(
-            "delegation is {}; messages can only reach active subagents",
+            "delegation is {}; it cannot receive a message yet",
             delegation.status.as_str()
         )));
     }
-    state
-        .store
-        .add_delegation_message(delegation_id, sender, message)?;
-    let child = state
+
+    let requested_route = routing.map(|routing| DelegationRoutingInput {
+        runtime: routing.runtime.trim().to_owned(),
+        model: routing.model.filter(|value| !value.trim().is_empty()),
+        effort: routing.effort.filter(|value| !value.trim().is_empty()),
+    });
+    if let Some(route) = &requested_route {
+        let provider = ProviderKind::from_str(&route.runtime)?;
+        if !matches!(
+            provider,
+            ProviderKind::Codex | ProviderKind::Claude | ProviderKind::Antigravity
+        ) {
+            return Err(IntegratorError::InvalidInput(format!(
+                "{} is not a supported delegation target in v1",
+                provider.as_str()
+            )));
+        }
+    }
+    let route_changed = requested_route.as_ref().is_some_and(|route| {
+        route.runtime != delegation.runtime
+            || route.model.as_deref() != delegation.model.as_deref()
+            || route.effort.as_deref() != delegation.effort.as_deref()
+    });
+    let existing_child = state
         .delegation_children
         .lock()
         .await
         .get(&delegation_id.to_string())
         .cloned();
-    let delivered = match child {
-        Some(child) if !*child.busy.lock().expect("busy lock") => {
-            deliver_queued_messages(app, &child).await.unwrap_or(false)
+    if route_changed
+        && existing_child
+            .as_ref()
+            .is_some_and(|child| *child.busy.lock().expect("busy lock"))
+    {
+        return Err(IntegratorError::InvalidInput(
+            "stop the active subagent turn before changing its provider or model".into(),
+        ));
+    }
+
+    if let Some(route) = requested_route.filter(|_| route_changed) {
+        delegation = state.store.update_delegation_routing(
+            delegation_id,
+            &route.runtime,
+            route.model.as_deref(),
+            route.effort.as_deref(),
+        )?;
+        if let Some(child_task_id) = delegation.child_task_id {
+            state.store.update_task_routing(
+                child_task_id,
+                &delegation.runtime,
+                delegation.model.as_deref().unwrap_or("Provider default"),
+                delegation.effort.as_deref(),
+            )?;
         }
-        _ => false,
+    }
+
+    state
+        .store
+        .add_delegation_message(delegation_id, sender, message)?;
+
+    let rebuild =
+        route_changed || existing_child.is_none() || delegation.status == DelegationStatus::Failed;
+    let child = if rebuild {
+        let previous = state
+            .delegation_children
+            .lock()
+            .await
+            .remove(&delegation_id.to_string());
+        if let Some(previous) = previous {
+            if let DelegationChildDriver::Codex { runtime, .. } = &previous.driver {
+                let _ = state.store.expire_process_approvals(&runtime.process_id);
+                let _ = runtime.client.shutdown().await;
+            }
+        }
+        let child = match respawn_existing_child(app, &delegation).await {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = state
+                    .store
+                    .update_delegation_status(delegation_id, DelegationStatus::Failed);
+                emit_update(app, delegation.parent_task_id);
+                return Err(error);
+            }
+        };
+        state
+            .delegation_children
+            .lock()
+            .await
+            .insert(delegation_id.to_string(), Arc::clone(&child));
+        child
+    } else {
+        existing_child.expect("existing child checked above")
+    };
+
+    let busy = *child.busy.lock().expect("busy lock");
+    let delivered = if busy {
+        false
+    } else {
+        *child.completed.lock().expect("completed lock") = false;
+        state.store.reopen_delegation(delegation_id)?;
+        match deliver_queued_messages_with_context(app, &child, rebuild).await {
+            Ok(delivered) => delivered,
+            Err(error) => {
+                let _ = state
+                    .store
+                    .update_delegation_status(delegation_id, DelegationStatus::Failed);
+                emit_update(app, delegation.parent_task_id);
+                return Err(error);
+            }
+        }
     };
     emit_update(app, delegation.parent_task_id);
     Ok(json!({
         "queued": true,
         "delivered": delivered,
+        "reopened": rebuild || !delegation.status.is_active(),
         "note": if delivered {
-            "The subagent was idle; your message started its next turn."
+            "The subagent was ready; your message started its next turn."
         } else {
             "The subagent is mid-turn; your message is queued and will be delivered when it settles."
         },
@@ -1364,10 +1652,17 @@ pub async fn delegation_send_message(
     app: AppHandle<tauri::Wry>,
     delegation_id: DelegationId,
     message: String,
+    routing: Option<DelegationRoutingInput>,
 ) -> CommandResult<Value> {
-    queue_message_to_child(&app, delegation_id, DelegationSender::User, &message)
-        .await
-        .map_err(Into::into)
+    queue_message_to_child(
+        &app,
+        delegation_id,
+        DelegationSender::User,
+        &message,
+        routing,
+    )
+    .await
+    .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -1421,5 +1716,41 @@ mod tests {
         assert!(preamble.contains("budget-first"));
         assert!(preamble.contains("Prefer Codex for mechanical work."));
         assert!(preamble.contains("delegate_start"));
+    }
+
+    #[test]
+    fn child_preamble_includes_specialist_and_downstream_preferences() {
+        let delegation = Delegation {
+            id: DelegationId::new(),
+            parent_task_id: TaskId::new(),
+            child_task_id: None,
+            profile_id: "claude-ux".into(),
+            profile_label: "Claude UX".into(),
+            runtime: "claude".into(),
+            model: Some("claude-fable-5".into()),
+            effort: Some("high".into()),
+            title: "Interaction audit".into(),
+            brief: "Review the flow".into(),
+            status: DelegationStatus::Starting,
+            result: None,
+            child_session_ref: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let profile = DelegationProfile {
+            id: "claude-ux".into(),
+            label: "Claude UX".into(),
+            runtime: "claude".into(),
+            model: Some("claude-fable-5".into()),
+            effort: Some("high".into()),
+            instruction: Some("Test keyboard and reduced-motion behavior.".into()),
+            preferred_child_profile_ids: vec!["luna-explore".into()],
+            cost_tier: "high".into(),
+            enabled: true,
+        };
+        let prompt = child_preamble(&delegation, true, Some(&profile), &["Luna explorer".into()]);
+        assert!(prompt.contains("Test keyboard and reduced-motion behavior."));
+        assert!(prompt.contains("Luna explorer"));
+        assert!(prompt.contains("task_complete"));
     }
 }

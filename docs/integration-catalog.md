@@ -116,6 +116,53 @@ An adapter contributing delegation peers must additionally declare native/broker
 
 Cross-runtime agent calls use the [Broker MCP contract](broker-mcp-contract.md). Shared task notes, run scratch, messages, transcript references, worktree leases, and Git UI identity use the [Repository coordination protocol](repo-coordination-protocol.md); adapters must not create private competing copies.
 
+### 4.2 Provider-native skill and slash-action contract
+
+The composer must source `/` suggestions from the selected runtime rather than
+from generic prompt shortcuts:
+
+- Codex uses app-server `skills/list`; invocation includes Codex's typed
+  `{type:"skill", name, path}` input. Skill paths remain in the native host and
+  the renderer returns only an opaque selection id. `/goal <objective>` uses
+  `thread/goal/set` with active status, then starts the first turn with that
+  same objective; it is a command, not a synthetic skill.
+- ACP runtimes use the full replacement from
+  `available_commands_update`; invocation remains the exact advertised
+  `/<name> [args]` text in `session/prompt`. ACP does not distinguish built-in
+  commands from skills, so Integrator must not invent that distinction.
+- Claude Code has no headless inventory endpoint. The native host performs a
+  bounded metadata-only scan of documented personal, project, legacy-command,
+  and plugin roots, merges the current bundled catalog, and preserves
+  the slash token at byte zero. `/goal` is direct because Claude supports it in
+  print mode; session-resident actions such as `/loop` remain interactive-only
+  until the adapter owns a persistent Claude process.
+- Antigravity skill metadata may be discovered from its provider-owned roots,
+  but the current print-mode route is not a slash-command transport. Those
+  rows are labeled interactive-only; they must never be sent as ordinary model
+  prose while claiming native execution.
+- Grok uses `grok --no-auto-update agent stdio`; before `session/new`, the ACP
+  adapter may select only the provider-advertised `cached_token` auth method.
+  It never reads, accepts, or proxies an xAI API key.
+
+Catalog metadata is untrusted and bounded. Refresh replaces old opaque ids,
+and execution revalidates the selected action against the same canonical
+trusted repository before dispatch. The composer may prefetch and retain a
+catalog for responsiveness because dispatch-time revalidation remains the
+authority.
+
+An unchanged provider action retains its opaque id across catalog refreshes;
+only a changed or removed action invalidates the handle. If Codex definitively
+reports that a stored thread or rollout no longer exists, Integrator forgets
+that native id, starts one replacement thread, and retries the not-yet-started
+turn once. Other provider errors are not replayed automatically.
+
+Composer and transcript emphasis is also catalog-backed. An exact direct
+action with `kind: skill` may render its leading `/name` token in the semantic
+skill style; commands and unknown slash text remain plain. The renderer sends
+only the opaque action id, while the native host derives and persists the
+verified skill name on the user item so the distinction survives restart and
+cannot be forged by ordinary message text.
+
 ## 5. Runtime records
 
 ### 5.1 Codex — launch P0

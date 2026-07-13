@@ -5,7 +5,7 @@ Status: Implemented (v1 slice of `broker-mcp-contract.md`)
 ## Goal
 
 Give any orchestrator session a model-facing tool surface to delegate work to
-subagents running on *other* providers, governed by a user-defined policy in
+subagents running on _other_ providers, governed by a user-defined policy in
 settings. Delegation is fully asynchronous: it never blocks or interrupts the
 user's conversation. Orchestrators can check in on and nudge children;
 children can ask questions of / report to the orchestrator.
@@ -57,18 +57,24 @@ commands.
 - `settings.delegation.instruction` — free-text user policy appended to the
   orchestrator preamble (the "custom instruction").
 - `settings.delegation.profiles` — JSON array of delegation targets:
-  `{ id, label, runtime, model, effort?, costTier: low|medium|high, enabled }`.
+  `{ id, label, runtime, model, effort?, instruction?, preferredChildProfileIds?, costTier: low|medium|high, enabled }`.
   `peers_list` returns only enabled profiles; `delegate_start` validates the
   profile id against this list. The model never picks raw runtime/model pairs.
+  A profile instruction is injected into the child preamble as that specialist's
+  standing role and quality bar. Preferred child profiles are exposed as
+  downstream planning metadata; recursive launching remains disabled by the
+  one-level v1 policy.
 
 ## Async message model
 
 Two queues per delegation (`delegation_messages`, sender = `orchestrator` |
 `child` | `user`):
 
-- **To child** (orchestrator `delegation_message`, or user nudge from the
-  rail): queued; delivered as the child's next turn the moment the child is
-  idle (turn settled). Never interrupts a running child turn.
+- **To child** (orchestrator `delegation_message`, or user message from the
+  rail/conversation pane): queued; delivered as the child's next turn the
+  moment the child is idle (turn settled). Completed, failed, stopped, or
+  process-disconnected children can be reopened under the same durable child
+  task. Never interrupts a running child turn.
 - **To orchestrator** (`orchestrator_ask` / `orchestrator_report`): queued;
   never interrupts the user's conversation. Delivered when (a) the
   orchestrator calls `delegation_status`/`delegation_result`, or (b) the
@@ -83,19 +89,22 @@ same repo/worktree as the parent) → child runtime spawned → first turn =
 child preamble + brief (+ parent conversation digest). Turn settles →
 deliver queued messages as next turn, else `waiting`. Child calls
 `task_complete(summary)` → `completed` with stored result. `delegation_stop`
-or user Stop → `stopped`. Child provider events flow through the existing
-pumps, so child transcripts are real tasks: clicking a child in the rail
-opens its full transcript. Child tasks are hidden from the task sidebar.
+or user Stop → `stopped`. A new user message reopens that same child task and
+starts a fresh provider driver when necessary. Child provider events flow
+through the existing pumps, so child transcripts are real tasks: clicking a
+child in the rail opens its full transcript immediately left of the right rail,
+beside the orchestrator conversation. Child tasks are hidden from the task
+sidebar.
 
 ## Provider support matrix (v1)
 
-| Provider    | As orchestrator (tools) | As child target |
-|-------------|-------------------------|-----------------|
-| Claude      | yes (`--mcp-config`)    | yes (child tools too) |
-| Cursor      | yes (ACP `mcpServers`)  | no (deferred)   |
+| Provider    | As orchestrator (tools)         | As child target                                                                         |
+| ----------- | ------------------------------- | --------------------------------------------------------------------------------------- |
+| Claude      | yes (`--mcp-config`)            | yes (child tools too)                                                                   |
+| Cursor      | yes (ACP `mcpServers`)          | no (deferred)                                                                           |
 | Codex       | no (deferred: config injection) | yes (approval policy `never`, no child tools — results captured from transcript digest) |
-| Antigravity | no                      | yes (no child tools) |
-| Grok        | no                      | no              |
+| Antigravity | no                              | yes (no child tools)                                                                    |
+| Grok        | no                              | no                                                                                      |
 
 Children without child tools still receive nudges (injected as turns) and
 still produce results (digest capture on completion); they just can't ask
@@ -113,12 +122,18 @@ questions mid-flight.
 
 - Composer: dropdown default now driven by settings; value forwarded on
   every turn.
-- Agents rail panel: live lineage from `delegation_list`, unread child
-  questions, Approve/Deny (manual mode), Nudge input, Stop, click-through to
-  the child task transcript. `delegation://update` Tauri event triggers
-  refresh.
+- Agents rail panel: live lineage from recursive `delegation_list` reads,
+  unread child questions, Approve/Deny (manual mode), Stop, and selection of a
+  half-width sibling conversation pane. The pane sits left of the persistent
+  right rail, so the two conversations are adjacent and the task-tool tabs
+  remain visible. Child projection events use the same transcript renderer and
+  the same Composer component as the orchestrator. At idle/terminal boundaries
+  the user can change among supported child providers, models, and efforts;
+  active turns must be stopped before rerouting. `delegation://update` Tauri
+  events trigger refresh.
 - Settings → Subagents: mode default, concurrency cap, custom instruction,
-  profile editor.
+  profile editor, per-specialist instructions, and preferred downstream helper
+  preferences.
 
 ## Security notes
 

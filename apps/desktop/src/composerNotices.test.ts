@@ -26,7 +26,7 @@ const baseComposerProps = {
   runtimes,
   defaultRuntime: "codex" as const,
   defaultModel: "Provider default",
-  onSend: vi.fn(async () => undefined),
+  onSend: vi.fn(async () => true),
 };
 
 afterEach(() => {
@@ -60,6 +60,25 @@ describe("composer notice expiry", () => {
 });
 
 describe("composer notices", () => {
+  it("clears a submitted draft immediately and restores it when sending is rejected", async () => {
+    let settle: (accepted: boolean) => void = () => undefined;
+    const onSend = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          settle = resolve;
+        }),
+    );
+
+    render(createElement(Composer, { ...baseComposerProps, onSend }));
+    const composer = screen.getByRole("textbox", { name: "Task message" });
+    fireEvent.change(composer, { target: { value: "Keep this if startup fails" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    expect(composer).toHaveValue("");
+    await act(async () => settle(false));
+    expect(composer).toHaveValue("Keep this if startup fails");
+  });
+
   it("renders above the composer and dismisses through the top-right close button", async () => {
     const notices: ComposerNotice[] = [
       {

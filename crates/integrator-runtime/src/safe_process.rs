@@ -13,10 +13,16 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct ProcessOutput {
     pub(crate) success: bool,
+    pub(crate) exit_code: Option<i32>,
     pub(crate) stdout: String,
     pub(crate) stderr: String,
     pub(crate) stdout_truncated: bool,
     pub(crate) stderr_truncated: bool,
+}
+
+pub(crate) enum ProcessRunOutcome {
+    Completed(ProcessOutput),
+    TimedOut,
 }
 
 pub(crate) fn run_bounded(
@@ -34,6 +40,21 @@ pub(crate) fn run_bounded_with_limits(
     max_output_bytes: u64,
     timeout: Duration,
 ) -> Result<ProcessOutput> {
+    match run_bounded_with_outcome(executable, args, cwd, max_output_bytes, timeout)? {
+        ProcessRunOutcome::Completed(output) => Ok(output),
+        ProcessRunOutcome::TimedOut => Err(IntegratorError::Unavailable(
+            "local process probe timed out".into(),
+        )),
+    }
+}
+
+pub(crate) fn run_bounded_with_outcome(
+    executable: &Path,
+    args: &[&str],
+    cwd: Option<&Path>,
+    max_output_bytes: u64,
+    timeout: Duration,
+) -> Result<ProcessRunOutcome> {
     let mut command = probe_command(executable, args);
     command
         .stdin(Stdio::null())
@@ -62,9 +83,7 @@ pub(crate) fn run_bounded_with_limits(
         if started.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(IntegratorError::Unavailable(
-                "local process probe timed out".into(),
-            ));
+            return Ok(ProcessRunOutcome::TimedOut);
         }
         thread::sleep(Duration::from_millis(20));
     };
@@ -74,13 +93,14 @@ pub(crate) fn run_bounded_with_limits(
     let (stderr, stderr_truncated) = stderr_reader
         .join()
         .map_err(|_| IntegratorError::Unavailable("stderr reader failed".into()))??;
-    Ok(ProcessOutput {
+    Ok(ProcessRunOutcome::Completed(ProcessOutput {
         success: status.success(),
+        exit_code: status.code(),
         stdout,
         stderr,
         stdout_truncated,
         stderr_truncated,
-    })
+    }))
 }
 
 fn read_limited(mut reader: impl Read, max_output_bytes: u64) -> Result<(String, bool)> {

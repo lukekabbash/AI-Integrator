@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-git-push-confirmed"
+description = "Enables the git_push_confirmed command without any pre-configured scope."
+commands.allow = ["git_push_confirmed"]
+
+[[permission]]
+identifier = "deny-git-push-confirmed"
+description = "Denies the git_push_confirmed command without any pre-configured scope."
+commands.deny = ["git_push_confirmed"]

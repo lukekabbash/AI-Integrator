@@ -1,8 +1,8 @@
 use chrono::{DateTime, TimeZone, Utc};
 use integrator_core::{
     ApprovalKind, ConnectionState, FileChangeKind, FileChangeProjection, ItemKind, ItemProjection,
-    ItemStatus, PlanStep, PlanStepStatus, Result, TransportRequestId, TurnProjection, TurnStatus,
-    UsageProjection,
+    ItemStatus, ModeOption, ModeProjection, PlanStep, PlanStepStatus, Result, TransportRequestId,
+    TurnProjection, TurnStatus, UsageProjection,
 };
 use serde_json::{Map, Value, json};
 
@@ -13,6 +13,8 @@ const TEXT_LIMIT: usize = 16 * 1024;
 const PATH_LIMIT: usize = 4 * 1024;
 const PLAN_STEP_LIMIT: usize = 4 * 1024;
 const PLAN_STEPS_LIMIT: usize = 256;
+/// Full plan documents (markdown) attached to plan-review approvals.
+const PLAN_DOCUMENT_LIMIT: usize = 256 * 1024;
 const TOOL_DETAIL_LIMIT: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
@@ -67,7 +69,11 @@ pub enum ProjectionMutation {
         reason: Option<String>,
         command: Option<String>,
         cwd: Option<String>,
+        /// Full plan document for `PlanReview` approvals; `None` otherwise.
+        plan_markdown: Option<String>,
     },
+    /// Replaces the session's mode state (current mode + available modes).
+    Mode(ModeProjection),
     ApprovalResolved {
         request_id: TransportRequestId,
     },
@@ -163,6 +169,7 @@ pub fn reduce_provider_event(input: ProviderEventInput) -> Result<Option<Reduced
                 status: ItemStatus::InProgress,
                 title: Some("File changes".into()),
                 body: None,
+                native_skill: None,
                 command: None,
                 cwd: None,
                 output: None,
@@ -185,7 +192,7 @@ pub fn reduce_provider_event(input: ProviderEventInput) -> Result<Option<Reduced
                 .get("diff")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let (diff, truncated) = bound_and_redact(raw, DIFF_LIMIT);
+            let (diff, truncated) = bound_and_redact_patch(raw, DIFF_LIMIT);
             ProjectionMutation::Diff { diff, truncated }
         }
         "thread/tokenUsage/updated" => {
@@ -211,6 +218,7 @@ pub fn reduce_provider_event(input: ProviderEventInput) -> Result<Option<Reduced
                 cwd: optional_string(&input.params, "cwd")
                     .or_else(|| optional_string(&input.params, "grantRoot"))
                     .map(|cwd| bound_and_redact(&cwd, PATH_LIMIT).0),
+                plan_markdown: None,
             }
         }
         "serverRequest/resolved" => {
@@ -324,6 +332,7 @@ fn parse_item(
         },
         title: None,
         body: None,
+        native_skill: None,
         command: None,
         cwd: None,
         output: None,
@@ -505,7 +514,7 @@ fn parse_file_changes(value: Option<&Value>) -> Vec<FileChangeProjection> {
                 patch: change
                     .get("diff")
                     .and_then(Value::as_str)
-                    .map(|diff| bound_and_redact(diff, DIFF_LIMIT).0),
+                    .map(|diff| bound_and_redact_patch(diff, DIFF_LIMIT).0),
             }
         })
         .collect()
@@ -579,6 +588,36 @@ fn redact_text(value: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Redact with `redact_text`, but keep each line's original whitespace when
+/// that line carried nothing to hide. `redact_text` rebuilds lines by joining
+/// words with single spaces, which corrupts patch payloads: unified-diff
+/// prefix columns and code indentation are significant there.
+fn redact_preserving_layout(value: &str) -> String {
+    let redacted: Vec<&str> = value.lines().collect();
+    let fully_redacted = redact_text(value);
+    let redacted_lines: Vec<&str> = fully_redacted.lines().collect();
+    if redacted.len() != redacted_lines.len() {
+        return fully_redacted;
+    }
+    redacted
+        .iter()
+        .zip(&redacted_lines)
+        .map(|(original, redacted_line)| {
+            let collapsed = original.split_whitespace().collect::<Vec<_>>().join(" ");
+            if *redacted_line == collapsed {
+                (*original).to_owned()
+            } else {
+                (*redacted_line).to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn bound_and_redact_patch(value: &str, limit: usize) -> (String, bool) {
+    truncate_utf8(&redact_preserving_layout(value), limit)
 }
 
 fn redact_credential_url(value: &str) -> String {
@@ -765,6 +804,44 @@ fn strip_context_primer(text: &str) -> &str {
     text
 }
 
+/// Collect ACP `diff` content blocks (`{type, path, oldText, newText}`) from a
+/// tool call into file-change projections carrying a unified patch.
+fn acp_diff_file_changes(blocks: &[Value]) -> Vec<FileChangeProjection> {
+    blocks
+        .iter()
+        .take(512)
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("diff"))
+        .filter_map(|block| {
+            let path = block.get("path").and_then(Value::as_str)?;
+            let old_text = block.get("oldText").and_then(Value::as_str);
+            let new_text = block.get("newText").and_then(Value::as_str).unwrap_or("");
+            Some(FileChangeProjection {
+                path: bound_and_redact(path, PATH_LIMIT).0,
+                change_kind: if old_text.is_none() {
+                    FileChangeKind::Add
+                } else {
+                    FileChangeKind::Modify
+                },
+                patch: unified_patch(old_text.unwrap_or(""), new_text),
+            })
+        })
+        .collect()
+}
+
+/// Render a whole-file before/after pair as unified-diff hunks. Returns `None`
+/// when the texts are identical, so an unchanged block projects no patch.
+fn unified_patch(old_text: &str, new_text: &str) -> Option<String> {
+    if old_text == new_text {
+        return None;
+    }
+    let diff = similar::TextDiff::from_lines(old_text, new_text);
+    let patch = diff.unified_diff().context_radius(3).to_string();
+    if patch.trim().is_empty() {
+        return None;
+    }
+    Some(bound_and_redact_patch(&patch, DIFF_LIMIT).0)
+}
+
 /// Reduce one ACP `session/update` notification into the same projection
 /// mutations the Codex reducer emits, so persistence and the renderer treat
 /// both providers identically. ACP has no provider turn identity, so the
@@ -840,6 +917,15 @@ pub fn reduce_acp_update(
             let output = content_text
                 .map(|text| bound_and_redact(&text, TOOL_DETAIL_LIMIT).0)
                 .or_else(|| json_detail(update.get("rawOutput"), TOOL_DETAIL_LIMIT));
+            // Diff content blocks carry the whole-file before/after text of an
+            // edit (Cursor sends these instead of tool arguments). Project them
+            // as file changes with a unified patch so the transcript can show
+            // the same inline diff it renders for Codex file changes.
+            let file_changes = update
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|blocks| acp_diff_file_changes(blocks))
+                .filter(|changes| !changes.is_empty());
             let item = ItemProjection {
                 id: format!("acp:{session_id}:{turn_id}:{tool_call_id}"),
                 provider_item_id: tool_call_id.to_owned(),
@@ -851,11 +937,12 @@ pub fn reduce_acp_update(
                     title
                 },
                 body: None,
+                native_skill: None,
                 command: None,
                 cwd: None,
                 output,
                 exit_code: None,
-                file_changes: None,
+                file_changes,
                 mcp_server: None,
                 // ACP reports a tool category ("read", "execute", ...) rather
                 // than a server/tool pair; surface it as the tool label.
@@ -947,9 +1034,119 @@ pub fn reduce_acp_permission_request(
             reason: title,
             command: None,
             cwd: None,
+            plan_markdown: None,
         },
         occurred_at,
     }
+}
+
+/// Reduce a Cursor `cursor/create_plan` extension request into a plan-review
+/// approval. The agent blocks until the client responds, so this surfaces the
+/// full plan document for the user to approve or reject.
+pub fn reduce_acp_plan_review_request(
+    session_id: &str,
+    turn_id: &str,
+    request_id: TransportRequestId,
+    params: &Value,
+    occurred_at: DateTime<Utc>,
+) -> ReducedProviderEvent {
+    let (audit_json, audit_truncated) = bounded_audit(params);
+    let item_id = params
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .unwrap_or("create-plan");
+    let name = params.get("name").and_then(Value::as_str);
+    let overview = params.get("overview").and_then(Value::as_str);
+    let reason = match (name, overview) {
+        (Some(name), Some(overview)) if !overview.trim().is_empty() => {
+            Some(format!("{name} — {overview}"))
+        }
+        (Some(name), _) => Some(name.to_owned()),
+        (None, Some(overview)) => Some(overview.to_owned()),
+        (None, None) => None,
+    }
+    .map(|text| bound_and_redact(&text, TEXT_LIMIT).0);
+    let plan_markdown = params
+        .get("plan")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| bound_and_redact(text, PLAN_DOCUMENT_LIMIT).0);
+    ReducedProviderEvent {
+        method: "cursor/create_plan".into(),
+        thread_id: session_id.to_owned(),
+        turn_id: Some(turn_id.to_owned()),
+        audit_json,
+        audit_truncated,
+        mutation: ProjectionMutation::ApprovalRequested {
+            request_id,
+            approval_kind: ApprovalKind::PlanReview,
+            item_id: item_id.to_owned(),
+            approval_id: None,
+            reason,
+            command: None,
+            cwd: None,
+            plan_markdown,
+        },
+        occurred_at,
+    }
+}
+
+/// Build the mode projection event for an ACP session. Used both when
+/// `session/new` advertises the initial mode state and when a
+/// `current_mode_update` notification (or a client-side `session/set_mode`)
+/// switches the current mode. `turn_id` is absent for between-turn changes.
+pub fn acp_mode_event(
+    session_id: &str,
+    turn_id: Option<&str>,
+    mode: ModeProjection,
+    occurred_at: DateTime<Utc>,
+) -> ReducedProviderEvent {
+    ReducedProviderEvent {
+        method: "session/update/current_mode_update".into(),
+        thread_id: session_id.to_owned(),
+        turn_id: turn_id.map(str::to_owned),
+        audit_json: "{}".into(),
+        audit_truncated: false,
+        mutation: ProjectionMutation::Mode(mode),
+        occurred_at,
+    }
+}
+
+/// Parse the `modes` field of an ACP `session/new`/`session/load` response
+/// (`SessionModeState`). Returns `None` when the agent does not support
+/// session modes.
+pub fn parse_acp_mode_state(response: &Value) -> Option<ModeProjection> {
+    let modes = response.get("modes")?;
+    let current = modes.get("currentModeId").and_then(Value::as_str)?;
+    let available = modes
+        .get("availableModes")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    Some(ModeOption {
+                        id: entry.get("id").and_then(Value::as_str)?.to_owned(),
+                        name: entry
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_else(|| {
+                                entry.get("id").and_then(Value::as_str).unwrap_or("")
+                            })
+                            .to_owned(),
+                        description: entry
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(ModeProjection {
+        current_mode_id: current.to_owned(),
+        available_modes: available,
+    })
 }
 
 /// Build the terminal turn projection for a started or finished ACP prompt.
@@ -1054,6 +1251,136 @@ mod tests {
     }
 
     #[test]
+    fn acp_session_modes_parse_from_session_new_response() {
+        let mode = parse_acp_mode_state(&json!({
+            "sessionId": "sess-1",
+            "modes": {
+                "currentModeId": "agent",
+                "availableModes": [
+                    {"id": "agent", "name": "Agent", "description": "Full agent capabilities"},
+                    {"id": "plan", "name": "Plan", "description": "Read-only planning"},
+                    {"id": "ask", "name": "Ask"}
+                ]
+            }
+        }))
+        .expect("mode state");
+        assert_eq!(mode.current_mode_id, "agent");
+        assert_eq!(mode.available_modes.len(), 3);
+        assert_eq!(mode.available_modes[1].name, "Plan");
+        assert_eq!(
+            mode.available_modes[1].description.as_deref(),
+            Some("Read-only planning")
+        );
+        assert_eq!(mode.available_modes[2].description, None);
+    }
+
+    #[test]
+    fn acp_session_modes_absent_or_malformed_yield_none() {
+        assert!(parse_acp_mode_state(&json!({ "sessionId": "sess-1" })).is_none());
+        assert!(parse_acp_mode_state(&json!({ "modes": { "availableModes": [] } })).is_none());
+    }
+
+    #[test]
+    fn acp_current_mode_update_stays_out_of_the_transcript() {
+        // The pump handles mode updates via session metadata; the transcript
+        // reducer must keep dropping them rather than surfacing a raw item.
+        let event = reduce_acp_update(
+            "session-1",
+            "turn-1",
+            0,
+            &json!({ "sessionUpdate": "current_mode_update", "currentModeId": "plan" }),
+            Utc::now(),
+        )
+        .expect("reduce");
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn cursor_create_plan_reduces_to_plan_review_approval() {
+        let event = reduce_acp_plan_review_request(
+            "session-1",
+            "turn-1",
+            TransportRequestId::Number(7.into()),
+            &json!({
+                "toolCallId": "call-1",
+                "name": "Add subtract function",
+                "overview": "Add subtract(a, b) to hello.py",
+                "plan": "# Plan\n\nAdd the function.",
+                "todos": [{"id": "t1", "content": "Add subtract", "status": "pending"}]
+            }),
+            Utc::now(),
+        );
+        match event.mutation {
+            ProjectionMutation::ApprovalRequested {
+                approval_kind,
+                item_id,
+                reason,
+                plan_markdown,
+                ..
+            } => {
+                assert_eq!(approval_kind, ApprovalKind::PlanReview);
+                assert_eq!(item_id, "call-1");
+                assert_eq!(
+                    reason.as_deref(),
+                    Some("Add subtract function — Add subtract(a, b) to hello.py")
+                );
+                assert_eq!(
+                    plan_markdown.as_deref(),
+                    Some("# Plan\n\nAdd the function.")
+                );
+            }
+            other => panic!("expected plan-review approval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cursor_create_plan_survives_missing_fields() {
+        let event = reduce_acp_plan_review_request(
+            "session-1",
+            "turn-1",
+            TransportRequestId::Number(8.into()),
+            &json!({}),
+            Utc::now(),
+        );
+        match event.mutation {
+            ProjectionMutation::ApprovalRequested {
+                approval_kind,
+                item_id,
+                reason,
+                plan_markdown,
+                ..
+            } => {
+                assert_eq!(approval_kind, ApprovalKind::PlanReview);
+                assert_eq!(item_id, "create-plan");
+                assert_eq!(reason, None);
+                assert_eq!(plan_markdown, None);
+            }
+            other => panic!("expected plan-review approval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cursor_create_plan_bounds_oversized_plan_documents() {
+        let huge = "x".repeat(PLAN_DOCUMENT_LIMIT + 1024);
+        let event = reduce_acp_plan_review_request(
+            "session-1",
+            "turn-1",
+            TransportRequestId::Number(9.into()),
+            &json!({ "toolCallId": "call-1", "plan": huge }),
+            Utc::now(),
+        );
+        match event.mutation {
+            ProjectionMutation::ApprovalRequested { plan_markdown, .. } => {
+                let plan = plan_markdown.expect("plan");
+                // Bounded to the document limit plus the truncation marker.
+                assert!(plan.len() <= PLAN_DOCUMENT_LIMIT + "\n[truncated]".len());
+                assert!(plan.ends_with("[truncated]"));
+            }
+            other => panic!("expected plan-review approval, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn raw_acp_thought_chunks_are_dropped() {
         let event = reduce_acp_update(
             "session-1",
@@ -1117,6 +1444,81 @@ mod tests {
             "partial update must not fabricate a title"
         );
         assert_eq!(item.output.as_deref(), Some("fn main() {}"));
+    }
+
+    #[test]
+    fn acp_diff_content_blocks_project_file_changes_with_unified_patch() {
+        let event = reduce_acp_update(
+            "session-1",
+            "turn-1",
+            0,
+            &json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-1",
+                "status": "completed",
+                "content": [{
+                    "type": "diff",
+                    "path": "C:\\repo\\src\\main.rs",
+                    "oldText": "fn main() {\n    println!(\"old\");\n}\n",
+                    "newText": "fn main() {\n    println!(\"new\");\n}\n"
+                }]
+            }),
+            Utc::now(),
+        )
+        .expect("reduce")
+        .expect("accepted");
+        let ProjectionMutation::MergeItem(item) = &event.mutation else {
+            panic!("expected merge mutation");
+        };
+        let changes = item.file_changes.as_ref().expect("file changes");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "C:\\repo\\src\\main.rs");
+        assert_eq!(changes[0].change_kind, FileChangeKind::Modify);
+        let patch = changes[0].patch.as_deref().expect("patch");
+        assert!(patch.contains("@@"), "patch has hunk headers: {patch}");
+        assert!(
+            patch.contains("-    println!(\"old\");"),
+            "patch: {patch:?}"
+        );
+        assert!(
+            patch.contains("+    println!(\"new\");"),
+            "patch: {patch:?}"
+        );
+    }
+
+    #[test]
+    fn acp_diff_block_without_old_text_projects_an_added_file() {
+        let event = reduce_acp_update(
+            "session-1",
+            "turn-1",
+            0,
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-2",
+                "title": "Write File",
+                "kind": "edit",
+                "content": [{
+                    "type": "diff",
+                    "path": "src/new.rs",
+                    "newText": "pub fn added() {}\n"
+                }]
+            }),
+            Utc::now(),
+        )
+        .expect("reduce")
+        .expect("accepted");
+        let ProjectionMutation::ReplaceItem(item) = &event.mutation else {
+            panic!("expected replace mutation");
+        };
+        let changes = item.file_changes.as_ref().expect("file changes");
+        assert_eq!(changes[0].change_kind, FileChangeKind::Add);
+        assert!(
+            changes[0]
+                .patch
+                .as_deref()
+                .expect("patch")
+                .contains("+pub fn added() {}")
+        );
     }
 
     #[test]

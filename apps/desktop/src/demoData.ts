@@ -362,6 +362,18 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
       meta: "42 files · 1.8 s",
     },
     {
+      id: "t2",
+      kind: "tool",
+      activityType: "file",
+      title: "Edited",
+      body: "src/runtime/router.ts",
+      filePath: "src/runtime/router.ts",
+      timestamp: "2026-07-10T05:16:00.000Z",
+      status: "success",
+      changeStats: { additions: 14, deletions: 6 },
+      diff: diff[0],
+    },
+    {
       id: "a1",
       kind: "assistant",
       body: "The native shell is underway. The first slice establishes one durable task surface, a typed local bridge, broker-visible child work, reviewable Git state, and settings that replace the project rail instead of becoming another cramped sidebar.",

@@ -125,6 +125,11 @@ pub enum StructuredCliEventKind {
     Diagnostic {
         message: String,
     },
+    /// The CLI reported a permission-mode change (Claude's stream-json
+    /// `system`/`status` message, e.g. after an approved `ExitPlanMode`).
+    PermissionModeChanged {
+        mode: String,
+    },
     Exited {
         code: Option<i32>,
         cancelled: bool,
@@ -618,6 +623,15 @@ fn parse_claude_event(value: &Value) -> Option<ParsedEvent> {
                 },
             })
         }
+        // Claude reports permission-mode transitions (e.g. leaving plan mode
+        // after an approved ExitPlanMode) as status messages.
+        "system" if value.get("subtype").and_then(Value::as_str) == Some("status") => {
+            let mode = string_at(value, "permissionMode")?;
+            Some(ParsedEvent {
+                session_id,
+                event: StructuredCliEventKind::PermissionModeChanged { mode },
+            })
+        }
         "stream_event" => {
             let event = value.get("event")?;
             (event.get("type")?.as_str()? == "content_block_delta").then_some(())?;
@@ -932,6 +946,43 @@ mod tests {
         // The initialize acknowledgement must not leak into the event stream.
         let ack = r#"{"type":"control_response","response":{"subtype":"success","request_id":"integrator-init","response":{}}}"#;
         assert!(parse_provider_line(StructuredCliProvider::Claude, ack).is_empty());
+    }
+
+    #[test]
+    fn parses_claude_permission_mode_status() {
+        // Observed live: the CLI reports mode transitions (e.g. after an
+        // approved ExitPlanMode) as system/status with a permissionMode.
+        let line = r#"{"type":"system","subtype":"status","status":null,"permissionMode":"acceptEdits","session_id":"sess-1"}"#;
+        let events = parse_provider_line(StructuredCliProvider::Claude, line);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id.as_deref(), Some("sess-1"));
+        assert!(matches!(
+            &events[0].event,
+            StructuredCliEventKind::PermissionModeChanged { mode } if mode == "acceptEdits"
+        ));
+        // A status without a permission mode carries nothing to project.
+        let bare = r#"{"type":"system","subtype":"status","status":"compacting"}"#;
+        assert!(parse_provider_line(StructuredCliProvider::Claude, bare).is_empty());
+    }
+
+    #[test]
+    fn parses_claude_exit_plan_mode_permission_request_with_plan() {
+        // Observed live: ExitPlanMode arrives as can_use_tool with the full
+        // plan markdown in the tool input.
+        let line = r##"{"type":"control_request","request_id":"req-2","request":{"subtype":"can_use_tool","tool_name":"ExitPlanMode","display_name":"ExitPlanMode","input":{"plan":"# Plan\n\nAdd power(a, b).","planFilePath":"C:\\plans\\p.md"},"tool_use_id":"toolu_2","requires_user_interaction":true}}"##;
+        let events = parse_provider_line(StructuredCliProvider::Claude, line);
+        assert_eq!(events.len(), 1);
+        let StructuredCliEventKind::PermissionRequest {
+            tool_name, input, ..
+        } = &events[0].event
+        else {
+            panic!("expected permission request, got {:?}", events[0].event);
+        };
+        assert_eq!(tool_name, "ExitPlanMode");
+        assert_eq!(
+            input.pointer("/plan").and_then(Value::as_str),
+            Some("# Plan\n\nAdd power(a, b).")
+        );
     }
 
     #[test]

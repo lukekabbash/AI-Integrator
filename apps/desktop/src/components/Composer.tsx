@@ -1,22 +1,24 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { motion } from "motion/react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence, m as motion } from "motion/react";
 import {
   ArrowUp,
-  AtSign,
-  FilePlus2,
+  Compass,
   Gauge,
   Mic,
   ShieldCheck,
-  Sparkles,
+  SlidersHorizontal,
   Square,
   Users,
   X,
 } from "lucide-react";
+import { FileIcon } from "./FileIcon";
 import {
   bridge,
   resolveModelEffort,
-  runtimeAuthWarning,
+  type ModeProjection,
   type ModelCatalogEntry,
+  type NativeActionReference,
+  type NativeProviderAction,
   type RuntimeConnection,
   type RuntimeId,
 } from "../bridge";
@@ -43,11 +45,33 @@ interface ComposerProps {
     effort?: string;
     permission: "read-only" | "project-write" | "ask" | "full-access";
     delegation: "off" | "manual" | "balanced" | "budget-first";
-  }) => Promise<void>;
+    nativeActionId?: string;
+    nativeAction?: NativeActionReference;
+  }) => Promise<boolean>;
+  /** Canonical trusted repository/worktree used for provider-native discovery. */
+  workingDirectory?: string;
   /** Persist provider/model/effort for an existing chat as soon as the user changes them. */
   onRoutingChange?: (value: { runtime: RuntimeId; model: string; effort?: string }) => void;
-  /** Opens a caller-owned context picker. Omitted until attachments are persisted with a task. */
-  onAddContext?: () => void;
+  /** Fires immediately when the user switches the permission profile, even mid-run. */
+  onPermissionChange?: (permission: "read-only" | "project-write" | "ask" | "full-access") => void;
+  /** Live session mode state for providers that advertise modes (e.g. Cursor
+   * Agent/Plan/Ask). Absent hides the mode picker. */
+  sessionModes?: ModeProjection;
+  /** Fires when the user picks a session mode; applies immediately, even mid-run. */
+  onSessionModeChange?: (modeId: string) => void;
+  /** External permission set-request (e.g. the agent left plan mode). A new
+   * id applies `value` to the permission picker, mirroring the session. */
+  permissionRequest?: {
+    id: string;
+    value: "read-only" | "project-write" | "ask" | "full-access";
+  } | null;
+  /** Project-relative file paths offered by the @-mention autocomplete. */
+  contextFiles?: string[];
+  /** External text insertion (e.g. right-click → add file as context). A new
+   * id inserts `text` at the caret of the current draft. */
+  insertRequest?: { id: number; text: string } | null;
+  /** Confirms an insert request was applied so the owner can clear it. */
+  onInsertHandled?: (id: number) => void;
   /** Blocking or actionable runtime feedback docked immediately above the composer. */
   notices?: ComposerNotice[];
   /** True while the active task's turn is in progress; swaps send for stop. */
@@ -56,6 +80,13 @@ interface ComposerProps {
   stopping?: boolean;
   /** Stops the in-progress turn from the send position. */
   onStop?: () => void;
+  /** Keeps provider/model/effort visible but immutable until the active turn settles. */
+  routingDisabled?: boolean;
+  permissionDisabled?: boolean;
+  delegationDisabled?: boolean;
+  /** Distinguishes simultaneous main/child composers for assistive technology. */
+  messageLabel?: string;
+  sendLabel?: string;
 }
 
 interface VoiceCapture {
@@ -67,10 +98,103 @@ interface VoiceCapture {
 }
 
 function normalizeRuntime(runtimes: RuntimeConnection[], desired: RuntimeId): RuntimeId {
+  if (runtimes.length === 0) return desired;
   return runtimes.some((item) => item.id === desired) ? desired : (runtimes[0]?.id ?? "codex");
 }
 
 type VoicePhase = "idle" | "starting" | "recording" | "stopping";
+
+interface AutocompleteToken {
+  kind: "file" | "skill";
+  query: string;
+  /** Offset of the trigger character (@ or /) in the draft. */
+  start: number;
+}
+
+/** Finds an @file or /skill token ending at the caret. `/` only triggers as
+ * the very first character of the draft, like a slash command. */
+function activeAutocompleteToken(prompt: string, caret: number): AutocompleteToken | null {
+  const before = prompt.slice(0, caret);
+  const match = /(^|\s)([@/][^\s]*)$/.exec(before);
+  if (!match) return null;
+  const token = match[2];
+  const start = caret - token.length;
+  if (token.startsWith("@")) return { kind: "file", query: token.slice(1), start };
+  if (start === 0) return { kind: "skill", query: token.slice(1), start };
+  return null;
+}
+
+interface AutocompleteMatch {
+  value: string;
+  label: string;
+  detail: string;
+  actionId?: string;
+  kind?: NativeProviderAction["kind"];
+  invocation?: NativeProviderAction["invocation"];
+}
+
+function matchFiles(files: string[], query: string): AutocompleteMatch[] {
+  const normalized = query.toLocaleLowerCase();
+  const ranked = files
+    .map((path) => {
+      const name = path.split("/").at(-1) ?? path;
+      const lowerName = name.toLocaleLowerCase();
+      const lowerPath = path.toLocaleLowerCase();
+      const rank = !normalized
+        ? 2
+        : lowerName.startsWith(normalized)
+          ? 0
+          : lowerName.includes(normalized)
+            ? 1
+            : lowerPath.includes(normalized)
+              ? 2
+              : -1;
+      return { path, name, rank };
+    })
+    .filter((entry) => entry.rank >= 0)
+    .sort((a, b) => a.rank - b.rank || a.path.localeCompare(b.path));
+  return ranked.slice(0, 8).map((entry) => ({
+    value: entry.path,
+    label: entry.name,
+    detail: entry.path.split("/").slice(0, -1).join("/"),
+  }));
+}
+
+function matchSkills(actions: NativeProviderAction[], query: string): AutocompleteMatch[] {
+  const normalized = query.toLocaleLowerCase();
+  return actions
+    .filter(
+      (action) =>
+        !normalized ||
+        action.name.toLocaleLowerCase().includes(normalized) ||
+        action.description.toLocaleLowerCase().includes(normalized),
+    )
+    .slice(0, 40)
+    .map((action) => ({
+      value: action.name,
+      label: `/${action.name}`,
+      detail: `${action.source} · ${
+        action.invocation === "interactiveOnly"
+          ? "interactive provider terminal only"
+          : action.description
+      }`,
+      actionId: action.id,
+      kind: action.kind,
+      invocation: action.invocation,
+    }));
+}
+
+function completedNativeAction(
+  prompt: string,
+  actions: NativeProviderAction[],
+): NativeProviderAction | undefined {
+  const token = /^\/([^\s]+)(?=\s|$)/.exec(prompt)?.[1];
+  if (!token) return undefined;
+  return actions.find(
+    (action) =>
+      action.name === token && action.invocation === "direct" && action.id.trim().length > 0,
+  );
+}
 
 function encodePcm16(samples: Float32Array, sourceRate: number): number[] {
   const targetRate = 24000;
@@ -102,14 +226,34 @@ export function Composer({
   defaultDelegation,
   enterToSend = true,
   onSend,
+  workingDirectory,
   onRoutingChange,
-  onAddContext,
+  onPermissionChange,
+  sessionModes,
+  onSessionModeChange,
+  permissionRequest = null,
+  contextFiles = [],
+  insertRequest = null,
+  onInsertHandled,
   notices = [],
   running = false,
   stopping = false,
   onStop,
+  routingDisabled = false,
+  permissionDisabled = false,
+  delegationDisabled = false,
+  messageLabel = "Task message",
+  sendLabel = "Send message",
 }: ComposerProps) {
   const [prompt, setPrompt] = useState("");
+  const [caret, setCaret] = useState(0);
+  // Highlight is stored with the token key it belongs to, so a new token (or
+  // a different query under it) derives back to the top match without effects.
+  const [autocompleteHighlight, setAutocompleteHighlight] = useState<{
+    key: string;
+    index: number;
+  }>({ key: "", index: 0 });
+  const [dismissedTokenKey, setDismissedTokenKey] = useState("");
   const [runtime, setRuntime] = useState<RuntimeId>(() =>
     normalizeRuntime(runtimes, defaultRuntime),
   );
@@ -118,18 +262,41 @@ export function Composer({
   const [permission, setPermission] = useState<
     "read-only" | "project-write" | "ask" | "full-access"
   >(defaultPermission ?? "project-write");
+  // Agent-driven permission changes (e.g. an approved plan exit) override
+  // the picker even after the user touched it — the session already moved.
+  // Applied once per request id with the adjust-state-during-render pattern.
+  const [appliedPermissionRequestId, setAppliedPermissionRequestId] = useState("");
+  if (permissionRequest && permissionRequest.id !== appliedPermissionRequestId) {
+    setAppliedPermissionRequestId(permissionRequest.id);
+    setPermission(permissionRequest.value);
+  }
   const [delegation, setDelegation] = useState<"off" | "manual" | "balanced" | "budget-first">(
     defaultDelegation ?? "off",
   );
   const [sending, setSending] = useState(false);
   const [providerCatalogs, setProviderCatalogs] = useState<Record<string, ModelCatalogEntry[]>>({});
+  const providerCatalogLoads = useRef(new Set<RuntimeId>());
+  const [nativeActionsByKey, setNativeActionsByKey] = useState<
+    Record<string, NativeProviderAction[]>
+  >({});
+  const [nativeActionsError, setNativeActionsError] = useState("");
+  const [nativeActionsLoadingKey, setNativeActionsLoadingKey] = useState("");
+  const [nativeActionRetry, setNativeActionRetry] = useState(0);
+  const nativeActionLoads = useRef(new Set<string>());
+  const composerTextMirrorRef = useRef<HTMLDivElement>(null);
   const [voiceConfigured, setVoiceConfigured] = useState<boolean | null>(null);
   const [voicePhase, setVoicePhase] = useState<VoicePhase>("idle");
   const [voiceError, setVoiceError] = useState("");
   const [voiceNotice, setVoiceNotice] = useState("");
   const [micDevices, setMicDevices] = useState<MediaDeviceInfo[]>([]);
   const [micDeviceId, setMicDeviceId] = useState("default");
+  const [controlsMenuOpen, setControlsMenuOpen] = useState(false);
+  const [controlsSubmenu, setControlsSubmenu] = useState<
+    "mode" | "permission" | "delegation" | null
+  >(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const controlsMenuRef = useRef<HTMLDivElement>(null);
+  const controlsMenuButtonRef = useRef<HTMLButtonElement>(null);
   const voiceCaptureRef = useRef<VoiceCapture | null>(null);
   const voiceAppendQueueRef = useRef(Promise.resolve());
   const voiceBaseRef = useRef("");
@@ -152,7 +319,6 @@ export function Composer({
   const activeModel = activeEntry?.id ?? "Provider default";
   const effortOptions = activeEntry?.efforts ?? [];
   const activeEffort = resolveModelEffort(activeEntry, effort);
-  const runtimeWarning = runtimeAuthWarning(selectedRuntime);
   const visibleNotices = notices.filter(
     (notice) =>
       !dismissedNoticeIds.has(notice.id) &&
@@ -160,6 +326,153 @@ export function Composer({
   );
   const voiceRecording = voicePhase === "recording";
   const voiceActive = voicePhase !== "idle";
+
+  useEffect(() => {
+    if (!controlsMenuOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (!controlsMenuRef.current?.contains(event.target as Node)) {
+        setControlsMenuOpen(false);
+        setControlsSubmenu(null);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setControlsMenuOpen(false);
+      setControlsSubmenu(null);
+      controlsMenuButtonRef.current?.focus();
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [controlsMenuOpen]);
+
+  const autocompleteToken = activeAutocompleteToken(prompt, caret);
+  const nativeActionKey = workingDirectory ? `${runtime}\u0000${workingDirectory}` : "";
+  const nativeActions = nativeActionsByKey[nativeActionKey] ?? [];
+  const activeNativeAction = completedNativeAction(prompt, nativeActions);
+  const activeNativeSkill = activeNativeAction?.kind === "skill" ? activeNativeAction : undefined;
+  const activeNativeSkillPrefix = activeNativeSkill ? `/${activeNativeSkill.name}` : "";
+  useEffect(() => {
+    if (!workingDirectory || !nativeActionKey) return;
+    if (nativeActionsByKey[nativeActionKey] || nativeActionLoads.current.has(nativeActionKey)) {
+      return;
+    }
+    let cancelled = false;
+    nativeActionLoads.current.add(nativeActionKey);
+    setNativeActionsLoadingKey(nativeActionKey);
+    setNativeActionsError("");
+    void bridge
+      .listNativeProviderActions(runtime, workingDirectory)
+      .then((actions) => {
+        if (!cancelled) {
+          setNativeActionsByKey((current) => ({ ...current, [nativeActionKey]: actions }));
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setNativeActionsError(
+            error instanceof Error ? error.message : "Could not load provider skills",
+          );
+        }
+      })
+      .finally(() => {
+        nativeActionLoads.current.delete(nativeActionKey);
+        if (!cancelled) setNativeActionsLoadingKey("");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [nativeActionKey, nativeActionRetry, nativeActionsByKey, runtime, workingDirectory]);
+  const autocompleteMatches = useMemo(
+    () =>
+      !autocompleteToken
+        ? []
+        : autocompleteToken.kind === "file"
+          ? matchFiles(contextFiles, autocompleteToken.query)
+          : matchSkills(nativeActions, autocompleteToken.query),
+    [autocompleteToken?.kind, autocompleteToken?.query, contextFiles, nativeActions], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+  // Dismissal (Escape) sticks to the trigger position; the highlight resets
+  // whenever the query under that trigger changes.
+  const autocompleteTokenKey = autocompleteToken
+    ? `${autocompleteToken.kind}:${autocompleteToken.start}`
+    : "";
+  const autocompleteHighlightKey = autocompleteToken
+    ? `${autocompleteTokenKey}:${autocompleteToken.query}`
+    : "";
+  const skillStatusVisible =
+    autocompleteToken?.kind === "skill" &&
+    (nativeActionsLoadingKey === nativeActionKey || Boolean(nativeActionsError));
+  const autocompleteOpen =
+    (autocompleteMatches.length > 0 || skillStatusVisible) &&
+    dismissedTokenKey !== autocompleteTokenKey;
+  const highlightedIndex =
+    autocompleteMatches.length === 0
+      ? 0
+      : Math.min(
+          autocompleteHighlight.key === autocompleteHighlightKey ? autocompleteHighlight.index : 0,
+          autocompleteMatches.length - 1,
+        );
+  const setHighlightedIndex = (index: number) => {
+    setAutocompleteHighlight({
+      key: autocompleteHighlightKey,
+      index: Math.max(0, Math.min(index, autocompleteMatches.length - 1)),
+    });
+  };
+
+  /** Marks a manual draft edit as the new voice baseline so programmatic
+   * insertions cooperate with an in-flight dictation session. */
+  const resetVoiceBaseline = (nextPrompt: string, position: number) => {
+    if (!voiceActive) return;
+    voiceBaseRef.current = nextPrompt;
+    voiceCommittedTranscriptRef.current = "";
+    voiceLiveTranscriptRef.current = "";
+    voiceAnchorRef.current = { start: position, end: position };
+  };
+
+  const acceptAutocomplete = (match: AutocompleteMatch) => {
+    const token = autocompleteToken;
+    if (!token) return;
+    if (token.kind === "skill" && match.invocation === "interactiveOnly") return;
+    const insert = token.kind === "file" ? `@${match.value} ` : `/${match.value} `;
+    const next = prompt.slice(0, token.start) + insert + prompt.slice(caret);
+    const position = token.start + insert.length;
+    setPrompt(next);
+    setCaret(position);
+    resetVoiceBaseline(next, position);
+    requestAnimationFrame(() => {
+      const textarea = textareaRef.current;
+      textarea?.focus();
+      textarea?.setSelectionRange(position, position);
+    });
+  };
+
+  // Applies host-driven insertions (right-click → add file as chat context).
+  const lastInsertIdRef = useRef(0);
+  useEffect(() => {
+    if (!insertRequest || insertRequest.id === lastInsertIdRef.current) return;
+    lastInsertIdRef.current = insertRequest.id;
+    const textarea = textareaRef.current;
+    const start = textarea?.selectionStart ?? prompt.length;
+    const end = textarea?.selectionEnd ?? start;
+    const before = prompt.slice(0, start);
+    const lead = before && !/\s$/.test(before) ? " " : "";
+    const text = lead + insertRequest.text;
+    const next = before + text + prompt.slice(end);
+    const position = start + text.length;
+    setPrompt(next);
+    setCaret(position);
+    resetVoiceBaseline(next, position);
+    onInsertHandled?.(insertRequest.id);
+    requestAnimationFrame(() => {
+      textarea?.focus();
+      textarea?.setSelectionRange(position, position);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- consumes the request exactly once per id
+  }, [insertRequest]);
 
   // Grow the textarea with its content (up to the CSS max-height) instead of
   // scrolling a fixed three-row box.
@@ -472,20 +785,22 @@ export function Composer({
     [],
   );
 
-  useEffect(() => {
-    if (providerCatalogs[runtime]) return;
-    let active = true;
-    void bridge
-      .listModelCatalog?.(runtime)
-      .then((entries) => {
-        if (!active || !entries?.length) return;
-        setProviderCatalogs((current) => ({ ...current, [runtime]: entries }));
-      })
-      .catch(() => undefined);
-    return () => {
-      active = false;
-    };
-  }, [runtime, providerCatalogs]);
+  const loadProviderCatalog = useCallback(
+    (targetRuntime: RuntimeId) => {
+      if (providerCatalogs[targetRuntime] || providerCatalogLoads.current.has(targetRuntime))
+        return;
+      providerCatalogLoads.current.add(targetRuntime);
+      void bridge
+        .listModelCatalog?.(targetRuntime)
+        .then((entries) => {
+          if (!entries?.length) return;
+          setProviderCatalogs((current) => ({ ...current, [targetRuntime]: entries }));
+        })
+        .catch(() => undefined)
+        .finally(() => providerCatalogLoads.current.delete(targetRuntime));
+    },
+    [providerCatalogs],
+  );
 
   // A saved model can belong to a different runtime (for example after an
   // imported settings file or a runtime change from an older build). Once the
@@ -509,33 +824,98 @@ export function Composer({
   const submit = async () => {
     const trimmed = prompt.trim();
     if (!trimmed || sending) return;
+    const submittedDraft = trimmed;
+    const nativeAction = completedNativeAction(trimmed, nativeActions);
+    const nativeActionId = nativeAction?.id;
     setSending(true);
+    // Clear immediately so the composer feels like a send action, not a
+    // request that is waiting on provider/session startup. A rejected send
+    // puts this exact draft back below.
+    setPrompt("");
     try {
-      await onSend({
+      const accepted = await onSend({
         prompt: trimmed,
         runtime,
         model: activeModel,
         effort: effortOptions.length > 0 ? activeEffort : undefined,
         permission,
         delegation,
+        ...(nativeActionId ? { nativeActionId } : {}),
+        ...(nativeAction
+          ? { nativeAction: { name: nativeAction.name, kind: nativeAction.kind } }
+          : {}),
       });
-      setPrompt("");
+      if (accepted === false) {
+        setPrompt((current) => (current.trim() ? current : submittedDraft));
+      } else {
+        if (composerTextMirrorRef.current) composerTextMirrorRef.current.scrollTop = 0;
+      }
       textareaRef.current?.focus();
+    } catch {
+      setPrompt((current) => (current.trim() ? current : submittedDraft));
     } finally {
       setSending(false);
     }
   };
 
-  const insertMention = () => {
-    const textarea = textareaRef.current;
-    const start = textarea?.selectionStart ?? prompt.length;
-    const end = textarea?.selectionEnd ?? prompt.length;
-    const next = `${prompt.slice(0, start)}@${prompt.slice(end)}`;
-    setPrompt(next);
-    requestAnimationFrame(() => {
-      textarea?.focus();
-      textarea?.setSelectionRange(start + 1, start + 1);
-    });
+  const changePermission = (next: string) => {
+    routingTouched.current = true;
+    setPermission(next as typeof permission);
+    onPermissionChange?.(next as typeof permission);
+  };
+
+  const changeDelegation = (next: string) => {
+    setDelegation(next as typeof delegation);
+  };
+
+  const changeEffort = (next: string) => {
+    routingTouched.current = true;
+    setEffort(next);
+    emitRoutingChange(runtime, activeModel, next);
+  };
+
+  const permissionOptions = [
+    { value: "read-only", label: "Read only" },
+    { value: "project-write", label: "Project write" },
+    { value: "ask", label: "Ask as needed" },
+    { value: "full-access", label: "Full access" },
+  ];
+  const delegationOptions = [
+    { value: "off", label: "No delegation" },
+    { value: "manual", label: "Manual" },
+    { value: "balanced", label: "Balanced delegation" },
+    { value: "budget-first", label: "Budget first" },
+  ];
+  const microphoneOptions = [
+    { value: "default", label: "Default mic" },
+    ...micDevices
+      .filter((device) => device.deviceId && device.deviceId !== "default")
+      .map((device, index) => ({
+        value: device.deviceId,
+        label: device.label || `Microphone ${index + 1}`,
+      })),
+  ];
+  const modeOptions =
+    sessionModes?.availableModes.map((mode) => ({ value: mode.id, label: mode.name })) ?? [];
+  const compactControlOptions =
+    controlsSubmenu === "mode"
+      ? modeOptions
+      : controlsSubmenu === "permission"
+        ? permissionOptions
+        : delegationOptions;
+  const compactControlValue =
+    controlsSubmenu === "mode"
+      ? sessionModes?.currentModeId
+      : controlsSubmenu === "permission"
+        ? permission
+        : delegation;
+  const chooseCompactControl = (value: string) => {
+    if (controlsSubmenu === "mode") onSessionModeChange?.(value);
+    if (controlsSubmenu === "permission") changePermission(value);
+    if (controlsSubmenu === "delegation") changeDelegation(value);
+    setControlsSubmenu(null);
+    setControlsMenuOpen(false);
+    controlsMenuButtonRef.current?.focus();
   };
 
   return (
@@ -568,112 +948,308 @@ export function Composer({
         </div>
       ) : null}
       <div className="composer" data-busy={sending}>
-        <textarea
-          ref={textareaRef}
-          value={prompt}
-          onChange={(event) => {
-            const nextPrompt = event.target.value;
-            if (voiceActive) {
-              // Treat a manual edit as the new draft baseline. This keeps
-              // typed text and already-transcribed words intact instead of
-              // rebuilding the textarea from the old pre-recording value.
-              voiceBaseRef.current = nextPrompt;
-              voiceCommittedTranscriptRef.current = "";
-              voiceLiveTranscriptRef.current = "";
-              voiceAnchorRef.current = {
-                start: event.target.selectionStart,
-                end: event.target.selectionEnd,
-              };
-            }
-            setPrompt(nextPrompt);
-          }}
-          onKeyDown={(event) => {
-            if (event.key !== "Enter" || event.nativeEvent.isComposing) return;
-            // Ctrl/Cmd+Enter always sends; plain Enter follows the setting.
-            if (event.ctrlKey || event.metaKey || (enterToSend && !event.shiftKey)) {
-              event.preventDefault();
-              void submit();
-            }
-          }}
-          rows={3}
-          placeholder="Ask, build, review… use / for skills and @ for context"
-          aria-label="Task message"
-          autoFocus
-        />
-        <div className="composer-context-row">
-          <button
-            className="composer-tool"
-            type="button"
-            onClick={onAddContext}
-            disabled={!onAddContext}
-            title={
-              onAddContext
-                ? "Add task context"
-                : "File context will be available when attachments are stored with this task."
-            }
-          >
-            <FilePlus2 />
-            <span>Add context</span>
-          </button>
-          <button
-            className="composer-tool"
-            type="button"
-            onClick={insertMention}
-            title="Insert @ to mention a file, symbol, or skill"
-          >
-            <AtSign />
-            <span>Mention</span>
-          </button>
-          <span className="context-chip">
-            <Sparkles /> v1 contract
-          </span>
+        <AnimatePresence>
+          {autocompleteOpen ? (
+            <motion.div
+              className="composer-autocomplete"
+              role="listbox"
+              aria-label={
+                autocompleteToken?.kind === "file" ? "File suggestions" : "Skill suggestions"
+              }
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 6 }}
+              transition={{ duration: 0.12, ease: "easeOut" }}
+            >
+              <p className="composer-autocomplete-hint">
+                {autocompleteToken?.kind === "file" ? "Project files" : "Provider native"} · ↑↓ to
+                choose · Enter to insert · Esc to dismiss
+              </p>
+              {autocompleteMatches.length === 0 && skillStatusVisible ? (
+                <p
+                  className="composer-autocomplete-status"
+                  role={nativeActionsError ? "alert" : "status"}
+                >
+                  {nativeActionsError || "Loading native skills…"}
+                </p>
+              ) : null}
+              {autocompleteMatches.map((match, index) => (
+                <button
+                  key={match.actionId ?? `${match.value}:${index}`}
+                  type="button"
+                  role="option"
+                  aria-selected={index === highlightedIndex}
+                  aria-disabled={match.invocation === "interactiveOnly"}
+                  data-active={index === highlightedIndex}
+                  data-disabled={match.invocation === "interactiveOnly" || undefined}
+                  title={
+                    match.invocation === "interactiveOnly"
+                      ? "Open this provider's interactive terminal to use this action"
+                      : undefined
+                  }
+                  // Keep focus in the textarea so accepting never blurs the draft.
+                  onMouseDown={(event) => event.preventDefault()}
+                  onMouseEnter={() => setHighlightedIndex(index)}
+                  onClick={() => acceptAutocomplete(match)}
+                >
+                  {autocompleteToken?.kind === "file" ? <FileIcon fileName={match.value} /> : null}
+                  <span>{match.label}</span>
+                  {match.detail ? <small>{match.detail}</small> : null}
+                </button>
+              ))}
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
+        <div className="composer-editor">
+          {activeNativeSkill ? (
+            <div
+              ref={composerTextMirrorRef}
+              className="composer-text-mirror"
+              aria-hidden="true"
+              data-native-skill={activeNativeSkill.name}
+            >
+              <strong className="native-skill-token">{activeNativeSkillPrefix}</strong>
+              {prompt.slice(activeNativeSkillPrefix.length)}
+            </div>
+          ) : null}
+          <textarea
+            ref={textareaRef}
+            className={activeNativeSkill ? "composer-textarea--mirrored" : undefined}
+            value={prompt}
+            onScroll={(event) => {
+              if (composerTextMirrorRef.current) {
+                composerTextMirrorRef.current.scrollTop = event.currentTarget.scrollTop;
+                composerTextMirrorRef.current.scrollLeft = event.currentTarget.scrollLeft;
+              }
+            }}
+            onChange={(event) => {
+              const nextPrompt = event.target.value;
+              if (nextPrompt.startsWith("/") && !prompt.startsWith("/") && nativeActionsError) {
+                setNativeActionRetry((current) => current + 1);
+              }
+              if (voiceActive) {
+                // Treat a manual edit as the new draft baseline. This keeps
+                // typed text and already-transcribed words intact instead of
+                // rebuilding the textarea from the old pre-recording value.
+                voiceBaseRef.current = nextPrompt;
+                voiceCommittedTranscriptRef.current = "";
+                voiceLiveTranscriptRef.current = "";
+                voiceAnchorRef.current = {
+                  start: event.target.selectionStart,
+                  end: event.target.selectionEnd,
+                };
+              }
+              setPrompt(nextPrompt);
+              setCaret(event.target.selectionStart);
+            }}
+            onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
+            onKeyDown={(event) => {
+              if (autocompleteOpen) {
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  setDismissedTokenKey(autocompleteTokenKey);
+                  return;
+                }
+                if (autocompleteMatches.length === 0) return;
+                if (event.key === "ArrowDown") {
+                  event.preventDefault();
+                  setHighlightedIndex(highlightedIndex + 1);
+                  return;
+                }
+                if (event.key === "ArrowUp") {
+                  event.preventDefault();
+                  setHighlightedIndex(highlightedIndex - 1);
+                  return;
+                }
+                if (
+                  event.key === "Tab" ||
+                  (event.key === "Enter" &&
+                    !event.ctrlKey &&
+                    !event.metaKey &&
+                    !event.shiftKey &&
+                    !event.nativeEvent.isComposing)
+                ) {
+                  event.preventDefault();
+                  acceptAutocomplete(autocompleteMatches[highlightedIndex]);
+                  return;
+                }
+              }
+              if (event.key !== "Enter" || event.nativeEvent.isComposing) return;
+              // Ctrl/Cmd+Enter always sends; plain Enter follows the setting.
+              if (event.ctrlKey || event.metaKey || (enterToSend && !event.shiftKey)) {
+                event.preventDefault();
+                void submit();
+              }
+            }}
+            rows={3}
+            placeholder="Ask, build, review… use / for skills and @ for context"
+            aria-label={messageLabel}
+            autoFocus
+          />
         </div>
         <div className="composer-control-row">
           <div className="composer-controls-left">
-            <Dropdown
-              className="compact-select"
-              aria-label="Permission"
-              leading={<ShieldCheck />}
-              value={permission}
-              onChange={(next) => {
-                routingTouched.current = true;
-                setPermission(next as typeof permission);
-              }}
-              options={[
-                { value: "read-only", label: "Read only" },
-                { value: "project-write", label: "Project write" },
-                { value: "ask", label: "Ask as needed" },
-                { value: "full-access", label: "Full access" },
-              ]}
-              compact
-            />
-            <Dropdown
-              className="compact-select"
-              aria-label="Delegation"
-              leading={<Users />}
-              value={delegation}
-              onChange={(next) => setDelegation(next as typeof delegation)}
-              options={[
-                { value: "off", label: "No delegation" },
-                { value: "manual", label: "Manual" },
-                { value: "balanced", label: "Balanced delegation" },
-                { value: "budget-first", label: "Budget first" },
-              ]}
-              compact
-            />
+            <div className="composer-controls-optional">
+              {sessionModes && sessionModes.availableModes.length > 1 ? (
+                <Dropdown
+                  className="compact-select mode-select"
+                  aria-label="Agent mode"
+                  leading={<Compass />}
+                  value={sessionModes.currentModeId}
+                  onChange={(next) => onSessionModeChange?.(next)}
+                  options={modeOptions}
+                  compact
+                />
+              ) : null}
+              <Dropdown
+                className="compact-select"
+                aria-label="Permission"
+                disabled={permissionDisabled}
+                leading={<ShieldCheck />}
+                value={permission}
+                onChange={changePermission}
+                options={permissionOptions}
+                compact
+              />
+              <Dropdown
+                className="compact-select"
+                aria-label="Delegation"
+                disabled={delegationDisabled}
+                leading={<Users />}
+                value={delegation}
+                onChange={changeDelegation}
+                options={delegationOptions}
+                compact
+              />
+            </div>
+            <div className="composer-overflow-controls" ref={controlsMenuRef}>
+              <button
+                ref={controlsMenuButtonRef}
+                className="dropdown-trigger composer-overflow-trigger"
+                type="button"
+                aria-label="More composer controls"
+                title="Mode, permission, delegation"
+                aria-haspopup="menu"
+                aria-expanded={controlsMenuOpen}
+                onClick={() => {
+                  setControlsSubmenu(null);
+                  setControlsMenuOpen((open) => !open);
+                }}
+              >
+                <SlidersHorizontal aria-hidden="true" />
+              </button>
+              <AnimatePresence>
+                {controlsMenuOpen ? (
+                  <motion.div
+                    className="composer-overflow-menu"
+                    role="menu"
+                    aria-label="Composer controls"
+                    initial={{ opacity: 0, y: 5, scale: 0.98 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: 4, scale: 0.98 }}
+                    transition={{ duration: 0.14, ease: [0.2, 0, 0, 1] }}
+                  >
+                    {sessionModes && modeOptions.length > 1 ? (
+                      <button
+                        className="composer-overflow-row"
+                        type="button"
+                        role="menuitem"
+                        aria-haspopup="menu"
+                        aria-expanded={controlsSubmenu === "mode"}
+                        onPointerEnter={() => setControlsSubmenu("mode")}
+                        onFocus={() => setControlsSubmenu("mode")}
+                        onClick={() => setControlsSubmenu("mode")}
+                        onKeyDown={(event) => {
+                          if (event.key === "ArrowRight") setControlsSubmenu("mode");
+                        }}
+                      >
+                        <span>Mode</span>
+                        <small>
+                          {modeOptions.find((option) => option.value === sessionModes.currentModeId)
+                            ?.label ?? sessionModes.currentModeId}
+                        </small>
+                      </button>
+                    ) : null}
+                    <button
+                      className="composer-overflow-row"
+                      type="button"
+                      role="menuitem"
+                      aria-haspopup="menu"
+                      aria-expanded={controlsSubmenu === "permission"}
+                      disabled={permissionDisabled}
+                      onPointerEnter={() => setControlsSubmenu("permission")}
+                      onFocus={() => setControlsSubmenu("permission")}
+                      onClick={() => setControlsSubmenu("permission")}
+                      onKeyDown={(event) => {
+                        if (event.key === "ArrowRight") setControlsSubmenu("permission");
+                      }}
+                    >
+                      <span>Permission</span>
+                      <small>
+                        {permissionOptions.find((option) => option.value === permission)?.label ??
+                          permission}
+                      </small>
+                    </button>
+                    <button
+                      className="composer-overflow-row"
+                      type="button"
+                      role="menuitem"
+                      aria-haspopup="menu"
+                      aria-expanded={controlsSubmenu === "delegation"}
+                      disabled={delegationDisabled}
+                      onPointerEnter={() => setControlsSubmenu("delegation")}
+                      onFocus={() => setControlsSubmenu("delegation")}
+                      onClick={() => setControlsSubmenu("delegation")}
+                      onKeyDown={(event) => {
+                        if (event.key === "ArrowRight") setControlsSubmenu("delegation");
+                      }}
+                    >
+                      <span>Delegation</span>
+                      <small>
+                        {delegationOptions.find((option) => option.value === delegation)?.label ??
+                          delegation}
+                      </small>
+                    </button>
+                    <AnimatePresence>
+                      {controlsSubmenu ? (
+                        <motion.div
+                          className="composer-overflow-submenu"
+                          role="menu"
+                          aria-label={`${controlsSubmenu} options`}
+                          initial={{ opacity: 0, x: -4, scale: 0.98 }}
+                          animate={{ opacity: 1, x: 0, scale: 1 }}
+                          exit={{ opacity: 0, x: -3, scale: 0.98 }}
+                          transition={{ duration: 0.12, ease: [0.2, 0, 0, 1] }}
+                        >
+                          {compactControlOptions.map((option) => (
+                            <button
+                              type="button"
+                              role="menuitemradio"
+                              aria-checked={option.value === compactControlValue}
+                              data-selected={option.value === compactControlValue}
+                              key={option.value}
+                              onClick={() => chooseCompactControl(option.value)}
+                            >
+                              {option.label}
+                            </button>
+                          ))}
+                        </motion.div>
+                      ) : null}
+                    </AnimatePresence>
+                  </motion.div>
+                ) : null}
+              </AnimatePresence>
+            </div>
           </div>
           <div className="composer-controls-right">
             {effortOptions.length > 0 ? (
               <Dropdown
                 className="compact-select effort-select"
                 aria-label="Reasoning effort"
+                disabled={routingDisabled}
                 leading={<Gauge />}
                 value={activeEffort}
-                onChange={(next) => {
-                  routingTouched.current = true;
-                  setEffort(next);
-                  emitRoutingChange(runtime, activeModel, next);
-                }}
+                onChange={changeEffort}
                 options={effortOptions.map((option) => ({
                   value: option.id,
                   label: option.label,
@@ -684,6 +1260,8 @@ export function Composer({
             <Dropdown
               className="model-select"
               aria-label="Model"
+              disabled={routingDisabled}
+              onOpen={() => loadProviderCatalog(runtime)}
               value={activeModel}
               onChange={(next) => {
                 routingTouched.current = true;
@@ -702,6 +1280,7 @@ export function Composer({
             <Dropdown
               className="route-select"
               aria-label="Runtime"
+              disabled={routingDisabled}
               value={runtime}
               onChange={(next) => {
                 routingTouched.current = true;
@@ -745,9 +1324,7 @@ export function Composer({
               aria-pressed={voiceRecording}
               aria-keyshortcuts={voiceRecording ? "Escape" : undefined}
               disabled={
-                voicePhase === "stopping" ||
-                voiceConfigured === null ||
-                voiceConfigured === false
+                voicePhase === "stopping" || voiceConfigured === null || voiceConfigured === false
               }
               title={
                 voicePhase === "starting"
@@ -774,15 +1351,7 @@ export function Composer({
                   : "default"
               }
               onChange={setMicDeviceId}
-              options={[
-                { value: "default", label: "Default mic" },
-                ...micDevices
-                  .filter((device) => device.deviceId && device.deviceId !== "default")
-                  .map((device, index) => ({
-                    value: device.deviceId,
-                    label: device.label || `Microphone ${index + 1}`,
-                  })),
-              ]}
+              options={microphoneOptions}
               compact
             />
             {running && onStop && !prompt.trim() ? (
@@ -803,7 +1372,7 @@ export function Composer({
                 type="button"
                 onClick={() => void submit()}
                 disabled={!prompt.trim() || sending}
-                aria-label={sending ? "Sending" : "Send message"}
+                aria-label={sending ? "Sending" : sendLabel}
                 whileTap={{ scale: 0.94 }}
               >
                 <ArrowUp />
@@ -818,15 +1387,10 @@ export function Composer({
           : "Ctrl Enter to send · Enter for a new line"}{" "}
         · agents can make mistakes; review changes
       </p>
-      {runtimeWarning || voiceActive || voiceNotice || voiceError ? (
+      {voiceActive || voiceNotice || voiceError ? (
         // Absolutely positioned so transient status lines never change the
         // composer's height or push it up while typing.
         <div className="composer-status-overlay" aria-label="Composer status">
-          {runtimeWarning ? (
-            <p className="composer-runtime-warning" role="status">
-              {runtimeWarning}
-            </p>
-          ) : null}
           {voiceActive ? (
             <p
               className={`composer-voice-status composer-voice-status--${voicePhase}`}

@@ -1,74 +1,76 @@
 :root {
   color-scheme: dark;
 
-  /* Graphite is the first-paint fallback; theme.ts replaces these atomically. */
-  --color-surface-canvas: #111315;
-  --color-surface-rail: #16191c;
-  --color-surface-panel: #1a1d21;
-  --color-surface-layer1: #1e2226;
-  --color-surface-layer2: #23282d;
-  --color-surface-elevated: #292f35;
-  --color-surface-overlay: #090a0bd9;
-  --color-text-primary: #f1f4f6;
-  --color-text-secondary: #bcc4ca;
-  --color-text-muted: #7f8a92;
-  --color-text-inverse: #0d1114;
-  --color-border-subtle: #2a3035;
-  --color-border-strong: #46515a;
-  --color-focus-ring: #7aaed6;
-  --color-selection-active: #284861;
-  --color-selection-text: #f5f9fc;
-  --color-accent-primary: #72a7d1;
-  --color-accent-hover: #8bb9dc;
-  --color-accent-pressed: #568db8;
-  --color-accent-subtle: #1c3447;
-  --color-accent-text: #09131b;
-  --color-status-success: #70b58a;
-  --color-status-warning: #d5a956;
-  --color-status-danger: #dc7771;
-  --color-status-info: #70a9ce;
-  --color-status-successSurface: #183125;
-  --color-status-warningSurface: #382d18;
-  --color-status-dangerSurface: #3c2020;
-  --color-status-infoSurface: #193247;
-  --color-diff-added: #173124;
-  --color-diff-addedStrong: #24533a;
-  --color-diff-addedText: #9bd3ae;
-  --color-diff-removed: #3a1e1e;
-  --color-diff-removedStrong: #612c2c;
-  --color-diff-removedText: #efaaa4;
-  --color-diff-context: #181b1e;
-  --color-syntax-keyword: #8eb7db;
-  --color-syntax-string: #a9c98f;
-  --color-syntax-type: #dbbd77;
-  --color-syntax-function: #79c6ba;
-  --color-syntax-variable: #d5dbe0;
-  --color-syntax-number: #d6a47b;
-  --color-syntax-comment: #77838c;
-  --color-terminal-ansi0: #171a1d;
-  --color-terminal-ansi1: #d46f6a;
-  --color-terminal-ansi2: #6fb287;
-  --color-terminal-ansi3: #cba14f;
-  --color-terminal-ansi4: #6e9fca;
-  --color-terminal-ansi5: #b58db6;
-  --color-terminal-ansi6: #68aaa8;
-  --color-terminal-ansi7: #c9ced2;
-  --color-terminal-ansi8: #68727a;
-  --color-terminal-ansi9: #ee8b84;
-  --color-terminal-ansi10: #8bcc9f;
-  --color-terminal-ansi11: #e3bd6d;
-  --color-terminal-ansi12: #8ab9df;
-  --color-terminal-ansi13: #c9a4c9;
-  --color-terminal-ansi14: #82c3c0;
-  --color-terminal-ansi15: #f3f5f6;
-  --color-chrome-background: #15181b;
-  --color-chrome-foreground: #d9dee2;
+  /* Integrator is the first-paint fallback; theme.ts replaces these atomically. */
+  --color-surface-canvas: #050505;
+  --color-surface-rail: #0e0e0e;
+  --color-surface-panel: #131313;
+  --color-surface-layer1: #191919;
+  --color-surface-layer2: #1f1f1f;
+  --color-surface-elevated: #262626;
+  --color-surface-overlay: #000000e0;
+  --color-text-primary: #ffffff;
+  --color-text-secondary: #c5c5c5;
+  --color-text-muted: #8c8c8c;
+  --color-text-inverse: #050505;
+  --color-border-subtle: #262626;
+  --color-border-strong: #4a4a4a;
+  --color-focus-ring: #d9d9d9;
+  --color-selection-active: #333333;
+  --color-selection-text: #ffffff;
+  --color-accent-primary: #e6e6e6;
+  --color-accent-hover: #ffffff;
+  --color-accent-pressed: #bfbfbf;
+  --color-accent-subtle: #292929;
+  --color-accent-text: #0a0a0a;
+  --color-status-success: #98b6a2;
+  --color-status-warning: #cfae72;
+  --color-status-danger: #d68983;
+  --color-status-info: #a3a3a3;
+  --color-status-successSurface: #1c2620;
+  --color-status-warningSurface: #2b2517;
+  --color-status-dangerSurface: #301d1c;
+  --color-status-infoSurface: #242424;
+  --color-diff-added: #17211b;
+  --color-diff-addedStrong: #2c4033;
+  --color-diff-addedText: #b2cfba;
+  --color-diff-removed: #2a1a19;
+  --color-diff-removedStrong: #4a2b28;
+  --color-diff-removedText: #dfaba4;
+  --color-diff-context: #151515;
+  --color-syntax-keyword: #d4d4d4;
+  --color-syntax-string: #a9bfa9;
+  --color-syntax-type: #cfc0a0;
+  --color-syntax-function: #a8c4be;
+  --color-syntax-variable: #ececec;
+  --color-syntax-number: #c8ab8e;
+  --color-syntax-comment: #767676;
+  --color-terminal-ansi0: #111111;
+  --color-terminal-ansi1: #cf8a82;
+  --color-terminal-ansi2: #96b89f;
+  --color-terminal-ansi3: #cdb078;
+  --color-terminal-ansi4: #a0aab2;
+  --color-terminal-ansi5: #b49cb4;
+  --color-terminal-ansi6: #8fb0ac;
+  --color-terminal-ansi7: #d6d6d6;
+  --color-terminal-ansi8: #707070;
+  --color-terminal-ansi9: #e2a59d;
+  --color-terminal-ansi10: #b0cdb7;
+  --color-terminal-ansi11: #dfc48f;
+  --color-terminal-ansi12: #b4c3cd;
+  --color-terminal-ansi13: #c9b3c9;
+  --color-terminal-ansi14: #a6c6c1;
+  --color-terminal-ansi15: #ffffff;
+  --color-chrome-background: #0a0a0a;
+  --color-chrome-foreground: #e0e0e0;
 
   --font-interface:
     Inter, "Segoe UI Variable", "SF Pro Text", -apple-system, BlinkMacSystemFont, sans-serif;
   --font-code: "Cascadia Code", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   --font-size-body: 14px;
   --font-size-code: 13px;
+  --font-size-chat: calc(var(--font-size-body) - 0.5px);
+  --font-size-review-diff: max(8px, calc(var(--font-size-code) - 4px));
   --font-weight-body: 400;
   --line-height-body: 1.55;
   --line-height-code: 1.5;
@@ -117,6 +119,7 @@
   --color-focus: var(--color-focus-ring);
   --color-accent: var(--color-accent-primary);
   --color-accent-soft: var(--color-accent-subtle);
+  --color-accent-contrast: var(--color-accent-text);
   --color-success: var(--color-status-success);
   --color-warning: var(--color-status-warning);
   --color-danger: var(--color-status-danger);
@@ -131,6 +134,9 @@
   --radius-control: var(--radius-sm);
   --radius-panel: var(--radius-md);
   --radius-composer: var(--radius-md);
+  /* Navigation rows (sidebar chats, settings nav, rail lists) sit between
+     control and panel roundness so they track the user's radius setting. */
+  --radius-row: calc(var(--radius-sm) + 2px);
   --motion-fast: var(--duration-fast);
   --motion-panel: var(--duration-moderate);
   --canvas: var(--color-surface-canvas);
@@ -223,7 +229,7 @@ samp,
 }
 
 * {
-  scrollbar-color: var(--color-border-strong) transparent;
+  scrollbar-color: color-mix(in srgb, var(--color-text-muted) 45%, transparent) transparent;
   scrollbar-width: thin;
 }
 
@@ -232,15 +238,26 @@ samp,
   height: 10px;
 }
 
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
 ::-webkit-scrollbar-thumb {
-  background: var(--color-border-strong);
+  min-height: 40px;
+  background: color-mix(in srgb, var(--color-text-muted) 38%, transparent);
   background-clip: padding-box;
   border: 3px solid transparent;
   border-radius: var(--radius-full);
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background-color: var(--color-text-muted);
+  background-color: color-mix(in srgb, var(--color-text-muted) 62%, transparent);
+  border-width: 2px;
+}
+
+::-webkit-scrollbar-thumb:active {
+  background-color: color-mix(in srgb, var(--color-text-secondary) 72%, transparent);
+  border-width: 2px;
 }
 
 ::-webkit-scrollbar-corner {

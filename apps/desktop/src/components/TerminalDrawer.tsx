@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { CircleStop } from "lucide-react";
 import {
   bridge,
@@ -14,6 +14,9 @@ interface TerminalLine {
 }
 
 const MAX_SCROLLBACK_LINES = 2_000;
+const INITIAL_RENDERED_LINES = 400;
+const SCROLLBACK_CHUNK = 400;
+const FOLLOW_THRESHOLD_PX = 48;
 
 function promptFor(shell: string | undefined, cwd: string): string {
   return shell === "PowerShell" ? `PS ${cwd}>` : `${cwd}$`;
@@ -40,18 +43,34 @@ export function TerminalDrawer({
   const [unavailableReason, setUnavailableReason] = useState("");
   const [cwd, setCwd] = useState(project.path);
   const [history, setHistory] = useState<string[]>([]);
+  const [renderedLineLimit, setRenderedLineLimit] = useState(INITIAL_RENDERED_LINES);
+  const [frozenEndId, setFrozenEndId] = useState<number | null>(null);
   const historyCursor = useRef(-1);
   const opening = useRef(false);
   const nextLineId = useRef(0);
   const bodyRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const pendingLinesRef = useRef<Array<Omit<TerminalLine, "id">>>([]);
+  const pendingFrameRef = useRef<number | null>(null);
+  const pendingAnchorRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
 
-  const appendLine = (kind: TerminalLine["kind"], text: string) => {
-    setLines((current) => [
-      ...current.slice(-(MAX_SCROLLBACK_LINES - 1)),
-      { id: nextLineId.current++, kind, text },
-    ]);
-  };
+  const flushPendingLines = useCallback(() => {
+    pendingFrameRef.current = null;
+    const pending = pendingLinesRef.current.splice(0);
+    if (!pending.length) return;
+    const appended = pending.map((line) => ({ ...line, id: nextLineId.current++ }));
+    setLines((current) => [...current, ...appended].slice(-MAX_SCROLLBACK_LINES));
+  }, []);
+
+  const appendLine = useCallback(
+    (kind: TerminalLine["kind"], text: string) => {
+      pendingLinesRef.current.push({ kind, text });
+      if (pendingFrameRef.current === null) {
+        pendingFrameRef.current = window.requestAnimationFrame(flushPendingLines);
+      }
+    },
+    [flushPendingLines],
+  );
 
   useEffect(() => {
     if (!open || session || unavailableReason || opening.current) return;
@@ -108,7 +127,17 @@ export function TerminalDrawer({
       active = false;
       unlisten?.();
     };
-  }, [session]);
+  }, [appendLine, session]);
+
+  useEffect(
+    () => () => {
+      if (pendingFrameRef.current !== null) {
+        window.cancelAnimationFrame(pendingFrameRef.current);
+      }
+      pendingLinesRef.current = [];
+    },
+    [],
+  );
 
   // The backend session dies with this drawer (project switch or app
   // navigation), never on a visibility toggle, so scrollback survives.
@@ -121,8 +150,17 @@ export function TerminalDrawer({
 
   useEffect(() => {
     const body = bodyRef.current;
-    if (body) body.scrollTop = body.scrollHeight;
-  }, [lines]);
+    if (body && frozenEndId === null) body.scrollTop = body.scrollHeight;
+  }, [frozenEndId, lines]);
+
+  useLayoutEffect(() => {
+    const pendingAnchor = pendingAnchorRef.current;
+    const body = bodyRef.current;
+    if (!pendingAnchor || !body) return;
+    pendingAnchorRef.current = null;
+    body.scrollTop =
+      pendingAnchor.scrollTop + Math.max(0, body.scrollHeight - pendingAnchor.scrollHeight);
+  }, [renderedLineLimit]);
 
   useEffect(() => {
     if (open) inputRef.current?.focus();
@@ -162,6 +200,32 @@ export function TerminalDrawer({
     void bridge.interruptTerminal(session.id).catch(() => undefined);
   };
 
+  const frozenIndex =
+    frozenEndId === null ? -1 : lines.findIndex((line) => line.id === frozenEndId);
+  const visibleEnd = frozenIndex >= 0 ? frozenIndex + 1 : lines.length;
+  const visibleStart = Math.max(0, visibleEnd - renderedLineLimit);
+  const visibleLines = useMemo(
+    () => lines.slice(visibleStart, visibleEnd),
+    [lines, visibleEnd, visibleStart],
+  );
+  const hiddenEarlierCount = visibleStart;
+  const pendingLatestCount = lines.length - visibleEnd;
+
+  const revealEarlier = (all: boolean) => {
+    const body = bodyRef.current;
+    if (body) {
+      pendingAnchorRef.current = { scrollHeight: body.scrollHeight, scrollTop: body.scrollTop };
+    }
+    setRenderedLineLimit(all ? visibleEnd : renderedLineLimit + SCROLLBACK_CHUNK);
+  };
+
+  const jumpToLatest = () => {
+    setFrozenEndId(null);
+    window.requestAnimationFrame(() => {
+      if (bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
+    });
+  };
+
   if (!open) return null;
 
   return (
@@ -192,10 +256,58 @@ export function TerminalDrawer({
           Close
         </button>
       </header>
-      <div className="terminal-body" role="log" aria-live="polite" ref={bodyRef}>
+      {hiddenEarlierCount > 0 || pendingLatestCount > 0 ? (
+        <div className="terminal-scrollback-controls">
+          {hiddenEarlierCount > 0 ? (
+            <>
+              <span role="status">
+                Showing {visibleLines.length.toLocaleString()} of {visibleEnd.toLocaleString()}{" "}
+                saved lines
+              </span>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => revealEarlier(false)}
+              >
+                Show earlier {Math.min(SCROLLBACK_CHUNK, hiddenEarlierCount).toLocaleString()} lines
+              </button>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => revealEarlier(true)}
+              >
+                Show all {visibleEnd.toLocaleString()} saved lines
+              </button>
+            </>
+          ) : null}
+          {pendingLatestCount > 0 ? (
+            <button className="secondary-button" type="button" onClick={jumpToLatest}>
+              {pendingLatestCount.toLocaleString()} new lines · Jump to latest
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+      <div
+        className="terminal-body"
+        role="log"
+        aria-live="polite"
+        ref={bodyRef}
+        onScroll={(event) => {
+          const body = event.currentTarget;
+          const atLatest =
+            body.scrollHeight - body.scrollTop - body.clientHeight <= FOLLOW_THRESHOLD_PX;
+          if (!atLatest && frozenEndId === null) {
+            setFrozenEndId(lines.at(-1)?.id ?? null);
+          } else if (atLatest && frozenEndId !== null) {
+            setFrozenEndId(null);
+          }
+        }}
+      >
         {unavailableReason ? <p className="terminal-notice">{unavailableReason}</p> : null}
-        {!unavailableReason && !session ? <p className="terminal-notice">Opening terminal…</p> : null}
-        {lines.map((line) => (
+        {!unavailableReason && !session ? (
+          <p className="terminal-notice">Opening terminal…</p>
+        ) : null}
+        {visibleLines.map((line) => (
           <p key={line.id} className={`terminal-line--${line.kind}`}>
             {line.kind === "command" ? (
               <span className="terminal-command">{line.text}</span>

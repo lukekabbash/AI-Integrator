@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { AnimatePresence, LayoutGroup, motion, useReducedMotion } from "motion/react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence, LayoutGroup, m as motion, useReducedMotion } from "motion/react";
 import {
   Archive,
   ArchiveRestore,
@@ -7,8 +7,6 @@ import {
   Folder,
   History,
   MoreHorizontal,
-  PanelLeftClose,
-  PanelLeftOpen,
   Pencil,
   Pin,
   PinOff,
@@ -16,20 +14,21 @@ import {
   Search,
   Settings,
 } from "lucide-react";
-import type { ProjectSummary, TaskSummary } from "../bridge";
+import type { ProjectSummary, TaskMessageSearchHit, TaskSummary } from "../bridge";
+import { AnimatedFolderIcon } from "./AnimatedFolderIcon";
 import { BrandMark } from "./BrandMark";
 import { ResizeHandle } from "./ResizeHandle";
+import { Tooltip } from "./Tooltip";
 
 interface TaskSidebarProps {
   projects: ProjectSummary[];
   tasks: TaskSummary[];
   activeProjectId: string;
   activeTaskId: string;
-  collapsed: boolean;
   openingProject: boolean;
   metadataActionsEnabled: boolean;
   taskActionBusyId: string;
-  onToggleCollapsed: () => void;
+  onSearchMessages?: (query: string) => Promise<TaskMessageSearchHit[]>;
   onSelectProject: (projectId: string) => void;
   onSelectTask: (taskId: string) => void;
   onNewTask: () => void;
@@ -59,6 +58,24 @@ const ACTIVE_STATUSES = new Set<TaskSummary["status"]>([
   "waiting",
   "failed",
 ]);
+
+type ChatDotKind = "streaming" | "attention" | "unread" | "unread-failed";
+
+/** Chats only earn a dot when something is happening: streaming output,
+ * waiting on the user, or holding an unread reply. Idle rows stay quiet. */
+function chatDotKind(task: TaskSummary): ChatDotKind | null {
+  if (task.status === "waiting") return "attention";
+  if (task.status === "starting" || task.status === "running") return "streaming";
+  if (task.unread) return task.status === "failed" ? "unread-failed" : "unread";
+  return null;
+}
+
+const chatDotLabel: Record<ChatDotKind, string> = {
+  streaming: "Streaming",
+  attention: "Needs your input",
+  unread: "Unread reply",
+  "unread-failed": "Failed, unread",
+};
 
 function sortTasks(tasks: TaskSummary[]): TaskSummary[] {
   return [...tasks].sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
@@ -109,9 +126,11 @@ const expandTransition = {
   ease: [0.2, 0.8, 0.2, 1] as const,
 };
 
-const menuTransition = {
-  duration: 0.16,
-  ease: [0.2, 0, 0, 1] as const,
+const menuSpring = {
+  type: "spring" as const,
+  stiffness: 540,
+  damping: 33,
+  mass: 0.7,
 };
 
 const activeSpring = {
@@ -121,16 +140,19 @@ const activeSpring = {
   mass: 0.7,
 };
 
+const INITIAL_PROJECT_CHAT_LIMIT = 80;
+const PROJECT_CHAT_PAGE_SIZE = 120;
+const INITIAL_SEARCH_RESULT_LIMIT = 80;
+
 export function TaskSidebar({
   projects,
   tasks,
   activeProjectId,
   activeTaskId,
-  collapsed,
   openingProject,
   metadataActionsEnabled,
   taskActionBusyId,
-  onToggleCollapsed,
+  onSearchMessages,
   onSelectProject,
   onSelectTask,
   onNewTask,
@@ -140,8 +162,13 @@ export function TaskSidebar({
   onOpenSettings,
   onResize,
 }: TaskSidebarProps) {
-  const reduceMotion = useReducedMotion();
+  const reduceMotion =
+    Boolean(useReducedMotion()) ||
+    (typeof document !== "undefined" && document.documentElement.dataset.motion === "none");
   const [query, setQuery] = useState("");
+  const [messageHits, setMessageHits] = useState<TaskMessageSearchHit[]>([]);
+  const [messageSearchLoading, setMessageSearchLoading] = useState(false);
+  const [searchResultLimit, setSearchResultLimit] = useState(INITIAL_SEARCH_RESULT_LIMIT);
   const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>(() =>
     activeProjectId ? { [activeProjectId]: true } : {},
   );
@@ -149,8 +176,11 @@ export function TaskSidebar({
   const [renamingId, setRenamingId] = useState("");
   const [renameValue, setRenameValue] = useState("");
   const [showArchived, setShowArchived] = useState(false);
+  const [projectChatLimits, setProjectChatLimits] = useState<Record<string, number>>({});
   const chatListRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const searchGenerationRef = useRef(0);
   const mod = modKeyLabel();
 
   // Adjust-during-render (not an effect): the active project's group opens
@@ -179,19 +209,70 @@ export function TaskSidebar({
     };
   }, [openMenuId]);
 
-  const normalizedQuery = query.trim().toLowerCase();
-  const searchResults = useMemo(
-    () =>
-      normalizedQuery
-        ? sortTasks(
-            tasks.filter((task) => {
-              const project = projects.find((candidate) => candidate.id === task.projectId);
-              return `${task.title} ${project?.name ?? ""}`.toLowerCase().includes(normalizedQuery);
-            }),
-          )
-        : [],
-    [normalizedQuery, projects, tasks],
+  useEffect(
+    () => () => {
+      if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+      searchGenerationRef.current += 1;
+    },
+    [],
   );
+
+  const updateSearch = (value: string) => {
+    setQuery(value);
+    setMessageHits([]);
+    setSearchResultLimit(INITIAL_SEARCH_RESULT_LIMIT);
+    if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+    const generation = ++searchGenerationRef.current;
+    const normalized = value.trim();
+    if (!onSearchMessages || normalized.length < 2) {
+      setMessageSearchLoading(false);
+      return;
+    }
+    setMessageSearchLoading(true);
+    searchTimerRef.current = setTimeout(() => {
+      void onSearchMessages(normalized)
+        .then((hits) => {
+          if (searchGenerationRef.current === generation) setMessageHits(hits);
+        })
+        .catch(() => {
+          if (searchGenerationRef.current === generation) setMessageHits([]);
+        })
+        .finally(() => {
+          if (searchGenerationRef.current === generation) setMessageSearchLoading(false);
+        });
+    }, 140);
+  };
+
+  const deferredQuery = useDeferredValue(query);
+  const normalizedQuery = deferredQuery.trim().toLowerCase();
+  const messageHitByTask = useMemo(
+    () => new Map(messageHits.map((hit) => [hit.taskId, hit.snippet])),
+    [messageHits],
+  );
+  const projectById = useMemo(
+    () => new Map(projects.map((project) => [project.id, project])),
+    [projects],
+  );
+  const searchResults = useMemo(() => {
+    if (!normalizedQuery) return [];
+    const titleMatches = sortTasks(
+      tasks.filter((task) => {
+        const project = projectById.get(task.projectId);
+        return `${task.title} ${project?.name ?? ""}`.toLowerCase().includes(normalizedQuery);
+      }),
+    );
+    const seen = new Set(titleMatches.map((task) => task.id));
+    const taskById = new Map(tasks.map((task) => [task.id, task]));
+    for (const hit of messageHits) {
+      const task = taskById.get(hit.taskId);
+      if (task && !seen.has(task.id)) {
+        seen.add(task.id);
+        titleMatches.push(task);
+      }
+    }
+    return titleMatches;
+  }, [messageHits, normalizedQuery, projectById, tasks]);
+  const visibleSearchResults = searchResults.slice(0, searchResultLimit);
 
   const tasksByProject = useMemo(() => {
     const map = new Map<string, TaskSummary[]>();
@@ -242,10 +323,20 @@ export function TaskSidebar({
     return [...pinned, ...recent];
   };
 
-  const renderChat = (task: TaskSummary, options?: { showProject?: boolean; nested?: boolean }) => {
-    const project = projects.find((candidate) => candidate.id === task.projectId);
+  const renderChat = (
+    task: TaskSummary,
+    options?: { showProject?: boolean; nested?: boolean; snippet?: string },
+  ) => {
+    const project = projectById.get(task.projectId);
     const busy = taskActionBusyId === task.id;
     const active = task.id === activeTaskId;
+    const dotKind = chatDotKind(task);
+    const meta = options?.snippet
+      ? `${project?.name ?? "Project"} · ${options.snippet}`
+      : chatMeta(task, {
+          showProject: options?.showProject,
+          projectName: project?.name,
+        });
     if (renamingId === task.id) {
       return (
         <form
@@ -284,56 +375,68 @@ export function TaskSidebar({
             aria-hidden="true"
           />
         ) : null}
-        <button
-          className="chat-row"
-          data-chat-select
-          type="button"
-          onClick={() => onSelectTask(task.id)}
-          aria-current={active ? "page" : undefined}
-          title={chatMeta(task, {
-            showProject: options?.showProject,
-            projectName: project?.name,
-          })}
-          data-status={task.status}
-        >
-          <span
-            className={`status-dot status-dot--${task.status}`}
-            role="img"
-            aria-label={`Status: ${task.status}`}
-          />
-          <span className="chat-row-copy">
-            <span>{task.title}</span>
-            <small>
-              {chatMeta(task, {
-                showProject: options?.showProject,
-                projectName: project?.name,
-              })}
-            </small>
-          </span>
-          {task.pinned ? <Pin className="chat-pin" aria-label="Pinned" /> : null}
-          {task.unread ? <span className="unread-dot" aria-label="Unread" /> : null}
-        </button>
-        <button
-          className="chat-more-button"
-          type="button"
-          aria-label="More chat actions"
-          title={`More actions for ${task.title}`}
-          aria-expanded={openMenuId === task.id}
-          onClick={() => setOpenMenuId((current) => (current === task.id ? "" : task.id))}
-          disabled={busy}
-        >
-          <MoreHorizontal />
-        </button>
+        <Tooltip label={task.title} hint={meta} placement="right">
+          <button
+            className="chat-row"
+            data-chat-select
+            type="button"
+            onClick={() => onSelectTask(task.id)}
+            aria-current={active ? "page" : undefined}
+            data-status={task.status}
+          >
+            {dotKind && options?.nested ? (
+              <motion.span
+                key="activity-dot"
+                className="chat-dot-transition"
+                role="img"
+                aria-label={chatDotLabel[dotKind]}
+                initial={reduceMotion ? false : { opacity: 0, scale: 0.72 }}
+                animate={{ opacity: active ? 0 : 1, scale: active ? 0.72 : 1 }}
+                transition={
+                  reduceMotion ? { duration: 0 } : { duration: 0.18, ease: [0.2, 0, 0, 1] }
+                }
+              >
+                <span className={`chat-dot chat-dot--${dotKind}`} aria-hidden="true" />
+              </motion.span>
+            ) : null}
+            <span className="chat-row-copy">
+              <span>{task.title}</span>
+              {options?.showProject ? <small>{meta}</small> : null}
+            </span>
+            {task.pinned ? <Pin className="chat-pin" aria-label="Pinned" /> : null}
+          </button>
+        </Tooltip>
+        <Tooltip label="More actions">
+          <button
+            className="chat-more-button"
+            type="button"
+            aria-label="More chat actions"
+            aria-expanded={openMenuId === task.id}
+            onClick={() => setOpenMenuId((current) => (current === task.id ? "" : task.id))}
+            disabled={busy}
+          >
+            <MoreHorizontal />
+          </button>
+        </Tooltip>
         <AnimatePresence>
           {openMenuId === task.id ? (
             <motion.div
               className="chat-action-menu"
               role="menu"
               ref={menuRef}
-              initial={reduceMotion ? false : { opacity: 0, y: -4, scale: 0.98 }}
+              initial={reduceMotion ? false : { opacity: 0, y: -5, scale: 0.96 }}
               animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={reduceMotion ? undefined : { opacity: 0, y: -3, scale: 0.98 }}
-              transition={menuTransition}
+              exit={
+                reduceMotion
+                  ? undefined
+                  : {
+                      opacity: 0,
+                      y: -3,
+                      scale: 0.98,
+                      transition: { duration: 0.12, ease: [0.2, 0, 0, 1] },
+                    }
+              }
+              transition={reduceMotion ? { duration: 0 } : menuSpring}
             >
               <button
                 role="menuitem"
@@ -374,50 +477,10 @@ export function TaskSidebar({
     );
   };
 
-  if (collapsed) {
-    return (
-      <aside className="task-sidebar task-sidebar--collapsed" aria-label="Chat navigation">
-        <div className="rail-icon-stack">
-          <BrandMark compact />
-          <button className="icon-button" type="button" onClick={onNewTask} aria-label="New chat">
-            <Plus />
-          </button>
-          <button
-            className="icon-button"
-            type="button"
-            onClick={onToggleCollapsed}
-            aria-label="Expand chat navigation"
-          >
-            <PanelLeftOpen />
-          </button>
-        </div>
-        <button
-          className="icon-button rail-settings"
-          type="button"
-          onClick={onOpenSettings}
-          aria-label="Open Settings"
-        >
-          <Settings />
-        </button>
-        {onResize ? (
-          <ResizeHandle axis="horizontal" label="Resize chat sidebar" onResize={onResize} />
-        ) : null}
-      </aside>
-    );
-  }
-
   return (
     <aside className="task-sidebar" aria-label="Chat navigation">
       <div className="sidebar-brand-row">
         <BrandMark />
-        <button
-          className="icon-button subtle"
-          type="button"
-          onClick={onToggleCollapsed}
-          aria-label="Collapse chat navigation"
-        >
-          <PanelLeftClose />
-        </button>
       </div>
 
       <motion.button
@@ -438,13 +501,13 @@ export function TaskSidebar({
         <input
           aria-label="Search chats"
           value={query}
-          onChange={(event) => setQuery(event.target.value)}
+          onChange={(event) => updateSearch(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === "ArrowDown") {
               event.preventDefault();
               focusRelativeChat(1);
             } else if (event.key === "Escape") {
-              setQuery("");
+              updateSearch("");
               event.currentTarget.blur();
             }
           }}
@@ -465,32 +528,60 @@ export function TaskSidebar({
       >
         <div className="rail-section-heading">
           <span>Projects</span>
-          <button
-            type="button"
-            className="icon-button tiny"
-            aria-label={openingProject ? "Opening project" : "Open another project"}
-            onClick={onOpenProject}
-            disabled={openingProject}
-            aria-busy={openingProject}
-          >
-            <Plus />
-          </button>
+          <Tooltip label={openingProject ? "Opening project…" : "Open another project"}>
+            <button
+              type="button"
+              className="icon-button tiny"
+              aria-label={openingProject ? "Opening project" : "Open another project"}
+              onClick={onOpenProject}
+              disabled={openingProject}
+              aria-busy={openingProject}
+            >
+              <Plus />
+            </button>
+          </Tooltip>
         </div>
 
         <LayoutGroup id="sidebar-chats">
           {normalizedQuery ? (
-            <section className="chat-section" aria-label="Search results">
+            <section
+              className="chat-section"
+              aria-label="Search results"
+              aria-busy={messageSearchLoading}
+            >
               <div className="rail-section-heading rail-section-heading--later">
                 <span>Search results</span>
                 <small>{searchResults.length}</small>
               </div>
               {searchResults.length ? (
-                searchResults.map((task) => renderChat(task, { showProject: true }))
+                <>
+                  {visibleSearchResults.map((task) =>
+                    renderChat(task, {
+                      showProject: true,
+                      snippet: messageHitByTask.get(task.id),
+                    }),
+                  )}
+                  {searchResults.length > searchResultLimit ? (
+                    <button
+                      className="project-chat-more"
+                      type="button"
+                      onClick={() => setSearchResultLimit((current) => current + 120)}
+                    >
+                      Show more results
+                    </button>
+                  ) : null}
+                </>
+              ) : messageSearchLoading ? (
+                <div className="sidebar-chat-empty" role="status">
+                  <Search />
+                  <strong>Searching messages…</strong>
+                  <span>Looking through local chat history.</span>
+                </div>
               ) : (
                 <div className="sidebar-chat-empty" role="status">
                   <History />
                   <strong>No matching chats</strong>
-                  <span>Try a project name or a shorter phrase.</span>
+                  <span>Try a chat title, project, or words from a message.</span>
                 </div>
               )}
             </section>
@@ -498,10 +589,21 @@ export function TaskSidebar({
             <div className="project-tree" aria-label="Projects">
               {projects.map((project) => {
                 const expanded = expandedProjects[project.id] ?? false;
-                const projectChats = chatsForProject(project.id);
+                const allProjectTasks = tasksByProject.get(project.id) ?? [];
+                const projectChats = expanded ? chatsForProject(project.id) : [];
+                const chatLimit = projectChatLimits[project.id] ?? INITIAL_PROJECT_CHAT_LIMIT;
+                const visibleProjectChats = projectChats.slice(0, chatLimit);
+                const activeProjectChat = projectChats.find((task) => task.id === activeTaskId);
+                if (
+                  activeProjectChat &&
+                  !visibleProjectChats.some((task) => task.id === activeProjectChat.id)
+                ) {
+                  visibleProjectChats.push(activeProjectChat);
+                }
+                const hiddenChatCount = Math.max(0, projectChats.length - chatLimit);
                 const visibleCount = showArchived
-                  ? projectChats.length
-                  : (tasksByProject.get(project.id) ?? []).filter((task) => !task.archived).length;
+                  ? allProjectTasks.filter((task) => task.archived).length
+                  : allProjectTasks.filter((task) => !task.archived).length;
                 return (
                   <div
                     className="project-group"
@@ -532,21 +634,29 @@ export function TaskSidebar({
                         aria-label={`Open project ${project.name}`}
                         aria-current={project.id === activeProjectId ? "true" : undefined}
                       >
-                        <Folder />
+                        <AnimatedFolderIcon open={expanded} />
                         <span>{project.name}</span>
-                        <small>{visibleCount}</small>
                       </button>
-                      {onNewTaskInProject ? (
-                        <button
-                          className="project-new-chat"
-                          type="button"
-                          aria-label={`New chat in ${project.name}`}
-                          title={`New chat in ${project.name}`}
-                          onClick={() => onNewTaskInProject(project.id)}
+                      <span className="project-header-meta">
+                        <small
+                          className="project-count"
+                          aria-label={`${visibleCount} chat${visibleCount === 1 ? "" : "s"}`}
                         >
-                          <Plus aria-hidden="true" />
-                        </button>
-                      ) : null}
+                          {visibleCount}
+                        </small>
+                        {onNewTaskInProject ? (
+                          <Tooltip label={`New chat in ${project.name}`}>
+                            <button
+                              className="project-new-chat"
+                              type="button"
+                              aria-label={`New chat in ${project.name}`}
+                              onClick={() => onNewTaskInProject(project.id)}
+                            >
+                              <Plus aria-hidden="true" />
+                            </button>
+                          </Tooltip>
+                        ) : null}
+                      </span>
                     </div>
                     <AnimatePresence initial={false}>
                       {expanded ? (
@@ -559,7 +669,26 @@ export function TaskSidebar({
                           transition={expandTransition}
                         >
                           {projectChats.length ? (
-                            projectChats.map((task) => renderChat(task, { nested: true }))
+                            <>
+                              {visibleProjectChats.map((task) =>
+                                renderChat(task, { nested: true }),
+                              )}
+                              {hiddenChatCount > 0 ? (
+                                <button
+                                  className="project-chat-more"
+                                  type="button"
+                                  onClick={() =>
+                                    setProjectChatLimits((current) => ({
+                                      ...current,
+                                      [project.id]: chatLimit + PROJECT_CHAT_PAGE_SIZE,
+                                    }))
+                                  }
+                                >
+                                  Show {Math.min(PROJECT_CHAT_PAGE_SIZE, hiddenChatCount)} older
+                                  chats
+                                </button>
+                              ) : null}
+                            </>
                           ) : (
                             <p className="project-chat-empty" role="status">
                               {showArchived ? "No archived chats" : "No chats yet"}

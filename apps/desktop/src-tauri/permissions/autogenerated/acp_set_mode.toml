@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-acp-set-mode"
+description = "Enables the acp_set_mode command without any pre-configured scope."
+commands.allow = ["acp_set_mode"]
+
+[[permission]]
+identifier = "deny-acp-set-mode"
+description = "Denies the acp_set_mode command without any pre-configured scope."
+commands.deny = ["acp_set_mode"]

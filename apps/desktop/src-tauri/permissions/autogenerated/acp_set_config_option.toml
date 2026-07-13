@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-acp-set-config-option"
+description = "Enables the acp_set_config_option command without any pre-configured scope."
+commands.allow = ["acp_set_config_option"]
+
+[[permission]]
+identifier = "deny-acp-set-config-option"
+description = "Denies the acp_set_config_option command without any pre-configured scope."
+commands.deny = ["acp_set_config_option"]

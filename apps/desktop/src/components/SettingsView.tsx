@@ -1,4 +1,5 @@
 import { useMemo, useRef, useState, useEffect } from "react";
+import { LayoutGroup, m as motion, useReducedMotion } from "motion/react";
 import {
   ArrowLeft,
   Bot,
@@ -51,6 +52,7 @@ import {
   type ThemePreferences,
 } from "../theme";
 import { BrandMark } from "./BrandMark";
+import { Tooltip } from "./Tooltip";
 import { Dropdown, ProviderIcon } from "./Dropdown";
 
 type SettingsSection =
@@ -95,12 +97,22 @@ interface DelegationProfileSetting {
   runtime: string;
   model?: string;
   effort?: string;
+  /** Specialist prompt injected into every child launched with this profile. */
+  instruction?: string;
+  /** Profile ids preferred if this specialist may delegate downstream. */
+  preferredChildProfileIds?: string[];
   costTier: "low" | "medium" | "high";
   enabled: boolean;
 }
 
 const DEFAULT_DELEGATION_PROFILES: DelegationProfileSetting[] = [
-  { id: "codex-default", label: "Codex (OpenAI)", runtime: "codex", costTier: "low", enabled: true },
+  {
+    id: "codex-default",
+    label: "Codex (OpenAI)",
+    runtime: "codex",
+    costTier: "low",
+    enabled: true,
+  },
   { id: "claude-default", label: "Claude", runtime: "claude", costTier: "high", enabled: true },
   {
     id: "antigravity-default",
@@ -233,6 +245,7 @@ function SubagentsSettings({
   const profiles = normalizeDelegationProfiles(settings["delegation.profiles"]);
   const [instructionDraft, setInstructionDraft] = useState(instruction);
   const [catalogs, setCatalogs] = useState<Record<string, ModelCatalogEntry[]>>({});
+  const profileSequence = useRef(0);
 
   // One catalog fetch per runtime present in the profile list. Failures fall
   // back to the static effort ids without blocking the page.
@@ -266,9 +279,11 @@ function SubagentsSettings({
     updateProfiles([
       ...profiles,
       {
-        id: `${target.runtime}-${Date.now().toString(36)}`,
+        id: `${target.runtime}-local-${++profileSequence.current}`,
         label: suffix > 1 ? `${target.label} ${suffix}` : target.label,
         runtime: target.runtime,
+        instruction: "",
+        preferredChildProfileIds: [],
         costTier: target.runtime === "codex" ? "low" : "medium",
         enabled: true,
       },
@@ -381,9 +396,7 @@ function SubagentsSettings({
                   className="subagent-profile-name"
                   aria-label={`Name for the ${profile.runtime} profile`}
                   value={profile.label}
-                  onChange={(event) =>
-                    updateProfile(profile.id, { label: event.target.value })
-                  }
+                  onChange={(event) => updateProfile(profile.id, { label: event.target.value })}
                 />
                 {runtimeInstalled(profile.runtime) ? null : (
                   <span className="subagent-profile-badge">CLI not installed</span>
@@ -397,9 +410,7 @@ function SubagentsSettings({
                   type="button"
                   className="subagent-profile-remove"
                   aria-label={`Remove the ${profile.label} profile`}
-                  onClick={() =>
-                    updateProfiles(profiles.filter((item) => item.id !== profile.id))
-                  }
+                  onClick={() => updateProfiles(profiles.filter((item) => item.id !== profile.id))}
                 >
                   <Trash2 />
                 </button>
@@ -468,6 +479,64 @@ function SubagentsSettings({
                       })
                     }
                   />
+                </div>
+              </div>
+              <label className="subagent-profile-instruction">
+                <small>Specialist instructions</small>
+                <textarea
+                  rows={4}
+                  maxLength={65_536}
+                  aria-label={`Specialist instructions for ${profile.label}`}
+                  placeholder="Define this specialist's role, quality bar, workflow, and expected deliverables."
+                  value={profile.instruction ?? ""}
+                  onChange={(event) =>
+                    updateProfile(profile.id, { instruction: event.target.value })
+                  }
+                  onBlur={(event) =>
+                    updateProfile(profile.id, { instruction: event.target.value.trim() })
+                  }
+                />
+              </label>
+              <div className="subagent-downstream">
+                <span>
+                  <small>Preferred downstream helpers</small>
+                  <p>
+                    Ordered preferences for this specialist's future delegated research and
+                    exploration. Recursive launching remains gated by the current one-level policy.
+                  </p>
+                </span>
+                <div>
+                  {profiles
+                    .filter((candidate) => candidate.id !== profile.id)
+                    .map((candidate) => {
+                      const selected = (profile.preferredChildProfileIds ?? []).includes(
+                        candidate.id,
+                      );
+                      return (
+                        <button
+                          key={candidate.id}
+                          type="button"
+                          role="checkbox"
+                          aria-checked={selected}
+                          data-selected={selected}
+                          onClick={() =>
+                            updateProfile(profile.id, {
+                              preferredChildProfileIds: selected
+                                ? (profile.preferredChildProfileIds ?? []).filter(
+                                    (id) => id !== candidate.id,
+                                  )
+                                : [...(profile.preferredChildProfileIds ?? []), candidate.id],
+                            })
+                          }
+                        >
+                          <ProviderIcon provider={candidate.runtime} label={candidate.label} />
+                          {candidate.label}
+                        </button>
+                      );
+                    })}
+                  {profiles.length <= 1 ? (
+                    <small>Add another profile to choose a helper.</small>
+                  ) : null}
                 </div>
               </div>
             </article>
@@ -564,7 +633,7 @@ function AppearanceSettings({
       <section className="settings-section">
         <header>
           <h2>Theme preset</h2>
-          <p>Twelve coordinated palettes. Provider identity never recolors the workspace.</p>
+          <p>Coordinated palettes. Provider identity never recolors the workspace.</p>
         </header>
         <div className="theme-grid" role="radiogroup" aria-label="Theme preset">
           {THEME_PRESETS.map((theme) => (
@@ -1194,9 +1263,7 @@ function UsageSettings({
                 <div className="settings-provider-stat">
                   <span>API equivalent</span>
                   <strong>
-                    {row.estimatedCostUsd !== undefined
-                      ? formatEstimatedCost(row.estimatedCostUsd)
-                      : "—"}
+                    {row.estimatedCostUsd != null ? formatEstimatedCost(row.estimatedCostUsd) : "—"}
                   </strong>
                 </div>
                 <div className="settings-provider-stat">
@@ -1570,10 +1637,7 @@ function PolicySettings({
             <h2>Transcript</h2>
             <p>Metadata shown above each agent reply in every chat.</p>
           </header>
-          <SettingRow
-            label="Model attribution"
-            description="Show which model produced each reply."
-          >
+          <SettingRow label="Model attribution" description="Show which model produced each reply.">
             <Dropdown
               aria-label="Model attribution"
               value={readSetting(settings, "transcript.showModel", true) ? "show" : "hide"}
@@ -1769,7 +1833,17 @@ function VoiceTypingSettings() {
   );
 }
 
+// Same spring as the chat sidebar's traveling selection pill.
+const navPillSpring = {
+  type: "spring" as const,
+  stiffness: 460,
+  damping: 38,
+  mass: 0.7,
+};
+
 export function SettingsView(props: SettingsViewProps) {
+  const reduceMotion =
+    Boolean(useReducedMotion()) || document.documentElement.dataset.motion === "none";
   const [section, setSection] = useState<SettingsSection>("appearance");
   const [query, setQuery] = useState("");
   const [settings, setSettings] = useState<SettingsMap>(DEFAULT_SETTINGS);
@@ -1910,25 +1984,32 @@ export function SettingsView(props: SettingsViewProps) {
           />
         </label>
         <nav>
-          {visibleNav.length === 0 ? (
-            <p className="settings-nav-empty">No settings match “{query.trim()}”.</p>
-          ) : null}
-          {visibleNav.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              data-active={section === item.id}
-              aria-current={section === item.id ? "page" : undefined}
-              onClick={() => setSection(item.id)}
-            >
-              <item.icon />
-              <span>
-                <strong>{item.label}</strong>
-                <small>{item.hint}</small>
-              </span>
-              <ChevronRight />
-            </button>
-          ))}
+          <LayoutGroup id="settings-navigation">
+            {visibleNav.length === 0 ? (
+              <p className="settings-nav-empty">No settings match “{query.trim()}”.</p>
+            ) : null}
+            {visibleNav.map((item) => (
+              <Tooltip label={item.hint} placement="right" key={item.id}>
+                <button
+                  type="button"
+                  data-active={section === item.id}
+                  aria-current={section === item.id ? "page" : undefined}
+                  onClick={() => setSection(item.id)}
+                >
+                  {section === item.id ? (
+                    <motion.span
+                      className="settings-nav-active"
+                      layoutId={reduceMotion ? undefined : "active-category"}
+                      transition={reduceMotion ? { duration: 0 } : navPillSpring}
+                      aria-hidden="true"
+                    />
+                  ) : null}
+                  <item.icon />
+                  <span>{item.label}</span>
+                </button>
+              </Tooltip>
+            ))}
+          </LayoutGroup>
         </nav>
         <div className="settings-local-note">
           <ShieldCheck />

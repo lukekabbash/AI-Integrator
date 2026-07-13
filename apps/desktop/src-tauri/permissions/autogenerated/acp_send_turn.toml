@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-acp-send-turn"
+description = "Enables the acp_send_turn command without any pre-configured scope."
+commands.allow = ["acp_send_turn"]
+
+[[permission]]
+identifier = "deny-acp-send-turn"
+description = "Denies the acp_send_turn command without any pre-configured scope."
+commands.deny = ["acp_send_turn"]

@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
-import { AnimatePresence, motion } from "motion/react";
+import { AnimatePresence, m as motion } from "motion/react";
 import { Check, ChevronDown } from "lucide-react";
 
 export interface DropdownOption {
@@ -14,10 +14,12 @@ interface DropdownProps {
   defaultValue?: string;
   options: DropdownOption[];
   onChange?: (value: string) => void;
+  onOpen?: () => void;
   "aria-label": string;
   className?: string;
   leading?: ReactNode;
   compact?: boolean;
+  disabled?: boolean;
 }
 
 export function Dropdown({
@@ -25,10 +27,12 @@ export function Dropdown({
   defaultValue,
   options,
   onChange,
+  onOpen,
   "aria-label": ariaLabel,
   className = "",
   leading,
   compact = false,
+  disabled = false,
 }: DropdownProps) {
   const [internalValue, setInternalValue] = useState(defaultValue ?? options[0]?.value ?? "");
   const [open, setOpen] = useState(false);
@@ -78,6 +82,7 @@ export function Dropdown({
   };
 
   const openMenu = () => {
+    onOpen?.();
     const triggerRect = buttonRef.current?.getBoundingClientRect();
     if (triggerRect && typeof window !== "undefined") {
       const estimatedMenuHeight = Math.min(options.length * 30 + 12, 320);
@@ -119,6 +124,7 @@ export function Dropdown({
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-controls={listId}
+        disabled={disabled}
         onClick={() => (open ? setOpen(false) : openMenu())}
         onKeyDown={(event) => {
           if (event.key === "ArrowDown" || event.key === "Enter" || event.key === " ") {
@@ -143,10 +149,19 @@ export function Dropdown({
             id={listId}
             role="listbox"
             aria-label={ariaLabel}
-            initial={{ opacity: 0, y: -5, scale: 0.98 }}
+            initial={{ opacity: 0, y: placement === "up" ? 6 : -6, scale: 0.96 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: -4, scale: 0.98 }}
-            transition={{ duration: motionDisabled ? 0 : 0.16, ease: [0.2, 0, 0, 1] }}
+            exit={{
+              opacity: 0,
+              y: placement === "up" ? 4 : -4,
+              scale: 0.98,
+              transition: { duration: motionDisabled ? 0 : 0.12, ease: [0.2, 0, 0, 1] },
+            }}
+            transition={
+              motionDisabled
+                ? { duration: 0 }
+                : { type: "spring", stiffness: 540, damping: 33, mass: 0.7 }
+            }
           >
             {options.map((option, index) => (
               <button

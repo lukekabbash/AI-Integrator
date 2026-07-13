@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-local-export"
+description = "Enables the local_export command without any pre-configured scope."
+commands.allow = ["local_export"]
+
+[[permission]]
+identifier = "deny-local-export"
+description = "Denies the local_export command without any pre-configured scope."
+commands.deny = ["local_export"]

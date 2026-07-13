@@ -121,6 +121,9 @@ pub struct ItemProjection {
     pub status: ItemStatus,
     pub title: Option<String>,
     pub body: Option<String>,
+    /// Provider-native skill verified by the trusted host for this user item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_skill: Option<String>,
     pub command: Option<String>,
     pub cwd: Option<String>,
     pub output: Option<String>,
@@ -172,6 +175,10 @@ pub struct UsageProjection {
 pub enum ApprovalKind {
     CommandExecution,
     FileChange,
+    /// The agent finished planning and is waiting for the user to approve
+    /// the plan before implementation (Claude `ExitPlanMode`, Cursor
+    /// `cursor/create_plan`).
+    PlanReview,
 }
 
 impl ApprovalKind {
@@ -180,8 +187,29 @@ impl ApprovalKind {
         match self {
             Self::CommandExecution => "command_execution",
             Self::FileChange => "file_change",
+            Self::PlanReview => "plan_review",
         }
     }
+}
+
+/// One agent-advertised session mode (ACP `SessionMode`), or a synthesized
+/// equivalent for providers with a fixed mode vocabulary (Claude permission
+/// modes). Ids are provider-opaque; render `name`/`description`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModeOption {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// The session's current mode plus every mode it can switch into. Snapshot
+/// semantics: each update replaces the whole state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModeProjection {
+    pub current_mode_id: String,
+    pub available_modes: Vec<ModeOption>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -246,6 +274,10 @@ pub struct ApprovalProjection {
     pub command: Option<String>,
     pub cwd: Option<String>,
     pub file_changes: Option<Vec<FileChangeProjection>>,
+    /// Full plan document (markdown) for `PlanReview` approvals. `default`
+    /// keeps approvals persisted before this field deserializable.
+    #[serde(default)]
+    pub plan_markdown: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -294,6 +326,9 @@ pub enum RuntimeProjection {
     },
     ApprovalChanged {
         approval: ApprovalProjection,
+    },
+    ModeChanged {
+        mode: ModeProjection,
     },
     TurnError {
         message: String,

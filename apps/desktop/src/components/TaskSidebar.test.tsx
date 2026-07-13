@@ -1,17 +1,19 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, within } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDemoSnapshot } from "../demoData";
 import { TaskSidebar } from "./TaskSidebar";
+
+afterEach(cleanup);
 
 function setup(overrides?: Partial<Parameters<typeof TaskSidebar>[0]>) {
   const snapshot = createDemoSnapshot();
   const callbacks = {
-    onToggleCollapsed: vi.fn(),
     onSelectProject: vi.fn(),
     onSelectTask: vi.fn(),
     onNewTask: vi.fn(),
+    onNewTaskInProject: vi.fn(),
     onOpenProject: vi.fn(),
     onUpdateTask: vi.fn(),
     onOpenSettings: vi.fn(),
@@ -23,7 +25,6 @@ function setup(overrides?: Partial<Parameters<typeof TaskSidebar>[0]>) {
       tasks={snapshot.tasks}
       activeProjectId={snapshot.activeProjectId}
       activeTaskId={snapshot.activeTaskId}
-      collapsed={false}
       openingProject={false}
       metadataActionsEnabled
       taskActionBusyId=""
@@ -49,6 +50,7 @@ describe("TaskSidebar", () => {
     for (const chat of integratorChats) {
       expect(screen.getByRole("button", { name: new RegExp(chat.title) })).toBeInTheDocument();
     }
+    expect(document.querySelectorAll(".chat-row-active")).toHaveLength(1);
   });
 
   it("reveals nested chats when expanding another project", () => {
@@ -62,6 +64,24 @@ describe("TaskSidebar", () => {
 
     fireEvent.click(screen.getByRole("button", { name: `Open project ${lotmind.name}` }));
     expect(callbacks.onSelectProject).toHaveBeenCalledWith("lotmind");
+  });
+
+  it("bounds large project histories while keeping the active chat reachable", () => {
+    const snapshot = createDemoSnapshot();
+    const tasks = Array.from({ length: 250 }, (_, index) => ({
+      ...snapshot.tasks[0],
+      id: `bulk-${index}`,
+      projectId: snapshot.activeProjectId,
+      title: `Bulk chat ${index}`,
+      status: "completed" as const,
+      updatedAt: new Date(Date.UTC(2026, 6, 12, 12, 0) - index * 60_000).toISOString(),
+    }));
+    setup({ tasks, activeTaskId: "bulk-249" });
+
+    expect(screen.getByRole("button", { name: /^Bulk chat 249/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Bulk chat 100/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show 120 older chats" }));
+    expect(screen.getByRole("button", { name: /^Bulk chat 100/ })).toBeInTheDocument();
   });
 
   it("selects a chat nested under a non-active project", () => {
@@ -81,18 +101,83 @@ describe("TaskSidebar", () => {
     expect(within(result).getByText(/Lotmind AI/i)).toBeInTheDocument();
   });
 
+  it("finds chats by persisted message text and shows a bounded snippet", async () => {
+    const onSearchMessages = vi.fn().mockResolvedValue([
+      {
+        taskId: "theme-pass",
+        snippet: "…the orchestrated emerald surface should stay semantic…",
+      },
+    ]);
+    setup({ onSearchMessages });
+    fireEvent.change(screen.getByRole("textbox", { name: "Search chats" }), {
+      target: { value: "orchestrated emerald" },
+    });
+
+    await waitFor(() => expect(onSearchMessages).toHaveBeenCalledWith("orchestrated emerald"));
+    const result = await screen.findByRole("button", { name: /Tune coordinated theme presets/i });
+    expect(within(result).getByText(/orchestrated emerald/i)).toBeInTheDocument();
+    expect(within(result).getByText(/AI Integrator/i)).toBeInTheDocument();
+  });
+
   it("keeps Settings as a bottom-aligned control", () => {
     setup();
     expect(screen.getByRole("button", { name: "Open Settings" })).toBeInTheDocument();
   });
 
-  it("keeps idle chat meta quiet with relative time instead of permanent status", () => {
+  it("keeps nested status compact while preserving accessible state labels", () => {
     setup();
     const idle = screen.getByRole("button", { name: /Tune coordinated theme presets/i });
+    expect(within(idle).queryByRole("img")).not.toBeInTheDocument();
     expect(idle.textContent).not.toMatch(/Completed/);
-    expect(idle.textContent).toMatch(/ago|Just now|Jul/);
+
     const live = screen.getByRole("button", { name: /Construct the native v1 workspace/i });
-    expect(live.textContent).toMatch(/Running/);
+    const liveDot = within(live).getByRole("img", { name: "Streaming" });
+    expect(liveDot).toHaveClass("chat-dot-transition");
+    expect(liveDot.querySelector(".chat-dot--streaming")).toBeInTheDocument();
+    expect(live.textContent).not.toMatch(/Running/);
+
+    const waiting = screen.getByRole("button", { name: /Certify Codex and ACP adapters/i });
+    expect(within(waiting).getByRole("img", { name: "Needs your input" })).toBeInTheDocument();
+    expect(waiting.textContent).not.toMatch(/Waiting for input/);
+  });
+
+  it("distinguishes unread replies and failed unread replies without marking idle chats", () => {
+    const snapshot = createDemoSnapshot();
+    const completed = snapshot.tasks.find((task) => task.id === "theme-pass")!;
+    setup({
+      tasks: [
+        ...snapshot.tasks,
+        { ...completed, id: "unread", title: "Unread reply", unread: true },
+        {
+          ...completed,
+          id: "failed-unread",
+          title: "Failed unread reply",
+          status: "failed",
+          unread: true,
+        },
+      ],
+    });
+
+    expect(
+      within(screen.getByRole("button", { name: /^Unread replyUnread reply$/ })).getByRole("img", {
+        name: "Unread reply",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      within(
+        screen.getByRole("button", {
+          name: /^Failed, unreadFailed unread reply$/,
+        }),
+      ).getByRole("img", { name: "Failed, unread" }),
+    ).toBeInTheDocument();
+  });
+
+  it("shares the project header's right slot between the chat count and new-chat action", () => {
+    const { callbacks } = setup();
+    expect(screen.getByLabelText("3 chats")).toHaveTextContent("3");
+
+    fireEvent.click(screen.getByRole("button", { name: "New chat in AI Integrator" }));
+    expect(callbacks.onNewTaskInProject).toHaveBeenCalledWith("integrator");
   });
 
   it("keeps the row overflow action above adjacent chats", () => {

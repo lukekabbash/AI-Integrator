@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-acp-connect"
+description = "Enables the acp_connect command without any pre-configured scope."
+commands.allow = ["acp_connect"]
+
+[[permission]]
+identifier = "deny-acp-connect"
+description = "Denies the acp_connect command without any pre-configured scope."
+commands.deny = ["acp_connect"]

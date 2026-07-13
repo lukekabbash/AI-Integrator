@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { AnimatePresence, motion } from "motion/react";
+import { AnimatePresence, m as motion } from "motion/react";
 import {
   Check,
   ChevronRight,
@@ -12,10 +12,12 @@ import {
   GitCommit,
   Info,
   MessageCircleQuestion,
+  PanelRightOpen,
   RefreshCw,
   TerminalSquare,
 } from "lucide-react";
-import { openExternalLink, type TranscriptEvent } from "../bridge";
+import { openExternalLink, type RuntimeUsageProjection, type TranscriptEvent } from "../bridge";
+import { DiffView } from "./DiffView";
 
 const FOLLOW_THRESHOLD_PX = 96;
 
@@ -23,6 +25,8 @@ interface TranscriptProps {
   events: TranscriptEvent[];
   running?: boolean;
   runningSince?: string;
+  usage?: RuntimeUsageProjection;
+  activeAgentCount?: number;
   /** The scroll viewport owned by the workspace shell. */
   scrollContainerRef?: React.RefObject<HTMLDivElement | null>;
   /** Moves a selected answer into the caller-owned composer draft. */
@@ -33,6 +37,8 @@ interface TranscriptProps {
   showTimestamps?: boolean;
   /** Re-runs the prompt that produced the latest assistant reply. */
   onRegenerate?: () => void;
+  /** Opens an observable file in the Files tab of the right rail. */
+  onOpenFile?: (path: string) => void;
 }
 
 function formatClock(timestamp: string): string {
@@ -48,12 +54,6 @@ function scrollToLatest(container: HTMLDivElement, behavior: ScrollBehavior = "a
   } else {
     container.scrollTop = top;
   }
-}
-
-function transcriptSignature(events: TranscriptEvent[], running: boolean): string {
-  return `${running ? "running" : "idle"}|${events
-    .map((event) => `${event.id}:${event.body}:${event.status ?? ""}`)
-    .join("|")}`;
 }
 
 function MarkdownLink({
@@ -76,6 +76,158 @@ function MarkdownLink({
   );
 }
 
+const MARKDOWN_REMARK_PLUGINS = [remarkGfm];
+const MARKDOWN_COMPONENTS = { a: MarkdownLink };
+
+const MarkdownBody = memo(function MarkdownBody({ body }: { body: string }) {
+  return (
+    <ReactMarkdown remarkPlugins={MARKDOWN_REMARK_PLUGINS} components={MARKDOWN_COMPONENTS}>
+      {body}
+    </ReactMarkdown>
+  );
+});
+
+const UserMessage = memo(function UserMessage({
+  body,
+  nativeSkill,
+  timestamp,
+  showTimestamp,
+}: {
+  body: string;
+  nativeSkill?: string;
+  timestamp: string;
+  showTimestamp: boolean;
+}) {
+  const skillPrefix = nativeSkill ? `/${nativeSkill}` : "";
+  const hasVerifiedSkill =
+    Boolean(skillPrefix) && (body === skillPrefix || body.startsWith(`${skillPrefix} `));
+  return (
+    <section
+      className="turn turn--user"
+      aria-label="Your message"
+      title={showTimestamp ? formatClock(timestamp) : undefined}
+    >
+      <p>
+        {hasVerifiedSkill ? (
+          <>
+            <strong
+              className="native-skill-token"
+              aria-label={`Native skill ${skillPrefix}`}
+              title="Provider-native skill"
+            >
+              {skillPrefix}
+            </strong>
+            {body.slice(skillPrefix.length)}
+          </>
+        ) : (
+          body
+        )}
+      </p>
+    </section>
+  );
+});
+
+const AssistantMessage = memo(function AssistantMessage({
+  id,
+  body,
+  timestamp,
+  modelLabel,
+  showTimestamp,
+  copied,
+  copyFailed,
+  isLatestAssistant,
+  running,
+  canRegenerate,
+  canAskAbout,
+  onCopy,
+  onRegenerate,
+  onAskAbout,
+}: {
+  id: string;
+  body: string;
+  timestamp: string;
+  modelLabel?: string;
+  showTimestamp: boolean;
+  copied: boolean;
+  copyFailed: boolean;
+  isLatestAssistant: boolean;
+  running: boolean;
+  canRegenerate: boolean;
+  canAskAbout: boolean;
+  onCopy: (id: string, body: string) => void;
+  onRegenerate: () => void;
+  onAskAbout: (body: string) => void;
+}) {
+  const clock = showTimestamp ? formatClock(timestamp) : "";
+  return (
+    <section className="turn turn--assistant" aria-label="Agent response">
+      {modelLabel ? (
+        <header className="turn-attribution">
+          <span className="turn-attribution-model">{modelLabel}</span>
+        </header>
+      ) : null}
+      <MarkdownBody body={body} />
+      <div className="message-actions">
+        <button
+          type="button"
+          className={copied ? "is-copied" : undefined}
+          onClick={() => onCopy(id, body)}
+          aria-label="Copy this response"
+          title={copyFailed ? "The system clipboard is unavailable." : "Copy this response"}
+        >
+          {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
+          <span>{copied ? "Copied" : "Copy"}</span>
+        </button>
+        {canRegenerate && isLatestAssistant && !running ? (
+          <button
+            type="button"
+            onClick={onRegenerate}
+            aria-label="Regenerate this response"
+            title="Run the same prompt again"
+          >
+            <RefreshCw aria-hidden="true" />
+            <span>Regenerate</span>
+          </button>
+        ) : null}
+        {canAskAbout ? (
+          <button
+            type="button"
+            onClick={() => onAskAbout(body)}
+            aria-label="Ask a follow-up about this response"
+            title="Ask a follow-up about this response"
+          >
+            <MessageCircleQuestion aria-hidden="true" />
+            <span>Ask about this</span>
+          </button>
+        ) : null}
+        {clock ? (
+          <time className="message-time" dateTime={timestamp}>
+            {clock}
+          </time>
+        ) : null}
+      </div>
+    </section>
+  );
+});
+
+const NoticeMessage = memo(function NoticeMessage({
+  title,
+  body,
+}: {
+  title?: string;
+  body: string;
+}) {
+  return (
+    <aside className="inline-notice">
+      <Info />
+      <span>
+        <strong>{title}</strong>
+        {body}
+      </span>
+    </aside>
+  );
+});
+
 function EventIcon({ event }: { event: TranscriptEvent }) {
   if (event.status === "success") return <Check />;
   if (event.status === "running") return <Circle className="spin-slow" />;
@@ -85,34 +237,72 @@ function EventIcon({ event }: { event: TranscriptEvent }) {
   return <FileSearch />;
 }
 
-function ActivityEvent({ event }: { event: TranscriptEvent }) {
-  const [expanded, setExpanded] = useState(false);
+function ActivityEvent({
+  event,
+  nested = false,
+  onOpenFile,
+}: {
+  event: TranscriptEvent;
+  nested?: boolean;
+  onOpenFile?: (path: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(event.expandedByDefault ?? false);
   const hasChildren = Boolean(event.children?.length);
   const hasDetails = Boolean(event.details?.length);
+  const hasDiff = Boolean(event.diff?.lines.length);
+  const filePath = event.filePath ?? event.diff?.path;
   const hasLongBody = Boolean(
     event.title && event.body && (event.body.length > 96 || event.body.includes("\n")),
   );
-  const expandable = hasChildren || hasDetails || hasLongBody;
+  const expandable = hasChildren || hasDetails || hasLongBody || hasDiff;
   return (
-    <div className="activity-event" data-status={event.status ?? "neutral"}>
-      <button
-        className="activity-event-summary"
-        type="button"
-        onClick={() => expandable && setExpanded((value) => !value)}
-        aria-expanded={expandable ? expanded : undefined}
-      >
-        <span className="activity-icon">
-          <EventIcon event={event} />
-        </span>
-        <span className="activity-copy">
-          <strong>{event.title ?? event.body}</strong>
-          {event.title ? <span>{firstLine(event.body)}</span> : null}
-        </span>
-        {event.meta ? <span className="activity-meta">{event.meta}</span> : null}
-        {expandable ? (
-          <ChevronRight className={expanded ? "disclosure disclosure--open-right" : "disclosure"} />
+    <div
+      className={`activity-event${hasChildren ? " activity-event--group" : ""}${nested ? " activity-event--nested" : ""}`}
+      data-status={event.status ?? "neutral"}
+    >
+      <div className="activity-event-summary">
+        <button
+          className="activity-event-toggle"
+          type="button"
+          onClick={() => expandable && setExpanded((value) => !value)}
+          aria-expanded={expandable ? expanded : undefined}
+          disabled={!expandable}
+        >
+          <span className="activity-icon">
+            <EventIcon event={event} />
+          </span>
+          <span className="activity-copy">
+            <strong>{event.title ?? event.body}</strong>
+            {event.title ? <span>{firstLine(event.body)}</span> : null}
+          </span>
+          {event.changeStats ? (
+            <span
+              className="activity-diff-stats"
+              aria-label={`${event.changeStats.additions} lines added, ${event.changeStats.deletions} lines removed`}
+            >
+              <i>+{event.changeStats.additions}</i>
+              <b>−{event.changeStats.deletions}</b>
+            </span>
+          ) : null}
+          {event.meta ? <span className="activity-meta">{event.meta}</span> : null}
+          {expandable ? (
+            <ChevronRight
+              className={expanded ? "disclosure disclosure--open-right" : "disclosure"}
+            />
+          ) : null}
+        </button>
+        {filePath && onOpenFile ? (
+          <button
+            className="activity-event-open-file"
+            type="button"
+            onClick={() => onOpenFile(filePath)}
+            aria-label={`Open ${filePath} in Files`}
+            title="Open in Files"
+          >
+            <PanelRightOpen aria-hidden="true" />
+          </button>
         ) : null}
-      </button>
+      </div>
       <AnimatePresence initial={false}>
         {expanded && hasDetails ? (
           <motion.div
@@ -150,18 +340,19 @@ function ActivityEvent({ event }: { event: TranscriptEvent }) {
             transition={{ duration: 0.18 }}
           >
             {event.children.map((child) => (
-              <div
-                className="activity-child"
-                key={child.id}
-                data-status={child.status ?? "neutral"}
-              >
-                <span className="activity-icon">
-                  <EventIcon event={child} />
-                </span>
-                <span>{child.body}</span>
-                {child.meta ? <small>{child.meta}</small> : null}
-              </div>
+              <ActivityEvent event={child} key={child.id} nested onOpenFile={onOpenFile} />
             ))}
+          </motion.div>
+        ) : null}
+        {expanded && event.diff ? (
+          <motion.div
+            className="activity-diff-review"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.18 }}
+          >
+            <DiffView file={event.diff} variant="inline" showReviewActions={false} />
           </motion.div>
         ) : null}
       </AnimatePresence>
@@ -173,11 +364,14 @@ export function Transcript({
   events,
   running = false,
   runningSince,
+  usage,
+  activeAgentCount,
   scrollContainerRef,
   onAskAbout,
   modelForEvent,
   showTimestamps = true,
   onRegenerate,
+  onOpenFile,
 }: TranscriptProps) {
   const [copiedEventId, setCopiedEventId] = useState<string | null>(null);
   const [, setElapsedTick] = useState(0);
@@ -186,19 +380,32 @@ export function Transcript({
   const clearCopyStatus = useRef<number | undefined>(undefined);
   const contentRef = useRef<HTMLDivElement>(null);
   const shouldFollowLatestRef = useRef(true);
-  const previousSignatureRef = useRef<string | null>(null);
-  const previousEventIdsRef = useRef<Set<string>>(new Set());
+  const previousEventsRef = useRef<TranscriptEvent[] | null>(null);
+  const previousRunningRef = useRef(running);
+  const previousLatestUserIdRef = useRef<string | undefined>(undefined);
   const scheduledFrameRef = useRef<number | undefined>(undefined);
+  const askAboutRef = useRef(onAskAbout);
+  const regenerateRef = useRef(onRegenerate);
+  const openFileRef = useRef(onOpenFile);
+
+  useEffect(() => {
+    askAboutRef.current = onAskAbout;
+    regenerateRef.current = onRegenerate;
+    openFileRef.current = onOpenFile;
+  }, [onAskAbout, onOpenFile, onRegenerate]);
 
   const scheduleFollow = useCallback(() => {
-    const container = scrollContainerRef?.current;
-    if (!container || !shouldFollowLatestRef.current) return;
+    if (!shouldFollowLatestRef.current) return;
     if (scheduledFrameRef.current !== undefined) {
       window.cancelAnimationFrame(scheduledFrameRef.current);
     }
+    // The container ref is resolved inside the frame, not here: when the
+    // transcript and its scroll container mount in the same commit (opening
+    // a chat), this runs from a layout effect before the parent's ref is
+    // attached, and reading it now would drop the initial scroll-to-bottom.
     scheduledFrameRef.current = window.requestAnimationFrame(() => {
       scheduledFrameRef.current = undefined;
-      if (shouldFollowLatestRef.current && scrollContainerRef.current) {
+      if (shouldFollowLatestRef.current && scrollContainerRef?.current) {
         scrollToLatest(scrollContainerRef.current);
       }
     });
@@ -216,30 +423,48 @@ export function Transcript({
       if (shouldFollow) setHasNewContent(false);
     };
 
-    handleScroll();
+    // Follow state changes only on real scroll events. Probing the position
+    // here would read scrollTop 0 on a freshly mounted, already-populated
+    // chat and misfile "just opened" as "scrolled away from the latest".
     container.addEventListener("scroll", handleScroll, { passive: true });
     return () => container.removeEventListener("scroll", handleScroll);
   }, [scrollContainerRef]);
 
+  const liveActivity = running ? findTrailingActivity(events) : undefined;
+  const renderedEventCount = events.length - (liveActivity ? 1 : 0);
+  const { lastAssistantId, latestUserId } = findRecentMessageIds(events, renderedEventCount);
+  const currentActivity = liveActivity
+    ? findActivityLeaf(liveActivity)
+    : running
+      ? findCurrentActivity(events)
+      : undefined;
+  const currentActivityLabel = currentActivity
+    ? describeCurrentActivity(currentActivity)
+    : undefined;
+
   useLayoutEffect(() => {
-    const signature = transcriptSignature(events, running);
-    const previousSignature = previousSignatureRef.current;
-    const isInitialLayout = previousSignature === null;
-    const previousEventIds = previousEventIdsRef.current;
-    const hasNewUserMessage = events.some(
-      (event) => event.kind === "user" && !previousEventIds.has(event.id),
-    );
-    previousSignatureRef.current = signature;
-    previousEventIdsRef.current = new Set(events.map((event) => event.id));
+    const previousEvents = previousEventsRef.current;
+    const isInitialLayout = previousEvents === null;
+    const hasNewUserMessage =
+      !isInitialLayout &&
+      latestUserId !== undefined &&
+      latestUserId !== previousLatestUserIdRef.current;
+    const hasTranscriptChanged =
+      previousRunningRef.current !== running ||
+      (previousEvents !== null &&
+        transcriptTailChanged(previousEvents, previousRunningRef.current, events, running));
+    previousEventsRef.current = events;
+    previousRunningRef.current = running;
+    previousLatestUserIdRef.current = latestUserId;
 
     if (isInitialLayout || hasNewUserMessage || shouldFollowLatestRef.current) {
       shouldFollowLatestRef.current = true;
       setHasNewContent(false);
       scheduleFollow();
-    } else if (previousSignature !== signature) {
+    } else if (hasTranscriptChanged) {
       setHasNewContent(true);
     }
-  }, [events, running, scheduleFollow]);
+  }, [events, latestUserId, running, scheduleFollow]);
 
   useEffect(() => {
     const container = scrollContainerRef?.current;
@@ -248,12 +473,8 @@ export function Transcript({
     const observer = new ResizeObserver(() => scheduleFollow());
     observer.observe(container);
     observer.observe(content);
-    const mutations =
-      typeof MutationObserver === "undefined" ? undefined : new MutationObserver(scheduleFollow);
-    mutations?.observe(container, { childList: true, subtree: true, characterData: true });
     return () => {
       observer.disconnect();
-      mutations?.disconnect();
     };
   }, [scheduleFollow, scrollContainerRef]);
 
@@ -275,29 +496,31 @@ export function Transcript({
     return () => window.clearInterval(interval);
   }, [running, runningSince]);
 
-  const lastAssistantId = [...events].reverse().find((event) => event.kind === "assistant")?.id;
-
   const jumpToLatest = () => {
     shouldFollowLatestRef.current = true;
     setHasNewContent(false);
     if (scrollContainerRef?.current) scrollToLatest(scrollContainerRef.current, "smooth");
   };
 
-  const copyMessage = async (event: TranscriptEvent) => {
+  const copyMessage = useCallback(async (id: string, body: string) => {
     if (!navigator.clipboard?.writeText) {
-      setCopyFailureId(event.id);
+      setCopyFailureId(id);
       return;
     }
     try {
-      await navigator.clipboard.writeText(event.body);
-      setCopiedEventId(event.id);
+      await navigator.clipboard.writeText(body);
+      setCopiedEventId(id);
       setCopyFailureId(null);
       if (clearCopyStatus.current) window.clearTimeout(clearCopyStatus.current);
       clearCopyStatus.current = window.setTimeout(() => setCopiedEventId(null), 2_000);
     } catch {
-      setCopyFailureId(event.id);
+      setCopyFailureId(id);
     }
-  };
+  }, []);
+
+  const askAbout = useCallback((body: string) => askAboutRef.current?.(body), []);
+  const regenerate = useCallback(() => regenerateRef.current?.(), []);
+  const openFile = useCallback((path: string) => openFileRef.current?.(path), []);
 
   return (
     <div className="transcript" ref={contentRef} aria-label="Task transcript">
@@ -306,91 +529,52 @@ export function Transcript({
           <span aria-hidden="true">↓</span> New activity · Jump to latest
         </button>
       ) : null}
-      {events.map((event) => {
+      {events.map((event, index) => {
+        if (index >= renderedEventCount) return null;
         if (event.kind === "user") {
           return (
-            <section
-              className="turn turn--user"
+            <UserMessage
               key={event.id}
-              aria-label="Your message"
-              title={showTimestamps ? formatClock(event.timestamp) : undefined}
-            >
-              <p>{event.body}</p>
-            </section>
+              body={event.body}
+              nativeSkill={event.nativeSkill}
+              timestamp={event.timestamp}
+              showTimestamp={showTimestamps}
+            />
           );
         }
         if (event.kind === "assistant") {
           const isLatestAssistant = event.id === lastAssistantId;
-          const clock = showTimestamps ? formatClock(event.timestamp) : "";
           const modelLabel = modelForEvent?.(event);
           return (
-            <section className="turn turn--assistant" key={event.id} aria-label="Agent response">
-              {modelLabel ? (
-                <header className="turn-attribution">
-                  <span className="turn-attribution-model">{modelLabel}</span>
-                </header>
-              ) : null}
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: MarkdownLink }}>
-                {event.body}
-              </ReactMarkdown>
-              <div className="message-actions">
-                <button
-                  type="button"
-                  className={copiedEventId === event.id ? "is-copied" : undefined}
-                  onClick={() => void copyMessage(event)}
-                  aria-label="Copy this response"
-                  title={
-                    copyFailureId === event.id
-                      ? "The system clipboard is unavailable."
-                      : "Copy this response"
-                  }
-                >
-                  {copiedEventId === event.id ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
-                  <span>{copiedEventId === event.id ? "Copied" : "Copy"}</span>
-                </button>
-                {onRegenerate && isLatestAssistant && !running ? (
-                  <button
-                    type="button"
-                    onClick={onRegenerate}
-                    aria-label="Regenerate this response"
-                    title="Run the same prompt again"
-                  >
-                    <RefreshCw aria-hidden="true" />
-                    <span>Regenerate</span>
-                  </button>
-                ) : null}
-                {onAskAbout ? (
-                  <button
-                    type="button"
-                    onClick={() => onAskAbout(event.body)}
-                    aria-label="Ask a follow-up about this response"
-                    title="Ask a follow-up about this response"
-                  >
-                    <MessageCircleQuestion aria-hidden="true" />
-                    <span>Ask about this</span>
-                  </button>
-                ) : null}
-                {clock ? (
-                  <time className="message-time" dateTime={event.timestamp}>
-                    {clock}
-                  </time>
-                ) : null}
-              </div>
-            </section>
+            <AssistantMessage
+              key={event.id}
+              id={event.id}
+              body={event.body}
+              timestamp={event.timestamp}
+              modelLabel={modelLabel}
+              showTimestamp={showTimestamps}
+              copied={copiedEventId === event.id}
+              copyFailed={copyFailureId === event.id}
+              isLatestAssistant={isLatestAssistant}
+              running={running}
+              canRegenerate={Boolean(onRegenerate)}
+              canAskAbout={Boolean(onAskAbout)}
+              onCopy={copyMessage}
+              onRegenerate={regenerate}
+              onAskAbout={askAbout}
+            />
           );
         }
         if (event.kind === "notice") {
-          return (
-            <aside className="inline-notice" key={event.id}>
-              <Info />
-              <span>
-                <strong>{event.title}</strong>
-                {event.body}
-              </span>
-            </aside>
-          );
+          return <NoticeMessage key={event.id} title={event.title} body={event.body} />;
         }
-        return <ActivityEvent event={event} key={event.id} />;
+        return (
+          <ActivityEvent
+            event={event}
+            key={event.id}
+            onOpenFile={onOpenFile ? openFile : undefined}
+          />
+        );
       })}
 
       {running ? (
@@ -403,10 +587,28 @@ export function Transcript({
           transition={{ delay: 0.2 }}
         >
           <span className="live-indicator" aria-hidden="true" />
-          <span>Turn in progress</span>
+          {liveActivity ? (
+            <>
+              <strong className="task-now-label">Activity</strong>
+              <span className="task-now-summary">{firstLine(liveActivity.body)}</span>
+              {currentActivityLabel ? (
+                <span className="task-now-current">Working on {currentActivityLabel}</span>
+              ) : null}
+            </>
+          ) : (
+            <span className="task-now-label">
+              {currentActivityLabel ? `Working on ${currentActivityLabel}` : "Thinking…"}
+            </span>
+          )}
           {runningSince ? (
             <span className="task-now-meta">
               <Clock3 /> {formatElapsed(runningSince)}
+              {usage ? <span>{formatTokens(usage.totalTokens)}</span> : null}
+              {activeAgentCount ? (
+                <span>
+                  {activeAgentCount} {activeAgentCount === 1 ? "agent" : "agents"}
+                </span>
+              ) : null}
             </span>
           ) : null}
         </motion.div>
@@ -419,6 +621,147 @@ function firstLine(body?: string): string {
   if (!body) return "";
   const line = body.split("\n", 1)[0] ?? "";
   return line.length > 140 ? `${line.slice(0, 140)}…` : line;
+}
+
+function findRecentMessageIds(
+  events: TranscriptEvent[],
+  renderedEventCount: number,
+): { lastAssistantId?: string; latestUserId?: string } {
+  let lastAssistantId: string | undefined;
+  let latestUserId: string | undefined;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!latestUserId && event.kind === "user") latestUserId = event.id;
+    if (!lastAssistantId && index < renderedEventCount && event.kind === "assistant") {
+      lastAssistantId = event.id;
+    }
+    if (lastAssistantId && latestUserId) break;
+  }
+  return { lastAssistantId, latestUserId };
+}
+
+function transcriptTailChanged(
+  previousEvents: TranscriptEvent[],
+  previousRunning: boolean,
+  events: TranscriptEvent[],
+  running: boolean,
+): boolean {
+  if (previousEvents === events) return false;
+  if (previousEvents.length !== events.length) return true;
+  const previousTail = previousEvents.at(-1);
+  const tail = events.at(-1);
+  if (!sameEventSurface(previousTail, tail)) return true;
+  if (
+    !sameEventSurface(
+      lastRenderedEvent(previousEvents, previousRunning),
+      lastRenderedEvent(events, running),
+    )
+  ) {
+    return true;
+  }
+  return !sameEventSurface(
+    previousTail ? findActivityLeaf(previousTail) : undefined,
+    tail ? findActivityLeaf(tail) : undefined,
+  );
+}
+
+function lastRenderedEvent(
+  events: TranscriptEvent[],
+  running: boolean,
+): TranscriptEvent | undefined {
+  const tail = events.at(-1);
+  return running && tail && isActivityEvent(tail) ? events.at(-2) : tail;
+}
+
+function sameEventSurface(
+  previous: TranscriptEvent | undefined,
+  current: TranscriptEvent | undefined,
+): boolean {
+  if (previous === current) return true;
+  if (!previous || !current) return false;
+  if (
+    previous.id !== current.id ||
+    previous.kind !== current.kind ||
+    previous.activityType !== current.activityType ||
+    previous.title !== current.title ||
+    previous.body !== current.body ||
+    previous.timestamp !== current.timestamp ||
+    previous.status !== current.status ||
+    previous.meta !== current.meta ||
+    previous.filePath !== current.filePath ||
+    previous.expandedByDefault !== current.expandedByDefault ||
+    previous.children?.length !== current.children?.length ||
+    previous.details?.length !== current.details?.length ||
+    previous.diff?.lines.length !== current.diff?.lines.length ||
+    previous.diff?.additions !== current.diff?.additions ||
+    previous.diff?.deletions !== current.diff?.deletions ||
+    previous.changeStats?.additions !== current.changeStats?.additions ||
+    previous.changeStats?.deletions !== current.changeStats?.deletions
+  ) {
+    return false;
+  }
+  const previousDetails = previous.details;
+  const currentDetails = current.details;
+  if (previousDetails && currentDetails) {
+    for (let index = 0; index < previousDetails.length; index += 1) {
+      if (
+        previousDetails[index].label !== currentDetails[index].label ||
+        previousDetails[index].body !== currentDetails[index].body
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function findCurrentActivity(events: TranscriptEvent[]): TranscriptEvent | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.children?.length) {
+      const nested = findCurrentActivity(event.children);
+      if (nested) return nested;
+    }
+    if (
+      event.status === "running" &&
+      (event.kind === "activity" || event.kind === "tool" || event.kind === "checkpoint")
+    ) {
+      return event;
+    }
+  }
+  return undefined;
+}
+
+function isActivityEvent(event: TranscriptEvent): boolean {
+  return (
+    event.kind === "activity" ||
+    event.kind === "tool" ||
+    event.kind === "checkpoint" ||
+    event.kind === "approval"
+  );
+}
+
+function findTrailingActivity(events: TranscriptEvent[]): TranscriptEvent | undefined {
+  const last = events[events.length - 1];
+  return last && isActivityEvent(last) ? last : undefined;
+}
+
+function findActivityLeaf(event: TranscriptEvent): TranscriptEvent {
+  const children = event.children;
+  return children?.length ? findActivityLeaf(children[children.length - 1]) : event;
+}
+
+function describeCurrentActivity(event: TranscriptEvent): string {
+  const detail = firstLine(event.body);
+  if (event.activityType === "command" && detail) return detail;
+  if (event.title && detail && detail !== event.title) return `${event.title} · ${detail}`;
+  return event.title ?? detail ?? "the task";
+}
+
+function formatTokens(tokens: number): string {
+  if (tokens < 1_000) return `${tokens} tokens`;
+  if (tokens < 1_000_000) return `${(tokens / 1_000).toFixed(tokens < 10_000 ? 1 : 0)}k tokens`;
+  return `${(tokens / 1_000_000).toFixed(tokens < 10_000_000 ? 1 : 0)}m tokens`;
 }
 
 function formatElapsed(since: string): string {

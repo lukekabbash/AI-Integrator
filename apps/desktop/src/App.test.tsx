@@ -28,10 +28,63 @@ describe("AI Integrator desktop workspace", () => {
       "aria-selected",
       "true",
     );
-    expect(screen.getByTitle("Subscription plan usage")).toHaveTextContent("—%");
+    // No provider reports quota in the demo snapshot: the pill shows tokens
+    // only instead of a dead "—%".
+    const usagePill = screen.getByTitle(/Subscription usage unavailable/);
+    expect(usagePill).not.toHaveTextContent("%");
+    expect(usagePill).toHaveTextContent("tokens");
+    expect(screen.getByPlaceholderText("Commit message")).toBeInTheDocument();
+  });
+
+  it("collapses and reopens both sidebars from the header corner buttons", async () => {
+    render(<App />);
     expect(
-      screen.getByPlaceholderText("Message (Ctrl/Cmd+Enter to commit)"),
+      await screen.findByRole("complementary", { name: "Chat navigation" }),
     ).toBeInTheDocument();
+    expect(await screen.findByRole("complementary", { name: "Task tools" })).toBeInTheDocument();
+
+    // Collapse fully unmounts each panel once the slide-out animation ends.
+    fireEvent.click(screen.getByRole("button", { name: "Close chat navigation" }));
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("complementary", { name: "Chat navigation" }),
+      ).not.toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Close task tools" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("complementary", { name: "Task tools" })).not.toBeInTheDocument(),
+    );
+
+    // The corner buttons stay put and bring each panel back.
+    fireEvent.click(screen.getByRole("button", { name: "Open chat navigation" }));
+    expect(
+      await screen.findByRole("complementary", { name: "Chat navigation" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open task tools" }));
+    expect(await screen.findByRole("complementary", { name: "Task tools" })).toBeInTheDocument();
+  });
+
+  it("loads the terminal on first use and keeps its session state mounted across toggles", async () => {
+    const openTerminal = vi
+      .spyOn(bridge, "openTerminal")
+      .mockRejectedValue(new Error("Terminal unavailable for this test."));
+
+    render(<App />);
+    const toggle = await screen.findByRole("button", { name: "Toggle terminal" });
+    expect(openTerminal).not.toHaveBeenCalled();
+
+    fireEvent.click(toggle);
+    expect(await screen.findByText("Terminal unavailable for this test.")).toBeInTheDocument();
+    expect(openTerminal).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(screen.queryByLabelText("Project terminal")).not.toBeInTheDocument(),
+    );
+    fireEvent.click(toggle);
+
+    expect(await screen.findByText("Terminal unavailable for this test.")).toBeInTheDocument();
+    expect(openTerminal).toHaveBeenCalledTimes(1);
   });
 
   it("opens Settings as a full replacement view and applies a theme preset", async () => {
@@ -54,6 +107,27 @@ describe("AI Integrator desktop workspace", () => {
     expect(
       await screen.findByRole("complementary", { name: "Chat navigation" }),
     ).toBeInTheDocument();
+  });
+
+  it("moves one active marker with the selected Settings category", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Open Settings" }));
+    await screen.findByRole("heading", { name: "Appearance" });
+
+    const navigation = screen.getByRole("complementary", { name: "Settings navigation" });
+    const appearance = within(navigation).getByRole("button", { name: "Appearance" });
+    const general = within(navigation).getByRole("button", { name: "General" });
+
+    expect(appearance.querySelector(".settings-nav-active")).toBeInTheDocument();
+    expect(navigation.querySelectorAll(".settings-nav-active")).toHaveLength(1);
+
+    fireEvent.click(general);
+    await screen.findByRole("heading", { name: "General" });
+    await waitFor(() => {
+      expect(general.querySelector(".settings-nav-active")).toBeInTheDocument();
+      expect(appearance.querySelector(".settings-nav-active")).not.toBeInTheDocument();
+      expect(navigation.querySelectorAll(".settings-nav-active")).toHaveLength(1);
+    });
   });
 
   it("keeps Settings out of the workspace view tabs and reachable from the sidebar", async () => {
@@ -241,7 +315,9 @@ describe("AI Integrator desktop workspace", () => {
 
   it("offers reasoning effort only for models that support it and follows the picker", async () => {
     render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Model" }));
     const effortTrigger = await screen.findByRole("button", { name: "Reasoning effort" });
+    fireEvent.keyDown(document, { key: "Escape" });
     expect(effortTrigger).toHaveTextContent("Medium");
 
     fireEvent.click(effortTrigger);
@@ -290,7 +366,9 @@ describe("AI Integrator desktop workspace", () => {
   it("keeps provider model and effort on a chat when switching away and back", async () => {
     render(<App />);
 
+    fireEvent.click(await screen.findByRole("button", { name: "Model" }));
     const effortTrigger = await screen.findByRole("button", { name: "Reasoning effort" });
+    fireEvent.keyDown(document, { key: "Escape" });
     expect(effortTrigger).toHaveTextContent("Medium");
     fireEvent.click(effortTrigger);
     fireEvent.click(await screen.findByRole("option", { name: "High" }));
@@ -303,6 +381,7 @@ describe("AI Integrator desktop workspace", () => {
     );
 
     fireEvent.click(within(sidebar).getByText("Construct the native v1 workspace"));
+    fireEvent.click(await screen.findByRole("button", { name: "Model" }));
     expect(await screen.findByRole("button", { name: "Reasoning effort" })).toHaveTextContent(
       "High",
     );
@@ -404,22 +483,18 @@ describe("AI Integrator desktop workspace", () => {
     storeSnapshot(empty);
     render(<App />);
 
-    fireEvent.click(
-      await screen.findByRole("button", { name: /Open project/ }),
-    );
+    fireEvent.click(await screen.findByRole("button", { name: /Open project/ }));
     const chooser = await screen.findByRole("dialog", { name: "Add a project" });
     fireEvent.click(within(chooser).getByRole("button", { name: /Create from scratch/ }));
 
     const nameField = await screen.findByLabelText("Project name");
     fireEvent.change(nameField, { target: { value: "fresh-idea" } });
-    fireEvent.click(screen.getByRole("button", { name: /Choose location & create/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Create project$/ }));
 
     expect(
       await screen.findByRole("heading", { name: "What are we working on?" }),
     ).toBeInTheDocument();
-    expect(
-      screen.getByText("fresh-idea", { selector: ".empty-task-kicker" }),
-    ).toBeInTheDocument();
+    expect(screen.getByText("fresh-idea", { selector: ".empty-task-kicker" })).toBeInTheDocument();
   });
 
   it("creates a durable task before sending when a project has no active task", async () => {
@@ -462,9 +537,7 @@ describe("AI Integrator desktop workspace", () => {
     fireEvent.click(newChatLabel.closest("button") as HTMLButtonElement);
     expect(await screen.findByRole("heading", { name: "New chat" })).toBeInTheDocument();
     expect(screen.getByRole("textbox", { name: "Task message" })).toHaveValue("");
-    expect(
-      screen.getByRole("heading", { name: "What are we working on?" }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "What are we working on?" })).toBeInTheDocument();
   });
 
   it("switches projects in one click and restores each project's last chat and center view", async () => {
@@ -509,7 +582,7 @@ describe("AI Integrator desktop workspace", () => {
     ).toBeInTheDocument();
     expect(await screen.findByText("Lotmind transcript")).toBeInTheDocument();
     expect(screen.queryByText("Integrator transcript")).not.toBeInTheDocument();
-    expect(screen.getByTitle("Subscription plan usage")).toHaveTextContent("222k");
+    expect(screen.getByTitle(/222,000 tokens on this task/)).toHaveTextContent("222k tokens");
 
     fireEvent.click(screen.getByRole("button", { name: "Open project AI Integrator" }));
     expect(
