@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const { bridgeMock } = vi.hoisted(() => ({
@@ -49,6 +49,17 @@ const runtime = {
   detail: "This CLI is authenticated but older than Integrator's certified protocol floor.",
 };
 
+const claudeRuntime = {
+  id: "claude" as const,
+  name: "Claude",
+  command: "/opt/homebrew/bin/claude",
+  version: "claude 2.1.0",
+  status: "connected" as const,
+  fidelity: "native" as const,
+  models: [],
+  detail: "Ready.",
+};
+
 const updatePlan = {
   id: "codex:update:installed:opaque",
   provider: "codex" as const,
@@ -84,7 +95,7 @@ describe("Runtime Settings command disclosure", () => {
     render(
       <SettingsView
         preferences={DEFAULT_THEME_PREFERENCES}
-        runtimes={[runtime]}
+        runtimes={[claudeRuntime, runtime]}
         usage={createEmptySnapshot().usage}
         onChangePreferences={vi.fn()}
         onResetPreferences={vi.fn()}
@@ -114,7 +125,7 @@ describe("Runtime Settings command disclosure", () => {
     render(
       <SettingsView
         preferences={DEFAULT_THEME_PREFERENCES}
-        runtimes={[runtime]}
+        runtimes={[claudeRuntime, runtime]}
         usage={createEmptySnapshot().usage}
         onChangePreferences={vi.fn()}
         onResetPreferences={vi.fn()}
@@ -124,10 +135,76 @@ describe("Runtime Settings command disclosure", () => {
     );
 
     await screen.findByRole("dialog", { name: "Update Codex" });
+    await waitFor(() => expect(screen.queryByText("Claude")).not.toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "Cancel runtime command" }));
 
     expect(screen.queryByRole("dialog", { name: "Update Codex" })).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Mock setup terminal")).not.toBeInTheDocument();
+    expect(await screen.findByText("Claude")).toBeInTheDocument();
+    expect(document.querySelector(".runtime-settings-stage")).toHaveAttribute(
+      "data-focused",
+      "false",
+    );
+  });
+
+  it("keeps a cancelled loading review closed when discovery finishes later", async () => {
+    let resolvePlans: (plans: Array<typeof updatePlan>) => void = () => undefined;
+    bridgeMock.listRuntimeActionPlans.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolvePlans = resolve;
+      }),
+    );
+
+    render(
+      <SettingsView
+        preferences={DEFAULT_THEME_PREFERENCES}
+        runtimes={[claudeRuntime, runtime]}
+        usage={createEmptySnapshot().usage}
+        onChangePreferences={vi.fn()}
+        onResetPreferences={vi.fn()}
+        runtimeActionRequest={{ id: 5, runtime: "codex", kind: "update" }}
+        onBack={vi.fn()}
+      />,
+    );
+
+    const review = await screen.findByRole("dialog", { name: "Update Codex" });
+    expect(review).toHaveTextContent("Inspecting documented methods");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel runtime command" }));
+    await act(async () => resolvePlans([updatePlan]));
+
+    expect(screen.queryByRole("dialog", { name: "Update Codex" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Mock setup terminal")).not.toBeInTheDocument();
+    expect(document.querySelector(".runtime-settings-stage")).toHaveAttribute(
+      "data-focused",
+      "false",
+    );
+  });
+
+  it("focuses the active provider and brings its terminal directly beneath it", async () => {
+    const { container } = render(
+      <SettingsView
+        preferences={DEFAULT_THEME_PREFERENCES}
+        runtimes={[claudeRuntime, runtime]}
+        usage={createEmptySnapshot().usage}
+        onChangePreferences={vi.fn()}
+        onResetPreferences={vi.fn()}
+        runtimeActionRequest={{ id: 4, runtime: "codex", kind: "update" }}
+        onBack={vi.fn()}
+      />,
+    );
+
+    const review = await screen.findByRole("dialog", { name: "Update Codex" });
+    await waitFor(() => expect(screen.queryByText("Claude")).not.toBeInTheDocument());
+    const stage = container.querySelector(".runtime-settings-stage");
+    expect(stage).toHaveAttribute("data-focused", "true");
+    expect(stage?.querySelector(".settings-runtime-row[data-active='true']")).toHaveTextContent(
+      "Codex",
+    );
+    expect(stage?.querySelector(".runtime-terminal-stage")).toContainElement(review);
+    expect(screen.queryByLabelText("Mock setup terminal")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Run this command" }));
+    expect(await screen.findByLabelText("Mock setup terminal")).toBeInTheDocument();
   });
 
   it("shows documented install methods and their exact commands before choosing one", async () => {

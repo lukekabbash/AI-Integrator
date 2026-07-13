@@ -328,6 +328,33 @@ export interface ProjectFileContent {
   isBinary: boolean;
 }
 
+/** A file the user attached to the composer from anywhere on their computer. */
+export interface ContextAttachment {
+  /** Absolute path in native builds; the bare file name in browser previews. */
+  path: string;
+  name: string;
+  kind: "image" | "file";
+  /** Inline preview for images, as a data: URL. */
+  dataUrl?: string;
+}
+
+const IMAGE_ATTACHMENT_EXTENSIONS = new Set([
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "bmp",
+  "svg",
+  "ico",
+  "avif",
+]);
+
+export function attachmentKind(name: string): "image" | "file" {
+  const extension = name.split(".").at(-1)?.toLowerCase() ?? "";
+  return IMAGE_ATTACHMENT_EXTENSIONS.has(extension) ? "image" : "file";
+}
+
 export interface ProjectFileOpener {
   id: string;
   label: string;
@@ -619,6 +646,11 @@ export interface AppBridge {
   appendVoiceTypingPcm?(pcm: number[]): Promise<void>;
   stopVoiceTyping?(): Promise<void>;
   subscribeVoiceTyping?(listener: (event: VoiceTypingEvent) => void): Promise<() => void>;
+  /** Native file picker for composer context attachments (any file on disk).
+   * Images arrive with an inline preview data URL; null means cancelled. */
+  pickContextAttachments?(): Promise<ContextAttachment[] | null>;
+  /** Loads an inline preview for an image path referenced by a chat message. */
+  readAttachmentPreview?(path: string): Promise<string | null>;
   exportLocalData(): Promise<unknown>;
   clearLocalData(): Promise<void>;
   loadWorkspace(): Promise<WorkspaceSnapshot>;
@@ -855,27 +887,13 @@ const cursorEffortConfigByModel = new Map<string, string>();
 /** Cursor only: the ACP config option id used for model selection. */
 let cursorModelConfigId: string | undefined;
 const FALLBACK_MODELS: Partial<Record<RuntimeId, string[]>> = {
-  codex: [PROVIDER_DEFAULT_MODEL],
-  claude: [
-    PROVIDER_DEFAULT_MODEL,
-    "claude-opus-4-8",
-    "claude-fable-5",
-    "claude-sonnet-5",
-    "claude-haiku-4-5",
-  ],
-  antigravity: [PROVIDER_DEFAULT_MODEL, "Gemini 3.1 Pro", "Gemini 3.5 Flash"],
+  claude: ["claude-opus-4-8", "claude-fable-5", "claude-sonnet-5", "claude-haiku-4-5"],
+  antigravity: ["Gemini 3.1 Pro", "Gemini 3.5 Flash"],
   // These are a degraded fallback only. A successfully negotiated Cursor ACP
   // catalog replaces them with the models available to the signed-in account.
-  cursor: [
-    PROVIDER_DEFAULT_MODEL,
-    "composer-2.5",
-    "cursor-small",
-    "deepseek-v3.1",
-    "deepseek-r1",
-    "auto",
-  ],
-  grok: [PROVIDER_DEFAULT_MODEL, "grok-4.5", "grok-build-0.1"],
-  custom: [PROVIDER_DEFAULT_MODEL],
+  cursor: ["composer-2.5", "cursor-small", "deepseek-v3.1", "deepseek-r1", "auto"],
+  grok: ["grok-4.5", "grok-build-0.1"],
+  custom: [],
 };
 
 const CHAT_TITLE_MAX_LENGTH = 54;
@@ -953,6 +971,7 @@ export function extractCodexCatalog(response: unknown): ModelCatalogEntry[] {
       displayName?: unknown;
       supportedReasoningEfforts?: unknown;
       defaultReasoningEffort?: unknown;
+      isDefault?: unknown;
     };
     const id = [value.id, value.model, value.slug, value.name].find(
       (candidate): candidate is string => typeof candidate === "string" && candidate.length > 0,
@@ -985,7 +1004,8 @@ export function extractCodexCatalog(response: unknown): ModelCatalogEntry[] {
         }
       }
     }
-    catalog.push(item);
+    if (value.isDefault === true) catalog.unshift(item);
+    else catalog.push(item);
   }
   return catalog;
 }
@@ -1056,6 +1076,8 @@ export function extractAcpCatalog(response: unknown): ModelCatalogEntry[] {
     thoughtOption && typeof thoughtOption.currentValue === "string"
       ? thoughtOption.currentValue
       : undefined;
+  const currentModel =
+    typeof modelOption.currentValue === "string" ? modelOption.currentValue : undefined;
   const catalog: ModelCatalogEntry[] = [];
   const seen = new Set<string>();
   for (const model of modelValues) {
@@ -1081,7 +1103,11 @@ export function extractAcpCatalog(response: unknown): ModelCatalogEntry[] {
     }
     catalog.push(item);
   }
-  return catalog;
+  if (!currentModel) return catalog;
+  const currentIndex = catalog.findIndex((entry) => entry.id === currentModel);
+  if (currentIndex <= 0) return catalog;
+  const [current] = catalog.splice(currentIndex, 1);
+  return current ? [current, ...catalog] : catalog;
 }
 
 /** Per-model reasoning parameters from Cursor's model-list extension RPC. */
@@ -1752,7 +1778,7 @@ function updateCursorCatalog(response: unknown): ModelCatalogEntry[] {
   const catalog = extractAcpCatalog(response);
   mergeCursorModelParams(catalog, cursorModelParams);
   if (catalog.length > 0) {
-    modelCatalogCache.set("cursor", [PROVIDER_DEFAULT_ENTRY, ...catalog]);
+    modelCatalogCache.set("cursor", catalog);
   }
   return catalog;
 }
@@ -1907,15 +1933,10 @@ async function applyCursorSelection(nativeTaskId: string, input: SendTurnInput):
   cursorAppliedSelection.set(nativeTaskId, applied);
 }
 
-const PROVIDER_DEFAULT_ENTRY: ModelCatalogEntry = {
-  id: PROVIDER_DEFAULT_MODEL,
-  label: PROVIDER_DEFAULT_MODEL,
-};
-
 /**
  * Claude Code CLI `--effort` levels (see `claude --help`). Effort is a session
- * flag, so every Claude model entry — including "Provider default" — gets the
- * picker; the CLI ignores it on models without effort support.
+ * flag, so every Claude model entry gets the picker; the CLI ignores it on
+ * models without effort support.
  */
 const CLAUDE_EFFORTS: ModelEffortOption[] = [
   { id: "low", label: "Low" },
@@ -1935,7 +1956,6 @@ const CLAUDE_DEFAULT_EFFORT = "high";
  * composes the selected effort back into the `--model` value.
  */
 const ANTIGRAVITY_CATALOG: ModelCatalogEntry[] = [
-  { id: PROVIDER_DEFAULT_MODEL, label: PROVIDER_DEFAULT_MODEL },
   {
     id: "Gemini 3.1 Pro",
     label: "Gemini 3.1 Pro",
@@ -1980,9 +2000,8 @@ async function loadModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]
       });
       const catalog = extractCodexCatalog(response);
       if (catalog.length > 0) {
-        const entries = [PROVIDER_DEFAULT_ENTRY, ...catalog];
-        modelCatalogCache.set(runtime, entries);
-        return entries;
+        modelCatalogCache.set(runtime, catalog);
+        return catalog;
       }
     } catch {
       // Codex unavailable right now; fall through to the static catalog.
@@ -2018,14 +2037,14 @@ async function loadModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]
     }
   }
   if (runtime === "claude") {
-    return (FALLBACK_MODELS.claude ?? [PROVIDER_DEFAULT_MODEL]).map((id) => ({
+    return (FALLBACK_MODELS.claude ?? []).map((id) => ({
       id,
       label: id,
       efforts: CLAUDE_EFFORTS,
       defaultEffort: CLAUDE_DEFAULT_EFFORT,
     }));
   }
-  return toCatalogEntries(FALLBACK_MODELS[runtime] ?? [PROVIDER_DEFAULT_MODEL]);
+  return toCatalogEntries(FALLBACK_MODELS[runtime] ?? []);
 }
 
 async function ensureCodexThread(input: SendTurnInput): Promise<string> {
@@ -2471,6 +2490,70 @@ export const bridge: AppBridge = {
       return (await nativeInvoke<TrustedProject[]>("project_list")).map(mapProject);
     }
     return readDemoSnapshot().projects;
+  },
+
+  pickContextAttachments: async () => {
+    if (isTauri()) {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        multiple: true,
+        title: "Attach files or images as context",
+      });
+      const paths = Array.isArray(selected)
+        ? selected
+        : typeof selected === "string"
+          ? [selected]
+          : [];
+      if (paths.length === 0) return null;
+      return Promise.all(
+        paths.map(async (path) => {
+          const name = path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
+          const kind = attachmentKind(name);
+          const dataUrl =
+            kind === "image"
+              ? await nativeInvoke<string | null>("attachment_preview", { path }).catch(() => null)
+              : null;
+          return { path, name, kind, ...(dataUrl ? { dataUrl } : {}) };
+        }),
+      );
+    }
+    // Browser preview: an in-page picker; entries fall back to bare names
+    // because the web platform never exposes real paths.
+    return new Promise((resolve) => {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.multiple = true;
+      input.onchange = () => {
+        const files = [...(input.files ?? [])];
+        if (files.length === 0) {
+          resolve(null);
+          return;
+        }
+        void Promise.all(
+          files.map(async (file) => {
+            const kind = attachmentKind(file.name);
+            const dataUrl =
+              kind === "image"
+                ? await new Promise<string | null>((done) => {
+                    const reader = new FileReader();
+                    reader.onload = () => done(typeof reader.result === "string" ? reader.result : null);
+                    reader.onerror = () => done(null);
+                    reader.readAsDataURL(file);
+                  })
+                : null;
+            return { path: file.name, name: file.name, kind, ...(dataUrl ? { dataUrl } : {}) };
+          }),
+        ).then(resolve);
+      };
+      input.oncancel = () => resolve(null);
+      input.click();
+    });
+  },
+
+  readAttachmentPreview: async (path) => {
+    if (!isTauri()) return null;
+    if (attachmentKind(path.split(/[\\/]/).filter(Boolean).at(-1) ?? path) !== "image") return null;
+    return nativeInvoke<string | null>("attachment_preview", { path }).catch(() => null);
   },
 
   probeRuntimes: () =>

@@ -24,6 +24,24 @@ const runtimes: RuntimeConnection[] = [
     models: ["claude-fable-5"],
     detail: "Ready",
   },
+  {
+    id: "cursor",
+    name: "Cursor",
+    command: "cursor-agent",
+    status: "connected",
+    fidelity: "acp",
+    models: ["composer-2.5"],
+    detail: "Ready",
+  },
+  {
+    id: "grok",
+    name: "Grok",
+    command: "grok",
+    status: "connected",
+    fidelity: "acp",
+    models: ["grok-build-0.1"],
+    detail: "Ready",
+  },
 ];
 
 const stoppedDelegation: DelegationView = {
@@ -130,6 +148,29 @@ describe("SubagentConversation", () => {
         effort: "high",
       }),
     );
+  });
+
+  it("offers Cursor and Grok as reroute targets for a child", async () => {
+    vi.spyOn(bridge, "loadTaskProjection").mockResolvedValue({ events: [], watermarkSeq: 0 });
+    vi.spyOn(bridge, "loadTaskGit").mockResolvedValue(childGit);
+    vi.spyOn(bridge, "subscribeRuntimeProjections").mockResolvedValue(() => undefined);
+    vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
+      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
+    ]);
+
+    render(
+      <SubagentConversation
+        delegation={stoppedDelegation}
+        runtimes={runtimes}
+        onClose={vi.fn()}
+        onSend={vi.fn().mockResolvedValue(undefined)}
+      />,
+    );
+
+    expect(await screen.findByText("No transcript events yet.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Runtime" }));
+    expect(await screen.findByRole("option", { name: "Cursor" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Grok" })).toBeInTheDocument();
   });
 
   it("mirrors compact task controls, reports child tokens, and opens the child review", async () => {

@@ -417,7 +417,9 @@ describe("runtime projection reducer", () => {
     );
 
     const [tool] = runtimeTranscript(state);
-    expect(tool).toMatchObject({ kind: "tool", title: "github · search" });
+    // Search-shaped tools surface the verb and the query instead of the raw
+    // provider identifier.
+    expect(tool).toMatchObject({ kind: "tool", title: "Searched", body: "flaky tests" });
     expect(tool.details).toEqual([
       { label: "Input", body: '{\n  "query": "flaky tests"\n}' },
       { label: "Output", body: "3 results" },

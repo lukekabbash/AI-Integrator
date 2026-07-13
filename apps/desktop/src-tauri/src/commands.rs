@@ -395,7 +395,7 @@ async fn probe_acp_actions(
         .collect())
 }
 
-async fn authenticate_acp_provider(
+pub(crate) async fn authenticate_acp_provider(
     client: &adapter_acp::AcpClient,
     provider: &ProviderKind,
 ) -> CommandResult<()> {
@@ -1600,6 +1600,44 @@ pub async fn project_file_reveal(
     tauri::async_runtime::spawn_blocking(move || reveal_project_file(&identity.root, &input.path))
         .await
         .map_err(|_| worker_error())?
+}
+
+/// Upper bound for inline attachment previews returned to the renderer.
+const ATTACHMENT_PREVIEW_MAX_BYTES: u64 = 12 * 1024 * 1024;
+
+/// Returns an inline `data:` URL preview for an image the user attached from
+/// the native file dialog. Attachment paths are user-picked and therefore not
+/// confined to a trusted project; only recognized image types under the size
+/// cap are read, and every failure degrades to `None` (no preview) because
+/// previews are best-effort decoration, never load-bearing.
+#[tauri::command]
+pub async fn attachment_preview(path: PathBuf) -> CommandResult<Option<String>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_default();
+        let mime = match extension.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "bmp" => "image/bmp",
+            "svg" => "image/svg+xml",
+            "ico" => "image/x-icon",
+            "avif" => "image/avif",
+            _ => return None,
+        };
+        let metadata = fs::metadata(&path).ok()?;
+        if !metadata.is_file() || metadata.len() > ATTACHMENT_PREVIEW_MAX_BYTES {
+            return None;
+        }
+        let bytes = fs::read(&path).ok()?;
+        Some(format!("data:{mime};base64,{}", BASE64.encode(bytes)))
+    })
+    .await
+    .map_err(|_| worker_error())
 }
 
 #[tauri::command]
@@ -2943,6 +2981,7 @@ pub async fn acp_connect(
         available_actions: Arc::new(std::sync::Mutex::new(Vec::new())),
         context_primer: Arc::new(std::sync::Mutex::new(None)),
         delegation_preamble: Arc::new(std::sync::Mutex::new(None)),
+        unattended: false,
     };
     spawn_acp_pump(app, Arc::clone(&state.store), runtime.clone());
     let previous = if let Some(task_id) = task_id {
@@ -2959,7 +2998,7 @@ pub async fn acp_connect(
     Ok(())
 }
 
-fn acp_launch_arguments(provider: &ProviderKind) -> CommandResult<Vec<String>> {
+pub(crate) fn acp_launch_arguments(provider: &ProviderKind) -> CommandResult<Vec<String>> {
     Ok(match provider {
         ProviderKind::Cursor => vec!["acp".into()],
         // Scripted ACP starts disable implicit self-updates; the vendor CLI
@@ -4048,7 +4087,11 @@ fn structured_json_detail(value: &Value) -> Option<String> {
 
 /// Forwards ACP agent events through the ACP reducer into SQLite and the
 /// renderer, mirroring the Codex pump.
-fn spawn_acp_pump(app: AppHandle<tauri::Wry>, store: Arc<LocalStore>, runtime: AcpRuntime) {
+pub(crate) fn spawn_acp_pump(
+    app: AppHandle<tauri::Wry>,
+    store: Arc<LocalStore>,
+    runtime: AcpRuntime,
+) {
     let mut receiver = runtime.client.subscribe();
     tauri::async_runtime::spawn(async move {
         // Assistant text segmentation: whenever a tool call lands after text
@@ -4146,6 +4189,22 @@ fn spawn_acp_pump(app: AppHandle<tauri::Wry>, store: Arc<LocalStore>, runtime: A
                     }
                 }
                 adapter_acp::AcpEvent::ServerRequest { id, method, params } => {
+                    // Delegated children run unattended: resolve blocking
+                    // server requests immediately (allow inside the already
+                    // trusted worktree, accept plan reviews) instead of
+                    // parking an approval card no one is watching. This is
+                    // the ACP analog of Codex children's approval "never".
+                    if runtime.unattended {
+                        let result = if method == "session/request_permission" {
+                            acp_auto_allow_outcome(&params)
+                        } else if method == "cursor/create_plan" {
+                            serde_json::json!({ "result": { "success": {} } })
+                        } else {
+                            serde_json::json!({ "error": "unsupported" })
+                        };
+                        let _ = runtime.client.respond_to_server_request(&id, result).await;
+                        continue;
+                    }
                     // Cursor's plan-review extension: the agent blocks until
                     // the client accepts or rejects the finished plan. It is
                     // surfaced as a plan-review approval; the response shape
@@ -4355,6 +4414,38 @@ fn structured_permission_response(
 /// Build the response for a Cursor `cursor/create_plan` extension request.
 /// Success tells the agent the plan was accepted; the error result carries
 /// the rejection back so the agent keeps planning instead of building.
+/// Select the least-privileged allow option a `session/request_permission`
+/// request advertises. Unattended children auto-allow inside the trusted
+/// worktree; a request advertising no allow option is cancelled, not guessed.
+pub(crate) fn acp_auto_allow_outcome(params: &Value) -> Value {
+    let options = params
+        .get("options")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let by_kind = |kind: &str| {
+        options
+            .iter()
+            .find(|option| option.get("kind").and_then(Value::as_str) == Some(kind))
+    };
+    let selected = by_kind("allow_once")
+        .or_else(|| by_kind("allow_always"))
+        .or_else(|| {
+            options.iter().find(|option| {
+                option
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind.starts_with("allow"))
+            })
+        });
+    match selected.and_then(|option| option.get("optionId").and_then(Value::as_str)) {
+        Some(option_id) => serde_json::json!({
+            "outcome": { "outcome": "selected", "optionId": option_id }
+        }),
+        None => serde_json::json!({ "outcome": { "outcome": "cancelled" } }),
+    }
+}
+
 fn acp_plan_review_result(decision: ApprovalDecision) -> Value {
     match decision {
         ApprovalDecision::Accept | ApprovalDecision::AcceptForSession => {
@@ -5262,6 +5353,30 @@ mod tests {
     }
 
     #[test]
+    fn unattended_acp_children_prefer_the_narrowest_allow_option() {
+        let params = serde_json::json!({ "options": [
+            { "optionId": "always", "kind": "allow_always" },
+            { "optionId": "once", "kind": "allow_once" },
+            { "optionId": "no", "kind": "reject_once" }
+        ]});
+        let outcome = acp_auto_allow_outcome(&params);
+        assert_eq!(outcome["outcome"]["outcome"], "selected");
+        assert_eq!(outcome["outcome"]["optionId"], "once");
+
+        // A request advertising no allow option is cancelled, never guessed.
+        let reject_only =
+            serde_json::json!({ "options": [{ "optionId": "no", "kind": "reject_once" }] });
+        assert_eq!(
+            acp_auto_allow_outcome(&reject_only)["outcome"]["outcome"],
+            "cancelled"
+        );
+        assert_eq!(
+            acp_auto_allow_outcome(&serde_json::json!({}))["outcome"]["outcome"],
+            "cancelled"
+        );
+    }
+
+    #[test]
     fn grok_auth_selects_only_the_vendor_owned_cached_token_method() {
         assert!(acp_has_auth_method(
             &serde_json::json!({ "authMethods": [{ "id": "cached_token" }, { "id": "xai.api_key" }] }),
@@ -5424,6 +5539,9 @@ mod tests {
         fs::create_dir_all(&nested).expect("create nested project directory");
         fs::write(nested.join("router.ts"), "export const route = true;\n")
             .expect("write project file");
+        // Trusted roots reach production callers canonicalized; macOS temp
+        // dirs are symlinked (/var -> /private/var), so mirror that here.
+        let root = dunce::canonicalize(&root).expect("canonicalize project root");
 
         let content =
             read_project_file(&root, "src/runtime/router.ts").expect("read nested project file");

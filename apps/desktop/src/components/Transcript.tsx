@@ -6,7 +6,6 @@ import {
   Check,
   ChevronRight,
   Circle,
-  Clock3,
   Copy,
   FileSearch,
   GitCommit,
@@ -16,17 +15,16 @@ import {
   RefreshCw,
   TerminalSquare,
 } from "lucide-react";
-import { openExternalLink, type RuntimeUsageProjection, type TranscriptEvent } from "../bridge";
-import { DiffView } from "./DiffView";
+import { bridge, openExternalLink, attachmentKind, type TranscriptEvent } from "../bridge";
+import { DiffView, type DiffSelectionPayload } from "./DiffView";
+import { FileIcon } from "./FileIcon";
+import { splitAttachmentBlock } from "./conversationFormatting";
 
 const FOLLOW_THRESHOLD_PX = 96;
 
 interface TranscriptProps {
   events: TranscriptEvent[];
   running?: boolean;
-  runningSince?: string;
-  usage?: RuntimeUsageProjection;
-  activeAgentCount?: number;
   /** The scroll viewport owned by the workspace shell. */
   scrollContainerRef?: React.RefObject<HTMLDivElement | null>;
   /** Moves a selected answer into the caller-owned composer draft. */
@@ -39,6 +37,8 @@ interface TranscriptProps {
   onRegenerate?: () => void;
   /** Opens an observable file in the Files tab of the right rail. */
   onOpenFile?: (path: string) => void;
+  /** Selection-to-chat from transcript-embedded diffs. */
+  onAddDiffSelection?: (payload: DiffSelectionPayload) => void;
 }
 
 function formatClock(timestamp: string): string {
@@ -87,6 +87,52 @@ const MarkdownBody = memo(function MarkdownBody({ body }: { body: string }) {
   );
 });
 
+/** Renders plain user text with valid-looking @mention tokens highlighted the
+ * same way slash commands are. */
+function mentionSegments(text: string): Array<string | { mention: string }> {
+  const segments: Array<string | { mention: string }> = [];
+  const pattern = /(^|\s)(@[\w./\\-]+)/g;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text))) {
+    const start = match.index + match[1].length;
+    if (start > cursor) segments.push(text.slice(cursor, start));
+    segments.push({ mention: match[2] });
+    cursor = start + match[2].length;
+  }
+  if (cursor < text.length) segments.push(text.slice(cursor));
+  return segments;
+}
+
+function AttachmentThumb({ path }: { path: string }) {
+  const name = path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
+  const isImage = attachmentKind(name) === "image";
+  const [preview, setPreview] = useState<string | null>(null);
+  useEffect(() => {
+    if (!isImage || !bridge.readAttachmentPreview) return;
+    let active = true;
+    void bridge
+      .readAttachmentPreview(path)
+      .then((dataUrl) => {
+        if (active) setPreview(dataUrl);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [isImage, path]);
+  return (
+    <span
+      className={`user-attachment${preview ? " user-attachment--image" : ""}`}
+      title={path}
+      data-attachment-kind={isImage ? "image" : "file"}
+    >
+      {preview ? <img src={preview} alt={name} /> : <FileIcon fileName={name} />}
+      <span>{name}</span>
+    </span>
+  );
+}
+
 const UserMessage = memo(function UserMessage({
   body,
   nativeSkill,
@@ -101,6 +147,8 @@ const UserMessage = memo(function UserMessage({
   const skillPrefix = nativeSkill ? `/${nativeSkill}` : "";
   const hasVerifiedSkill =
     Boolean(skillPrefix) && (body === skillPrefix || body.startsWith(`${skillPrefix} `));
+  const { text, attachments } = splitAttachmentBlock(body);
+  const tail = hasVerifiedSkill ? text.slice(skillPrefix.length) : text;
   return (
     <section
       className="turn turn--user"
@@ -109,20 +157,35 @@ const UserMessage = memo(function UserMessage({
     >
       <p>
         {hasVerifiedSkill ? (
-          <>
+          <strong
+            className="native-skill-token"
+            aria-label={`Native skill ${skillPrefix}`}
+            title="Provider-native skill"
+          >
+            {skillPrefix}
+          </strong>
+        ) : null}
+        {mentionSegments(tail).map((segment, index) =>
+          typeof segment === "string" ? (
+            segment
+          ) : (
             <strong
-              className="native-skill-token"
-              aria-label={`Native skill ${skillPrefix}`}
-              title="Provider-native skill"
+              className="context-mention-token"
+              key={`${segment.mention}-${index}`}
+              title="Context mention"
             >
-              {skillPrefix}
+              {segment.mention}
             </strong>
-            {body.slice(skillPrefix.length)}
-          </>
-        ) : (
-          body
+          ),
         )}
       </p>
+      {attachments.length > 0 ? (
+        <span className="user-attachments" aria-label="Attached files">
+          {attachments.map((path) => (
+            <AttachmentThumb key={path} path={path} />
+          ))}
+        </span>
+      ) : null}
     </section>
   );
 });
@@ -241,10 +304,12 @@ function ActivityEvent({
   event,
   nested = false,
   onOpenFile,
+  onAddDiffSelection,
 }: {
   event: TranscriptEvent;
   nested?: boolean;
   onOpenFile?: (path: string) => void;
+  onAddDiffSelection?: (payload: DiffSelectionPayload) => void;
 }) {
   const [expanded, setExpanded] = useState(event.expandedByDefault ?? false);
   const hasChildren = Boolean(event.children?.length);
@@ -340,7 +405,13 @@ function ActivityEvent({
             transition={{ duration: 0.18 }}
           >
             {event.children.map((child) => (
-              <ActivityEvent event={child} key={child.id} nested onOpenFile={onOpenFile} />
+              <ActivityEvent
+                event={child}
+                key={child.id}
+                nested
+                onOpenFile={onOpenFile}
+                onAddDiffSelection={onAddDiffSelection}
+              />
             ))}
           </motion.div>
         ) : null}
@@ -352,7 +423,12 @@ function ActivityEvent({
             exit={{ height: 0, opacity: 0 }}
             transition={{ duration: 0.18 }}
           >
-            <DiffView file={event.diff} variant="inline" showReviewActions={false} />
+            <DiffView
+              file={event.diff}
+              variant="inline"
+              showReviewActions={false}
+              onAddSelection={onAddDiffSelection}
+            />
           </motion.div>
         ) : null}
       </AnimatePresence>
@@ -363,20 +439,18 @@ function ActivityEvent({
 export function Transcript({
   events,
   running = false,
-  runningSince,
-  usage,
-  activeAgentCount,
   scrollContainerRef,
   onAskAbout,
   modelForEvent,
   showTimestamps = true,
   onRegenerate,
   onOpenFile,
+  onAddDiffSelection,
 }: TranscriptProps) {
   const [copiedEventId, setCopiedEventId] = useState<string | null>(null);
-  const [, setElapsedTick] = useState(0);
   const [copyFailureId, setCopyFailureId] = useState<string | null>(null);
   const [hasNewContent, setHasNewContent] = useState(false);
+  const [liveStreamOpen, setLiveStreamOpen] = useState(false);
   const clearCopyStatus = useRef<number | undefined>(undefined);
   const contentRef = useRef<HTMLDivElement>(null);
   const shouldFollowLatestRef = useRef(true);
@@ -393,6 +467,11 @@ export function Transcript({
     regenerateRef.current = onRegenerate;
     openFileRef.current = onOpenFile;
   }, [onAskAbout, onOpenFile, onRegenerate]);
+
+  // A fresh turn starts with the live stream folded back to one line.
+  useEffect(() => {
+    if (!running) setLiveStreamOpen(false);
+  }, [running]);
 
   const scheduleFollow = useCallback(() => {
     if (!shouldFollowLatestRef.current) return;
@@ -441,6 +520,11 @@ export function Transcript({
   const currentActivityLabel = currentActivity
     ? describeCurrentActivity(currentActivity)
     : undefined;
+  // Keying the narration on its visible text is what drives the ticker
+  // transition: any wording change swaps the node through AnimatePresence.
+  const narrationKey = liveActivity
+    ? `${firstLine(liveActivity.body)}|${currentActivityLabel ?? ""}`
+    : (currentActivityLabel ?? "thinking");
 
   useLayoutEffect(() => {
     const previousEvents = previousEventsRef.current;
@@ -487,14 +571,6 @@ export function Transcript({
     },
     [],
   );
-
-  // The elapsed label has minute granularity; keep it moving on quiet turns
-  // where no transcript events arrive to trigger a render.
-  useEffect(() => {
-    if (!running || !runningSince) return;
-    const interval = window.setInterval(() => setElapsedTick((tick) => tick + 1), 30_000);
-    return () => window.clearInterval(interval);
-  }, [running, runningSince]);
 
   const jumpToLatest = () => {
     shouldFollowLatestRef.current = true;
@@ -573,45 +649,84 @@ export function Transcript({
             event={event}
             key={event.id}
             onOpenFile={onOpenFile ? openFile : undefined}
+            onAddDiffSelection={onAddDiffSelection}
           />
         );
       })}
 
       {running ? (
-        <motion.div
-          className="task-now"
-          role="status"
-          aria-live="polite"
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={{ delay: 0.2 }}
-        >
-          <span className="live-indicator" aria-hidden="true" />
-          {liveActivity ? (
-            <>
-              <strong className="task-now-label">Activity</strong>
-              <span className="task-now-summary">{firstLine(liveActivity.body)}</span>
-              {currentActivityLabel ? (
-                <span className="task-now-current">Working on {currentActivityLabel}</span>
-              ) : null}
-            </>
-          ) : (
-            <span className="task-now-label">
-              {currentActivityLabel ? `Working on ${currentActivityLabel}` : "Thinking…"}
+        <div className="task-now">
+          <button
+            className="task-now-toggle"
+            type="button"
+            onClick={() => liveActivity && setLiveStreamOpen((value) => !value)}
+            aria-expanded={liveActivity ? liveStreamOpen : undefined}
+            disabled={!liveActivity}
+            title={liveActivity ? "Show the live activity stream" : undefined}
+          >
+            <span className="live-indicator" aria-hidden="true" />
+            <span className="task-now-line" role="status" aria-live="polite">
+              <AnimatePresence initial={false}>
+                <motion.span
+                  className="task-now-text"
+                  key={narrationKey}
+                  initial={{ opacity: 0, y: 14, filter: "blur(2px)" }}
+                  animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                  exit={{ opacity: 0, y: -14, filter: "blur(2px)" }}
+                  transition={{ duration: 0.32, ease: [0.32, 0.72, 0.24, 1] }}
+                >
+                  {liveActivity ? (
+                    <>
+                      <strong className="task-now-label">Activity</strong>
+                      <span className="task-now-summary">{firstLine(liveActivity.body)}</span>
+                      {currentActivityLabel ? (
+                        <span className="task-now-current">Working on {currentActivityLabel}</span>
+                      ) : null}
+                    </>
+                  ) : (
+                    <span className="task-now-label">
+                      {currentActivityLabel ? `Working on ${currentActivityLabel}` : "Thinking…"}
+                    </span>
+                  )}
+                </motion.span>
+              </AnimatePresence>
             </span>
-          )}
-          {runningSince ? (
-            <span className="task-now-meta">
-              <Clock3 /> {formatElapsed(runningSince)}
-              {usage ? <span>{formatTokens(usage.totalTokens)}</span> : null}
-              {activeAgentCount ? (
-                <span>
-                  {activeAgentCount} {activeAgentCount === 1 ? "agent" : "agents"}
-                </span>
-              ) : null}
-            </span>
-          ) : null}
-        </motion.div>
+            {liveActivity ? (
+              <ChevronRight
+                className={liveStreamOpen ? "disclosure disclosure--open-right" : "disclosure"}
+              />
+            ) : null}
+          </button>
+          <AnimatePresence initial={false}>
+            {liveStreamOpen && liveActivity ? (
+              <motion.div
+                className="task-now-stream"
+                initial={{ height: 0, opacity: 0 }}
+                animate={{ height: "auto", opacity: 1 }}
+                exit={{ height: 0, opacity: 0 }}
+                transition={{ duration: 0.22 }}
+              >
+                {(liveActivity.children?.length ? liveActivity.children : [liveActivity]).map(
+                  (child) => (
+                    <motion.div
+                      key={child.id}
+                      initial={{ opacity: 0, y: 8 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ duration: 0.24, ease: [0.32, 0.72, 0.24, 1] }}
+                    >
+                      <ActivityEvent
+                        event={child}
+                        nested
+                        onOpenFile={onOpenFile ? openFile : undefined}
+                        onAddDiffSelection={onAddDiffSelection}
+                      />
+                    </motion.div>
+                  ),
+                )}
+              </motion.div>
+            ) : null}
+          </AnimatePresence>
+        </div>
       ) : null}
     </div>
   );
@@ -758,17 +873,3 @@ function describeCurrentActivity(event: TranscriptEvent): string {
   return event.title ?? detail ?? "the task";
 }
 
-function formatTokens(tokens: number): string {
-  if (tokens < 1_000) return `${tokens} tokens`;
-  if (tokens < 1_000_000) return `${(tokens / 1_000).toFixed(tokens < 10_000 ? 1 : 0)}k tokens`;
-  return `${(tokens / 1_000_000).toFixed(tokens < 10_000_000 ? 1 : 0)}m tokens`;
-}
-
-function formatElapsed(since: string): string {
-  const elapsedMs = Date.now() - new Date(since).getTime();
-  if (!Number.isFinite(elapsedMs) || elapsedMs < 0) return "";
-  const minutes = Math.floor(elapsedMs / 60_000);
-  if (minutes < 1) return "<1m";
-  if (minutes < 60) return `${minutes}m`;
-  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
-}

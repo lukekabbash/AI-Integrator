@@ -64,6 +64,22 @@
       ],
       "autoPort": false,
       "port": 4183
+    },
+    {
+      "name": "desktop-web-alt4",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "--prefix",
+        "apps/desktop",
+        "run",
+        "dev",
+        "--",
+        "--port",
+        "4184",
+        "--strictPort"
+      ],
+      "autoPort": false,
+      "port": 4184
     }
   ]
 }

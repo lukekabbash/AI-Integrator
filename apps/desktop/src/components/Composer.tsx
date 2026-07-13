@@ -3,8 +3,10 @@ import { AnimatePresence, m as motion } from "motion/react";
 import {
   ArrowUp,
   Compass,
+  Folder,
   Gauge,
   Mic,
+  Plus,
   ShieldCheck,
   SlidersHorizontal,
   Square,
@@ -13,8 +15,11 @@ import {
 } from "lucide-react";
 import { FileIcon } from "./FileIcon";
 import {
+  attachmentKind,
   bridge,
+  PROVIDER_DEFAULT_MODEL,
   resolveModelEffort,
+  type ContextAttachment,
   type ModeProjection,
   type ModelCatalogEntry,
   type NativeActionReference,
@@ -67,6 +72,10 @@ interface ComposerProps {
   } | null;
   /** Project-relative file paths offered by the @-mention autocomplete. */
   contextFiles?: string[];
+  /** Requests the bounded project scan the first time an @-token is typed,
+   * so mention suggestions work before the Files tab has ever been opened.
+   * Owners keep this idempotent and cached. */
+  onRequestContextFiles?: () => void;
   /** External text insertion (e.g. right-click → add file as context). A new
    * id inserts `text` at the caret of the current draft. */
   insertRequest?: { id: number; text: string } | null;
@@ -128,36 +137,118 @@ interface AutocompleteMatch {
   value: string;
   label: string;
   detail: string;
+  /** Distinguishes project files from folders in @-mention suggestions. */
+  entry?: "file" | "folder";
   actionId?: string;
   kind?: NativeProviderAction["kind"];
   invocation?: NativeProviderAction["invocation"];
 }
 
-function matchFiles(files: string[], query: string): AutocompleteMatch[] {
-  const normalized = query.toLocaleLowerCase();
-  const ranked = files
-    .map((path) => {
-      const name = path.split("/").at(-1) ?? path;
-      const lowerName = name.toLocaleLowerCase();
-      const lowerPath = path.toLocaleLowerCase();
-      const rank = !normalized
-        ? 2
-        : lowerName.startsWith(normalized)
-          ? 0
-          : lowerName.includes(normalized)
-            ? 1
-            : lowerPath.includes(normalized)
-              ? 2
-              : -1;
-      return { path, name, rank };
-    })
-    .filter((entry) => entry.rank >= 0)
+/** Folder structure derived from the flat project file list, so @-mention
+ * suggestions can browse directories without a second backend call. */
+interface ContextIndex {
+  fileSet: Set<string>;
+  folderSet: Set<string>;
+  /** Immediate children per folder path; the root is keyed by "". */
+  children: Map<string, { folders: string[]; files: string[] }>;
+}
+
+interface ComposerAttachment extends ContextAttachment {
+  /** Project folders use the same compact context treatment as files, while
+   * retaining a truthful folder icon. Picker attachments leave this unset. */
+  entry?: "file" | "folder";
+}
+
+function buildContextIndex(files: string[]): ContextIndex {
+  const fileSet = new Set(files);
+  const folderSet = new Set<string>();
+  const raw = new Map<string, { folders: Set<string>; files: string[] }>();
+  const childrenOf = (folder: string) => {
+    let entry = raw.get(folder);
+    if (!entry) {
+      entry = { folders: new Set(), files: [] };
+      raw.set(folder, entry);
+    }
+    return entry;
+  };
+  for (const path of files) {
+    const segments = path.split("/").filter(Boolean);
+    if (segments.length === 0) continue;
+    let parent = "";
+    for (let index = 0; index < segments.length - 1; index += 1) {
+      const folder = parent ? `${parent}/${segments[index]}` : segments[index];
+      folderSet.add(folder);
+      childrenOf(parent).folders.add(folder);
+      parent = folder;
+    }
+    childrenOf(parent).files.push(path);
+  }
+  const children = new Map<string, { folders: string[]; files: string[] }>();
+  for (const [folder, entry] of raw) {
+    children.set(folder, {
+      folders: [...entry.folders].sort((a, b) => a.localeCompare(b)),
+      files: entry.files.slice().sort((a, b) => a.localeCompare(b)),
+    });
+  }
+  return { fileSet, folderSet, children };
+}
+
+const CONTEXT_MATCH_LIMIT = 12;
+
+function contextMatch(path: string, entry: "file" | "folder"): AutocompleteMatch {
+  const name = path.split("/").at(-1) ?? path;
+  return {
+    value: path,
+    label: entry === "folder" ? `${name}/` : name,
+    detail: path.split("/").slice(0, -1).join("/"),
+    entry,
+  };
+}
+
+function nameRank(path: string, normalized: string): number {
+  if (!normalized) return 0;
+  const name = (path.split("/").at(-1) ?? "").toLocaleLowerCase();
+  return name.startsWith(normalized) ? 0 : name.includes(normalized) ? 1 : -1;
+}
+
+/** Directory-first @-mention matching: an empty query or a query anchored to
+ * an existing folder browses that folder (folders before files, like a file
+ * tree); anything else fuzzy-ranks every folder and file in the project. */
+function matchContext(index: ContextIndex, query: string): AutocompleteMatch[] {
+  const slash = query.lastIndexOf("/");
+  const dir = slash >= 0 ? query.slice(0, slash) : "";
+  const leaf = slash >= 0 ? query.slice(slash + 1) : query;
+  const normalizedLeaf = leaf.toLocaleLowerCase();
+  const browsing = slash < 0 ? query === "" : dir === "" || index.folderSet.has(dir);
+  if (browsing) {
+    const listing = index.children.get(dir) ?? { folders: [], files: [] };
+    const pick = (paths: string[], entry: "file" | "folder") =>
+      paths
+        .map((path) => ({ path, rank: nameRank(path, normalizedLeaf) }))
+        .filter((item) => item.rank >= 0)
+        .sort((a, b) => a.rank - b.rank || a.path.localeCompare(b.path))
+        .map((item) => contextMatch(item.path, entry));
+    return [...pick(listing.folders, "folder"), ...pick(listing.files, "file")].slice(
+      0,
+      CONTEXT_MATCH_LIMIT,
+    );
+  }
+  const normalizedQuery = query.toLocaleLowerCase();
+  const rank = (path: string) => {
+    const byName = nameRank(path, normalizedQuery);
+    if (byName >= 0) return byName;
+    return path.toLocaleLowerCase().includes(normalizedQuery) ? 2 : -1;
+  };
+  const candidates = [
+    ...[...index.folderSet].map((path) => ({ path, entry: "folder" as const })),
+    ...[...index.fileSet].map((path) => ({ path, entry: "file" as const })),
+  ]
+    .map((item) => ({ ...item, rank: rank(item.path) }))
+    .filter((item) => item.rank >= 0)
     .sort((a, b) => a.rank - b.rank || a.path.localeCompare(b.path));
-  return ranked.slice(0, 8).map((entry) => ({
-    value: entry.path,
-    label: entry.name,
-    detail: entry.path.split("/").slice(0, -1).join("/"),
-  }));
+  return candidates
+    .slice(0, CONTEXT_MATCH_LIMIT)
+    .map((item) => contextMatch(item.path, item.entry));
 }
 
 function matchSkills(actions: NativeProviderAction[], query: string): AutocompleteMatch[] {
@@ -194,6 +285,99 @@ function completedNativeAction(
     (action) =>
       action.name === token && action.invocation === "direct" && action.id.trim().length > 0,
   );
+}
+
+export interface DraftSegment {
+  text: string;
+  token?: "skill" | "mention";
+}
+
+/** Splits a draft into plain text and highlightable tokens: the verified
+ * /skill prefix plus every @mention that names a real project file or folder
+ * (folder mentions may carry a trailing slash). */
+// eslint-disable-next-line react-refresh/only-export-components
+export function draftSegments(
+  prompt: string,
+  skillPrefix: string,
+  index: ContextIndex,
+): DraftSegment[] {
+  const segments: DraftSegment[] = [];
+  let offset = 0;
+  if (skillPrefix && (prompt === skillPrefix || prompt.startsWith(`${skillPrefix} `))) {
+    segments.push({ text: skillPrefix, token: "skill" });
+    offset = skillPrefix.length;
+  }
+  const rest = prompt.slice(offset);
+  const pattern = /(^|\s)(@[^\s]+)/g;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(rest))) {
+    const token = match[2].slice(1);
+    const normalized = token.endsWith("/") ? token.slice(0, -1) : token;
+    if (!index.fileSet.has(token) && !index.folderSet.has(normalized)) continue;
+    const start = match.index + match[1].length;
+    if (start > cursor) segments.push({ text: rest.slice(cursor, start) });
+    segments.push({ text: match[2], token: "mention" });
+    cursor = start + match[2].length;
+  }
+  if (cursor < rest.length || rest.length === 0) segments.push({ text: rest.slice(cursor) });
+  return segments;
+}
+
+function projectAttachment(path: string, entry: "file" | "folder"): ComposerAttachment {
+  const attachmentPath = entry === "folder" && !path.endsWith("/") ? `${path}/` : path;
+  const name = attachmentPath.split("/").filter(Boolean).at(-1) ?? attachmentPath;
+  return {
+    path: attachmentPath,
+    name: entry === "folder" ? `${name}/` : name,
+    kind: entry === "file" ? attachmentKind(name) : "file",
+    entry,
+  };
+}
+
+function projectReference(token: string, index: ContextIndex): ComposerAttachment | null {
+  if (index.fileSet.has(token)) return projectAttachment(token, "file");
+  const folder = token.endsWith("/") ? token.slice(0, -1) : token;
+  return index.folderSet.has(folder) ? projectAttachment(folder, "folder") : null;
+}
+
+/** Once a valid @reference is followed by whitespace it is committed as
+ * context: the token leaves the prose draft and becomes a removable card. */
+function detachCommittedProjectReferences(
+  prompt: string,
+  index: ContextIndex,
+): { prompt: string; attachments: ComposerAttachment[] } {
+  const attachments: ComposerAttachment[] = [];
+  let removedAtStart = false;
+  const nextPrompt = prompt.replace(
+    /(^|\s)@([^\s]+)(?=\s)/g,
+    (match: string, _leading: string, token: string, offset: number) => {
+      const attachment = projectReference(token, index);
+      if (!attachment) return match;
+      attachments.push(attachment);
+      removedAtStart ||= offset === 0;
+      return "";
+    },
+  );
+  return {
+    prompt: removedAtStart ? nextPrompt.replace(/^\s/, "") : nextPrompt,
+    attachments,
+  };
+}
+
+function appendUniqueAttachments(
+  current: ComposerAttachment[],
+  additions: ComposerAttachment[],
+): ComposerAttachment[] {
+  const existing = new Set(current.map((attachment) => attachment.path));
+  return [
+    ...current,
+    ...additions.filter((attachment) => {
+      if (existing.has(attachment.path)) return false;
+      existing.add(attachment.path);
+      return true;
+    }),
+  ];
 }
 
 function encodePcm16(samples: Float32Array, sourceRate: number): number[] {
@@ -233,6 +417,7 @@ export function Composer({
   onSessionModeChange,
   permissionRequest = null,
   contextFiles = [],
+  onRequestContextFiles,
   insertRequest = null,
   onInsertHandled,
   notices = [],
@@ -274,6 +459,8 @@ export function Composer({
     defaultDelegation ?? "off",
   );
   const [sending, setSending] = useState(false);
+  const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
+  const [attachmentError, setAttachmentError] = useState("");
   const [providerCatalogs, setProviderCatalogs] = useState<Record<string, ModelCatalogEntry[]>>({});
   const providerCatalogLoads = useRef(new Set<RuntimeId>());
   const [nativeActionsByKey, setNativeActionsByKey] = useState<
@@ -310,13 +497,26 @@ export function Composer({
   /** Once the user picks any routing value, settings defaults stop syncing. */
   const routingTouched = useRef(false);
   const selectedRuntime = runtimes.find((item) => item.id === runtime) ?? runtimes[0];
-  const catalog =
-    providerCatalogs[runtime] ??
-    (selectedRuntime?.models.length
-      ? selectedRuntime.models.map((id) => ({ id, label: id }))
-      : [{ id: "Provider default", label: "Provider default" }]);
+  const catalogLoaded = Object.hasOwn(providerCatalogs, runtime);
+  const runtimeCatalog =
+    selectedRuntime?.models
+      .filter((id) => id !== PROVIDER_DEFAULT_MODEL)
+      .map((id) => ({ id, label: id })) ?? [];
+  const catalog = (providerCatalogs[runtime] ?? runtimeCatalog).filter(
+    (entry) => entry.id !== PROVIDER_DEFAULT_MODEL,
+  );
   const activeEntry = catalog.find((entry) => entry.id === model) ?? catalog[0];
-  const activeModel = activeEntry?.id ?? "Provider default";
+  const activeModel = activeEntry?.id ?? "";
+  const modelOptions =
+    catalog.length > 0
+      ? catalog.map((entry) => ({ value: entry.id, label: entry.label }))
+      : [
+          {
+            value: "",
+            label: catalogLoaded ? "Model unavailable" : "Checking model…",
+            disabled: true,
+          },
+        ];
   const effortOptions = activeEntry?.efforts ?? [];
   const activeEffort = resolveModelEffort(activeEntry, effort);
   const visibleNotices = notices.filter(
@@ -350,11 +550,23 @@ export function Composer({
   }, [controlsMenuOpen]);
 
   const autocompleteToken = activeAutocompleteToken(prompt, caret);
+  const contextIndex = useMemo(() => buildContextIndex(contextFiles), [contextFiles]);
+  const wantsContextFiles = autocompleteToken?.kind === "file";
+  useEffect(() => {
+    if (wantsContextFiles) onRequestContextFiles?.();
+  }, [onRequestContextFiles, wantsContextFiles]);
   const nativeActionKey = workingDirectory ? `${runtime}\u0000${workingDirectory}` : "";
   const nativeActions = nativeActionsByKey[nativeActionKey] ?? [];
   const activeNativeAction = completedNativeAction(prompt, nativeActions);
   const activeNativeSkill = activeNativeAction?.kind === "skill" ? activeNativeAction : undefined;
   const activeNativeSkillPrefix = activeNativeSkill ? `/${activeNativeSkill.name}` : "";
+  // The mirror renders behind the transparent-text textarea whenever the
+  // draft holds at least one highlightable token (/skill or valid @mention).
+  const mirrorSegments = useMemo(
+    () => draftSegments(prompt, activeNativeSkillPrefix, contextIndex),
+    [activeNativeSkillPrefix, contextIndex, prompt],
+  );
+  const mirrorActive = mirrorSegments.some((segment) => segment.token);
   useEffect(() => {
     if (!workingDirectory || !nativeActionKey) return;
     if (nativeActionsByKey[nativeActionKey] || nativeActionLoads.current.has(nativeActionKey)) {
@@ -391,9 +603,9 @@ export function Composer({
       !autocompleteToken
         ? []
         : autocompleteToken.kind === "file"
-          ? matchFiles(contextFiles, autocompleteToken.query)
+          ? matchContext(contextIndex, autocompleteToken.query)
           : matchSkills(nativeActions, autocompleteToken.query),
-    [autocompleteToken?.kind, autocompleteToken?.query, contextFiles, nativeActions], // eslint-disable-line react-hooks/exhaustive-deps
+    [autocompleteToken?.kind, autocompleteToken?.query, contextIndex, nativeActions], // eslint-disable-line react-hooks/exhaustive-deps
   );
   // Dismissal (Escape) sticks to the trigger position; the highlight resets
   // whenever the query under that trigger changes.
@@ -433,11 +645,53 @@ export function Composer({
     voiceAnchorRef.current = { start: position, end: position };
   };
 
+  const addAttachments = async () => {
+    const pick = bridge.pickContextAttachments;
+    if (!pick) return;
+    setAttachmentError("");
+    try {
+      const picked = await pick();
+      if (!picked?.length) return;
+      setAttachments((current) => appendUniqueAttachments(current, picked));
+    } catch (error) {
+      setAttachmentError(
+        error instanceof Error ? error.message : "Could not attach files from this computer.",
+      );
+    } finally {
+      textareaRef.current?.focus();
+    }
+  };
+
   const acceptAutocomplete = (match: AutocompleteMatch) => {
     const token = autocompleteToken;
     if (!token) return;
     if (token.kind === "skill" && match.invocation === "interactiveOnly") return;
-    const insert = token.kind === "file" ? `@${match.value} ` : `/${match.value} `;
+    if (token.kind === "file" && match.entry === "file") {
+      const attachment = projectAttachment(match.value, "file");
+      const before = prompt.slice(0, token.start);
+      let after = prompt.slice(caret);
+      if ((!before || /\s$/.test(before)) && /^\s/.test(after)) after = after.slice(1);
+      const next = before + after;
+      const position = before.length;
+      setAttachments((current) => appendUniqueAttachments(current, [attachment]));
+      setPrompt(next);
+      setCaret(position);
+      resetVoiceBaseline(next, position);
+      requestAnimationFrame(() => {
+        const textarea = textareaRef.current;
+        textarea?.focus();
+        textarea?.setSelectionRange(position, position);
+      });
+      return;
+    }
+    // Folder mentions insert without a trailing space so the token stays
+    // active and the popup drills into the folder; a typed space finalizes it.
+    const insert =
+      token.kind === "file"
+        ? match.entry === "folder"
+          ? `@${match.value}/`
+          : `@${match.value} `
+        : `/${match.value} `;
     const next = prompt.slice(0, token.start) + insert + prompt.slice(caret);
     const position = token.start + insert.length;
     setPrompt(next);
@@ -458,6 +712,16 @@ export function Composer({
     const textarea = textareaRef.current;
     const start = textarea?.selectionStart ?? prompt.length;
     const end = textarea?.selectionEnd ?? start;
+    const exactReference = /^@([^\s]+)\s*$/.exec(insertRequest.text)?.[1];
+    const attachment = exactReference ? projectReference(exactReference, contextIndex) : null;
+    if (attachment) {
+      queueMicrotask(() => {
+        setAttachments((current) => appendUniqueAttachments(current, [attachment]));
+      });
+      onInsertHandled?.(insertRequest.id);
+      textarea?.focus();
+      return;
+    }
     const before = prompt.slice(0, start);
     const lead = before && !/\s$/.test(before) ? " " : "";
     const text = lead + insertRequest.text;
@@ -793,14 +1057,20 @@ export function Composer({
       void bridge
         .listModelCatalog?.(targetRuntime)
         .then((entries) => {
-          if (!entries?.length) return;
-          setProviderCatalogs((current) => ({ ...current, [targetRuntime]: entries }));
+          setProviderCatalogs((current) => ({
+            ...current,
+            [targetRuntime]: (entries ?? []).filter((entry) => entry.id !== PROVIDER_DEFAULT_MODEL),
+          }));
         })
         .catch(() => undefined)
         .finally(() => providerCatalogLoads.current.delete(targetRuntime));
     },
     [providerCatalogs],
   );
+
+  useEffect(() => {
+    loadProviderCatalog(runtime);
+  }, [loadProviderCatalog, runtime]);
 
   // A saved model can belong to a different runtime (for example after an
   // imported settings file or a runtime change from an older build). Once the
@@ -810,21 +1080,41 @@ export function Composer({
     const resolvedCatalog = providerCatalogs[runtime];
     if (!resolvedCatalog?.length || resolvedCatalog.some((entry) => entry.id === model)) return;
     const nextEntry = resolvedCatalog[0];
+    if (!nextEntry) return;
+    const nextEffort = resolveModelEffort(nextEntry, defaultEffort);
     let cancelled = false;
     void Promise.resolve().then(() => {
       if (cancelled) return;
       setModel(nextEntry.id);
-      setEffort(resolveModelEffort(nextEntry, defaultEffort));
+      setEffort(nextEffort);
+      onRoutingChange?.({
+        runtime,
+        model: nextEntry.id,
+        effort: nextEntry.efforts?.length ? nextEffort : undefined,
+      });
     });
     return () => {
       cancelled = true;
     };
-  }, [defaultEffort, model, providerCatalogs, runtime]);
+  }, [defaultEffort, model, onRoutingChange, providerCatalogs, runtime]);
 
   const submit = async () => {
     const trimmed = prompt.trim();
-    if (!trimmed || sending) return;
+    if ((!trimmed && attachments.length === 0) || !activeModel || sending) return;
     const submittedDraft = trimmed;
+    const submittedAttachments = attachments;
+    // Picker attachments and committed @references share one plain-text
+    // context block. Providers retain the same path context, while the
+    // transcript can re-render the same compact cards after sending.
+    const attachmentBlock =
+      attachments.length > 0
+        ? `Attached files:\n${attachments.map((attachment) => `- ${attachment.path}`).join("\n")}`
+        : "";
+    const outgoing = trimmed
+      ? attachmentBlock
+        ? `${trimmed}\n\n${attachmentBlock}`
+        : trimmed
+      : attachmentBlock;
     const nativeAction = completedNativeAction(trimmed, nativeActions);
     const nativeActionId = nativeAction?.id;
     setSending(true);
@@ -832,9 +1122,14 @@ export function Composer({
     // request that is waiting on provider/session startup. A rejected send
     // puts this exact draft back below.
     setPrompt("");
+    setAttachments([]);
+    const restoreDraft = () => {
+      setPrompt((current) => (current.trim() ? current : submittedDraft));
+      setAttachments((current) => (current.length > 0 ? current : submittedAttachments));
+    };
     try {
       const accepted = await onSend({
-        prompt: trimmed,
+        prompt: outgoing,
         runtime,
         model: activeModel,
         effort: effortOptions.length > 0 ? activeEffort : undefined,
@@ -846,13 +1141,13 @@ export function Composer({
           : {}),
       });
       if (accepted === false) {
-        setPrompt((current) => (current.trim() ? current : submittedDraft));
+        restoreDraft();
       } else {
         if (composerTextMirrorRef.current) composerTextMirrorRef.current.scrollTop = 0;
       }
       textareaRef.current?.focus();
     } catch {
-      setPrompt((current) => (current.trim() ? current : submittedDraft));
+      restoreDraft();
     } finally {
       setSending(false);
     }
@@ -971,8 +1266,9 @@ export function Composer({
               transition={{ duration: 0.12, ease: "easeOut" }}
             >
               <p className="composer-autocomplete-hint">
-                {autocompleteToken?.kind === "file" ? "Project files" : "Provider native"} · ↑↓ to
-                choose · Enter to insert · Esc to dismiss
+                {autocompleteToken?.kind === "file"
+                  ? "Project files & folders · ↑↓ to choose · Enter inserts, folders drill in · Esc to dismiss"
+                  : "Provider native · ↑↓ to choose · Enter to insert · Esc to dismiss"}
               </p>
               {autocompleteMatches.length === 0 && skillStatusVisible ? (
                 <p
@@ -1001,8 +1297,14 @@ export function Composer({
                   onMouseEnter={() => setHighlightedIndex(index)}
                   onClick={() => acceptAutocomplete(match)}
                 >
-                  {autocompleteToken?.kind === "file" ? <FileIcon fileName={match.value} /> : null}
-                  <span>{match.label}</span>
+                  {autocompleteToken?.kind === "file" ? (
+                    match.entry === "folder" ? (
+                      <Folder aria-hidden="true" />
+                    ) : (
+                      <FileIcon fileName={match.value} />
+                    )
+                  ) : null}
+                  <span className="autocomplete-token">{match.label}</span>
                   {match.detail ? <small>{match.detail}</small> : null}
                 </button>
               ))}
@@ -1010,20 +1312,32 @@ export function Composer({
           ) : null}
         </AnimatePresence>
         <div className="composer-editor">
-          {activeNativeSkill ? (
+          {mirrorActive ? (
             <div
               ref={composerTextMirrorRef}
               className="composer-text-mirror"
               aria-hidden="true"
-              data-native-skill={activeNativeSkill.name}
+              data-native-skill={activeNativeSkill?.name}
             >
-              <strong className="native-skill-token">{activeNativeSkillPrefix}</strong>
-              {prompt.slice(activeNativeSkillPrefix.length)}
+              {mirrorSegments.map((segment, index) =>
+                segment.token ? (
+                  <strong
+                    key={`${segment.text}-${index}`}
+                    className={
+                      segment.token === "skill" ? "native-skill-token" : "context-mention-token"
+                    }
+                  >
+                    {segment.text}
+                  </strong>
+                ) : (
+                  segment.text
+                ),
+              )}
             </div>
           ) : null}
           <textarea
             ref={textareaRef}
-            className={activeNativeSkill ? "composer-textarea--mirrored" : undefined}
+            className={mirrorActive ? "composer-textarea--mirrored" : undefined}
             value={prompt}
             onScroll={(event) => {
               if (composerTextMirrorRef.current) {
@@ -1033,23 +1347,34 @@ export function Composer({
             }}
             onChange={(event) => {
               const nextPrompt = event.target.value;
+              const nextCaret = event.target.selectionStart;
               if (nextPrompt.startsWith("/") && !prompt.startsWith("/") && nativeActionsError) {
                 setNativeActionRetry((current) => current + 1);
+              }
+              const detached = detachCommittedProjectReferences(nextPrompt, contextIndex);
+              const detachedPrefix = detachCommittedProjectReferences(
+                nextPrompt.slice(0, nextCaret),
+                contextIndex,
+              );
+              const committedPrompt = detached.prompt;
+              const committedCaret = detachedPrefix.prompt.length;
+              if (detached.attachments.length > 0) {
+                setAttachments((current) => appendUniqueAttachments(current, detached.attachments));
               }
               if (voiceActive) {
                 // Treat a manual edit as the new draft baseline. This keeps
                 // typed text and already-transcribed words intact instead of
                 // rebuilding the textarea from the old pre-recording value.
-                voiceBaseRef.current = nextPrompt;
+                voiceBaseRef.current = committedPrompt;
                 voiceCommittedTranscriptRef.current = "";
                 voiceLiveTranscriptRef.current = "";
                 voiceAnchorRef.current = {
-                  start: event.target.selectionStart,
-                  end: event.target.selectionEnd,
+                  start: committedCaret,
+                  end: committedCaret,
                 };
               }
-              setPrompt(nextPrompt);
-              setCaret(event.target.selectionStart);
+              setPrompt(committedPrompt);
+              setCaret(committedCaret);
             }}
             onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
             onKeyDown={(event) => {
@@ -1096,8 +1421,59 @@ export function Composer({
             autoFocus
           />
         </div>
+        {attachments.length > 0 || attachmentError ? (
+          <div className="composer-attachments" aria-label="Attached context">
+            {attachments.map((attachment) => (
+              <div
+                className={`composer-attachment${
+                  attachment.dataUrl ? " composer-attachment--image" : ""
+                }`}
+                key={attachment.path}
+                title={attachment.path}
+              >
+                {attachment.dataUrl ? (
+                  <img src={attachment.dataUrl} alt={attachment.name} />
+                ) : attachment.entry === "folder" ? (
+                  <Folder className="file-type-icon" aria-hidden="true" />
+                ) : (
+                  <FileIcon fileName={attachment.name} />
+                )}
+                <span>{attachment.name}</span>
+                <button
+                  className="composer-attachment-remove"
+                  type="button"
+                  aria-label={`Remove ${attachment.name}`}
+                  title="Remove attachment"
+                  onClick={() =>
+                    setAttachments((current) =>
+                      current.filter((item) => item.path !== attachment.path),
+                    )
+                  }
+                >
+                  <X aria-hidden="true" />
+                </button>
+              </div>
+            ))}
+            {attachmentError ? (
+              <p className="composer-attachment-error" role="alert">
+                {attachmentError}
+              </p>
+            ) : null}
+          </div>
+        ) : null}
         <div className="composer-control-row">
           <div className="composer-controls-left">
+            {bridge.pickContextAttachments ? (
+              <button
+                className="icon-button subtle composer-attach"
+                type="button"
+                onClick={() => void addAttachments()}
+                aria-label="Attach files or images from your computer"
+                title="Attach files or images as context"
+              >
+                <Plus aria-hidden="true" />
+              </button>
+            ) : null}
             <div className="composer-controls-optional">
               {sessionModes && sessionModes.availableModes.length > 1 ? (
                 <Dropdown
@@ -1283,7 +1659,7 @@ export function Composer({
                 setEffort(nextEffort);
                 emitRoutingChange(runtime, next, nextEfforts.length > 0 ? nextEffort : undefined);
               }}
-              options={catalog.map((entry) => ({ value: entry.id, label: entry.label }))}
+              options={modelOptions}
               compact
             />
             <Dropdown
@@ -1294,23 +1670,27 @@ export function Composer({
               onChange={(next) => {
                 routingTouched.current = true;
                 const nextRuntime = next as RuntimeId;
+                const nextRuntimeCatalog =
+                  providerCatalogs[nextRuntime] ??
+                  (runtimes.find((item) => item.id === nextRuntime)?.models ?? [])
+                    .filter((id) => id !== PROVIDER_DEFAULT_MODEL)
+                    .map((id) => ({ id, label: id }));
                 const nextModel =
-                  providerCatalogs[nextRuntime]?.[0]?.id ??
-                  runtimes.find((item) => item.id === nextRuntime)?.models[0] ??
-                  "Provider default";
-                const nextEntry = providerCatalogs[nextRuntime]?.find(
-                  (entry) => entry.id === nextModel,
-                );
+                  nextRuntimeCatalog.find((entry) => entry.id !== PROVIDER_DEFAULT_MODEL)?.id ?? "";
+                const nextEntry = nextRuntimeCatalog.find((entry) => entry.id === nextModel);
                 const nextEfforts = nextEntry?.efforts ?? [];
                 const nextEffort = resolveModelEffort(nextEntry, defaultEffort);
                 setRuntime(nextRuntime);
                 setModel(nextModel);
                 setEffort(nextEffort);
-                emitRoutingChange(
-                  nextRuntime,
-                  nextModel,
-                  nextEfforts.length > 0 ? nextEffort : undefined,
-                );
+                loadProviderCatalog(nextRuntime);
+                if (nextModel) {
+                  emitRoutingChange(
+                    nextRuntime,
+                    nextModel,
+                    nextEfforts.length > 0 ? nextEffort : undefined,
+                  );
+                }
               }}
               options={runtimes.map((item) => ({
                 value: item.id,
@@ -1363,7 +1743,7 @@ export function Composer({
               options={microphoneOptions}
               compact
             />
-            {running && onStop && !prompt.trim() ? (
+            {running && onStop && !prompt.trim() && attachments.length === 0 ? (
               <motion.button
                 className="send-button send-button--stop"
                 type="button"
@@ -1380,7 +1760,7 @@ export function Composer({
                 className="send-button"
                 type="button"
                 onClick={() => void submit()}
-                disabled={!prompt.trim() || sending}
+                disabled={(!prompt.trim() && attachments.length === 0) || !activeModel || sending}
                 aria-label={sending ? "Sending" : sendLabel}
                 whileTap={{ scale: 0.94 }}
               >

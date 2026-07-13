@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useRef, useState, useEffect } from "react";
-import { LayoutGroup, m as motion, useReducedMotion } from "motion/react";
+import { AnimatePresence, LayoutGroup, m as motion, useReducedMotion } from "motion/react";
 import {
   ArrowLeft,
   Bot,
@@ -24,6 +24,7 @@ import {
   Trash2,
   Upload,
   Users,
+  X,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import {
@@ -52,7 +53,7 @@ import {
   importThemePreferences,
   INTERFACE_FONT_CHOICES,
   THEME_COLOR_TOKENS,
-  THEME_PRESETS,
+  THEME_PRESET_GRID_ORDER,
   type ThemeColorToken,
   type ThemePreferencePatch,
   type ThemePreferences,
@@ -135,6 +136,8 @@ const DEFAULT_DELEGATION_PROFILES: DelegationProfileSetting[] = [
     costTier: "medium",
     enabled: true,
   },
+  { id: "cursor-default", label: "Cursor", runtime: "cursor", costTier: "medium", enabled: true },
+  { id: "grok-default", label: "Grok Build", runtime: "grok", costTier: "low", enabled: true },
 ];
 
 /**
@@ -150,7 +153,7 @@ const DEFAULT_SETTINGS: SettingsMap = {
   "transcript.showModel": true,
   "transcript.showTimestamps": true,
   "models.defaultRuntime": "codex",
-  "models.defaultModel": "Provider default",
+  "models.defaultModel": "",
   "models.defaultEffort": "medium",
   "permissions.defaultProfile": "project-write",
   // Consumed by the native delegation broker (peers_list / delegate_start
@@ -235,13 +238,20 @@ const FALLBACK_EFFORTS: Record<string, string[]> = {
   claude: ["low", "medium", "high", "xhigh", "max"],
   codex: ["minimal", "low", "medium", "high"],
   antigravity: ["low", "medium", "high"],
+  // Cursor thought levels are per-model and only known from the live
+  // catalog; Grok advertises none. An empty list keeps the picker honest
+  // ("Default effort" only) instead of offering ids the agent would drop.
+  cursor: [],
+  grok: [],
 };
 
-/** Runtimes that can run as delegated subagents in v1. */
+/** Runtimes that can run as delegated subagents. */
 const DELEGATION_TARGETS: Array<{ runtime: string; label: string }> = [
   { runtime: "codex", label: "Codex (OpenAI)" },
   { runtime: "claude", label: "Claude" },
   { runtime: "antigravity", label: "Antigravity (Gemini)" },
+  { runtime: "cursor", label: "Cursor" },
+  { runtime: "grok", label: "Grok Build" },
 ];
 
 function SubagentsSettings({
@@ -298,7 +308,7 @@ function SubagentsSettings({
         runtime: target.runtime,
         instruction: "",
         preferredChildProfileIds: [],
-        costTier: target.runtime === "codex" ? "low" : "medium",
+        costTier: target.runtime === "codex" || target.runtime === "grok" ? "low" : "medium",
         enabled: true,
       },
     ]);
@@ -436,14 +446,11 @@ function SubagentsSettings({
                     <Dropdown
                       className="compact-select"
                       aria-label={`Model for ${profile.label}`}
-                      value={profile.model ?? ""}
-                      options={[
-                        { value: "", label: "Provider default" },
-                        ...catalog.map((item) => ({
-                          value: item.id,
-                          label: item.label || item.id,
-                        })),
-                      ]}
+                      value={entry?.id ?? catalog[0].id}
+                      options={catalog.map((item) => ({
+                        value: item.id,
+                        label: item.label || item.id,
+                      }))}
                       onChange={(value) => {
                         const nextEntry = catalog.find((item) => item.id === value);
                         updateProfile(profile.id, {
@@ -458,7 +465,7 @@ function SubagentsSettings({
                   ) : (
                     <input
                       aria-label={`Model for ${profile.label}`}
-                      placeholder="Provider default"
+                      placeholder="Model ID"
                       value={profile.model ?? ""}
                       onChange={(event) =>
                         updateProfile(profile.id, { model: event.target.value || undefined })
@@ -570,9 +577,10 @@ function SubagentsSettings({
           ))}
         </div>
         <p className="subagent-footnote">
-          Orchestrator tools are injected for Claude and Cursor sessions; Codex, Claude, and
-          Antigravity can all run as subagents. See docs/delegation-broker-v1.md for the support
-          matrix.
+          Orchestrator tools are injected for Claude and Cursor sessions; every listed provider can
+          run as a subagent. Claude and Cursor children get subagent tools; Codex, Antigravity, and
+          Grok report through their transcript digest. See docs/delegation-broker-v1.md for the
+          support matrix.
         </p>
       </section>
     </>
@@ -650,35 +658,38 @@ function AppearanceSettings({
           <p>Coordinated palettes. Provider identity never recolors the workspace.</p>
         </header>
         <div className="theme-grid" role="radiogroup" aria-label="Theme preset">
-          {THEME_PRESETS.map((theme) => (
-            <button
-              className="theme-swatch"
-              type="button"
-              role="radio"
-              aria-checked={preferences.themeId === theme.id}
-              data-active={preferences.themeId === theme.id}
-              onClick={() => onChange({ themeId: theme.id })}
-              key={theme.id}
-            >
-              <span
-                className="theme-preview"
-                style={{
-                  background: theme.colors["surface.canvas"],
-                  borderColor: theme.colors["border.strong"],
-                }}
+          {THEME_PRESET_GRID_ORDER.map((themeId) => {
+            const theme = getThemePreset(themeId);
+            return (
+              <button
+                className="theme-swatch"
+                type="button"
+                role="radio"
+                aria-checked={preferences.themeId === theme.id}
+                data-active={preferences.themeId === theme.id}
+                onClick={() => onChange({ themeId: theme.id })}
+                key={theme.id}
               >
-                <i style={{ background: theme.colors["surface.rail"] }} />
-                <b style={{ background: theme.colors["surface.layer1"] }} />
-                <em style={{ background: theme.colors["accent.primary"] }} />
-                <small style={{ background: theme.colors["diff.addedStrong"] }} />
-              </span>
-              <span>
-                <strong>{theme.label}</strong>
-                <small>{theme.appearance}</small>
-              </span>
-              {preferences.themeId === theme.id ? <Check /> : null}
-            </button>
-          ))}
+                <span
+                  className="theme-preview"
+                  style={{
+                    background: theme.colors["surface.canvas"],
+                    borderColor: theme.colors["border.strong"],
+                  }}
+                >
+                  <i style={{ background: theme.colors["surface.rail"] }} />
+                  <b style={{ background: theme.colors["surface.layer1"] }} />
+                  <em style={{ background: theme.colors["accent.primary"] }} />
+                  <small style={{ background: theme.colors["diff.addedStrong"] }} />
+                </span>
+                <span>
+                  <strong>{theme.label}</strong>
+                  <small>{theme.appearance}</small>
+                </span>
+                {preferences.themeId === theme.id ? <Check /> : null}
+              </button>
+            );
+          })}
         </div>
       </section>
       <section className="settings-section">
@@ -988,6 +999,145 @@ function runtimeConnectionForRequest(
   );
 }
 
+interface RuntimePlannerState {
+  runtime: RuntimeConnection;
+  kind: RuntimeActionKind;
+  plans: RuntimeActionPlan[];
+  selectedId: string;
+}
+
+function runtimeActionTitle(planner: RuntimePlannerState): string {
+  if (planner.kind === "install") return `Install ${planner.runtime.name}`;
+  if (planner.kind === "update") return `Update ${planner.runtime.name}`;
+  return `Sign in to ${planner.runtime.name}`;
+}
+
+function RuntimeCommandReview({
+  planner,
+  selectedPlan,
+  loading,
+  onSelectPlan,
+  onCancel,
+  onRun,
+}: {
+  planner: RuntimePlannerState;
+  selectedPlan?: RuntimeActionPlan;
+  loading: boolean;
+  onSelectPlan: (planId: string) => void;
+  onCancel: () => void;
+  onRun: () => void;
+}) {
+  const title = runtimeActionTitle(planner);
+  return (
+    <section
+      className="runtime-setup-terminal runtime-command-review"
+      role="dialog"
+      aria-labelledby="runtime-action-title"
+    >
+      <header>
+        <span>
+          <strong id="runtime-action-title">{title}</strong>
+          <small>Review the exact local command before anything runs.</small>
+        </span>
+        <button
+          className="icon-button"
+          type="button"
+          onClick={onCancel}
+          aria-label="Cancel runtime command"
+        >
+          <X aria-hidden="true" />
+        </button>
+      </header>
+      <div className="runtime-command-review-body">
+        {loading || !selectedPlan ? (
+          <div className="runtime-command-review-loading" role="status">
+            <LoaderCircle className="spin-slow" aria-hidden="true" />
+            <span>
+              <strong>Inspecting documented methods…</strong>
+              <small>No command has started.</small>
+            </span>
+          </div>
+        ) : (
+          <>
+            {planner.plans.length > 1 ? (
+              <fieldset className="runtime-methods">
+                <legend>Method</legend>
+                {planner.plans.map((plan) => (
+                  <label key={plan.id} data-available={plan.available}>
+                    <input
+                      type="radio"
+                      name="runtime-method"
+                      value={plan.id}
+                      checked={planner.selectedId === plan.id}
+                      disabled={!plan.available}
+                      onChange={() => onSelectPlan(plan.id)}
+                    />
+                    <span>
+                      <strong>
+                        {plan.method}
+                        {plan.recommended ? " · Recommended" : ""}
+                      </strong>
+                      <small>{plan.available ? plan.description : plan.unavailableReason}</small>
+                    </span>
+                  </label>
+                ))}
+              </fieldset>
+            ) : null}
+            <div className="runtime-command-disclosure">
+              <span>
+                <strong>Command</strong>
+                <small>{selectedPlan.method}</small>
+              </span>
+              <code>{selectedPlan.command}</code>
+              <button
+                className="icon-button"
+                type="button"
+                aria-label="Copy runtime command"
+                onClick={() => void navigator.clipboard.writeText(selectedPlan.command)}
+              >
+                <Copy aria-hidden="true" />
+              </button>
+            </div>
+            <p className="runtime-command-review-note">{selectedPlan.environmentNote}</p>
+            {selectedPlan.downloadsAndExecutesCode ? (
+              <p className="runtime-action-warning">
+                <TriangleAlert aria-hidden="true" /> This command downloads and executes vendor code
+                and may replace files outside your projects.
+              </p>
+            ) : null}
+            <div className="runtime-action-source">
+              <button
+                className="text-button"
+                type="button"
+                disabled={!selectedPlan.sourceUrl}
+                onClick={() => void openExternalLink(selectedPlan.sourceUrl)}
+              >
+                <ExternalLink aria-hidden="true" /> Vendor documentation
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+      <footer className="runtime-command-review-footer">
+        <span>Nothing runs until you confirm this exact command.</span>
+        <span className="runtime-command-review-actions">
+          <button className="secondary-button" type="button" onClick={onCancel}>
+            Cancel
+          </button>
+          <button
+            className="primary-button"
+            type="button"
+            disabled={loading || !selectedPlan?.available}
+            onClick={onRun}
+          >
+            Run this command
+          </button>
+        </span>
+      </footer>
+    </section>
+  );
+}
+
 function RuntimeSettings({
   runtimes,
   actionRequest,
@@ -997,24 +1147,33 @@ function RuntimeSettings({
   actionRequest?: RuntimeActionRequest | null;
   onRefreshRuntimes?: () => Promise<RuntimeConnection[]>;
 }) {
+  const reduceMotion =
+    Boolean(useReducedMotion()) || document.documentElement.dataset.motion === "none";
   const handledRequest = useRef(0);
-  const [planner, setPlanner] = useState<{
-    runtime: RuntimeConnection;
-    kind: RuntimeActionKind;
-    plans: RuntimeActionPlan[];
-    selectedId: string;
-  } | null>(null);
+  const plannerRequestSequence = useRef(0);
+  const [planner, setPlanner] = useState<RuntimePlannerState | null>(null);
   const [loadingPlan, setLoadingPlan] = useState(false);
   const [checking, setChecking] = useState(false);
   const [activePlan, setActivePlan] = useState<RuntimeActionPlan | null>(null);
   const [message, setMessage] = useState("");
 
+  const cancelPlanner = useCallback(() => {
+    plannerRequestSequence.current += 1;
+    setPlanner(null);
+    setLoadingPlan(false);
+  }, []);
+
   const openPlanner = useCallback(async (runtime: RuntimeConnection, kind: RuntimeActionKind) => {
+    const requestId = ++plannerRequestSequence.current;
+    setActivePlan(null);
+    setPlanner({ runtime, kind, plans: [], selectedId: "" });
     setLoadingPlan(true);
     setMessage(`Inspecting documented ${kind} methods for ${runtime.name}…`);
     try {
       const plans = await bridge.listRuntimeActionPlans(runtime.id, kind);
+      if (requestId !== plannerRequestSequence.current) return;
       if (plans.length === 0) {
+        setPlanner(null);
         setMessage(
           `No documented ${kind} command is available for ${runtime.name} on this system.`,
         );
@@ -1027,11 +1186,13 @@ function RuntimeSettings({
       setPlanner({ runtime, kind, plans, selectedId: selected?.id ?? "" });
       setMessage("");
     } catch (error) {
+      if (requestId !== plannerRequestSequence.current) return;
+      setPlanner(null);
       setMessage(
         error instanceof Error ? error.message : `Could not inspect ${runtime.name} setup.`,
       );
     } finally {
-      setLoadingPlan(false);
+      if (requestId === plannerRequestSequence.current) setLoadingPlan(false);
     }
   }, []);
 
@@ -1061,6 +1222,10 @@ function RuntimeSettings({
   };
 
   const selectedPlan = planner?.plans.find((plan) => plan.id === planner.selectedId);
+  const focusedRuntime = activePlan?.provider ?? planner?.runtime.id;
+  const visibleRuntimes = focusedRuntime
+    ? runtimes.filter((runtime) => runtime.id === focusedRuntime)
+    : runtimes;
   const startSelectedPlan = () => {
     if (!selectedPlan?.available) return;
     setActivePlan(selectedPlan);
@@ -1090,186 +1255,207 @@ function RuntimeSettings({
           {checking ? "Checking…" : "Check all"}
         </button>
       </div>
-      <section className="settings-section">
-        <header>
-          <h2>Local runtime inventory</h2>
-          <p>
-            Status combines executable discovery, version, authentication, and Integrator’s
-            compatibility floor. A login alone is not reported as ready.
-          </p>
-        </header>
-        <div className="settings-runtime-list">
-          {runtimes.map((runtime) => (
-            <div key={runtime.id}>
-              <span className={`runtime-logo runtime-logo--${runtime.id}`}>
-                <ProviderIcon provider={runtime.id} label={runtime.name} />
-              </span>
-              <span>
-                <strong>
-                  {runtime.name}
-                  <small data-status={runtime.status}>{runtime.status.replace("_", " ")}</small>
-                </strong>
-                <code>{runtime.version ?? "Version not reported"}</code>
-                <p>{runtime.detail}</p>
-                <code className="runtime-executable">{runtime.command}</code>
-              </span>
-              <span className="runtime-row-actions">
-                {runtime.status === "not_installed" ? (
-                  <button
-                    className="primary-button"
-                    type="button"
-                    onClick={() => void openPlanner(runtime, "install")}
-                    disabled={loadingPlan}
+      <motion.div
+        className="runtime-settings-stage"
+        data-focused={Boolean(focusedRuntime)}
+        layout={!reduceMotion}
+        transition={reduceMotion ? { duration: 0 } : navPillSpring}
+      >
+        <section className="settings-section">
+          <header>
+            <h2>Local runtime inventory</h2>
+            <p>
+              Status combines executable discovery, version, authentication, and Integrator’s
+              compatibility floor. A login alone is not reported as ready.
+            </p>
+          </header>
+          <div className="settings-runtime-list">
+            <AnimatePresence initial={false} mode="popLayout">
+              {visibleRuntimes.map((runtime, index) => (
+                <motion.div
+                  key={runtime.id}
+                  className="settings-runtime-row"
+                  data-active={runtime.id === focusedRuntime}
+                  layout={!reduceMotion}
+                  layoutId={reduceMotion ? undefined : `runtime-row-${runtime.id}`}
+                  initial={
+                    reduceMotion ? false : { opacity: 0, y: 10, scale: 0.985, filter: "blur(5px)" }
+                  }
+                  animate={{ opacity: 1, x: 0, y: 0, scale: 1, filter: "blur(0px)" }}
+                  exit={
+                    reduceMotion
+                      ? { opacity: 0 }
+                      : {
+                          opacity: 0,
+                          x: index % 2 === 0 ? -18 : 18,
+                          y: 5,
+                          scale: 0.975,
+                          filter: "blur(7px)",
+                        }
+                  }
+                  transition={
+                    reduceMotion
+                      ? { duration: 0 }
+                      : {
+                          layout: { type: "spring", stiffness: 360, damping: 34, mass: 0.8 },
+                          opacity: { duration: 0.2 },
+                          filter: { duration: 0.22 },
+                          x: { duration: 0.24, ease: [0.2, 0, 0, 1] },
+                        }
+                  }
+                >
+                  <span className={`runtime-logo runtime-logo--${runtime.id}`}>
+                    <ProviderIcon provider={runtime.id} label={runtime.name} />
+                  </span>
+                  <span>
+                    <strong>
+                      {runtime.name}
+                      <small data-status={runtime.status}>{runtime.status.replace("_", " ")}</small>
+                    </strong>
+                    <code>{runtime.version ?? "Version not reported"}</code>
+                    <p>{runtime.detail}</p>
+                    <code className="runtime-executable">{runtime.command}</code>
+                  </span>
+                  <span className="runtime-row-actions">
+                    {runtime.status === "not_installed" ? (
+                      <button
+                        className="primary-button"
+                        type="button"
+                        onClick={() => void openPlanner(runtime, "install")}
+                        disabled={loadingPlan}
+                      >
+                        Install
+                      </button>
+                    ) : (
+                      <>
+                        <button
+                          className={
+                            runtime.status === "login_required"
+                              ? "primary-button"
+                              : "secondary-button"
+                          }
+                          type="button"
+                          onClick={() => void openPlanner(runtime, "login")}
+                          disabled={loadingPlan}
+                        >
+                          Sign in
+                        </button>
+                        <button
+                          className={
+                            runtime.status === "degraded" ? "primary-button" : "secondary-button"
+                          }
+                          type="button"
+                          onClick={() => void openPlanner(runtime, "update")}
+                          disabled={loadingPlan}
+                        >
+                          Update
+                        </button>
+                      </>
+                    )}
+                  </span>
+                </motion.div>
+              ))}
+            </AnimatePresence>
+          </div>
+        </section>
+        <AnimatePresence initial={false}>
+          {planner || activePlan ? (
+            <motion.div
+              className="runtime-terminal-stage"
+              key={focusedRuntime}
+              layout={!reduceMotion}
+              initial={
+                reduceMotion
+                  ? false
+                  : {
+                      opacity: 0,
+                      y: 28,
+                      scale: 0.985,
+                      filter: "blur(8px)",
+                      clipPath: "inset(0 0 16% 0 round 12px)",
+                    }
+              }
+              animate={
+                reduceMotion
+                  ? { opacity: 1 }
+                  : {
+                      opacity: 1,
+                      y: 0,
+                      scale: 1,
+                      filter: "blur(0px)",
+                      clipPath: "inset(0 0 0% 0 round 12px)",
+                      transition: {
+                        layout: { type: "spring", stiffness: 340, damping: 32, mass: 0.82 },
+                        opacity: { duration: 0.32, delay: 0.1, ease: [0.2, 0, 0, 1] },
+                        y: { type: "spring", stiffness: 290, damping: 28, mass: 0.9, delay: 0.05 },
+                        scale: { duration: 0.38, delay: 0.05, ease: [0.2, 0, 0, 1] },
+                        filter: { duration: 0.36, delay: 0.08, ease: [0.2, 0, 0, 1] },
+                        clipPath: { duration: 0.42, delay: 0.06, ease: [0.2, 0, 0, 1] },
+                      },
+                    }
+              }
+              exit={
+                reduceMotion
+                  ? { opacity: 0, transition: { duration: 0 } }
+                  : {
+                      opacity: 0,
+                      y: 16,
+                      scale: 0.99,
+                      filter: "blur(5px)",
+                      clipPath: "inset(0 0 10% 0 round 12px)",
+                      transition: { duration: 0.2, ease: [0.4, 0, 1, 1] },
+                    }
+              }
+              style={{ transformOrigin: "top center" }}
+            >
+              <AnimatePresence initial={false} mode="wait">
+                {activePlan ? (
+                  <motion.div
+                    key={`terminal-${activePlan.id}`}
+                    initial={reduceMotion ? false : { opacity: 0, y: 12, filter: "blur(4px)" }}
+                    animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                    exit={reduceMotion ? { opacity: 0 } : { opacity: 0, y: -8 }}
+                    transition={reduceMotion ? { duration: 0 } : { duration: 0.22 }}
                   >
-                    Install
-                  </button>
-                ) : (
-                  <>
-                    <button
-                      className={
-                        runtime.status === "login_required" ? "primary-button" : "secondary-button"
+                    <RuntimeSetupTerminal
+                      plan={activePlan}
+                      onClose={() => setActivePlan(null)}
+                      onExit={() =>
+                        void refresh(
+                          runtimes.find((runtime) => runtime.id === activePlan.provider)?.name,
+                        )
                       }
-                      type="button"
-                      onClick={() => void openPlanner(runtime, "login")}
-                      disabled={loadingPlan}
-                    >
-                      Sign in
-                    </button>
-                    <button
-                      className={
-                        runtime.status === "degraded" ? "primary-button" : "secondary-button"
+                    />
+                  </motion.div>
+                ) : planner ? (
+                  <motion.div
+                    key={`review-${planner.runtime.id}-${planner.kind}`}
+                    initial={reduceMotion ? false : { opacity: 0, y: 12, filter: "blur(4px)" }}
+                    animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                    exit={reduceMotion ? { opacity: 0 } : { opacity: 0, y: -8 }}
+                    transition={reduceMotion ? { duration: 0 } : { duration: 0.22 }}
+                  >
+                    <RuntimeCommandReview
+                      planner={planner}
+                      selectedPlan={selectedPlan}
+                      loading={loadingPlan}
+                      onSelectPlan={(selectedId) =>
+                        setPlanner((current) => (current ? { ...current, selectedId } : current))
                       }
-                      type="button"
-                      onClick={() => void openPlanner(runtime, "update")}
-                      disabled={loadingPlan}
-                    >
-                      Update
-                    </button>
-                  </>
-                )}
-              </span>
-            </div>
-          ))}
-        </div>
-      </section>
-      {activePlan ? (
-        <RuntimeSetupTerminal
-          plan={activePlan}
-          onClose={() => setActivePlan(null)}
-          onExit={() =>
-            void refresh(runtimes.find((runtime) => runtime.id === activePlan.provider)?.name)
-          }
-        />
-      ) : null}
+                      onCancel={cancelPlanner}
+                      onRun={startSelectedPlan}
+                    />
+                  </motion.div>
+                ) : null}
+              </AnimatePresence>
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
+      </motion.div>
       {message ? (
         <p className="settings-action-message" role="status">
           {message}
         </p>
-      ) : null}
-      {planner && selectedPlan ? (
-        <div className="runtime-action-backdrop" role="presentation">
-          <section
-            className="runtime-action-dialog"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="runtime-action-title"
-          >
-            <header>
-              <span>
-                <strong id="runtime-action-title">
-                  {planner.kind === "install"
-                    ? `Install ${planner.runtime.name}`
-                    : planner.kind === "update"
-                      ? `Update ${planner.runtime.name}`
-                      : `Sign in to ${planner.runtime.name}`}
-                </strong>
-                <small>Review the exact local command before anything runs.</small>
-              </span>
-              <button
-                className="icon-button"
-                type="button"
-                onClick={() => setPlanner(null)}
-                aria-label="Cancel runtime command"
-              >
-                ×
-              </button>
-            </header>
-            {planner.plans.length > 1 ? (
-              <fieldset className="runtime-methods">
-                <legend>Method</legend>
-                {planner.plans.map((plan) => (
-                  <label key={plan.id} data-available={plan.available}>
-                    <input
-                      type="radio"
-                      name="runtime-method"
-                      value={plan.id}
-                      checked={planner.selectedId === plan.id}
-                      disabled={!plan.available}
-                      onChange={() =>
-                        setPlanner((current) =>
-                          current ? { ...current, selectedId: plan.id } : current,
-                        )
-                      }
-                    />
-                    <span>
-                      <strong>
-                        {plan.method}
-                        {plan.recommended ? " · Recommended" : ""}
-                      </strong>
-                      <small>{plan.available ? plan.description : plan.unavailableReason}</small>
-                    </span>
-                  </label>
-                ))}
-              </fieldset>
-            ) : null}
-            <div className="runtime-command-disclosure">
-              <span>
-                <strong>Command</strong>
-                <small>{selectedPlan.method}</small>
-              </span>
-              <code>{selectedPlan.command}</code>
-              <button
-                className="icon-button"
-                type="button"
-                aria-label="Copy runtime command"
-                onClick={() => void navigator.clipboard.writeText(selectedPlan.command)}
-              >
-                <Copy aria-hidden="true" />
-              </button>
-            </div>
-            <p>{selectedPlan.environmentNote}</p>
-            {selectedPlan.downloadsAndExecutesCode ? (
-              <p className="runtime-action-warning">
-                <TriangleAlert aria-hidden="true" /> This command downloads and executes vendor code
-                and may replace files outside your projects.
-              </p>
-            ) : null}
-            <div className="runtime-action-source">
-              <button
-                className="text-button"
-                type="button"
-                disabled={!selectedPlan.sourceUrl}
-                onClick={() => void openExternalLink(selectedPlan.sourceUrl)}
-              >
-                <ExternalLink aria-hidden="true" /> Vendor documentation
-              </button>
-            </div>
-            <footer>
-              <button className="secondary-button" type="button" onClick={() => setPlanner(null)}>
-                Cancel
-              </button>
-              <button
-                className="primary-button"
-                type="button"
-                disabled={!selectedPlan.available}
-                onClick={startSelectedPlan}
-              >
-                {loadingPlan ? <LoaderCircle className="spin-slow" aria-hidden="true" /> : null}
-                Run this command
-              </button>
-            </footer>
-          </section>
-        </div>
       ) : null}
     </>
   );
@@ -1563,16 +1749,22 @@ function ModelsSettings({
     ? configuredRuntime
     : (runtimes[0]?.id ?? "codex");
   const selectedRuntime = runtimes.find((runtime) => runtime.id === runtimeId);
-  const fallbackCatalog = selectedRuntime?.models.map((id) => ({ id, label: id })) ?? [];
-  const catalog = catalogs[runtimeId] ?? fallbackCatalog;
+  const fallbackCatalog =
+    selectedRuntime?.models
+      .filter((id) => id !== "Provider default")
+      .map((id) => ({ id, label: id })) ?? [];
+  const catalogLoaded = Object.hasOwn(catalogs, runtimeId);
+  const catalog = (catalogs[runtimeId] ?? fallbackCatalog).filter(
+    (entry) => entry.id !== "Provider default",
+  );
   const configuredModel = readSetting(
     settings,
     "models.defaultModel",
-    catalog[0]?.id ?? "Provider default",
+    catalog[0]?.id ?? "",
   ) as string;
   const selectedModel = catalog.some((entry) => entry.id === configuredModel)
     ? configuredModel
-    : (catalog[0]?.id ?? configuredModel);
+    : (catalog[0]?.id ?? "");
   const selectedEntry = catalog.find((entry) => entry.id === selectedModel);
   const effortOptions = selectedEntry?.efforts ?? [];
   const configuredEffort = readSetting<string | undefined>(
@@ -1584,12 +1776,17 @@ function ModelsSettings({
   const runtimeWarning = runtimeAuthWarning(selectedRuntime);
 
   useEffect(() => {
+    if (!selectedModel || configuredModel === selectedModel) return;
+    setSetting("models.defaultModel", selectedModel);
+  }, [configuredModel, selectedModel, setSetting]);
+
+  useEffect(() => {
     if (catalogs[runtimeId]) return;
     let active = true;
     void bridge
       .listModelCatalog(runtimeId)
       .then((entries) => {
-        if (active && entries.length > 0) {
+        if (active) {
           setCatalogs((current) => ({ ...current, [runtimeId]: entries }));
         }
       })
@@ -1663,10 +1860,17 @@ function ModelsSettings({
               const nextEffort = resolveModelEffort(nextEntry, configuredEffort);
               if (nextEffort) setSetting("models.defaultEffort", nextEffort);
             }}
-            options={(catalog.length > 0
-              ? catalog
-              : [{ id: "Provider default", label: "Provider default" }]
-            ).map((entry) => ({ value: entry.id, label: entry.label }))}
+            options={
+              catalog.length > 0
+                ? catalog.map((entry) => ({ value: entry.id, label: entry.label }))
+                : [
+                    {
+                      value: "",
+                      label: catalogLoaded ? "Model unavailable" : "Checking model…",
+                      disabled: true,
+                    },
+                  ]
+            }
           />
         </SettingRow>
         <SettingRow

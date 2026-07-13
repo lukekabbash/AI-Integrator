@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { Composer } from "./components/Composer";
 import {
   composerNoticeExpiry,
+  isRuntimeHealthError,
   isRuntimeUpdateRequired,
   usageResetAtFromMessage,
   type ComposerNotice,
@@ -71,6 +72,13 @@ describe("runtime update notices", () => {
       isRuntimeUpdateRequired("Claude CLI is out of date. Update to the latest version."),
     ).toBe(true);
     expect(isRuntimeUpdateRequired("The provider process exited unexpectedly.")).toBe(false);
+  });
+
+  it("distinguishes probe-recoverable provider failures from unrelated turn errors", () => {
+    expect(isRuntimeHealthError("Codex is not connected for this task")).toBe(true);
+    expect(isRuntimeHealthError("Transport closed while reading from Claude")).toBe(true);
+    expect(isRuntimeHealthError("This model requires a newer version of Codex.")).toBe(true);
+    expect(isRuntimeHealthError("The requested file does not exist")).toBe(false);
   });
 });
 

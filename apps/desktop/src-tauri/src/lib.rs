@@ -89,6 +89,7 @@ pub fn run() {
             project_file_opener_list,
             project_file_open,
             project_file_reveal,
+            attachment_preview,
             git_status,
             git_overview,
             git_history,

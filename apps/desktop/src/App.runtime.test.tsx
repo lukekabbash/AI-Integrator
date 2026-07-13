@@ -701,6 +701,82 @@ describe("native runtime recovery UI", () => {
     expect(dialog).toHaveTextContent("Review the exact local command before anything runs");
   });
 
+  it("clears stale provider errors and disconnect notices after a successful re-check", async () => {
+    bridgeMock.listRuntimeActionPlans.mockResolvedValue([
+      {
+        id: "codex:update:vendor-cli",
+        provider: "codex",
+        kind: "update",
+        method: "Vendor CLI",
+        label: "Update with the installed CLI",
+        command: "/opt/homebrew/bin/codex update",
+        description: "Runs the exact installed vendor CLI.",
+        sourceUrl: "https://developers.openai.com/codex/cli",
+        available: true,
+        recommended: true,
+        downloadsAndExecutesCode: true,
+        modifiesOutsideProjects: true,
+        environmentNote: "Runs locally with a reduced environment.",
+      },
+    ]);
+
+    render(<App />);
+    await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
+
+    act(() => {
+      runtimeListener?.(
+        projection(10, {
+          kind: "connectionChanged",
+          state: "disconnected",
+          reason: "Codex is not connected",
+        }),
+      );
+      runtimeListener?.(
+        projection(11, {
+          kind: "turnError",
+          message:
+            "'gpt-5.6-luna' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.",
+          retryable: false,
+        }),
+      );
+    });
+
+    expect(await screen.findByText("Codex is disconnected")).toBeVisible();
+    fireEvent.click(await screen.findByRole("button", { name: "Update Codex" }));
+    await screen.findByRole("dialog", { name: "Update Codex" });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel runtime command" }));
+
+    bridgeMock.probeRuntimes.mockResolvedValueOnce([
+      {
+        id: "codex",
+        name: "Codex",
+        command: "/opt/homebrew/bin/codex",
+        version: "codex-cli 0.140.0",
+        status: "connected",
+        fidelity: "native",
+        models: ["gpt-5.6-luna"],
+        detail: "Ready.",
+      },
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "Check all" }));
+    await screen.findByText("Runtime status refreshed.");
+    fireEvent.click(screen.getByRole("button", { name: /Back to workspace/i }));
+
+    expect(screen.queryByText("Codex is disconnected")).not.toBeInTheDocument();
+    expect(screen.queryByText(/requires a newer version of Codex/i)).not.toBeInTheDocument();
+
+    act(() => {
+      runtimeListener?.(
+        projection(12, {
+          kind: "connectionChanged",
+          state: "disconnected",
+          reason: "Provider process exited after verification",
+        }),
+      );
+    });
+    expect(await screen.findByText("Codex is disconnected")).toBeVisible();
+  });
+
   it("allows stale approval operation errors to be dismissed", async () => {
     bridgeMock.respondToApproval.mockRejectedValueOnce(
       new Error("approval belongs to an expired provider process"),

@@ -22,7 +22,8 @@ children can ask questions of / report to the orchestrator.
 │  · child tools: orchestrator_ask, orchestrator_report,│
 │    task_complete                                     │
 │ Child runtimes: HashMap<delegation_id, ChildRuntime> │
-│  (structured CLI for claude/agy, app-server for codex)│
+│  (structured CLI for claude/agy, app-server for      │
+│   codex, ACP for cursor/grok)                        │
 └──────────────▲───────────────────────────────────────┘
                │ line-delimited JSON-RPC + token
 ┌──────────────┴──────────────┐
@@ -101,14 +102,26 @@ sidebar.
 | Provider    | As orchestrator (tools)         | As child target                                                                         |
 | ----------- | ------------------------------- | --------------------------------------------------------------------------------------- |
 | Claude      | yes (`--mcp-config`)            | yes (child tools too)                                                                   |
-| Cursor      | yes (ACP `mcpServers`)          | no (deferred)                                                                           |
+| Cursor      | yes (ACP `mcpServers`)          | yes (child tools via ACP `mcpServers`; Agent mode pinned; unattended auto-allow)        |
 | Codex       | no (deferred: config injection) | yes (approval policy `never`, no child tools — results captured from transcript digest) |
 | Antigravity | no                              | yes (no child tools)                                                                    |
-| Grok        | no                              | no                                                                                      |
+| Grok        | no                              | yes (no child tools; unattended auto-allow)                                             |
 
 Children without child tools still receive nudges (injected as turns) and
 still produce results (digest capture on completion); they just can't ask
 questions mid-flight.
+
+ACP children (Cursor/Grok) run one long-lived agent process per child
+session. `session/prompt` resolves at turn end, so the delegation settles
+from the prompt future itself rather than a watcher. Because no one watches
+a child's approvals, the ACP pump answers `session/request_permission`
+immediately (narrowest allow option; cancel if the request advertises no
+allow) and auto-accepts `cursor/create_plan` — the ACP analog of the Codex
+child's approval policy `never`. Cursor children are pinned to the Agent
+session mode so a brief executes instead of being planned or answered
+read-only, and profile model/effort pins apply through the stable
+`session/set_config_option` surface (effort via the Cursor model-list
+extension); values the agent does not advertise are dropped, never failed.
 
 ## Persistence (migration 6)
 
@@ -149,6 +162,6 @@ questions mid-flight.
 
 ## Deferred (explicitly out of v1)
 
-Cursor/Grok children; Codex/agy orchestrator tool injection; per-delegation
-worktree leases; mid-session MCP hot-attach; cross-repo delegation; token
-budget metering per delegation.
+Codex/agy orchestrator tool injection; per-delegation worktree leases;
+mid-session MCP hot-attach; cross-repo delegation; token budget metering per
+delegation. (Cursor/Grok children shipped post-v1 — see the support matrix.)

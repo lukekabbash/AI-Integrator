@@ -30,7 +30,7 @@ use integrator_core::{
 use integrator_runtime::{
     ProjectionMutation, ReducedProviderEvent, StructuredCliEventKind, StructuredCliLaunchOptions,
     StructuredCliProvider, StructuredPermissionMode, acp_turn_projection, discover_providers,
-    provider_executable, redact_and_bound,
+    parse_acp_mode_state, provider_executable, redact_and_bound,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -42,7 +42,7 @@ use tokio::{
 };
 
 use crate::state::{
-    AppState, CodexRuntime, DelegationChild, DelegationChildDriver, StructuredRuntime,
+    AcpRuntime, AppState, CodexRuntime, DelegationChild, DelegationChildDriver, StructuredRuntime,
 };
 
 pub const DELEGATION_UPDATE_EVENT: &str = "delegation://update";
@@ -135,6 +135,28 @@ fn default_profiles() -> Vec<DelegationProfile> {
             instruction: None,
             preferred_child_profile_ids: Vec::new(),
             cost_tier: "medium".into(),
+            enabled: true,
+        },
+        DelegationProfile {
+            id: "cursor-default".into(),
+            label: "Cursor".into(),
+            runtime: "cursor".into(),
+            model: None,
+            effort: None,
+            instruction: None,
+            preferred_child_profile_ids: Vec::new(),
+            cost_tier: "medium".into(),
+            enabled: true,
+        },
+        DelegationProfile {
+            id: "grok-default".into(),
+            label: "Grok Build".into(),
+            runtime: "grok".into(),
+            model: None,
+            effort: None,
+            instruction: None,
+            preferred_child_profile_ids: Vec::new(),
+            cost_tier: "low".into(),
             enabled: true,
         },
     ]
@@ -887,6 +909,36 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
             ));
             spawn_codex_child(&app, &delegation, child_task.id, executable, cwd).await?
         }
+        ProviderKind::Cursor | ProviderKind::Grok => {
+            // Cursor accepts broker tools through ACP `session/new`
+            // `mcpServers`; Grok has no injection surface, so its results
+            // come from the transcript digest like Antigravity's.
+            let mcp_server = match (&broker, provider) {
+                (Some(info), ProviderKind::Cursor) => Some(acp_mcp_server_entry(
+                    info,
+                    "child",
+                    &delegation_id.to_string(),
+                    "off",
+                )?),
+                _ => None,
+            };
+            first_prompt.push_str(&child_preamble(
+                &delegation,
+                mcp_server.is_some(),
+                profile,
+                &preferred_children,
+            ));
+            spawn_acp_child(
+                &app,
+                &delegation,
+                child_task.id,
+                provider,
+                executable,
+                cwd,
+                mcp_server,
+            )
+            .await?
+        }
         other => {
             let _ = state
                 .store
@@ -966,6 +1018,27 @@ async fn respawn_existing_child(
         }
         ProviderKind::Codex => {
             spawn_codex_child(app, delegation, child_task_id, executable, cwd).await?
+        }
+        ProviderKind::Cursor | ProviderKind::Grok => {
+            let mcp_server = match (&broker, provider) {
+                (Some(info), ProviderKind::Cursor) => Some(acp_mcp_server_entry(
+                    info,
+                    "child",
+                    &delegation.id.to_string(),
+                    "off",
+                )?),
+                _ => None,
+            };
+            spawn_acp_child(
+                app,
+                delegation,
+                child_task_id,
+                provider,
+                executable,
+                cwd,
+                mcp_server,
+            )
+            .await?
         }
         other => {
             return Err(IntegratorError::InvalidInput(format!(
@@ -1098,6 +1171,250 @@ async fn spawn_codex_child(
     Ok(child)
 }
 
+/// The mode a delegated ACP child must run in: agents that advertise session
+/// modes (Cursor: Agent/Plan/Ask) could otherwise start in whatever mode the
+/// user's CLI last used, leaving a brief planned or answered read-only
+/// instead of executed. Returns `None` when no switch is needed.
+fn acp_agent_mode_target(response: &Value) -> Option<String> {
+    let modes = parse_acp_mode_state(response)?;
+    let target = modes.available_modes.iter().find(|mode| {
+        mode.id.eq_ignore_ascii_case("agent") || mode.name.eq_ignore_ascii_case("agent")
+    })?;
+    (target.id != modes.current_mode_id).then(|| target.id.clone())
+}
+
+/// Find a stable ACP config option by category (with id fallbacks) in a
+/// `session/new` response and flatten its advertised values.
+fn acp_session_config(
+    response: &Value,
+    category: &str,
+    id_fallbacks: &[&str],
+) -> Option<(String, Vec<String>)> {
+    let options = response
+        .get("configOptions")
+        .or_else(|| {
+            response
+                .get("session")
+                .and_then(|session| session.get("configOptions"))
+        })?
+        .as_array()?;
+    let option = options
+        .iter()
+        .find(|option| option.get("category").and_then(Value::as_str) == Some(category))
+        .or_else(|| {
+            options.iter().find(|option| {
+                option
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id_fallbacks.contains(&id))
+            })
+        })?;
+    let id = option.get("id").and_then(Value::as_str)?.to_owned();
+    let mut values = Vec::new();
+    collect_acp_config_values(option.get("options"), &mut values);
+    Some((id, values))
+}
+
+/// ACP config values may nest (groups carry their own `options` arrays).
+fn collect_acp_config_values(value: Option<&Value>, into: &mut Vec<String>) {
+    let Some(entries) = value.and_then(Value::as_array) else {
+        return;
+    };
+    for entry in entries {
+        if let Some(value) = entry.get("value").and_then(Value::as_str) {
+            if !value.is_empty() {
+                into.push(value.to_owned());
+            }
+            continue;
+        }
+        collect_acp_config_values(entry.get("options"), into);
+    }
+}
+
+/// A profile model id resolved against the session's advertised values.
+/// Session catalog ids may be bracketed ("gpt-5.5[reasoning=medium]"), so a
+/// plain profile id also matches its bracket-free prefix.
+fn resolve_acp_model<'a>(values: &'a [String], model: &str) -> Option<&'a str> {
+    values
+        .iter()
+        .find(|value| value.as_str() == model || value.split('[').next() == Some(model))
+        .map(String::as_str)
+}
+
+/// Best-effort model/effort pinning for ACP children, mirroring the
+/// composer's Cursor selection flow. A value the agent does not advertise is
+/// dropped — a stale profile can never fail a delegated turn.
+async fn apply_acp_child_routing(
+    client: &adapter_acp::AcpClient,
+    provider: ProviderKind,
+    session_id: &str,
+    session_response: &Value,
+    model: Option<&str>,
+    effort: Option<&str>,
+) {
+    let Some(model) = model else { return };
+    let Some((config_id, values)) =
+        acp_session_config(session_response, "model", &["model", "models"])
+    else {
+        return;
+    };
+    let Some(resolved) = resolve_acp_model(&values, model) else {
+        return;
+    };
+    let resolved = resolved.to_owned();
+    if client
+        .set_config_option(session_id, &config_id, &resolved)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let Some(effort) = effort else { return };
+    if provider != ProviderKind::Cursor {
+        return;
+    }
+    // Thought level is per-model and only discoverable through the Cursor
+    // extension RPC; older builds without it keep the model's own default.
+    let Ok(models) = client.list_cursor_models().await else {
+        return;
+    };
+    let plain_model = resolved.split('[').next().unwrap_or(&resolved);
+    if let Some((config_id, values)) = cursor_effort_config(&models, plain_model)
+        && values.iter().any(|value| value == effort)
+    {
+        let _ = client
+            .set_config_option(session_id, &config_id, effort)
+            .await;
+    }
+}
+
+/// The thought-level config option id and values for one model in a
+/// `cursor/list_available_models` response.
+fn cursor_effort_config(response: &Value, model: &str) -> Option<(String, Vec<String>)> {
+    let entry = response
+        .get("models")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("value").and_then(Value::as_str) == Some(model))?;
+    let options = entry.get("configOptions")?.as_array()?;
+    let thought: Vec<&Value> = options
+        .iter()
+        .filter(|option| option.get("category").and_then(Value::as_str) == Some("thought_level"))
+        .collect();
+    let option = thought
+        .iter()
+        .find(|option| {
+            matches!(
+                option.get("id").and_then(Value::as_str),
+                Some("effort" | "reasoning")
+            )
+        })
+        .or_else(|| {
+            thought.iter().find(|option| {
+                let mut values = Vec::new();
+                collect_acp_config_values(option.get("options"), &mut values);
+                values.len() > 2
+            })
+        })?;
+    let id = option.get("id").and_then(Value::as_str)?.to_owned();
+    let mut values = Vec::new();
+    collect_acp_config_values(option.get("options"), &mut values);
+    Some((id, values))
+}
+
+async fn spawn_acp_child(
+    app: &AppHandle<tauri::Wry>,
+    delegation: &Delegation,
+    child_task_id: TaskId,
+    provider: ProviderKind,
+    executable: PathBuf,
+    cwd: PathBuf,
+    mcp_server: Option<Value>,
+) -> Result<DelegationChild> {
+    let state = app.state::<AppState>();
+    let arguments = crate::commands::acp_launch_arguments(&provider)
+        .map_err(|error| IntegratorError::InvalidInput(error.message))?;
+    let client = adapter_acp::AcpClient::spawn(adapter_acp::AcpLaunchOptions {
+        executable,
+        arguments,
+        working_directory: Some(cwd.clone()),
+        client_version: env!("CARGO_PKG_VERSION").into(),
+    })
+    .await?;
+    if let Err(error) = crate::commands::authenticate_acp_provider(&client, &provider).await {
+        let _ = client.shutdown().await;
+        return Err(IntegratorError::Unavailable(error.message));
+    }
+    let response = match client
+        .new_session(&cwd, mcp_server.into_iter().collect())
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = client.shutdown().await;
+            return Err(error);
+        }
+    };
+    let Some(session_id) = response
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        let _ = client.shutdown().await;
+        return Err(IntegratorError::Unavailable(format!(
+            "{} did not return a session identifier",
+            provider.as_str()
+        )));
+    };
+    if let Some(mode_id) = acp_agent_mode_target(&response) {
+        let _ = client.set_mode(&session_id, &mode_id).await;
+    }
+    apply_acp_child_routing(
+        &client,
+        provider,
+        &session_id,
+        &response,
+        delegation.model.as_deref(),
+        delegation.effort.as_deref(),
+    )
+    .await;
+    let process_id = uuid::Uuid::new_v4().to_string();
+    let binding = state
+        .store
+        .create_runtime_binding(child_task_id, &process_id, provider)?;
+    let binding = state.store.attach_provider_thread(&binding, &session_id)?;
+    state
+        .store
+        .set_delegation_session_ref(delegation.id, &session_id)?;
+    let runtime = AcpRuntime {
+        client: client.clone(),
+        provider,
+        process_id,
+        alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        binding: Arc::new(std::sync::Mutex::new(Some(binding))),
+        current_turn: Arc::new(std::sync::Mutex::new(None)),
+        permission_options: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        session_modes: Arc::new(std::sync::Mutex::new(parse_acp_mode_state(&response))),
+        plan_requests: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        available_actions: Arc::new(std::sync::Mutex::new(Vec::new())),
+        context_primer: Arc::new(std::sync::Mutex::new(None)),
+        delegation_preamble: Arc::new(std::sync::Mutex::new(None)),
+        unattended: true,
+    };
+    crate::commands::spawn_acp_pump(app.clone(), Arc::clone(&state.store), runtime.clone());
+    Ok(DelegationChild {
+        delegation_id: delegation.id,
+        child_task_id,
+        parent_task_id: delegation.parent_task_id,
+        busy: Arc::new(std::sync::Mutex::new(false)),
+        completed: Arc::new(std::sync::Mutex::new(false)),
+        driver: DelegationChildDriver::Acp {
+            runtime,
+            session_id,
+        },
+    })
+}
+
 /// Starts (or resumes) one child turn with the given wire prompt, recording
 /// synthetic user/turn projections for structured providers so the child's
 /// transcript shows what was injected.
@@ -1141,6 +1458,69 @@ async fn start_child_turn(
             }
             DelegationChildDriver::Codex { runtime, thread_id } => {
                 runtime.client.start_turn(thread_id, &prompt).await?;
+            }
+            DelegationChildDriver::Acp {
+                runtime,
+                session_id,
+            } => {
+                // `session/prompt` resolves when the turn finishes, so the
+                // turn runs on a background task and settles the delegation
+                // itself — there is no separate watcher for ACP children.
+                let turn_id = uuid::Uuid::new_v4().to_string();
+                *runtime.current_turn.lock().expect("turn lock") = Some(turn_id.clone());
+                let started_at = Utc::now();
+                if let Some(binding) = runtime.binding.lock().expect("binding lock").clone() {
+                    emit_child_turn_started(app, &binding, &turn_id, &prompt);
+                }
+                let app = app.clone();
+                let runtime = runtime.clone();
+                let session_id = session_id.clone();
+                let delegation_id = child.delegation_id;
+                let child_identity = Arc::clone(&child.busy);
+                tauri::async_runtime::spawn(async move {
+                    let outcome = runtime.client.prompt(&session_id, &prompt).await;
+                    let now = Utc::now();
+                    let (status, error, failed) = match &outcome {
+                        Ok(response) => match adapter_acp::StopReason::from_protocol(response) {
+                            adapter_acp::StopReason::Cancelled => {
+                                (TurnStatus::Interrupted, None, false)
+                            }
+                            adapter_acp::StopReason::Refusal => (
+                                TurnStatus::Failed,
+                                Some("The agent refused the turn".to_owned()),
+                                true,
+                            ),
+                            _ => (TurnStatus::Completed, None, false),
+                        },
+                        Err(error) => (TurnStatus::Failed, Some(error.to_string()), true),
+                    };
+                    let binding = runtime.binding.lock().expect("binding lock").clone();
+                    if let Some(binding) = binding
+                        && let Some(thread_id) = binding.thread_id.clone()
+                    {
+                        let mut turn =
+                            acp_turn_projection(&turn_id, status, error, started_at, now);
+                        turn.stop_requested = false;
+                        let finished = ReducedProviderEvent {
+                            method: "client/delegation/turnFinished".into(),
+                            thread_id,
+                            turn_id: Some(turn_id.clone()),
+                            audit_json: "{}".into(),
+                            audit_truncated: false,
+                            mutation: ProjectionMutation::Turn(turn),
+                            occurred_at: now,
+                        };
+                        let state = app.state::<AppState>();
+                        crate::commands::apply_and_emit(&app, &state.store, &binding, &finished);
+                    }
+                    {
+                        let mut current = runtime.current_turn.lock().expect("turn lock");
+                        if current.as_deref() == Some(turn_id.as_str()) {
+                            *current = None;
+                        }
+                    }
+                    child_turn_settled(app, delegation_id, failed, &child_identity).await;
+                });
             }
         }
         Ok(())
@@ -1221,7 +1601,7 @@ fn watch_structured_child(
     let child_identity = Arc::clone(&child.busy);
     let session_ref = match &child.driver {
         DelegationChildDriver::Structured { session_ref, .. } => Arc::clone(session_ref),
-        DelegationChildDriver::Codex { .. } => return,
+        DelegationChildDriver::Codex { .. } | DelegationChildDriver::Acp { .. } => return,
     };
     let mut receiver = client.subscribe();
     tauri::async_runtime::spawn(async move {
@@ -1288,7 +1668,24 @@ fn watch_codex_child(
 /// The delegation state machine tick that runs whenever a child turn ends:
 /// deliver queued orchestrator/user messages as the next turn, otherwise go
 /// idle (`waiting`), or settle terminal states.
-async fn child_turn_settled(
+///
+/// Boxed rather than `async fn`: ACP children settle from inside
+/// `start_child_turn`'s own spawned task, so this future is recursive
+/// (settle → deliver queued → start turn → settle) and needs type erasure
+/// for the compiler to prove it `Send`.
+fn child_turn_settled(
+    app: AppHandle<tauri::Wry>,
+    delegation_id: DelegationId,
+    failed: bool,
+    child_identity: &Arc<std::sync::Mutex<bool>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    let child_identity = Arc::clone(child_identity);
+    Box::pin(async move {
+        child_turn_settled_inner(app, delegation_id, failed, &child_identity).await;
+    })
+}
+
+async fn child_turn_settled_inner(
     app: AppHandle<tauri::Wry>,
     delegation_id: DelegationId,
     failed: bool,
@@ -1432,10 +1829,14 @@ pub async fn queue_message_to_child(
         let provider = ProviderKind::from_str(&route.runtime)?;
         if !matches!(
             provider,
-            ProviderKind::Codex | ProviderKind::Claude | ProviderKind::Antigravity
+            ProviderKind::Codex
+                | ProviderKind::Claude
+                | ProviderKind::Antigravity
+                | ProviderKind::Cursor
+                | ProviderKind::Grok
         ) {
             return Err(IntegratorError::InvalidInput(format!(
-                "{} is not a supported delegation target in v1",
+                "{} is not a supported delegation target",
                 provider.as_str()
             )));
         }
@@ -1490,11 +1891,18 @@ pub async fn queue_message_to_child(
             .lock()
             .await
             .remove(&delegation_id.to_string());
-        if let Some(previous) = previous
-            && let DelegationChildDriver::Codex { runtime, .. } = &previous.driver
-        {
-            let _ = state.store.expire_process_approvals(&runtime.process_id);
-            let _ = runtime.client.shutdown().await;
+        if let Some(previous) = previous {
+            match &previous.driver {
+                DelegationChildDriver::Codex { runtime, .. } => {
+                    let _ = state.store.expire_process_approvals(&runtime.process_id);
+                    let _ = runtime.client.shutdown().await;
+                }
+                DelegationChildDriver::Acp { runtime, .. } => {
+                    let _ = state.store.expire_process_approvals(&runtime.process_id);
+                    let _ = runtime.client.shutdown().await;
+                }
+                DelegationChildDriver::Structured { .. } => {}
+            }
         }
         let child = match respawn_existing_child(app, &delegation).await {
             Ok(child) => child,
@@ -1566,6 +1974,17 @@ pub async fn stop_delegation(
                 }
             }
             DelegationChildDriver::Codex { runtime, .. } => {
+                let _ = state.store.expire_process_approvals(&runtime.process_id);
+                let _ = runtime.client.shutdown().await;
+            }
+            DelegationChildDriver::Acp {
+                runtime,
+                session_id,
+            } => {
+                // Cancel first so the in-flight prompt resolves as
+                // `cancelled` rather than a transport error, then drop the
+                // process — a reopened delegation respawns a fresh session.
+                let _ = runtime.client.cancel(session_id).await;
                 let _ = state.store.expire_process_approvals(&runtime.process_id);
                 let _ = runtime.client.shutdown().await;
             }
@@ -1761,6 +2180,92 @@ mod tests {
         assert!(profiles.iter().any(|profile| profile.runtime == "codex"));
         profiles.sort_by_key(|profile| cost_rank(&profile.cost_tier));
         assert_eq!(profiles.first().map(|p| p.cost_tier.as_str()), Some("low"));
+    }
+
+    #[test]
+    fn default_profiles_cover_every_supported_child_runtime() {
+        let store = LocalStore::open_in_memory().expect("store");
+        let profiles = delegation_profiles(&store);
+        for runtime in ["codex", "claude", "antigravity", "cursor", "grok"] {
+            assert!(
+                profiles.iter().any(|profile| profile.runtime == runtime),
+                "missing built-in profile for {runtime}"
+            );
+        }
+    }
+
+    #[test]
+    fn acp_children_pin_the_agent_mode_only_when_needed() {
+        let planning = json!({
+            "sessionId": "session-1",
+            "modes": {
+                "currentModeId": "plan",
+                "availableModes": [
+                    { "id": "agent", "name": "Agent" },
+                    { "id": "plan", "name": "Plan" },
+                    { "id": "ask", "name": "Ask" }
+                ]
+            }
+        });
+        assert_eq!(acp_agent_mode_target(&planning), Some("agent".into()));
+
+        let already_agent = json!({
+            "modes": {
+                "currentModeId": "agent",
+                "availableModes": [{ "id": "agent", "name": "Agent" }]
+            }
+        });
+        assert_eq!(acp_agent_mode_target(&already_agent), None);
+        // Agents without session modes (Grok) skip the pin entirely.
+        assert_eq!(
+            acp_agent_mode_target(&json!({ "sessionId": "session-1" })),
+            None
+        );
+    }
+
+    #[test]
+    fn acp_model_config_resolves_bracketed_session_values() {
+        let response = json!({
+            "configOptions": [
+                { "id": "model", "category": "model", "options": [
+                    { "name": "Frontier", "options": [
+                        { "value": "gpt-5.5[reasoning=medium]", "name": "GPT-5.5" }
+                    ]},
+                    { "value": "composer-2.5", "name": "Composer" }
+                ]}
+            ]
+        });
+        let (config_id, values) =
+            acp_session_config(&response, "model", &["model", "models"]).expect("model option");
+        assert_eq!(config_id, "model");
+        assert_eq!(
+            resolve_acp_model(&values, "gpt-5.5"),
+            Some("gpt-5.5[reasoning=medium]")
+        );
+        assert_eq!(
+            resolve_acp_model(&values, "composer-2.5"),
+            Some("composer-2.5")
+        );
+        assert_eq!(resolve_acp_model(&values, "missing"), None);
+    }
+
+    #[test]
+    fn cursor_effort_config_is_per_model() {
+        let response = json!({
+            "models": [
+                { "value": "gpt-5.5", "configOptions": [
+                    { "id": "effort", "category": "thought_level", "currentValue": "medium",
+                      "options": [
+                        { "value": "low" }, { "value": "medium" }, { "value": "high" }
+                    ]}
+                ]}
+            ]
+        });
+        let (config_id, values) =
+            cursor_effort_config(&response, "gpt-5.5").expect("effort option");
+        assert_eq!(config_id, "effort");
+        assert!(values.iter().any(|value| value == "high"));
+        assert!(cursor_effort_config(&response, "other-model").is_none());
     }
 
     #[test]

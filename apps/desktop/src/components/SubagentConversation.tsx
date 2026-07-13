@@ -1,4 +1,5 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { AnimatePresence } from "motion/react";
 import { CircleStop, PanelRightClose, PanelRightOpen, TerminalSquare, X } from "lucide-react";
 import {
   bridge,
@@ -17,6 +18,7 @@ import {
 } from "../runtimeProjection";
 import { Composer } from "./Composer";
 import { ConversationHeader } from "./ConversationHeader";
+import { TaskStatusPill } from "./TaskStatusPill";
 import { formatCompactTokenCount } from "./conversationFormatting";
 import { Dropdown } from "./Dropdown";
 
@@ -29,6 +31,8 @@ interface SubagentConversationProps {
   delegation: DelegationView;
   runtimes: RuntimeConnection[];
   contextFiles?: string[];
+  /** Requests the bounded project scan the first time an @-token is typed. */
+  onRequestContextFiles?: () => void;
   enterToSend?: boolean;
   rightRailOpen?: boolean;
   terminalOpen?: boolean;
@@ -55,6 +59,7 @@ export function SubagentConversation({
   delegation,
   runtimes,
   contextFiles,
+  onRequestContextFiles,
   enterToSend,
   rightRailOpen = true,
   terminalOpen = false,
@@ -81,7 +86,7 @@ export function SubagentConversation({
   const [optimisticMessages, setOptimisticMessages] = useState<TranscriptEvent[]>([]);
   const [selectedRouting, setSelectedRouting] = useState<DelegationRouting>({
     runtime: delegation.runtime as DelegationRouting["runtime"],
-    model: delegation.model || "Provider default",
+    model: delegation.model || "",
     effort: delegation.effort ?? undefined,
   });
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -195,7 +200,7 @@ export function SubagentConversation({
     delegation.status !== "starting",
   );
   const supportedRuntimes = runtimes.filter((runtime) =>
-    ["codex", "claude", "antigravity"].includes(runtime.id),
+    ["codex", "claude", "antigravity", "cursor", "grok"].includes(runtime.id),
   );
   const reviewFile = git?.files.find((file) => file.path === reviewFilePath) ?? git?.files[0];
   const totalTokens = projection?.usage?.totalTokens ?? 0;
@@ -398,8 +403,6 @@ export function SubagentConversation({
                 <Transcript
                   events={events}
                   running={turnRunning}
-                  runningSince={projection?.turn?.startedAt}
-                  usage={projection?.usage}
                   scrollContainerRef={scrollRef}
                   modelForEvent={() => selectedRouting.model || delegation.profileLabel}
                 />
@@ -408,6 +411,15 @@ export function SubagentConversation({
               <div className="subagent-conversation-empty">No transcript events yet.</div>
             )}
           </div>
+          <AnimatePresence initial={false}>
+            {turnRunning ? (
+              <TaskStatusPill
+                key="subagent-status-pill"
+                runningSince={projection?.turn?.startedAt}
+                usage={projection?.usage}
+              />
+            ) : null}
+          </AnimatePresence>
           {canMessage ? (
             <div className="subagent-composer-wrap">
               {actionError ? (
@@ -425,6 +437,7 @@ export function SubagentConversation({
                 defaultDelegation="off"
                 enterToSend={enterToSend}
                 contextFiles={contextFiles}
+                onRequestContextFiles={onRequestContextFiles}
                 running={turnRunning}
                 stopping={stopping}
                 onStop={() => void stop()}

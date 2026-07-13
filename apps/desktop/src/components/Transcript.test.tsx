@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TranscriptEvent } from "../bridge";
 import { Transcript } from "./Transcript";
@@ -288,11 +288,7 @@ describe("Transcript", () => {
   it("keeps the active run status compact while the response arrives", () => {
     const runningSince = "2026-07-11T12:01:00.000Z";
     const { rerender } = render(
-      <Transcript
-        events={[event("user-1", "user", "Start the task")]}
-        running
-        runningSince={runningSince}
-      />,
+      <Transcript events={[event("user-1", "user", "Start the task")]} running />,
     );
 
     expect(screen.getByText("Thinking…")).toBeInTheDocument();
@@ -306,14 +302,13 @@ describe("Transcript", () => {
           },
         ]}
         running
-        runningSince={runningSince}
       />,
     );
 
     expect(screen.getByText("Thinking…")).toBeInTheDocument();
   });
 
-  it("shows the current command, live tokens, and agent count", () => {
+  it("shows the current command in the live narration line", () => {
     render(
       <Transcript
         events={[
@@ -326,21 +321,10 @@ describe("Transcript", () => {
           },
         ]}
         running
-        runningSince="2026-07-11T12:00:00.000Z"
-        usage={{
-          inputTokens: 100,
-          cachedInputTokens: 0,
-          outputTokens: 384,
-          reasoningOutputTokens: 0,
-          totalTokens: 784,
-        }}
-        activeAgentCount={1}
       />,
     );
 
     expect(screen.getByText("Working on pnpm test")).toBeInTheDocument();
-    expect(screen.getByText("784 tokens")).toBeInTheDocument();
-    expect(screen.getByText("1 agent")).toBeInTheDocument();
   });
 
   it("moves a trailing activity batch into the single live status row", () => {
@@ -365,16 +349,25 @@ describe("Transcript", () => {
           },
         ]}
         running
-        runningSince="2026-07-11T12:00:00.000Z"
       />,
     );
 
-    expect(screen.queryByRole("button", { name: /Activity.*3 tools/ })).not.toBeInTheDocument();
+    // The batch renders only inside the live status row, not as its own
+    // transcript entry.
+    expect(document.querySelectorAll(".activity-event--group")).toHaveLength(0);
     expect(screen.getByText("Activity")).toBeInTheDocument();
     expect(screen.getByText("3 tools")).toBeInTheDocument();
     expect(document.querySelector(".task-now-current")).toHaveTextContent(
       "Working on Tool call · Tool activity",
     );
+
+    // Opening the live row streams the batch's children as activity rows.
+    fireEvent.click(screen.getByRole("button", { name: /Activity.*3 tools/ }));
+    const stream = document.querySelector(".task-now-stream");
+    expect(stream).not.toBeNull();
+    expect(
+      within(stream as HTMLElement).getByRole("button", { name: /Tool call.*Tool activity/ }),
+    ).toBeInTheDocument();
   });
 
   it("expands a grouped activity loop and preserves nested tool details", () => {

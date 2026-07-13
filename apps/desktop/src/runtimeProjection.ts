@@ -237,12 +237,31 @@ function toolPath(input: Record<string, unknown>): string | undefined {
   return candidate?.trim();
 }
 
-function toolAction(item: ItemProjection): "read" | "write" | "edit" | "other" {
+function toolAction(item: ItemProjection): "read" | "write" | "edit" | "search" | "other" {
   const name = [item.mcpTool, item.title].filter(Boolean).join(" ").toLowerCase();
   if (/\b(read|cat|open|view)\b/.test(name)) return "read";
   if (/\b(write|create|save)\b/.test(name)) return "write";
   if (/\b(edit|patch|replace|update)\b/.test(name)) return "edit";
+  if (/\b(search|grep|glob|find|list)\b/.test(name)) return "search";
   return "other";
+}
+
+/** "web_search" / "fetchUrl" / "apply-patch" → "Web search" / "Fetch url" / "Apply patch". */
+function humanizeToolName(name?: string): string | undefined {
+  if (!name) return undefined;
+  const words = name
+    .replace(/[_-]+/g, " ")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .trim();
+  if (!words) return undefined;
+  return words.charAt(0).toUpperCase() + words.slice(1).toLowerCase();
+}
+
+function toolQuery(input: Record<string, unknown>): string | undefined {
+  const candidate = [input.pattern, input.query, input.q].find(
+    (value): value is string => typeof value === "string" && value.trim().length > 0,
+  );
+  return candidate?.trim();
 }
 
 function toolSummary(item: ItemProjection): {
@@ -274,8 +293,13 @@ function toolSummary(item: ItemProjection): {
   if (action === "read") return { title: "Read", body: path ?? fallback };
   if (action === "write") return { title: "Wrote", body: path ?? fallback, changeStats };
   if (action === "edit") return { title: "Edited", body: path ?? fallback, changeStats };
+  if (action === "search") return { title: "Searched", body: toolQuery(input) ?? path ?? fallback };
+  const toolName = humanizeToolName(item.mcpTool);
   return {
-    title: [item.mcpServer, item.mcpTool].filter(Boolean).join(" · ") || "Tool call",
+    title:
+      (toolName && item.mcpServer ? `${toolName} · ${item.mcpServer}` : toolName) ||
+      item.title ||
+      "Tool call",
     body: path ?? fallback,
     changeStats,
   };

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_THEME_PREFERENCES,
   THEME_COLOR_TOKENS,
+  THEME_PRESET_GRID_ORDER,
   THEME_PRESETS,
   applyThemePreferences,
   normalizeThemePreferences,
@@ -10,8 +11,8 @@ import {
 
 describe("semantic theme catalog", () => {
   it("ships the full preset catalog with a complete semantic palette", () => {
-    expect(THEME_PRESETS).toHaveLength(19);
-    expect(new Set(THEME_PRESETS.map((preset) => preset.id)).size).toBe(19);
+    expect(THEME_PRESETS).toHaveLength(24);
+    expect(new Set(THEME_PRESETS.map((preset) => preset.id)).size).toBe(24);
     for (const preset of THEME_PRESETS) {
       expect(Object.keys(preset.colors)).toHaveLength(THEME_COLOR_TOKENS.length);
       expect(preset.colors["diff.added"]).not.toBe(preset.colors["diff.removed"]);
@@ -23,6 +24,43 @@ describe("semantic theme catalog", () => {
     expect(serialized).not.toContain("#9a8cff");
     expect(serialized).not.toContain("#7c3aed");
     expect(serialized).not.toContain("purple");
+  });
+
+  it("groups dark and light appearance presets while preserving their color progression", () => {
+    expect(THEME_PRESET_GRID_ORDER).toEqual([
+      "integrator",
+      "rosewood",
+      "ember",
+      "dusk",
+      "espresso",
+      "brass",
+      "forest",
+      "juniper",
+      "ocean",
+      "high-contrast",
+      "midnight",
+      "slate",
+      "graphite",
+      "velvet",
+      "iris",
+      "orchid",
+      "dawn",
+      "sand",
+      "paper",
+      "sage",
+      "arctic",
+      "ash",
+      "lilac",
+      "porcelain",
+    ]);
+    expect(new Set(THEME_PRESET_GRID_ORDER)).toEqual(
+      new Set(THEME_PRESETS.map((preset) => preset.id)),
+    );
+    expect(
+      THEME_PRESET_GRID_ORDER.map(
+        (id) => THEME_PRESETS.find((preset) => preset.id === id)?.appearance,
+      ),
+    ).toEqual([...Array<string>(16).fill("dark"), ...Array<string>(8).fill("light")]);
   });
 
   it("normalizes unsafe imported preferences", () => {

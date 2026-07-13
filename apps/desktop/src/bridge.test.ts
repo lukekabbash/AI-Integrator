@@ -137,6 +137,17 @@ describe("provider model catalogs", () => {
     expect(resolveModelEffort(entry, "high")).toBe("high");
   });
 
+  it("places the provider-advertised Codex default model first", () => {
+    expect(
+      extractCodexCatalog({
+        data: [
+          { id: "gpt-5.5", displayName: "GPT-5.5" },
+          { id: "gpt-5.6-luna", displayName: "GPT-5.6 Luna", isDefault: true },
+        ],
+      }).map((entry) => entry.id),
+    ).toEqual(["gpt-5.6-luna", "gpt-5.5"]);
+  });
+
   it("reads Cursor model and thought-level options from stable ACP configOptions", () => {
     expect(
       extractAcpCatalog({
@@ -196,6 +207,24 @@ describe("provider model catalogs", () => {
 
   it("degrades safely when an ACP agent does not advertise model options", () => {
     expect(extractAcpCatalog({ sessionId: "session-1", modes: {} })).toEqual([]);
+  });
+
+  it("places the ACP session's current model first", () => {
+    expect(
+      extractAcpCatalog({
+        configOptions: [
+          {
+            id: "model",
+            category: "model",
+            currentValue: "deepseek-r1",
+            options: [
+              { value: "composer-2.5", name: "Composer 2.5" },
+              { value: "deepseek-r1", name: "DeepSeek R1" },
+            ],
+          },
+        ],
+      }).map((entry) => entry.id),
+    ).toEqual(["deepseek-r1", "composer-2.5"]);
   });
 
   it("reads per-model reasoning options from cursor/list_available_models", () => {

@@ -17,9 +17,16 @@ const USAGE_LIMIT_PATTERN =
 const RESET_CLOCK_PATTERN = /\bat\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b/i;
 const RUNTIME_UPDATE_PATTERN =
   /requires? (?:a )?newer version|(?:cli|client|runtime|app)\s+(?:is\s+)?(?:out[ -]of[ -]date|too old)|(?:upgrade|update)\s+(?:to\s+)?(?:the\s+)?latest\s+(?:app|cli|client|runtime|version)/i;
+const RUNTIME_CONNECTION_PATTERN =
+  /\b(?:disconnected|not connected|connection (?:closed|failed|lost)|transport (?:closed|failed)|broken pipe|login required|not authenticated|authentication (?:required|failed))\b/i;
 
 export function isRuntimeUpdateRequired(message: string): boolean {
   return RUNTIME_UPDATE_PATTERN.test(message);
+}
+
+/** Errors made obsolete by a fresh, successful provider probe. */
+export function isRuntimeHealthError(message: string): boolean {
+  return isRuntimeUpdateRequired(message) || RUNTIME_CONNECTION_PATTERN.test(message);
 }
 
 function localResetTime(value: string, baseline: number): number | undefined {

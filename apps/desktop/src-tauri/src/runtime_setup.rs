@@ -9,7 +9,7 @@ use std::{
 
 use integrator_core::ProviderKind;
 use integrator_runtime::discover_provider;
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -746,10 +746,12 @@ mod tests {
             PathBuf::from("agy"),
         );
         assert_eq!(antigravity.public.command, "agy");
-        assert!(antigravity
-            .public
-            .description
-            .contains("remains running after browser sign-in"));
+        assert!(
+            antigravity
+                .public
+                .description
+                .contains("remains running after browser sign-in")
+        );
     }
 
     #[test]
@@ -765,9 +767,11 @@ mod tests {
             assert!(!plans.is_empty(), "missing installer for {provider:?}");
             assert!(plans.iter().all(|plan| !plan.public.command.is_empty()));
             assert!(plans.iter().all(|plan| !plan.public.source_url.is_empty()));
-            assert!(plans
-                .iter()
-                .all(|plan| plan.public.modifies_outside_projects));
+            assert!(
+                plans
+                    .iter()
+                    .all(|plan| plan.public.modifies_outside_projects)
+            );
         }
     }
 

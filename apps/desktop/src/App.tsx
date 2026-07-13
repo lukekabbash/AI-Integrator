@@ -48,6 +48,7 @@ import {
   type ProjectFileOpener,
   type ProjectSummary,
   recordLocalTurnUsage,
+  type RuntimeConnection,
   type RuntimeId,
   type RuntimeProjectionEvent,
   type StartTaskInput,
@@ -58,6 +59,7 @@ import {
 } from "./bridge";
 import {
   composerNoticeExpiry,
+  isRuntimeHealthError,
   isRuntimeUpdateRequired,
   type ComposerNotice,
 } from "./composerNotices";
@@ -73,6 +75,7 @@ import {
   type ThemePreferences,
 } from "./theme";
 import { Composer } from "./components/Composer";
+import { TaskStatusPill } from "./components/TaskStatusPill";
 import { ConversationHeader } from "./components/ConversationHeader";
 import { formatCompactTokenCount } from "./components/conversationFormatting";
 import { ResizeHandle } from "./components/ResizeHandle";
@@ -129,7 +132,7 @@ const MODEL_LABEL_WORDS: Record<string, string> = {
 };
 
 function formatModelLabel(modelId?: string): string {
-  if (!modelId || modelId === "Provider default") return modelId ?? "";
+  if (!modelId || modelId === "Provider default") return "";
   return modelId
     .split(/(\s+|-)/)
     .map((token) => MODEL_LABEL_WORDS[token.toLowerCase()] ?? token)
@@ -672,6 +675,41 @@ function ConnectionNotice({ state }: { state: RuntimeProjectionState["connection
   );
 }
 
+function clearVerifiedRuntimeFailures(
+  state: RuntimeProjectionState,
+  runtime: RuntimeId | undefined,
+  verifiedRuntimes: ReadonlySet<RuntimeId>,
+): RuntimeProjectionState {
+  if (!runtime || !verifiedRuntimes.has(runtime)) return state;
+  const errors = state.errors.filter((error) => !isRuntimeHealthError(error.message));
+  const connection =
+    state.connection.state === "disconnected" ? { state: "connected" as const } : state.connection;
+  if (errors.length === state.errors.length && connection === state.connection) return state;
+  return { ...state, errors, connection };
+}
+
+function runtimeIdForProjectionProvider(provider: RuntimeProjectionEvent["provider"]): RuntimeId {
+  return provider === "custom-acp" ? "custom" : provider;
+}
+
+function recordRuntimeVerificationEvent(
+  event: RuntimeProjectionEvent,
+  verifiedRuntimes: Set<RuntimeId>,
+): boolean {
+  const runtime = runtimeIdForProjectionProvider(event.provider);
+  if (event.projection.kind === "connectionChanged") {
+    if (event.projection.state === "connected") {
+      verifiedRuntimes.add(runtime);
+      return true;
+    }
+    if (event.projection.state === "disconnected") verifiedRuntimes.delete(runtime);
+  }
+  if (event.projection.kind === "turnError" && isRuntimeHealthError(event.projection.message)) {
+    verifiedRuntimes.delete(runtime);
+  }
+  return false;
+}
+
 function ApprovalControl({
   approval,
   busy,
@@ -905,12 +943,49 @@ export default function App() {
   const projectionGeneration = useRef(0);
   const navigationGeneration = useRef(0);
   const taskProjectionCache = useRef(new Map<string, RuntimeProjectionState>());
+  const taskRuntimeByIdRef = useRef(
+    new Map(snapshot.tasks.map((task) => [task.id, task.runtime] as const)),
+  );
+  const verifiedRuntimesRef = useRef(new Set<RuntimeId>());
   const taskGitCache = useRef(new Map<string, GitSnapshot>());
   const taskGitRefreshedAt = useRef(new Map<string, number>());
   const projectFilesCache = useRef(new Map<string, ProjectFileEntry[]>());
   const activeProjectForFilesRef = useRef<string | undefined>(undefined);
   const composerNoticeSequence = useRef(0);
   const conversationWorkspaceRef = useRef<HTMLDivElement>(null);
+
+  const applyVerifiedRuntimeHealth = useCallback(
+    (runtimes: RuntimeConnection[], tasks: TaskSummary[]) => {
+      const verified = new Set(
+        runtimes.filter((runtime) => runtime.status === "connected").map((runtime) => runtime.id),
+      );
+      verifiedRuntimesRef.current = verified;
+      taskRuntimeByIdRef.current = new Map(tasks.map((task) => [task.id, task.runtime] as const));
+      if (verified.size === 0) return;
+
+      setComposerError((current) => {
+        if (!current || !isRuntimeHealthError(current.message)) return current;
+        const runtime = taskRuntimeByIdRef.current.get(current.taskId);
+        return runtime && verified.has(runtime) ? null : current;
+      });
+      setRuntimeState((current) =>
+        current
+          ? clearVerifiedRuntimeFailures(
+              current,
+              taskRuntimeByIdRef.current.get(current.taskId),
+              verified,
+            )
+          : current,
+      );
+      for (const [taskId, state] of taskProjectionCache.current) {
+        taskProjectionCache.current.set(
+          taskId,
+          clearVerifiedRuntimeFailures(state, taskRuntimeByIdRef.current.get(taskId), verified),
+        );
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     const timeout = window.setTimeout(
@@ -1005,6 +1080,11 @@ export default function App() {
             },
           };
         }
+        next = clearVerifiedRuntimeFailures(
+          next,
+          taskRuntimeByIdRef.current.get(taskId),
+          verifiedRuntimesRef.current,
+        );
         taskProjectionCache.current.set(taskId, next);
         setRuntimeState(next);
       } catch (error) {
@@ -1035,7 +1115,17 @@ export default function App() {
       if (applicable.length === 0) return;
       setRuntimeState((current) => {
         let next = current ?? createRuntimeProjectionState(taskId);
-        for (const event of applicable) next = applyRuntimeProjection(next, event);
+        for (const event of applicable) {
+          const verified = recordRuntimeVerificationEvent(event, verifiedRuntimesRef.current);
+          next = applyRuntimeProjection(next, event);
+          if (verified) {
+            next = clearVerifiedRuntimeFailures(
+              next,
+              runtimeIdForProjectionProvider(event.provider),
+              verifiedRuntimesRef.current,
+            );
+          }
+        }
         taskProjectionCache.current.set(taskId, next);
         return next;
       });
@@ -1048,6 +1138,9 @@ export default function App() {
       try {
         if (nativeHost) {
           unlisten = await bridge.subscribeRuntimeProjections((event) => {
+            if (!projectionReady.current) {
+              recordRuntimeVerificationEvent(event, verifiedRuntimesRef.current);
+            }
             const persistedActivity = taskActivityUpdate(event, false);
             if (persistedActivity) {
               setSnapshot((current) => {
@@ -1131,6 +1224,9 @@ export default function App() {
           }
         }
         setSnapshot(loaded);
+        taskRuntimeByIdRef.current = new Map(
+          loaded.tasks.map((task) => [task.id, task.runtime] as const),
+        );
         setActiveFilePath((path) => path || loaded.git.files[0]?.path || "");
         // The shell is useful as soon as local projects/tasks/settings exist.
         // Provider discovery and transcript reconciliation are independent,
@@ -1141,6 +1237,7 @@ export default function App() {
             .then((runtimes) => {
               if (!active || !runtimes) return;
               setSnapshot((current) => ({ ...current, runtimes }));
+              applyVerifiedRuntimeHealth(runtimes, loaded.tasks);
             })
             .catch(() => undefined);
         }
@@ -1173,7 +1270,7 @@ export default function App() {
       if (projectionFrame !== undefined) window.cancelAnimationFrame(projectionFrame);
       unlisten?.();
     };
-  }, [nativeHost, reconcileTaskProjection]);
+  }, [applyVerifiedRuntimeHealth, nativeHost, reconcileTaskProjection]);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => void bridge.persistSession(snapshot), 300);
@@ -1383,8 +1480,9 @@ export default function App() {
   const refreshRuntimes = useCallback(async () => {
     const runtimes = await bridge.probeRuntimes();
     setSnapshot((current) => ({ ...current, runtimes }));
+    applyVerifiedRuntimeHealth(runtimes, snapshot.tasks);
     return runtimes;
-  }, []);
+  }, [applyVerifiedRuntimeHealth, snapshot.tasks]);
 
   const openRuntimeAction = useCallback(
     (runtime: RuntimeId, kind: RuntimeActionRequest["kind"]) => {
@@ -1992,16 +2090,44 @@ export default function App() {
     }
   };
 
-  /** Drops `@path` into the main chat composer as task context. */
-  const mentionProjectFile = (file: ProjectFileEntry) => {
+  /** Routes text into the main chat composer, which only exists on the Task
+   * view of the workspace. */
+  const insertIntoComposer = (text: string) => {
     composerInsertSequence.current += 1;
-    setComposerInsert({
-      id: composerInsertSequence.current,
-      text: `@${file.path} `,
-    });
-    // The composer only exists on the Task view of the workspace.
+    setComposerInsert({ id: composerInsertSequence.current, text });
     changeCenterView("task");
     setScreen("workspace");
+  };
+
+  /** Drops `@path` into the main chat composer as task context. */
+  const mentionProjectFile = (file: ProjectFileEntry) => {
+    insertIntoComposer(`@${file.path} `);
+  };
+
+  /** Drops `@folder/` into the main chat composer as task context. */
+  const mentionProjectFolder = (path: string) => {
+    insertIntoComposer(`@${path}/ `);
+  };
+
+  /** Quotes highlighted file or diff lines into the composer as an @mention
+   * plus a fenced snippet, so questions about the selection stand alone. */
+  const addSelectionToChat = (
+    payload: { path: string; startLine?: number; endLine?: number; text: string; intent: "add" | "ask" },
+    source: "file" | "diff",
+  ) => {
+    const range =
+      payload.startLine === undefined
+        ? ""
+        : payload.endLine !== undefined && payload.endLine !== payload.startLine
+          ? `L${payload.startLine}-${payload.endLine}`
+          : `L${payload.startLine}`;
+    const label = [source === "diff" ? "diff" : "", range].filter(Boolean).join(" ");
+    // A wider fence keeps snippets that themselves contain ``` intact.
+    const fence = payload.text.includes("```") ? "````" : "```";
+    const block = `@${payload.path}${label ? ` (${label})` : ""}\n${fence}${
+      source === "diff" ? "diff" : ""
+    }\n${payload.text}\n${fence}\n`;
+    insertIntoComposer(payload.intent === "ask" ? `${block}\n` : block);
   };
 
   const openProjectPathExternal = async (path: string, openerId: string) => {
@@ -2543,7 +2669,10 @@ export default function App() {
           onOpenSettings={() => setScreen("settings")}
           onOpenSetup={() => setScreen("setup")}
         />
-        <div className="app-content">
+        <div
+          className="app-content"
+          style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}
+        >
           {screen === "settings" ? (
             <Suspense
               fallback={
@@ -2591,7 +2720,6 @@ export default function App() {
               data-rail-open={showRightRail}
               style={
                 {
-                  "--sidebar-width": `${sidebarWidth}px`,
                   "--right-rail-width": `${rightRailWidth}px`,
                 } as CSSProperties
               }
@@ -2761,12 +2889,6 @@ export default function App() {
                                 events={projectedTranscript}
                                 scrollContainerRef={transcriptScrollRef}
                                 running={nativeTurnRunning || optimisticTurnStarting}
-                                usage={runtimeUsage}
-                                activeAgentCount={activeAgentCount}
-                                runningSince={
-                                  runtimeState?.turn?.startedAt ??
-                                  optimisticForActiveTask?.event.timestamp
-                                }
                                 modelForEvent={
                                   localSettings["transcript.showModel"] !== false
                                     ? (event) =>
@@ -2780,12 +2902,28 @@ export default function App() {
                                 }
                                 onRegenerate={() => void regenerateLatest()}
                                 onOpenFile={openTranscriptFile}
+                                onAddDiffSelection={(payload) =>
+                                  addSelectionToChat(payload, "diff")
+                                }
                               />
                             </Suspense>
                           ) : (
                             <EmptyTaskState project={activeProject} />
                           )}
                         </div>
+                        <AnimatePresence initial={false}>
+                          {activeTask && (nativeTurnRunning || optimisticTurnStarting) ? (
+                            <TaskStatusPill
+                              key="task-status-pill"
+                              runningSince={
+                                runtimeState?.turn?.startedAt ??
+                                optimisticForActiveTask?.event.timestamp
+                              }
+                              usage={runtimeUsage}
+                              activeAgentCount={activeAgentCount}
+                            />
+                          ) : null}
+                        </AnimatePresence>
                         {pendingApproval ? (
                           <ApprovalControl
                             approval={pendingApproval}
@@ -2835,6 +2973,7 @@ export default function App() {
                           }
                           enterToSend={localSettings["composer.enterToSend"] !== false}
                           contextFiles={contextFilePaths}
+                          onRequestContextFiles={requestProjectFiles}
                           workingDirectory={activeTask?.worktree ?? activeProject.path}
                           insertRequest={composerInsert}
                           onInsertHandled={(id) =>
@@ -2943,6 +3082,7 @@ export default function App() {
                               `${activeFile.path} marked reviewed for this session`,
                             );
                           }}
+                          onAddSelection={(payload) => addSelectionToChat(payload, "diff")}
                         />
                       </Suspense>
                     ) : (
@@ -3004,6 +3144,7 @@ export default function App() {
                           delegation={selectedDelegation}
                           runtimes={snapshot.runtimes}
                           contextFiles={contextFilePaths}
+                          onRequestContextFiles={requestProjectFiles}
                           enterToSend={localSettings["composer.enterToSend"] !== false}
                           rightRailOpen={rightRailOpen}
                           terminalOpen={terminalOwner === selectedDelegation.id}
@@ -3108,6 +3249,8 @@ export default function App() {
                         onOpenProjectFile={openProjectFile}
                         onRenameProjectFile={renameProjectFile}
                         onMentionProjectFile={mentionProjectFile}
+                        onMentionProjectFolder={mentionProjectFolder}
+                        onAddFileSelection={(payload) => addSelectionToChat(payload, "file")}
                         fileOpeners={projectFileOpeners}
                         onOpenGitFileExternal={nativeHost ? openGitFileExternal : undefined}
                         onRevealGitFile={nativeHost ? revealGitFile : undefined}

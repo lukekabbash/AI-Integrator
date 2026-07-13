@@ -1,6 +1,11 @@
 import { Check, FileCode2, MessageSquarePlus, RefreshCw } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { highlightCodeLine } from "./codeHighlight";
+import {
+  SelectionActionPopover,
+  type SelectionContext,
+  type SelectionPayload,
+} from "./SelectionActionPopover";
 
 const LANGUAGE_BY_EXTENSION: Record<string, string> = {
   ts: "TypeScript",
@@ -51,6 +56,40 @@ export interface DiffViewProps {
   showReviewActions?: boolean;
   /** A caller-owned comment flow. It is intentionally absent until persistence exists. */
   onAddLineComment?: (input: { path: string; line: number }) => void;
+  /** Selection-to-chat: fires when the user highlights diff text and picks
+   * "Add to chat" or "Ask about this" from the floating pill. */
+  onAddSelection?: (payload: DiffSelectionPayload) => void;
+}
+
+export interface DiffSelectionPayload extends SelectionPayload {
+  path: string;
+}
+
+/** Rebuilds the selected diff lines from the code cells the range touches,
+ * keeping +/− markers. A selection inside one cell keeps its exact text.
+ * Old-side context cells are skipped in split view (their new-side twin
+ * carries the same content). */
+function resolveDiffSelection(range: Range, container: HTMLElement): SelectionContext | null {
+  const cells = [...container.querySelectorAll<HTMLElement>("[data-diff-kind]")].filter(
+    (cell) =>
+      range.intersectsNode(cell) &&
+      !(cell.dataset.diffSide === "old" && cell.dataset.diffKind === "context"),
+  );
+  if (cells.length === 0) return null;
+  const numbers = cells
+    .map((cell) => Number(cell.dataset.diffLine))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  const startLine = numbers.length > 0 ? Math.min(...numbers) : undefined;
+  const endLine = numbers.length > 0 ? Math.max(...numbers) : undefined;
+  if (cells.length === 1) return { text: range.toString(), startLine, endLine };
+  const marker = (kind?: string) => (kind === "add" ? "+" : kind === "delete" ? "-" : " ");
+  const text = cells
+    .map(
+      (cell) =>
+        `${marker(cell.dataset.diffKind)} ${cell.querySelector("code")?.textContent ?? ""}`,
+    )
+    .join("\n");
+  return { text, startLine, endLine };
 }
 
 function DiffCode({ line, path }: { line: DiffLine; path: string }) {
@@ -153,7 +192,11 @@ function UnifiedDiff({ file, onAddLineComment }: Pick<DiffViewProps, "file" | "o
                 <td className="diff-gutter" aria-hidden="true">
                   {line.kind === "add" ? "+" : line.kind === "delete" ? "−" : " "}
                 </td>
-                <td className="diff-code">
+                <td
+                  className="diff-code"
+                  data-diff-kind={line.kind}
+                  data-diff-line={line.newNumber ?? line.oldNumber}
+                >
                   <code>
                     <DiffCode line={line} path={file.path} />
                   </code>
@@ -232,7 +275,12 @@ function SplitCell({
   return (
     <>
       <td className={`diff-line-number diff-line-number--${side}`}>{number ?? ""}</td>
-      <td className={`diff-split-code diff-split-code--${kind}`}>
+      <td
+        className={`diff-split-code diff-split-code--${kind}`}
+        data-diff-kind={line ? kind : undefined}
+        data-diff-side={line ? side : undefined}
+        data-diff-line={number}
+      >
         {line ? (
           <>
             <code>
@@ -312,10 +360,17 @@ export function DiffView({
   refreshing = false,
   showReviewActions = true,
   onAddLineComment,
+  onAddSelection,
 }: DiffViewProps) {
   const canMarkReviewed = Boolean(onMarkReviewed);
   const inline = variant === "inline";
   const mode: DiffViewMode = inline ? "unified" : viewMode;
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const resolveSelection = useCallback(
+    (range: Range) =>
+      scrollRef.current ? resolveDiffSelection(range, scrollRef.current) : null,
+    [],
+  );
   return (
     <section
       className={`diff-workspace${inline ? " diff-workspace--inline" : ""}`}
@@ -406,7 +461,15 @@ export function DiffView({
         </div>
       ) : null}
 
-      <div className="diff-scroll" data-view={mode}>
+      {onAddSelection ? (
+        <SelectionActionPopover
+          containerRef={scrollRef}
+          resolve={resolveSelection}
+          label={`Selection actions for ${file.path}`}
+          onAction={(payload) => onAddSelection({ ...payload, path: file.path })}
+        />
+      ) : null}
+      <div className="diff-scroll" data-view={mode} ref={scrollRef}>
         {file.diffLoaded === false ? (
           <div className="route-loading" role="status" aria-live="polite">
             Loading diff…

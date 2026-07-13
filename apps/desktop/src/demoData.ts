@@ -267,7 +267,7 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
       account: "ChatGPT subscription",
       status: "connected",
       fidelity: "native",
-      models: ["GPT-5.4", "GPT-5-Codex", "Provider default"],
+      models: ["GPT-5.4", "GPT-5-Codex"],
       detail: "Native app-server events, approvals, plans, and usage.",
     },
     {

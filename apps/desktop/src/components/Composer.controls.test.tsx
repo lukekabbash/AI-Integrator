@@ -58,11 +58,8 @@ describe("Composer compact controls", () => {
     expect(screen.getByRole("button", { name: "Runtime" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Model" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Start voice typing" })).toBeInTheDocument();
-    expect(bridge.listModelCatalog).not.toHaveBeenCalled();
-    // Native catalogs are deliberately negotiated only after explicit model
-    // interaction so mounting a composer cannot start or replace a session.
+    await waitFor(() => expect(bridge.listModelCatalog).toHaveBeenCalledWith("codex"));
     fireEvent.click(screen.getByRole("button", { name: "Model" }));
-    expect(bridge.listModelCatalog).toHaveBeenCalledWith("codex");
     fireEvent.click(await screen.findByRole("option", { name: "GPT-5.6 Luna" }));
     expect(await screen.findByRole("button", { name: "Reasoning effort" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Microphone" })).toBeInTheDocument();
@@ -103,5 +100,33 @@ describe("Composer compact controls", () => {
         delegation: "balanced",
       }),
     );
+  });
+
+  it("replaces a legacy provider-default route with the discovered model", async () => {
+    vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
+      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
+    ]);
+    const onRoutingChange = vi.fn();
+
+    render(
+      <Composer
+        runtimes={[{ ...runtimes[0], models: [] }]}
+        defaultRuntime="codex"
+        defaultModel="Provider default"
+        onSend={vi.fn().mockResolvedValue(true)}
+        onRoutingChange={onRoutingChange}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("Checking model…");
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("GPT-5.6 Luna"),
+    );
+    expect(screen.queryByText("Provider default")).not.toBeInTheDocument();
+    expect(onRoutingChange).toHaveBeenCalledWith({
+      runtime: "codex",
+      model: "gpt-5.6-luna",
+      effort: undefined,
+    });
   });
 });

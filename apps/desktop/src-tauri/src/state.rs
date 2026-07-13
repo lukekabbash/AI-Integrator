@@ -81,6 +81,11 @@ pub struct AcpRuntime {
     /// One-shot delegation tool preamble queued at session start and spent
     /// on the first turn (ACP sessions persist, so it must not repeat).
     pub delegation_preamble: Arc<std::sync::Mutex<Option<String>>>,
+    /// Delegated children run without a human watching their approvals: the
+    /// pump resolves `session/request_permission` and `cursor/create_plan`
+    /// immediately (the ACP analog of Codex's approval-policy "never")
+    /// instead of parking an approval card no one will answer.
+    pub unattended: bool,
 }
 
 /// One provider-neutral structured CLI route. The vendor CLI owns auth and
@@ -142,6 +147,12 @@ pub enum DelegationChildDriver {
     Codex {
         runtime: CodexRuntime,
         thread_id: String,
+    },
+    /// Cursor/Grok ACP agents: one long-lived process per child session,
+    /// running unattended (permission prompts auto-resolve in the pump).
+    Acp {
+        runtime: AcpRuntime,
+        session_id: String,
     },
 }
 

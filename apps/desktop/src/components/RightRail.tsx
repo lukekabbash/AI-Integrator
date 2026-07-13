@@ -32,6 +32,8 @@ import {
 } from "lucide-react";
 import { AnimatedFolderIcon } from "./AnimatedFolderIcon";
 import { FileIcon } from "./FileIcon";
+import { SelectionActionPopover, type SelectionPayload } from "./SelectionActionPopover";
+import { selectionEndpointElement } from "./conversationFormatting";
 import type {
   ChildAgent,
   DelegationView,
@@ -46,6 +48,11 @@ import { ResizeHandle } from "./ResizeHandle";
 import { Tooltip } from "./Tooltip";
 
 type RailTab = "git" | "agents" | "files" | "usage";
+
+/** Selection payload from the file preview, with the file it came from. */
+export interface FileSelectionPayload extends SelectionPayload {
+  path: string;
+}
 
 const INITIAL_FILE_TREE_ENTRIES = 300;
 const FILE_TREE_CHUNK = 300;
@@ -81,6 +88,10 @@ interface RightRailProps {
   onRenameProjectFile?: (file: ProjectFileEntry, newName: string) => Promise<void>;
   /** Inserts the file as an @context mention into the main chat composer. */
   onMentionProjectFile?: (file: ProjectFileEntry) => void;
+  /** Inserts a folder as an @context mention into the main chat composer. */
+  onMentionProjectFolder?: (path: string) => void;
+  /** Selection-to-chat from the file preview: quoted lines land in the composer. */
+  onAddFileSelection?: (payload: FileSelectionPayload) => void;
   /** Native-detected, allowlisted external targets for Git file actions. */
   fileOpeners?: ProjectFileOpener[];
   onOpenGitFileExternal?: (file: DiffFile, openerId: string) => Promise<void>;
@@ -1274,19 +1285,44 @@ function ProgressiveSurfaceControls({
   );
 }
 
-function FilePreview({ file }: { file: ProjectFileContent }) {
+function FilePreview({
+  file,
+  onAddSelection,
+}: {
+  file: ProjectFileContent;
+  onAddSelection?: (payload: FileSelectionPayload) => void;
+}) {
   const lines = useMemo(() => file.content.split("\n"), [file.content]);
   const [lineLimit, setLineLimit] = useState(INITIAL_FILE_PREVIEW_LINES);
   const visibleLines = lines.slice(0, lineLimit);
+  const linesRef = useRef<HTMLOListElement>(null);
+  const resolveSelection = useCallback((range: Range) => {
+    const container = linesRef.current;
+    if (!container) return null;
+    const startRow = selectionEndpointElement(range.startContainer, "li[data-line]", container);
+    const endRow = selectionEndpointElement(range.endContainer, "li[data-line]", container);
+    const startLine = startRow ? Number(startRow.dataset.line) : undefined;
+    const endLine = endRow ? Number(endRow.dataset.line) : undefined;
+    // List markers are CSS counters, so the raw selection text is clean code.
+    return { text: range.toString(), startLine, endLine };
+  }, []);
   return (
     <motion.div
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       transition={{ duration: 0.14, ease: "easeOut" }}
     >
-      <ol className="file-reader-lines" aria-label={`Contents of ${file.path}`}>
+      {onAddSelection ? (
+        <SelectionActionPopover
+          containerRef={linesRef}
+          resolve={resolveSelection}
+          label={`Selection actions for ${file.path}`}
+          onAction={(payload) => onAddSelection({ ...payload, path: file.path })}
+        />
+      ) : null}
+      <ol className="file-reader-lines" aria-label={`Contents of ${file.path}`} ref={linesRef}>
         {visibleLines.map((line, index) => (
-          <li key={`${file.path}-${index}`}>
+          <li key={`${file.path}-${index}`} data-line={index + 1}>
             <code>
               {highlightFileLine(line).map((token, tokenIndex) => (
                 <span
@@ -1320,6 +1356,8 @@ function FilePanel({
   onOpenProjectFile,
   onRenameProjectFile,
   onMentionProjectFile,
+  onMentionProjectFolder,
+  onAddFileSelection,
   onOpenProjectFileExternal,
   onRevealProjectFile,
 }: Pick<
@@ -1331,6 +1369,8 @@ function FilePanel({
   | "onOpenProjectFile"
   | "onRenameProjectFile"
   | "onMentionProjectFile"
+  | "onMentionProjectFolder"
+  | "onAddFileSelection"
   | "onOpenProjectFileExternal"
   | "onRevealProjectFile"
 >) {
@@ -1345,6 +1385,10 @@ function FilePanel({
   const [renameError, setRenameError] = useState("");
   const [fileActionError, setFileActionError] = useState("");
   const [contextMenu, setContextMenu] = useState<FileContextMenuState | null>(null);
+  const [folderMenu, setFolderMenu] = useState<{ path: string; x: number; y: number } | null>(
+    null,
+  );
+  const folderMenuRef = useRef<HTMLDivElement>(null);
   const [treeWindow, setTreeWindow] = useState({
     key: "",
     limit: INITIAL_FILE_TREE_ENTRIES,
@@ -1464,6 +1508,25 @@ function FilePanel({
   }, [contextMenu]);
 
   useEffect(() => {
+    if (!folderMenu) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (!folderMenuRef.current?.contains(event.target as Node)) setFolderMenu(null);
+    };
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setFolderMenu(null);
+    };
+    const onBlur = () => setFolderMenu(null);
+    window.addEventListener("pointerdown", onPointerDown, true);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown, true);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, [folderMenu]);
+
+  useEffect(() => {
     if (!contextMenu?.keyboard) return;
     const frame = window.requestAnimationFrame(() => {
       contextMenuRef.current?.querySelector<HTMLElement>("[role='menuitem']")?.focus();
@@ -1478,6 +1541,7 @@ function FilePanel({
     source: HTMLElement | null = null,
     keyboard = false,
   ) => {
+    setFolderMenu(null);
     setContextMenu({
       file,
       // Clamped so the menu never opens off-screen near the window edges.
@@ -1485,6 +1549,15 @@ function FilePanel({
       y: Math.min(y, Math.max(4, window.innerHeight - 288)),
       source,
       keyboard,
+    });
+  };
+
+  const openFolderMenu = (path: string, x: number, y: number) => {
+    setContextMenu(null);
+    setFolderMenu({
+      path,
+      x: Math.min(x, Math.max(4, window.innerWidth - 224)),
+      y: Math.min(y, Math.max(4, window.innerHeight - 144)),
     });
   };
 
@@ -1605,6 +1678,7 @@ function FilePanel({
                 onCommitRename={(file, name) => void commitRename(file, name)}
                 onCancelRename={() => setRenamingPath("")}
                 onContextMenu={openContextMenu}
+                onFolderContextMenu={onMentionProjectFolder ? openFolderMenu : undefined}
               />
             ) : null}
             {projectFilesState === "ready" ? (
@@ -1720,7 +1794,11 @@ function FilePanel({
                       This binary file cannot be safely previewed as text.
                     </p>
                   ) : (
-                    <FilePreview key={activeFile.path} file={activeFile} />
+                    <FilePreview
+                      key={activeFile.path}
+                      file={activeFile}
+                      onAddSelection={onAddFileSelection}
+                    />
                   )
                 ) : null}
               </div>
@@ -1809,6 +1887,43 @@ function FilePanel({
             onClick={() => {
               void copyFilePath(contextMenu.file);
               setContextMenu(null);
+            }}
+          >
+            <Copy /> Copy relative path
+          </button>
+        </div>
+      ) : null}
+      {folderMenu ? (
+        <div
+          ref={folderMenuRef}
+          className="compact-action-menu file-context-menu"
+          role="menu"
+          aria-label={`Actions for folder ${folderMenu.path}`}
+          style={{ left: folderMenu.x, top: folderMenu.y }}
+          onKeyDown={handleMenuNavigation}
+        >
+          <div className="file-context-menu-path" title={folderMenu.path}>
+            <AnimatedFolderIcon open={false} className="tree-folder-icon" />
+            <span>{folderMenu.path}/</span>
+          </div>
+          {onMentionProjectFolder ? (
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                onMentionProjectFolder(folderMenu.path);
+                setFolderMenu(null);
+              }}
+            >
+              <AtSign /> Add to chat as context
+            </button>
+          ) : null}
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              void navigator.clipboard?.writeText(folderMenu.path).catch(() => undefined);
+              setFolderMenu(null);
             }}
           >
             <Copy /> Copy relative path
@@ -1934,6 +2049,8 @@ interface ProjectTreeCallbacks {
     source?: HTMLElement | null,
     keyboard?: boolean,
   ) => void;
+  /** Present only when the host can mention folders as chat context. */
+  onFolderContextMenu?: (path: string, x: number, y: number) => void;
 }
 
 function TreeRenameInput({
@@ -1991,6 +2108,7 @@ function ProjectTree({
   onCommitRename,
   onCancelRename,
   onContextMenu,
+  onFolderContextMenu,
   activePath,
   openingPath,
   renamingPath,
@@ -2023,6 +2141,11 @@ function ProjectTree({
               aria-expanded={expanded}
               aria-label={`${expanded ? "Collapse" : "Expand"} folder ${folderPath}`}
               onClick={() => onToggleFolder(expansionKey)}
+              onContextMenu={(event) => {
+                if (!onFolderContextMenu) return;
+                event.preventDefault();
+                onFolderContextMenu(folderPath, event.clientX, event.clientY);
+              }}
             >
               <ChevronRight className="tree-chevron" />
               <AnimatedFolderIcon open={expanded} className="tree-folder-icon" />
@@ -2048,6 +2171,7 @@ function ProjectTree({
                     onCommitRename={onCommitRename}
                     onCancelRename={onCancelRename}
                     onContextMenu={onContextMenu}
+                    onFolderContextMenu={onFolderContextMenu}
                     activePath={activePath}
                     openingPath={openingPath}
                     renamingPath={renamingPath}
@@ -2273,6 +2397,8 @@ export function RightRail(props: RightRailProps) {
             onOpenProjectFile={props.onOpenProjectFile}
             onRenameProjectFile={props.onRenameProjectFile}
             onMentionProjectFile={props.onMentionProjectFile}
+            onMentionProjectFolder={props.onMentionProjectFolder}
+            onAddFileSelection={props.onAddFileSelection}
             fileOpeners={props.fileOpeners}
             onOpenProjectFileExternal={props.onOpenProjectFileExternal}
             onRevealProjectFile={props.onRevealProjectFile}
