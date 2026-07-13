@@ -41,6 +41,9 @@ pub fn run() {
                 boxed
             })?;
             app.manage(state);
+            if let Err(error) = delegation::prune_stale_mcp_configs(app.handle()) {
+                eprintln!("delegation broker config cleanup failed: {error}");
+            }
             delegation::start_broker_host(app.handle().clone());
             Ok(())
         })

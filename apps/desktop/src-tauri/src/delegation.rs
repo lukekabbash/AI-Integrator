@@ -10,7 +10,17 @@
 //! deliver only when the recipient is idle (children) or pulls them
 //! (orchestrators). Nothing here ever interrupts the user's conversation.
 
-use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs::OpenOptions,
+    io::Write,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use chrono::Utc;
 use integrator_core::{
@@ -320,8 +330,47 @@ pub fn write_mcp_config(
         }
     });
     let path = directory.join(format!("{role}-{scope}.json"));
-    std::fs::write(&path, serde_json::to_vec_pretty(&config)?).map_err(IntegratorError::from)?;
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&path).map_err(IntegratorError::from)?;
+    file.write_all(&serde_json::to_vec_pretty(&config)?)
+        .map_err(IntegratorError::from)?;
     Ok(path)
+}
+
+fn prune_stale_mcp_configs_in(data_directory: &Path) -> std::io::Result<usize> {
+    let directory = data_directory.join("broker-mcp");
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let is_json = entry
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
+        if !file_type.is_file() || !is_json {
+            continue;
+        }
+        std::fs::remove_file(entry.path())?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+/// Delete only stale, regular JSON configs from the app-owned broker scratch
+/// directory. The single-instance startup path calls this before issuing the
+/// new run's loopback token; directories, links, and unrelated files survive.
+pub fn prune_stale_mcp_configs(app: &AppHandle<tauri::Wry>) -> Result<usize> {
+    let state = app.state::<AppState>();
+    prune_stale_mcp_configs_in(&state.data_directory).map_err(IntegratorError::from)
 }
 
 /// The `session/new` `mcpServers` entry for ACP agents.
@@ -1678,6 +1727,34 @@ pub async fn delegation_stop_cmd(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_mcp_config_cleanup_is_narrow_and_idempotent() {
+        let root = tempfile::tempdir().expect("temporary app data");
+        assert_eq!(
+            prune_stale_mcp_configs_in(root.path()).expect("missing directory cleanup"),
+            0
+        );
+        let directory = root.path().join("broker-mcp");
+        std::fs::create_dir_all(directory.join("keep.json"))
+            .expect("create same-suffix directory sentinel");
+        std::fs::write(directory.join("stale.json"), b"ephemeral token fixture")
+            .expect("write stale config");
+        std::fs::write(directory.join("keep.txt"), b"unrelated sentinel")
+            .expect("write unrelated sentinel");
+
+        assert_eq!(
+            prune_stale_mcp_configs_in(root.path()).expect("prune stale config"),
+            1
+        );
+        assert!(!directory.join("stale.json").exists());
+        assert!(directory.join("keep.txt").is_file());
+        assert!(directory.join("keep.json").is_dir());
+        assert_eq!(
+            prune_stale_mcp_configs_in(root.path()).expect("idempotent cleanup"),
+            0
+        );
+    }
 
     #[test]
     fn profiles_fall_back_to_defaults_and_sort_by_cost() {
