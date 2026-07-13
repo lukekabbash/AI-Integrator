@@ -2078,6 +2078,24 @@ kbd {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+.composer-notice-action {
+  margin: 8px 0 0;
+  padding: 5px 9px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 7px;
+  color: var(--color-text-primary);
+  background: var(--color-layer-2);
+  font-size: 10.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    border-color var(--motion-fast),
+    background var(--motion-fast);
+}
+.composer-notice-action:hover {
+  border-color: var(--color-accent-primary);
+  background: var(--color-accent-subtle);
+}
 .composer {
   position: relative;
   width: min(100%, 780px);
@@ -5259,6 +5277,10 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
 .settings-runtime-list strong small[data-status="connected"] {
   color: var(--color-success);
 }
+.settings-runtime-list strong small[data-status="degraded"],
+.settings-runtime-list strong small[data-status="login_required"] {
+  color: var(--color-warning);
+}
 .settings-runtime-list code {
   align-self: center;
   color: var(--color-text-tertiary);
@@ -5269,6 +5291,190 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   margin: 0;
   color: var(--color-text-secondary);
   font-size: 9.5px;
+}
+.settings-runtime-list .runtime-executable {
+  grid-column: 1 / -1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.runtime-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.runtime-row-actions button {
+  min-width: 64px;
+}
+.runtime-action-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: color-mix(in srgb, var(--color-canvas) 62%, transparent);
+  backdrop-filter: blur(12px);
+}
+.runtime-action-dialog {
+  width: min(560px, 100%);
+  max-height: min(760px, calc(100vh - 48px));
+  overflow: auto;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 16px;
+  background: var(--color-layer-1);
+  box-shadow: 0 24px 80px color-mix(in srgb, black 32%, transparent);
+}
+.runtime-action-dialog > header,
+.runtime-action-dialog > footer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 16px 18px;
+}
+.runtime-action-dialog > header {
+  justify-content: space-between;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+.runtime-action-dialog > header > span {
+  display: grid;
+  gap: 3px;
+}
+.runtime-action-dialog > header strong {
+  color: var(--color-text-primary);
+  font-size: 14px;
+}
+.runtime-action-dialog > header small,
+.runtime-methods small,
+.runtime-command-disclosure small {
+  color: var(--color-text-tertiary);
+  font-size: 10px;
+}
+.runtime-action-dialog > p,
+.runtime-action-source {
+  margin: 0;
+  padding: 0 18px 14px;
+  color: var(--color-text-secondary);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+.runtime-action-dialog > footer {
+  justify-content: flex-end;
+  border-top: 1px solid var(--color-border-subtle);
+}
+.runtime-methods {
+  margin: 0;
+  padding: 12px 18px 0;
+  border: 0;
+}
+.runtime-methods legend {
+  padding: 0 0 5px;
+  color: var(--color-text-tertiary);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.runtime-methods label {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--color-border-subtle);
+  cursor: pointer;
+}
+.runtime-methods label[data-available="false"] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.runtime-methods label span {
+  display: grid;
+  gap: 2px;
+}
+.runtime-methods label strong {
+  color: var(--color-text-primary);
+  font-size: 11px;
+}
+.runtime-command-disclosure {
+  margin: 14px 18px 10px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px;
+  gap: 8px;
+  align-items: center;
+}
+.runtime-command-disclosure > span {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+.runtime-command-disclosure code {
+  min-width: 0;
+  padding: 10px 11px;
+  overflow-x: auto;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 8px;
+  color: var(--color-text-primary);
+  background: var(--color-canvas);
+  font: 10px/1.5 var(--font-code);
+  white-space: nowrap;
+}
+.runtime-action-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  color: var(--color-warning) !important;
+}
+.runtime-action-warning svg,
+.runtime-action-source svg {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+.runtime-setup-terminal {
+  margin-top: 14px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--color-canvas);
+}
+.runtime-setup-terminal > header,
+.runtime-setup-terminal > footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 11px;
+  background: var(--color-layer-1);
+}
+.runtime-setup-terminal > header {
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+.runtime-setup-terminal > header > span {
+  min-width: 0;
+  margin-right: auto;
+  display: grid;
+  gap: 1px;
+}
+.runtime-setup-terminal > header strong {
+  color: var(--color-text-primary);
+  font-size: 11px;
+}
+.runtime-setup-terminal > header small,
+.runtime-setup-terminal > footer {
+  color: var(--color-text-tertiary);
+  font-size: 9px;
+}
+.runtime-setup-terminal > footer {
+  justify-content: space-between;
+  border-top: 1px solid var(--color-border-subtle);
+}
+.runtime-setup-terminal-host {
+  height: 310px;
+  padding: 8px 6px;
+}
+.runtime-setup-terminal-host .xterm {
+  height: 100%;
 }
 .role-routing {
   border-top: 1px solid var(--color-border-subtle);

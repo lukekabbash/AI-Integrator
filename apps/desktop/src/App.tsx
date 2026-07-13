@@ -56,7 +56,12 @@ import {
   type TaskSummary,
   type TranscriptEvent,
 } from "./bridge";
-import { composerNoticeExpiry, type ComposerNotice } from "./composerNotices";
+import {
+  composerNoticeExpiry,
+  isRuntimeUpdateRequired,
+  type ComposerNotice,
+} from "./composerNotices";
+import type { RuntimeActionRequest } from "./components/SettingsView";
 import { createDemoSnapshot, createEmptySnapshot, type WorkspaceSnapshot } from "./demoData";
 import {
   initializeTheme,
@@ -129,6 +134,17 @@ function formatModelLabel(modelId?: string): string {
     .split(/(\s+|-)/)
     .map((token) => MODEL_LABEL_WORDS[token.toLowerCase()] ?? token)
     .join("");
+}
+
+function runtimeLabel(runtime: RuntimeId): string {
+  return {
+    codex: "Codex",
+    cursor: "Cursor",
+    claude: "Claude Code",
+    grok: "Grok Build",
+    antigravity: "Antigravity",
+    custom: "Custom ACP",
+  }[runtime];
 }
 
 const SettingsView = lazy(() =>
@@ -832,6 +848,10 @@ export default function App() {
   const [stoppingTurn, setStoppingTurn] = useState(false);
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
   const [screen, setScreen] = useState<Screen>(initialScreen);
+  const [runtimeActionRequest, setRuntimeActionRequest] = useState<RuntimeActionRequest | null>(
+    null,
+  );
+  const runtimeActionSequence = useRef(0);
   const [centerView, setCenterView] = useState<CenterView>(initialCenterView);
   const [localSettings, setLocalSettings] = useState<Record<string, unknown>>({});
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
@@ -1360,16 +1380,24 @@ export default function App() {
     if (nativeHost) void bridge.setSetting("appearance.theme", next);
   };
 
-  const connectRuntime = async (runtime: RuntimeId) => {
-    const updated = await bridge.beginRuntimeLogin(runtime);
-    setSnapshot((current) => ({
-      ...current,
-      runtimes: current.runtimes.map((candidate) =>
-        candidate.id === runtime ? updated : candidate,
-      ),
-    }));
-    return updated;
-  };
+  const refreshRuntimes = useCallback(async () => {
+    const runtimes = await bridge.probeRuntimes();
+    setSnapshot((current) => ({ ...current, runtimes }));
+    return runtimes;
+  }, []);
+
+  const openRuntimeAction = useCallback(
+    (runtime: RuntimeId, kind: RuntimeActionRequest["kind"]) => {
+      runtimeActionSequence.current += 1;
+      setRuntimeActionRequest({
+        id: runtimeActionSequence.current,
+        runtime,
+        kind,
+      });
+      setScreen("settings");
+    },
+    [],
+  );
 
   const selectTask = (taskId: string) => {
     const targetTask = snapshot.tasks.find((task) => task.id === taskId);
@@ -1869,14 +1897,6 @@ export default function App() {
     return true;
   };
 
-  const login = async (runtime: RuntimeId) => {
-    const updated = await bridge.beginRuntimeLogin(runtime);
-    setSnapshot((current) => ({
-      ...current,
-      runtimes: current.runtimes.map((item) => (item.id === runtime ? updated : item)),
-    }));
-  };
-
   const changeCenterView = (view: CenterView) => {
     setCenterView(view);
     if (!activeTask) return;
@@ -2215,13 +2235,23 @@ export default function App() {
         : snapshot.children.filter((agent) => agent.status === "running").length)
     : 0;
   const composerNotices: ComposerNotice[] = [
-    ...(activeRuntimeState?.errors ?? []).map((error) => ({
-      id: `runtime-error-${error.seq}`,
-      title: error.retryable ? "Provider retrying" : "Turn error",
-      message: error.message,
-      variant: error.retryable ? ("warning" as const) : ("error" as const),
-      expiresAt: composerNoticeExpiry(error.message, error.occurredAt, displayedUsage.resetAt),
-    })),
+    ...(activeRuntimeState?.errors ?? []).map((error) => {
+      const runtime = activeTask?.runtime;
+      return {
+        id: `runtime-error-${error.seq}`,
+        title: error.retryable ? "Provider retrying" : "Turn error",
+        message: error.message,
+        variant: error.retryable ? ("warning" as const) : ("error" as const),
+        expiresAt: composerNoticeExpiry(error.message, error.occurredAt, displayedUsage.resetAt),
+        action:
+          runtime && isRuntimeUpdateRequired(error.message)
+            ? {
+                label: `Update ${runtimeLabel(runtime)}`,
+                onSelect: () => openRuntimeAction(runtime, "update"),
+              }
+            : undefined,
+      };
+    }),
     ...(composerError && composerError.taskId === activeTask?.id
       ? [
           {
@@ -2229,6 +2259,13 @@ export default function App() {
             title: "Turn error",
             message: composerError.message,
             variant: "error" as const,
+            action:
+              activeTask && isRuntimeUpdateRequired(composerError.message)
+                ? {
+                    label: `Update ${runtimeLabel(activeTask.runtime)}`,
+                    onSelect: () => openRuntimeAction(activeTask.runtime, "update"),
+                  }
+                : undefined,
           },
         ]
       : []),
@@ -2521,7 +2558,8 @@ export default function App() {
                 usage={snapshot.usage}
                 onChangePreferences={setTheme}
                 onResetPreferences={resetTheme}
-                onConnectRuntime={connectRuntime}
+                runtimeActionRequest={runtimeActionRequest}
+                onRefreshRuntimes={refreshRuntimes}
                 onSettingChanged={(key, value) =>
                   setLocalSettings((current) => ({ ...current, [key]: value }))
                 }
@@ -2540,7 +2578,7 @@ export default function App() {
               <SetupView
                 runtimes={snapshot.runtimes}
                 onBack={() => setScreen("workspace")}
-                onLogin={login}
+                onRuntimeAction={openRuntimeAction}
                 onFinish={() => setScreen("workspace")}
               />
             </Suspense>

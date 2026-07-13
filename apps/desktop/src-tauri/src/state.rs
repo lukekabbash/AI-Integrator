@@ -212,6 +212,11 @@ pub struct AppState {
         std::sync::Mutex<HashMap<String, crate::native_actions::NativeActionHandle>>,
     pub voice_typing: std::sync::Mutex<Option<VoiceTypingSession>>,
     pub terminals: std::sync::Mutex<HashMap<String, TerminalSession>>,
+    /// Vendor setup/update PTYs. Each session is born from a native allowlisted
+    /// plan; the renderer can write terminal bytes but cannot choose a program,
+    /// argv, cwd, or inherited environment.
+    pub runtime_terminals:
+        std::sync::Mutex<HashMap<String, crate::runtime_setup::RuntimeTerminalSession>>,
     /// Live delegated subagents keyed by delegation id. Unlike the primary
     /// single-slot runtimes above, children run concurrently.
     pub delegation_children: Mutex<HashMap<String, Arc<crate::state::DelegationChild>>>,
@@ -245,6 +250,7 @@ impl AppState {
             native_action_handles: std::sync::Mutex::new(HashMap::new()),
             voice_typing: std::sync::Mutex::new(None),
             terminals: std::sync::Mutex::new(HashMap::new()),
+            runtime_terminals: std::sync::Mutex::new(HashMap::new()),
             delegation_children: Mutex::new(HashMap::new()),
             broker: std::sync::Mutex::new(None),
         })

@@ -943,6 +943,15 @@ export function Composer({
                 </button>
               </div>
               <p>{notice.message}</p>
+              {notice.action ? (
+                <button
+                  className="composer-notice-action"
+                  type="button"
+                  onClick={notice.action.onSelect}
+                >
+                  {notice.action.label}
+                </button>
+              ) : null}
             </aside>
           ))}
         </div>

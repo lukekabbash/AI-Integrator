@@ -4,12 +4,17 @@ mod broker_mcp;
 mod commands;
 mod delegation;
 mod native_actions;
+mod runtime_setup;
 mod state;
 
 use commands::*;
 use delegation::{
     delegation_approve, delegation_deny, delegation_list, delegation_send_message,
     delegation_stop_cmd,
+};
+use runtime_setup::{
+    runtime_action_plan_list, runtime_terminal_close, runtime_terminal_open,
+    runtime_terminal_resize, runtime_terminal_write,
 };
 use state::AppState;
 use tauri::Manager;
@@ -91,6 +96,11 @@ pub fn run() {
             terminal_run,
             terminal_interrupt,
             terminal_close,
+            runtime_action_plan_list,
+            runtime_terminal_open,
+            runtime_terminal_write,
+            runtime_terminal_resize,
+            runtime_terminal_close,
             git_diff,
             git_stage,
             git_unstage,

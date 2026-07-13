@@ -56,8 +56,8 @@ pub(crate) type CommandResult<T> = std::result::Result<T, CommandError>;
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandError {
-    code: &'static str,
-    message: String,
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
 }
 
 impl From<IntegratorError> for CommandError {

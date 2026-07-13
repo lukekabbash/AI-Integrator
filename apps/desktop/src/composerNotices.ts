@@ -6,11 +6,21 @@ export interface ComposerNotice {
   message: string;
   variant: ComposerNoticeVariant;
   expiresAt?: number;
+  action?: {
+    label: string;
+    onSelect: () => void;
+  };
 }
 
 const USAGE_LIMIT_PATTERN =
   /usage\s+limit|usage_limit|rate\s+limit|credits?\s+(?:depleted|exhausted)/i;
 const RESET_CLOCK_PATTERN = /\bat\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b/i;
+const RUNTIME_UPDATE_PATTERN =
+  /requires? (?:a )?newer version|(?:cli|client|runtime|app)\s+(?:is\s+)?(?:out[ -]of[ -]date|too old)|(?:upgrade|update)\s+(?:to\s+)?(?:the\s+)?latest\s+(?:app|cli|client|runtime|version)/i;
+
+export function isRuntimeUpdateRequired(message: string): boolean {
+  return RUNTIME_UPDATE_PATTERN.test(message);
+}
 
 function localResetTime(value: string, baseline: number): number | undefined {
   const absolute = Date.parse(value);

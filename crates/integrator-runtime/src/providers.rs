@@ -16,6 +16,13 @@ pub fn discover_providers() -> Vec<ProviderStatus> {
     definitions().into_iter().map(discover_one).collect()
 }
 
+pub fn discover_provider(provider: ProviderKind) -> Option<ProviderStatus> {
+    definitions()
+        .into_iter()
+        .find(|definition| definition.provider == provider)
+        .map(discover_one)
+}
+
 fn definitions() -> [ProbeDefinition; 5] {
     [
         ProbeDefinition {
@@ -79,6 +86,7 @@ fn discover_one(definition: ProbeDefinition) -> ProviderStatus {
         Ok(_) => (None, Some("version-probe-failed".into())),
         Err(_) => (None, Some("version-probe-unavailable".into())),
     };
+    let compatibility_code = runtime_compatibility_code(&definition.provider, version.as_deref());
     let (authentication, auth_code) = authentication_status(&definition.provider, &executable);
 
     ProviderStatus {
@@ -88,7 +96,7 @@ fn discover_one(definition: ProbeDefinition) -> ProviderStatus {
         version,
         authentication,
         transport: Some(definition.transport),
-        diagnostic_code: auth_code.or(probe_code),
+        diagnostic_code: auth_code.or(compatibility_code).or(probe_code),
     }
 }
 
@@ -252,6 +260,32 @@ fn first_safe_line(value: &str) -> Option<String> {
         .filter(|line| !line.is_empty())
 }
 
+/// The generated Codex protocol snapshot is 0.144.0. Older app-server builds
+/// can authenticate and list models yet still reject a turn when a newly
+/// advertised model requires a newer client, so auth alone cannot mean ready.
+fn runtime_compatibility_code(provider: &ProviderKind, version: Option<&str>) -> Option<String> {
+    if *provider != ProviderKind::Codex {
+        return None;
+    }
+    version
+        .and_then(version_triplet)
+        .filter(|version| *version < (0, 144, 0))
+        .map(|_| "runtime-update-required".into())
+}
+
+fn version_triplet(value: &str) -> Option<(u32, u32, u32)> {
+    value
+        .split(|character: char| !character.is_ascii_digit() && character != '.')
+        .filter(|candidate| !candidate.is_empty())
+        .find_map(|candidate| {
+            let mut parts = candidate.split('.');
+            let major = parts.next()?.parse().ok()?;
+            let minor = parts.next()?.parse().ok()?;
+            let patch = parts.next()?.parse().ok()?;
+            Some((major, minor, patch))
+        })
+}
+
 #[must_use]
 pub fn provider_executable(statuses: &[ProviderStatus], provider: ProviderKind) -> Option<PathBuf> {
     statuses
@@ -281,6 +315,13 @@ mod tests {
     }
 
     #[test]
+    fn one_provider_probe_does_not_require_a_full_inventory() {
+        let status = discover_provider(ProviderKind::Antigravity).expect("Antigravity definition");
+        assert_eq!(status.provider, ProviderKind::Antigravity);
+        assert!(discover_provider(ProviderKind::CustomAcp).is_none());
+    }
+
+    #[test]
     fn current_cli_entrypoints_are_preferred() {
         let cursor = definitions()
             .into_iter()
@@ -293,6 +334,32 @@ mod tests {
             .find(|definition| definition.provider == ProviderKind::Grok)
             .expect("Grok Build definition");
         assert_eq!(grok.version_args, &["version"]);
+    }
+
+    #[test]
+    fn codex_below_the_protocol_floor_requires_an_update() {
+        assert_eq!(
+            runtime_compatibility_code(&ProviderKind::Codex, Some("codex-cli 0.139.0")),
+            Some("runtime-update-required".into())
+        );
+        assert_eq!(
+            runtime_compatibility_code(&ProviderKind::Codex, Some("codex-cli 0.144.0")),
+            None
+        );
+        assert_eq!(
+            runtime_compatibility_code(&ProviderKind::Claude, Some("0.1.0")),
+            None
+        );
+    }
+
+    #[test]
+    fn version_parser_accepts_vendor_prefixes_and_prereleases() {
+        assert_eq!(
+            version_triplet("codex-cli 0.144.0-alpha.4"),
+            Some((0, 144, 0))
+        );
+        assert_eq!(version_triplet("v2.1.195 (Claude Code)"), Some((2, 1, 195)));
+        assert_eq!(version_triplet("unknown"), None);
     }
 
     #[test]

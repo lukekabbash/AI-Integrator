@@ -1,18 +1,21 @@
-import { useMemo, useRef, useState, useEffect } from "react";
+import { useCallback, useMemo, useRef, useState, useEffect } from "react";
 import { LayoutGroup, m as motion, useReducedMotion } from "motion/react";
 import {
   ArrowLeft,
   Bot,
   Braces,
   Check,
-  ChevronRight,
   CircleDollarSign,
+  Copy,
   Database,
   Download,
+  ExternalLink,
   KeyRound,
+  LoaderCircle,
   Mic,
   MonitorCog,
   Palette,
+  RefreshCw,
   RotateCcw,
   Save,
   Search,
@@ -25,12 +28,15 @@ import {
 import type { LucideIcon } from "lucide-react";
 import {
   bridge,
+  openExternalLink,
   resolveModelEffort,
   runtimeAuthWarning,
   type LocalAppInfo,
   type ModelCatalogEntry,
   type ProviderUsageSummary,
   type RuntimeConnection,
+  type RuntimeActionKind,
+  type RuntimeActionPlan,
   type RuntimeId,
   type StorageTotals,
   type SubscriptionQuota,
@@ -54,6 +60,7 @@ import {
 import { BrandMark } from "./BrandMark";
 import { Tooltip } from "./Tooltip";
 import { Dropdown, ProviderIcon } from "./Dropdown";
+import { RuntimeSetupTerminal } from "./RuntimeSetupTerminal";
 
 type SettingsSection =
   | "general"
@@ -71,10 +78,17 @@ interface SettingsViewProps {
   usage: UsageSnapshot;
   onChangePreferences: (patch: ThemePreferencePatch) => void;
   onResetPreferences: () => void;
-  onConnectRuntime?: (runtime: RuntimeId) => Promise<RuntimeConnection>;
+  runtimeActionRequest?: RuntimeActionRequest | null;
+  onRefreshRuntimes?: () => Promise<RuntimeConnection[]>;
   /** Mirrors each persisted change into the workspace immediately. */
   onSettingChanged?: (key: string, value: unknown) => void;
   onBack: () => void;
+}
+
+export interface RuntimeActionRequest {
+  id: number;
+  runtime: RuntimeId;
+  kind: RuntimeActionKind;
 }
 
 const settingsNav: Array<{ id: SettingsSection; label: string; hint: string; icon: LucideIcon }> = [
@@ -950,31 +964,109 @@ function AppearanceSettings({
   );
 }
 
+function runtimeConnectionForRequest(
+  runtimes: RuntimeConnection[],
+  runtimeId: RuntimeId,
+): RuntimeConnection {
+  return (
+    runtimes.find((candidate) => candidate.id === runtimeId) ?? {
+      id: runtimeId,
+      name: {
+        codex: "Codex",
+        cursor: "Cursor",
+        claude: "Claude Code",
+        grok: "Grok Build",
+        antigravity: "Antigravity",
+        custom: "Custom ACP",
+      }[runtimeId],
+      command: runtimeId,
+      status: "degraded",
+      fidelity: "pty",
+      models: [],
+      detail: "Runtime status will be checked after this action.",
+    }
+  );
+}
+
 function RuntimeSettings({
   runtimes,
-  onConnectRuntime,
+  actionRequest,
+  onRefreshRuntimes,
 }: {
   runtimes: RuntimeConnection[];
-  onConnectRuntime?: (runtime: RuntimeId) => Promise<RuntimeConnection>;
+  actionRequest?: RuntimeActionRequest | null;
+  onRefreshRuntimes?: () => Promise<RuntimeConnection[]>;
 }) {
-  const [busyRuntime, setBusyRuntime] = useState<RuntimeId | null>(null);
+  const handledRequest = useRef(0);
+  const [planner, setPlanner] = useState<{
+    runtime: RuntimeConnection;
+    kind: RuntimeActionKind;
+    plans: RuntimeActionPlan[];
+    selectedId: string;
+  } | null>(null);
+  const [loadingPlan, setLoadingPlan] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [activePlan, setActivePlan] = useState<RuntimeActionPlan | null>(null);
   const [message, setMessage] = useState("");
-  const connectRuntime = async (runtime: RuntimeConnection) => {
-    if (!onConnectRuntime) {
-      setMessage("Runtime setup is available from the Setup route in this build.");
-      return;
-    }
-    setBusyRuntime(runtime.id);
-    setMessage("");
+
+  const openPlanner = useCallback(async (runtime: RuntimeConnection, kind: RuntimeActionKind) => {
+    setLoadingPlan(true);
+    setMessage(`Inspecting documented ${kind} methods for ${runtime.name}…`);
     try {
-      await onConnectRuntime(runtime.id);
-      setMessage(`${runtime.name} setup completed through its vendor-owned flow.`);
+      const plans = await bridge.listRuntimeActionPlans(runtime.id, kind);
+      if (plans.length === 0) {
+        setMessage(
+          `No documented ${kind} command is available for ${runtime.name} on this system.`,
+        );
+        return;
+      }
+      const selected =
+        plans.find((plan) => plan.recommended && plan.available) ??
+        plans.find((plan) => plan.available) ??
+        plans[0];
+      setPlanner({ runtime, kind, plans, selectedId: selected?.id ?? "" });
+      setMessage("");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : `Could not set up ${runtime.name}.`);
+      setMessage(
+        error instanceof Error ? error.message : `Could not inspect ${runtime.name} setup.`,
+      );
     } finally {
-      setBusyRuntime(null);
+      setLoadingPlan(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!actionRequest || handledRequest.current === actionRequest.id) return;
+    handledRequest.current = actionRequest.id;
+    void openPlanner(
+      runtimeConnectionForRequest(runtimes, actionRequest.runtime),
+      actionRequest.kind,
+    );
+  }, [actionRequest, openPlanner, runtimes]);
+
+  const refresh = async (name?: string) => {
+    if (!onRefreshRuntimes) return;
+    setChecking(true);
+    setMessage(name ? `Checking ${name} again…` : "Checking installed runtimes…");
+    try {
+      await onRefreshRuntimes();
+      setMessage(
+        name ? `${name} checked again after the command finished.` : "Runtime status refreshed.",
+      );
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Runtime status could not be refreshed.");
+    } finally {
+      setChecking(false);
     }
   };
+
+  const selectedPlan = planner?.plans.find((plan) => plan.id === planner.selectedId);
+  const startSelectedPlan = () => {
+    if (!selectedPlan?.available) return;
+    setActivePlan(selectedPlan);
+    setPlanner(null);
+  };
+
   return (
     <>
       <div className="settings-page-heading">
@@ -982,16 +1074,29 @@ function RuntimeSettings({
           <Bot />
         </span>
         <div>
-          <h1>Agents & models</h1>
+          <h1>Runtimes</h1>
           <p>
-            Integrator reuses each CLI’s own login and records the exact executable it launches.
+            Inspect, install, authenticate, update, and re-check the local CLIs Integrator can use.
           </p>
         </div>
+        <button
+          className="secondary-button"
+          type="button"
+          onClick={() => void refresh()}
+          disabled={checking}
+          aria-busy={checking}
+        >
+          <RefreshCw className={checking ? "spin-slow" : undefined} aria-hidden="true" />
+          {checking ? "Checking…" : "Check all"}
+        </button>
       </div>
       <section className="settings-section">
         <header>
-          <h2>Installed runtimes</h2>
-          <p>Login and setup always run in vendor-owned or user-controlled surfaces.</p>
+          <h2>Local runtime inventory</h2>
+          <p>
+            Status combines executable discovery, version, authentication, and Integrator’s
+            compatibility floor. A login alone is not reported as ready.
+          </p>
         </header>
         <div className="settings-runtime-list">
           {runtimes.map((runtime) => (
@@ -1004,30 +1109,167 @@ function RuntimeSettings({
                   {runtime.name}
                   <small data-status={runtime.status}>{runtime.status.replace("_", " ")}</small>
                 </strong>
-                <code>{runtime.command}</code>
+                <code>{runtime.version ?? "Version not reported"}</code>
                 <p>{runtime.detail}</p>
+                <code className="runtime-executable">{runtime.command}</code>
               </span>
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={() => void connectRuntime(runtime)}
-                disabled={busyRuntime !== null}
-              >
-                {busyRuntime === runtime.id
-                  ? "Checking…"
-                  : runtime.status === "connected"
-                    ? "Details"
-                    : "Set up"}
-                <ChevronRight />
-              </button>
+              <span className="runtime-row-actions">
+                {runtime.status === "not_installed" ? (
+                  <button
+                    className="primary-button"
+                    type="button"
+                    onClick={() => void openPlanner(runtime, "install")}
+                    disabled={loadingPlan}
+                  >
+                    Install
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      className={
+                        runtime.status === "login_required" ? "primary-button" : "secondary-button"
+                      }
+                      type="button"
+                      onClick={() => void openPlanner(runtime, "login")}
+                      disabled={loadingPlan}
+                    >
+                      Sign in
+                    </button>
+                    <button
+                      className={
+                        runtime.status === "degraded" ? "primary-button" : "secondary-button"
+                      }
+                      type="button"
+                      onClick={() => void openPlanner(runtime, "update")}
+                      disabled={loadingPlan}
+                    >
+                      Update
+                    </button>
+                  </>
+                )}
+              </span>
             </div>
           ))}
         </div>
       </section>
+      {activePlan ? (
+        <RuntimeSetupTerminal
+          plan={activePlan}
+          onClose={() => setActivePlan(null)}
+          onExit={() =>
+            void refresh(runtimes.find((runtime) => runtime.id === activePlan.provider)?.name)
+          }
+        />
+      ) : null}
       {message ? (
         <p className="settings-action-message" role="status">
           {message}
         </p>
+      ) : null}
+      {planner && selectedPlan ? (
+        <div className="runtime-action-backdrop" role="presentation">
+          <section
+            className="runtime-action-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="runtime-action-title"
+          >
+            <header>
+              <span>
+                <strong id="runtime-action-title">
+                  {planner.kind === "install"
+                    ? `Install ${planner.runtime.name}`
+                    : planner.kind === "update"
+                      ? `Update ${planner.runtime.name}`
+                      : `Sign in to ${planner.runtime.name}`}
+                </strong>
+                <small>Review the exact local command before anything runs.</small>
+              </span>
+              <button
+                className="icon-button"
+                type="button"
+                onClick={() => setPlanner(null)}
+                aria-label="Cancel runtime command"
+              >
+                ×
+              </button>
+            </header>
+            {planner.plans.length > 1 ? (
+              <fieldset className="runtime-methods">
+                <legend>Method</legend>
+                {planner.plans.map((plan) => (
+                  <label key={plan.id} data-available={plan.available}>
+                    <input
+                      type="radio"
+                      name="runtime-method"
+                      value={plan.id}
+                      checked={planner.selectedId === plan.id}
+                      disabled={!plan.available}
+                      onChange={() =>
+                        setPlanner((current) =>
+                          current ? { ...current, selectedId: plan.id } : current,
+                        )
+                      }
+                    />
+                    <span>
+                      <strong>
+                        {plan.method}
+                        {plan.recommended ? " · Recommended" : ""}
+                      </strong>
+                      <small>{plan.available ? plan.description : plan.unavailableReason}</small>
+                    </span>
+                  </label>
+                ))}
+              </fieldset>
+            ) : null}
+            <div className="runtime-command-disclosure">
+              <span>
+                <strong>Command</strong>
+                <small>{selectedPlan.method}</small>
+              </span>
+              <code>{selectedPlan.command}</code>
+              <button
+                className="icon-button"
+                type="button"
+                aria-label="Copy runtime command"
+                onClick={() => void navigator.clipboard.writeText(selectedPlan.command)}
+              >
+                <Copy aria-hidden="true" />
+              </button>
+            </div>
+            <p>{selectedPlan.environmentNote}</p>
+            {selectedPlan.downloadsAndExecutesCode ? (
+              <p className="runtime-action-warning">
+                <TriangleAlert aria-hidden="true" /> This command downloads and executes vendor code
+                and may replace files outside your projects.
+              </p>
+            ) : null}
+            <div className="runtime-action-source">
+              <button
+                className="text-button"
+                type="button"
+                disabled={!selectedPlan.sourceUrl}
+                onClick={() => void openExternalLink(selectedPlan.sourceUrl)}
+              >
+                <ExternalLink aria-hidden="true" /> Vendor documentation
+              </button>
+            </div>
+            <footer>
+              <button className="secondary-button" type="button" onClick={() => setPlanner(null)}>
+                Cancel
+              </button>
+              <button
+                className="primary-button"
+                type="button"
+                disabled={!selectedPlan.available}
+                onClick={startSelectedPlan}
+              >
+                {loadingPlan ? <LoaderCircle className="spin-slow" aria-hidden="true" /> : null}
+                Run this command
+              </button>
+            </footer>
+          </section>
+        </div>
       ) : null}
     </>
   );
@@ -1844,7 +2086,9 @@ const navPillSpring = {
 export function SettingsView(props: SettingsViewProps) {
   const reduceMotion =
     Boolean(useReducedMotion()) || document.documentElement.dataset.motion === "none";
-  const [section, setSection] = useState<SettingsSection>("appearance");
+  const [section, setSection] = useState<SettingsSection>(
+    props.runtimeActionRequest ? "runtimes" : "appearance",
+  );
   const [query, setQuery] = useState("");
   const [settings, setSettings] = useState<SettingsMap>(DEFAULT_SETTINGS);
   const [appInfo, setAppInfo] = useState<LocalAppInfo>({
@@ -2040,7 +2284,11 @@ export function SettingsView(props: SettingsViewProps) {
             />
           ) : null}
           {section === "runtimes" ? (
-            <RuntimeSettings runtimes={props.runtimes} onConnectRuntime={props.onConnectRuntime} />
+            <RuntimeSettings
+              runtimes={props.runtimes}
+              actionRequest={props.runtimeActionRequest}
+              onRefreshRuntimes={props.onRefreshRuntimes}
+            />
           ) : null}
           {section === "usage" ? (
             <UsageSettings usage={props.usage} runtimes={props.runtimes} />

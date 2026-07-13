@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-runtime-terminal-write"
+description = "Enables the runtime_terminal_write command without any pre-configured scope."
+commands.allow = ["runtime_terminal_write"]
+
+[[permission]]
+identifier = "deny-runtime-terminal-write"
+description = "Denies the runtime_terminal_write command without any pre-configured scope."
+commands.deny = ["runtime_terminal_write"]

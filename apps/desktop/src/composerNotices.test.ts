@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { Composer } from "./components/Composer";
 import {
   composerNoticeExpiry,
+  isRuntimeUpdateRequired,
   usageResetAtFromMessage,
   type ComposerNotice,
 } from "./composerNotices";
@@ -56,6 +57,20 @@ describe("composer notice expiry", () => {
     expect(
       composerNoticeExpiry("You've hit your usage limit.", "2026-07-11T04:00:00", "5:03 AM"),
     ).toBe(new Date("2026-07-11T05:03:00").getTime());
+  });
+});
+
+describe("runtime update notices", () => {
+  it("recognizes provider version failures without treating unrelated turn errors as updates", () => {
+    expect(
+      isRuntimeUpdateRequired(
+        "'gpt-5.6-luna' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.",
+      ),
+    ).toBe(true);
+    expect(
+      isRuntimeUpdateRequired("Claude CLI is out of date. Update to the latest version."),
+    ).toBe(true);
+    expect(isRuntimeUpdateRequired("The provider process exited unexpectedly.")).toBe(false);
   });
 });
 
@@ -128,5 +143,23 @@ describe("composer notices", () => {
       vi.advanceTimersByTime(5_001);
     });
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("offers an explicit runtime update action when the caller supplies one", () => {
+    const onSelect = vi.fn();
+    const notices: ComposerNotice[] = [
+      {
+        id: "runtime-old",
+        title: "Turn error",
+        message: "This model requires a newer version of Codex.",
+        variant: "error",
+        action: { label: "Update codex", onSelect },
+      },
+    ];
+
+    render(createElement(Composer, { ...baseComposerProps, notices }));
+    fireEvent.click(screen.getByRole("button", { name: "Update codex" }));
+
+    expect(onSelect).toHaveBeenCalledOnce();
   });
 });

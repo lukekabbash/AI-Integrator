@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-runtime-terminal-open"
+description = "Enables the runtime_terminal_open command without any pre-configured scope."
+commands.allow = ["runtime_terminal_open"]
+
+[[permission]]
+identifier = "deny-runtime-terminal-open"
+description = "Denies the runtime_terminal_open command without any pre-configured scope."
+commands.deny = ["runtime_terminal_open"]

@@ -572,6 +572,40 @@ export interface TerminalOutputEvent {
   cwd: string;
 }
 
+export type RuntimeActionKind = "install" | "update" | "login";
+
+export interface RuntimeActionPlan {
+  /** Native-resolved identifier; execution re-resolves it instead of trusting renderer argv. */
+  id: string;
+  provider: RuntimeId;
+  kind: RuntimeActionKind;
+  method: string;
+  label: string;
+  command: string;
+  description: string;
+  sourceUrl: string;
+  available: boolean;
+  unavailableReason?: string;
+  recommended: boolean;
+  downloadsAndExecutesCode: boolean;
+  modifiesOutsideProjects: boolean;
+  environmentNote: string;
+}
+
+export interface RuntimeTerminalInfo {
+  id: string;
+  provider: RuntimeId;
+  kind: RuntimeActionKind;
+  command: string;
+}
+
+export interface RuntimeTerminalOutputEvent {
+  sessionId: string;
+  stream: "output" | "exit";
+  data?: string;
+  exitCode?: number | null;
+}
+
 export interface AppBridge {
   getAppInfo(): Promise<LocalAppInfo>;
   getStorageTotals(): Promise<StorageTotals>;
@@ -613,6 +647,20 @@ export interface AppBridge {
   interruptTerminal(sessionId: string): Promise<void>;
   closeTerminal(sessionId: string): Promise<void>;
   subscribeTerminalOutput(listener: (event: TerminalOutputEvent) => void): Promise<() => void>;
+  listRuntimeActionPlans(runtime: RuntimeId, kind: RuntimeActionKind): Promise<RuntimeActionPlan[]>;
+  openRuntimeTerminal(
+    planId: string,
+    dimensions: { cols: number; rows: number },
+  ): Promise<RuntimeTerminalInfo>;
+  writeRuntimeTerminal(sessionId: string, data: string): Promise<void>;
+  resizeRuntimeTerminal(
+    sessionId: string,
+    dimensions: { cols: number; rows: number },
+  ): Promise<void>;
+  closeRuntimeTerminal(sessionId: string): Promise<void>;
+  subscribeRuntimeTerminalOutput(
+    listener: (event: RuntimeTerminalOutputEvent) => void,
+  ): Promise<() => void>;
   supportsTaskMetadata(): boolean;
   updateTaskMetadata(
     taskId: string,
@@ -1400,7 +1448,9 @@ function mapRuntime(status: NativeProviderStatus): RuntimeConnection {
     antigravity: "Antigravity",
     custom: "Custom ACP",
   };
-  const connected = status.installed && status.authentication === "authenticated";
+  const updateRequired = status.diagnosticCode === "runtime-update-required";
+  const connected =
+    status.installed && status.authentication === "authenticated" && !updateRequired;
   return {
     id,
     name: names[id],
@@ -1424,7 +1474,9 @@ function mapRuntime(status: NativeProviderStatus): RuntimeConnection {
             ? "structured"
             : "pty",
     models: [],
-    detail: status.diagnosticCode ?? (connected ? "Authenticated local CLI" : "Status unavailable"),
+    detail: updateRequired
+      ? "This CLI is authenticated but older than Integrator's certified protocol floor."
+      : (status.diagnosticCode ?? (connected ? "Authenticated local CLI" : "Status unavailable")),
   };
 }
 
@@ -2640,6 +2692,74 @@ export const bridge: AppBridge = {
     if (!isTauri()) return () => undefined;
     const { listen } = await import("@tauri-apps/api/event");
     return listen<TerminalOutputEvent>("terminal://output", (event) => {
+      listener(event.payload);
+    });
+  },
+
+  listRuntimeActionPlans: async (runtime, kind) => {
+    if (isTauri()) {
+      return nativeInvoke<RuntimeActionPlan[]>("runtime_action_plan_list", {
+        provider: runtime,
+        kind,
+      });
+    }
+    const current = readDemoSnapshot().runtimes.find((candidate) => candidate.id === runtime);
+    if (kind !== "install" && !current) return [];
+    const command =
+      kind === "install"
+        ? `Install ${runtime} with its official installer`
+        : kind === "login"
+          ? `${current?.command ?? runtime} login`
+          : `${current?.command ?? runtime} update`;
+    return [
+      {
+        id: `${runtime}:${kind}:preview`,
+        provider: runtime,
+        kind,
+        method: kind === "install" ? "Official installer" : "Vendor CLI",
+        label: kind === "install" ? "Install with official installer" : `${kind} with vendor CLI`,
+        command,
+        description: "Native builds resolve and run this provider-owned action locally.",
+        sourceUrl: "",
+        available: true,
+        recommended: true,
+        downloadsAndExecutesCode: kind !== "login",
+        modifiesOutsideProjects: true,
+        environmentNote:
+          "Runs locally with a reduced environment. API-key variables are not inherited.",
+      },
+    ];
+  },
+
+  openRuntimeTerminal: async (planId, dimensions) => {
+    if (!isTauri()) {
+      throw new Error("Runtime setup commands run only in the native desktop app.");
+    }
+    return nativeInvoke<RuntimeTerminalInfo>("runtime_terminal_open", {
+      planId,
+      ...dimensions,
+    });
+  },
+
+  writeRuntimeTerminal: async (sessionId, data) => {
+    if (!isTauri()) return;
+    await nativeInvoke("runtime_terminal_write", { sessionId, data });
+  },
+
+  resizeRuntimeTerminal: async (sessionId, dimensions) => {
+    if (!isTauri()) return;
+    await nativeInvoke("runtime_terminal_resize", { sessionId, ...dimensions });
+  },
+
+  closeRuntimeTerminal: async (sessionId) => {
+    if (!isTauri()) return;
+    await nativeInvoke("runtime_terminal_close", { sessionId });
+  },
+
+  subscribeRuntimeTerminalOutput: async (listener) => {
+    if (!isTauri()) return () => undefined;
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<RuntimeTerminalOutputEvent>("runtime-terminal://output", (event) => {
       listener(event.payload);
     });
   },

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-runtime-action-plan-list"
+description = "Enables the runtime_action_plan_list command without any pre-configured scope."
+commands.allow = ["runtime_action_plan_list"]
+
+[[permission]]
+identifier = "deny-runtime-action-plan-list"
+description = "Denies the runtime_action_plan_list command without any pre-configured scope."
+commands.deny = ["runtime_action_plan_list"]

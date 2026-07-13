@@ -14,6 +14,9 @@ const { bridgeMock } = vi.hoisted(() => ({
     persistSession: vi.fn(),
     probeRuntimes: vi.fn(),
     beginRuntimeLogin: vi.fn(),
+    listRuntimeActionPlans: vi.fn(),
+    listSettings: vi.fn(),
+    getAppInfo: vi.fn(),
     openProject: vi.fn(),
     registerProject: vi.fn(),
     listProjects: vi.fn(),
@@ -74,6 +77,20 @@ function projection(
 
 describe("native runtime recovery UI", () => {
   beforeEach(() => {
+    const localValues = new Map<string, string>();
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: {
+        clear: () => localValues.clear(),
+        getItem: (key: string) => localValues.get(key) ?? null,
+        key: (index: number) => [...localValues.keys()][index] ?? null,
+        get length() {
+          return localValues.size;
+        },
+        removeItem: (key: string) => localValues.delete(key),
+        setItem: (key: string, value: string) => localValues.set(key, value),
+      },
+    });
     Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
     for (const value of Object.values(bridgeMock)) value.mockReset();
     bridgeMock.listProjectFileOpeners.mockResolvedValue([]);
@@ -87,6 +104,13 @@ describe("native runtime recovery UI", () => {
     bridgeMock.listNativeProviderActions.mockResolvedValue([]);
     bridgeMock.listDelegations.mockResolvedValue([]);
     bridgeMock.listModelCatalog.mockResolvedValue([]);
+    bridgeMock.listSettings.mockResolvedValue([]);
+    bridgeMock.getAppInfo.mockResolvedValue({
+      applicationVersion: "test",
+      domainSchemaVersion: 2,
+      dataDirectory: "H:\\AppData\\Integrator",
+      localOnly: true,
+    });
     bridgeMock.subscribeDelegationUpdates.mockResolvedValue(vi.fn());
     const workspace = createEmptySnapshot();
     workspace.projects = [
@@ -636,6 +660,45 @@ describe("native runtime recovery UI", () => {
     ).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Dismiss Turn error" }));
     expect(screen.queryByText("gemini turn execution is not implemented")).not.toBeInTheDocument();
+  });
+
+  it("routes a provider version error into disclosed Runtime Settings without executing it", async () => {
+    bridgeMock.listRuntimeActionPlans.mockResolvedValue([
+      {
+        id: "codex:update:vendor-cli",
+        provider: "codex",
+        kind: "update",
+        method: "Vendor CLI",
+        label: "Update with the installed CLI",
+        command: "/opt/homebrew/bin/codex update",
+        description: "Runs the exact installed vendor CLI.",
+        sourceUrl: "https://developers.openai.com/codex/cli",
+        available: true,
+        recommended: true,
+        downloadsAndExecutesCode: true,
+        modifiesOutsideProjects: true,
+        environmentNote: "Runs locally with a reduced environment.",
+      },
+    ]);
+
+    render(<App />);
+    await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
+
+    act(() => {
+      runtimeListener?.(
+        projection(10, {
+          kind: "turnError",
+          message:
+            "'gpt-5.6-luna' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.",
+          retryable: false,
+        }),
+      );
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Update Codex" }));
+    const dialog = await screen.findByRole("dialog", { name: "Update Codex" });
+    expect(dialog).toHaveTextContent("/opt/homebrew/bin/codex update");
+    expect(dialog).toHaveTextContent("Review the exact local command before anything runs");
   });
 
   it("allows stale approval operation errors to be dismissed", async () => {

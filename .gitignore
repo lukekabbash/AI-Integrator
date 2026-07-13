@@ -108,3 +108,11 @@ test-results/
 *.dmg
 *.app.tar.gz
 *.sig
+
+# Agent provider research corpus (local scratch; keep Claude Code manifest only)
+temp/agent-provider-docs-2026-07-13/*
+!temp/agent-provider-docs-2026-07-13/providers/
+temp/agent-provider-docs-2026-07-13/providers/*
+!temp/agent-provider-docs-2026-07-13/providers/claude-code/
+temp/agent-provider-docs-2026-07-13/providers/claude-code/*
+!temp/agent-provider-docs-2026-07-13/providers/claude-code/source-manifest.json

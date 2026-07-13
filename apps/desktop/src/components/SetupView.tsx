@@ -5,35 +5,24 @@ import {
   ArrowRight,
   Check,
   HardDrive,
-  LoaderCircle,
   RefreshCw,
   ShieldCheck,
   TerminalSquare,
   WifiOff,
 } from "lucide-react";
-import type { RuntimeConnection, RuntimeId } from "../bridge";
+import type { RuntimeActionKind, RuntimeConnection, RuntimeId } from "../bridge";
 import { BrandMark } from "./BrandMark";
 import { ProviderIcon } from "./Dropdown";
 
 interface SetupViewProps {
   runtimes: RuntimeConnection[];
   onBack: () => void;
-  onLogin: (runtime: RuntimeId) => Promise<void>;
+  onRuntimeAction: (runtime: RuntimeId, kind: RuntimeActionKind) => void;
   onFinish: () => void;
 }
 
-export function SetupView({ runtimes, onBack, onLogin, onFinish }: SetupViewProps) {
+export function SetupView({ runtimes, onBack, onRuntimeAction, onFinish }: SetupViewProps) {
   const [step, setStep] = useState<"welcome" | "runtimes" | "privacy">("welcome");
-  const [loggingIn, setLoggingIn] = useState<RuntimeId | null>(null);
-
-  const login = async (runtime: RuntimeId) => {
-    setLoggingIn(runtime);
-    try {
-      await onLogin(runtime);
-    } finally {
-      setLoggingIn(null);
-    }
-  };
 
   return (
     <main className="setup-screen" id="main-content">
@@ -131,36 +120,28 @@ export function SetupView({ runtimes, onBack, onLogin, onFinish }: SetupViewProp
                       <button
                         className="secondary-button"
                         type="button"
-                        onClick={() => void login(runtime.id)}
-                        disabled={loggingIn !== null}
+                        onClick={() => onRuntimeAction(runtime.id, "update")}
                       >
-                        {loggingIn === runtime.id ? (
-                          <LoaderCircle className="spin-slow" />
-                        ) : (
-                          <RefreshCw />
-                        )}{" "}
-                        Check status
+                        <RefreshCw /> Review
                       </button>
                     ) : null}
                     {runtime.status === "login_required" ? (
                       <button
                         className="primary-button"
                         type="button"
-                        onClick={() => void login(runtime.id)}
-                        disabled={loggingIn !== null}
+                        onClick={() => onRuntimeAction(runtime.id, "login")}
                       >
-                        {loggingIn === runtime.id ? (
-                          <LoaderCircle className="spin-slow" />
-                        ) : (
-                          <RefreshCw />
-                        )}{" "}
-                        Sign in
+                        <RefreshCw /> Sign in
                       </button>
                     ) : null}
                     {runtime.status === "not_installed" ? (
-                      <span className="runtime-install-hint">
-                        Install the vendor CLI to connect
-                      </span>
+                      <button
+                        className="primary-button"
+                        type="button"
+                        onClick={() => onRuntimeAction(runtime.id, "install")}
+                      >
+                        Install
+                      </button>
                     ) : null}
                   </div>
                 ))}
