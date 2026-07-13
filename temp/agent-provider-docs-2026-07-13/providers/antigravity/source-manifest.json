@@ -1,0 +1,14 @@
+[
+  {"url":"https://antigravity.google/docs/cli-getting-started","title":"CLI getting started/install/auth","kind":"cli","authority":"official","topics":["install","auth"]},
+  {"url":"https://antigravity.google/docs/cli-install","title":"CLI installation and authlink","kind":"install","authority":"official","topics":["install","auth","updates"]},
+  {"url":"https://antigravity.google/docs/cli-using","title":"CLI usage/settings/permissions","kind":"usage","authority":"official","topics":["commands","permissions","config"]},
+  {"url":"https://antigravity.google/docs/cli-settings","title":"CLI settings","kind":"config","authority":"official","topics":["config"]},
+  {"url":"https://antigravity.google/product/antigravity-cli","title":"CLI product/features","kind":"overview","authority":"official","topics":["features","agents","mcp"]},
+  {"url":"https://github.com/google-antigravity/antigravity-cli","title":"Official CLI repository","kind":"source","authority":"official","topics":["source","commands"]},
+  {"url":"https://github.com/google-antigravity/antigravity-cli/blob/main/CHANGELOG.md","title":"Official CLI changelog","kind":"updates","authority":"official","topics":["updates","drift"]},
+  {"url":"https://antigravity.google/docs/cli-overview","title":"CLI overview","kind":"overview","authority":"official","topics":["architecture","tui"]},
+  {"url":"https://www.antigravity.google/blog/introducing-google-antigravity-cli","title":"Official CLI introduction","kind":"product","authority":"official","topics":["architecture"]},
+  {"url":"https://codelabs.developers.google.com/antigravity-cli-hands-on","title":"Official hands-on codelab","kind":"tutorial","authority":"official","topics":["usage","auth"]},
+  {"url":"https://codelabs.developers.google.com/sdd-agy-cli","title":"Spec-driven CLI codelab","kind":"tutorial","authority":"official","topics":["skills","mcp","workflows"]},
+  {"url":"https://www.antigravity.google/docs/home","title":"Google Antigravity documentation home","kind":"index","authority":"official","topics":["docs"]}
+]

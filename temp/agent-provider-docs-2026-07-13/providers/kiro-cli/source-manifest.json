@@ -1,0 +1,182 @@
+[
+  {
+    "url": "https://agentclientprotocol.com/protocol/overview",
+    "title": "ACP overview",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://agentclientprotocol.com/protocol/v1/transports",
+    "title": "ACP transports",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://agentclientprotocol.com/protocol/session-setup",
+    "title": "ACP session setup",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://agentclientprotocol.com/protocol/session-config-options",
+    "title": "ACP session config options",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://agentclientprotocol.com/protocol/permissions",
+    "title": "ACP permissions",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://kiro.dev/docs/cli/",
+    "title": "Kiro CLI overview",
+    "kind": "overview",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "overview"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://kiro.dev/docs/cli/installation/",
+    "title": "Kiro CLI installation/update",
+    "kind": "install",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "install"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://kiro.dev/docs/cli/quick-start/",
+    "title": "Kiro CLI quickstart",
+    "kind": "usage",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "usage"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://kiro.dev/docs/cli/reference/cli-commands/",
+    "title": "Kiro CLI commands",
+    "kind": "cli",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "cli"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://kiro.dev/docs/cli/reference/slash-commands/",
+    "title": "Kiro slash commands",
+    "kind": "commands",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "commands"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://kiro.dev/docs/cli/authentication/",
+    "title": "Kiro CLI authentication",
+    "kind": "auth",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "auth"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://kiro.dev/docs/cli/agents/",
+    "title": "Kiro custom agents",
+    "kind": "agents",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "agents"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://kiro.dev/docs/cli/mcp/",
+    "title": "Kiro MCP",
+    "kind": "mcp",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "mcp"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://kiro.dev/docs/cli/hooks/",
+    "title": "Kiro hooks",
+    "kind": "hooks",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "hooks"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://kiro.dev/docs/cli/permissions/",
+    "title": "Kiro permissions",
+    "kind": "permissions",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "permissions"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://kiro.dev/docs/cli/v3/",
+    "title": "Kiro CLI 3.0 early access",
+    "kind": "versioning",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "versioning"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://kiro.dev/docs/cli/built-in-tools/",
+    "title": "Kiro built-in tools",
+    "kind": "tools",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "tools"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://kiro.dev/docs/cli/code-intelligence/",
+    "title": "Kiro code intelligence",
+    "kind": "tools",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "tools"
+    ],
+    "priority": "supporting"
+  }
+]

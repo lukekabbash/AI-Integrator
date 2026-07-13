@@ -1,0 +1,172 @@
+[
+  {
+    "url": "https://agentclientprotocol.com/protocol/overview",
+    "title": "ACP overview",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://agentclientprotocol.com/protocol/v1/transports",
+    "title": "ACP transports",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://agentclientprotocol.com/protocol/session-setup",
+    "title": "ACP session setup",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://agentclientprotocol.com/protocol/session-config-options",
+    "title": "ACP session config options",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://agentclientprotocol.com/protocol/permissions",
+    "title": "ACP permissions",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://docs.cline.bot/cli/cli-reference",
+    "title": "Cline CLI reference",
+    "kind": "cli",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "cli"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.cline.bot/getting-started/installing-cline",
+    "title": "Installing Cline CLI",
+    "kind": "install",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "install"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.cline.bot/cli/headless",
+    "title": "Cline headless mode",
+    "kind": "headless",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "headless"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.cline.bot/cli/acp",
+    "title": "Cline ACP",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.cline.bot/cli/authentication",
+    "title": "Cline authentication",
+    "kind": "auth",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "auth"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.cline.bot/cli/configuration",
+    "title": "Cline configuration",
+    "kind": "config",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "config"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.cline.bot/cli/mcp",
+    "title": "Cline MCP",
+    "kind": "mcp",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "mcp"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.cline.bot/cli/hooks",
+    "title": "Cline hooks",
+    "kind": "hooks",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "hooks"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.cline.bot/cli/permissions",
+    "title": "Cline command permissions",
+    "kind": "permissions",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "permissions"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.cline.bot/cli/sessions",
+    "title": "Cline sessions/history",
+    "kind": "sessions",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "sessions"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.cline.bot/cli/update",
+    "title": "Cline updates",
+    "kind": "updates",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "updates"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://github.com/cline/cline",
+    "title": "Cline source repository",
+    "kind": "source",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "source"
+    ],
+    "priority": "supporting"
+  }
+]

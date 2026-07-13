@@ -1,0 +1,172 @@
+[
+  {
+    "url": "https://agentclientprotocol.com/protocol/overview",
+    "title": "ACP overview",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://agentclientprotocol.com/protocol/v1/transports",
+    "title": "ACP transports",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://agentclientprotocol.com/protocol/session-setup",
+    "title": "ACP session setup",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://agentclientprotocol.com/protocol/session-config-options",
+    "title": "ACP session config options",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://agentclientprotocol.com/protocol/permissions",
+    "title": "ACP permissions",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://github.com/QwenLM/qwen-code",
+    "title": "Qwen Code source repository",
+    "kind": "source",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "source"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://github.com/QwenLM/qwen-code/blob/main/README.md",
+    "title": "Qwen Code README",
+    "kind": "overview",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "overview"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://github.com/QwenLM/qwen-code/tree/main/docs",
+    "title": "Qwen Code docs",
+    "kind": "docs",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "docs"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://github.com/QwenLM/qwen-code/blob/main/docs/users/configuration/settings.md",
+    "title": "Qwen Code settings",
+    "kind": "config",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "config"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://github.com/QwenLM/qwen-code/blob/main/docs/users/features/acp.md",
+    "title": "Qwen Code ACP",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://github.com/QwenLM/qwen-code/blob/main/docs/users/features/headless.md",
+    "title": "Qwen Code headless mode",
+    "kind": "headless",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "headless"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://github.com/QwenLM/qwen-code/blob/main/docs/users/features/mcp.md",
+    "title": "Qwen Code MCP",
+    "kind": "mcp",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "mcp"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://github.com/QwenLM/qwen-code/blob/main/docs/users/features/skills.md",
+    "title": "Qwen Code skills",
+    "kind": "skills",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "skills"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://github.com/QwenLM/qwen-code/blob/main/docs/users/features/subagents.md",
+    "title": "Qwen Code subagents",
+    "kind": "agents",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "agents"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://github.com/QwenLM/qwen-code/blob/main/docs/users/authentication.md",
+    "title": "Qwen Code authentication",
+    "kind": "auth",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "auth"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://github.com/QwenLM/qwen-code/releases",
+    "title": "Qwen Code releases",
+    "kind": "updates",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "updates"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/qwen-code",
+    "title": "Qwen Cloud Qwen Code guide",
+    "kind": "install",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "install"
+    ],
+    "priority": "supporting"
+  }
+]

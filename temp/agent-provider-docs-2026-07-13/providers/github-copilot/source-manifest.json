@@ -1,0 +1,182 @@
+[
+  {
+    "url": "https://agentclientprotocol.com/protocol/overview",
+    "title": "ACP overview",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://agentclientprotocol.com/protocol/v1/transports",
+    "title": "ACP transports",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://agentclientprotocol.com/protocol/session-setup",
+    "title": "ACP session setup",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://agentclientprotocol.com/protocol/session-config-options",
+    "title": "ACP session config options",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://agentclientprotocol.com/protocol/permissions",
+    "title": "ACP permissions",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://docs.github.com/en/copilot/reference/copilot-cli-reference",
+    "title": "Copilot CLI reference index",
+    "kind": "overview",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "overview"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference",
+    "title": "Copilot CLI command reference",
+    "kind": "cli",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "cli"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.github.com/en/copilot/reference/copilot-cli-reference/programmatic-use",
+    "title": "Copilot CLI programmatic use",
+    "kind": "headless",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "headless"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server",
+    "title": "Copilot CLI ACP server",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.github.com/en/copilot/reference/copilot-cli-reference/configuration-directory",
+    "title": "Copilot configuration directory",
+    "kind": "config",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "config"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.github.com/en/copilot/reference/copilot-cli-reference/authentication",
+    "title": "Copilot CLI authentication",
+    "kind": "auth",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "auth"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.github.com/en/copilot/reference/copilot-cli-reference/permissions",
+    "title": "Copilot CLI permissions",
+    "kind": "permissions",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "permissions"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.github.com/en/copilot/reference/copilot-cli-reference/mcp-configuration",
+    "title": "Copilot MCP configuration",
+    "kind": "mcp",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "mcp"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.github.com/en/copilot/reference/copilot-cli-reference/hooks-reference",
+    "title": "Copilot hooks",
+    "kind": "hooks",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "hooks"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.github.com/en/copilot/reference/copilot-cli-reference/skills-reference",
+    "title": "Copilot skills",
+    "kind": "skills",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "skills"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.github.com/en/copilot/reference/copilot-cli-reference/custom-agents",
+    "title": "Copilot custom agents",
+    "kind": "agents",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "agents"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://docs.github.com/en/copilot/reference/copilot-cli-reference/security",
+    "title": "Copilot CLI security",
+    "kind": "security",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "security"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://github.com/github/copilot-cli/releases",
+    "title": "Copilot CLI releases",
+    "kind": "updates",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "updates"
+    ],
+    "priority": "supporting"
+  }
+]

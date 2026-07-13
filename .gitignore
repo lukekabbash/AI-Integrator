@@ -109,10 +109,13 @@ test-results/
 *.app.tar.gz
 *.sig
 
-# Agent provider research corpus (local scratch; keep Claude Code manifest only)
+# Agent provider research corpus (local scratch; keep provider dossiers only)
 temp/agent-provider-docs-2026-07-13/*
 !temp/agent-provider-docs-2026-07-13/providers/
 temp/agent-provider-docs-2026-07-13/providers/*
-!temp/agent-provider-docs-2026-07-13/providers/claude-code/
-temp/agent-provider-docs-2026-07-13/providers/claude-code/*
-!temp/agent-provider-docs-2026-07-13/providers/claude-code/source-manifest.json
+!temp/agent-provider-docs-2026-07-13/providers/*/
+temp/agent-provider-docs-2026-07-13/providers/*/*
+!temp/agent-provider-docs-2026-07-13/providers/*/README.md
+!temp/agent-provider-docs-2026-07-13/providers/*/INTEGRATOR-NOTES.md
+!temp/agent-provider-docs-2026-07-13/providers/*/FEATURE-MATRIX.md
+!temp/agent-provider-docs-2026-07-13/providers/*/source-manifest.json

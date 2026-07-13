@@ -1,0 +1,182 @@
+[
+  {
+    "url": "https://agentclientprotocol.com/protocol/overview",
+    "title": "ACP overview",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://agentclientprotocol.com/protocol/v1/transports",
+    "title": "ACP transports",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://agentclientprotocol.com/protocol/session-setup",
+    "title": "ACP session setup",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://agentclientprotocol.com/protocol/session-config-options",
+    "title": "ACP session config options",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://agentclientprotocol.com/protocol/permissions",
+    "title": "ACP permissions",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://google-gemini.github.io/gemini-cli/docs/",
+    "title": "Gemini CLI documentation index",
+    "kind": "overview",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "overview"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://google-gemini.github.io/gemini-cli/docs/cli/",
+    "title": "Gemini CLI overview and headless mode",
+    "kind": "cli",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "cli"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://google-gemini.github.io/gemini-cli/docs/cli/commands.html",
+    "title": "Gemini CLI commands",
+    "kind": "commands",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "commands"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://google-gemini.github.io/gemini-cli/docs/get-started/configuration.html",
+    "title": "Gemini CLI configuration",
+    "kind": "config",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "config"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://google-gemini.github.io/gemini-cli/docs/get-started/authentication.html",
+    "title": "Gemini CLI authentication",
+    "kind": "auth",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "auth"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/acp-mode.md",
+    "title": "Gemini CLI ACP mode",
+    "kind": "protocol",
+    "authority": "protocol-authority",
+    "topics": [
+      "protocol"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://google-gemini.github.io/gemini-cli/docs/cli/headless.html",
+    "title": "Gemini CLI headless mode",
+    "kind": "headless",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "headless"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://google-gemini.github.io/gemini-cli/docs/cli/checkpointing.html",
+    "title": "Gemini CLI checkpointing",
+    "kind": "sessions",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "sessions"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://google-gemini.github.io/gemini-cli/docs/cli/sandbox.html",
+    "title": "Gemini CLI sandbox",
+    "kind": "permissions",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "permissions"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://google-gemini.github.io/gemini-cli/docs/cli/trusted-folders.html",
+    "title": "Gemini CLI trusted folders",
+    "kind": "security",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "security"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://google-gemini.github.io/gemini-cli/docs/tools/",
+    "title": "Gemini CLI tools",
+    "kind": "tools",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "tools"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://google-gemini.github.io/gemini-cli/docs/tools/mcp-server.html",
+    "title": "Gemini CLI MCP servers",
+    "kind": "mcp",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "mcp"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://github.com/google-gemini/gemini-cli/releases",
+    "title": "Gemini CLI releases",
+    "kind": "updates",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "updates"
+    ],
+    "priority": "supporting"
+  }
+]

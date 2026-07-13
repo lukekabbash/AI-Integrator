@@ -1,0 +1,10 @@
+[
+  {"url":"https://agentclientprotocol.com/protocol/overview","title":"ACP overview","kind":"protocol","authority":"protocol","topics":["lifecycle"]},
+  {"url":"https://agentclientprotocol.com/protocol/v1/transports","title":"ACP transports","kind":"protocol","authority":"protocol","topics":["stdio","framing"]},
+  {"url":"https://agentclientprotocol.com/protocol/session-setup","title":"ACP session setup","kind":"protocol","authority":"protocol","topics":["session","capabilities"]},
+  {"url":"https://agentclientprotocol.com/protocol/session-config-options","title":"ACP session config options","kind":"protocol","authority":"protocol","topics":["models","effort","modes"]},
+  {"url":"https://agentclientprotocol.com/protocol/permissions","title":"ACP permissions","kind":"protocol","authority":"protocol","topics":["approvals","security"]},
+  {"url":"https://agentclientprotocol.com/protocol/authentication","title":"ACP authentication","kind":"protocol","authority":"protocol","topics":["auth"]},
+  {"url":"https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json","title":"ACP registry","kind":"registry","authority":"protocol","topics":["discovery"]},
+  {"url":"https://agentclientprotocol.com/implementors/agents","title":"ACP agent implementor guidance","kind":"guidance","authority":"protocol","topics":["implementation"]}
+]

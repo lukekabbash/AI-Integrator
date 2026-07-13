@@ -1,0 +1,132 @@
+[
+  {
+    "url": "https://aider.chat/docs/",
+    "title": "Aider documentation index",
+    "kind": "overview",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "overview"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://aider.chat/docs/install.html",
+    "title": "Aider installation",
+    "kind": "install",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "install"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://aider.chat/docs/usage.html",
+    "title": "Aider usage",
+    "kind": "usage",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "usage"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://aider.chat/docs/config.html",
+    "title": "Aider configuration",
+    "kind": "config",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "config"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://aider.chat/docs/config/options.html",
+    "title": "Aider options reference",
+    "kind": "cli",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "cli"
+    ],
+    "priority": "primary"
+  },
+  {
+    "url": "https://aider.chat/docs/config/api-keys.html",
+    "title": "Aider API keys",
+    "kind": "auth",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "auth"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://aider.chat/docs/usage/commands.html",
+    "title": "Aider in-chat commands",
+    "kind": "commands",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "commands"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://aider.chat/docs/usage/modes.html",
+    "title": "Aider chat modes",
+    "kind": "modes",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "modes"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://aider.chat/docs/usage/shell.html",
+    "title": "Aider shell commands",
+    "kind": "tools",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "tools"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://aider.chat/docs/usage/lint-test.html",
+    "title": "Aider lint/test loop",
+    "kind": "tools",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "tools"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://aider.chat/docs/config/model-settings.html",
+    "title": "Aider model settings",
+    "kind": "models",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "models"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://aider.chat/docs/advanced-usage.html",
+    "title": "Aider advanced usage",
+    "kind": "advanced",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "advanced"
+    ],
+    "priority": "supporting"
+  },
+  {
+    "url": "https://github.com/Aider-AI/aider/releases",
+    "title": "Aider releases",
+    "kind": "updates",
+    "authority": "vendor-or-official-source",
+    "topics": [
+      "updates"
+    ],
+    "priority": "supporting"
+  }
+]
