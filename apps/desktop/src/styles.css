@@ -3410,12 +3410,32 @@ kbd {
   /* Subtle checkerboard so transparent icons and PNGs read clearly on any
      theme; opaque images simply cover it. */
   background-image:
-    linear-gradient(45deg, color-mix(in srgb, var(--color-layer-2) 55%, transparent) 25%, transparent 25%),
-    linear-gradient(-45deg, color-mix(in srgb, var(--color-layer-2) 55%, transparent) 25%, transparent 25%),
-    linear-gradient(45deg, transparent 75%, color-mix(in srgb, var(--color-layer-2) 55%, transparent) 75%),
-    linear-gradient(-45deg, transparent 75%, color-mix(in srgb, var(--color-layer-2) 55%, transparent) 75%);
+    linear-gradient(
+      45deg,
+      color-mix(in srgb, var(--color-layer-2) 55%, transparent) 25%,
+      transparent 25%
+    ),
+    linear-gradient(
+      -45deg,
+      color-mix(in srgb, var(--color-layer-2) 55%, transparent) 25%,
+      transparent 25%
+    ),
+    linear-gradient(
+      45deg,
+      transparent 75%,
+      color-mix(in srgb, var(--color-layer-2) 55%, transparent) 75%
+    ),
+    linear-gradient(
+      -45deg,
+      transparent 75%,
+      color-mix(in srgb, var(--color-layer-2) 55%, transparent) 75%
+    );
   background-size: 16px 16px;
-  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+  background-position:
+    0 0,
+    0 8px,
+    8px -8px,
+    -8px 0;
 }
 .file-reader-lines {
   margin: 0;
@@ -3629,7 +3649,7 @@ body[data-resizing="true"] .resize-handle::after {
 }
 .commit-card {
   position: relative;
-  margin: 0 10px 8px;
+  margin: 0 10px 6px;
   border: 1px solid var(--color-border-base);
   border-radius: var(--radius-control);
   background: var(--color-layer-1);
@@ -3695,32 +3715,41 @@ body[data-resizing="true"] .resize-handle::after {
 .git-panel > .branch-header,
 .git-panel > .git-overview-actions,
 .git-panel > .commit-card,
+.git-panel > .commit-split,
 .git-panel > .git-action-error {
   flex: none;
 }
 .commit-split {
   position: relative;
+  margin: 0 10px 8px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 30px;
-  border-top: 1px solid var(--color-border-subtle);
+  grid-template-columns: minmax(0, 1fr) 26px;
+  border-radius: var(--radius-control);
 }
 .commit-split .commit-button,
 .commit-split .commit-menu-trigger {
   width: auto;
   min-width: 0;
+  min-height: 26px;
   margin: 0;
-  border-radius: 0 0 0 calc(var(--radius-control) - 1px);
-  box-shadow: inset 0 1px color-mix(in srgb, var(--color-accent-contrast) 14%, transparent);
+  padding: 0 8px;
+  border-radius: var(--radius-control) 0 0 var(--radius-control);
+  box-shadow: none;
+  font-size: 10.5px;
+  font-weight: 600;
+}
+.commit-split .commit-button svg {
+  width: 12px;
 }
 .commit-split .commit-menu-trigger {
   padding: 0;
   display: grid;
   place-items: center;
   border-left: 1px solid color-mix(in srgb, var(--color-accent-contrast) 22%, transparent);
-  border-radius: 0 0 calc(var(--radius-control) - 1px) 0;
+  border-radius: 0 var(--radius-control) var(--radius-control) 0;
 }
 .commit-menu-trigger svg {
-  width: 13px;
+  width: 12px;
 }
 .commit-action-menu {
   position: absolute;
@@ -3840,11 +3869,12 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   padding: 0 10px;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 10px;
   color: var(--color-text-secondary);
   font-size: 10.5px;
 }
-.git-section-title > span {
+.git-section-title > span:first-child {
+  margin-right: auto;
   display: flex;
   align-items: center;
   gap: 5px;
@@ -4052,40 +4082,28 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   line-height: 1.4;
 }
 .commit-row {
-  position: relative;
-  min-height: 35px;
-  padding: 3px 9px 3px 26px;
+  height: 35px;
+  padding: 0 9px 0 8px;
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
 }
-.commit-row::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 14px;
-  width: 1px;
-  background: var(--color-border-strong);
+.commit-graph-cell {
+  flex: none;
+  display: block;
 }
-.commit-node {
-  position: absolute;
-  left: 10px;
-  width: 9px;
-  height: 9px;
-  border: 2px solid var(--color-text-tertiary);
-  border-radius: 99px;
-  background: var(--color-rail);
-}
-.commit-row[data-current="true"] .commit-node {
-  border-color: var(--color-accent);
-  background: var(--color-accent);
-}
-.commit-row > span:last-child {
+.commit-text {
   min-width: 0;
+  flex: 1;
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+.commit-subject {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
 }
 .commit-row strong {
   overflow: hidden;
@@ -4095,9 +4113,70 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.commit-row[data-unpushed="true"] strong {
+  color: var(--color-text-primary);
+}
+.commit-refs {
+  display: flex;
+  flex: none;
+  gap: 3px;
+}
+.commit-refs em {
+  max-width: 108px;
+  overflow: hidden;
+  padding: 0 5px;
+  border: 1px solid color-mix(in srgb, var(--color-accent) 34%, transparent);
+  border-radius: 99px;
+  color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent-soft, var(--color-layer-2)) 55%, transparent);
+  font: 8.5px var(--font-code);
+  font-style: normal;
+  line-height: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.commit-refs em[data-kind="remote"] {
+  border-color: var(--color-border-base);
+  color: var(--color-text-secondary);
+  background: transparent;
+}
+.commit-refs em[data-kind="tag"] {
+  border-color: color-mix(in srgb, var(--color-warning) 44%, transparent);
+  color: var(--color-warning);
+  background: transparent;
+}
+.commit-refs em[data-kind="more"] {
+  border-color: var(--color-border-subtle);
+  color: var(--color-text-tertiary);
+  background: transparent;
+}
 .commit-row small {
   color: var(--color-text-tertiary);
   font: 9.5px var(--font-code);
+}
+.commit-local-flag {
+  color: color-mix(in srgb, var(--color-accent) 74%, var(--color-text-tertiary));
+  font-style: normal;
+}
+.git-history-more {
+  width: calc(100% - 16px);
+  min-height: 24px;
+  margin: 2px 8px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-row);
+  color: var(--color-text-tertiary);
+  background: transparent;
+  font-size: 9.5px;
+  cursor: pointer;
+}
+.git-history-more:hover {
+  border-color: var(--color-border-subtle);
+  color: var(--color-text-secondary);
+  background: color-mix(in srgb, var(--color-layer-2) 62%, transparent);
+}
+.git-history-more:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 .rail-sticky-actions {
   position: sticky;

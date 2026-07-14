@@ -85,8 +85,7 @@ function resolveDiffSelection(range: Range, container: HTMLElement): SelectionCo
   const marker = (kind?: string) => (kind === "add" ? "+" : kind === "delete" ? "-" : " ");
   const text = cells
     .map(
-      (cell) =>
-        `${marker(cell.dataset.diffKind)} ${cell.querySelector("code")?.textContent ?? ""}`,
+      (cell) => `${marker(cell.dataset.diffKind)} ${cell.querySelector("code")?.textContent ?? ""}`,
     )
     .join("\n");
   return { text, startLine, endLine };
@@ -367,8 +366,7 @@ export function DiffView({
   const mode: DiffViewMode = inline ? "unified" : viewMode;
   const scrollRef = useRef<HTMLDivElement>(null);
   const resolveSelection = useCallback(
-    (range: Range) =>
-      scrollRef.current ? resolveDiffSelection(range, scrollRef.current) : null,
+    (range: Range) => (scrollRef.current ? resolveDiffSelection(range, scrollRef.current) : null),
     [],
   );
   return (
@@ -396,7 +394,9 @@ export function DiffView({
           </span>
         </div>
         <div className="diff-summary">
-          <span className="diff-add">{file.statsLoaded === false ? "…" : `+${file.additions}`}</span>
+          <span className="diff-add">
+            {file.statsLoaded === false ? "…" : `+${file.additions}`}
+          </span>
           {file.statsLoaded === false ? null : (
             <span className="diff-delete">−{file.deletions}</span>
           )}

@@ -69,6 +69,29 @@ export function createEmptySnapshot(): WorkspaceSnapshot {
   };
 }
 
+/** Real (non-synthetic) commits in the demo snapshot's first graph page. */
+export const DEMO_GIT_RECENT_COMMITS = 4;
+
+/** Older demo commits served in pages by `loadTaskGitHistory`. */
+export function demoGitHistoryArchive(): GitSnapshot["commits"] {
+  const subjects = [
+    "Wire broker MCP config validation",
+    "Add delegation store migrations",
+    "Introduce structured CLI transport",
+    "Harden runtime setup terminal",
+    "Track usage evidence per provider",
+    "Ship first transcript renderer",
+    "Create workspace shell",
+    "Initial commit",
+  ];
+  return subjects.map((subject, index) => ({
+    id: `hist-${String(index + 1).padStart(3, "0")}`,
+    subject,
+    relativeTime: `${index + 3}h`,
+    parents: index === subjects.length - 1 ? [] : [`hist-${String(index + 2).padStart(3, "0")}`],
+  }));
+}
+
 const diff: DiffFile[] = [
   {
     path: "src/runtime/router.ts",
@@ -542,10 +565,11 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
         id: "2c18fd4",
         subject: "Initialize product specification",
         relativeTime: "2h",
-        parents: [],
-        refs: ["origin/feature/v1-native-app", "main"],
+        parents: ["hist-001"],
+        refs: ["origin/feature/v1-native-app", "main", "origin/main", "origin/HEAD"],
       },
     ],
+    historyHasMore: true,
   };
 
   return {

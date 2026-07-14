@@ -1,5 +1,10 @@
 import type { WorkspaceSnapshot } from "./demoData";
-import { createDemoSnapshot, createEmptySnapshot } from "./demoData";
+import {
+  createDemoSnapshot,
+  createEmptySnapshot,
+  DEMO_GIT_RECENT_COMMITS,
+  demoGitHistoryArchive,
+} from "./demoData";
 
 export type RuntimeId = "codex" | "cursor" | "claude" | "grok" | "antigravity" | "custom";
 export type TaskStatus =
@@ -365,6 +370,19 @@ export interface ProjectFileOpener {
   description: string;
 }
 
+export interface GitCommit {
+  id: string;
+  subject: string;
+  relativeTime: string;
+  current?: boolean;
+  /** Abbreviated parent hashes; two or more mean a merge commit. */
+  parents?: string[];
+  /** Branch/tag decorations pointing at this commit. */
+  refs?: string[];
+  /** True when the commit is not reachable from the branch upstream. */
+  unpushed?: boolean;
+}
+
 export interface GitSnapshot {
   branch: string;
   upstream: string;
@@ -372,7 +390,9 @@ export interface GitSnapshot {
   behind: number;
   worktree: string;
   files: DiffFile[];
-  commits: Array<{ id: string; subject: string; relativeTime: string; current?: boolean }>;
+  commits: GitCommit[];
+  /** True when older commits exist beyond the loaded graph window. */
+  historyHasMore?: boolean;
 }
 
 export interface PushPreview {
@@ -677,6 +697,11 @@ export interface AppBridge {
   /** Runs one isolated, provider-backed naming attempt for a newly created chat. */
   generateTaskTitle(input: GenerateTaskTitleInput): Promise<TaskNavigationMetadata | null>;
   loadTaskGit(taskId: string): Promise<GitSnapshot>;
+  /** One older page of commit history for the Git rail's "Show more". */
+  loadTaskGitHistory(
+    taskId: string,
+    skip: number,
+  ): Promise<{ commits: GitCommit[]; hasMore: boolean }>;
   loadTaskGitFile(taskId: string, file: DiffFile): Promise<DiffFile>;
   listProjectFiles(projectId: string): Promise<ProjectFileEntry[]>;
   readProjectFile(projectId: string, path: string): Promise<ProjectFileContent>;
@@ -874,6 +899,9 @@ interface NativeGitCommit {
   subject: string;
   relativeTime: string;
   current?: boolean;
+  parents?: string[];
+  refs?: string[];
+  unpushed?: boolean;
 }
 
 interface NativeGitOverview {
@@ -2199,6 +2227,8 @@ function summarizeNativeGitFile(status: NativeFileStatus): DiffFile {
   };
 }
 
+const GIT_HISTORY_PAGE = 32;
+
 async function refreshNativeGit(taskId: string): Promise<GitSnapshot> {
   const repository = repositoryForTask(taskId);
   const overview = await nativeInvoke<NativeGitOverview>("git_overview", { repository });
@@ -2212,6 +2242,7 @@ async function refreshNativeGit(taskId: string): Promise<GitSnapshot> {
     worktree: identity.root,
     files,
     commits,
+    historyHasMore: commits.length >= GIT_HISTORY_PAGE,
   };
   nativeGitByTask.set(taskId, snapshot);
   return snapshot;
@@ -2719,6 +2750,38 @@ export const bridge: AppBridge = {
     return snapshot.taskContexts[taskId]?.git ?? createEmptySnapshot().git;
   },
 
+  loadTaskGitHistory: async (taskId, skip) => {
+    if (isTauri()) {
+      const repository = repositoryForTask(taskId);
+      const page = await nativeInvoke<NativeGitCommit[]>("git_history", {
+        repository,
+        skip,
+        limit: GIT_HISTORY_PAGE,
+      });
+      const hasMore = page.length >= GIT_HISTORY_PAGE;
+      const current = nativeGitByTask.get(taskId);
+      if (current) {
+        const known = new Set(current.commits.map((commit) => commit.id));
+        nativeGitByTask.set(taskId, {
+          ...current,
+          commits: [...current.commits, ...page.filter((commit) => !known.has(commit.id))],
+          historyHasMore: hasMore,
+        });
+      }
+      return { commits: page, hasMore };
+    }
+    // The demo keeps a small archive so the control is exercisable in the
+    // browser build; skip is measured in real commits, so ignore the
+    // synthetic working-tree row.
+    const realSkip = Math.max(0, skip - 1);
+    const alreadyLoaded = Math.max(0, realSkip - DEMO_GIT_RECENT_COMMITS);
+    const commits = demoGitHistoryArchive().slice(alreadyLoaded, alreadyLoaded + 4);
+    return {
+      commits,
+      hasMore: alreadyLoaded + commits.length < demoGitHistoryArchive().length,
+    };
+  },
+
   loadTaskGitFile: async (taskId, file) => {
     if (isTauri()) return loadNativeGitFile(taskId, file);
     return file;
@@ -3208,8 +3271,26 @@ export const bridge: AppBridge = {
       if (!current) return refreshNativeGit(taskId);
       // Stage/unstage already returns the authoritative post-action status.
       // Branch, history and divergence cannot change here, so rebuilding them
-      // (and every patch) is wasted work on the hottest Git interaction.
-      const git = { ...current, files: statuses.map(summarizeNativeGitFile) };
+      // (and every patch) is wasted work on the hottest Git interaction. The
+      // status rows carry no line counts, so keep the ones already loaded —
+      // staging a whole file never changes its diff size.
+      const previousByPath = new Map(current.files.map((file) => [file.path, file]));
+      const git = {
+        ...current,
+        files: statuses.map((status) => {
+          const summarized = summarizeNativeGitFile(status);
+          const previous = previousByPath.get(summarized.path);
+          if (!previous || summarized.statsLoaded !== false || previous.statsLoaded === false) {
+            return summarized;
+          }
+          return {
+            ...summarized,
+            additions: previous.additions,
+            deletions: previous.deletions,
+            statsLoaded: true,
+          };
+        }),
+      };
       nativeGitByTask.set(taskId, git);
       return git;
     }
@@ -3232,7 +3313,14 @@ export const bridge: AppBridge = {
       ahead: git.ahead + 1,
       files: git.files.map((file) => ({ ...file, staged: false })),
       commits: [
-        { id: "local", subject: message, relativeTime: "now", current: true },
+        {
+          id: "local",
+          subject: message,
+          relativeTime: "now",
+          current: true,
+          parents: git.commits[0] ? [git.commits[0].id] : [],
+          unpushed: true,
+        },
         ...git.commits.map((commit) => ({ ...commit, current: false })),
       ],
     };

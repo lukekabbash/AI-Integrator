@@ -197,6 +197,15 @@ pub struct HistoryCommit {
     pub subject: String,
     pub relative_time: String,
     pub current: bool,
+    /// Abbreviated parent hashes, in `%p` order. Two or more mean a merge.
+    #[serde(default)]
+    pub parents: Vec<String>,
+    /// Branch/tag decorations (`%D`), with `HEAD ->` collapsed to the name.
+    #[serde(default)]
+    pub refs: Vec<String>,
+    /// True when the commit is not reachable from the branch's upstream.
+    #[serde(default)]
+    pub unpushed: bool,
 }
 
 /// Read-only data needed to render the compact Git rail. Building this value
@@ -322,10 +331,11 @@ impl GitService {
             branch: status.branch.clone(),
             head: status.head.clone(),
         };
-        let history = self
-            .optional(root, &["log", "-32", "--format=%h%x00%s%x00%cr"])?
+        let mut history = self
+            .optional(root, &["log", "-32", &format!("--format={HISTORY_FORMAT}")])?
             .map(|output| parse_history(&output))
             .unwrap_or_default();
+        self.annotate_unpushed(root, status.upstream.as_deref(), &mut history);
         let push_preview = match (status.branch.as_deref(), status.head.as_deref()) {
             (Some(branch), Some(head)) => {
                 Some(self.push_preview_from_status(root, branch, head, &status)?)
@@ -469,9 +479,10 @@ impl GitService {
             let path = path.ok_or_else(|| {
                 IntegratorError::InvalidInput("an untracked diff requires one file path".into())
             })?;
+            let authorized_root = dunce::canonicalize(repository).map_err(IntegratorError::Io)?;
             let canonical =
                 dunce::canonicalize(repository.join(path)).map_err(IntegratorError::Io)?;
-            if !canonical.starts_with(repository) || !canonical.is_file() {
+            if !canonical.starts_with(&authorized_root) || !canonical.is_file() {
                 return Err(IntegratorError::Unauthorized(
                     "untracked diff path is outside the authorized repository".into(),
                 ));
@@ -583,8 +594,65 @@ impl GitService {
     }
 
     pub fn history(&self, repository: &Path) -> Result<Vec<HistoryCommit>> {
-        let output = self.required(repository, &["log", "-32", "--format=%h%x00%s%x00%cr"])?;
-        Ok(parse_history(&output))
+        self.history_page(repository, 0, 32)
+    }
+
+    /// One page of history for the rail's "Show older commits" control.
+    /// `current` is only meaningful on the first page; later pages clear it.
+    pub fn history_page(
+        &self,
+        repository: &Path,
+        skip: u32,
+        limit: u32,
+    ) -> Result<Vec<HistoryCommit>> {
+        let limit = limit.clamp(1, 128);
+        let count_arg = format!("-{limit}");
+        let skip_arg = format!("--skip={skip}");
+        let output = self.required(
+            repository,
+            &["log", &count_arg, &skip_arg, &format!("--format={HISTORY_FORMAT}")],
+        )?;
+        let mut history = parse_history(&output);
+        if skip > 0 {
+            for commit in &mut history {
+                commit.current = false;
+            }
+        }
+        let status = self.read_status(repository, false)?;
+        self.annotate_unpushed(repository, status.upstream.as_deref(), &mut history);
+        Ok(history)
+    }
+
+    /// Mark history commits that are not reachable from the branch upstream
+    /// so the rail can distinguish shared history from local-only work. With
+    /// no upstream configured, every commit is local-only by definition.
+    fn annotate_unpushed(
+        &self,
+        repository: &Path,
+        upstream: Option<&str>,
+        history: &mut [HistoryCommit],
+    ) {
+        let Some(upstream) = upstream.filter(|name| !name.starts_with('-')) else {
+            for commit in history.iter_mut() {
+                commit.unpushed = true;
+            }
+            return;
+        };
+        let range = format!("{upstream}..HEAD");
+        let Ok(Some(output)) = self.optional(repository, &["rev-list", "--max-count=256", &range])
+        else {
+            return;
+        };
+        let local: Vec<&str> = output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        for commit in history.iter_mut() {
+            commit.unpushed = local
+                .iter()
+                .any(|full| full.starts_with(commit.id.as_str()));
+        }
     }
 
     pub fn push_preview(&self, repository: &Path) -> Result<PushPreview> {
@@ -1058,6 +1126,10 @@ fn parse_counts(value: &str) -> (u64, u64) {
     (parts.next().unwrap_or(0), parts.next().unwrap_or(0))
 }
 
+/// One record per line; fields NUL-separated: abbreviated hash, subject,
+/// relative time, abbreviated parent hashes, and ref decorations.
+const HISTORY_FORMAT: &str = "%h%x00%s%x00%cr%x00%p%x00%D";
+
 fn parse_history(output: &str) -> Vec<HistoryCommit> {
     output
         .lines()
@@ -1069,11 +1141,34 @@ fn parse_history(output: &str) -> Vec<HistoryCommit> {
             if id.is_empty() || subject.is_empty() || relative_time.is_empty() {
                 return None;
             }
+            let parents = fields
+                .next()
+                .map(|value| {
+                    value
+                        .split_whitespace()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let refs = fields
+                .next()
+                .map(|value| {
+                    value
+                        .split(", ")
+                        .map(|name| name.strip_prefix("HEAD -> ").unwrap_or(name).trim())
+                        .filter(|name| !name.is_empty() && *name != "HEAD")
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             Some(HistoryCommit {
                 id: id.into(),
                 subject: subject.into(),
                 relative_time: relative_time.into(),
                 current: false,
+                parents,
+                refs,
+                unpushed: false,
             })
         })
         .enumerate()
@@ -1170,14 +1265,18 @@ fn parse_numstat(output: &str) -> HashMap<PathBuf, (Option<u64>, Option<u64>)> {
     let mut stats = HashMap::new();
     for record in output.split_terminator('\0') {
         let mut fields = record.splitn(3, '\t');
-        let (Some(added), Some(removed), Some(path)) = (fields.next(), fields.next(), fields.next())
+        let (Some(added), Some(removed), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
         else {
             continue;
         };
         if path.is_empty() {
             continue;
         }
-        stats.insert(PathBuf::from(path), (added.parse().ok(), removed.parse().ok()));
+        stats.insert(
+            PathBuf::from(path),
+            (added.parse().ok(), removed.parse().ok()),
+        );
     }
     stats
 }
@@ -1188,8 +1287,9 @@ const MAX_UNTRACKED_STAT_BYTES: u64 = 1_000_000;
 /// generating a per-file diff. Returns `None` for binary, oversized, or
 /// unreadable files, and for paths that resolve outside the repository.
 fn count_untracked_lines(repository: &Path, path: &Path) -> Option<u64> {
+    let authorized_root = dunce::canonicalize(repository).ok()?;
     let canonical = dunce::canonicalize(repository.join(path)).ok()?;
-    if !canonical.starts_with(repository) {
+    if !canonical.starts_with(&authorized_root) {
         return None;
     }
     let metadata = fs::metadata(&canonical).ok()?;

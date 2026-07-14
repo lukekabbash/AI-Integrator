@@ -1454,12 +1454,16 @@ pub async fn git_overview(
 pub async fn git_history(
     state: State<'_, AppState>,
     repository: PathBuf,
+    skip: Option<u32>,
+    limit: Option<u32>,
 ) -> CommandResult<Vec<HistoryCommit>> {
     let (git, identity) = authorized_git(&state, repository).await?;
-    tauri::async_runtime::spawn_blocking(move || git.history(&identity.root))
-        .await
-        .map_err(|_| worker_error())?
-        .map_err(Into::into)
+    tauri::async_runtime::spawn_blocking(move || {
+        git.history_page(&identity.root, skip.unwrap_or(0), limit.unwrap_or(32))
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
 }
 
 const MAX_PROJECT_FILE_ENTRIES: usize = 5_000;
@@ -5141,10 +5145,10 @@ fn project_file_opener_executable(id: &str) -> Option<PathBuf> {
         }
     }
     #[cfg(target_os = "macos")]
-    if let Some(bundle) = macos_bundle {
-        if bundle.is_file() {
-            return Some(bundle.to_path_buf());
-        }
+    if let Some(bundle) = macos_bundle
+        && bundle.is_file()
+    {
+        return Some(bundle.to_path_buf());
     }
     let _ = (windows_relative, macos_bundle);
     native_executable_on_path(command)

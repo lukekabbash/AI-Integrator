@@ -41,6 +41,7 @@ import type {
   ChildAgent,
   DelegationView,
   DiffFile,
+  GitCommit,
   GitSnapshot,
   ProjectFileContent,
   ProjectFileEntry,
@@ -63,6 +64,222 @@ const INITIAL_FILE_PREVIEW_LINES = 400;
 const FILE_PREVIEW_CHUNK = 400;
 const INITIAL_GIT_FILE_ROWS = 200;
 const GIT_FILE_CHUNK = 200;
+
+const GRAPH_LANE_WIDTH = 9;
+const GRAPH_ROW_HEIGHT = 35;
+const GRAPH_MAX_LANES = 6;
+/** One vivid hue per lane, Cursor-style, so a side branch reads as a single
+ * colored thread. Lane 0 follows the app accent; the rest are fixed hues
+ * chosen to stay legible on both light and dark themes. */
+const GRAPH_LANE_COLORS = [
+  "var(--color-accent)",
+  "#d0679d",
+  "#5aa7e0",
+  "#c9a227",
+  "#9a7ecc",
+  "#5fb08a",
+];
+
+interface CommitGraphEdge {
+  from: number;
+  to: number;
+  /** Edge bends into (or out of) this row's node instead of passing through. */
+  node: boolean;
+}
+
+interface CommitGraphRow {
+  lane: number;
+  incoming: CommitGraphEdge[];
+  outgoing: CommitGraphEdge[];
+  laneCount: number;
+}
+
+/**
+ * Assign a lane to every commit the way VS Code's commit graph does: each
+ * lane tracks the hash it expects next, merges join lanes into the commit's
+ * node, and extra parents fork new lanes below it. Parents that fall outside
+ * the truncated log keep their lane running off the bottom edge.
+ */
+function buildCommitGraph(commits: GitCommit[]): CommitGraphRow[] {
+  const lanes: Array<string | null> = [];
+  return commits.map((commit) => {
+    const expecting = lanes.flatMap((hash, index) => (hash === commit.id ? [index] : []));
+    let lane = expecting.length ? expecting[0] : lanes.indexOf(null);
+    if (lane === -1) lane = lanes.length;
+    const incoming: CommitGraphEdge[] = [];
+    lanes.forEach((hash, index) => {
+      if (hash === null) return;
+      if (hash === commit.id) incoming.push({ from: index, to: lane, node: true });
+      else incoming.push({ from: index, to: index, node: false });
+    });
+    for (const index of expecting) lanes[index] = null;
+    const parents = commit.parents ?? [];
+    const outgoing: CommitGraphEdge[] = [];
+    if (parents.length) {
+      lanes[lane] = parents[0];
+      outgoing.push({ from: lane, to: lane, node: true });
+      for (const parent of parents.slice(1)) {
+        let parentLane = lanes.indexOf(parent);
+        if (parentLane === -1) {
+          parentLane = lanes.indexOf(null);
+          if (parentLane === -1) parentLane = lanes.length;
+          lanes[parentLane] = parent;
+        }
+        outgoing.push({ from: lane, to: parentLane, node: true });
+      }
+    } else {
+      lanes[lane] = null;
+    }
+    lanes.forEach((hash, index) => {
+      if (hash === null || index === lane) return;
+      if (outgoing.some((edge) => edge.node && edge.to === index)) return;
+      outgoing.push({ from: index, to: index, node: false });
+    });
+    while (lanes.length && lanes.at(-1) === null) lanes.pop();
+    const laneCount = [...incoming, ...outgoing].reduce(
+      (max, edge) => Math.max(max, edge.from + 1, edge.to + 1),
+      lane + 1,
+    );
+    return { lane, incoming, outgoing, laneCount: Math.min(laneCount, GRAPH_MAX_LANES) };
+  });
+}
+
+function graphLaneX(lane: number): number {
+  return 4.5 + lane * GRAPH_LANE_WIDTH;
+}
+
+function graphEdgePath(edge: CommitGraphEdge, half: "top" | "bottom"): string {
+  const from = graphLaneX(edge.from);
+  const to = graphLaneX(edge.to);
+  const mid = GRAPH_ROW_HEIGHT / 2;
+  if (half === "top") {
+    if (!edge.node || edge.from === edge.to) return `M ${from} 0 L ${from} ${mid}`;
+    return `M ${from} 0 C ${from} ${mid - 4}, ${to} ${mid - 12}, ${to} ${mid}`;
+  }
+  if (!edge.node || edge.from === edge.to) return `M ${from} ${mid} L ${from} ${GRAPH_ROW_HEIGHT}`;
+  return `M ${from} ${mid} C ${to} ${mid + 12}, ${to} ${mid + 4}, ${to} ${GRAPH_ROW_HEIGHT}`;
+}
+
+function CommitGraphCell({
+  row,
+  current,
+  unpushed,
+  merge,
+  tooltip,
+}: {
+  row: CommitGraphRow;
+  current: boolean;
+  unpushed: boolean;
+  merge: boolean;
+  tooltip: string;
+}) {
+  const width = row.laneCount * GRAPH_LANE_WIDTH;
+  const laneColor = GRAPH_LANE_COLORS[row.lane % GRAPH_LANE_COLORS.length];
+  const edges = [
+    ...row.incoming.map((edge) => ({ edge, half: "top" as const })),
+    ...row.outgoing.map((edge) => ({ edge, half: "bottom" as const })),
+  ].filter(({ edge }) => edge.from < GRAPH_MAX_LANES && edge.to < GRAPH_MAX_LANES);
+  return (
+    <svg
+      className="commit-graph-cell"
+      width={width}
+      height={GRAPH_ROW_HEIGHT}
+      viewBox={`0 0 ${width} ${GRAPH_ROW_HEIGHT}`}
+      role="img"
+      aria-label={tooltip}
+    >
+      <title>{tooltip}</title>
+      {edges.map(({ edge, half }, index) => (
+        <path
+          key={`${half}-${index}`}
+          d={graphEdgePath(edge, half)}
+          fill="none"
+          stroke={GRAPH_LANE_COLORS[Math.max(edge.from, edge.to) % GRAPH_LANE_COLORS.length]}
+          strokeWidth="1.5"
+        />
+      ))}
+      {current ? (
+        <circle
+          cx={graphLaneX(row.lane)}
+          cy={GRAPH_ROW_HEIGHT / 2}
+          r={5.6}
+          fill="none"
+          stroke={laneColor}
+          strokeWidth="1"
+          opacity="0.45"
+        />
+      ) : null}
+      <circle
+        className="commit-graph-node"
+        cx={graphLaneX(row.lane)}
+        cy={GRAPH_ROW_HEIGHT / 2}
+        r={3.4}
+        fill={unpushed ? "var(--color-rail)" : laneColor}
+        stroke={laneColor}
+        strokeWidth="1.6"
+      />
+      {merge ? (
+        <circle
+          cx={graphLaneX(row.lane)}
+          cy={GRAPH_ROW_HEIGHT / 2}
+          r={1.3}
+          fill={unpushed ? laneColor : "var(--color-rail)"}
+        />
+      ) : null}
+    </svg>
+  );
+}
+
+interface CommitRefChip {
+  label: string;
+  kind: "local" | "remote" | "tag" | "more";
+  title?: string;
+}
+
+/**
+ * Collapse raw `%D` decorations into at most two low-noise chips: drop
+ * `<remote>/HEAD` pointers, drop the current branch (the Graph header and
+ * tip node already say where it is — including its remote twin when it sits
+ * on the same commit), fold any other local branch with its remote-tracking
+ * twin into one chip, and fold anything past two into a `+n` chip whose
+ * tooltip lists the rest.
+ */
+function collapseCommitRefs(refs: string[], upstream: string, branch: string): CommitRefChip[] {
+  const remote = upstream.includes("/") ? `${upstream.split("/")[0]}/` : "origin/";
+  const names = refs.filter((name) => !name.endsWith("/HEAD"));
+  const consumed = new Set<string>();
+  if (names.includes(branch)) {
+    consumed.add(branch);
+    consumed.add(`${remote}${branch}`);
+    consumed.add(`origin/${branch}`);
+  }
+  const chips: CommitRefChip[] = [];
+  for (const name of names) {
+    if (consumed.has(name)) continue;
+    if (name.startsWith("tag: ")) {
+      chips.push({ label: name.slice(5), kind: "tag" });
+      continue;
+    }
+    if (name.startsWith(remote) || name.startsWith("origin/")) {
+      chips.push({ label: name, kind: "remote" });
+      continue;
+    }
+    const twin = names.find(
+      (candidate) => candidate === `${remote}${name}` || candidate === `origin/${name}`,
+    );
+    if (twin) consumed.add(twin);
+    chips.push({ label: name, kind: "local", title: twin ? `${name} · also at ${twin}` : name });
+  }
+  if (chips.length > 2) {
+    const extra = chips.splice(2);
+    chips.push({
+      label: `+${extra.length}`,
+      kind: "more",
+      title: extra.map((chip) => chip.label).join(", "),
+    });
+  }
+  return chips;
+}
 
 interface RightRailProps {
   git: GitSnapshot;
@@ -108,6 +325,8 @@ interface RightRailProps {
   onPush: () => Promise<void>;
   onReviewChanges?: () => void;
   onRefreshGit?: () => Promise<void>;
+  /** Append the next page of older commits to the graph. */
+  onLoadMoreGitHistory?: () => Promise<void>;
   onResize?: (delta: number) => void;
 }
 
@@ -175,6 +394,7 @@ function GitPanel({
   onPush,
   onReviewChanges,
   onRefreshGit,
+  onLoadMoreGitHistory,
   fileOpeners = [],
   onOpenGitFileExternal,
   onRevealGitFile,
@@ -190,6 +410,7 @@ function GitPanel({
   | "onPush"
   | "onReviewChanges"
   | "onRefreshGit"
+  | "onLoadMoreGitHistory"
   | "fileOpeners"
   | "onOpenGitFileExternal"
   | "onRevealGitFile"
@@ -200,6 +421,7 @@ function GitPanel({
   >(null);
   const reduceMotion = useReducedMotion();
   const [stagingPath, setStagingPath] = useState<string | null>(null);
+  const [loadingHistory, setLoadingHistory] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [stagedLimit, setStagedLimit] = useState(INITIAL_GIT_FILE_ROWS);
   const [unstagedLimit, setUnstagedLimit] = useState(INITIAL_GIT_FILE_ROWS);
@@ -263,6 +485,7 @@ function GitPanel({
     }
     return { staged, unstaged, lineStatsLoaded, additions, deletions };
   }, [git.files]);
+  const graphRows = useMemo(() => buildCommitGraph(git.commits), [git.commits]);
   const supportedFileOpeners = fileOpeners;
 
   const runStage = async (file: DiffFile, nextStaged: boolean) => {
@@ -305,6 +528,19 @@ function GitPanel({
       setActionError(getErrorMessage(error));
     } finally {
       setBusy(null);
+    }
+  };
+
+  const runLoadMoreHistory = async () => {
+    if (!onLoadMoreGitHistory || loadingHistory) return;
+    setLoadingHistory(true);
+    setActionError(null);
+    try {
+      await onLoadMoreGitHistory();
+    } catch (error) {
+      setActionError(getErrorMessage(error));
+    } finally {
+      setLoadingHistory(false);
     }
   };
 
@@ -599,7 +835,8 @@ function GitPanel({
             </motion.span>
           </button>
         </Tooltip>
-        <div className="commit-split" ref={commitMenuRef}>
+      </div>
+      <div className="commit-split" ref={commitMenuRef}>
         <button
           className="primary-button commit-button"
           type="button"
@@ -668,7 +905,6 @@ function GitPanel({
             </button>
           </div>
         ) : null}
-        </div>
       </div>
       {actionError ? (
         <p className="git-action-error" role="alert">
@@ -689,7 +925,6 @@ function GitPanel({
         <section className="git-section git-section--staged" aria-label="Staged changes">
           <div className="git-section-title">
             <span>Staged changes</span>
-            <small>{staged.length}</small>
             {staged.length ? (
               <button
                 type="button"
@@ -699,6 +934,7 @@ function GitPanel({
                 Unstage all
               </button>
             ) : null}
+            <small>{staged.length}</small>
           </div>
           <div className="git-section-body">
             {staged.length ? (
@@ -729,7 +965,6 @@ function GitPanel({
         <section className="git-section git-section--changes" aria-label="Unstaged changes">
           <div className="git-section-title">
             <span>Changes</span>
-            <small>{unstaged.length}</small>
             {unstaged.length ? (
               <button
                 type="button"
@@ -739,6 +974,7 @@ function GitPanel({
                 Stage all
               </button>
             ) : null}
+            <small>{unstaged.length}</small>
           </div>
           <div className="git-section-body">
             {unstaged.length ? (
@@ -775,24 +1011,61 @@ function GitPanel({
           </div>
           <div className="git-section-body git-history-body">
             {git.commits.length ? (
-              git.commits.map((commit, index) => (
-                <div
-                  className="commit-row"
-                  key={`${commit.id}-${index}`}
-                  data-current={commit.current}
-                >
-                  <span className="commit-node" />
-                  <span>
-                    <strong>{commit.subject}</strong>
-                    <small>
-                      {commit.id} · {commit.relativeTime}
-                    </small>
-                  </span>
-                </div>
-              ))
+              git.commits.map((commit, index) => {
+                const merge = (commit.parents?.length ?? 0) > 1;
+                const unpushed = commit.unpushed === true;
+                return (
+                  <div
+                    className="commit-row"
+                    key={`${commit.id}-${index}`}
+                    data-current={commit.current}
+                    data-unpushed={unpushed || undefined}
+                  >
+                    <CommitGraphCell
+                      row={graphRows[index]}
+                      current={commit.current === true}
+                      unpushed={unpushed}
+                      merge={merge}
+                      tooltip={`${commit.id}${merge ? " · merge" : ""} · ${
+                        unpushed
+                          ? `not on ${git.upstream || "remote"}`
+                          : `on ${git.upstream || "remote"}`
+                      }`}
+                    />
+                    <span className="commit-text">
+                      <span className="commit-subject">
+                        <strong>{commit.subject}</strong>
+                        {commit.refs?.length ? (
+                          <span className="commit-refs">
+                            {collapseCommitRefs(commit.refs, git.upstream, git.branch).map((chip) => (
+                              <em key={chip.label} data-kind={chip.kind} title={chip.title}>
+                                {chip.label}
+                              </em>
+                            ))}
+                          </span>
+                        ) : null}
+                      </span>
+                      <small>
+                        {commit.id} · {commit.relativeTime}
+                        {unpushed ? <i className="commit-local-flag"> · local</i> : null}
+                      </small>
+                    </span>
+                  </div>
+                );
+              })
             ) : (
               <p className="empty-compact">Commit history is not available for this task.</p>
             )}
+            {git.commits.length && git.historyHasMore && onLoadMoreGitHistory ? (
+              <button
+                className="git-history-more"
+                type="button"
+                onClick={() => void runLoadMoreHistory()}
+                disabled={loadingHistory}
+              >
+                {loadingHistory ? "Loading older commits…" : "Show older commits"}
+              </button>
+            ) : null}
           </div>
         </section>
       </div>
@@ -1520,18 +1793,17 @@ function FilePanel({
     if (!openProjectFileRequest) return;
     if (handledOpenRequestRef.current === openProjectFileRequest.id) return;
     const file = resolveRequestedFile(projectFiles, openProjectFileRequest.path);
-    if (!file) {
-      // Retry while the tree is still loading; once it is ready an unresolved
-      // path gets surfaced in the reader instead of failing silently.
-      if (projectFilesState !== "ready") return;
-      handledOpenRequestRef.current = openProjectFileRequest.id;
-      setReadError(`Could not find ${openProjectFileRequest.path} in the project files.`);
-      return;
-    }
+    // Retry while the tree is still loading; once it is ready an unresolved
+    // path gets surfaced in the reader instead of failing silently.
+    if (!file && projectFilesState !== "ready") return;
     // Mark the request handled inside the timer so a StrictMode remount that
-    // clears the pending timeout does not swallow the open.
+    // clears the pending timeout does not swallow the open or its error.
     const timer = window.setTimeout(() => {
       handledOpenRequestRef.current = openProjectFileRequest.id;
+      if (!file) {
+        setReadError(`Could not find ${openProjectFileRequest.path} in the project files.`);
+        return;
+      }
       void openProjectFile(file);
     }, 0);
     return () => window.clearTimeout(timer);
