@@ -261,6 +261,7 @@ impl LocalStore {
             task,
             events,
             watermark_seq: watermark,
+            runtime_live: false,
         })
     }
 

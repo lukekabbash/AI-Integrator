@@ -326,6 +326,10 @@ export interface DiffFile {
   truncated?: boolean;
 }
 
+export function diffFileKey(file: Pick<DiffFile, "path" | "staged">): string {
+  return `${file.staged ? "index" : "worktree"}\0${file.path}`;
+}
+
 export interface ProjectFileEntry {
   path: string;
   size: number;
@@ -685,6 +689,8 @@ export interface RuntimeProjectionEvent {
 export interface TaskProjectionSnapshot {
   events: RuntimeProjectionEvent[];
   watermarkSeq: number;
+  /** Native-process liveness attested while the snapshot was loaded. */
+  runtimeLive: boolean;
 }
 
 export type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
@@ -992,6 +998,10 @@ interface NativeFileStatus {
   path: string;
   additions?: number | null;
   deletions?: number | null;
+  stagedAdditions?: number | null;
+  stagedDeletions?: number | null;
+  unstagedAdditions?: number | null;
+  unstagedDeletions?: number | null;
 }
 
 interface NativeDiff {
@@ -2318,10 +2328,13 @@ export function parseDiffLines(patch: string): DiffLine[] {
   return lines;
 }
 
-function summarizeNativeGitFile(status: NativeFileStatus): DiffFile {
-  const staged = status.indexStatus !== " " && status.indexStatus !== "?";
-  const code = staged ? status.indexStatus : status.worktreeStatus;
-  const statsLoaded = typeof status.additions === "number" && typeof status.deletions === "number";
+function summarizeNativeGitFile(
+  status: NativeFileStatus,
+  staged: boolean,
+  code: string,
+  additions: number | null | undefined,
+  deletions: number | null | undefined,
+): DiffFile {
   return {
     path: status.path,
     status:
@@ -2332,13 +2345,42 @@ function summarizeNativeGitFile(status: NativeFileStatus): DiffFile {
           : code === "R"
             ? "renamed"
             : "modified",
-    additions: status.additions ?? 0,
-    deletions: status.deletions ?? 0,
+    additions: additions ?? 0,
+    deletions: deletions ?? 0,
     staged,
     lines: [],
     diffLoaded: false,
-    statsLoaded,
+    statsLoaded: typeof additions === "number" && typeof deletions === "number",
   };
+}
+
+function summarizeNativeGitFiles(status: NativeFileStatus): DiffFile[] {
+  const staged = status.indexStatus !== " " && status.indexStatus !== "?";
+  const unstaged = status.worktreeStatus !== " ";
+  const files: DiffFile[] = [];
+  if (staged) {
+    files.push(
+      summarizeNativeGitFile(
+        status,
+        true,
+        status.indexStatus,
+        status.stagedAdditions ?? (unstaged ? undefined : status.additions),
+        status.stagedDeletions ?? (unstaged ? undefined : status.deletions),
+      ),
+    );
+  }
+  if (unstaged) {
+    files.push(
+      summarizeNativeGitFile(
+        status,
+        false,
+        status.worktreeStatus,
+        status.unstagedAdditions ?? (staged ? undefined : status.additions),
+        status.unstagedDeletions ?? (staged ? undefined : status.deletions),
+      ),
+    );
+  }
+  return files;
 }
 
 const GIT_HISTORY_PAGE = 32;
@@ -2433,7 +2475,7 @@ async function loadNativeProjectGit(projectId: string): Promise<GitSnapshot> {
 
 function mapNativeGitOverview(overview: NativeGitOverview): GitSnapshot {
   const { identity, history: commits, pushPreview: preview } = overview;
-  const files = overview.files.map(summarizeNativeGitFile);
+  const files = overview.files.flatMap(summarizeNativeGitFiles);
   return {
     kind: "repository" as const,
     branch: identity.branch ?? preview?.branch ?? "detached",
@@ -2471,7 +2513,7 @@ async function loadNativeGitFile(taskId: string, file: DiffFile): Promise<DiffFi
     nativeGitByTask.set(taskId, {
       ...snapshot,
       files: snapshot.files.map((candidate) =>
-        candidate.path === loaded.path ? loaded : candidate,
+        diffFileKey(candidate) === diffFileKey(loaded) ? loaded : candidate,
       ),
     });
   }
@@ -3624,7 +3666,7 @@ export const bridge: AppBridge = {
   },
 
   loadTaskProjection: async (taskId) => {
-    if (!isTauri()) return { events: [], watermarkSeq: 0 };
+    if (!isTauri()) return { events: [], watermarkSeq: 0, runtimeLive: false };
     return nativeInvoke<TaskProjectionSnapshot>("task_snapshot", { taskId });
   },
 
@@ -3668,17 +3710,14 @@ export const bridge: AppBridge = {
       );
       const current = nativeGitByTask.get(taskId);
       if (!current) return refreshNativeGit(taskId);
-      // Stage/unstage already returns the authoritative post-action status.
-      // Branch, history and divergence cannot change here, so rebuilding them
-      // (and every patch) is wasted work on the hottest Git interaction. The
-      // status rows carry no line counts, so keep the ones already loaded —
-      // staging a whole file never changes its diff size.
-      const previousByPath = new Map(current.files.map((file) => [file.path, file]));
+      // Stage/unstage returns authoritative scoped status and line counts.
+      // Branch, history and divergence cannot change here, so rebuilding the
+      // rest of the overview is unnecessary on the hottest Git interaction.
+      const previousByScope = new Map(current.files.map((file) => [diffFileKey(file), file]));
       const git = {
         ...current,
-        files: statuses.map((status) => {
-          const summarized = summarizeNativeGitFile(status);
-          const previous = previousByPath.get(summarized.path);
+        files: statuses.flatMap(summarizeNativeGitFiles).map((summarized) => {
+          const previous = previousByScope.get(diffFileKey(summarized));
           if (!previous || summarized.statsLoaded !== false || previous.statsLoaded === false) {
             return summarized;
           }
@@ -3710,7 +3749,7 @@ export const bridge: AppBridge = {
     return {
       ...git,
       ahead: git.ahead + 1,
-      files: git.files.map((file) => ({ ...file, staged: false })),
+      files: git.files.filter((file) => !file.staged),
       commits: [
         {
           id: "local",

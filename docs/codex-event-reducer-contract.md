@@ -51,7 +51,7 @@ Migration 2 adds normalized turn, item, approval, and bounded event-log tables k
 5. Commit.
 6. Emit the normalized projection containing that sequence.
 
-The task snapshot API returns projections plus a `watermarkSeq`. The renderer registers its event listener first, buffers events while loading the snapshot, then applies only sequences newer than the watermark.
+The task snapshot API returns projections, a `watermarkSeq`, and an in-process `runtimeLive` attestation. The renderer registers its event listener first, buffers events while loading the snapshot, then applies only sequences newer than the watermark. Reopening a live task preserves its projected turn ID and `startedAt`; absence of a new connection event during navigation is not evidence that the task stopped.
 
 ## Request identifiers and approvals
 

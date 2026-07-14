@@ -363,6 +363,9 @@ pub struct TaskSnapshot {
     pub task: Task,
     pub events: Vec<RuntimeProjectionEvent>,
     pub watermark_seq: i64,
+    /// Attested by the native command after checking the in-process runtime
+    /// registry. Store-only snapshots cannot claim process liveness.
+    pub runtime_live: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

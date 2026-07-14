@@ -110,7 +110,11 @@ afterEach(() => {
 
 describe("SubagentConversation", () => {
   it("reopens a stopped child and sends the provider/model selected in the shared composer", async () => {
-    vi.spyOn(bridge, "loadTaskProjection").mockResolvedValue({ events: [], watermarkSeq: 0 });
+    vi.spyOn(bridge, "loadTaskProjection").mockResolvedValue({
+      events: [],
+      watermarkSeq: 0,
+      runtimeLive: false,
+    });
     vi.spyOn(bridge, "loadTaskGit").mockResolvedValue(childGit);
     vi.spyOn(bridge, "subscribeRuntimeProjections").mockResolvedValue(() => undefined);
     vi.spyOn(bridge, "listModelCatalog").mockImplementation(async (runtime) =>
@@ -167,7 +171,11 @@ describe("SubagentConversation", () => {
   });
 
   it("offers Cursor and Grok as reroute targets for a child", async () => {
-    vi.spyOn(bridge, "loadTaskProjection").mockResolvedValue({ events: [], watermarkSeq: 0 });
+    vi.spyOn(bridge, "loadTaskProjection").mockResolvedValue({
+      events: [],
+      watermarkSeq: 0,
+      runtimeLive: false,
+    });
     vi.spyOn(bridge, "loadTaskGit").mockResolvedValue(childGit);
     vi.spyOn(bridge, "subscribeRuntimeProjections").mockResolvedValue(() => undefined);
     vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
@@ -190,6 +198,7 @@ describe("SubagentConversation", () => {
   it("mirrors compact task controls, reports child tokens, and opens the child review", async () => {
     vi.spyOn(bridge, "loadTaskProjection").mockResolvedValue({
       watermarkSeq: 1,
+      runtimeLive: false,
       events: [
         {
           taskId: "task-child",

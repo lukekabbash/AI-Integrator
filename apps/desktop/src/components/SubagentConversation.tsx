@@ -4,6 +4,7 @@ import { createPortal } from "react-dom";
 import { CircleStop, PanelRightClose, PanelRightOpen, TerminalSquare, X } from "lucide-react";
 import {
   bridge,
+  diffFileKey,
   type DelegationRouting,
   type DelegationView,
   type GitSnapshot,
@@ -82,7 +83,7 @@ export function SubagentConversation({
   const [reviewLoading, setReviewLoading] = useState(false);
   const [reviewError, setReviewError] = useState("");
   const [reviewRefreshVersion, setReviewRefreshVersion] = useState(0);
-  const [reviewFilePath, setReviewFilePath] = useState("");
+  const [reviewFileKey, setReviewFileKey] = useState("");
   const [diffView, setDiffView] = useState<"unified" | "split">("unified");
   const [reviewedFiles, setReviewedFiles] = useState<Record<string, boolean>>({});
   const [optimisticMessages, setOptimisticMessages] = useState<TranscriptEvent[]>([]);
@@ -158,10 +159,12 @@ export function SubagentConversation({
       .then((snapshot) => {
         if (disposed) return;
         setGit(snapshot);
-        setReviewFilePath((current) =>
-          snapshot.files.some((file) => file.path === current)
+        setReviewFileKey((current) =>
+          snapshot.files.some((file) => diffFileKey(file) === current)
             ? current
-            : (snapshot.files[0]?.path ?? ""),
+            : snapshot.files[0]
+              ? diffFileKey(snapshot.files[0])
+              : "",
         );
       })
       .catch((error) => {
@@ -204,7 +207,8 @@ export function SubagentConversation({
   const supportedRuntimes = runtimes.filter((runtime) =>
     ["codex", "claude", "antigravity", "cursor", "grok"].includes(runtime.id),
   );
-  const reviewFile = git?.files.find((file) => file.path === reviewFilePath) ?? git?.files[0];
+  const reviewFile =
+    git?.files.find((file) => diffFileKey(file) === reviewFileKey) ?? git?.files[0];
   const totalTokens = projection?.usage?.totalTokens ?? 0;
 
   useEffect(() => {
@@ -228,7 +232,7 @@ export function SubagentConversation({
             ? {
                 ...current,
                 files: current.files.map((candidate) =>
-                  candidate.path === loaded.path ? loaded : candidate,
+                  diffFileKey(candidate) === diffFileKey(loaded) ? loaded : candidate,
                 ),
               }
             : current,
@@ -506,9 +510,12 @@ export function SubagentConversation({
                 <div className="subagent-review-toolbar">
                   <Dropdown
                     aria-label="Subagent review file"
-                    value={reviewFile.path}
-                    onChange={setReviewFilePath}
-                    options={git.files.map((file) => ({ value: file.path, label: file.path }))}
+                    value={diffFileKey(reviewFile)}
+                    onChange={setReviewFileKey}
+                    options={git.files.map((file) => ({
+                      value: diffFileKey(file),
+                      label: `${file.path} — ${file.staged ? "staged" : "unstaged"}`,
+                    }))}
                     compact
                   />
                 </div>
@@ -522,9 +529,12 @@ export function SubagentConversation({
                   onViewModeChange={setDiffView}
                   onRefresh={refreshReview}
                   refreshing={reviewLoading}
-                  reviewed={Boolean(reviewedFiles[reviewFile.path])}
+                  reviewed={Boolean(reviewedFiles[diffFileKey(reviewFile)])}
                   onMarkReviewed={() =>
-                    setReviewedFiles((current) => ({ ...current, [reviewFile.path]: true }))
+                    setReviewedFiles((current) => ({
+                      ...current,
+                      [diffFileKey(reviewFile)]: true,
+                    }))
                   }
                 />
               </Suspense>

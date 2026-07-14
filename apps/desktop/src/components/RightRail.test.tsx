@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { LazyMotion, domAnimation } from "motion/react";
 import { describe, expect, it, vi } from "vitest";
 import { createDemoSnapshot } from "../demoData";
@@ -94,6 +94,40 @@ describe("RightRail", () => {
       fireEvent.click(screen.getByRole("button", { name: /Set up Git$/ }));
     });
     expect(onInitializeGit).toHaveBeenCalledOnce();
+  });
+
+  it("shows and selects both scopes of a partially staged file", () => {
+    const snapshot = createDemoSnapshot();
+    const staged = {
+      ...snapshot.git.files[0],
+      path: "src/App.tsx",
+      staged: true,
+      additions: 4,
+      deletions: 1,
+    };
+    const unstaged = {
+      ...staged,
+      staged: false,
+      additions: 2,
+      deletions: 0,
+    };
+    const { callbacks } = setup({ git: { ...snapshot.git, files: [staged, unstaged] } });
+
+    expect(
+      within(screen.getByRole("region", { name: "Staged changes" })).getByText("App.tsx"),
+    ).toBeVisible();
+    expect(
+      within(screen.getByRole("region", { name: "Unstaged changes" })).getByText("App.tsx"),
+    ).toBeVisible();
+
+    const fileButtons = document.querySelectorAll<HTMLButtonElement>(".git-file-name");
+    fireEvent.click(fileButtons[1]!);
+    expect(callbacks.onSelectFile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: "src/App.tsx",
+        staged: false,
+      }),
+    );
   });
 
   it("surfaces local-only publishing and keeps remote management in the Git menu", async () => {

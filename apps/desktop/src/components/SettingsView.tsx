@@ -19,7 +19,7 @@ import {
   RotateCcw,
   Save,
   Search,
-  Settings2,
+  Settings,
   ShieldCheck,
   TriangleAlert,
   Trash2,
@@ -1427,12 +1427,32 @@ function ModelsAndRuntimesSettings({
                   <span className={`runtime-logo runtime-logo--${runtime.id}`}>
                     <ProviderIcon provider={runtime.id} label={runtime.name} />
                   </span>
-                  <span>
-                    <strong>
-                      {runtime.name}
-                      <small data-status={runtime.status}>{runtime.status.replace("_", " ")}</small>
-                    </strong>
-                    <code>{runtime.version ?? "Version not reported"}</code>
+                  <span className="runtime-row-info">
+                    <span className="runtime-row-title">
+                      <strong>
+                        {runtime.name}
+                        <small data-status={runtime.status}>
+                          {runtime.status.replace("_", " ")}
+                        </small>
+                      </strong>
+                      <code>{runtime.version ?? "Version not reported"}</code>
+                      {runtime.status !== "not_installed" && configuringRuntime !== runtime.id ? (
+                        <Tooltip label={`Edit defaults for ${runtime.name}`}>
+                          <button
+                            className="icon-button subtle runtime-defaults-button"
+                            type="button"
+                            aria-label={`Edit defaults for ${runtime.name}`}
+                            onClick={() => {
+                              setConfiguringRuntime(runtime.id);
+                              loadCatalog(runtime.id);
+                              setMessage("");
+                            }}
+                          >
+                            <Settings aria-hidden="true" />
+                          </button>
+                        </Tooltip>
+                      ) : null}
+                    </span>
                     <p>{runtime.detail}</p>
                     <code className="runtime-executable">{runtime.command}</code>
                   </span>
@@ -1448,22 +1468,6 @@ function ModelsAndRuntimesSettings({
                       </button>
                     ) : (
                       <>
-                        {configuringRuntime === runtime.id ? null : (
-                          <Tooltip label={`Edit defaults for ${runtime.name}`}>
-                            <button
-                              className="icon-button subtle runtime-defaults-button"
-                              type="button"
-                              aria-label={`Edit defaults for ${runtime.name}`}
-                              onClick={() => {
-                                setConfiguringRuntime(runtime.id);
-                                loadCatalog(runtime.id);
-                                setMessage("");
-                              }}
-                            >
-                              <Settings2 aria-hidden="true" />
-                            </button>
-                          </Tooltip>
-                        )}
                         <button
                           className={
                             runtime.status === "login_required"
@@ -1616,10 +1620,6 @@ function ModelsAndRuntimesSettings({
                             configuringRuntime}{" "}
                           defaults
                         </h3>
-                        <p>
-                          Recalled whenever you choose this runtime in a new chat. Existing chats
-                          keep their own route.
-                        </p>
                       </div>
                     </header>
                     <SettingRow

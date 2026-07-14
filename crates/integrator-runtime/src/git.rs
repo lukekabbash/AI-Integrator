@@ -171,6 +171,15 @@ pub struct FileStatus {
     pub additions: Option<u64>,
     #[serde(default)]
     pub deletions: Option<u64>,
+    /// Scope-specific counts preserve both sides of a partially staged file.
+    #[serde(default)]
+    pub staged_additions: Option<u64>,
+    #[serde(default)]
+    pub staged_deletions: Option<u64>,
+    #[serde(default)]
+    pub unstaged_additions: Option<u64>,
+    #[serde(default)]
+    pub unstaged_deletions: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -415,16 +424,32 @@ impl GitService {
         let unstaged = numstat(false);
         let staged = numstat(true);
         for file in files {
-            let stats = if file.index_status == '?' {
-                count_untracked_lines(repository, &file.path).map(|lines| (Some(lines), Some(0)))
-            } else if file.index_status != ' ' {
-                staged.get(&file.path).copied()
-            } else {
-                unstaged.get(&file.path).copied()
-            };
-            if let Some((additions, deletions)) = stats {
+            if file.index_status == '?' {
+                if let Some(lines) = count_untracked_lines(repository, &file.path) {
+                    file.additions = Some(lines);
+                    file.deletions = Some(0);
+                    file.unstaged_additions = Some(lines);
+                    file.unstaged_deletions = Some(0);
+                }
+                continue;
+            }
+            if file.index_status != ' '
+                && let Some((additions, deletions)) = staged.get(&file.path).copied()
+            {
+                file.staged_additions = additions;
+                file.staged_deletions = deletions;
                 file.additions = additions;
                 file.deletions = deletions;
+            }
+            if file.worktree_status != ' '
+                && let Some((additions, deletions)) = unstaged.get(&file.path).copied()
+            {
+                file.unstaged_additions = additions;
+                file.unstaged_deletions = deletions;
+                if file.index_status == ' ' {
+                    file.additions = additions;
+                    file.deletions = deletions;
+                }
             }
         }
     }
@@ -691,6 +716,10 @@ impl GitService {
                     path: PathBuf::from(path),
                     additions: None,
                     deletions: None,
+                    staged_additions: None,
+                    staged_deletions: None,
+                    unstaged_additions: None,
+                    unstaged_deletions: None,
                 })
             })
             .collect())
@@ -771,7 +800,9 @@ impl GitService {
         let mut args = vec!["add", "--"];
         args.extend(strings.iter().map(String::as_str));
         self.required(repository, &args)?;
-        self.status(repository)
+        let mut files = self.status(repository)?;
+        self.annotate_line_stats(repository, &mut files);
+        Ok(files)
     }
 
     pub fn unstage(&self, repository: &Path, paths: &[PathBuf]) -> Result<Vec<FileStatus>> {
@@ -797,7 +828,9 @@ impl GitService {
         };
         args.extend(strings.iter().map(String::as_str));
         self.required(repository, &args)?;
-        self.status(repository)
+        let mut files = self.status(repository)?;
+        self.annotate_line_stats(repository, &mut files);
+        Ok(files)
     }
 
     pub fn commit(&self, repository: &Path, message: &str) -> Result<CommitResult> {
@@ -1562,6 +1595,10 @@ fn parse_porcelain_v2(output: &str, include_files: bool) -> PorcelainStatus {
                 path: PathBuf::from(path),
                 additions: None,
                 deletions: None,
+                staged_additions: None,
+                staged_deletions: None,
+                unstaged_additions: None,
+                unstaged_deletions: None,
             }),
             _ => None,
         };
@@ -1586,6 +1623,10 @@ fn parse_v2_tracked(record: &str, fields: usize) -> Option<FileStatus> {
         path: PathBuf::from(path),
         additions: None,
         deletions: None,
+        staged_additions: None,
+        staged_deletions: None,
+        unstaged_additions: None,
+        unstaged_deletions: None,
     })
 }
 
@@ -1865,6 +1906,15 @@ mod tests {
         assert_eq!(overview.files.len(), 1);
         assert_eq!(overview.files[0].path, PathBuf::from("sample.txt"));
         assert_eq!(overview.files[0].worktree_status, 'M');
+        git.stage(root, &[PathBuf::from("sample.txt")])
+            .expect("stage first tranche");
+        fs::write(root.join("sample.txt"), "hello\nworld\nlater\n")
+            .expect("write unstaged remainder");
+        let overview = git.overview(&identity).expect("partially staged overview");
+        assert_eq!(overview.files[0].index_status, 'M');
+        assert_eq!(overview.files[0].worktree_status, 'M');
+        assert_eq!(overview.files[0].staged_additions, Some(1));
+        assert_eq!(overview.files[0].unstaged_additions, Some(1));
         assert_eq!(
             overview
                 .push_preview

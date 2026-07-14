@@ -3050,6 +3050,23 @@ kbd {
   bottom: calc(100% + 6px);
   transform-origin: bottom right;
 }
+/* Animated cards and rows create their own stacking contexts, so an open
+   menu must lift its whole containing card above later siblings. */
+.dropdown[data-open="true"] {
+  z-index: 60;
+}
+.runtime-settings-stage:has(.dropdown[data-open="true"]),
+.settings-section:has(.dropdown[data-open="true"]),
+.setting-row:has(.dropdown[data-open="true"]),
+.settings-runtime-row:has(.dropdown[data-open="true"]),
+.runtime-favorite-setting:has(.dropdown[data-open="true"]),
+.runtime-default-editor > div:has(.dropdown[data-open="true"]) {
+  position: relative;
+  z-index: 40;
+}
+.runtime-default-editor:has(.dropdown[data-open="true"]) {
+  overflow: visible;
+}
 .composer-controls-left .dropdown-menu {
   left: 0;
   right: auto;
@@ -5986,22 +6003,23 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   min-height: 92px;
   padding: 12px 4px;
   display: grid;
-  grid-template-columns: 40px minmax(0, 1fr) auto;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 13px;
+  gap: 12px;
   border-bottom: 1px solid var(--color-border-subtle);
 }
 .runtime-logo {
-  width: 34px;
-  height: 34px;
+  width: 30px;
+  height: 30px;
   display: grid;
   place-items: center;
-  border: 1px solid var(--color-border-base);
-  border-radius: 10px;
   color: var(--color-text-primary);
-  background: var(--color-layer-1);
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 750;
+}
+.runtime-logo .provider-icon {
+  width: 22px;
+  height: 22px;
 }
 .runtime-logo--claude {
   color: #d59b7a;
@@ -6298,22 +6316,18 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   min-height: 80px;
   margin-bottom: 36px;
   display: grid;
-  grid-template-columns: 42px minmax(0, 1fr) auto;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
   align-items: start;
-  gap: 14px;
+  gap: 12px;
 }
 .settings-page-heading > span {
-  width: 38px;
-  height: 38px;
+  height: 28px;
   display: grid;
   place-items: center;
-  border: 1px solid var(--color-border-base);
-  border-radius: 11px;
   color: var(--color-accent);
-  background: var(--color-layer-1);
 }
 .settings-page-heading > span svg {
-  width: 19px;
+  width: 20px;
 }
 .settings-page-heading h1 {
   margin: 0 0 5px;
@@ -6594,14 +6608,32 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
 .settings-runtime-list > div > span:nth-child(2) {
   min-width: 0;
   display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 2px 8px;
+  gap: 2px;
+}
+.runtime-row-title {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 .settings-runtime-list strong {
   display: flex;
   align-items: center;
   gap: 7px;
   font-size: 12px;
+}
+.runtime-row-title .runtime-defaults-button {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  color: var(--color-text-tertiary);
+}
+.runtime-row-title .runtime-defaults-button:hover {
+  color: var(--color-text-primary);
+}
+.runtime-row-title .runtime-defaults-button svg {
+  width: 12px;
+  height: 12px;
 }
 .settings-runtime-list strong small {
   padding: 1px 5px;
@@ -6647,23 +6679,11 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   padding-inline: 9px;
   font-size: 11px;
 }
-.runtime-row-actions > .icon-button {
-  width: 28px;
-  height: 28px;
-  color: var(--color-text-tertiary);
-}
-.runtime-row-actions > .icon-button:hover {
-  color: var(--color-text-primary);
-}
-.runtime-row-actions > .icon-button svg {
-  width: 14px;
-  height: 14px;
-}
 .runtime-favorite-setting {
   min-height: 62px;
-  padding: 10px 3px;
+  padding: 10px 4px;
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) minmax(170px, 220px);
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 18px;
   border-bottom: 1px solid var(--color-border-subtle);
@@ -6685,7 +6705,14 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   line-height: 1.45;
 }
 .runtime-favorite-setting .dropdown {
+  min-width: 188px;
+  justify-self: end;
+}
+.runtime-favorite-setting .dropdown-trigger {
   width: 100%;
+}
+.runtime-favorite-setting .dropdown-trigger .dropdown-label {
+  flex: 1;
 }
 .runtime-defaults-stage {
   min-width: 0;
@@ -6719,20 +6746,11 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   width: 15px;
   height: 15px;
 }
-.runtime-default-editor > header h3,
-.runtime-default-editor > header p {
-  margin: 0;
-}
 .runtime-default-editor > header h3 {
+  margin: 0;
   color: var(--color-text-primary);
   font-size: 12px;
   font-weight: 650;
-}
-.runtime-default-editor > header p {
-  margin-top: 3px;
-  color: var(--color-text-tertiary);
-  font-size: 9.5px;
-  line-height: 1.45;
 }
 .runtime-default-editor > .setting-row {
   margin-inline: 3px;
@@ -8018,6 +8036,9 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   .runtime-library-header,
   .runtime-favorite-setting {
     grid-template-columns: 1fr;
+  }
+  .runtime-favorite-setting .dropdown {
+    justify-self: start;
   }
   .runtime-library-back {
     justify-self: end;

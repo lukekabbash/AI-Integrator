@@ -3005,16 +3005,19 @@ pub async fn task_snapshot(
     // provider processes do not survive the app. Settle it as interrupted
     // before reading, so reopening a task does not rehydrate a phantom
     // streaming turn whose timer counts from hours ago.
-    if !task_has_live_runtime(&state, task_id).await {
+    let runtime_live = task_has_live_runtime(&state, task_id).await;
+    if !runtime_live {
         let store = Arc::clone(&state.store);
         let _ =
             tauri::async_runtime::spawn_blocking(move || store.settle_stopped_turn(task_id)).await;
     }
     let store = Arc::clone(&state.store);
-    tauri::async_runtime::spawn_blocking(move || store.task_snapshot(task_id))
+    let mut snapshot = tauri::async_runtime::spawn_blocking(move || store.task_snapshot(task_id))
         .await
         .map_err(|_| worker_error())?
-        .map_err(Into::into)
+        .map_err(CommandError::from)?;
+    snapshot.runtime_live = runtime_live;
+    Ok(snapshot)
 }
 
 #[tauri::command]

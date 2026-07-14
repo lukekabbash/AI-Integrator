@@ -42,16 +42,17 @@ import { AnimatedFolderIcon } from "./AnimatedFolderIcon";
 import { FileIcon } from "./FileIcon";
 import { SelectionActionPopover, type SelectionPayload } from "./SelectionActionPopover";
 import { selectionEndpointElement } from "./conversationFormatting";
-import type {
-  ChildAgent,
-  DelegationView,
-  DiffFile,
-  GitCommit,
-  GitSnapshot,
-  ProjectFileContent,
-  ProjectFileEntry,
-  ProjectFileOpener,
-  UsageSnapshot,
+import {
+  diffFileKey,
+  type ChildAgent,
+  type DelegationView,
+  type DiffFile,
+  type GitCommit,
+  type GitSnapshot,
+  type ProjectFileContent,
+  type ProjectFileEntry,
+  type ProjectFileOpener,
+  type UsageSnapshot,
 } from "../bridge";
 import { ResizeHandle } from "./ResizeHandle";
 import { Tooltip } from "./Tooltip";
@@ -727,8 +728,8 @@ function GitPanel({
   const fileRow = (file: DiffFile, isStaged: boolean) => (
     <div
       className="git-file-row"
-      data-active={activeFile?.path === file.path}
-      key={file.path}
+      data-active={activeFile ? diffFileKey(activeFile) === diffFileKey(file) : false}
+      key={diffFileKey(file)}
       onContextMenu={(event) => {
         event.preventDefault();
         openFileContextMenu(
@@ -764,7 +765,7 @@ function GitPanel({
           }
         }}
         title={file.path}
-        aria-pressed={activeFile?.path === file.path}
+        aria-pressed={activeFile ? diffFileKey(activeFile) === diffFileKey(file) : false}
       >
         <span>{file.path.split("/").at(-1)}</span>
         <small>{file.path.split("/").slice(0, -1).join("/")}</small>

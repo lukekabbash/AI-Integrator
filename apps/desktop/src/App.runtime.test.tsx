@@ -160,10 +160,16 @@ describe("native runtime recovery UI", () => {
       );
       return {
         watermarkSeq: 8,
+        runtimeLive: true,
         events: [
           projection(5, {
             kind: "turnChanged",
-            turn: { id: "turn-1", status: "inProgress", stopRequested: false },
+            turn: {
+              id: "turn-1",
+              status: "inProgress",
+              stopRequested: false,
+              startedAt: new Date(Date.now() - 125 * 60_000).toISOString(),
+            },
           }),
           projection(6, { kind: "connectionChanged", state: "gap", reason: "receiver lagged" }),
           projection(7, {
@@ -206,7 +212,7 @@ describe("native runtime recovery UI", () => {
     Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
   });
 
-  it("listens before snapshot load and renders real recovery controls", async () => {
+  it("keeps a backend-attested live turn running across snapshot recovery", async () => {
     render(<App />);
 
     expect(
@@ -223,32 +229,102 @@ describe("native runtime recovery UI", () => {
       bridgeMock.loadWorkspace.mock.invocationCallOrder[0],
     );
 
-    // The persisted in-progress turn cannot still be streaming without a live
-    // provider connection: it settles as interrupted instead of showing a
-    // stop control and an ever-growing elapsed timer.
-    expect(screen.getByText("Response interrupted")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /^Stop/ })).not.toBeInTheDocument();
+    // No connection event landed during hydration. The snapshot's native
+    // liveness attestation keeps the turn active and its original clock intact.
+    expect(screen.queryByText("Response interrupted")).not.toBeInTheDocument();
+    expect(screen.getByText("2h 5m")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Stop turn" })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Run command" }));
     await waitFor(() =>
       expect(bridgeMock.respondToApproval).toHaveBeenCalledWith("task-1", "approval-1", "accept"),
     );
 
-    // A live provider picks the task back up: the turn revives and the stop
-    // control returns.
-    act(() => {
-      runtimeListener?.(
-        projection(12, { kind: "connectionChanged", state: "connected", processId: "process-1" }),
-      );
-      runtimeListener?.(
-        projection(13, {
-          kind: "turnChanged",
-          turn: { id: "turn-2", status: "inProgress", stopRequested: false },
-        }),
-      );
-    });
-    fireEvent.click(await screen.findByRole("button", { name: "Stop turn" }));
+    fireEvent.click(screen.getByRole("button", { name: "Stop turn" }));
     await waitFor(() => expect(bridgeMock.stopTurn).toHaveBeenCalledWith("task-1"));
+  });
+
+  it("preserves a live turn and its timer when switching away and back", async () => {
+    const workspace = createEmptySnapshot();
+    workspace.projects = [
+      {
+        id: "project-1",
+        name: "sample",
+        path: "H:\\Code\\sample",
+        branch: "main",
+        dirtyFiles: 0,
+        expanded: true,
+      },
+    ];
+    workspace.tasks = [
+      {
+        id: "task-1",
+        projectId: "project-1",
+        title: "Foreground task",
+        status: "completed",
+        runtime: "codex",
+        model: "Provider default",
+        updatedAt: "2026-07-10T16:00:00Z",
+      },
+      {
+        id: "task-2",
+        projectId: "project-1",
+        title: "Background live task",
+        status: "running",
+        runtime: "codex",
+        model: "Provider default",
+        updatedAt: "2026-07-10T15:00:00Z",
+      },
+    ];
+    workspace.activeProjectId = "project-1";
+    workspace.activeTaskId = "task-2";
+    bridgeMock.loadWorkspace.mockResolvedValue(workspace);
+    bridgeMock.loadTaskProjection.mockImplementation(async (taskId: string) => {
+      if (taskId === "task-1") {
+        return { watermarkSeq: 0, runtimeLive: false, events: [] };
+      }
+      return {
+        watermarkSeq: 2,
+        runtimeLive: true,
+        events: [
+          {
+            ...projection(1, {
+              kind: "connectionChanged",
+              state: "connected",
+              processId: "process-2",
+            }),
+            taskId: "task-2",
+          },
+          {
+            ...projection(2, {
+              kind: "turnChanged",
+              turn: {
+                id: "turn-background",
+                status: "inProgress",
+                stopRequested: false,
+                startedAt: new Date(Date.now() - 125 * 60_000).toISOString(),
+              },
+            }),
+            taskId: "task-2",
+          },
+        ],
+      };
+    });
+
+    render(<App />);
+    await waitFor(() => expect(bridgeMock.loadTaskProjection).toHaveBeenCalledWith("task-2"));
+    fireEvent.click(await screen.findByRole("button", { name: /Foreground task/i }));
+    await waitFor(() => expect(bridgeMock.loadTaskProjection).toHaveBeenCalledWith("task-1"));
+    fireEvent.click(await screen.findByRole("button", { name: /Background live task/i }));
+
+    await waitFor(() => {
+      expect(
+        bridgeMock.loadTaskProjection.mock.calls.filter(([taskId]) => taskId === "task-2"),
+      ).toHaveLength(2);
+    });
+    expect(screen.queryByText("Response interrupted")).not.toBeInTheDocument();
+    expect(screen.getByText("2h 5m")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Stop turn" })).toBeInTheDocument();
   });
 
   it("loads the selected native diff when the header Review tab opens", async () => {
@@ -552,6 +628,7 @@ describe("native runtime recovery UI", () => {
     bridgeMock.setSessionMode.mockResolvedValue(undefined);
     bridgeMock.loadTaskProjection.mockResolvedValue({
       watermarkSeq: 6,
+      runtimeLive: true,
       events: [
         projection(5, {
           kind: "turnChanged",
@@ -626,7 +703,11 @@ describe("native runtime recovery UI", () => {
     workspace.activeProjectId = "project-1";
     workspace.activeTaskId = "task-1";
     bridgeMock.loadWorkspace.mockResolvedValue(workspace);
-    bridgeMock.loadTaskProjection.mockResolvedValue({ watermarkSeq: 0, events: [] });
+    bridgeMock.loadTaskProjection.mockResolvedValue({
+      watermarkSeq: 0,
+      runtimeLive: false,
+      events: [],
+    });
     bridgeMock.probeRuntimes.mockReturnValue(new Promise(() => undefined));
     bridgeMock.sendTurn.mockResolvedValue(undefined);
 
@@ -837,7 +918,11 @@ describe("native runtime recovery UI", () => {
     workspace.activeProjectId = "project-1";
     workspace.activeTaskId = "task-1";
     bridgeMock.loadWorkspace.mockResolvedValue(workspace);
-    bridgeMock.loadTaskProjection.mockResolvedValue({ watermarkSeq: 0, events: [] });
+    bridgeMock.loadTaskProjection.mockResolvedValue({
+      watermarkSeq: 0,
+      runtimeLive: false,
+      events: [],
+    });
 
     render(<App />);
     const background = await screen.findByRole("button", { name: /Background task/i });
@@ -867,11 +952,92 @@ describe("native runtime recovery UI", () => {
     await waitFor(() =>
       expect(bridgeMock.setTaskStatus).toHaveBeenCalledWith("task-2", "completed"),
     );
+    await waitFor(() => expect(bridgeMock.loadTaskGit).toHaveBeenCalledWith("task-2"));
 
     fireEvent.click(screen.getByRole("button", { name: /Background task/i }));
     const selectedBackground = await screen.findByRole("button", { name: /Background task/i });
     await waitFor(() => expect(selectedBackground).toHaveAttribute("aria-current", "page"));
     expect(within(selectedBackground).queryByRole("img")).not.toBeInTheDocument();
+  });
+
+  it("ignores an older Git refresh that resolves after a newer one", async () => {
+    render(<App />);
+    await waitFor(() => expect(bridgeMock.loadTaskGit).toHaveBeenCalledWith("task-1"));
+
+    let resolveOlder!: (snapshot: ReturnType<typeof createEmptySnapshot>["git"]) => void;
+    let resolveNewer!: (snapshot: ReturnType<typeof createEmptySnapshot>["git"]) => void;
+    const older = new Promise<ReturnType<typeof createEmptySnapshot>["git"]>((resolve) => {
+      resolveOlder = resolve;
+    });
+    const newer = new Promise<ReturnType<typeof createEmptySnapshot>["git"]>((resolve) => {
+      resolveNewer = resolve;
+    });
+    bridgeMock.loadTaskGit.mockImplementationOnce(() => older).mockImplementationOnce(() => newer);
+
+    act(() => {
+      runtimeListener?.(
+        projection(30, {
+          kind: "turnChanged",
+          turn: { id: "turn-older", status: "completed", stopRequested: false },
+        }),
+      );
+      runtimeListener?.(
+        projection(31, {
+          kind: "turnChanged",
+          turn: { id: "turn-newer", status: "completed", stopRequested: false },
+        }),
+      );
+    });
+    await waitFor(() => expect(bridgeMock.loadTaskGit).toHaveBeenCalledTimes(3));
+
+    const gitSnapshot = (path: string) => ({
+      ...createEmptySnapshot().git,
+      kind: "repository" as const,
+      branch: "main",
+      worktree: "H:\\Code\\sample",
+      files: [
+        {
+          path,
+          status: "modified" as const,
+          additions: 1,
+          deletions: 0,
+          staged: false,
+          lines: [],
+        },
+      ],
+    });
+
+    await act(async () => resolveNewer(gitSnapshot("src/newer.ts")));
+    expect(await screen.findByText("newer.ts")).toBeInTheDocument();
+    await act(async () => resolveOlder(gitSnapshot("src/older.ts")));
+    expect(screen.getByText("newer.ts")).toBeInTheDocument();
+    expect(screen.queryByText("older.ts")).not.toBeInTheDocument();
+  });
+
+  it("debounces provider file changes into a live Git refresh", async () => {
+    render(<App />);
+    await waitFor(() => expect(bridgeMock.loadTaskGit).toHaveBeenCalledWith("task-1"));
+    bridgeMock.loadTaskGit.mockClear();
+
+    act(() => {
+      runtimeListener?.(
+        projection(32, {
+          kind: "itemChanged",
+          item: {
+            id: "codex:thread-1:turn-1:file-1",
+            providerItemId: "file-1",
+            kind: "fileChange",
+            status: "completed",
+            fileChanges: [{ path: "src/live.ts", changeKind: "modify" }],
+            truncated: false,
+            updatedAt: "2026-07-10T16:00:00Z",
+          },
+        }),
+      );
+    });
+
+    await waitFor(() => expect(bridgeMock.loadTaskGit).toHaveBeenCalledWith("task-1"));
+    expect(bridgeMock.loadTaskGit).toHaveBeenCalledTimes(1);
   });
 
   it("shows the serialized Cursor failure instead of replacing it with a generic turn error", async () => {

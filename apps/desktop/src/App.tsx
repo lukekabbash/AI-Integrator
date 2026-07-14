@@ -41,6 +41,7 @@ import {
 import {
   bridge,
   CHAT_TITLE_PLACEHOLDER,
+  diffFileKey,
   draftOwnerKey,
   formatBridgeError,
   type ApprovalDecision,
@@ -1213,7 +1214,9 @@ export default function App() {
   const [terminalOwner, setTerminalOwner] = useState<"main" | string | null>(null);
   const [terminalSurfaceActivated, setTerminalSurfaceActivated] = useState(false);
   const [diffView, setDiffView] = useState<"unified" | "split">("unified");
-  const [activeFilePath, setActiveFilePath] = useState(() => snapshot.git.files[0]?.path ?? "");
+  const [activeFileKey, setActiveFileKey] = useState(() =>
+    snapshot.git.files[0] ? diffFileKey(snapshot.git.files[0]) : "",
+  );
   const [projectFiles, setProjectFiles] = useState<ProjectFileEntry[]>([]);
   const [projectFileOpenerState, setProjectFileOpenerState] = useState<{
     projectId: string;
@@ -1225,7 +1228,7 @@ export default function App() {
   const [reviewedFiles, setReviewedFiles] = useState<Record<string, boolean>>({});
   const [reviewRefreshing, setReviewRefreshing] = useState(false);
   const [reviewLoadError, setReviewLoadError] = useState<{
-    path: string;
+    fileKey: string;
     message: string;
   } | null>(null);
   const [reviewRetryVersion, setReviewRetryVersion] = useState(0);
@@ -1241,12 +1244,15 @@ export default function App() {
   const projectionGeneration = useRef(0);
   const navigationGeneration = useRef(0);
   const taskProjectionCache = useRef(new Map<string, RuntimeProjectionState>());
+  const activeTaskIdRef = useRef<string | undefined>(snapshot.activeTaskId);
   const taskRuntimeByIdRef = useRef(
     new Map(snapshot.tasks.map((task) => [task.id, task.runtime] as const)),
   );
   const verifiedRuntimesRef = useRef(new Set<RuntimeId>());
   const taskGitCache = useRef(new Map<string, GitSnapshot>());
   const taskGitRefreshedAt = useRef(new Map<string, number>());
+  const taskGitGeneration = useRef(new Map<string, number>());
+  const scheduledTaskGitRefresh = useRef(new Map<string, number>());
   const projectFilesCache = useRef(new Map<string, ProjectFileEntry[]>());
   const activeProjectForFilesRef = useRef<string | undefined>(undefined);
   const composerNoticeSequence = useRef(0);
@@ -1286,6 +1292,54 @@ export default function App() {
       }
     },
     [],
+  );
+
+  const applyTaskGitSnapshot = useCallback(
+    (taskId: string, git: GitSnapshot, expectedGeneration?: number): boolean => {
+      const currentGeneration = taskGitGeneration.current.get(taskId) ?? 0;
+      if (expectedGeneration !== undefined && expectedGeneration !== currentGeneration) {
+        return false;
+      }
+      if (expectedGeneration === undefined) {
+        taskGitGeneration.current.set(taskId, currentGeneration + 1);
+      }
+      taskGitCache.current.set(taskId, git);
+      taskGitRefreshedAt.current.set(taskId, Date.now());
+      if (activeTaskIdRef.current !== taskId) return true;
+      setSnapshot((current) => (current.activeTaskId === taskId ? { ...current, git } : current));
+      setActiveFileKey((current) =>
+        git.files.some((file) => diffFileKey(file) === current)
+          ? current
+          : git.files[0]
+            ? diffFileKey(git.files[0])
+            : "",
+      );
+      return true;
+    },
+    [],
+  );
+
+  const refreshTaskGitSnapshot = useCallback(
+    async (taskId: string): Promise<GitSnapshot | undefined> => {
+      const generation = (taskGitGeneration.current.get(taskId) ?? 0) + 1;
+      taskGitGeneration.current.set(taskId, generation);
+      const git = await bridge.loadTaskGit(taskId);
+      return applyTaskGitSnapshot(taskId, git, generation) ? git : undefined;
+    },
+    [applyTaskGitSnapshot],
+  );
+
+  const scheduleTaskGitRefresh = useCallback(
+    (taskId: string) => {
+      const pending = scheduledTaskGitRefresh.current.get(taskId);
+      if (pending !== undefined) window.clearTimeout(pending);
+      const timer = window.setTimeout(() => {
+        scheduledTaskGitRefresh.current.delete(taskId);
+        void refreshTaskGitSnapshot(taskId).catch(() => undefined);
+      }, 250);
+      scheduledTaskGitRefresh.current.set(taskId, timer);
+    },
+    [refreshTaskGitSnapshot],
   );
 
   useEffect(() => {
@@ -1333,26 +1387,33 @@ export default function App() {
           ...next,
           lastSeq: Math.max(next.lastSeq, loaded.watermarkSeq),
         };
-        let liveConnectionSeen = false;
+        let runtimeLive = loaded.runtimeLive;
         for (const event of projectionBuffer.current
           .filter((candidate) => candidate.taskId === taskId && candidate.seq > loaded.watermarkSeq)
           .sort((a, b) => a.seq - b.seq)) {
-          if (event.projection.kind === "connectionChanged") liveConnectionSeen = true;
+          if (
+            (event.projection.kind === "connectionChanged" &&
+              event.projection.state !== "disconnected") ||
+            (event.projection.kind === "turnChanged" &&
+              (event.projection.turn.status === "pending" ||
+                event.projection.turn.status === "inProgress"))
+          ) {
+            runtimeLive = true;
+          }
           next = applyRuntimeProjection(next, event);
         }
         if (generation !== projectionGeneration.current) return;
         projectionBuffer.current = [];
         projectionReady.current = true;
         if (
-          !liveConnectionSeen &&
+          !runtimeLive &&
           (next.connection.state === "reconciling" ||
             next.connection.state === "connecting" ||
             next.connection.state === "connected")
         ) {
-          // Persisted liveness is stale by definition — a provider process
-          // never survives the app — so without a live connection event the
-          // task is disconnected until Codex reconnects. Persisted "gap"
-          // stays visible: it records that history still needs reconciling.
+          // Persisted connection state cannot prove that its provider process
+          // survived. The native snapshot command checks the task-owned
+          // runtime; a newer buffered lifecycle event can also prove liveness.
           next = {
             ...next,
             connection: {
@@ -1362,15 +1423,12 @@ export default function App() {
           };
         }
         if (
-          !liveConnectionSeen &&
+          !runtimeLive &&
           next.turn &&
           (next.turn.status === "inProgress" || next.turn.status === "pending")
         ) {
-          // Same reasoning for the turn itself: without a live provider the
-          // persisted "streaming" turn can never finish, so it must not keep
-          // the transcript spinner and elapsed timer alive. The backend
-          // settles this in the store on snapshot; this covers the window
-          // where that write fails or an older database is loaded.
+          // The backend normally settles this before returning the snapshot;
+          // retain a renderer fallback for a failed settlement or old store.
           next = {
             ...next,
             turn: {
@@ -1409,6 +1467,7 @@ export default function App() {
     let active = true;
     let unlisten: (() => void) | undefined;
     let projectionFrame: number | undefined;
+    const scheduledGitRefreshes = scheduledTaskGitRefresh.current;
     const frameEvents: RuntimeProjectionEvent[] = [];
     const applyLiveProjectionBatch = (events: RuntimeProjectionEvent[]) => {
       const taskId = projectionTaskId.current;
@@ -1439,6 +1498,12 @@ export default function App() {
       try {
         if (nativeHost) {
           unlisten = await bridge.subscribeRuntimeProjections((event) => {
+            if (
+              event.projection.kind === "itemChanged" &&
+              event.projection.item.kind === "fileChange"
+            ) {
+              scheduleTaskGitRefresh(event.taskId);
+            }
             if (!projectionReady.current) {
               recordRuntimeVerificationEvent(event, verifiedRuntimesRef.current);
             }
@@ -1461,9 +1526,13 @@ export default function App() {
                 persistedActivity.status === "failed" ||
                 persistedActivity.status === "stopped"
               ) {
+                const pendingRefresh = scheduledTaskGitRefresh.current.get(event.taskId);
+                if (pendingRefresh !== undefined) window.clearTimeout(pendingRefresh);
+                scheduledTaskGitRefresh.current.delete(event.taskId);
                 void bridge
                   .setTaskStatus?.(event.taskId, persistedActivity.status)
                   .catch(() => undefined);
+                void refreshTaskGitSnapshot(event.taskId).catch(() => undefined);
               }
             }
             if (!projectionReady.current) {
@@ -1529,7 +1598,9 @@ export default function App() {
         taskRuntimeByIdRef.current = new Map(
           loaded.tasks.map((task) => [task.id, task.runtime] as const),
         );
-        setActiveFilePath((path) => path || loaded.git.files[0]?.path || "");
+        setActiveFileKey(
+          (key) => key || (loaded.git.files[0] ? diffFileKey(loaded.git.files[0]) : ""),
+        );
         // The shell is useful as soon as local projects/tasks/settings exist.
         // Provider discovery and transcript reconciliation are independent,
         // read-only refreshes and must not gate that first paint.
@@ -1546,16 +1617,8 @@ export default function App() {
         if (nativeHost && loaded.activeTaskId) {
           void reconcileTaskProjection(loaded.activeTaskId, true);
           const taskId = loaded.activeTaskId;
-          void Promise.resolve(bridge.loadTaskGit?.(taskId))
-            .then((git) => {
-              if (!active || !git) return;
-              taskGitCache.current.set(taskId, git);
-              taskGitRefreshedAt.current.set(taskId, Date.now());
-              setSnapshot((current) =>
-                current.activeTaskId === taskId ? { ...current, git } : current,
-              );
-              setActiveFilePath((current) => current || git.files[0]?.path || "");
-            })
+          activeTaskIdRef.current = taskId;
+          void refreshTaskGitSnapshot(taskId)
             .catch(() => undefined)
             .finally(() => {
               if (active) setGitLoading(false);
@@ -1575,10 +1638,21 @@ export default function App() {
     })();
     return () => {
       active = false;
+      for (const timer of scheduledGitRefreshes.values()) {
+        window.clearTimeout(timer);
+      }
+      scheduledGitRefreshes.clear();
       if (projectionFrame !== undefined) window.cancelAnimationFrame(projectionFrame);
       unlisten?.();
     };
-  }, [applyVerifiedRuntimeHealth, composerDraftStore, nativeHost, reconcileTaskProjection]);
+  }, [
+    applyVerifiedRuntimeHealth,
+    composerDraftStore,
+    nativeHost,
+    reconcileTaskProjection,
+    refreshTaskGitSnapshot,
+    scheduleTaskGitRefresh,
+  ]);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => void bridge.persistSession(snapshot), 300);
@@ -1588,7 +1662,6 @@ export default function App() {
   // Delegated-subagent lineage for the active task. Refreshed on task switch
   // and whenever the native broker reports a delegation change; the events
   // are cheap notifications, so a full re-list keeps the panel authoritative.
-  const activeTaskIdRef = useRef<string | undefined>(snapshot.activeTaskId);
   useEffect(() => {
     activeTaskIdRef.current = snapshot.activeTaskId;
   }, [snapshot.activeTaskId]);
@@ -1788,7 +1861,7 @@ export default function App() {
     return draft.revision;
   };
   const activeFile =
-    snapshot.git.files.find((file) => file.path === activeFilePath) ?? snapshot.git.files[0];
+    snapshot.git.files.find((file) => diffFileKey(file) === activeFileKey) ?? snapshot.git.files[0];
   const activeProjectIdForFiles = activeProject?.id;
   const projectFileOpeners =
     projectFileOpenerState.projectId === activeProjectIdForFiles
@@ -1963,11 +2036,13 @@ export default function App() {
     // wait on SQLite or subprocess startup.
     setSwitchingTaskId(cachedRuntime ? "" : taskId);
     setGitLoading(refreshTaskGit);
+    activeTaskIdRef.current = taskId;
     setOperationError("");
     setRuntimeState(cachedRuntime ?? null);
     setSelectedDelegationId(undefined);
     setCenterView(restoredView);
-    setActiveFilePath(cachedGit?.files[0]?.path ?? cached?.git.files[0]?.path ?? "");
+    const firstCachedFile = cachedGit?.files[0] ?? cached?.git.files[0];
+    setActiveFileKey(firstCachedFile ? diffFileKey(firstCachedFile) : "");
     setSnapshot((current) => {
       const currentContext = current.activeTaskId
         ? {
@@ -2011,21 +2086,7 @@ export default function App() {
         if (generation === navigationGeneration.current) setSwitchingTaskId("");
       });
       if (refreshTaskGit) {
-        void bridge
-          .loadTaskGit(taskId)
-          .then((git) => {
-            taskGitCache.current.set(taskId, git);
-            taskGitRefreshedAt.current.set(taskId, Date.now());
-            if (generation !== navigationGeneration.current) return;
-            setSnapshot((current) =>
-              current.activeTaskId === taskId ? { ...current, git } : current,
-            );
-            setActiveFilePath((current) =>
-              git.files.some((file) => file.path === current)
-                ? current
-                : (git.files[0]?.path ?? ""),
-            );
-          })
+        void refreshTaskGitSnapshot(taskId)
           .catch((error: unknown) => {
             if (generation !== navigationGeneration.current) return;
             setOperationError(error instanceof Error ? error.message : "Could not load Git state");
@@ -2053,11 +2114,12 @@ export default function App() {
     }
     ++navigationGeneration.current;
     setGitLoading(nativeHost);
+    activeTaskIdRef.current = undefined;
     setNewChatDraftKey((value) => value + 1);
     const empty = createEmptySnapshot();
     setRuntimeState(null);
     setCenterView("task");
-    setActiveFilePath("");
+    setActiveFileKey("");
     setSnapshot((current) => {
       const contexts = current.activeTaskId
         ? {
@@ -2089,6 +2151,7 @@ export default function App() {
 
   const mergeProject = (project: ProjectSummary) => {
     setGitLoading(nativeHost);
+    activeTaskIdRef.current = snapshot.tasks.find((task) => task.projectId === project.id)?.id;
     setSnapshot((current) => {
       const existingTasks = current.tasks.filter((task) => task.projectId === project.id);
       const sameProject = current.activeProjectId === project.id;
@@ -2206,7 +2269,7 @@ export default function App() {
       setRuntimeState(null);
     }
     setCenterView("task");
-    setActiveFilePath("");
+    setActiveFileKey("");
   };
 
   const createTask = async (
@@ -2263,7 +2326,7 @@ export default function App() {
     setSelectedDelegationId(undefined);
     setCenterView("task");
     setScreen("workspace");
-    setActiveFilePath("");
+    setActiveFileKey("");
     setNewChatDraftKey((value) => value + 1);
     setSnapshot((current) => ({
       ...current,
@@ -2558,7 +2621,7 @@ export default function App() {
           const empty = createEmptySnapshot();
           setRuntimeState(null);
           setCenterView("task");
-          setActiveFilePath("");
+          setActiveFileKey("");
           setSnapshot((current) => ({
             ...current,
             activeProjectId: archivedTask.projectId,
@@ -2579,7 +2642,7 @@ export default function App() {
 
   const selectFile = (file: DiffFile) => {
     setReviewLoadError(null);
-    setActiveFilePath(file.path);
+    setActiveFileKey(diffFileKey(file));
     changeCenterView("review");
   };
 
@@ -2674,17 +2737,13 @@ export default function App() {
   const stageFile = async (file: DiffFile, staged: boolean) => {
     if (!activeTask) return;
     const git = await bridge.stageFiles(activeTask.id, [file.path], staged);
-    taskGitCache.current.set(activeTask.id, git);
-    taskGitRefreshedAt.current.set(activeTask.id, Date.now());
-    setSnapshot((current) => ({ ...current, git }));
+    applyTaskGitSnapshot(activeTask.id, git);
   };
 
   const commit = async (message: string) => {
     if (!activeTask) return;
     const git = await bridge.commit(activeTask.id, message);
-    taskGitCache.current.set(activeTask.id, git);
-    taskGitRefreshedAt.current.set(activeTask.id, Date.now());
-    setSnapshot((current) => ({ ...current, git }));
+    applyTaskGitSnapshot(activeTask.id, git);
   };
 
   const generateCommitMessage = async () => {
@@ -2714,10 +2773,7 @@ export default function App() {
     if (result.outcome === "outcomeUncertain") {
       throw new Error(`${result.summary} Refresh Git status before retrying.`);
     }
-    const git = await bridge.loadTaskGit(activeTask.id);
-    taskGitCache.current.set(activeTask.id, git);
-    taskGitRefreshedAt.current.set(activeTask.id, Date.now());
-    setSnapshot((current) => ({ ...current, git }));
+    await refreshTaskGitSnapshot(activeTask.id);
   };
 
   const loadMoreGitHistory = async () => {
@@ -2747,19 +2803,13 @@ export default function App() {
       setSnapshot((current) => ({ ...current, git }));
       return;
     }
-    const git = await bridge.loadTaskGit(activeTask.id);
-    taskGitCache.current.set(activeTask.id, git);
-    taskGitRefreshedAt.current.set(activeTask.id, Date.now());
-    setSnapshot((current) => ({ ...current, git }));
-    setActiveFilePath((current) =>
-      git.files.some((file) => file.path === current) ? current : (git.files[0]?.path ?? ""),
-    );
+    await refreshTaskGitSnapshot(activeTask.id);
   };
 
   const applyGitSnapshot = (git: GitSnapshot) => {
     if (activeTask) {
-      taskGitCache.current.set(activeTask.id, git);
-      taskGitRefreshedAt.current.set(activeTask.id, Date.now());
+      applyTaskGitSnapshot(activeTask.id, git);
+      return;
     }
     setSnapshot((current) => ({ ...current, git }));
   };
@@ -2862,7 +2912,7 @@ export default function App() {
           const git = {
             ...current.git,
             files: current.git.files.map((candidate) =>
-              candidate.path === loaded.path ? loaded : candidate,
+              diffFileKey(candidate) === diffFileKey(loaded) ? loaded : candidate,
             ),
           };
           taskGitCache.current.set(taskId, git);
@@ -2872,7 +2922,7 @@ export default function App() {
       .catch((error: unknown) => {
         if (!active) return;
         const message = error instanceof Error ? error.message : "Could not load that diff";
-        setReviewLoadError({ path: file.path, message });
+        setReviewLoadError({ fileKey: diffFileKey(file), message });
       });
     return () => {
       active = false;
@@ -3687,7 +3737,7 @@ export default function App() {
                       <div className="route-loading" role="status" aria-live="polite">
                         Checking this worktree for changes…
                       </div>
-                    ) : activeFile && reviewLoadError?.path === activeFile.path ? (
+                    ) : activeFile && reviewLoadError?.fileKey === diffFileKey(activeFile) ? (
                       <ReviewLoadErrorState
                         message={reviewLoadError.message}
                         onRetry={() => {
@@ -3710,13 +3760,14 @@ export default function App() {
                           onRefresh={() => void refreshReview()}
                           refreshing={reviewRefreshing}
                           reviewed={Boolean(
-                            activeTask && reviewedFiles[`${activeTask.id}:${activeFile.path}`],
+                            activeTask &&
+                            reviewedFiles[`${activeTask.id}:${diffFileKey(activeFile)}`],
                           )}
                           onMarkReviewed={() => {
                             if (!activeTask) return;
                             setReviewedFiles((current) => ({
                               ...current,
-                              [`${activeTask.id}:${activeFile.path}`]: true,
+                              [`${activeTask.id}:${diffFileKey(activeFile)}`]: true,
                             }));
                             setOperationStatus(
                               `${activeFile.path} marked reviewed for this session`,
@@ -3905,9 +3956,7 @@ export default function App() {
                         onStageFiles={async (paths, staged) => {
                           if (!activeTask) return;
                           const git = await bridge.stageFiles(activeTask.id, paths, staged);
-                          taskGitCache.current.set(activeTask.id, git);
-                          taskGitRefreshedAt.current.set(activeTask.id, Date.now());
-                          setSnapshot((current) => ({ ...current, git }));
+                          applyTaskGitSnapshot(activeTask.id, git);
                         }}
                         onCommit={commit}
                         onGenerateCommitMessage={

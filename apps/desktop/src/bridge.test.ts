@@ -663,6 +663,80 @@ describe("native trusted-project bridge", () => {
     expect(invokeMock).toHaveBeenCalledWith("git_overview", { repository: root });
   });
 
+  it("projects a partially staged path into independent staged and unstaged files", async () => {
+    const root = "H:\\Code\\partial";
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "local_export") {
+        return Promise.resolve({
+          projects: [
+            {
+              id: "project-partial",
+              displayName: "partial",
+              repositoryRoot: root,
+              gitRepositoryRoot: root,
+              gitCommonDirectory: `${root}\\.git`,
+              createdAt: "2026-07-14T12:00:00Z",
+              lastOpenedAt: "2026-07-14T12:00:00Z",
+            },
+          ],
+          tasks: [
+            {
+              id: "task-partial",
+              title: "Partial staging",
+              repositoryPath: root,
+              state: "ready",
+              pinned: false,
+              archived: false,
+              createdAt: "2026-07-14T12:00:00Z",
+              updatedAt: "2026-07-14T12:00:00Z",
+            },
+          ],
+          settings: [],
+          providerSessions: [],
+          composerDrafts: [],
+        });
+      }
+      if (command === "git_overview") {
+        return Promise.resolve({
+          identity: { root, branch: "main" },
+          files: [
+            {
+              indexStatus: "M",
+              worktreeStatus: "M",
+              path: "src/App.tsx",
+              stagedAdditions: 4,
+              stagedDeletions: 1,
+              unstagedAdditions: 2,
+              unstagedDeletions: 0,
+            },
+          ],
+          history: [],
+          remotes: [],
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    await bridge.loadWorkspace();
+
+    await expect(bridge.loadTaskGit("task-partial")).resolves.toMatchObject({
+      files: [
+        {
+          path: "src/App.tsx",
+          staged: true,
+          additions: 4,
+          deletions: 1,
+        },
+        {
+          path: "src/App.tsx",
+          staged: false,
+          additions: 2,
+          deletions: 0,
+        },
+      ],
+    });
+  });
+
   it("keeps external file actions typed and repository-scoped", async () => {
     openMock.mockResolvedValue("H:\\Code\\file-actions");
     invokeMock.mockResolvedValueOnce({
@@ -703,7 +777,7 @@ describe("native trusted-project bridge", () => {
     const listener = vi.fn();
     listenMock.mockResolvedValue(unlisten);
     invokeMock
-      .mockResolvedValueOnce({ events: [], watermarkSeq: 41 })
+      .mockResolvedValueOnce({ events: [], watermarkSeq: 41, runtimeLive: true })
       .mockResolvedValueOnce({ id: "approval-1", state: "responding" })
       .mockResolvedValueOnce({ turnId: "turn-1", stopRequested: true, alreadyRequested: false });
 
@@ -712,6 +786,7 @@ describe("native trusted-project bridge", () => {
     await expect(bridge.loadTaskProjection("task-1")).resolves.toEqual({
       events: [],
       watermarkSeq: 41,
+      runtimeLive: true,
     });
     await bridge.respondToApproval("task-1", "approval-1", "acceptForSession");
     await bridge.stopTurn("task-1");
