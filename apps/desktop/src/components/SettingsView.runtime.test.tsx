@@ -144,12 +144,15 @@ describe("Runtime Settings command disclosure", () => {
 
     await screen.findByRole("dialog", { name: "Update Codex" });
     await waitFor(() => expect(screen.queryByText("Claude")).not.toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: "Favorite runtime" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Cancel runtime command" }));
 
     expect(screen.queryByRole("dialog", { name: "Update Codex" })).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Mock setup terminal")).not.toBeInTheDocument();
-    expect(await screen.findByRole("heading", { name: "New chat route" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Runtime library" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "New chat route" })).not.toBeInTheDocument();
     expect(await screen.findByText("Claude")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Favorite runtime" })).toBeInTheDocument();
     expect(document.querySelector(".runtime-settings-stage")).toHaveAttribute(
       "data-focused",
       "false",
@@ -230,14 +233,14 @@ describe("Runtime Settings command disclosure", () => {
       />,
     );
 
-    fireEvent.click(
-      screen.getByText("Models & runtimes").closest("button") as HTMLButtonElement,
-    );
+    fireEvent.click(screen.getByText("Models and Runtimes").closest("button") as HTMLButtonElement);
+    expect(await screen.findByRole("button", { name: "Favorite runtime" })).toBeInTheDocument();
     const runtimeRow = (await screen.findByText("Codex")).closest(".settings-runtime-row");
     expect(runtimeRow).not.toBeNull();
     fireEvent.click(within(runtimeRow as HTMLElement).getByRole("button", { name: "Update" }));
 
     expect(await screen.findByRole("dialog", { name: "Update Codex" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Favorite runtime" })).not.toBeInTheDocument();
     expect(bridgeMock.listRuntimeActionPlans).toHaveBeenCalledWith("codex", "update");
     fireEvent.click(screen.getByRole("button", { name: "Run this command" }));
     expect(await screen.findByLabelText("Mock setup terminal")).toBeInTheDocument();
@@ -247,6 +250,7 @@ describe("Runtime Settings command disclosure", () => {
       expect(screen.queryByLabelText("Mock setup terminal")).not.toBeInTheDocument(),
     );
     expect(await screen.findByText("Claude")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Favorite runtime" })).toBeInTheDocument();
     expect(document.querySelector(".runtime-settings-stage")).toHaveAttribute(
       "data-focused",
       "false",
@@ -333,10 +337,19 @@ describe("Runtime Settings command disclosure", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Models & runtimes" }));
+    fireEvent.click(screen.getByRole("button", { name: "Models and Runtimes" }));
+    expect(await screen.findByRole("button", { name: "Favorite runtime" })).toHaveTextContent(
+      "Last used",
+    );
     const claudeRow = (await screen.findByText("Claude")).closest(".settings-runtime-row");
     expect(claudeRow).not.toBeNull();
-    fireEvent.click(within(claudeRow as HTMLElement).getByRole("button", { name: /Defaults/ }));
+    fireEvent.click(
+      within(claudeRow as HTMLElement).getByRole("button", {
+        name: "Edit defaults for Claude",
+      }),
+    );
+    expect(screen.queryByRole("button", { name: "Favorite runtime" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Back" })).toBeInTheDocument();
 
     const model = await screen.findByRole("button", { name: "Preferred model for claude" });
     fireEvent.click(model);
@@ -351,8 +364,43 @@ describe("Runtime Settings command disclosure", () => {
         claude: { model: "claude-sonnet", effort: "low" },
       }),
     );
-    fireEvent.click(screen.getByRole("button", { name: "Done" }));
-    expect(await screen.findByRole("heading", { name: "New chat route" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Default runtime" })).toHaveTextContent("Codex");
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(await screen.findByRole("heading", { name: "Runtime library" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Favorite runtime" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Default runtime" })).not.toBeInTheDocument();
+  });
+
+  it("uses a reversible favorite dropdown and preserves legacy route defaults when clearing it", async () => {
+    bridgeMock.listSettings.mockResolvedValueOnce([
+      { key: "settings.models.defaultRuntime", value: "codex" },
+      { key: "settings.models.defaultModel", value: "gpt-codex" },
+      { key: "settings.models.defaultEffort", value: "high" },
+    ]);
+
+    render(
+      <SettingsView
+        preferences={DEFAULT_THEME_PREFERENCES}
+        runtimes={[{ ...runtime, status: "connected", models: ["gpt-codex"] }, claudeRuntime]}
+        usage={createEmptySnapshot().usage}
+        onChangePreferences={vi.fn()}
+        onResetPreferences={vi.fn()}
+        onBack={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Models and Runtimes" }));
+    const favoriteRuntime = await screen.findByRole("button", { name: "Favorite runtime" });
+    expect(favoriteRuntime).toHaveTextContent("Codex");
+    fireEvent.click(favoriteRuntime);
+    fireEvent.click(await screen.findByRole("option", { name: "Last used" }));
+
+    expect(bridgeMock.setSetting).toHaveBeenCalledWith(
+      "settings.models.defaultsByRuntime",
+      expect.objectContaining({ codex: { model: "gpt-codex", effort: "high" } }),
+    );
+    expect(bridgeMock.setSetting).toHaveBeenCalledWith("settings.models.defaultRuntime", "");
+    expect(await screen.findByRole("button", { name: "Favorite runtime" })).toHaveTextContent(
+      "Last used",
+    );
   });
 });

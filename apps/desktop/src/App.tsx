@@ -1691,7 +1691,9 @@ export default function App() {
     typeof storedLastRuntime === "string" &&
     snapshot.runtimes.some((runtime) => runtime.id === storedLastRuntime)
       ? (storedLastRuntime as RuntimeId)
-      : snapshot.tasks[0]?.runtime;
+      : snapshot.tasks.find((task) =>
+          snapshot.runtimes.some((runtime) => runtime.id === task.runtime),
+        )?.runtime;
   const settingsDefaultRuntime =
     favoriteRuntime ??
     lastRuntime ??
@@ -2432,9 +2434,7 @@ export default function App() {
       return false;
     }
     setLocalSettings((current) => ({ ...current, "models.lastRuntime": input.runtime }));
-    void bridge
-      .setSetting("settings.models.lastRuntime", input.runtime)
-      .catch(() => undefined);
+    void bridge.setSetting("settings.models.lastRuntime", input.runtime).catch(() => undefined);
     if (input.draftRevision !== undefined) {
       const cleared = composerDraftStore.clear(
         { kind: "task", taskId: targetTask.id },
@@ -3588,13 +3588,9 @@ export default function App() {
                               : `draft-${activeProject.id}-${newChatDraftKey}`
                           }
                           runtimes={snapshot.runtimes}
-                          defaultRuntime={
-                            activeTask?.runtime ?? settingsDefaultRuntime
-                          }
+                          defaultRuntime={activeTask?.runtime ?? settingsDefaultRuntime}
                           defaultModel={activeTask?.model ?? settingsDefaultModel}
-                          defaultEffort={
-                            activeTask?.effort ?? settingsDefaultRoute.effort
-                          }
+                          defaultEffort={activeTask?.effort ?? settingsDefaultRoute.effort}
                           runtimeDefaults={composerRuntimeDefaults}
                           defaultPermission={
                             localSettings["permissions.defaultProfile"] === "read-only" ||

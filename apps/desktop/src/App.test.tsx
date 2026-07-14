@@ -157,7 +157,7 @@ describe("AI Integrator desktop workspace", () => {
       "General",
       "Appearance",
       "Composer",
-      "Models & runtimes",
+      "Models and Runtimes",
       "Permissions",
       "Usage & budgets",
     ];
@@ -202,17 +202,15 @@ describe("AI Integrator desktop workspace", () => {
     expect(screen.getByRole("textbox", { name: "Search Settings" })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /^Models/ }));
-    expect(
-      await screen.findByRole("heading", { name: "Models & runtimes" }),
-    ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Default model" }));
+    expect(await screen.findByRole("heading", { name: "Models and Runtimes" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Edit defaults for Codex" }));
+    fireEvent.click(screen.getByRole("button", { name: "Preferred model for codex" }));
     fireEvent.click(screen.getByRole("option", { name: "GPT-5.4" }));
     expect(window.localStorage.getItem("aiintegrator.settings.v1")).toContain(
-      "models.defaultModel",
+      "models.defaultsByRuntime",
     );
-    fireEvent.click(screen.getByRole("button", { name: "Default runtime" }));
-    fireEvent.click(screen.getByRole("option", { name: "Claude Code" }));
-    expect(screen.queryByText("Vendor login warning")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(screen.getByRole("button", { name: "Favorite runtime" })).toHaveTextContent("Last used");
 
     fireEvent.click(screen.getByRole("button", { name: /Usage & budgets/i }));
     expect(await screen.findByRole("heading", { name: "Per-provider usage" })).toBeInTheDocument();
@@ -241,21 +239,22 @@ describe("AI Integrator desktop workspace", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Open Settings" }));
     fireEvent.click(await screen.findByRole("button", { name: /^Models/ }));
-    fireEvent.click(await screen.findByRole("button", { name: "Default model" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit defaults for Codex" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Preferred model for codex" }));
     fireEvent.click(screen.getByRole("option", { name: "GPT-5.4" }));
-    const effort = await screen.findByRole("button", { name: "Default effort" });
-    expect(effort).toHaveTextContent("Medium");
+    const effort = await screen.findByRole("button", { name: "Preferred effort for codex" });
+    expect(effort).toHaveTextContent("None");
 
     fireEvent.click(effort);
     expect(screen.getByRole("option", { name: "None" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Minimal" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Extra high" })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Default model" }));
+    fireEvent.click(screen.getByRole("button", { name: "Preferred model for codex" }));
     fireEvent.click(screen.getByRole("option", { name: "GPT-5 mini" }));
-    expect(await screen.findByLabelText("Default effort unavailable")).toHaveTextContent(
-      "Not exposed by this model",
-    );
+    expect(
+      await screen.findByLabelText("Preferred effort unavailable for codex"),
+    ).toHaveTextContent("Not exposed by this model");
   });
 
   it("applies saved default runtime and model to a new chat", async () => {
@@ -289,9 +288,7 @@ describe("AI Integrator desktop workspace", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /^New chat(?! in)/ }));
 
-    expect(await screen.findByRole("button", { name: "Runtime" })).toHaveTextContent(
-      "Claude Code",
-    );
+    expect(await screen.findByRole("button", { name: "Runtime" })).toHaveTextContent("Claude Code");
     expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("Claude Sonnet 5");
   });
 
@@ -299,9 +296,10 @@ describe("AI Integrator desktop workspace", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Open Settings" }));
     fireEvent.click(await screen.findByRole("button", { name: /^Models/ }));
-    fireEvent.click(screen.getByRole("button", { name: "Default runtime" }));
+    fireEvent.click(screen.getByRole("button", { name: "Favorite runtime" }));
     fireEvent.click(screen.getByRole("option", { name: "Claude Code" }));
-    fireEvent.click(screen.getByRole("button", { name: "Default model" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit defaults for Claude Code" }));
+    fireEvent.click(screen.getByRole("button", { name: "Preferred model for claude" }));
     fireEvent.click(screen.getByRole("option", { name: "Claude Sonnet 5" }));
     fireEvent.click(screen.getByRole("button", { name: /Back to workspace/i }));
     fireEvent.click(await screen.findByRole("button", { name: /^New chat(?! in)/ }));

@@ -1,8 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  normalizeRuntimeRouteDefaults,
-  readRuntimeRouteDefault,
-} from "./routingDefaults";
+import { normalizeRuntimeRouteDefaults, readRuntimeRouteDefault } from "./routingDefaults";
 
 describe("runtime route defaults", () => {
   it("keeps legacy model and effort attached to their original runtime", () => {
