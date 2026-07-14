@@ -21,6 +21,7 @@ const { bridgeMock } = vi.hoisted(() => ({
     registerProject: vi.fn(),
     listProjects: vi.fn(),
     startTask: vi.fn(),
+    generateTaskTitle: vi.fn(),
     loadTaskGit: vi.fn(),
     loadTaskGitFile: vi.fn(),
     listProjectFiles: vi.fn(),
@@ -105,6 +106,7 @@ describe("native runtime recovery UI", () => {
     bridgeMock.listDelegations.mockResolvedValue([]);
     bridgeMock.listModelCatalog.mockResolvedValue([]);
     bridgeMock.listSettings.mockResolvedValue([]);
+    bridgeMock.generateTaskTitle.mockResolvedValue(null);
     bridgeMock.getAppInfo.mockResolvedValue({
       applicationVersion: "test",
       domainSchemaVersion: 2,
@@ -375,40 +377,35 @@ describe("native runtime recovery UI", () => {
 
     fireEvent.click(await screen.findByRole("tab", { name: /^Agents/ }));
     fireEvent.click(await screen.findByRole("button", { name: "View transcript" }));
-    const child = await screen.findByLabelText("Polish the interaction transcript");
-    // The lead task's chrome lives in the titlebar; only the subagent pane
-    // renders a conversation header, and it owns the shared controls.
-    const headers = document.querySelectorAll<HTMLElement>(".conversation-header");
-    expect(headers).toHaveLength(1);
-    const childHeader = headers[0];
+    await screen.findByLabelText("Polish the interaction transcript");
     const titlebar = document.querySelector<HTMLElement>(".native-titlebar");
     const appRoot = document.querySelector<HTMLElement>(".app-root");
     expect(titlebar).not.toBeNull();
     expect(appRoot).toHaveAttribute("data-subagent-visible", "true");
+    expect(appRoot).toHaveAttribute("data-subagent-layout-ready", "true");
+    expect(document.querySelector(".conversation-header")).not.toBeInTheDocument();
+    expect(
+      within(titlebar!).getByRole("heading", { name: "Polish the interaction" }),
+    ).toBeInTheDocument();
+    expect(titlebar!.querySelector(".titlebar-subagent-slot")).toContainElement(
+      titlebar!.querySelector(".titlebar-subagent-header"),
+    );
 
     expect(screen.getAllByRole("button", { name: /chat navigation/i })).toHaveLength(1);
-    expect(
-      within(titlebar!).getByRole("button", { name: /chat navigation/i }),
-    ).toBeInTheDocument();
+    expect(within(titlebar!).getByRole("button", { name: /chat navigation/i })).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: "Toggle terminal" })).toHaveLength(1);
     expect(screen.getAllByRole("button", { name: "Close task tools" })).toHaveLength(1);
-    expect(within(titlebar!).queryByRole("button", { name: "Toggle terminal" })).toBeNull();
-    expect(
-      within(childHeader).getByRole("button", { name: "Toggle terminal" }),
-    ).toBeInTheDocument();
-    expect(
-      within(childHeader).getByRole("button", { name: "Close task tools" }),
-    ).toBeInTheDocument();
+    expect(within(titlebar!).getByRole("button", { name: "Toggle terminal" })).toBeInTheDocument();
+    expect(within(titlebar!).getByRole("button", { name: "Close task tools" })).toBeInTheDocument();
 
-    fireEvent.click(within(child).getByRole("button", { name: "Close subagent transcript" }));
-    await waitFor(() => expect(document.querySelectorAll(".conversation-header")).toHaveLength(0));
+    fireEvent.click(within(titlebar!).getByRole("button", { name: "Close subagent transcript" }));
+    await waitFor(() =>
+      expect(screen.queryByLabelText("Polish the interaction transcript")).not.toBeInTheDocument(),
+    );
     expect(appRoot).toHaveAttribute("data-subagent-visible", "false");
-    expect(
-      within(titlebar!).getByRole("button", { name: "Toggle terminal" }),
-    ).toBeInTheDocument();
-    expect(
-      within(titlebar!).getByRole("button", { name: "Close task tools" }),
-    ).toBeInTheDocument();
+    expect(appRoot).not.toHaveAttribute("data-subagent-layout-ready");
+    expect(within(titlebar!).getByRole("button", { name: "Toggle terminal" })).toBeInTheDocument();
+    expect(within(titlebar!).getByRole("button", { name: "Close task tools" })).toBeInTheDocument();
   });
 
   it("auto-approves pending and later approvals after switching to full access mid-run", async () => {

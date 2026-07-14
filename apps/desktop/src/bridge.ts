@@ -412,6 +412,12 @@ export interface StartTaskInput {
   delegation: "off" | "manual" | "balanced" | "budget-first";
 }
 
+export interface GenerateTaskTitleInput {
+  taskId: string;
+  prompt: string;
+  runtime: RuntimeId;
+}
+
 export interface ModelEffortOption {
   id: string;
   label: string;
@@ -664,6 +670,8 @@ export interface AppBridge {
   probeRuntimes(): Promise<RuntimeConnection[]>;
   beginRuntimeLogin(runtime: RuntimeId): Promise<RuntimeConnection>;
   startTask(input: StartTaskInput): Promise<TaskSummary>;
+  /** Runs one isolated, provider-backed naming attempt for a newly created chat. */
+  generateTaskTitle(input: GenerateTaskTitleInput): Promise<TaskNavigationMetadata | null>;
   loadTaskGit(taskId: string): Promise<GitSnapshot>;
   loadTaskGitFile(taskId: string, file: DiffFile): Promise<DiffFile>;
   listProjectFiles(projectId: string): Promise<ProjectFileEntry[]>;
@@ -897,12 +905,12 @@ const FALLBACK_MODELS: Partial<Record<RuntimeId, string[]>> = {
 };
 
 const CHAT_TITLE_MAX_LENGTH = 54;
+export const CHAT_TITLE_PLACEHOLDER = "Coding session";
 
 /**
  * Keep a new chat's label useful in the rail without copying an entire prompt
- * into it. This is intentionally local and deterministic: title generation
- * must not add a second provider request or move prompt text across the native
- * boundary just to name a task.
+ * into it. Native builds use a provider-backed naming worker; this remains the
+ * deterministic browser-preview fallback.
  */
 export function deriveChatTitle(prompt: string, maxLength = CHAT_TITLE_MAX_LENGTH): string {
   const firstLine = prompt
@@ -2536,7 +2544,8 @@ export const bridge: AppBridge = {
               kind === "image"
                 ? await new Promise<string | null>((done) => {
                     const reader = new FileReader();
-                    reader.onload = () => done(typeof reader.result === "string" ? reader.result : null);
+                    reader.onload = () =>
+                      done(typeof reader.result === "string" ? reader.result : null);
                     reader.onerror = () => done(null);
                     reader.readAsDataURL(file);
                   })
@@ -2632,7 +2641,7 @@ export const bridge: AppBridge = {
       if (!project) throw new Error(`Unknown project: ${input.projectId}`);
       const task = await nativeInvoke<NativeTask>("task_create", {
         input: {
-          title: deriveChatTitle(input.prompt, 240),
+          title: CHAT_TITLE_PLACEHOLDER,
           repositoryPath: project.path,
           worktreePath: undefined,
           runtime: input.runtime,
@@ -2656,7 +2665,7 @@ export const bridge: AppBridge = {
     return {
       id: `task-${Date.now()}`,
       projectId: input.projectId,
-      title: deriveChatTitle(input.prompt),
+      title: CHAT_TITLE_PLACEHOLDER,
       status: "running",
       runtime: input.runtime,
       model: input.model,
@@ -2664,6 +2673,32 @@ export const bridge: AppBridge = {
       updatedAt: new Date().toISOString(),
       unread: false,
       worktree: `ai/${new Date().toISOString().slice(0, 10)}`,
+    };
+  },
+
+  generateTaskTitle: async (input) => {
+    if (isTauri()) {
+      const nativeTaskId = await ensureNativeTask(input.taskId);
+      const task = await nativeInvoke<NativeTask | null>("task_generate_title", {
+        taskId: nativeTaskId,
+        provider: input.runtime === "custom" ? "custom-acp" : input.runtime,
+        prompt: input.prompt,
+      });
+      if (!task) return null;
+      return {
+        taskId: input.taskId,
+        title: task.title,
+        pinned: task.pinned,
+        archived: task.archived,
+        updatedAt: task.updatedAt,
+      };
+    }
+    return {
+      taskId: input.taskId,
+      title: deriveChatTitle(input.prompt),
+      pinned: false,
+      archived: false,
+      updatedAt: new Date().toISOString(),
     };
   },
 

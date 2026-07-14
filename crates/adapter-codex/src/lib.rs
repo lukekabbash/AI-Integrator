@@ -331,6 +331,34 @@ impl CodexClient {
         self.request("thread/start", params).await
     }
 
+    /// Starts a disposable, read-only helper thread that is excluded from
+    /// Codex history. This intentionally exposes no general policy controls.
+    pub async fn start_ephemeral_read_only_thread(
+        &self,
+        cwd: &Path,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+    ) -> Result<Value> {
+        if !cwd.is_dir() {
+            return Err(IntegratorError::InvalidInput(
+                "thread working directory does not exist".into(),
+            ));
+        }
+        let mut params = json!({
+            "cwd": cwd.to_string_lossy(),
+            "approvalPolicy": "never",
+            "sandbox": "read-only",
+            "ephemeral": true
+        });
+        if let Some(model) = model {
+            params["model"] = Value::String(model.into());
+        }
+        if let Some(effort) = reasoning_effort {
+            params["reasoningEffort"] = Value::String(effort.into());
+        }
+        self.request("thread/start", params).await
+    }
+
     pub async fn resume_thread(&self, thread_id: &str) -> Result<Value> {
         validate_protocol_id(thread_id, "thread")?;
         self.request("thread/resume", json!({ "threadId": thread_id }))

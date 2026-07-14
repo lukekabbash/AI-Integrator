@@ -427,7 +427,17 @@ export function TaskSidebar({
               </motion.span>
             ) : null}
             <span className="chat-row-copy">
-              <span>{task.title}</span>
+              <motion.span
+                className="chat-row-title"
+                key={task.title}
+                initial={reduceMotion ? false : { opacity: 0, y: 2, filter: "blur(2px)" }}
+                animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                transition={
+                  reduceMotion ? { duration: 0 } : { duration: 0.2, ease: [0.2, 0, 0, 1] }
+                }
+              >
+                {task.title}
+              </motion.span>
               {options?.showProject ? <small>{meta}</small> : null}
             </span>
             {task.pinned ? <Pin className="chat-pin" aria-label="Pinned" /> : null}
@@ -509,67 +519,67 @@ export function TaskSidebar({
   return (
     <>
       <aside className="task-sidebar" aria-label="Chat navigation">
-      <div className="sidebar-brand-row">
-        <BrandMark />
-        <Tooltip label="Search chats" hint={`${mod} K`}>
-          <motion.button
-            ref={searchButtonRef}
-            className="sidebar-search-button"
-            type="button"
-            aria-label="Search chats"
-            aria-haspopup="dialog"
-            aria-expanded={searchOpen}
-            onClick={() => {
-              setOpenMenuId("");
-              setSearchOpen(true);
-            }}
-            whileTap={reduceMotion ? undefined : { scale: 0.94 }}
-          >
-            <Search aria-hidden="true" />
-          </motion.button>
-        </Tooltip>
-      </div>
-
-      <motion.button
-        className="new-task-button"
-        type="button"
-        onClick={onNewTask}
-        whileTap={reduceMotion ? undefined : { scale: 0.985 }}
-        transition={{ duration: 0.12 }}
-      >
-        <Plus aria-hidden="true" />
-        <span>New chat</span>
-        <kbd>{mod} N</kbd>
-      </motion.button>
-
-      <div
-        className="sidebar-scroll"
-        ref={chatListRef}
-        onKeyDown={(event) => {
-          if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-            event.preventDefault();
-            focusRelativeChat(event.key === "ArrowDown" ? 1 : -1);
-          }
-        }}
-      >
-        <div className="rail-section-heading">
-          <span>Projects</span>
-          <Tooltip label={openingProject ? "Opening project…" : "Open another project"}>
-            <button
+        <div className="sidebar-brand-row">
+          <BrandMark />
+          <Tooltip label="Search chats" hint={`${mod} K`}>
+            <motion.button
+              ref={searchButtonRef}
+              className="sidebar-search-button"
               type="button"
-              className="icon-button tiny"
-              aria-label={openingProject ? "Opening project" : "Open another project"}
-              onClick={onOpenProject}
-              disabled={openingProject}
-              aria-busy={openingProject}
+              aria-label="Search chats"
+              aria-haspopup="dialog"
+              aria-expanded={searchOpen}
+              onClick={() => {
+                setOpenMenuId("");
+                setSearchOpen(true);
+              }}
+              whileTap={reduceMotion ? undefined : { scale: 0.94 }}
             >
-              <Plus />
-            </button>
+              <Search aria-hidden="true" />
+            </motion.button>
           </Tooltip>
         </div>
 
-        <LayoutGroup id="sidebar-chats">
-          <div className="project-tree" aria-label="Projects">
+        <motion.button
+          className="new-task-button"
+          type="button"
+          onClick={onNewTask}
+          whileTap={reduceMotion ? undefined : { scale: 0.985 }}
+          transition={{ duration: 0.12 }}
+        >
+          <Plus aria-hidden="true" />
+          <span>New chat</span>
+          <kbd>{mod} N</kbd>
+        </motion.button>
+
+        <div
+          className="sidebar-scroll"
+          ref={chatListRef}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+              event.preventDefault();
+              focusRelativeChat(event.key === "ArrowDown" ? 1 : -1);
+            }
+          }}
+        >
+          <div className="rail-section-heading">
+            <span>Projects</span>
+            <Tooltip label={openingProject ? "Opening project…" : "Open another project"}>
+              <button
+                type="button"
+                className="icon-button tiny"
+                aria-label={openingProject ? "Opening project" : "Open another project"}
+                onClick={onOpenProject}
+                disabled={openingProject}
+                aria-busy={openingProject}
+              >
+                <Plus />
+              </button>
+            </Tooltip>
+          </div>
+
+          <LayoutGroup id="sidebar-chats">
+            <div className="project-tree" aria-label="Projects">
               {projects.map((project) => {
                 const expanded = expandedProjects[project.id] ?? false;
                 const allProjectTasks = tasksByProject.get(project.id) ?? [];
@@ -692,36 +702,36 @@ export function TaskSidebar({
                   </span>
                 </button>
               ) : null}
-          </div>
-        </LayoutGroup>
+            </div>
+          </LayoutGroup>
+
+          <button
+            className="utility-row archived-toggle"
+            data-active={showArchived}
+            type="button"
+            onClick={() => setShowArchived((value) => !value)}
+          >
+            <Archive />
+            <span>{showArchived ? "Back to chats" : "Archived"}</span>
+            {archivedCount ? <small>{archivedCount}</small> : null}
+          </button>
+        </div>
 
         <button
-          className="utility-row archived-toggle"
-          data-active={showArchived}
+          className="sidebar-settings-row"
           type="button"
-          onClick={() => setShowArchived((value) => !value)}
+          onClick={onOpenSettings}
+          aria-label="Open Settings"
         >
-          <Archive />
-          <span>{showArchived ? "Back to chats" : "Archived"}</span>
-          {archivedCount ? <small>{archivedCount}</small> : null}
+          <Settings />
+          <span>
+            <strong>Settings</strong>
+            <small>Appearance, agents, Git</small>
+          </span>
         </button>
-      </div>
-
-      <button
-        className="sidebar-settings-row"
-        type="button"
-        onClick={onOpenSettings}
-        aria-label="Open Settings"
-      >
-        <Settings />
-        <span>
-          <strong>Settings</strong>
-          <small>Appearance, agents, Git</small>
-        </span>
-      </button>
-      {onResize ? (
-        <ResizeHandle axis="horizontal" label="Resize chat sidebar" onResize={onResize} />
-      ) : null}
+        {onResize ? (
+          <ResizeHandle axis="horizontal" label="Resize chat sidebar" onResize={onResize} />
+        ) : null}
       </aside>
       {typeof document !== "undefined"
         ? createPortal(
@@ -745,9 +755,7 @@ export function TaskSidebar({
                     aria-labelledby="chat-search-title"
                     initial={reduceMotion ? false : { opacity: 0, y: -12, scale: 0.985 }}
                     animate={{ opacity: 1, y: 0, scale: 1 }}
-                    exit={
-                      reduceMotion ? undefined : { opacity: 0, y: -8, scale: 0.99 }
-                    }
+                    exit={reduceMotion ? undefined : { opacity: 0, y: -8, scale: 0.99 }}
                     transition={
                       reduceMotion
                         ? { duration: 0 }
@@ -842,9 +850,7 @@ export function TaskSidebar({
                                 <button
                                   className="project-chat-more"
                                   type="button"
-                                  onClick={() =>
-                                    setSearchResultLimit((current) => current + 120)
-                                  }
+                                  onClick={() => setSearchResultLimit((current) => current + 120)}
                                 >
                                   Show more results
                                 </button>

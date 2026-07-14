@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
+import type { ComponentProps } from "react";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bridge, type DelegationView, type GitSnapshot, type RuntimeConnection } from "../bridge";
@@ -85,8 +86,17 @@ const childGit: GitSnapshot = {
   ],
 };
 
+function renderSubagent(props: Omit<ComponentProps<typeof SubagentConversation>, "headerTarget">) {
+  const headerTarget = document.createElement("div");
+  headerTarget.className = "test-subagent-header-target";
+  document.body.appendChild(headerTarget);
+  render(<SubagentConversation {...props} headerTarget={headerTarget} />);
+  return headerTarget;
+}
+
 afterEach(() => {
   cleanup();
+  document.querySelectorAll(".test-subagent-header-target").forEach((target) => target.remove());
   vi.restoreAllMocks();
 });
 
@@ -116,14 +126,12 @@ describe("SubagentConversation", () => {
     );
     const onSend = vi.fn().mockResolvedValue(undefined);
 
-    render(
-      <SubagentConversation
-        delegation={stoppedDelegation}
-        runtimes={runtimes}
-        onClose={vi.fn()}
-        onSend={onSend}
-      />,
-    );
+    renderSubagent({
+      delegation: stoppedDelegation,
+      runtimes,
+      onClose: vi.fn(),
+      onSend,
+    });
 
     expect(await screen.findByText("No transcript events yet.")).toBeInTheDocument();
     expect(screen.getByRole("textbox", { name: "Message Polish the interaction" })).toBeEnabled();
@@ -158,14 +166,12 @@ describe("SubagentConversation", () => {
       { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
     ]);
 
-    render(
-      <SubagentConversation
-        delegation={stoppedDelegation}
-        runtimes={runtimes}
-        onClose={vi.fn()}
-        onSend={vi.fn().mockResolvedValue(undefined)}
-      />,
-    );
+    renderSubagent({
+      delegation: stoppedDelegation,
+      runtimes,
+      onClose: vi.fn(),
+      onSend: vi.fn().mockResolvedValue(undefined),
+    });
 
     expect(await screen.findByText("No transcript events yet.")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Runtime" }));
@@ -224,22 +230,21 @@ describe("SubagentConversation", () => {
     const onToggleTerminal = vi.fn();
     const onToggleRightRail = vi.fn();
 
-    render(
-      <SubagentConversation
-        delegation={stoppedDelegation}
-        runtimes={runtimes}
-        onClose={vi.fn()}
-        onSend={vi.fn().mockResolvedValue(undefined)}
-        onToggleTerminal={onToggleTerminal}
-        onToggleRightRail={onToggleRightRail}
-      />,
-    );
+    const headerTarget = renderSubagent({
+      delegation: stoppedDelegation,
+      runtimes,
+      onClose: vi.fn(),
+      onSend: vi.fn().mockResolvedValue(undefined),
+      onToggleTerminal,
+      onToggleRightRail,
+    });
 
     expect(await screen.findByLabelText("1,400,000 tokens")).toHaveTextContent("1.4m");
     expect(await screen.findByRole("tab", { name: "Review" })).toBeInTheDocument();
-    const header = document.querySelector<HTMLElement>(".conversation-header");
-    expect(header).not.toBeNull();
-    expect(within(header!).getByRole("tab", { name: "Task" })).toHaveAttribute(
+    expect(document.querySelector(".conversation-header")).not.toBeInTheDocument();
+    const header = within(headerTarget).getByRole("heading", { name: "Polish the interaction" });
+    expect(header).toBeInTheDocument();
+    expect(within(headerTarget).getByRole("tab", { name: "Task" })).toHaveAttribute(
       "aria-selected",
       "true",
     );

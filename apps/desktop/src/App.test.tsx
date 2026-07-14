@@ -645,6 +645,10 @@ describe("AI Integrator desktop workspace", () => {
     await waitFor(() => expect(search).toHaveFocus());
     fireEvent.change(search, { target: { value: "adapter" } });
     fireEvent.keyDown(search, { key: "ArrowDown" });
-    expect(screen.getByRole("button", { name: /Certify Codex and ACP adapters/ })).toHaveFocus();
+    expect(
+      within(screen.getByRole("dialog", { name: "Search chats" })).getByRole("button", {
+        name: /Certify Codex and ACP adapters/,
+      }),
+    ).toHaveFocus();
   });
 });

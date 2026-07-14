@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { createDemoSnapshot } from "../demoData";
 import type { DelegationView, ProjectFileContent, ProjectFileEntry } from "../bridge";
@@ -24,6 +24,7 @@ function setup(overrides?: Partial<Parameters<typeof RightRail>[0]>) {
     onStageFile: vi.fn().mockResolvedValue(undefined),
     onStageFiles: vi.fn().mockResolvedValue(undefined),
     onCommit: vi.fn().mockResolvedValue(undefined),
+    onGenerateCommitMessage: vi.fn().mockResolvedValue("feat: generate commit subjects"),
     onPush: vi.fn().mockResolvedValue(undefined),
     onReviewChanges: vi.fn(),
     onRefreshGit: vi.fn().mockResolvedValue(undefined),
@@ -273,6 +274,49 @@ describe("RightRail", () => {
 
     await waitFor(() => expect(callbacks.onCommit).toHaveBeenCalledTimes(1));
     expect(await screen.findByRole("alert")).toHaveTextContent("Commit rejected by Git");
+  });
+
+  it("generates a commit draft from the sparkle without committing it", async () => {
+    const { callbacks } = setup();
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate commit message" }));
+
+    await waitFor(() => expect(callbacks.onGenerateCommitMessage).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole("textbox", { name: "Commit message" })).toHaveValue(
+      "feat: generate commit subjects",
+    );
+    expect(callbacks.onCommit).not.toHaveBeenCalled();
+  });
+
+  it("never overwrites a manual edit made while generation is running", async () => {
+    let resolveGeneration: (message: string) => void = () => undefined;
+    const generation = new Promise<string>((resolve) => {
+      resolveGeneration = resolve;
+    });
+    setup({ onGenerateCommitMessage: vi.fn(() => generation) });
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Commit message" }), {
+      target: { value: "Initial draft" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Generate commit message" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Commit message" }), {
+      target: { value: "My manual subject" },
+    });
+    await act(async () => resolveGeneration("feat: generated subject"));
+
+    expect(screen.getByRole("textbox", { name: "Commit message" })).toHaveValue(
+      "My manual subject",
+    );
+  });
+
+  it("surfaces commit-message provider failures in the Git panel", async () => {
+    setup({
+      onGenerateCommitMessage: vi.fn().mockRejectedValue(new Error("Provider is unavailable")),
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate commit message" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Provider is unavailable");
   });
 
   it("keeps commit and push distinct inside the compact split action", async () => {

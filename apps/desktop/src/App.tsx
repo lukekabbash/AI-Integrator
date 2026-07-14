@@ -3,6 +3,7 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -36,6 +37,7 @@ import {
 } from "lucide-react";
 import {
   bridge,
+  CHAT_TITLE_PLACEHOLDER,
   formatBridgeError,
   type ApprovalDecision,
   type ApprovalProjection,
@@ -282,6 +284,7 @@ function NativeTitlebar({
   leading,
   tabs,
   trailing,
+  subagentHeaderRef,
   motionScale,
   onOpenProject,
   onNewChat,
@@ -300,6 +303,7 @@ function NativeTitlebar({
   leading?: ReactNode;
   tabs?: ReactNode;
   trailing?: ReactNode;
+  subagentHeaderRef?: (node: HTMLDivElement | null) => void;
   motionScale: number;
   onOpenProject: () => void;
   onNewChat: () => void;
@@ -325,154 +329,155 @@ function NativeTitlebar({
     <header className="native-titlebar">
       <div className="titlebar-drag" data-tauri-drag-region />
       <span className="titlebar-workspace-divider" aria-hidden="true" />
+      <div className="titlebar-subagent-slot" ref={subagentHeaderRef} />
       <div className="titlebar-left">
         <div className="titlebar-brand-mini">
           <span>AI</span>
-        <div className="titlebar-menu-group">
-          <button
-            type="button"
-            className="titlebar-menu-trigger"
-            aria-haspopup="menu"
-            aria-expanded={openMenu === "file"}
-            onClick={() => setOpenMenu((current) => (current === "file" ? null : "file"))}
-          >
-            File
-          </button>
-          {openMenu === "file" ? (
-            <div className="titlebar-menu" role="menu" aria-label="File">
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  onOpenProject();
-                  setOpenMenu(null);
-                }}
-              >
-                Open project…
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  onNewChat();
-                  setOpenMenu(null);
-                }}
-              >
-                New chat
-              </button>
-            </div>
-          ) : null}
-        </div>
-        <div className="titlebar-menu-group">
-          <button
-            type="button"
-            className="titlebar-menu-trigger"
-            aria-haspopup="menu"
-            aria-expanded={openMenu === "edit"}
-            onClick={() => setOpenMenu((current) => (current === "edit" ? null : "edit"))}
-          >
-            Edit
-          </button>
-          {openMenu === "edit" ? (
-            <div className="titlebar-menu" role="menu" aria-label="Edit">
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  onFocusComposer();
-                  setOpenMenu(null);
-                }}
-              >
-                Focus composer
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  onCopyConversation();
-                  setOpenMenu(null);
-                }}
-              >
-                Copy conversation
-              </button>
-            </div>
-          ) : null}
-        </div>
-        <div className="titlebar-menu-group">
-          <button
-            type="button"
-            className="titlebar-menu-trigger"
-            aria-haspopup="menu"
-            aria-expanded={openMenu === "view"}
-            onClick={() => setOpenMenu((current) => (current === "view" ? null : "view"))}
-          >
-            View
-          </button>
-          {openMenu === "view" ? (
-            <div className="titlebar-menu" role="menu" aria-label="View">
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  onToggleSidebar();
-                  setOpenMenu(null);
-                }}
-              >
-                Toggle chats
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  onToggleTaskTools();
-                  setOpenMenu(null);
-                }}
-              >
-                Toggle task tools
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  onToggleTerminal();
-                  setOpenMenu(null);
-                }}
-              >
-                Toggle terminal
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  onOpenSettings();
-                  setOpenMenu(null);
-                }}
-              >
-                Settings
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  onOpenSetup();
-                  setOpenMenu(null);
-                }}
-              >
-                Runtime setup
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  onReviewChanges();
-                  setOpenMenu(null);
-                }}
-              >
-                Review changes
-              </button>
-            </div>
-          ) : null}
-        </div>
+          <div className="titlebar-menu-group">
+            <button
+              type="button"
+              className="titlebar-menu-trigger"
+              aria-haspopup="menu"
+              aria-expanded={openMenu === "file"}
+              onClick={() => setOpenMenu((current) => (current === "file" ? null : "file"))}
+            >
+              File
+            </button>
+            {openMenu === "file" ? (
+              <div className="titlebar-menu" role="menu" aria-label="File">
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    onOpenProject();
+                    setOpenMenu(null);
+                  }}
+                >
+                  Open project…
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    onNewChat();
+                    setOpenMenu(null);
+                  }}
+                >
+                  New chat
+                </button>
+              </div>
+            ) : null}
+          </div>
+          <div className="titlebar-menu-group">
+            <button
+              type="button"
+              className="titlebar-menu-trigger"
+              aria-haspopup="menu"
+              aria-expanded={openMenu === "edit"}
+              onClick={() => setOpenMenu((current) => (current === "edit" ? null : "edit"))}
+            >
+              Edit
+            </button>
+            {openMenu === "edit" ? (
+              <div className="titlebar-menu" role="menu" aria-label="Edit">
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    onFocusComposer();
+                    setOpenMenu(null);
+                  }}
+                >
+                  Focus composer
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    onCopyConversation();
+                    setOpenMenu(null);
+                  }}
+                >
+                  Copy conversation
+                </button>
+              </div>
+            ) : null}
+          </div>
+          <div className="titlebar-menu-group">
+            <button
+              type="button"
+              className="titlebar-menu-trigger"
+              aria-haspopup="menu"
+              aria-expanded={openMenu === "view"}
+              onClick={() => setOpenMenu((current) => (current === "view" ? null : "view"))}
+            >
+              View
+            </button>
+            {openMenu === "view" ? (
+              <div className="titlebar-menu" role="menu" aria-label="View">
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    onToggleSidebar();
+                    setOpenMenu(null);
+                  }}
+                >
+                  Toggle chats
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    onToggleTaskTools();
+                    setOpenMenu(null);
+                  }}
+                >
+                  Toggle task tools
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    onToggleTerminal();
+                    setOpenMenu(null);
+                  }}
+                >
+                  Toggle terminal
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    onOpenSettings();
+                    setOpenMenu(null);
+                  }}
+                >
+                  Settings
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    onOpenSetup();
+                    setOpenMenu(null);
+                  }}
+                >
+                  Runtime setup
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    onReviewChanges();
+                    setOpenMenu(null);
+                  }}
+                >
+                  Review changes
+                </button>
+              </div>
+            ) : null}
+          </div>
         </div>
         {title ? (
           <motion.div
@@ -486,21 +491,27 @@ function NativeTitlebar({
             }}
           >
             {leading}
-            <h1>{title}</h1>
+            <h1>
+              <motion.span
+                className="titlebar-title-copy"
+                key={title}
+                initial={motionScale === 0 ? false : { opacity: 0, y: 2, filter: "blur(2px)" }}
+                animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                transition={{ duration: 0.2 * motionScale, ease: [0.2, 0, 0, 1] }}
+              >
+                {title}
+              </motion.span>
+            </h1>
             {detail ? <span className="titlebar-title-detail">{detail}</span> : null}
           </motion.div>
         ) : null}
       </div>
-      {tabs ? null : <div className="titlebar-context">{context}</div>}
+      {tabs || title ? null : <div className="titlebar-context">{context}</div>}
       <div className="titlebar-end">
         {tabs}
         {trailing}
         <div className="window-controls">
-          <button
-            type="button"
-            aria-label="Minimize"
-            onClick={() => void windowAction("minimize")}
-          >
+          <button type="button" aria-label="Minimize" onClick={() => void windowAction("minimize")}>
             <Minus />
           </button>
           <button
@@ -992,6 +1003,9 @@ export default function App() {
   const activeProjectForFilesRef = useRef<string | undefined>(undefined);
   const composerNoticeSequence = useRef(0);
   const conversationWorkspaceRef = useRef<HTMLDivElement>(null);
+  const appRootRef = useRef<HTMLDivElement>(null);
+  const subagentPaneRef = useRef<HTMLDivElement>(null);
+  const [subagentHeaderTarget, setSubagentHeaderTarget] = useState<HTMLDivElement | null>(null);
 
   const applyVerifiedRuntimeHealth = useCallback(
     (runtimes: RuntimeConnection[], tasks: TaskSummary[]) => {
@@ -1495,6 +1509,36 @@ export default function App() {
   const selectedDelegation = delegations.find(
     (delegation) => delegation.id === selectedDelegationId && delegation.childTaskId,
   );
+
+  useLayoutEffect(() => {
+    const root = appRootRef.current;
+    const pane = subagentPaneRef.current;
+    if (!root || !pane || !selectedDelegation) return;
+
+    const alignHeader = () => {
+      const rootRect = root.getBoundingClientRect();
+      const paneRect = pane.getBoundingClientRect();
+      root.style.setProperty(
+        "--subagent-pane-left",
+        `${Math.max(0, paneRect.left - rootRect.left)}px`,
+      );
+      root.dataset.subagentLayoutReady = "true";
+    };
+
+    alignHeader();
+    const observer =
+      typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(alignHeader);
+    observer?.observe(root);
+    observer?.observe(pane);
+    window.addEventListener("resize", alignHeader);
+
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", alignHeader);
+      delete root.dataset.subagentLayoutReady;
+      root.style.removeProperty("--subagent-pane-left");
+    };
+  }, [selectedDelegation, subagentPaneRatio]);
   const titleContext =
     screen === "settings"
       ? "Settings"
@@ -1796,7 +1840,7 @@ export default function App() {
         delegation: options?.delegation ?? "balanced",
       });
       appendTask(task);
-      setOperationStatus(`Created ${task.title}`);
+      setOperationStatus("Chat created");
       return task;
     } catch (error) {
       setOperationError(error instanceof Error ? error.message : "Could not create the task");
@@ -1885,6 +1929,7 @@ export default function App() {
     }
     setOperationError("");
     setComposerError(null);
+    const isNewTask = !activeTask;
     const targetTask =
       activeTask ??
       (await createTask(project, input.prompt, {
@@ -1895,6 +1940,26 @@ export default function App() {
         delegation: input.delegation,
       }));
     if (!targetTask) return false;
+    if (isNewTask) {
+      void bridge
+        .generateTaskTitle({
+          taskId: targetTask.id,
+          prompt: input.prompt,
+          runtime: input.runtime,
+        })
+        .then((metadata) => {
+          if (!metadata) return;
+          setSnapshot((current) => ({
+            ...current,
+            tasks: current.tasks.map((task) =>
+              task.id === targetTask.id && task.title === CHAT_TITLE_PLACEHOLDER
+                ? { ...task, title: metadata.title, updatedAt: metadata.updatedAt }
+                : task,
+            ),
+          }));
+        })
+        .catch(() => undefined);
+    }
     setTaskPermissions((current) => ({
       ...current,
       [targetTask.id]: input.permission,
@@ -2149,7 +2214,13 @@ export default function App() {
   /** Quotes highlighted file or diff lines into the composer as an @mention
    * plus a fenced snippet, so questions about the selection stand alone. */
   const addSelectionToChat = (
-    payload: { path: string; startLine?: number; endLine?: number; text: string; intent: "add" | "ask" },
+    payload: {
+      path: string;
+      startLine?: number;
+      endLine?: number;
+      text: string;
+      intent: "add" | "ask";
+    },
     source: "file" | "diff",
   ) => {
     const range =
@@ -2687,6 +2758,7 @@ export default function App() {
   return (
     <LazyMotion features={domMax} strict>
       <div
+        ref={appRootRef}
         className="app-root"
         data-sidebar-visible={screen === "workspace" && !sidebarCollapsed}
         data-rail-visible={screen === "workspace" && showRightRail}
@@ -2705,6 +2777,7 @@ export default function App() {
           context={titleContext}
           title={screen === "workspace" ? (activeTask?.title ?? "New chat") : undefined}
           motionScale={motionScale}
+          subagentHeaderRef={setSubagentHeaderTarget}
           detail={
             screen === "workspace" && activeProject ? (
               <>
@@ -2725,7 +2798,7 @@ export default function App() {
             ) : undefined
           }
           tabs={
-            screen === "workspace" ? (
+            screen === "workspace" && !selectedDelegation ? (
               <div className="titlebar-view-tabs" role="tablist" aria-label="Task view">
                 <button
                   type="button"
@@ -2750,7 +2823,7 @@ export default function App() {
             ) : undefined
           }
           trailing={
-            screen === "workspace" ? (
+            screen === "workspace" && !selectedDelegation ? (
               <>
                 <button className="usage-compact" type="button" title={usagePillTitle}>
                   {usagePillPercent !== undefined ? (
@@ -2771,28 +2844,24 @@ export default function App() {
                     {runtimeState.turn.stopRequested || stoppingTurn ? "Stopping…" : "Stop"}
                   </button>
                 ) : null}
-                {!selectedDelegation ? (
-                  <>
-                    <button
-                      className="icon-button subtle"
-                      type="button"
-                      onClick={() => toggleTerminal("main")}
-                      aria-label="Toggle terminal"
-                      aria-pressed={terminalOwner === "main"}
-                    >
-                      <TerminalSquare />
-                    </button>
-                    <button
-                      className="icon-button subtle"
-                      type="button"
-                      onClick={() => setRightRailOpen((value) => !value)}
-                      aria-label={rightRailOpen ? "Close task tools" : "Open task tools"}
-                      aria-pressed={rightRailOpen}
-                    >
-                      {rightRailOpen ? <PanelRightClose /> : <PanelRightOpen />}
-                    </button>
-                  </>
-                ) : null}
+                <button
+                  className="icon-button subtle"
+                  type="button"
+                  onClick={() => toggleTerminal("main")}
+                  aria-label="Toggle terminal"
+                  aria-pressed={terminalOwner === "main"}
+                >
+                  <TerminalSquare />
+                </button>
+                <button
+                  className="icon-button subtle"
+                  type="button"
+                  onClick={() => setRightRailOpen((value) => !value)}
+                  aria-label={rightRailOpen ? "Close task tools" : "Open task tools"}
+                  aria-pressed={rightRailOpen}
+                >
+                  {rightRailOpen ? <PanelRightClose /> : <PanelRightOpen />}
+                </button>
               </>
             ) : undefined
           }
@@ -3183,6 +3252,7 @@ export default function App() {
                 <AnimatePresence initial={false}>
                   {selectedDelegation ? (
                     <motion.div
+                      ref={subagentPaneRef}
                       className="subagent-workspace-pane"
                       key={selectedDelegation.id}
                       style={{ width: `${subagentPaneRatio * 100}%` }}
@@ -3212,6 +3282,7 @@ export default function App() {
                       >
                         <SubagentConversation
                           delegation={selectedDelegation}
+                          headerTarget={subagentHeaderTarget}
                           runtimes={snapshot.runtimes}
                           contextFiles={contextFilePaths}
                           onRequestContextFiles={requestProjectFiles}

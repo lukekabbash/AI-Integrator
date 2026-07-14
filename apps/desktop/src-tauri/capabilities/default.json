@@ -22,6 +22,7 @@
     "allow-task-search-messages",
     "allow-task-set-state",
     "allow-task-update-metadata",
+    "allow-task-generate-title",
     "allow-task-update-routing",
     "allow-setting-list",
     "allow-setting-set",

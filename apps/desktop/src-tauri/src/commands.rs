@@ -4677,7 +4677,7 @@ fn extract_thread_id(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-async fn authorized_git(
+pub(crate) async fn authorized_git(
     state: &State<'_, AppState>,
     repository: PathBuf,
 ) -> CommandResult<(GitService, RepositoryIdentity)> {

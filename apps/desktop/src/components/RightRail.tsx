@@ -7,7 +7,7 @@ import {
   type CSSProperties,
   type KeyboardEvent,
 } from "react";
-import { AnimatePresence, m as motion } from "motion/react";
+import { AnimatePresence, m as motion, useReducedMotion } from "motion/react";
 import {
   Activity,
   AtSign,
@@ -27,6 +27,7 @@ import {
   Radio,
   RefreshCw,
   SquareArrowOutUpRight,
+  Sparkles,
   Users,
   X,
 } from "lucide-react";
@@ -101,6 +102,7 @@ interface RightRailProps {
   onStageFile: (file: DiffFile, staged: boolean) => Promise<void>;
   onStageFiles?: (paths: string[], staged: boolean) => Promise<void>;
   onCommit: (message: string) => Promise<void>;
+  onGenerateCommitMessage?: () => Promise<string>;
   onPush: () => Promise<void>;
   onReviewChanges?: () => void;
   onRefreshGit?: () => Promise<void>;
@@ -167,6 +169,7 @@ function GitPanel({
   onStageFile,
   onStageFiles,
   onCommit,
+  onGenerateCommitMessage,
   onPush,
   onReviewChanges,
   onRefreshGit,
@@ -181,6 +184,7 @@ function GitPanel({
   | "onStageFile"
   | "onStageFiles"
   | "onCommit"
+  | "onGenerateCommitMessage"
   | "onPush"
   | "onReviewChanges"
   | "onRefreshGit"
@@ -189,9 +193,10 @@ function GitPanel({
   | "onRevealGitFile"
 >) {
   const [message, setMessage] = useState("");
-  const [busy, setBusy] = useState<"commit" | "commit-push" | "push" | "stage" | "refresh" | null>(
-    null,
-  );
+  const [busy, setBusy] = useState<
+    "commit" | "commit-push" | "generate" | "push" | "stage" | "refresh" | null
+  >(null);
+  const reduceMotion = useReducedMotion();
   const [stagingPath, setStagingPath] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [stagedLimit, setStagedLimit] = useState(INITIAL_GIT_FILE_ROWS);
@@ -312,6 +317,22 @@ function GitPanel({
     try {
       await onCommit(message.trim());
       setMessage("");
+    } catch (error) {
+      setActionError(getErrorMessage(error));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const runGenerateCommitMessage = async () => {
+    if (!onGenerateCommitMessage || staged.length === 0 || busy !== null) return;
+    const draftAtStart = message;
+    setBusy("generate");
+    setActionError(null);
+    try {
+      const generated = (await onGenerateCommitMessage()).trim();
+      if (!generated) throw new Error("The provider returned an empty commit message.");
+      setMessage((current) => (current === draftAtStart ? generated : current));
     } catch (error) {
       setActionError(getErrorMessage(error));
     } finally {
@@ -518,9 +539,12 @@ function GitPanel({
         </span>
       </div>
 
-      <label className="commit-composer">
-        <span className="sr-only">Commit message</span>
+      <div className="commit-composer">
+        <label className="sr-only" htmlFor="git-commit-message">
+          Commit message
+        </label>
         <textarea
+          id="git-commit-message"
           value={message}
           onChange={(event) => setMessage(event.target.value)}
           onKeyDown={(event) => {
@@ -532,7 +556,42 @@ function GitPanel({
           rows={2}
           placeholder="Commit message"
         />
-      </label>
+        <Tooltip
+          label={
+            busy === "generate"
+              ? "Writing commit message…"
+              : staged.length === 0
+                ? "Stage changes first"
+                : "Generate commit message"
+          }
+          placement="top"
+        >
+          <button
+            className="sparkle-button"
+            type="button"
+            aria-label="Generate commit message"
+            aria-busy={busy === "generate"}
+            disabled={!onGenerateCommitMessage || staged.length === 0 || busy !== null}
+            onClick={() => void runGenerateCommitMessage()}
+          >
+            <motion.span
+              aria-hidden="true"
+              animate={
+                busy === "generate" && !reduceMotion
+                  ? { rotate: [0, 18, -12, 0], scale: [1, 1.08, 1] }
+                  : { rotate: 0, scale: 1 }
+              }
+              transition={
+                busy === "generate" && !reduceMotion
+                  ? { duration: 1.1, ease: "easeInOut", repeat: Number.POSITIVE_INFINITY }
+                  : { duration: 0.16 }
+              }
+            >
+              <Sparkles />
+            </motion.span>
+          </button>
+        </Tooltip>
+      </div>
       <div className="commit-split" ref={commitMenuRef}>
         <button
           className="primary-button commit-button"
@@ -1407,9 +1466,7 @@ function FilePanel({
   const [renameError, setRenameError] = useState("");
   const [fileActionError, setFileActionError] = useState("");
   const [contextMenu, setContextMenu] = useState<FileContextMenuState | null>(null);
-  const [folderMenu, setFolderMenu] = useState<{ path: string; x: number; y: number } | null>(
-    null,
-  );
+  const [folderMenu, setFolderMenu] = useState<{ path: string; x: number; y: number } | null>(null);
   const folderMenuRef = useRef<HTMLDivElement>(null);
   const [treeWindow, setTreeWindow] = useState({
     key: "",

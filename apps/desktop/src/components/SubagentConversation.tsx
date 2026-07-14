@@ -1,5 +1,6 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { AnimatePresence } from "motion/react";
+import { createPortal } from "react-dom";
 import { CircleStop, PanelRightClose, PanelRightOpen, TerminalSquare, X } from "lucide-react";
 import {
   bridge,
@@ -17,7 +18,6 @@ import {
   type RuntimeProjectionState,
 } from "../runtimeProjection";
 import { Composer } from "./Composer";
-import { ConversationHeader } from "./ConversationHeader";
 import { TaskStatusPill } from "./TaskStatusPill";
 import { formatCompactTokenCount } from "./conversationFormatting";
 import { Dropdown } from "./Dropdown";
@@ -29,6 +29,7 @@ const DiffView = lazy(() => import("./DiffView").then((module) => ({ default: mo
 
 interface SubagentConversationProps {
   delegation: DelegationView;
+  headerTarget?: HTMLElement | null;
   runtimes: RuntimeConnection[];
   contextFiles?: string[];
   /** Requests the bounded project scan the first time an @-token is typed. */
@@ -57,6 +58,7 @@ function statusLabel(status: DelegationView["status"]): string {
 
 export function SubagentConversation({
   delegation,
+  headerTarget,
   runtimes,
   contextFiles,
   onRequestContextFiles,
@@ -297,90 +299,100 @@ export function SubagentConversation({
 
   return (
     <section className="subagent-conversation" aria-label={`${delegation.title} transcript`}>
-      <ConversationHeader
-        title={delegation.title}
-        detail={
-          <>
-            {delegation.profileLabel} · {selectedRouting.model || selectedRouting.runtime} ·{" "}
-            {statusLabel(delegation.status)}
-          </>
-        }
-        leading={
-          <span
-            className={`agent-avatar agent-avatar--${selectedRouting.runtime}`}
-            aria-hidden="true"
-          >
-            {delegation.profileLabel.slice(0, 1)}
-          </span>
-        }
-        view={centerView}
-        viewLabel="Subagent view"
-        reviewCount={git?.files.length}
-        onViewChange={(view) => {
-          setCenterView(view);
-          if (view === "review") {
-            setReviewError("");
-            setReviewLoading(true);
-          }
-        }}
-        actions={
-          <>
-            <span
-              className="usage-compact conversation-token-count"
-              aria-label={`${totalTokens.toLocaleString()} tokens`}
-              title={`${totalTokens.toLocaleString()} tokens used by this subagent`}
-            >
-              {formatCompactTokenCount(totalTokens)}
-            </span>
-            {activeStatus(delegation.status) && onStop ? (
-              <button
-                className="stop-turn-button subagent-stop-button"
-                type="button"
-                onClick={() => void stop()}
-                disabled={stopping}
-                aria-label={stopping ? "Stopping subagent" : "Stop subagent"}
-              >
-                <CircleStop aria-hidden="true" />
-                <span>{stopping ? "Stopping…" : "Stop"}</span>
-              </button>
-            ) : null}
-            {onToggleTerminal ? (
-              <button
-                className="icon-button subtle"
-                type="button"
-                onClick={onToggleTerminal}
-                aria-label="Toggle terminal"
-                aria-pressed={terminalOpen}
-              >
-                <TerminalSquare aria-hidden="true" />
-              </button>
-            ) : null}
-            {onToggleRightRail ? (
-              <button
-                className="icon-button subtle"
-                type="button"
-                onClick={onToggleRightRail}
-                aria-label={rightRailOpen ? "Close task tools" : "Open task tools"}
-                aria-pressed={rightRailOpen}
-              >
-                {rightRailOpen ? (
-                  <PanelRightClose aria-hidden="true" />
-                ) : (
-                  <PanelRightOpen aria-hidden="true" />
-                )}
-              </button>
-            ) : null}
-            <button
-              className="icon-button subtle"
-              type="button"
-              onClick={onClose}
-              aria-label="Close subagent transcript"
-            >
-              <X aria-hidden="true" />
-            </button>
-          </>
-        }
-      />
+      {headerTarget
+        ? createPortal(
+            <div className="titlebar-subagent-header">
+              <div className="titlebar-subagent-copy">
+                <h2>{delegation.title}</h2>
+                <span>
+                  {delegation.profileLabel} · {selectedRouting.model || selectedRouting.runtime} ·{" "}
+                  {statusLabel(delegation.status)}
+                </span>
+              </div>
+              <div className="titlebar-view-tabs" role="tablist" aria-label="Subagent view">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={centerView === "task"}
+                  data-active={centerView === "task"}
+                  onClick={() => setCenterView("task")}
+                >
+                  Task
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-label="Review"
+                  aria-selected={centerView === "review"}
+                  data-active={centerView === "review"}
+                  onClick={() => {
+                    setCenterView("review");
+                    setReviewError("");
+                    setReviewLoading(true);
+                  }}
+                >
+                  Review{git?.files.length ? ` ${git.files.length}` : ""}
+                </button>
+              </div>
+              <div className="titlebar-subagent-actions">
+                <span
+                  className="usage-compact conversation-token-count"
+                  aria-label={`${totalTokens.toLocaleString()} tokens`}
+                  title={`${totalTokens.toLocaleString()} tokens used by this subagent`}
+                >
+                  {formatCompactTokenCount(totalTokens)}
+                </span>
+                {activeStatus(delegation.status) && onStop ? (
+                  <button
+                    className="stop-turn-button subagent-stop-button"
+                    type="button"
+                    onClick={() => void stop()}
+                    disabled={stopping}
+                    aria-label={stopping ? "Stopping subagent" : "Stop subagent"}
+                  >
+                    <CircleStop aria-hidden="true" />
+                    <span>{stopping ? "Stopping…" : "Stop"}</span>
+                  </button>
+                ) : null}
+                {onToggleTerminal ? (
+                  <button
+                    className="icon-button subtle"
+                    type="button"
+                    onClick={onToggleTerminal}
+                    aria-label="Toggle terminal"
+                    aria-pressed={terminalOpen}
+                  >
+                    <TerminalSquare aria-hidden="true" />
+                  </button>
+                ) : null}
+                {onToggleRightRail ? (
+                  <button
+                    className="icon-button subtle"
+                    type="button"
+                    onClick={onToggleRightRail}
+                    aria-label={rightRailOpen ? "Close task tools" : "Open task tools"}
+                    aria-pressed={rightRailOpen}
+                  >
+                    {rightRailOpen ? (
+                      <PanelRightClose aria-hidden="true" />
+                    ) : (
+                      <PanelRightOpen aria-hidden="true" />
+                    )}
+                  </button>
+                ) : null}
+                <button
+                  className="icon-button subtle"
+                  type="button"
+                  onClick={onClose}
+                  aria-label="Close subagent transcript"
+                >
+                  <X aria-hidden="true" />
+                </button>
+              </div>
+            </div>,
+            headerTarget,
+          )
+        : null}
       {centerView === "task" ? (
         <>
           <div className="transcript-scroll subagent-transcript-scroll" ref={scrollRef}>

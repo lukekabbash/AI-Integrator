@@ -8,6 +8,7 @@ const APP_COMMANDS: &[&str] = &[
     "task_search_messages",
     "task_set_state",
     "task_update_metadata",
+    "task_generate_title",
     "task_update_routing",
     "setting_list",
     "setting_set",

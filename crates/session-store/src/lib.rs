@@ -21,6 +21,13 @@ mod projection_store;
 pub use delegation_store::NewDelegation;
 pub use projection_store::{PersistedStopRequest, PreparedApprovalResponse};
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommitMessageGenerationClaim {
+    Claimed,
+    Cached(String),
+    InProgress,
+}
+
 const MIGRATIONS: &[(i64, &str)] = &[
     (
         1,
@@ -573,6 +580,28 @@ const MIGRATIONS: &[(i64, &str)] = &[
             WHERE state IN ('pending', 'responding', 'response_failed');
         "#,
     ),
+    (
+        10,
+        r#"
+        CREATE TABLE task_title_jobs (
+            task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+            started_at TEXT NOT NULL
+        );
+        "#,
+    ),
+    (
+        11,
+        r#"
+        CREATE TABLE commit_message_jobs (
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            provider TEXT NOT NULL,
+            diff_fingerprint TEXT NOT NULL,
+            message TEXT,
+            started_at TEXT NOT NULL,
+            PRIMARY KEY(task_id, provider, diff_fingerprint)
+        );
+        "#,
+    ),
 ];
 
 pub struct LocalStore {
@@ -659,6 +688,8 @@ impl LocalStore {
                  DELETE FROM codex_items;
                  DELETE FROM codex_turns;
                  DELETE FROM codex_task_projection;
+                 DELETE FROM commit_message_jobs;
+                 DELETE FROM task_title_jobs;
                  DELETE FROM runtime_sessions;
                  DELETE FROM provider_sessions;
                  DELETE FROM tasks;
@@ -949,6 +980,154 @@ impl LocalStore {
             return Err(IntegratorError::NotFound(format!("task {task_id}")));
         }
         self.get_task(task_id)
+    }
+
+    /// Replace a temporary title only while it still has the expected value.
+    /// A concurrent manual rename therefore always wins over background naming.
+    pub fn compare_and_set_task_title(
+        &self,
+        task_id: TaskId,
+        expected_title: &str,
+        title: &str,
+    ) -> Result<Option<Task>> {
+        let expected_title = expected_title.trim();
+        let title = title.trim();
+        if expected_title.is_empty() || expected_title.chars().count() > 240 {
+            return Err(IntegratorError::InvalidInput(
+                "expected task title must contain 1 to 240 characters".into(),
+            ));
+        }
+        if title.is_empty() || title.chars().count() > 240 {
+            return Err(IntegratorError::InvalidInput(
+                "task title must contain 1 to 240 characters".into(),
+            ));
+        }
+        let now = Utc::now();
+        let changed = self
+            .connection
+            .lock()
+            .execute(
+                "UPDATE tasks SET title = ?1, updated_at = ?2 WHERE id = ?3 AND title = ?4",
+                params![title, now.to_rfc3339(), task_id.to_string(), expected_title],
+            )
+            .map_err(storage_error)?;
+        if changed == 0 {
+            self.get_task(task_id)?;
+            return Ok(None);
+        }
+        self.get_task(task_id).map(Some)
+    }
+
+    /// Persistently claim the one automatic naming attempt allowed for a task.
+    /// The insert is conditional on the placeholder still being present, so a
+    /// renderer retry, app restart, or concurrent manual rename cannot spend a
+    /// second provider call.
+    pub fn claim_task_title_generation(
+        &self,
+        task_id: TaskId,
+        expected_title: &str,
+    ) -> Result<bool> {
+        let expected_title = expected_title.trim();
+        if expected_title.is_empty() || expected_title.chars().count() > 240 {
+            return Err(IntegratorError::InvalidInput(
+                "expected task title must contain 1 to 240 characters".into(),
+            ));
+        }
+        let changed = self
+            .connection
+            .lock()
+            .execute(
+                "INSERT OR IGNORE INTO task_title_jobs(task_id, started_at) SELECT id, ?1 FROM tasks WHERE id = ?2 AND title = ?3",
+                params![Utc::now().to_rfc3339(), task_id.to_string(), expected_title],
+            )
+            .map_err(storage_error)?;
+        if changed == 0 {
+            self.get_task(task_id)?;
+        }
+        Ok(changed == 1)
+    }
+
+    /// Claim one provider call for a specific staged-diff snapshot. Completed
+    /// results are reused, while an unfinished claim fails closed so retries or
+    /// concurrent clicks cannot multiply provider spend.
+    pub fn claim_commit_message_generation(
+        &self,
+        task_id: TaskId,
+        provider: &str,
+        diff_fingerprint: &str,
+    ) -> Result<CommitMessageGenerationClaim> {
+        let provider = provider.trim();
+        let diff_fingerprint = diff_fingerprint.trim();
+        if provider.is_empty() || provider.chars().count() > 64 {
+            return Err(IntegratorError::InvalidInput(
+                "commit-message provider must contain 1 to 64 characters".into(),
+            ));
+        }
+        if diff_fingerprint.is_empty() || diff_fingerprint.chars().count() > 128 {
+            return Err(IntegratorError::InvalidInput(
+                "commit-message fingerprint must contain 1 to 128 characters".into(),
+            ));
+        }
+
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(storage_error)?;
+        let existing = transaction
+            .query_row(
+                "SELECT message FROM commit_message_jobs WHERE task_id = ?1 AND provider = ?2 AND diff_fingerprint = ?3",
+                params![task_id.to_string(), provider, diff_fingerprint],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        if let Some(message) = existing {
+            transaction.commit().map_err(storage_error)?;
+            return Ok(match message {
+                Some(message) => CommitMessageGenerationClaim::Cached(message),
+                None => CommitMessageGenerationClaim::InProgress,
+            });
+        }
+        let changed = transaction
+            .execute(
+                "INSERT INTO commit_message_jobs(task_id, provider, diff_fingerprint, message, started_at) SELECT id, ?1, ?2, NULL, ?3 FROM tasks WHERE id = ?4",
+                params![provider, diff_fingerprint, Utc::now().to_rfc3339(), task_id.to_string()],
+            )
+            .map_err(storage_error)?;
+        transaction.commit().map_err(storage_error)?;
+        if changed == 0 {
+            drop(connection);
+            self.get_task(task_id)?;
+        }
+        Ok(CommitMessageGenerationClaim::Claimed)
+    }
+
+    pub fn complete_commit_message_generation(
+        &self,
+        task_id: TaskId,
+        provider: &str,
+        diff_fingerprint: &str,
+        message: &str,
+    ) -> Result<()> {
+        let message = message.trim();
+        if message.is_empty() || message.chars().count() > 72 || message.chars().any(char::is_control)
+        {
+            return Err(IntegratorError::InvalidInput(
+                "commit message must contain 1 to 72 printable characters".into(),
+            ));
+        }
+        let changed = self
+            .connection
+            .lock()
+            .execute(
+                "UPDATE commit_message_jobs SET message = ?1 WHERE task_id = ?2 AND provider = ?3 AND diff_fingerprint = ?4 AND message IS NULL",
+                params![message, task_id.to_string(), provider, diff_fingerprint],
+            )
+            .map_err(storage_error)?;
+        if changed == 0 {
+            return Err(IntegratorError::InvalidInput(
+                "commit-message generation was not claimed".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Persist the composer's last provider/model/effort selection for this chat.
@@ -1336,6 +1515,135 @@ mod tests {
         RuntimeProjectionEvent,
     };
     use integrator_runtime::{ProjectionMutation, ReducedProviderEvent};
+
+    fn create_naming_task(store: &LocalStore) -> Task {
+        store
+            .create_task(NewTask {
+                title: "Coding session".into(),
+                repository_path: None,
+                worktree_path: None,
+                runtime: Some("codex".into()),
+                model: None,
+                effort: None,
+                parent_task_id: None,
+            })
+            .expect("create naming task")
+    }
+
+    #[test]
+    fn title_generation_claim_is_one_shot_and_manual_rename_wins() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let task = create_naming_task(&store);
+        assert!(
+            store
+                .claim_task_title_generation(task.id, "Coding session")
+                .expect("first claim")
+        );
+        assert!(
+            !store
+                .claim_task_title_generation(task.id, "Coding session")
+                .expect("duplicate claim")
+        );
+        store
+            .update_task_metadata(task.id, Some("My own title".into()), None, None)
+            .expect("manual rename");
+        assert_eq!(
+            store
+                .compare_and_set_task_title(task.id, "Coding session", "Generated title")
+                .expect("late generated title"),
+            None
+        );
+        assert_eq!(store.get_task(task.id).expect("task").title, "My own title");
+    }
+
+    #[test]
+    fn title_generation_claim_survives_restart() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = directory.path().join("title-claim.sqlite3");
+        let task_id = {
+            let store = LocalStore::open(&database).expect("open store");
+            let task = create_naming_task(&store);
+            assert!(
+                store
+                    .claim_task_title_generation(task.id, "Coding session")
+                    .expect("claim")
+            );
+            task.id
+        };
+        let reopened = LocalStore::open(&database).expect("reopen store");
+        assert!(
+            !reopened
+                .claim_task_title_generation(task_id, "Coding session")
+                .expect("persistent claim")
+        );
+    }
+
+    #[test]
+    fn commit_message_generation_reuses_completed_diff_and_blocks_duplicate_spend() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let task = create_naming_task(&store);
+        assert_eq!(
+            store
+                .claim_commit_message_generation(task.id, "codex", "diff-a")
+                .expect("claim"),
+            CommitMessageGenerationClaim::Claimed
+        );
+        assert_eq!(
+            store
+                .claim_commit_message_generation(task.id, "codex", "diff-a")
+                .expect("pending claim"),
+            CommitMessageGenerationClaim::InProgress
+        );
+        store
+            .complete_commit_message_generation(
+                task.id,
+                "codex",
+                "diff-a",
+                "feat: generate commit subjects",
+            )
+            .expect("complete");
+        assert_eq!(
+            store
+                .claim_commit_message_generation(task.id, "codex", "diff-a")
+                .expect("cached claim"),
+            CommitMessageGenerationClaim::Cached("feat: generate commit subjects".into())
+        );
+        assert_eq!(
+            store
+                .claim_commit_message_generation(task.id, "codex", "diff-b")
+                .expect("changed diff"),
+            CommitMessageGenerationClaim::Claimed
+        );
+    }
+
+    #[test]
+    fn commit_message_generation_cache_survives_restart() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = directory.path().join("commit-message-cache.sqlite3");
+        let task_id = {
+            let store = LocalStore::open(&database).expect("open store");
+            let task = create_naming_task(&store);
+            store
+                .claim_commit_message_generation(task.id, "claude", "diff-a")
+                .expect("claim");
+            store
+                .complete_commit_message_generation(
+                    task.id,
+                    "claude",
+                    "diff-a",
+                    "fix: preserve staged changes",
+                )
+                .expect("complete");
+            task.id
+        };
+        let reopened = LocalStore::open(&database).expect("reopen store");
+        assert_eq!(
+            reopened
+                .claim_commit_message_generation(task_id, "claude", "diff-a")
+                .expect("cached after restart"),
+            CommitMessageGenerationClaim::Cached("fix: preserve staged changes".into())
+        );
+    }
 
     #[test]
     fn migration_and_local_round_trip() {

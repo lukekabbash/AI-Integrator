@@ -297,6 +297,13 @@ impl AcpClient {
         .await
     }
 
+    /// Best-effort cleanup for agents that advertise ACP session deletion.
+    pub async fn delete_session(&self, session_id: &str) -> Result<Value> {
+        validate_session_id(session_id)?;
+        self.request("session/delete", json!({ "sessionId": session_id }))
+            .await
+    }
+
     pub async fn respond_to_server_request(&self, id: &AcpRequestId, result: Value) -> Result<()> {
         id.validate()?;
         self.write_message(json!({

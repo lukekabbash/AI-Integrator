@@ -19,23 +19,42 @@ function setup(overrides?: Partial<Parameters<typeof TaskSidebar>[0]>) {
     onOpenSettings: vi.fn(),
     onResize: vi.fn(),
   };
-  render(
-    <TaskSidebar
-      projects={snapshot.projects}
-      tasks={snapshot.tasks}
-      activeProjectId={snapshot.activeProjectId}
-      activeTaskId={snapshot.activeTaskId}
-      openingProject={false}
-      metadataActionsEnabled
-      taskActionBusyId=""
-      {...callbacks}
-      {...overrides}
-    />,
-  );
-  return { snapshot, callbacks };
+  const props = {
+    projects: snapshot.projects,
+    tasks: snapshot.tasks,
+    activeProjectId: snapshot.activeProjectId,
+    activeTaskId: snapshot.activeTaskId,
+    openingProject: false,
+    metadataActionsEnabled: true,
+    taskActionBusyId: "",
+    ...callbacks,
+    ...overrides,
+  } satisfies Parameters<typeof TaskSidebar>[0];
+  const view = render(<TaskSidebar {...props} />);
+  return {
+    snapshot,
+    callbacks,
+    rerenderSidebar: (next: Partial<Parameters<typeof TaskSidebar>[0]>) =>
+      view.rerender(<TaskSidebar {...props} {...next} />),
+  };
 }
 
 describe("TaskSidebar", () => {
+  it("mounts a fresh motion title when an automatic name arrives", () => {
+    const snapshot = createDemoSnapshot();
+    const task = { ...snapshot.tasks[0], title: "Coding session" };
+    const { rerenderSidebar } = setup({ tasks: [task], activeTaskId: task.id });
+    const placeholder = screen.getByText("Coding session", { selector: ".chat-row-title" });
+
+    rerenderSidebar({ tasks: [{ ...task, title: "Provider Agnostic Naming" }] });
+
+    const generated = screen.getByText("Provider Agnostic Naming", {
+      selector: ".chat-row-title",
+    });
+    expect(generated).not.toBe(placeholder);
+    expect(screen.queryByText("Coding session", { selector: ".chat-row-title" })).toBeNull();
+  });
+
   it("nests chats under the expanded active project", () => {
     const { snapshot } = setup();
     const active = snapshot.projects.find((project) => project.id === snapshot.activeProjectId)!;
@@ -93,10 +112,11 @@ describe("TaskSidebar", () => {
 
   it("flattens search results across projects with project labels", () => {
     setup();
+    fireEvent.click(screen.getByRole("button", { name: "Search chats" }));
     fireEvent.change(screen.getByRole("textbox", { name: "Search chats" }), {
       target: { value: "overnight" },
     });
-    expect(screen.getByText("Search results")).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Search chats" })).toBeInTheDocument();
     const result = screen.getByRole("button", { name: /Mobile intake overnight agent/i });
     expect(within(result).getByText(/Lotmind AI/i)).toBeInTheDocument();
   });
@@ -109,14 +129,38 @@ describe("TaskSidebar", () => {
       },
     ]);
     setup({ onSearchMessages });
+    fireEvent.click(screen.getByRole("button", { name: "Search chats" }));
     fireEvent.change(screen.getByRole("textbox", { name: "Search chats" }), {
       target: { value: "orchestrated emerald" },
     });
 
     await waitFor(() => expect(onSearchMessages).toHaveBeenCalledWith("orchestrated emerald"));
-    const result = await screen.findByRole("button", { name: /Tune coordinated theme presets/i });
+    const dialog = screen.getByRole("dialog", { name: "Search chats" });
+    const result = await within(dialog).findByRole("button", {
+      name: /Tune coordinated theme presets/i,
+    });
     expect(within(result).getByText(/orchestrated emerald/i)).toBeInTheDocument();
     expect(within(result).getByText(/AI Integrator/i)).toBeInTheDocument();
+  });
+
+  it("keeps search compact in the brand row and opens a focused modal", () => {
+    setup();
+    const sidebar = screen.getByRole("complementary", { name: "Chat navigation" });
+    const searchButton = within(sidebar).getByRole("button", { name: "Search chats" });
+    const brand = within(sidebar).getByLabelText("AI Integrator");
+    expect(brand.closest(".sidebar-brand-row")).toContainElement(searchButton);
+    expect(
+      within(sidebar).queryByRole("textbox", { name: "Search chats" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(searchButton);
+    const input = screen.getByRole("textbox", { name: "Search chats" });
+    expect(screen.getByRole("dialog", { name: "Search chats" })).toBeInTheDocument();
+    expect(input).toHaveFocus();
+
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Search chats" })).not.toBeInTheDocument();
+    expect(searchButton).toHaveFocus();
   });
 
   it("keeps Settings as a bottom-aligned control", () => {

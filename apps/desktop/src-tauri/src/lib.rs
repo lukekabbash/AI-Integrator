@@ -1,12 +1,14 @@
 #![forbid(unsafe_code)]
 
 mod broker_mcp;
+mod chat_title;
 mod commands;
 mod delegation;
 mod native_actions;
 mod runtime_setup;
 mod state;
 
+use chat_title::task_generate_title;
 use commands::*;
 use delegation::{
     delegation_approve, delegation_deny, delegation_list, delegation_send_message,
@@ -62,6 +64,7 @@ pub fn run() {
             task_search_messages,
             task_set_state,
             task_update_metadata,
+            task_generate_title,
             task_update_routing,
             setting_list,
             setting_set,
