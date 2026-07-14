@@ -1358,7 +1358,7 @@ function RuntimeSettings({
             </AnimatePresence>
           </div>
         </section>
-        <AnimatePresence initial={false}>
+        <AnimatePresence initial={false} mode="popLayout">
           {planner || activePlan ? (
             <motion.div
               className="runtime-terminal-stage"
@@ -1369,10 +1369,8 @@ function RuntimeSettings({
                   ? false
                   : {
                       opacity: 0,
-                      y: 28,
+                      y: 14,
                       scale: 0.985,
-                      filter: "blur(8px)",
-                      clipPath: "inset(0 0 16% 0 round 12px)",
                     }
               }
               animate={
@@ -1382,15 +1380,11 @@ function RuntimeSettings({
                       opacity: 1,
                       y: 0,
                       scale: 1,
-                      filter: "blur(0px)",
-                      clipPath: "inset(0 0 0% 0 round 12px)",
                       transition: {
-                        layout: { type: "spring", stiffness: 340, damping: 32, mass: 0.82 },
-                        opacity: { duration: 0.32, delay: 0.1, ease: [0.2, 0, 0, 1] },
-                        y: { type: "spring", stiffness: 290, damping: 28, mass: 0.9, delay: 0.05 },
-                        scale: { duration: 0.38, delay: 0.05, ease: [0.2, 0, 0, 1] },
-                        filter: { duration: 0.36, delay: 0.08, ease: [0.2, 0, 0, 1] },
-                        clipPath: { duration: 0.42, delay: 0.06, ease: [0.2, 0, 0, 1] },
+                        layout: { duration: 0.28, ease: [0.2, 0, 0, 1] },
+                        opacity: { duration: 0.24, ease: [0.2, 0, 0, 1] },
+                        y: { duration: 0.24, ease: [0.2, 0, 0, 1] },
+                        scale: { duration: 0.24, ease: [0.2, 0, 0, 1] },
                       },
                     }
               }
@@ -1399,11 +1393,9 @@ function RuntimeSettings({
                   ? { opacity: 0, transition: { duration: 0 } }
                   : {
                       opacity: 0,
-                      y: 16,
-                      scale: 0.99,
-                      filter: "blur(5px)",
-                      clipPath: "inset(0 0 10% 0 round 12px)",
-                      transition: { duration: 0.2, ease: [0.4, 0, 1, 1] },
+                      y: 8,
+                      scale: 0.985,
+                      transition: { duration: 0.16, ease: [0.4, 0, 1, 1] },
                     }
               }
               style={{ transformOrigin: "top center" }}
@@ -1411,11 +1403,48 @@ function RuntimeSettings({
               <AnimatePresence initial={false} mode="wait">
                 {activePlan ? (
                   <motion.div
+                    className="runtime-terminal-content"
                     key={`terminal-${activePlan.id}`}
-                    initial={reduceMotion ? false : { opacity: 0, y: 12, filter: "blur(4px)" }}
-                    animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
-                    exit={reduceMotion ? { opacity: 0 } : { opacity: 0, y: -8 }}
-                    transition={reduceMotion ? { duration: 0 } : { duration: 0.22 }}
+                    layout={!reduceMotion}
+                    initial={
+                      reduceMotion
+                        ? false
+                        : {
+                            opacity: 0,
+                            y: 8,
+                            scale: 0.99,
+                          }
+                    }
+                    animate={
+                      reduceMotion
+                        ? { opacity: 1 }
+                        : {
+                            opacity: 1,
+                            y: 0,
+                            scale: 1,
+                          }
+                    }
+                    exit={
+                      reduceMotion
+                        ? { opacity: 0 }
+                        : {
+                            opacity: 0,
+                            y: -8,
+                            scale: 0.99,
+                            transition: { duration: 0.1, ease: [0.4, 0, 1, 1] },
+                          }
+                    }
+                    transition={
+                      reduceMotion
+                        ? { duration: 0 }
+                        : {
+                            layout: { duration: 0.28, ease: [0.2, 0, 0, 1] },
+                            opacity: { duration: 0.24, ease: [0.2, 0, 0, 1] },
+                            y: { duration: 0.24, ease: [0.2, 0, 0, 1] },
+                            scale: { duration: 0.24, ease: [0.2, 0, 0, 1] },
+                          }
+                    }
+                    style={{ transformOrigin: "top center" }}
                   >
                     <RuntimeSetupTerminal
                       plan={activePlan}
@@ -1429,11 +1458,20 @@ function RuntimeSettings({
                   </motion.div>
                 ) : planner ? (
                   <motion.div
+                    className="runtime-terminal-content"
                     key={`review-${planner.runtime.id}-${planner.kind}`}
-                    initial={reduceMotion ? false : { opacity: 0, y: 12, filter: "blur(4px)" }}
-                    animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
-                    exit={reduceMotion ? { opacity: 0 } : { opacity: 0, y: -8 }}
-                    transition={reduceMotion ? { duration: 0 } : { duration: 0.22 }}
+                    initial={reduceMotion ? false : { opacity: 0, y: 8, scale: 0.99 }}
+                    animate={reduceMotion ? { opacity: 1 } : { opacity: 1, y: 0, scale: 1 }}
+                    exit={reduceMotion ? { opacity: 0 } : { opacity: 0, y: -8, scale: 0.99 }}
+                    transition={
+                      reduceMotion
+                        ? { duration: 0 }
+                        : {
+                            opacity: { duration: 0.2, ease: [0.2, 0, 0, 1] },
+                            y: { duration: 0.2, ease: [0.2, 0, 0, 1] },
+                            scale: { duration: 0.2, ease: [0.2, 0, 0, 1] },
+                          }
+                    }
                   >
                     <RuntimeCommandReview
                       planner={planner}

@@ -20,13 +20,18 @@ vi.mock("../bridge", async (importOriginal) => {
 vi.mock("./RuntimeSetupTerminal", () => ({
   RuntimeSetupTerminal: ({
     plan,
+    onClose,
     onExit,
   }: {
     plan: { command: string };
+    onClose: () => void;
     onExit: (code: number) => void;
   }) => (
     <div aria-label="Mock setup terminal">
       <code>{plan.command}</code>
+      <button type="button" onClick={onClose}>
+        Close setup terminal
+      </button>
       <button type="button" onClick={() => onExit(0)}>
         Finish command
       </button>
@@ -205,6 +210,39 @@ describe("Runtime Settings command disclosure", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Run this command" }));
     expect(await screen.findByLabelText("Mock setup terminal")).toBeInTheDocument();
+  });
+
+  it("opens and closes the approved terminal from a runtime row action", async () => {
+    render(
+      <SettingsView
+        preferences={DEFAULT_THEME_PREFERENCES}
+        runtimes={[claudeRuntime, runtime]}
+        usage={createEmptySnapshot().usage}
+        onChangePreferences={vi.fn()}
+        onResetPreferences={vi.fn()}
+        onBack={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Runtimes").closest("button") as HTMLButtonElement);
+    const runtimeRow = (await screen.findByText("Codex")).closest(".settings-runtime-row");
+    expect(runtimeRow).not.toBeNull();
+    fireEvent.click(within(runtimeRow as HTMLElement).getByRole("button", { name: "Update" }));
+
+    expect(await screen.findByRole("dialog", { name: "Update Codex" })).toBeInTheDocument();
+    expect(bridgeMock.listRuntimeActionPlans).toHaveBeenCalledWith("codex", "update");
+    fireEvent.click(screen.getByRole("button", { name: "Run this command" }));
+    expect(await screen.findByLabelText("Mock setup terminal")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close setup terminal" }));
+    await waitFor(() =>
+      expect(screen.queryByLabelText("Mock setup terminal")).not.toBeInTheDocument(),
+    );
+    expect(await screen.findByText("Claude")).toBeInTheDocument();
+    expect(document.querySelector(".runtime-settings-stage")).toHaveAttribute(
+      "data-focused",
+      "false",
+    );
   });
 
   it("shows documented install methods and their exact commands before choosing one", async () => {

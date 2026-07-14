@@ -5743,7 +5743,11 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
 .runtime-terminal-stage {
   min-width: 0;
   isolation: isolate;
-  will-change: transform, opacity, filter, clip-path;
+  will-change: transform, opacity;
+}
+.runtime-terminal-content {
+  min-width: 0;
+  will-change: transform, opacity;
 }
 .runtime-settings-stage[data-focused="true"] .runtime-terminal-stage {
   margin-top: -1px;
