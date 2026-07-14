@@ -57,11 +57,13 @@ export function createEmptySnapshot(): WorkspaceSnapshot {
       ],
     },
     git: {
+      kind: "notRepository",
       branch: "",
-      upstream: "Not published",
+      upstream: "",
       ahead: 0,
       behind: 0,
       worktree: "",
+      remotes: [],
       files: [],
       commits: [],
     },
@@ -218,6 +220,7 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
       id: "integrator",
       name: "AI Integrator",
       path: "Projects/AI Integrator",
+      gitRepositoryRoot: "Projects/AI Integrator",
       branch: "feature/v1-native-app",
       dirtyFiles: 3,
       expanded: true,
@@ -226,6 +229,7 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
       id: "lotmind",
       name: "Lotmind AI",
       path: "Projects/Lotmind AI",
+      gitRepositoryRoot: "Projects/Lotmind AI",
       branch: "main",
       dirtyFiles: 0,
       expanded: false,
@@ -234,6 +238,7 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
       id: "eve",
       name: "EVE OS",
       path: "Projects/EVE OS",
+      gitRepositoryRoot: "Projects/EVE OS",
       branch: "dev",
       dirtyFiles: 1,
       expanded: false,
@@ -527,11 +532,19 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
   };
 
   const git: GitSnapshot = {
+    kind: "repository",
     branch: "feature/v1-native-app",
     upstream: "origin/feature/v1-native-app",
     ahead: 2,
     behind: 0,
     worktree: "Projects/AI Integrator",
+    remotes: [
+      {
+        name: "origin",
+        fetchUrl: "https://github.com/example/ai-integrator.git",
+        pushUrl: "https://github.com/example/ai-integrator.git",
+      },
+    ],
     files: diff,
     commits: [
       {

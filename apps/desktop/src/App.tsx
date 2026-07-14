@@ -23,14 +23,17 @@ import {
   ArrowRight,
   CircleStop,
   ClipboardList,
+  Download,
   FileDiff,
   FolderOpen,
   FolderPlus,
+  Github,
   Minus,
   PanelLeftClose,
   PanelLeftOpen,
   PanelRightClose,
   PanelRightOpen,
+  Search,
   Square,
   TerminalSquare,
   X,
@@ -45,10 +48,12 @@ import {
   type ComposerDraft,
   type ComposerDraftOwner,
   type ComposerDraftValue,
+  type CloneProjectInput,
   type DelegationView,
   type DelegationRouting,
   type DiffFile,
   type GitSnapshot,
+  type GithubRepositoryCatalog,
   type NativeActionReference,
   type ProjectFileContent,
   type ProjectFileEntry,
@@ -542,7 +547,7 @@ function EmptyProjectState({ busy, onOpenProject }: { busy: boolean; onOpenProje
         <FolderOpen />
       </div>
       <p className="empty-eyebrow">Local-first workspace</p>
-      <h1 id="empty-project-title">Open a local Git project</h1>
+      <h1 id="empty-project-title">Open a local project</h1>
       <p className="empty-description">
         Choose a repository you own. AI Integrator stores project trust and sessions locally, and
         your vendor CLI credentials stay with each provider.
@@ -560,7 +565,7 @@ function EmptyProjectState({ busy, onOpenProject }: { busy: boolean; onOpenProje
       </button>
       <div className="empty-trust-note">
         <strong>No AI Integrator account required</strong>
-        <span>The selected repository is verified by the native Git service before use.</span>
+        <span>The selected folder stays local and is explicitly trusted before agents use it.</span>
       </div>
     </section>
   );
@@ -572,20 +577,83 @@ function AddProjectModal({
   onClose,
   onOpenExisting,
   onCreateNew,
+  onClone,
 }: {
   busy: boolean;
   error: string;
   onClose: () => void;
   onOpenExisting: () => void;
   onCreateNew: (name: string) => void;
+  onClone: (input: CloneProjectInput) => void;
 }) {
-  const [mode, setMode] = useState<"choose" | "create">("choose");
+  const [mode, setMode] = useState<"choose" | "create" | "clone">("choose");
   const [name, setName] = useState("");
+  const [cloneSource, setCloneSource] = useState<"github" | "url">("github");
+  const [catalog, setCatalog] = useState<GithubRepositoryCatalog | null>(null);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [query, setQuery] = useState("");
+  const [selectedRepository, setSelectedRepository] = useState("");
+  const [repositoryUrl, setRepositoryUrl] = useState("");
+  const [parent, setParent] = useState(() => {
+    try {
+      return window.localStorage.getItem("integrator.clone.parent") ?? "";
+    } catch {
+      return "";
+    }
+  });
+  const [folderName, setFolderName] = useState("");
+  const [folderNameEdited, setFolderNameEdited] = useState(false);
   const nameInputRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
     if (mode === "create") nameInputRef.current?.focus();
   }, [mode]);
+  const openClone = () => {
+    setMode("clone");
+    if (!parent) {
+      void bridge.getDefaultProjectParent().then((value) => setParent(value));
+    }
+    if (!catalog && !catalogLoading) {
+      setCatalogLoading(true);
+      void bridge
+        .listGithubRepositories()
+        .then(setCatalog)
+        .catch((failure: unknown) =>
+          setCatalog({
+            installed: false,
+            authenticated: false,
+            repositories: [],
+            detail: failure instanceof Error ? failure.message : "GitHub repositories unavailable.",
+          }),
+        )
+        .finally(() => setCatalogLoading(false));
+    }
+  };
   const trimmedName = name.trim();
+  const filteredRepositories = (catalog?.repositories ?? []).filter((repository) => {
+    const needle = query.trim().toLocaleLowerCase();
+    return (
+      !needle ||
+      repository.nameWithOwner.toLocaleLowerCase().includes(needle) ||
+      repository.description?.toLocaleLowerCase().includes(needle)
+    );
+  });
+  const inferFolderName = (value: string) =>
+    value
+      .trim()
+      .split(/[/:]/)
+      .at(-1)
+      ?.replace(/\.git$/i, "") ?? "";
+  const cloneReady = Boolean(
+    parent.trim() &&
+    folderName.trim() &&
+    (cloneSource === "github" ? selectedRepository : repositoryUrl.trim()),
+  );
+  const title =
+    mode === "choose"
+      ? "Add a project"
+      : mode === "create"
+        ? "Create new project"
+        : "Clone repository";
   return (
     <div
       className="modal-backdrop"
@@ -604,9 +672,7 @@ function AddProjectModal({
         aria-labelledby="add-project-title"
       >
         <div className="modal-head">
-          <h2 id="add-project-title">
-            {mode === "choose" ? "Add a project" : "Create new project"}
-          </h2>
+          <h2 id="add-project-title">{title}</h2>
           <button
             type="button"
             className="icon-button"
@@ -623,7 +689,14 @@ function AddProjectModal({
               <FolderOpen aria-hidden="true" />
               <span>
                 <strong>Open local folder</strong>
-                <small>Choose an existing Git repository on this machine.</small>
+                <small>Open any folder, with or without Git.</small>
+              </span>
+            </button>
+            <button type="button" className="modal-option" onClick={openClone} disabled={busy}>
+              <Download aria-hidden="true" />
+              <span>
+                <strong>Clone repository</strong>
+                <small>Choose from GitHub or paste a repository URL.</small>
               </span>
             </button>
             <button
@@ -634,12 +707,12 @@ function AddProjectModal({
             >
               <FolderPlus aria-hidden="true" />
               <span>
-                <strong>Create from scratch</strong>
+                <strong>Create new project</strong>
                 <small>Make a new folder and initialize a fresh Git repository.</small>
               </span>
             </button>
           </div>
-        ) : (
+        ) : mode === "create" ? (
           <form
             className="modal-create-form"
             onSubmit={(event) => {
@@ -682,6 +755,165 @@ function AddProjectModal({
                 aria-busy={busy}
               >
                 {busy ? "Creating…" : "Create project"}
+              </button>
+            </div>
+          </form>
+        ) : (
+          <form
+            className="modal-create-form clone-project-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (!cloneReady) return;
+              onClone({
+                remote: cloneSource === "url" ? repositoryUrl.trim() : "",
+                parent: parent.trim(),
+                folderName: folderName.trim(),
+                ...(cloneSource === "github" ? { githubRepository: selectedRepository } : {}),
+              });
+            }}
+          >
+            <div className="clone-source-tabs" role="tablist" aria-label="Repository source">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={cloneSource === "github"}
+                data-active={cloneSource === "github"}
+                onClick={() => setCloneSource("github")}
+              >
+                <Github aria-hidden="true" /> Your repositories
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={cloneSource === "url"}
+                data-active={cloneSource === "url"}
+                onClick={() => setCloneSource("url")}
+              >
+                Repository URL
+              </button>
+            </div>
+            {cloneSource === "github" ? (
+              <div className="clone-repository-picker">
+                {catalogLoading ? <p className="modal-hint">Checking GitHub CLI…</p> : null}
+                {catalog?.authenticated ? (
+                  <>
+                    <label className="clone-search" htmlFor="clone-repository-search">
+                      <Search aria-hidden="true" />
+                      <input
+                        id="clone-repository-search"
+                        type="search"
+                        value={query}
+                        placeholder={`Search ${catalog.account ?? "GitHub"} repositories`}
+                        onChange={(event) => setQuery(event.target.value)}
+                      />
+                    </label>
+                    <div className="clone-repository-list" role="listbox">
+                      {filteredRepositories.map((repository) => (
+                        <button
+                          key={repository.nameWithOwner}
+                          type="button"
+                          role="option"
+                          aria-selected={selectedRepository === repository.nameWithOwner}
+                          data-selected={selectedRepository === repository.nameWithOwner}
+                          onClick={() => {
+                            setSelectedRepository(repository.nameWithOwner);
+                            setFolderName(repository.name);
+                            setFolderNameEdited(false);
+                          }}
+                        >
+                          <span>
+                            <strong>{repository.nameWithOwner}</strong>
+                            <small>{repository.description || "No description"}</small>
+                          </span>
+                          <small>{repository.private ? "Private" : "Public"}</small>
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                ) : catalog ? (
+                  <div className="clone-cli-state">
+                    <strong>GitHub repositories unavailable</strong>
+                    <span>{catalog.detail ?? "Sign in with GitHub CLI, or paste a URL."}</span>
+                    <button type="button" onClick={() => setCloneSource("url")}>
+                      Use a URL
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+            ) : (
+              <label htmlFor="clone-repository-url">
+                Repository URL
+                <input
+                  id="clone-repository-url"
+                  type="text"
+                  value={repositoryUrl}
+                  placeholder="https://github.com/company/project.git"
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    setRepositoryUrl(value);
+                    if (!folderNameEdited) setFolderName(inferFolderName(value));
+                  }}
+                />
+              </label>
+            )}
+            <label htmlFor="clone-folder-name">
+              Folder name
+              <input
+                id="clone-folder-name"
+                type="text"
+                value={folderName}
+                maxLength={120}
+                placeholder="project"
+                onChange={(event) => {
+                  setFolderName(event.target.value);
+                  setFolderNameEdited(true);
+                }}
+              />
+            </label>
+            <div className="clone-location-row">
+              <span>
+                <small>Location</small>
+                <strong title={parent}>{parent || "Loading default location…"}</strong>
+              </span>
+              <button
+                type="button"
+                className="ghost-button"
+                onClick={() => {
+                  void bridge.pickProjectParent().then((selected) => {
+                    if (!selected) return;
+                    setParent(selected);
+                    try {
+                      window.localStorage.setItem("integrator.clone.parent", selected);
+                    } catch {
+                      // Remembering the location is best-effort.
+                    }
+                  });
+                }}
+              >
+                Change…
+              </button>
+            </div>
+            {error ? (
+              <p className="modal-error" role="alert">
+                {error}
+              </p>
+            ) : null}
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="ghost-button"
+                onClick={() => setMode("choose")}
+                disabled={busy}
+              >
+                Back
+              </button>
+              <button
+                type="submit"
+                className="empty-primary-action"
+                disabled={busy || !cloneReady}
+                aria-busy={busy}
+              >
+                {busy ? "Cloning…" : "Clone repository"}
               </button>
             </div>
           </form>
@@ -1436,6 +1668,28 @@ export default function App() {
     snapshot.projects.find((project) => project.id === snapshot.activeProjectId) ??
     snapshot.projects.find((project) => project.id === activeTask?.projectId) ??
     snapshot.projects[0];
+  useEffect(() => {
+    if (!activeProject || activeTask) return;
+    let active = true;
+    void bridge
+      .loadProjectGit(activeProject.id)
+      .then((git) => {
+        if (!active) return;
+        setSnapshot((current) =>
+          current.activeProjectId === activeProject.id && !current.activeTaskId
+            ? { ...current, git }
+            : current,
+        );
+      })
+      .catch((error: unknown) => {
+        if (active) {
+          setOperationError(error instanceof Error ? error.message : "Could not load Git state");
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [activeProject, activeTask]);
   const activeDraftOwner: ComposerDraftOwner | undefined = activeProject
     ? activeTask
       ? { kind: "task", taskId: activeTask.id }
@@ -1835,6 +2089,26 @@ export default function App() {
       setAddProjectOpen(false);
     } catch (error) {
       setCreateProjectError(formatBridgeError(error, "Could not create the project"));
+    } finally {
+      setOpeningProject(false);
+    }
+  };
+
+  const cloneProject = async (input: CloneProjectInput) => {
+    if (openingProject) return;
+    setOpeningProject(true);
+    setCreateProjectError("");
+    setOperationError("");
+    setOperationStatus("");
+    try {
+      const project = await bridge.cloneProject(input);
+      mergeProject(project);
+      setCenterView("task");
+      setScreen("workspace");
+      setOperationStatus(`${project.name} cloned`);
+      setAddProjectOpen(false);
+    } catch (error) {
+      setCreateProjectError(formatBridgeError(error, "Could not clone the repository"));
     } finally {
       setOpeningProject(false);
     }
@@ -2406,10 +2680,9 @@ export default function App() {
 
   const refreshGit = async () => {
     if (!activeTask) {
-      setSnapshot((current) => ({
-        ...current,
-        git: createEmptySnapshot().git,
-      }));
+      if (!activeProject) return;
+      const git = await bridge.loadProjectGit(activeProject.id);
+      setSnapshot((current) => ({ ...current, git }));
       return;
     }
     const git = await bridge.loadTaskGit(activeTask.id);
@@ -2419,6 +2692,72 @@ export default function App() {
     setActiveFilePath((current) =>
       git.files.some((file) => file.path === current) ? current : (git.files[0]?.path ?? ""),
     );
+  };
+
+  const applyGitSnapshot = (git: GitSnapshot) => {
+    if (activeTask) {
+      taskGitCache.current.set(activeTask.id, git);
+      taskGitRefreshedAt.current.set(activeTask.id, Date.now());
+    }
+    setSnapshot((current) => ({ ...current, git }));
+  };
+
+  const initializeProjectGit = async () => {
+    if (!activeProject) return;
+    const project = await bridge.initializeGit(activeProject.id);
+    // Reconcile by path as well as id: the active project may be a local
+    // placeholder whose id differs from the trusted record the backend
+    // returns, and the Git panel keys off the entry that stays active.
+    setSnapshot((current) => ({
+      ...current,
+      projects: current.projects.map((candidate) =>
+        candidate.id === project.id || candidate.path === project.path
+          ? { ...candidate, gitRepositoryRoot: project.gitRepositoryRoot }
+          : candidate,
+      ),
+    }));
+    applyGitSnapshot(await bridge.loadProjectGit(activeProject.id));
+  };
+
+  const addGitRemote = async (name: string, url: string) => {
+    if (!activeProject) return;
+    applyGitSnapshot(await bridge.addGitRemote(activeProject.id, name, url));
+  };
+
+  const updateGitRemote = async (name: string, url: string) => {
+    if (!activeProject) return;
+    applyGitSnapshot(await bridge.updateGitRemote(activeProject.id, name, url));
+  };
+
+  const removeGitRemote = async (name: string) => {
+    if (!activeProject) return;
+    applyGitSnapshot(await bridge.removeGitRemote(activeProject.id, name));
+  };
+
+  const fetchGit = async (remote?: string) => {
+    if (!activeProject) return;
+    applyGitSnapshot(await bridge.fetchGit(activeProject.id, remote));
+  };
+
+  const pullGit = async (mode: "fastForwardOnly" | "rebase") => {
+    if (!activeProject) return;
+    applyGitSnapshot(await bridge.pullGit(activeProject.id, mode));
+  };
+
+  const publishGitBranch = async (remote: string) => {
+    if (!activeProject) return;
+    const result = await bridge.publishGitBranch(activeProject.id, remote);
+    if (result.outcome === "outcomeUncertain") throw new Error(result.summary);
+    await refreshGit();
+  };
+
+  const publishGithubRepository = async (input: {
+    nameWithOwner: string;
+    visibility: "private" | "public" | "internal";
+    remote: string;
+  }) => {
+    if (!activeProject) return;
+    applyGitSnapshot(await bridge.publishGithubRepository(activeProject.id, input));
   };
 
   const refreshReview = async () => {
@@ -3534,6 +3873,14 @@ export default function App() {
                         onPush={push}
                         onReviewChanges={reviewChanges}
                         onRefreshGit={refreshGit}
+                        onInitializeGit={initializeProjectGit}
+                        onAddRemote={addGitRemote}
+                        onUpdateRemote={updateGitRemote}
+                        onRemoveRemote={removeGitRemote}
+                        onFetch={fetchGit}
+                        onPull={pullGit}
+                        onPublishBranch={publishGitBranch}
+                        onPublishGithub={publishGithubRepository}
                         onLoadMoreGitHistory={loadMoreGitHistory}
                         onResize={(delta) =>
                           setRightRailWidth((current) => clampDimension(current - delta, 300, 520))
@@ -3556,6 +3903,7 @@ export default function App() {
             }}
             onOpenExisting={() => void openExistingProject()}
             onCreateNew={(name) => void createNewProject(name)}
+            onClone={(input) => void cloneProject(input)}
           />
         ) : null}
       </div>

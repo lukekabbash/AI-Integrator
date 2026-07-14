@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-git-remote-remove"
+description = "Enables the git_remote_remove command without any pre-configured scope."
+commands.allow = ["git_remote_remove"]
+
+[[permission]]
+identifier = "deny-git-remote-remove"
+description = "Denies the git_remote_remove command without any pre-configured scope."
+commands.deny = ["git_remote_remove"]

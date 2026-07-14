@@ -242,8 +242,13 @@ pub struct NewTask {
 pub struct TrustedProject {
     pub id: ProjectId,
     pub display_name: String,
+    /// Exact canonical folder selected by the user. It may be a subfolder of
+    /// a Git repository or an ordinary non-Git directory.
     pub repository_root: PathBuf,
-    pub git_common_directory: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_repository_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_common_directory: Option<PathBuf>,
     pub created_at: DateTime<Utc>,
     pub last_opened_at: DateTime<Utc>,
 }

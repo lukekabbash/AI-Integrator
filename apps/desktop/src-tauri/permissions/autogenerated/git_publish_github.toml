@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-git-publish-github"
+description = "Enables the git_publish_github command without any pre-configured scope."
+commands.allow = ["git_publish_github"]
+
+[[permission]]
+identifier = "deny-git-publish-github"
+description = "Denies the git_publish_github command without any pre-configured scope."
+commands.deny = ["git_publish_github"]

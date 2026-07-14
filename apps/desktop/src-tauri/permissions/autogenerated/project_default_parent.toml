@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-project-default-parent"
+description = "Enables the project_default_parent command without any pre-configured scope."
+commands.allow = ["project_default_parent"]
+
+[[permission]]
+identifier = "deny-project-default-parent"
+description = "Denies the project_default_parent command without any pre-configured scope."
+commands.deny = ["project_default_parent"]

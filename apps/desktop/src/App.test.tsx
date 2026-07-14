@@ -469,7 +469,7 @@ describe("AI Integrator desktop workspace", () => {
     storeSnapshot(empty);
     render(<App />);
 
-    const heading = await screen.findByRole("heading", { name: "Open a local Git project" });
+    const heading = await screen.findByRole("heading", { name: "Open a local project" });
     const emptyState = heading.closest("section");
     expect(emptyState).not.toBeNull();
     fireEvent.click(
@@ -495,7 +495,7 @@ describe("AI Integrator desktop workspace", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: /Open project/ }));
     const chooser = await screen.findByRole("dialog", { name: "Add a project" });
-    fireEvent.click(within(chooser).getByRole("button", { name: /Create from scratch/ }));
+    fireEvent.click(within(chooser).getByRole("button", { name: /Create new project/ }));
 
     const nameField = await screen.findByLabelText("Project name");
     fireEvent.change(nameField, { target: { value: "fresh-idea" } });
@@ -505,6 +505,26 @@ describe("AI Integrator desktop workspace", () => {
       await screen.findByRole("heading", { name: "What are we working on?" }),
     ).toBeInTheDocument();
     expect(screen.getByText("fresh-idea", { selector: ".empty-task-kicker" })).toBeInTheDocument();
+  });
+
+  it("clones a repository selected from the GitHub CLI catalog", async () => {
+    const empty = createEmptySnapshot();
+    empty.runtimes = createDemoSnapshot().runtimes;
+    storeSnapshot(empty);
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Open project/ }));
+    const chooser = await screen.findByRole("dialog", { name: "Add a project" });
+    fireEvent.click(within(chooser).getByRole("button", { name: /Clone repository/ }));
+    fireEvent.click(await screen.findByRole("option", { name: /demo\/ai-integrator/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Clone repository$/ }));
+
+    expect(
+      await screen.findByRole("heading", { name: "What are we working on?" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("ai-integrator", { selector: ".empty-task-kicker" }),
+    ).toBeInTheDocument();
   });
 
   it("creates a durable task before sending when a project has no active task", async () => {

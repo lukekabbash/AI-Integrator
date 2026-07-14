@@ -1,4 +1,6 @@
 import {
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useMemo,
@@ -17,12 +19,15 @@ import {
   ChevronRight,
   CircleDollarSign,
   Copy,
+  CloudUpload,
+  Download,
   FileText,
   FolderOpen,
   FolderSearch,
   GitBranch,
   GitCommitHorizontal,
   GitCompare,
+  Link,
   Minus,
   Pencil,
   Plus,
@@ -50,6 +55,10 @@ import type {
 } from "../bridge";
 import { ResizeHandle } from "./ResizeHandle";
 import { Tooltip } from "./Tooltip";
+
+const GitRemoteDialog = lazy(() =>
+  import("./GitRemoteDialog").then((module) => ({ default: module.GitRemoteDialog })),
+);
 
 type RailTab = "git" | "agents" | "files" | "usage";
 
@@ -325,6 +334,18 @@ interface RightRailProps {
   onPush: () => Promise<void>;
   onReviewChanges?: () => void;
   onRefreshGit?: () => Promise<void>;
+  onInitializeGit?: () => Promise<void>;
+  onAddRemote?: (name: string, url: string) => Promise<void>;
+  onUpdateRemote?: (name: string, url: string) => Promise<void>;
+  onRemoveRemote?: (name: string) => Promise<void>;
+  onFetch?: (remote?: string) => Promise<void>;
+  onPull?: (mode: "fastForwardOnly" | "rebase") => Promise<void>;
+  onPublishBranch?: (remote: string) => Promise<void>;
+  onPublishGithub?: (input: {
+    nameWithOwner: string;
+    visibility: "private" | "public" | "internal";
+    remote: string;
+  }) => Promise<void>;
   /** Append the next page of older commits to the graph. */
   onLoadMoreGitHistory?: () => Promise<void>;
   onResize?: (delta: number) => void;
@@ -394,6 +415,14 @@ function GitPanel({
   onPush,
   onReviewChanges,
   onRefreshGit,
+  onInitializeGit,
+  onAddRemote,
+  onUpdateRemote,
+  onRemoveRemote,
+  onFetch,
+  onPull,
+  onPublishBranch,
+  onPublishGithub,
   onLoadMoreGitHistory,
   fileOpeners = [],
   onOpenGitFileExternal,
@@ -410,6 +439,14 @@ function GitPanel({
   | "onPush"
   | "onReviewChanges"
   | "onRefreshGit"
+  | "onInitializeGit"
+  | "onAddRemote"
+  | "onUpdateRemote"
+  | "onRemoveRemote"
+  | "onFetch"
+  | "onPull"
+  | "onPublishBranch"
+  | "onPublishGithub"
   | "onLoadMoreGitHistory"
   | "fileOpeners"
   | "onOpenGitFileExternal"
@@ -417,7 +454,7 @@ function GitPanel({
 >) {
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState<
-    "commit" | "commit-push" | "generate" | "push" | "stage" | "refresh" | null
+    "commit" | "commit-push" | "generate" | "push" | "stage" | "refresh" | "remote" | null
   >(null);
   const reduceMotion = useReducedMotion();
   const [stagingPath, setStagingPath] = useState<string | null>(null);
@@ -426,6 +463,9 @@ function GitPanel({
   const [stagedLimit, setStagedLimit] = useState(INITIAL_GIT_FILE_ROWS);
   const [unstagedLimit, setUnstagedLimit] = useState(INITIAL_GIT_FILE_ROWS);
   const [commitMenuOpen, setCommitMenuOpen] = useState(false);
+  const [remoteDialog, setRemoteDialog] = useState<
+    "manage" | "connect" | "github" | "branch" | null
+  >(null);
   const [fileContextMenu, setFileContextMenu] = useState<{
     file: DiffFile;
     x: number;
@@ -524,6 +564,20 @@ function GitPanel({
     setActionError(null);
     try {
       await onRefreshGit();
+    } catch (error) {
+      setActionError(getErrorMessage(error));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const runRemoteAction = async (action: () => Promise<void>, close = false) => {
+    if (busy !== null) return;
+    setBusy("remote");
+    setActionError(null);
+    try {
+      await action();
+      if (close) setRemoteDialog(null);
     } catch (error) {
       setActionError(getErrorMessage(error));
     } finally {
@@ -718,6 +772,37 @@ function GitPanel({
     </div>
   );
 
+  if (git.kind === "notRepository") {
+    return (
+      <div className="rail-panel git-panel git-panel--empty">
+        <div className="git-setup-state">
+          <span className="git-setup-icon" aria-hidden="true">
+            <GitBranch />
+          </span>
+          <h3>Set up Git for this folder</h3>
+          <p>Track changes, create commits, and connect a remote when you’re ready.</p>
+          <button
+            type="button"
+            className="primary-button"
+            disabled={!onInitializeGit || busy !== null}
+            aria-busy={busy === "remote"}
+            onClick={() => {
+              if (onInitializeGit) void runRemoteAction(onInitializeGit);
+            }}
+          >
+            <GitBranch /> {busy === "remote" ? "Setting up…" : "Set up Git"}
+          </button>
+          <small>Your existing files won’t be changed.</small>
+        </div>
+        {actionError ? (
+          <p className="git-action-error" role="alert">
+            {actionError}
+          </p>
+        ) : null}
+      </div>
+    );
+  }
+
   return (
     <div className="rail-panel git-panel">
       <div className="branch-header">
@@ -755,6 +840,28 @@ function GitPanel({
           </button>
         </Tooltip>
       </div>
+      {git.remotes.length === 0 ? (
+        <div className="git-local-only">
+          <span>
+            <strong>Local only</strong>
+            <small>Add a remote when you want to share this repository.</small>
+          </span>
+          <button
+            type="button"
+            onClick={() => setRemoteDialog("github")}
+            disabled={!onPublishGithub || busy !== null}
+          >
+            Publish to GitHub
+          </button>
+          <button
+            type="button"
+            onClick={() => setRemoteDialog("connect")}
+            disabled={!onAddRemote || busy !== null}
+          >
+            Connect remote
+          </button>
+        </div>
+      ) : null}
       <div className="git-overview-actions">
         <button
           className="secondary-button"
@@ -854,7 +961,7 @@ function GitPanel({
           ref={commitMenuTriggerRef}
           className="primary-button commit-menu-trigger"
           type="button"
-          aria-label="More commit actions"
+          aria-label="More Git actions"
           aria-haspopup="menu"
           aria-expanded={commitMenuOpen}
           onClick={() => setCommitMenuOpen((current) => !current)}
@@ -872,35 +979,106 @@ function GitPanel({
           <div
             className="compact-action-menu commit-action-menu"
             role="menu"
-            aria-label="Commit actions"
+            aria-label="Git actions"
             onKeyDown={handleMenuNavigation}
           >
             <button
               type="button"
               role="menuitem"
               onClick={() => void runCommitAndPush()}
-              disabled={!message.trim() || staged.length === 0}
+              disabled={!git.upstream || !message.trim() || !staged.length}
             >
               <GitCommitHorizontal />
               <span>
                 <strong>Commit &amp; push</strong>
-                <small>Commit locally, then push to {git.upstream || "upstream"}</small>
+                <small>
+                  {!git.upstream
+                    ? git.remotes.length
+                      ? "Publish this branch first to enable pushing"
+                      : "Connect a remote first to enable pushing"
+                    : !staged.length
+                      ? "Stage changes to commit"
+                      : !message.trim()
+                        ? "Write a commit message first"
+                        : `Commit locally, then push to ${git.upstream}`}
+                </small>
               </span>
             </button>
+            {git.upstream && git.ahead > 0 ? (
+              <button type="button" role="menuitem" onClick={() => void runPush()}>
+                <SquareArrowOutUpRight />
+                <span>
+                  <strong>Push {git.ahead}</strong>
+                  <small>
+                    {git.ahead} local commit{git.ahead === 1 ? "" : "s"}
+                  </small>
+                </span>
+              </button>
+            ) : null}
+            {git.remotes.length || git.upstream ? (
+              <span className="compact-action-menu-separator" role="separator" />
+            ) : null}
+            {git.remotes.length ? (
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setCommitMenuOpen(false);
+                  void runRemoteAction(() => onFetch?.() ?? Promise.resolve());
+                }}
+              >
+                <Download />
+                <span>
+                  <strong>Fetch</strong>
+                  <small>Update remote branches</small>
+                </span>
+              </button>
+            ) : null}
+            {git.upstream ? (
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setCommitMenuOpen(false);
+                  void runRemoteAction(() => onPull?.("fastForwardOnly") ?? Promise.resolve());
+                }}
+              >
+                <ArrowDown />
+                <span>
+                  <strong>Pull</strong>
+                  <small>Fast-forward only</small>
+                </span>
+              </button>
+            ) : null}
+            {!git.upstream && git.remotes.length ? (
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setCommitMenuOpen(false);
+                  setRemoteDialog("branch");
+                }}
+              >
+                <CloudUpload />
+                <span>
+                  <strong>Publish branch</strong>
+                  <small>Set an upstream remote</small>
+                </span>
+              </button>
+            ) : null}
+            <span className="compact-action-menu-separator" role="separator" />
             <button
               type="button"
               role="menuitem"
-              onClick={() => void runPush()}
-              disabled={git.ahead === 0}
+              onClick={() => {
+                setCommitMenuOpen(false);
+                setRemoteDialog("manage");
+              }}
             >
-              <SquareArrowOutUpRight />
+              <Link />
               <span>
-                <strong>Push{git.ahead ? ` ${git.ahead}` : ""}</strong>
-                <small>
-                  {git.ahead
-                    ? `${git.ahead} local commit${git.ahead === 1 ? "" : "s"}`
-                    : "Nothing to push"}
-                </small>
+                <strong>Manage remotes</strong>
+                <small>Add, edit, remove, or fetch</small>
               </span>
             </button>
           </div>
@@ -911,7 +1089,22 @@ function GitPanel({
           {actionError}
         </p>
       ) : null}
-
+      {remoteDialog ? (
+        <Suspense fallback={null}>
+          <GitRemoteDialog
+            mode={remoteDialog}
+            git={git}
+            onClose={() => setRemoteDialog(null)}
+            onError={(message) => setActionError(message || null)}
+            onAdd={onAddRemote}
+            onUpdate={onUpdateRemote}
+            onRemove={onRemoveRemote}
+            onFetch={onFetch}
+            onPublishBranch={onPublishBranch}
+            onPublishGithub={onPublishGithub}
+          />
+        </Suspense>
+      ) : null}
       <div
         className="git-workspace"
         ref={workspaceRef}
@@ -1037,11 +1230,13 @@ function GitPanel({
                         <strong>{commit.subject}</strong>
                         {commit.refs?.length ? (
                           <span className="commit-refs">
-                            {collapseCommitRefs(commit.refs, git.upstream, git.branch).map((chip) => (
-                              <em key={chip.label} data-kind={chip.kind} title={chip.title}>
-                                {chip.label}
-                              </em>
-                            ))}
+                            {collapseCommitRefs(commit.refs, git.upstream, git.branch).map(
+                              (chip) => (
+                                <em key={chip.label} data-kind={chip.kind} title={chip.title}>
+                                  {chip.label}
+                                </em>
+                              ),
+                            )}
                           </span>
                         ) : null}
                       </span>
@@ -2634,6 +2829,13 @@ function UsagePanel({ usage }: { usage: UsageSnapshot }) {
 export function RightRail(props: RightRailProps) {
   const [tab, setTab] = useState<RailTab>("git");
   const { onRequestProjectFiles } = props;
+  // Browser snapshots and test fixtures from before the Git state migration
+  // may not yet carry the discriminator or remote list.
+  const normalizedGit: GitSnapshot = {
+    ...props.git,
+    kind: props.git.kind ?? (props.git.worktree ? "repository" : "notRepository"),
+    remotes: props.git.remotes ?? [],
+  };
   const handledTabRequestRef = useRef<number | null>(null);
   useEffect(() => {
     const request = props.openProjectFileRequest;
@@ -2655,7 +2857,12 @@ export function RightRail(props: RightRailProps) {
     icon: typeof GitBranch;
     count?: number;
   }> = [
-    { id: "git", label: "Git", icon: GitBranch, count: props.git.files.length },
+    {
+      id: "git",
+      label: "Git",
+      icon: GitBranch,
+      count: normalizedGit.kind === "repository" ? normalizedGit.files.length : undefined,
+    },
     {
       id: "agents",
       label: "Agents",
@@ -2718,7 +2925,7 @@ export function RightRail(props: RightRailProps) {
         ))}
       </div>
       <div id={`task-tools-panel-${tab}`} role="tabpanel" aria-labelledby={`task-tools-tab-${tab}`}>
-        {tab === "git" ? <GitPanel {...props} /> : null}
+        {tab === "git" ? <GitPanel {...props} git={normalizedGit} /> : null}
         {tab === "agents" ? (
           <AgentPanel
             agents={props.children}

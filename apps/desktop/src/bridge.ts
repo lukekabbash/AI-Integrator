@@ -73,6 +73,8 @@ export interface ProjectSummary {
   id: string;
   name: string;
   path: string;
+  /** Canonical Git root when this folder is backed by a repository. */
+  gitRepositoryRoot?: string;
   branch: string;
   dirtyFiles: number;
   expanded: boolean;
@@ -424,15 +426,52 @@ export interface GitCommit {
 }
 
 export interface GitSnapshot {
+  kind: "repository" | "notRepository";
   branch: string;
   upstream: string;
   ahead: number;
   behind: number;
   worktree: string;
+  remotes: GitRemote[];
   files: DiffFile[];
   commits: GitCommit[];
   /** True when older commits exist beyond the loaded graph window. */
   historyHasMore?: boolean;
+}
+
+export interface GitRemote {
+  name: string;
+  fetchUrl: string;
+  pushUrl: string;
+}
+
+export interface GithubRepository {
+  name: string;
+  nameWithOwner: string;
+  owner: string;
+  description?: string | null;
+  private: boolean;
+  archived: boolean;
+  pushedAt?: string | null;
+  url: string;
+  sshUrl: string;
+  defaultBranch?: string | null;
+}
+
+export interface GithubRepositoryCatalog {
+  installed: boolean;
+  authenticated: boolean;
+  account?: string | null;
+  hostname?: string | null;
+  repositories: GithubRepository[];
+  detail?: string | null;
+}
+
+export interface CloneProjectInput {
+  remote: string;
+  parent: string;
+  folderName: string;
+  githubRepository?: string;
 }
 
 export interface PushPreview {
@@ -731,6 +770,10 @@ export interface AppBridge {
   openProject(): Promise<ProjectSummary | null>;
   /** Create `Documents/AI Integrator/Projects/<name>` (deduped), git-init it, and register it. */
   createProject(name: string): Promise<ProjectSummary>;
+  getDefaultProjectParent(): Promise<string>;
+  pickProjectParent(): Promise<string | null>;
+  listGithubRepositories(): Promise<GithubRepositoryCatalog>;
+  cloneProject(input: CloneProjectInput): Promise<ProjectSummary>;
   registerProject(path: string): Promise<ProjectSummary>;
   listProjects(): Promise<ProjectSummary[]>;
   probeRuntimes(): Promise<RuntimeConnection[]>;
@@ -741,6 +784,22 @@ export interface AppBridge {
   /** Runs one isolated, provider-backed naming attempt for a newly created chat. */
   generateTaskTitle(input: GenerateTaskTitleInput): Promise<TaskNavigationMetadata | null>;
   loadTaskGit(taskId: string): Promise<GitSnapshot>;
+  loadProjectGit(projectId: string): Promise<GitSnapshot>;
+  initializeGit(projectId: string): Promise<ProjectSummary>;
+  addGitRemote(projectId: string, name: string, url: string): Promise<GitSnapshot>;
+  updateGitRemote(projectId: string, name: string, url: string): Promise<GitSnapshot>;
+  removeGitRemote(projectId: string, name: string): Promise<GitSnapshot>;
+  fetchGit(projectId: string, remote?: string): Promise<GitSnapshot>;
+  pullGit(projectId: string, mode: "fastForwardOnly" | "rebase"): Promise<GitSnapshot>;
+  publishGitBranch(projectId: string, remote: string): Promise<PushResult>;
+  publishGithubRepository(
+    projectId: string,
+    input: {
+      nameWithOwner: string;
+      visibility: "private" | "public" | "internal";
+      remote: string;
+    },
+  ): Promise<GitSnapshot>;
   /** One older page of commit history for the Git rail's "Show more". */
   loadTaskGitHistory(
     taskId: string,
@@ -916,7 +975,8 @@ interface TrustedProject {
   id: string;
   displayName: string;
   repositoryRoot: string;
-  gitCommonDirectory: string;
+  gitRepositoryRoot?: string;
+  gitCommonDirectory?: string;
   createdAt: string;
   lastOpenedAt: string;
 }
@@ -953,6 +1013,7 @@ interface NativeGitOverview {
   identity: NativeRepository;
   files: NativeFileStatus[];
   history: NativeGitCommit[];
+  remotes: GitRemote[];
   pushPreview?: PushPreview;
 }
 
@@ -1608,6 +1669,7 @@ function mapProject(project: TrustedProject): ProjectSummary {
     id: project.id,
     name: project.displayName,
     path: project.repositoryRoot,
+    gitRepositoryRoot: project.gitRepositoryRoot,
     branch: "",
     dirtyFiles: 0,
     expanded: true,
@@ -2276,23 +2338,102 @@ function summarizeNativeGitFile(status: NativeFileStatus): DiffFile {
 
 const GIT_HISTORY_PAGE = 32;
 
+function notRepositorySnapshot(worktree: string): GitSnapshot {
+  return {
+    kind: "notRepository",
+    branch: "",
+    upstream: "",
+    ahead: 0,
+    behind: 0,
+    worktree,
+    remotes: [],
+    files: [],
+    commits: [],
+  };
+}
+
+// Folders confirmed by the backend this session to hold no Git repository.
+// Bounds the re-detection below to one probe per folder.
+const verifiedNonRepositoryPaths = new Set<string>();
+
+function rememberProjectGitRoot(path: string, gitRepositoryRoot: string | undefined) {
+  if (!cachedWorkspace) return;
+  cachedWorkspace = {
+    ...cachedWorkspace,
+    projects: cachedWorkspace.projects.map((candidate) =>
+      candidate.path === path ? { ...candidate, gitRepositoryRoot } : candidate,
+    ),
+  };
+}
+
+/**
+ * The cached workspace can lag behind the folder on disk: Git may have been
+ * initialized in a previous session, outside the app, or under a project row
+ * written before repository detection. Before treating a project as "not a
+ * repository" (which surfaces the Set up Git state), re-register the trusted
+ * folder once so the backend re-detects its repository and heals the record.
+ */
+async function resolveProjectGitRoot(project: ProjectSummary): Promise<string | undefined> {
+  if (project.gitRepositoryRoot) return project.gitRepositoryRoot;
+  if (verifiedNonRepositoryPaths.has(project.path)) return undefined;
+  try {
+    const refreshed = mapProject(
+      await nativeInvoke<TrustedProject>("project_register", { path: project.path }),
+    );
+    rememberProjectGitRoot(project.path, refreshed.gitRepositoryRoot);
+    if (refreshed.gitRepositoryRoot) return refreshed.gitRepositoryRoot;
+  } catch {
+    // Detection failures fall through to the explicit setup state; the next
+    // refresh may retry via the button rather than looping here.
+  }
+  verifiedNonRepositoryPaths.add(project.path);
+  return undefined;
+}
+
 async function refreshNativeGit(taskId: string): Promise<GitSnapshot> {
   const repository = repositoryForTask(taskId);
+  const workspace = cachedWorkspace ?? readDemoSnapshot();
+  const task = workspace.tasks.find((candidate) => candidate.id === taskId);
+  const project = workspace.projects.find((candidate) => candidate.id === task?.projectId);
+  if (project && !(await resolveProjectGitRoot(project))) {
+    const snapshot = notRepositorySnapshot(project.path);
+    nativeGitByTask.set(taskId, snapshot);
+    return snapshot;
+  }
   const overview = await nativeInvoke<NativeGitOverview>("git_overview", { repository });
+  const snapshot = mapNativeGitOverview(overview);
+  nativeGitByTask.set(taskId, snapshot);
+  return snapshot;
+}
+
+async function loadNativeProjectGit(projectId: string): Promise<GitSnapshot> {
+  const workspace = cachedWorkspace ?? readDemoSnapshot();
+  const project = workspace.projects.find((candidate) => candidate.id === projectId);
+  if (!project) throw new Error(`Unknown project: ${projectId}`);
+  if (!(await resolveProjectGitRoot(project))) {
+    return notRepositorySnapshot(project.path);
+  }
+  const overview = await nativeInvoke<NativeGitOverview>("git_overview", {
+    repository: project.path,
+  });
+  return mapNativeGitOverview(overview);
+}
+
+function mapNativeGitOverview(overview: NativeGitOverview): GitSnapshot {
   const { identity, history: commits, pushPreview: preview } = overview;
   const files = overview.files.map(summarizeNativeGitFile);
-  const snapshot = {
+  return {
+    kind: "repository" as const,
     branch: identity.branch ?? preview?.branch ?? "detached",
-    upstream: preview?.upstream ?? "Not published",
+    upstream: preview?.upstream ?? "",
     ahead: preview?.ahead ?? 0,
     behind: preview?.behind ?? 0,
     worktree: identity.root,
+    remotes: overview.remotes,
     files,
     commits,
     historyHasMore: commits.length >= GIT_HISTORY_PAGE,
   };
-  nativeGitByTask.set(taskId, snapshot);
-  return snapshot;
 }
 
 async function loadNativeGitFile(taskId: string, file: DiffFile): Promise<DiffFile> {
@@ -2548,7 +2689,7 @@ export const bridge: AppBridge = {
       const selected = await open({
         directory: true,
         multiple: false,
-        title: "Open a Git project",
+        title: "Open a project folder",
       });
       if (typeof selected !== "string") return null;
       return bridge.registerProject(selected);
@@ -2565,6 +2706,57 @@ export const bridge: AppBridge = {
     return bridge.registerProject(`C:\\Users\\demo\\Documents\\AI Integrator\\Projects\\${name}`);
   },
 
+  getDefaultProjectParent: async () => {
+    if (isTauri()) return nativeInvoke<string>("project_default_parent");
+    return "C:\\Users\\demo\\Documents\\AI Integrator\\Projects";
+  },
+
+  pickProjectParent: async () => {
+    if (isTauri()) {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "Choose where to clone the project",
+      });
+      return typeof selected === "string" ? selected : null;
+    }
+    return "C:\\Users\\demo\\Documents\\AI Integrator\\Projects";
+  },
+
+  listGithubRepositories: async () => {
+    if (isTauri()) {
+      return nativeInvoke<GithubRepositoryCatalog>("github_repository_list");
+    }
+    return {
+      installed: true,
+      authenticated: true,
+      account: "demo",
+      hostname: "github.com",
+      repositories: [
+        {
+          name: "ai-integrator",
+          nameWithOwner: "demo/ai-integrator",
+          owner: "demo",
+          description: "A local-first AI development workspace",
+          private: true,
+          archived: false,
+          url: "https://github.com/demo/ai-integrator",
+          sshUrl: "git@github.com:demo/ai-integrator.git",
+          defaultBranch: "main",
+        },
+      ],
+    };
+  },
+
+  cloneProject: async (input) => {
+    if (isTauri()) {
+      const project = await nativeInvoke<TrustedProject>("project_clone", { input });
+      return mapProject(project);
+    }
+    return bridge.registerProject(`${input.parent}\\${input.folderName}`);
+  },
+
   registerProject: async (path) => {
     if (isTauri()) {
       const project = await nativeInvoke<TrustedProject>("project_register", { path });
@@ -2577,6 +2769,7 @@ export const bridge: AppBridge = {
       id: `project-${Date.now()}`,
       name: path.split(/[\\/]/).filter(Boolean).at(-1) ?? "Demo project",
       path,
+      gitRepositoryRoot: path,
       branch: "main",
       dirtyFiles: 0,
       expanded: true,
@@ -2831,6 +3024,115 @@ export const bridge: AppBridge = {
     if (isTauri()) return refreshNativeGit(taskId);
     const snapshot = readDemoSnapshot();
     return snapshot.taskContexts[taskId]?.git ?? createEmptySnapshot().git;
+  },
+
+  loadProjectGit: async (projectId) => {
+    if (isTauri()) return loadNativeProjectGit(projectId);
+    const snapshot = readDemoSnapshot();
+    return snapshot.projects.some((project) => project.id === projectId)
+      ? snapshot.git
+      : createEmptySnapshot().git;
+  },
+
+  initializeGit: async (projectId) => {
+    const path = repositoryForProject(projectId);
+    if (!isTauri()) {
+      const snapshot = readDemoSnapshot();
+      const project = snapshot.projects.find((candidate) => candidate.id === projectId);
+      if (!project) throw new Error(`Unknown project: ${projectId}`);
+      return { ...project, gitRepositoryRoot: project.path, branch: "main" };
+    }
+    const project = mapProject(await nativeInvoke<TrustedProject>("project_git_init", { path }));
+    verifiedNonRepositoryPaths.delete(project.path);
+    // The workspace may know this folder under a different project id (for
+    // example a placeholder derived from a task path), so reconcile by path
+    // as well — matching only by id would leave the stale record in place.
+    if (cachedWorkspace) {
+      const known = cachedWorkspace.projects.some(
+        (candidate) => candidate.id === project.id || candidate.path === project.path,
+      );
+      cachedWorkspace = {
+        ...cachedWorkspace,
+        projects: known
+          ? cachedWorkspace.projects.map((candidate) =>
+              candidate.id === project.id || candidate.path === project.path
+                ? { ...candidate, gitRepositoryRoot: project.gitRepositoryRoot }
+                : candidate,
+            )
+          : [...cachedWorkspace.projects, project],
+      };
+    }
+    return project;
+  },
+
+  addGitRemote: async (projectId, name, url) => {
+    if (!isTauri()) return bridge.loadProjectGit(projectId);
+    await nativeInvoke("git_remote_add", {
+      repository: repositoryForProject(projectId),
+      name,
+      url,
+    });
+    return loadNativeProjectGit(projectId);
+  },
+
+  updateGitRemote: async (projectId, name, url) => {
+    if (!isTauri()) return bridge.loadProjectGit(projectId);
+    await nativeInvoke("git_remote_update", {
+      repository: repositoryForProject(projectId),
+      name,
+      url,
+    });
+    return loadNativeProjectGit(projectId);
+  },
+
+  removeGitRemote: async (projectId, name) => {
+    if (!isTauri()) return bridge.loadProjectGit(projectId);
+    await nativeInvoke("git_remote_remove", { repository: repositoryForProject(projectId), name });
+    return loadNativeProjectGit(projectId);
+  },
+
+  fetchGit: async (projectId, remote) => {
+    if (!isTauri()) return bridge.loadProjectGit(projectId);
+    const overview = await nativeInvoke<NativeGitOverview>("git_fetch", {
+      repository: repositoryForProject(projectId),
+      remote,
+    });
+    return mapNativeGitOverview(overview);
+  },
+
+  pullGit: async (projectId, mode) => {
+    if (!isTauri()) return bridge.loadProjectGit(projectId);
+    const overview = await nativeInvoke<NativeGitOverview>("git_pull", {
+      repository: repositoryForProject(projectId),
+      mode,
+    });
+    return mapNativeGitOverview(overview);
+  },
+
+  publishGitBranch: async (projectId, remote) => {
+    if (!isTauri()) {
+      return {
+        outcome: "pushed",
+        head: "demo",
+        branch: "main",
+        remote,
+        refspec: "refs/heads/main:refs/heads/main",
+        summary: "Published demo branch",
+      };
+    }
+    return nativeInvoke<PushResult>("git_publish_branch", {
+      repository: repositoryForProject(projectId),
+      remote,
+    });
+  },
+
+  publishGithubRepository: async (projectId, input) => {
+    if (!isTauri()) return bridge.loadProjectGit(projectId);
+    const overview = await nativeInvoke<NativeGitOverview>("git_publish_github", {
+      repository: repositoryForProject(projectId),
+      ...input,
+    });
+    return mapNativeGitOverview(overview);
   },
 
   loadTaskGitHistory: async (taskId, skip) => {

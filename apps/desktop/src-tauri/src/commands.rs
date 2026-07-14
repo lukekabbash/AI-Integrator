@@ -22,13 +22,14 @@ use integrator_core::{
     TaskSnapshot, TaskState, TransportRequestId, TrustedProject, TurnStatus, Versioned,
 };
 use integrator_runtime::{
-    CommitResult, CreateWorktree, DiffResult, DiffScope, FileStatus, GitOverview, GitService,
-    HistoryCommit, ProjectionMutation, ProviderEventInput, PushConfirmation, PushPreview,
-    PushResult, ReducedProviderEvent, RepositoryIdentity, StructuredCliEventKind,
-    StructuredCliLaunchOptions, StructuredCliProvider, StructuredPermissionMode, StructuredUsage,
-    WorktreeInfo, acp_mode_event, acp_turn_projection, discover_providers, parse_acp_mode_state,
-    provider_executable, reduce_acp_permission_request, reduce_acp_plan_review_request,
-    reduce_acp_update, reduce_connection_event, reduce_provider_event,
+    CommitResult, CreateWorktree, DiffResult, DiffScope, FileStatus, GitOverview, GitRemote,
+    GitService, GithubCliService, GithubRepositoryCatalog, GithubVisibility, HistoryCommit,
+    ProjectionMutation, ProviderEventInput, PullMode, PushConfirmation, PushPreview, PushResult,
+    ReducedProviderEvent, RepositoryIdentity, StructuredCliEventKind, StructuredCliLaunchOptions,
+    StructuredCliProvider, StructuredPermissionMode, StructuredUsage, WorktreeInfo, acp_mode_event,
+    acp_turn_projection, discover_providers, parse_acp_mode_state, provider_executable,
+    reduce_acp_permission_request, reduce_acp_plan_review_request, reduce_acp_update,
+    reduce_connection_event, reduce_provider_event,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -158,8 +159,7 @@ pub async fn provider_action_list(
     provider: ProviderKind,
     repository: PathBuf,
 ) -> CommandResult<Vec<NativeProviderAction>> {
-    let (_, identity) = authorized_git(&state, repository).await?;
-    let repository = identity.root;
+    let repository = authorized_project_directory(&state, repository).await?;
     let resolved = match &provider {
         ProviderKind::Codex => codex_native_actions(&state, &repository).await?,
         ProviderKind::Cursor | ProviderKind::Grok => {
@@ -1271,24 +1271,30 @@ pub async fn project_register(
     state: State<'_, AppState>,
     path: PathBuf,
 ) -> CommandResult<TrustedProject> {
-    let git = state.git.clone().ok_or_else(git_unavailable)?;
+    let git = state.git.clone();
     let store = Arc::clone(&state.store);
     let authorizations = Arc::clone(&state.git_authorizations);
     tauri::async_runtime::spawn_blocking(move || {
         let mut authorizations = authorizations.lock().expect("git authorization cache lock");
-        let identity = git.repository(&path)?;
-        let display_name = identity
-            .root
+        let project_root = canonical_project_directory(&path)?;
+        let identity = git
+            .as_ref()
+            .map(|git| git.repository_if_present(&project_root))
+            .transpose()?
+            .flatten();
+        let display_name = project_root
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("Repository")
+            .unwrap_or("Project")
             .chars()
             .take(120)
             .collect::<String>();
         let project = store.upsert_trusted_project(
             &display_name,
-            &identity.root,
-            &identity.common_directory,
+            &project_root,
+            identity
+                .as_ref()
+                .map(|identity| (identity.root.as_path(), identity.common_directory.as_path())),
         )?;
         authorizations.clear();
         Ok::<TrustedProject, IntegratorError>(project)
@@ -1365,10 +1371,128 @@ pub async fn project_create(
         let project = store.upsert_trusted_project(
             &display_name,
             &identity.root,
-            &identity.common_directory,
+            Some((&identity.root, &identity.common_directory)),
         )?;
         authorizations.clear();
         Ok(project)
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectCloneInput {
+    remote: String,
+    parent: PathBuf,
+    folder_name: String,
+    github_repository: Option<String>,
+}
+
+#[tauri::command]
+pub fn project_default_parent(app: AppHandle) -> CommandResult<PathBuf> {
+    let documents = app.path().document_dir().map_err(|_| CommandError {
+        code: "unavailable",
+        message: "could not locate the Documents folder".into(),
+    })?;
+    let parent = documents.join("AI Integrator").join("Projects");
+    fs::create_dir_all(&parent).map_err(|error| CommandError::from(IntegratorError::Io(error)))?;
+    canonical_project_directory(&parent).map_err(Into::into)
+}
+
+/// Clones into one explicit destination and registers the resulting folder.
+/// GitHub account discovery remains optional: pasted Git URLs use Git itself,
+/// while a repository chosen from the authenticated GitHub catalog uses `gh`.
+#[tauri::command]
+pub async fn project_clone(
+    state: State<'_, AppState>,
+    input: ProjectCloneInput,
+) -> CommandResult<TrustedProject> {
+    let git = state.git.clone().ok_or_else(git_unavailable)?;
+    let store = Arc::clone(&state.store);
+    let authorizations = Arc::clone(&state.git_authorizations);
+    tauri::async_runtime::spawn_blocking(move || {
+        validate_project_name(&input.folder_name)?;
+        let parent = canonical_project_directory(&input.parent)?;
+        let destination = parent.join(input.folder_name.trim());
+        let identity = if let Some(repository) = input.github_repository.as_deref() {
+            let github = GithubCliService::discover().ok_or_else(|| {
+                IntegratorError::Unavailable("GitHub CLI is not installed".into())
+            })?;
+            github.clone_repository(repository, &destination)?;
+            git.repository(&destination)?
+        } else {
+            git.clone_repository(&input.remote, &destination)?
+        };
+        let project = store.upsert_trusted_project(
+            input.folder_name.trim(),
+            &identity.root,
+            Some((&identity.root, &identity.common_directory)),
+        )?;
+        authorizations
+            .lock()
+            .expect("git authorization cache lock")
+            .clear();
+        Ok::<TrustedProject, IntegratorError>(project)
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn github_repository_list() -> CommandResult<GithubRepositoryCatalog> {
+    tauri::async_runtime::spawn_blocking(|| match GithubCliService::discover() {
+        Some(github) => github.catalog(),
+        None => Ok(GithubRepositoryCatalog {
+            installed: false,
+            authenticated: false,
+            account: None,
+            hostname: None,
+            repositories: Vec::new(),
+            detail: Some("GitHub CLI is not installed.".into()),
+        }),
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
+}
+
+/// Explicitly turns one trusted ordinary folder into a Git repository, or
+/// adopts the repository the folder already belongs to.
+#[tauri::command]
+pub async fn project_git_init(
+    state: State<'_, AppState>,
+    path: PathBuf,
+) -> CommandResult<TrustedProject> {
+    let root = authorized_project_directory(&state, path).await?;
+    let git = state.git.clone().ok_or_else(git_unavailable)?;
+    let store = Arc::clone(&state.store);
+    let authorizations = Arc::clone(&state.git_authorizations);
+    tauri::async_runtime::spawn_blocking(move || {
+        // The UI can hold a stale "not a repository" snapshot (for example a
+        // project row written before Git detection, or Git initialized outside
+        // the app). Adopting the existing repository keeps the action
+        // idempotent instead of failing on a folder that is already set up.
+        let identity = match git.repository_if_present(&root)? {
+            Some(existing) => existing,
+            None => git.init(&root)?,
+        };
+        let display_name = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Project");
+        let project = store.upsert_trusted_project(
+            display_name,
+            &root,
+            Some((&identity.root, &identity.common_directory)),
+        )?;
+        authorizations
+            .lock()
+            .expect("git authorization cache lock")
+            .clear();
+        Ok::<TrustedProject, IntegratorError>(project)
     })
     .await
     .map_err(|_| worker_error())?
@@ -1485,6 +1609,107 @@ pub async fn git_history(
     .map_err(Into::into)
 }
 
+#[tauri::command]
+pub async fn git_remote_add(
+    state: State<'_, AppState>,
+    repository: PathBuf,
+    name: String,
+    url: String,
+) -> CommandResult<Vec<GitRemote>> {
+    let (git, identity) = authorized_git(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(move || git.add_remote(&identity.root, &name, &url))
+        .await
+        .map_err(|_| worker_error())?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn git_remote_update(
+    state: State<'_, AppState>,
+    repository: PathBuf,
+    name: String,
+    url: String,
+) -> CommandResult<Vec<GitRemote>> {
+    let (git, identity) = authorized_git(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(move || git.update_remote(&identity.root, &name, &url))
+        .await
+        .map_err(|_| worker_error())?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn git_remote_remove(
+    state: State<'_, AppState>,
+    repository: PathBuf,
+    name: String,
+) -> CommandResult<Vec<GitRemote>> {
+    let (git, identity) = authorized_git(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(move || git.remove_remote(&identity.root, &name))
+        .await
+        .map_err(|_| worker_error())?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn git_fetch(
+    state: State<'_, AppState>,
+    repository: PathBuf,
+    remote: Option<String>,
+) -> CommandResult<GitOverview> {
+    let (git, identity) = authorized_git(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(move || git.fetch(&identity.root, remote.as_deref()))
+        .await
+        .map_err(|_| worker_error())?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn git_pull(
+    state: State<'_, AppState>,
+    repository: PathBuf,
+    mode: PullMode,
+) -> CommandResult<GitOverview> {
+    let (git, identity) = authorized_git(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(move || git.pull(&identity.root, mode))
+        .await
+        .map_err(|_| worker_error())?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn git_publish_branch(
+    state: State<'_, AppState>,
+    repository: PathBuf,
+    remote: String,
+) -> CommandResult<PushResult> {
+    let (git, identity) = authorized_git(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(move || git.publish_branch(&identity.root, &remote))
+        .await
+        .map_err(|_| worker_error())?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn git_publish_github(
+    state: State<'_, AppState>,
+    repository: PathBuf,
+    name_with_owner: String,
+    visibility: GithubVisibility,
+    remote: String,
+) -> CommandResult<GitOverview> {
+    let (git, identity) = authorized_git(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let github = GithubCliService::discover()
+            .ok_or_else(|| IntegratorError::Unavailable("GitHub CLI is not installed".into()))?;
+        github.publish_repository(&identity.root, &name_with_owner, visibility, &remote)?;
+        let refreshed = git.repository(&identity.root)?;
+        git.overview(&refreshed)
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
+}
+
 const MAX_PROJECT_FILE_ENTRIES: usize = 5_000;
 const MAX_PROJECT_FILE_BYTES: u64 = 1_000_000;
 
@@ -1551,8 +1776,8 @@ pub async fn project_file_list(
     state: State<'_, AppState>,
     repository: PathBuf,
 ) -> CommandResult<Vec<ProjectFileEntry>> {
-    let (_, identity) = authorized_git(&state, repository).await?;
-    tauri::async_runtime::spawn_blocking(move || list_project_files(&identity.root))
+    let root = authorized_project_directory(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(move || list_project_files(&root))
         .await
         .map_err(|_| worker_error())?
         .map_err(Into::into)
@@ -1564,8 +1789,8 @@ pub async fn project_file_read(
     repository: PathBuf,
     input: ProjectFileReadInput,
 ) -> CommandResult<ProjectFileContent> {
-    let (_, identity) = authorized_git(&state, repository).await?;
-    tauri::async_runtime::spawn_blocking(move || read_project_file(&identity.root, &input.path))
+    let root = authorized_project_directory(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(move || read_project_file(&root, &input.path))
         .await
         .map_err(|_| worker_error())?
         .map_err(Into::into)
@@ -1577,9 +1802,9 @@ pub async fn project_file_rename(
     repository: PathBuf,
     input: ProjectFileRenameInput,
 ) -> CommandResult<ProjectFileEntry> {
-    let (_, identity) = authorized_git(&state, repository).await?;
+    let root = authorized_project_directory(&state, repository).await?;
     tauri::async_runtime::spawn_blocking(move || {
-        rename_project_file(&identity.root, &input.path, &input.new_name)
+        rename_project_file(&root, &input.path, &input.new_name)
     })
     .await
     .map_err(|_| worker_error())?
@@ -1593,7 +1818,7 @@ pub async fn project_file_opener_list(
     state: State<'_, AppState>,
     repository: PathBuf,
 ) -> CommandResult<Vec<ProjectFileOpener>> {
-    let _ = authorized_git(&state, repository).await?;
+    let _ = authorized_project_directory(&state, repository).await?;
     tauri::async_runtime::spawn_blocking(discover_project_file_openers)
         .await
         .map_err(|_| worker_error())
@@ -1608,9 +1833,9 @@ pub async fn project_file_open(
     repository: PathBuf,
     input: ProjectFileOpenInput,
 ) -> CommandResult<()> {
-    let (_, identity) = authorized_git(&state, repository).await?;
+    let root = authorized_project_directory(&state, repository).await?;
     tauri::async_runtime::spawn_blocking(move || {
-        open_project_file_external(&identity.root, &input.path, &input.opener_id)
+        open_project_file_external(&root, &input.path, &input.opener_id)
     })
     .await
     .map_err(|_| worker_error())?
@@ -1624,8 +1849,8 @@ pub async fn project_file_reveal(
     repository: PathBuf,
     input: ProjectFileRevealInput,
 ) -> CommandResult<()> {
-    let (_, identity) = authorized_git(&state, repository).await?;
-    tauri::async_runtime::spawn_blocking(move || reveal_project_file(&identity.root, &input.path))
+    let root = authorized_project_directory(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(move || reveal_project_file(&root, &input.path))
         .await
         .map_err(|_| worker_error())?
 }
@@ -1791,8 +2016,8 @@ pub async fn terminal_open(
     state: State<'_, AppState>,
     repository: PathBuf,
 ) -> CommandResult<TerminalSessionInfo> {
-    let (_, identity) = authorized_git(&state, repository).await?;
-    let root = dunce::canonicalize(&identity.root).map_err(|error| CommandError {
+    let project_root = authorized_project_directory(&state, repository).await?;
+    let root = dunce::canonicalize(&project_root).map_err(|error| CommandError {
         code: "terminal-unavailable",
         message: format!("could not resolve the repository root: {error}"),
     })?;
@@ -2603,12 +2828,12 @@ pub async fn codex_start_turn(
     repository: PathBuf,
     native_action_id: Option<String>,
 ) -> CommandResult<Value> {
-    let (_, identity) = authorized_git(&state, repository).await?;
+    let repository = authorized_task_directory(&state, task_id, repository).await?;
     let runtime = codex_runtime(&state, Some(task_id)).await?;
     let mut goal_objective = None;
     let skill = if let Some(action_id) = native_action_id.as_deref() {
         let handle =
-            resolve_native_action_handle(&state, &ProviderKind::Codex, &identity.root, action_id)?;
+            resolve_native_action_handle(&state, &ProviderKind::Codex, &repository, action_id)?;
         let rest = native_slash_prompt(&prompt, &handle.name)?;
         if handle.kind == NativeActionKind::Command {
             if handle.name != "goal" {
@@ -2638,7 +2863,7 @@ pub async fn codex_start_turn(
             })?;
             let current = runtime
                 .client
-                .list_skills(&identity.root, true)
+                .list_skills(&repository, true)
                 .await
                 .map_err(CommandError::from)?;
             let still_enabled = parse_codex_actions(&current)?.into_iter().any(|candidate| {
@@ -2983,6 +3208,10 @@ pub async fn acp_connect(
     working_directory: Option<PathBuf>,
     task_id: Option<TaskId>,
 ) -> CommandResult<()> {
+    let working_directory = match working_directory {
+        Some(directory) => Some(authorized_project_directory(&state, directory).await?),
+        None => None,
+    };
     let arguments = acp_launch_arguments(&provider)?;
     let statuses = tauri::async_runtime::spawn_blocking(discover_providers)
         .await
@@ -3059,7 +3288,7 @@ pub async fn acp_start_session(
     cwd: PathBuf,
     delegation: Option<String>,
 ) -> CommandResult<Value> {
-    state.store.get_task(task_id).map_err(CommandError::from)?;
+    let cwd = authorized_task_directory(&state, task_id, cwd).await?;
     let runtime = acp_runtime(&state, Some(task_id), None).await?;
     let provider = runtime.provider;
     let provider_name = provider.as_str().to_owned();
@@ -3434,36 +3663,14 @@ pub async fn structured_cli_start_turn(
     delegation: Option<String>,
     native_action_id: Option<String>,
 ) -> CommandResult<Value> {
-    let task = state.store.get_task(task_id).map_err(CommandError::from)?;
-    let (_, repository) = authorized_git(&state, cwd.clone()).await?;
-    let expected = task
-        .worktree_path
-        .as_ref()
-        .or(task.repository_path.as_ref())
-        .ok_or_else(|| CommandError {
-            code: "invalid-input",
-            message: "task has no explicit repository/worktree identity".into(),
-        })?;
-    let expected = dunce::canonicalize(expected).map_err(|_| CommandError {
-        code: "invalid-input",
-        message: "task repository/worktree is unavailable".into(),
-    })?;
-    if repository.root != expected {
-        return Err(CommandError {
-            code: "unauthorized",
-            message: "provider working directory does not match this task's repository/worktree"
-                .into(),
-        });
-    }
+    let repository = authorized_task_directory(&state, task_id, cwd.clone()).await?;
     let native_action = native_action_id
         .as_deref()
-        .map(|action_id| {
-            resolve_native_action_handle(&state, &provider, &repository.root, action_id)
-        })
+        .map(|action_id| resolve_native_action_handle(&state, &provider, &repository, action_id))
         .transpose()?;
     if let Some(action) = native_action.as_ref() {
         native_slash_prompt(&prompt, &action.name)?;
-        let still_present = discover_file_actions(&provider, &repository.root)
+        let still_present = discover_file_actions(&provider, &repository)
             .into_iter()
             .any(|candidate| {
                 candidate.name == action.name
@@ -4729,6 +4936,71 @@ pub(crate) async fn authorized_git(
     .map_err(|_| worker_error())?
     .map_err(CommandError::from)?;
     Ok((git, identity))
+}
+
+/// Authorize the exact folder the user added, whether or not it currently has
+/// Git metadata. Linked worktrees retain the established Git authorization
+/// path so existing task/worktree behavior does not broaden silently.
+pub(crate) async fn authorized_project_directory(
+    state: &State<'_, AppState>,
+    candidate: PathBuf,
+) -> CommandResult<PathBuf> {
+    let selected =
+        tauri::async_runtime::spawn_blocking(move || canonical_project_directory(&candidate))
+            .await
+            .map_err(|_| worker_error())?
+            .map_err(CommandError::from)?;
+    let store = Arc::clone(&state.store);
+    let trusted = selected.clone();
+    let exact = tauri::async_runtime::spawn_blocking(move || {
+        Ok::<bool, IntegratorError>(store.list_trusted_projects()?.into_iter().any(|project| {
+            canonical_project_directory(&project.repository_root).is_ok_and(|root| root == trusted)
+        }))
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(CommandError::from)?;
+    if exact {
+        return Ok(selected);
+    }
+    let (_, identity) = authorized_git(state, selected).await?;
+    Ok(identity.root)
+}
+
+async fn authorized_task_directory(
+    state: &State<'_, AppState>,
+    task_id: TaskId,
+    candidate: PathBuf,
+) -> CommandResult<PathBuf> {
+    let task = state.store.get_task(task_id).map_err(CommandError::from)?;
+    let directory = authorized_project_directory(state, candidate).await?;
+    let expected = task
+        .worktree_path
+        .as_ref()
+        .or(task.repository_path.as_ref())
+        .ok_or_else(|| CommandError {
+            code: "invalid-input",
+            message: "task has no explicit project/worktree identity".into(),
+        })?;
+    let expected = canonical_project_directory(expected).map_err(CommandError::from)?;
+    if directory != expected {
+        return Err(CommandError {
+            code: "unauthorized",
+            message: "provider working directory does not match this task's project/worktree"
+                .into(),
+        });
+    }
+    Ok(directory)
+}
+
+fn canonical_project_directory(path: &Path) -> integrator_core::Result<PathBuf> {
+    let canonical = dunce::canonicalize(path).map_err(IntegratorError::Io)?;
+    if !canonical.is_dir() {
+        return Err(IntegratorError::InvalidInput(
+            "the selected project must be a directory".into(),
+        ));
+    }
+    Ok(canonical)
 }
 
 fn list_project_files(root: &Path) -> integrator_core::Result<Vec<ProjectFileEntry>> {

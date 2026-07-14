@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-github-repository-list"
+description = "Enables the github_repository_list command without any pre-configured scope."
+commands.allow = ["github_repository_list"]
+
+[[permission]]
+identifier = "deny-github-repository-list"
+description = "Denies the github_repository_list command without any pre-configured scope."
+commands.deny = ["github_repository_list"]

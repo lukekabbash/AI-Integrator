@@ -64,11 +64,19 @@ const stoppedDelegation: DelegationView = {
 };
 
 const childGit: GitSnapshot = {
+  kind: "repository",
   branch: "feature/subagent",
   upstream: "origin/feature/subagent",
   ahead: 1,
   behind: 0,
   worktree: "fixture/integrator-3-child",
+  remotes: [
+    {
+      name: "origin",
+      fetchUrl: "https://example.com/repo.git",
+      pushUrl: "https://example.com/repo.git",
+    },
+  ],
   commits: [],
   files: [
     {

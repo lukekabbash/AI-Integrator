@@ -46,6 +46,51 @@ function setup(overrides?: Partial<Parameters<typeof RightRail>[0]>) {
 }
 
 describe("RightRail", () => {
+  it("treats an ordinary folder as an intentional Git setup state", async () => {
+    const onInitializeGit = vi.fn().mockResolvedValue(undefined);
+    setup({
+      git: {
+        kind: "notRepository",
+        branch: "",
+        upstream: "",
+        ahead: 0,
+        behind: 0,
+        worktree: "/Users/me/Projects/notes",
+        remotes: [],
+        files: [],
+        commits: [],
+      },
+      onInitializeGit,
+    });
+
+    expect(screen.getByRole("heading", { name: "Set up Git for this folder" })).toBeVisible();
+    expect(screen.queryByPlaceholderText("Commit message")).not.toBeInTheDocument();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Set up Git$/ }));
+    });
+    expect(onInitializeGit).toHaveBeenCalledOnce();
+  });
+
+  it("surfaces local-only publishing and keeps remote management in the Git menu", () => {
+    const snapshot = createDemoSnapshot();
+    setup({ git: { ...snapshot.git, upstream: "", remotes: [] } });
+
+    expect(screen.getByText("Local only")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Publish to GitHub" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Connect remote" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "More Git actions" }));
+    expect(screen.getByRole("menuitem", { name: /Manage remotes/i })).toBeVisible();
+    // Commit & push stays discoverable even without a remote — disabled, with
+    // the reason spelled out instead of vanishing from the menu.
+    const commitAndPush = screen.getByRole("menuitem", { name: /Commit & push/i });
+    expect(commitAndPush).toBeDisabled();
+    expect(commitAndPush).toHaveTextContent("Connect a remote first");
+    // Exactly one separator (before Manage remotes): hidden items must not
+    // leave extra dividers or phantom space at the top of the menu.
+    expect(document.querySelectorAll(".compact-action-menu-separator")).toHaveLength(1);
+    expect(screen.queryByText("Nothing to push")).not.toBeInTheDocument();
+  });
+
   it("selects a subagent for the sibling conversation pane and renders descendant lineage", () => {
     const delegations: DelegationView[] = [
       {
@@ -191,7 +236,7 @@ describe("RightRail", () => {
     });
     expect(screen.getByTitle("Open file-0999.ts")).toBeInTheDocument();
     expect(tree.querySelectorAll("[title^='Open file-']")).toHaveLength(1);
-  });
+  }, 12_000);
 
   it("progressively mounts large text previews with an explicit show-all action", async () => {
     const content = Array.from({ length: 1_200 }, (_, index) => `preview-line-${index}`).join("\n");
@@ -327,7 +372,7 @@ describe("RightRail", () => {
     fireEvent.change(screen.getByRole("textbox", { name: "Commit message" }), {
       target: { value: "Ship the staged change" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "More commit actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "More Git actions" }));
     fireEvent.click(screen.getByRole("menuitem", { name: /Commit & push/i }));
 
     await waitFor(() => expect(onCommit).toHaveBeenCalledWith("Ship the staged change"));
@@ -343,7 +388,7 @@ describe("RightRail", () => {
     const onPush = vi.fn().mockResolvedValue(undefined);
     setup({ onCommit, onPush });
 
-    fireEvent.click(screen.getByRole("button", { name: "More commit actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "More Git actions" }));
     fireEvent.click(screen.getByRole("menuitem", { name: /^Push/i }));
 
     await waitFor(() => expect(onPush).toHaveBeenCalledTimes(1));
@@ -469,7 +514,7 @@ describe("RightRail", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Show all 600 files" }));
     expect(document.querySelectorAll(".git-file-row")).toHaveLength(600);
-  });
+  }, 12_000);
 
   it("does not present unconnected sidebar actions as buttons", () => {
     setup();

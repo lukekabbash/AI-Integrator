@@ -20,6 +20,7 @@ const MAX_GIT_POINTER_BYTES: u64 = 4 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const GIT_COMMIT_TIMEOUT: Duration = Duration::from_secs(120);
 const GIT_PUSH_TIMEOUT: Duration = Duration::from_secs(120);
+const GIT_NETWORK_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +52,7 @@ struct CachedAuthorizedRepository {
     identity: RepositoryIdentity,
     project_id: ProjectId,
     project_root: PathBuf,
+    project_git_root: PathBuf,
     project_common_directory: PathBuf,
 }
 
@@ -59,6 +61,7 @@ struct AuthorizedRepositoryMatch {
     identity: RepositoryIdentity,
     project_id: ProjectId,
     project_root: PathBuf,
+    project_git_root: PathBuf,
     project_common_directory: PathBuf,
 }
 
@@ -84,7 +87,9 @@ impl AuthorizedRepositoryCache {
             let trust_is_current = projects.iter().any(|project| {
                 project.id == entry.project_id
                     && project.repository_root == entry.project_root
-                    && project.git_common_directory == entry.project_common_directory
+                    && project.git_repository_root.as_ref() == Some(&entry.project_git_root)
+                    && project.git_common_directory.as_ref()
+                        == Some(&entry.project_common_directory)
             });
             if trust_is_current && cached_repository_layout_matches(&entry.identity) {
                 self.touch(&selected);
@@ -98,6 +103,7 @@ impl AuthorizedRepositoryCache {
             identity: structural_identity(&authorized.identity),
             project_id: authorized.project_id,
             project_root: authorized.project_root,
+            project_git_root: authorized.project_git_root,
             project_common_directory: authorized.project_common_directory,
         };
         self.insert(selected.clone(), cached.clone());
@@ -216,7 +222,23 @@ pub struct GitOverview {
     pub identity: RepositoryIdentity,
     pub files: Vec<FileStatus>,
     pub history: Vec<HistoryCommit>,
+    pub remotes: Vec<GitRemote>,
     pub push_preview: Option<PushPreview>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitRemote {
+    pub name: String,
+    pub fetch_url: String,
+    pub push_url: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PullMode {
+    FastForwardOnly,
+    Rebase,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -304,6 +326,27 @@ impl GitService {
         })
     }
 
+    /// Detect Git without treating an ordinary folder as an exceptional
+    /// operation. A visible `.git` marker that Git cannot read remains an
+    /// error so corruption or trust failures are never mistaken for a folder
+    /// that is safe to initialize.
+    pub fn repository_if_present(&self, path: &Path) -> Result<Option<RepositoryIdentity>> {
+        let selected = canonical_directory(path)?;
+        if self
+            .optional(&selected, &["rev-parse", "--is-inside-work-tree"])?
+            .is_some()
+        {
+            return self.repository(&selected).map(Some);
+        }
+        if selected
+            .ancestors()
+            .any(|ancestor| ancestor.join(".git").exists())
+        {
+            return self.repository(&selected).map(Some);
+        }
+        Ok(None)
+    }
+
     /// Refresh only volatile repository identity fields after structural
     /// authorization. Porcelain v2 supplies branch and HEAD together in one
     /// read-only Git invocation, including unborn and detached states.
@@ -348,6 +391,7 @@ impl GitService {
             identity,
             files,
             history,
+            remotes: self.remotes(root)?,
             push_preview,
         })
     }
@@ -385,15 +429,202 @@ impl GitService {
         }
     }
 
-    /// Initialize a fresh repository in an existing empty directory and
-    /// return its identity so it can be registered like any opened project.
+    /// Initialize Git in an existing directory without touching its files.
     pub fn init(&self, directory: &Path) -> Result<RepositoryIdentity> {
         let directory = canonical_directory(directory)?;
-        self.required(&directory, &["init"])?;
-        // Normalize the unborn default branch to `main` regardless of the
-        // user's init.defaultBranch; best-effort on older git versions.
-        let _ = self.optional(&directory, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        if self.repository_if_present(&directory)?.is_some() {
+            return Err(IntegratorError::InvalidInput(
+                "the selected folder is already inside a Git repository".into(),
+            ));
+        }
+        let configured_branch = self
+            .optional(&directory, &["config", "--get", "init.defaultBranch"])?
+            .and_then(|value| clean_optional(Some(value)));
+        if configured_branch.is_some() {
+            self.required(&directory, &["init"])?;
+        } else {
+            self.required(&directory, &["init", "-b", "main"])?;
+        }
         self.repository(&directory)
+    }
+
+    pub fn clone_repository(&self, remote: &str, destination: &Path) -> Result<RepositoryIdentity> {
+        validate_remote_url(remote)?;
+        validate_new_destination(destination)?;
+        let parent = destination.parent().ok_or_else(|| {
+            IntegratorError::InvalidInput("clone destination must have a parent folder".into())
+        })?;
+        let parent = canonical_directory(parent)?;
+        let destination_name = destination
+            .file_name()
+            .ok_or_else(|| IntegratorError::InvalidInput("clone folder name is missing".into()))?
+            .to_string_lossy()
+            .into_owned();
+        let output = self.output(
+            &parent,
+            &["clone", "--", remote.trim(), &destination_name],
+            GIT_NETWORK_TIMEOUT,
+        )?;
+        if !output.success {
+            return Err(git_failure(output));
+        }
+        if output.stdout_truncated || output.stderr_truncated {
+            return Err(IntegratorError::Git(
+                "clone completed with unexpectedly large output; inspect the destination".into(),
+            ));
+        }
+        self.repository(destination)
+    }
+
+    pub fn remotes(&self, repository: &Path) -> Result<Vec<GitRemote>> {
+        let names = self.optional(repository, &["remote"])?.unwrap_or_default();
+        names
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(|name| {
+                validate_remote_name(name)?;
+                let fetch = self.required(repository, &["remote", "get-url", name])?;
+                let push = self
+                    .optional(repository, &["remote", "get-url", "--push", name])?
+                    .unwrap_or_else(|| fetch.clone());
+                Ok(GitRemote {
+                    name: name.to_owned(),
+                    fetch_url: sanitize_remote_url(fetch.trim()),
+                    push_url: sanitize_remote_url(push.trim()),
+                })
+            })
+            .collect()
+    }
+
+    pub fn add_remote(&self, repository: &Path, name: &str, url: &str) -> Result<Vec<GitRemote>> {
+        validate_remote_name(name)?;
+        validate_remote_url(url)?;
+        self.required(
+            repository,
+            &["remote", "add", "--", name.trim(), url.trim()],
+        )?;
+        self.remotes(repository)
+    }
+
+    pub fn update_remote(
+        &self,
+        repository: &Path,
+        name: &str,
+        url: &str,
+    ) -> Result<Vec<GitRemote>> {
+        validate_remote_name(name)?;
+        validate_remote_url(url)?;
+        self.required(
+            repository,
+            &["remote", "set-url", "--", name.trim(), url.trim()],
+        )?;
+        self.remotes(repository)
+    }
+
+    pub fn remove_remote(&self, repository: &Path, name: &str) -> Result<Vec<GitRemote>> {
+        validate_remote_name(name)?;
+        self.required(repository, &["remote", "remove", "--", name.trim()])?;
+        self.remotes(repository)
+    }
+
+    pub fn fetch(&self, repository: &Path, remote: Option<&str>) -> Result<GitOverview> {
+        if let Some(remote) = remote {
+            validate_remote_name(remote)?;
+            self.required_with_timeout(
+                repository,
+                &["fetch", "--prune", "--", remote.trim()],
+                GIT_NETWORK_TIMEOUT,
+            )?;
+        } else {
+            self.required_with_timeout(
+                repository,
+                &["fetch", "--all", "--prune"],
+                GIT_NETWORK_TIMEOUT,
+            )?;
+        }
+        let identity = self.repository(repository)?;
+        self.overview(&identity)
+    }
+
+    pub fn pull(&self, repository: &Path, mode: PullMode) -> Result<GitOverview> {
+        if !self.status(repository)?.is_empty() {
+            return Err(IntegratorError::Git(
+                "commit or stash local changes before pulling".into(),
+            ));
+        }
+        if self.push_preview(repository)?.upstream.is_none() {
+            return Err(IntegratorError::Git(
+                "this branch has no upstream to pull from".into(),
+            ));
+        }
+        let args = match mode {
+            PullMode::FastForwardOnly => ["pull", "--ff-only"],
+            PullMode::Rebase => ["pull", "--rebase"],
+        };
+        self.required_with_timeout(repository, &args, GIT_NETWORK_TIMEOUT)?;
+        let identity = self.repository(repository)?;
+        self.overview(&identity)
+    }
+
+    pub fn publish_branch(&self, repository: &Path, remote: &str) -> Result<PushResult> {
+        validate_remote_name(remote)?;
+        let remote_url = self.required(repository, &["remote", "get-url", remote])?;
+        let remote_url = sanitize_remote_url(remote_url.trim());
+        let head = self.required(repository, &["rev-parse", "--verify", "HEAD"])?;
+        let head = head.trim().to_owned();
+        let branch = self.required(repository, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+        let branch = branch.trim().to_owned();
+        validate_revision(&branch)?;
+        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+        let outcome = run_bounded_with_outcome(
+            &self.executable,
+            &[
+                "push",
+                "--porcelain",
+                "--set-upstream",
+                "--",
+                remote,
+                &refspec,
+            ],
+            Some(repository),
+            MAX_GIT_OUTPUT_BYTES,
+            GIT_PUSH_TIMEOUT,
+        )?;
+        match outcome {
+            ProcessRunOutcome::TimedOut => Ok(PushResult {
+                outcome: PushOutcome::OutcomeUncertain,
+                head,
+                branch,
+                remote: remote.to_owned(),
+                refspec,
+                summary: format!(
+                    "Publishing to {remote} ({remote_url}) timed out. Refresh before retrying."
+                ),
+            }),
+            ProcessRunOutcome::Completed(output) if !output.success => Err(git_failure(output)),
+            ProcessRunOutcome::Completed(output)
+                if output.stdout_truncated || output.stderr_truncated =>
+            {
+                Ok(PushResult {
+                    outcome: PushOutcome::OutcomeUncertain,
+                    head,
+                    branch,
+                    remote: remote.to_owned(),
+                    refspec,
+                    summary: "Publish returned unusually large output. Refresh before retrying."
+                        .into(),
+                })
+            }
+            ProcessRunOutcome::Completed(output) => Ok(PushResult {
+                outcome: PushOutcome::Pushed,
+                head,
+                branch,
+                remote: remote.to_owned(),
+                refspec,
+                summary: redact_text(&format!("{}\n{}", output.stdout, output.stderr)),
+            }),
+        }
     }
 
     pub fn worktrees(&self, repository: &Path) -> Result<Vec<WorktreeInfo>> {
@@ -610,7 +841,12 @@ impl GitService {
         let skip_arg = format!("--skip={skip}");
         let output = self.required(
             repository,
-            &["log", &count_arg, &skip_arg, &format!("--format={HISTORY_FORMAT}")],
+            &[
+                "log",
+                &count_arg,
+                &skip_arg,
+                &format!("--format={HISTORY_FORMAT}"),
+            ],
         )?;
         let mut history = parse_history(&output);
         if skip > 0 {
@@ -863,7 +1099,16 @@ impl GitService {
     }
 
     fn required(&self, cwd: &Path, args: &[&str]) -> Result<String> {
-        let output = self.output(cwd, args, GIT_TIMEOUT)?;
+        self.required_with_timeout(cwd, args, GIT_TIMEOUT)
+    }
+
+    fn required_with_timeout(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        timeout: Duration,
+    ) -> Result<String> {
+        let output = self.output(cwd, args, timeout)?;
         if output.success {
             if output.stdout_truncated || output.stderr_truncated {
                 Err(IntegratorError::Git(
@@ -917,23 +1162,34 @@ fn authorize_repository_match(
             Ok(path) => path,
             Err(_) => continue,
         };
-        let common_directory = match canonical_directory(&project.git_common_directory) {
+        let Some(git_root) = project.git_repository_root.as_deref() else {
+            continue;
+        };
+        let git_root = match canonical_directory(git_root) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        let Some(common_directory) = project.git_common_directory.as_deref() else {
+            continue;
+        };
+        let common_directory = match canonical_directory(common_directory) {
             Ok(path) => path,
             Err(_) => continue,
         };
         if common_directory != identity.common_directory {
             continue;
         }
-        if project_root == identity.root {
+        if git_root == identity.root {
             return Ok(AuthorizedRepositoryMatch {
                 identity,
                 project_id: project.id,
                 project_root,
+                project_git_root: git_root,
                 project_common_directory: common_directory,
             });
         }
         if git
-            .worktrees(&project_root)?
+            .worktrees(&git_root)?
             .iter()
             .any(|worktree| worktree.path == identity.root)
         {
@@ -941,6 +1197,7 @@ fn authorize_repository_match(
                 identity,
                 project_id: project.id,
                 project_root,
+                project_git_root: git_root,
                 project_common_directory: common_directory,
             });
         }
@@ -1027,6 +1284,83 @@ fn canonical_directory(path: &Path) -> Result<PathBuf> {
         ));
     }
     dunce::canonicalize(path).map_err(IntegratorError::Io)
+}
+
+fn validate_new_destination(path: &Path) -> Result<()> {
+    if !path.is_absolute()
+        || path.exists()
+        || path.parent().is_none_or(|parent| !parent.is_dir())
+        || path.file_name().is_none_or(|name| name.is_empty())
+    {
+        return Err(IntegratorError::InvalidInput(
+            "clone destination must be a new absolute path inside an existing folder".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_remote_name(name: &str) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty()
+        || name.len() > 240
+        || name.starts_with('-')
+        || name.chars().any(char::is_whitespace)
+        || name.contains(['~', '^', ':', '?', '*', '[', '\\'])
+        || name.contains("..")
+    {
+        return Err(IntegratorError::InvalidInput(
+            "invalid Git remote name".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_remote_url(url: &str) -> Result<()> {
+    let url = url.trim();
+    if url.is_empty()
+        || url.len() > 4096
+        || url.starts_with('-')
+        || url.contains(['\0', '\n', '\r'])
+        || url.contains('?')
+        || url.contains('#')
+    {
+        return Err(IntegratorError::InvalidInput(
+            "remote URL is invalid or contains unsupported credential parameters".into(),
+        ));
+    }
+    if Path::new(url).is_absolute() {
+        return Ok(());
+    }
+    if let Ok(parsed) = url::Url::parse(url) {
+        if !matches!(parsed.scheme(), "http" | "https" | "ssh" | "git" | "file")
+            || (parsed.scheme() != "file" && parsed.host_str().is_none())
+            || parsed.password().is_some()
+            || (matches!(parsed.scheme(), "http" | "https") && !parsed.username().is_empty())
+        {
+            return Err(IntegratorError::InvalidInput(
+                "remote URL uses an unsupported transport or embedded credentials".into(),
+            ));
+        }
+        return Ok(());
+    }
+    let scp_style = url.split_once(':').is_some_and(|(authority, path)| {
+        let Some((user, host)) = authority.split_once('@') else {
+            return false;
+        };
+        !user.is_empty()
+            && !host.is_empty()
+            && !path.is_empty()
+            && user
+                .chars()
+                .chain(host.chars())
+                .all(|character| character.is_ascii_alphanumeric() || "-._".contains(character))
+    });
+    if !scp_style {
+        return Err(IntegratorError::InvalidInput(
+            "remote URL must use HTTPS, SSH, Git, file, or an absolute local path".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn git_failure(output: ProcessOutput) -> IntegratorError {
@@ -1319,7 +1653,9 @@ fn sanitize_remote_url(value: &str) -> String {
         .min()
         .unwrap_or(value.len());
     let value = &value[..boundary];
-    if let Some(scheme_end) = value.find("://") {
+    if (value.starts_with("http://") || value.starts_with("https://"))
+        && let Some(scheme_end) = value.find("://")
+    {
         let after_scheme = scheme_end + 3;
         let path_start = value[after_scheme..]
             .find('/')
@@ -1334,11 +1670,6 @@ fn sanitize_remote_url(value: &str) -> String {
                 &value[path_start..]
             );
         }
-    }
-    if let Some(at) = value.find('@')
-        && value[..at].find(':').is_none()
-    {
-        return value[at + 1..].to_owned();
     }
     value.to_owned()
 }
@@ -1369,7 +1700,8 @@ mod tests {
             id: ProjectId::new(),
             display_name: "Trusted".into(),
             repository_root: identity.root.clone(),
-            git_common_directory: identity.common_directory.clone(),
+            git_repository_root: Some(identity.root.clone()),
+            git_common_directory: Some(identity.common_directory.clone()),
             created_at: now,
             last_opened_at: now,
         }
@@ -1403,6 +1735,60 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_folder_requires_explicit_initialization() {
+        let directory = tempfile::tempdir().expect("ordinary folder");
+        let git = GitService::discover().expect("discover git");
+        assert_eq!(
+            git.repository_if_present(directory.path())
+                .expect("detect ordinary folder"),
+            None
+        );
+
+        let initialized = git.init(directory.path()).expect("initialize Git");
+        assert_eq!(
+            initialized.root,
+            dunce::canonicalize(directory.path()).expect("canonical ordinary folder")
+        );
+        assert_eq!(initialized.branch.as_deref(), Some("main"));
+        assert!(
+            git.repository_if_present(directory.path())
+                .expect("detect initialized repository")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn remotes_can_be_added_updated_and_removed_locally() {
+        let directory = tempfile::tempdir().expect("repository");
+        let first_remote = tempfile::tempdir().expect("first remote");
+        let second_remote = tempfile::tempdir().expect("second remote");
+        initialize_repository(directory.path());
+        let git = GitService::discover().expect("discover git");
+
+        let remotes = git
+            .add_remote(
+                directory.path(),
+                "origin",
+                &first_remote.path().to_string_lossy(),
+            )
+            .expect("add remote");
+        assert_eq!(remotes[0].name, "origin");
+        let remotes = git
+            .update_remote(
+                directory.path(),
+                "origin",
+                &second_remote.path().to_string_lossy(),
+            )
+            .expect("update remote");
+        assert_eq!(remotes[0].fetch_url, second_remote.path().to_string_lossy());
+        assert!(
+            git.remove_remote(directory.path(), "origin")
+                .expect("remove remote")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn remote_credentials_are_removed() {
         assert_eq!(
             sanitize_remote_url("https://user:secret@example.test/org/repo.git"),
@@ -1410,12 +1796,20 @@ mod tests {
         );
         assert_eq!(
             sanitize_remote_url("git@example.test:org/repo.git"),
-            "example.test:org/repo.git"
+            "git@example.test:org/repo.git"
         );
         assert_eq!(
             sanitize_remote_url("https://example.test/org/repo.git?access_token=not-real"),
             "https://example.test/org/repo.git"
         );
+    }
+
+    #[test]
+    fn remote_urls_reject_command_transports_and_embedded_https_credentials() {
+        assert!(validate_remote_url("ext::sh -c touch /tmp/unsafe").is_err());
+        assert!(validate_remote_url("https://user:secret@example.test/repo.git").is_err());
+        assert!(validate_remote_url("ssh://git@example.test/org/repo.git").is_ok());
+        assert!(validate_remote_url("git@example.test:org/repo.git").is_ok());
     }
 
     #[test]
@@ -1690,8 +2084,9 @@ mod tests {
         let projects = vec![TrustedProject {
             id: ProjectId::new(),
             display_name: "Trusted".into(),
-            repository_root: identity.root,
-            git_common_directory: identity.common_directory,
+            repository_root: identity.root.clone(),
+            git_repository_root: Some(identity.root),
+            git_common_directory: Some(identity.common_directory),
             created_at: now,
             last_opened_at: now,
         }];
@@ -1734,7 +2129,8 @@ mod tests {
             id: ProjectId::new(),
             display_name: "Trusted".into(),
             repository_root: identity.root.clone(),
-            git_common_directory: identity.common_directory.clone(),
+            git_repository_root: Some(identity.root.clone()),
+            git_common_directory: Some(identity.common_directory.clone()),
             created_at: now,
             last_opened_at: now,
         }];

@@ -629,6 +629,20 @@ const MIGRATIONS: &[(i64, &str)] = &[
             ON composer_drafts(task_id) WHERE task_id IS NOT NULL;
         "#,
     ),
+    (
+        13,
+        r#"
+        CREATE TABLE project_git_repositories (
+            project_id TEXT PRIMARY KEY REFERENCES trusted_projects(id) ON DELETE CASCADE,
+            repository_root TEXT NOT NULL,
+            git_common_directory TEXT NOT NULL
+        );
+        INSERT INTO project_git_repositories(project_id, repository_root, git_common_directory)
+            SELECT id, repository_root, git_common_directory FROM trusted_projects;
+        CREATE INDEX project_git_repositories_common_dir_idx
+            ON project_git_repositories(git_common_directory);
+        "#,
+    ),
 ];
 
 pub struct LocalStore {
@@ -934,8 +948,8 @@ impl LocalStore {
     pub fn upsert_trusted_project(
         &self,
         display_name: &str,
-        repository_root: &Path,
-        git_common_directory: &Path,
+        project_root: &Path,
+        git_repository: Option<(&Path, &Path)>,
     ) -> Result<TrustedProject> {
         let display_name = display_name.trim();
         if display_name.is_empty() || display_name.chars().count() > 120 {
@@ -943,19 +957,27 @@ impl LocalStore {
                 "project display name must contain 1 to 120 characters".into(),
             ));
         }
-        if !repository_root.is_absolute() || !git_common_directory.is_absolute() {
+        if !project_root.is_absolute()
+            || git_repository
+                .is_some_and(|(root, common)| !root.is_absolute() || !common.is_absolute())
+        {
             return Err(IntegratorError::InvalidInput(
                 "trusted project paths must be canonical absolute paths".into(),
             ));
         }
-        let repository_root = repository_root.to_string_lossy().into_owned();
-        let git_common_directory = git_common_directory.to_string_lossy().into_owned();
+        let project_root = project_root.to_string_lossy().into_owned();
+        let git_repository = git_repository.map(|(root, common)| {
+            (
+                root.to_string_lossy().into_owned(),
+                common.to_string_lossy().into_owned(),
+            )
+        });
         let now = Utc::now();
         let connection = self.connection.lock();
         let existing = connection
             .query_row(
                 "SELECT id, created_at FROM trusted_projects WHERE repository_root = ?1",
-                [&repository_root],
+                [&project_root],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
@@ -967,17 +989,42 @@ impl LocalStore {
             ),
             None => (ProjectId::new(), now),
         };
-        connection
+        let transaction = connection.unchecked_transaction().map_err(storage_error)?;
+        // `git_common_directory` remains populated for compatibility with the
+        // original table constraint. Authoritative optional Git identity lives
+        // in `project_git_repositories` from migration 13 onward.
+        let legacy_common = git_repository
+            .as_ref()
+            .map_or(project_root.as_str(), |(_, common)| common.as_str());
+        transaction
             .execute(
                 "INSERT INTO trusted_projects(id, display_name, repository_root, git_common_directory, created_at, last_opened_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(repository_root) DO UPDATE SET display_name = excluded.display_name, git_common_directory = excluded.git_common_directory, last_opened_at = excluded.last_opened_at",
-                params![id.to_string(), display_name, repository_root, git_common_directory, created_at.to_rfc3339(), now.to_rfc3339()],
+                params![id.to_string(), display_name, project_root, legacy_common, created_at.to_rfc3339(), now.to_rfc3339()],
             )
             .map_err(storage_error)?;
+        transaction
+            .execute(
+                "DELETE FROM project_git_repositories WHERE project_id = ?1",
+                [id.to_string()],
+            )
+            .map_err(storage_error)?;
+        if let Some((root, common)) = &git_repository {
+            transaction
+                .execute(
+                    "INSERT INTO project_git_repositories(project_id, repository_root, git_common_directory) VALUES (?1, ?2, ?3)",
+                    params![id.to_string(), root, common],
+                )
+                .map_err(storage_error)?;
+        }
+        transaction.commit().map_err(storage_error)?;
         Ok(TrustedProject {
             id,
             display_name: display_name.to_owned(),
-            repository_root: PathBuf::from(repository_root),
-            git_common_directory: PathBuf::from(git_common_directory),
+            repository_root: PathBuf::from(project_root),
+            git_repository_root: git_repository.as_ref().map(|(root, _)| PathBuf::from(root)),
+            git_common_directory: git_repository
+                .as_ref()
+                .map(|(_, common)| PathBuf::from(common)),
             created_at,
             last_opened_at: now,
         })
@@ -986,7 +1033,9 @@ impl LocalStore {
     pub fn list_trusted_projects(&self) -> Result<Vec<TrustedProject>> {
         let connection = self.connection.lock();
         let mut statement = connection
-            .prepare("SELECT id, display_name, repository_root, git_common_directory, created_at, last_opened_at FROM trusted_projects ORDER BY last_opened_at DESC")
+            .prepare(
+                "SELECT p.id, p.display_name, p.repository_root, g.repository_root, g.git_common_directory, p.created_at, p.last_opened_at FROM trusted_projects p LEFT JOIN project_git_repositories g ON g.project_id = p.id ORDER BY p.last_opened_at DESC",
+            )
             .map_err(storage_error)?;
         let rows = statement
             .query_map([], |row| {
@@ -994,19 +1043,22 @@ impl LocalStore {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                     row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             })
             .map_err(storage_error)?;
         rows.map(|row| {
-            let (id, display_name, root, common, created, opened) = row.map_err(storage_error)?;
+            let (id, display_name, root, git_root, common, created, opened) =
+                row.map_err(storage_error)?;
             Ok(TrustedProject {
                 id: ProjectId::from_str(&id).map_err(invalid_stored)?,
                 display_name,
                 repository_root: PathBuf::from(root),
-                git_common_directory: PathBuf::from(common),
+                git_repository_root: git_root.map(PathBuf::from),
+                git_common_directory: common.map(PathBuf::from),
                 created_at: parse_time(&created)?,
                 last_opened_at: parse_time(&opened)?,
             })
@@ -2054,11 +2106,12 @@ mod tests {
             .set_setting("appearance.theme", Value::String("graphite".into()))
             .expect("set setting");
         let directory = tempfile::tempdir().expect("temp directory");
+        let common = directory.path().join(".git");
         store
             .upsert_trusted_project(
                 "Clearable project",
                 directory.path(),
-                &directory.path().join(".git"),
+                Some((directory.path(), &common)),
             )
             .expect("register project");
         let now = Utc::now();
@@ -2492,7 +2545,7 @@ mod tests {
         let common = repository.join(".git");
         std::fs::create_dir_all(&common).expect("fixture repository");
         store
-            .upsert_trusted_project("Draft fixture", &repository, &common)
+            .upsert_trusted_project("Draft fixture", &repository, Some((&repository, &common)))
             .expect("register draft project")
     }
 
@@ -2716,7 +2769,7 @@ mod tests {
 
         let first = LocalStore::open(&database).expect("first open");
         let registered = first
-            .upsert_trusted_project("Repository", &repository, &common)
+            .upsert_trusted_project("Repository", &repository, Some((&repository, &common)))
             .expect("register project");
         drop(first);
 
@@ -2738,6 +2791,26 @@ mod tests {
         assert!(
             repository.exists(),
             "removal must never delete repository data"
+        );
+    }
+
+    #[test]
+    fn ordinary_project_folder_persists_without_git_identity() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let database = directory.path().join("integrator.sqlite3");
+        let project_root = directory.path().join("notes");
+        std::fs::create_dir(&project_root).expect("project folder");
+        let store = LocalStore::open(&database).expect("open store");
+
+        let project = store
+            .upsert_trusted_project("Notes", &project_root, None)
+            .expect("register ordinary folder");
+        assert_eq!(project.repository_root, project_root);
+        assert_eq!(project.git_repository_root, None);
+        assert_eq!(project.git_common_directory, None);
+        assert_eq!(
+            store.list_trusted_projects().expect("list projects"),
+            vec![project]
         );
     }
 }

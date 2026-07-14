@@ -568,9 +568,11 @@ fn redact_text(value: &str) -> String {
                     && word.chars().any(|c| c.is_ascii_lowercase())
                     && word.chars().any(|c| c.is_ascii_uppercase())
                     && word.chars().any(|c| c.is_ascii_digit());
+                let path_like =
+                    (word.contains('/') || word.contains('\\')) && !word.contains("://");
                 if redact_next
                     || sensitive_assignment
-                    || high_entropy
+                    || (high_entropy && !path_like)
                     || lower_word.starts_with("sk-")
                 {
                     words.push("[redacted]".to_owned());
@@ -1202,6 +1204,26 @@ mod tests {
         }).expect("reduce").expect("accepted");
         assert!(
             matches!(event.mutation, ProjectionMutation::ReplaceItem(ItemProjection { kind: ItemKind::AgentMessage, body: Some(ref body), .. }) if body == "Done")
+        );
+    }
+
+    #[test]
+    fn long_file_paths_are_not_mistaken_for_high_entropy_secrets() {
+        assert_eq!(
+            redact_text("/Users/lukekabbash/Documents/Code/integrator-3/src/App2.tsx"),
+            "/Users/lukekabbash/Documents/Code/integrator-3/src/App2.tsx"
+        );
+        assert_eq!(
+            redact_text(r"C:\Users\Luke\Documents\Integrator-3\src\App2.tsx"),
+            r"C:\Users\Luke\Documents\Integrator-3\src\App2.tsx"
+        );
+    }
+
+    #[test]
+    fn high_entropy_non_path_tokens_are_still_redacted() {
+        assert_eq!(
+            redact_text("prefix AbcdefghijklmnopQRSTUVWX1234567890 suffix"),
+            "prefix [redacted] suffix"
         );
     }
 
