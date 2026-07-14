@@ -3,6 +3,7 @@
 mod broker_mcp;
 mod chat_title;
 mod commands;
+mod commit_message;
 mod delegation;
 mod native_actions;
 mod runtime_setup;
@@ -10,6 +11,7 @@ mod state;
 
 use chat_title::task_generate_title;
 use commands::*;
+use commit_message::git_generate_commit_message;
 use delegation::{
     delegation_approve, delegation_deny, delegation_list, delegation_send_message,
     delegation_stop_cmd,
@@ -109,6 +111,7 @@ pub fn run() {
             git_stage,
             git_unstage,
             git_commit,
+            git_generate_commit_message,
             git_push_preview,
             git_push_confirmed,
             codex_connect,

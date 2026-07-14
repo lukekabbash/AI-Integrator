@@ -2269,6 +2269,16 @@ export default function App() {
     setSnapshot((current) => ({ ...current, git }));
   };
 
+  const generateCommitMessage = async () => {
+    if (!activeTask) throw new Error("Open a task before generating a commit message.");
+    await bridge.updateTaskRouting(activeTask.id, {
+      runtime: activeTask.runtime,
+      model: activeTask.model,
+      effort: activeTask.effort,
+    });
+    return bridge.generateCommitMessage(activeTask.id, activeTask.runtime);
+  };
+
   const push = async () => {
     if (!activeTask) return;
     const preview = await bridge.previewPush(activeTask.id);
@@ -3407,6 +3417,9 @@ export default function App() {
                           setSnapshot((current) => ({ ...current, git }));
                         }}
                         onCommit={commit}
+                        onGenerateCommitMessage={
+                          nativeHost && activeTask ? generateCommitMessage : undefined
+                        }
                         onPush={push}
                         onReviewChanges={reviewChanges}
                         onRefreshGit={refreshGit}

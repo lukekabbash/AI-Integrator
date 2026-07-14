@@ -1108,7 +1108,9 @@ impl LocalStore {
         message: &str,
     ) -> Result<()> {
         let message = message.trim();
-        if message.is_empty() || message.chars().count() > 72 || message.chars().any(char::is_control)
+        if message.is_empty()
+            || message.chars().count() > 72
+            || message.chars().any(char::is_control)
         {
             return Err(IntegratorError::InvalidInput(
                 "commit message must contain 1 to 72 printable characters".into(),

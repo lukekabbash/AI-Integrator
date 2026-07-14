@@ -43,6 +43,7 @@ const { bridgeMock } = vi.hoisted(() => ({
     stopDelegation: vi.fn(),
     stageFiles: vi.fn(),
     commit: vi.fn(),
+    generateCommitMessage: vi.fn(),
     previewPush: vi.fn(),
     confirmPush: vi.fn(),
     push: vi.fn(),
@@ -107,6 +108,7 @@ describe("native runtime recovery UI", () => {
     bridgeMock.listModelCatalog.mockResolvedValue([]);
     bridgeMock.listSettings.mockResolvedValue([]);
     bridgeMock.generateTaskTitle.mockResolvedValue(null);
+    bridgeMock.generateCommitMessage.mockResolvedValue("feat: generate commit subjects");
     bridgeMock.getAppInfo.mockResolvedValue({
       applicationVersion: "test",
       domainSchemaVersion: 2,

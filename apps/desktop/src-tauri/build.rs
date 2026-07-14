@@ -52,6 +52,7 @@ const APP_COMMANDS: &[&str] = &[
     "git_stage",
     "git_unstage",
     "git_commit",
+    "git_generate_commit_message",
     "git_push_preview",
     "git_push_confirmed",
     "codex_connect",

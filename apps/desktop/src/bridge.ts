@@ -746,6 +746,8 @@ export interface AppBridge {
   }>;
   stageFiles(taskId: string, paths: string[], staged: boolean): Promise<GitSnapshot>;
   commit(taskId: string, message: string): Promise<GitSnapshot>;
+  /** Draft one bounded staged-diff subject with the task's selected provider. */
+  generateCommitMessage(taskId: string, runtime: RuntimeId): Promise<string>;
   /** Read-only push data used to render an explicit confirmation surface. */
   previewPush(taskId: string): Promise<PushPreview>;
   /** Execute only the exact push state returned by previewPush. */
@@ -3225,6 +3227,17 @@ export const bridge: AppBridge = {
         ...git.commits.map((commit) => ({ ...commit, current: false })),
       ],
     };
+  },
+
+  generateCommitMessage: async (taskId, runtime) => {
+    if (!isTauri()) {
+      throw new Error("Commit-message generation is available only in the native desktop app");
+    }
+    const nativeTaskId = await ensureNativeTask(taskId);
+    return nativeInvoke<string>("git_generate_commit_message", {
+      taskId: nativeTaskId,
+      provider: runtime === "custom" ? "custom-acp" : runtime,
+    });
   },
 
   previewPush: async (taskId) => {

@@ -59,6 +59,7 @@
     "allow-git-stage",
     "allow-git-unstage",
     "allow-git-commit",
+    "allow-git-generate-commit-message",
     "allow-git-push-preview",
     "allow-git-push-confirmed",
     "allow-codex-connect",
