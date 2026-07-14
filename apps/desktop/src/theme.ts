@@ -1124,6 +1124,136 @@ export function themeTokenToCssVariable(token: ThemeColorToken): `--color-${stri
   return `--color-${token.replaceAll(".", "-")}`;
 }
 
+/* Terminal surface derivation.
+ *
+ * The terminal is a first-class surface: instead of pointing component CSS at
+ * raw ANSI slots (which flips illegible on light themes), each theme derives a
+ * semantic terminal palette here, and every foreground is nudged until it
+ * clears WCAG AA (4.5:1) against the derived background. Runs on the merged
+ * colors so user color overrides keep the same guarantee. */
+
+type Rgb = readonly [number, number, number];
+
+function parseThemeColor(value: string): Rgb | null {
+  const text = value.trim();
+  const hex = /^#([0-9a-f]{3,8})$/i.exec(text)?.[1];
+  if (hex && [3, 4, 6, 8].includes(hex.length)) {
+    const size = hex.length <= 4 ? 1 : 2;
+    const channel = (index: number) => {
+      const part = hex.slice(index * size, index * size + size);
+      return Number.parseInt(size === 1 ? part + part : part, 16);
+    };
+    return [channel(0), channel(1), channel(2)];
+  }
+  const rgb = /^rgba?\(\s*(\d{1,3})[\s,]+(\d{1,3})[\s,]+(\d{1,3})/i.exec(text);
+  if (rgb) {
+    const channels = [rgb[1], rgb[2], rgb[3]].map((part) => Math.min(255, Number(part)));
+    return [channels[0], channels[1], channels[2]];
+  }
+  return null;
+}
+
+function rgbToHex([r, g, b]: Rgb): string {
+  const part = (channel: number) =>
+    Math.round(Math.min(255, Math.max(0, channel)))
+      .toString(16)
+      .padStart(2, "0");
+  return `#${part(r)}${part(g)}${part(b)}`;
+}
+
+function relativeLuminance([r, g, b]: Rgb): number {
+  const linear = (channel: number) => {
+    const srgb = channel / 255;
+    return srgb <= 0.04045 ? srgb / 12.92 : ((srgb + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
+}
+
+function contrastOf(a: Rgb, b: Rgb): number {
+  const [lighter, darker] = [relativeLuminance(a), relativeLuminance(b)].sort((x, y) => y - x);
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+export function contrastRatio(foreground: string, background: string): number {
+  const fg = parseThemeColor(foreground);
+  const bg = parseThemeColor(background);
+  return fg && bg ? contrastOf(fg, bg) : 1;
+}
+
+/** Gamma-space mix, matching CSS `color-mix(in srgb, a weight%, b)`. Rounded
+ * to whole channels so contrast checks see exactly what the hex output ships. */
+function mixRgb(a: Rgb, b: Rgb, weightOfA: number): Rgb {
+  const mix = (index: number) => Math.round(a[index] * weightOfA + b[index] * (1 - weightOfA));
+  return [mix(0), mix(1), mix(2)];
+}
+
+const TERMINAL_MIN_CONTRAST = 4.5;
+
+/** Blend `color` toward black or white (whichever helps) until it clears `minimum`. */
+function ensureContrast(color: Rgb, background: Rgb, minimum: number): Rgb {
+  if (contrastOf(color, background) >= minimum) return color;
+  const black: Rgb = [0, 0, 0];
+  const white: Rgb = [255, 255, 255];
+  const target = contrastOf(black, background) >= contrastOf(white, background) ? black : white;
+  let candidate = color;
+  for (let step = 1; step <= 20; step += 1) {
+    candidate = mixRgb(target, color, step / 20);
+    if (contrastOf(candidate, background) >= minimum) break;
+  }
+  return candidate;
+}
+
+export interface TerminalColors {
+  readonly surface: string;
+  readonly text: string;
+  readonly textMuted: string;
+  readonly command: string;
+  readonly success: string;
+  readonly error: string;
+  readonly warning: string;
+}
+
+export function deriveTerminalColors(
+  colors: ThemeColors,
+  appearance: ThemeAppearance,
+  fallback: ThemeColors = colors,
+): TerminalColors {
+  // User overrides may be any CSS color; fall back to the preset value (always
+  // hex) when one cannot be parsed, so the derivation never degrades silently.
+  const resolve = (token: ThemeColorToken): Rgb =>
+    parseThemeColor(colors[token]) ?? parseThemeColor(fallback[token]) ?? [0, 0, 0];
+  const ansi = (slot: number) => resolve(`terminal.ansi${slot}` as ThemeColorToken);
+  const canvas = resolve("surface.canvas");
+
+  // Dark themes deepen the canvas with the ANSI black; light themes keep a
+  // near-canvas surface with only a hint of ink so the light ANSI ramp
+  // (tuned for light backgrounds) stays legible.
+  const surface =
+    appearance === "light" ? mixRgb(ansi(0), canvas, 0.08) : mixRgb(ansi(0), canvas, 0.6);
+
+  const pick = (candidates: readonly Rgb[]): Rgb => {
+    for (const candidate of candidates) {
+      if (contrastOf(candidate, surface) >= TERMINAL_MIN_CONTRAST) return candidate;
+    }
+    return ensureContrast(candidates[0], surface, TERMINAL_MIN_CONTRAST);
+  };
+
+  const text = pick(
+    appearance === "light"
+      ? [ansi(0), resolve("text.primary")]
+      : [ansi(7), resolve("text.primary"), ansi(15)],
+  );
+  return {
+    surface: rgbToHex(surface),
+    text: rgbToHex(text),
+    textMuted: rgbToHex(ensureContrast(resolve("text.muted"), surface, TERMINAL_MIN_CONTRAST)),
+    command: rgbToHex(pick([ansi(4), ansi(12)])),
+    success: rgbToHex(pick([ansi(2), ansi(10)])),
+    error: rgbToHex(pick(appearance === "light" ? [ansi(1), ansi(9)] : [ansi(9), ansi(1)])),
+    warning: rgbToHex(pick([resolve("status.warning"), ansi(3), ansi(11)])),
+  };
+}
+
 export const INTERFACE_FONT_CHOICES = [
   {
     id: "system",
@@ -1416,6 +1546,15 @@ export function applyThemePreferences(
   for (const token of THEME_COLOR_TOKENS) {
     root.style.setProperty(themeTokenToCssVariable(token), colors[token]);
   }
+
+  const terminal = deriveTerminalColors(colors, preset.appearance, preset.colors);
+  root.style.setProperty("--color-terminal-surface", terminal.surface);
+  root.style.setProperty("--color-terminal-text", terminal.text);
+  root.style.setProperty("--color-terminal-text-muted", terminal.textMuted);
+  root.style.setProperty("--color-terminal-command", terminal.command);
+  root.style.setProperty("--color-terminal-success", terminal.success);
+  root.style.setProperty("--color-terminal-error", terminal.error);
+  root.style.setProperty("--color-terminal-warning", terminal.warning);
 
   root.dataset.theme = preset.id;
   root.dataset.appearance = preset.appearance;

@@ -61,6 +61,15 @@
   --color-terminal-ansi13: #c9b3c9;
   --color-terminal-ansi14: #a6c6c1;
   --color-terminal-ansi15: #ffffff;
+  /* Semantic terminal surface; theme.ts re-derives these per theme with a
+     WCAG AA contrast guarantee (deriveTerminalColors). */
+  --color-terminal-surface: #0c0c0c;
+  --color-terminal-text: #d6d6d6;
+  --color-terminal-text-muted: #9a9a9a;
+  --color-terminal-command: #a0aab2;
+  --color-terminal-success: #96b89f;
+  --color-terminal-error: #e2a59d;
+  --color-terminal-warning: #cfae72;
   --color-chrome-background: #0a0a0a;
   --color-chrome-foreground: #e0e0e0;
 
@@ -153,12 +162,20 @@
   --accent: var(--color-accent-primary);
   --accent-hover: var(--color-accent-hover);
   --accent-pressed: var(--color-accent-pressed);
+
+  /* Ink used to paint the masked brand mark (see .brand-mark-glyph). Defaults to
+     the theme's near-white ink with a faint accent wash so the lockup quietly
+     picks up each dark theme's hue; light themes lean into the accent below. */
+  --brand-mark-ink: color-mix(in srgb, var(--color-text-primary) 80%, var(--color-accent-primary));
 }
 
 :root[data-appearance="light"] {
   color-scheme: light;
   --shadow-elevated: 0 12px 32px rgb(37 42 45 / 13%), 0 1px 2px rgb(37 42 45 / 10%);
   --shadow-composer: 0 5px 18px rgb(37 42 45 / 9%), 0 0 0 1px var(--color-border-subtle);
+  /* A white mark vanishes on pale surfaces, so lean into the accent for a
+     deliberate, colored lockup that still stays dark enough to read. */
+  --brand-mark-ink: color-mix(in srgb, var(--color-accent-primary) 68%, var(--color-text-primary));
 }
 
 :root[data-density="compact"] {

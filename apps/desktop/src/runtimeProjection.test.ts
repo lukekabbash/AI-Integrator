@@ -452,7 +452,7 @@ describe("runtime projection reducer", () => {
       title: "Edited",
       body: "src/App.tsx",
       changeStats: { additions: 2, deletions: 1 },
-      expandedByDefault: true,
+      expandedByDefault: false,
     });
     expect(runtimeTranscript(state)[0].details).toBeUndefined();
     expect(runtimeTranscript(state)[0].diff).toMatchObject({
@@ -488,7 +488,7 @@ describe("runtime projection reducer", () => {
     expect(runtimeTranscript(state)[0]).toMatchObject({
       body: "src/router.ts",
       changeStats: { additions: 2, deletions: 1 },
-      expandedByDefault: true,
+      expandedByDefault: false,
     });
     expect(runtimeTranscript(state)[0].details).toBeUndefined();
     expect(runtimeTranscript(state)[0].diff).toMatchObject({
@@ -528,7 +528,7 @@ describe("runtime projection reducer", () => {
       body: "C:\\repo\\src\\Hud.tsx",
       filePath: "C:\\repo\\src\\Hud.tsx",
       changeStats: { additions: 2, deletions: 1 },
-      expandedByDefault: true,
+      expandedByDefault: false,
     });
     expect(runtimeTranscript(state)[0].details).toBeUndefined();
     expect(runtimeTranscript(state)[0].diff).toMatchObject({

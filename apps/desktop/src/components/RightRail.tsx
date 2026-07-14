@@ -1348,6 +1348,28 @@ function FilePreview({
   );
 }
 
+/** Transcript tool events may carry absolute or "./"-prefixed paths while the
+ * project tree is root-relative; resolve by exact match first, then by the
+ * longest tree path the requested path ends with. */
+function resolveRequestedFile(
+  files: ProjectFileEntry[],
+  requestedPath: string,
+): ProjectFileEntry | undefined {
+  const normalize = (path: string) => path.replace(/\\/g, "/").replace(/^\.\//, "");
+  const requested = normalize(requestedPath);
+  let suffixMatch: ProjectFileEntry | undefined;
+  let suffixMatchLength = 0;
+  for (const file of files) {
+    const candidate = normalize(file.path);
+    if (candidate === requested) return file;
+    if (requested.endsWith(`/${candidate}`) && candidate.length > suffixMatchLength) {
+      suffixMatch = file;
+      suffixMatchLength = candidate.length;
+    }
+  }
+  return suffixMatch;
+}
+
 function FilePanel({
   projectFiles = [],
   projectFilesState = "unavailable",
@@ -1468,12 +1490,23 @@ function FilePanel({
   useEffect(() => {
     if (!openProjectFileRequest) return;
     if (handledOpenRequestRef.current === openProjectFileRequest.id) return;
-    const file = projectFiles.find((candidate) => candidate.path === openProjectFileRequest.path);
-    if (!file) return;
-    handledOpenRequestRef.current = openProjectFileRequest.id;
-    const timer = window.setTimeout(() => void openProjectFile(file), 0);
+    const file = resolveRequestedFile(projectFiles, openProjectFileRequest.path);
+    if (!file) {
+      // Retry while the tree is still loading; once it is ready an unresolved
+      // path gets surfaced in the reader instead of failing silently.
+      if (projectFilesState !== "ready") return;
+      handledOpenRequestRef.current = openProjectFileRequest.id;
+      setReadError(`Could not find ${openProjectFileRequest.path} in the project files.`);
+      return;
+    }
+    // Mark the request handled inside the timer so a StrictMode remount that
+    // clears the pending timeout does not swallow the open.
+    const timer = window.setTimeout(() => {
+      handledOpenRequestRef.current = openProjectFileRequest.id;
+      void openProjectFile(file);
+    }, 0);
     return () => window.clearTimeout(timer);
-  }, [openProjectFileRequest, projectFiles, openProjectFile]);
+  }, [openProjectFileRequest, projectFiles, projectFilesState, openProjectFile]);
 
   const closeTab = (path: string) => {
     setOpenTabs((current) => {
@@ -2297,8 +2330,12 @@ export function RightRail(props: RightRailProps) {
   useEffect(() => {
     const request = props.openProjectFileRequest;
     if (!request || handledTabRequestRef.current === request.id) return;
-    handledTabRequestRef.current = request.id;
-    const timer = window.setTimeout(() => setTab("files"), 0);
+    // Mark the request handled inside the timer so a StrictMode remount that
+    // clears the pending timeout does not swallow the tab switch.
+    const timer = window.setTimeout(() => {
+      handledTabRequestRef.current = request.id;
+      setTab("files");
+    }, 0);
     return () => window.clearTimeout(timer);
   }, [props.openProjectFileRequest]);
   useEffect(() => {

@@ -11,8 +11,8 @@ import {
   GitCommit,
   Info,
   MessageCircleQuestion,
-  PanelRightOpen,
   RefreshCw,
+  Search,
   TerminalSquare,
 } from "lucide-react";
 import { bridge, openExternalLink, attachmentKind, type TranscriptEvent } from "../bridge";
@@ -350,11 +350,6 @@ function ActivityEvent({
             </span>
           ) : null}
           {event.meta ? <span className="activity-meta">{event.meta}</span> : null}
-          {expandable ? (
-            <ChevronRight
-              className={expanded ? "disclosure disclosure--open-right" : "disclosure"}
-            />
-          ) : null}
         </button>
         {filePath && onOpenFile ? (
           <button
@@ -364,9 +359,26 @@ function ActivityEvent({
             aria-label={`Open ${filePath} in Files`}
             title="Open in Files"
           >
-            <PanelRightOpen aria-hidden="true" />
+            <Search aria-hidden="true" />
           </button>
         ) : null}
+        {expandable ? (
+          // The toggle button already announces expansion; this mirror keeps
+          // the chevron clickable in its own fixed right-edge column.
+          <button
+            className="activity-event-disclosure"
+            type="button"
+            tabIndex={-1}
+            aria-hidden="true"
+            onClick={() => setExpanded((value) => !value)}
+          >
+            <ChevronRight
+              className={expanded ? "disclosure disclosure--open-right" : "disclosure"}
+            />
+          </button>
+        ) : (
+          <span className="activity-event-disclosure" aria-hidden="true" />
+        )}
       </div>
       <AnimatePresence initial={false}>
         {expanded && hasDetails ? (

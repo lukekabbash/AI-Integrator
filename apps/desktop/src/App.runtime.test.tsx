@@ -376,19 +376,21 @@ describe("native runtime recovery UI", () => {
     fireEvent.click(await screen.findByRole("tab", { name: /^Agents/ }));
     fireEvent.click(await screen.findByRole("button", { name: "View transcript" }));
     const child = await screen.findByLabelText("Polish the interaction transcript");
+    // The lead task's chrome lives in the titlebar; only the subagent pane
+    // renders a conversation header, and it owns the shared controls.
     const headers = document.querySelectorAll<HTMLElement>(".conversation-header");
-    expect(headers).toHaveLength(2);
-    const mainHeader = headers[0];
-    const childHeader = headers[1];
+    expect(headers).toHaveLength(1);
+    const childHeader = headers[0];
+    const titlebar = document.querySelector<HTMLElement>(".native-titlebar");
+    expect(titlebar).not.toBeNull();
 
-    expect(mainHeader.className).toBe(childHeader.className);
     expect(screen.getAllByRole("button", { name: /chat navigation/i })).toHaveLength(1);
     expect(
-      within(mainHeader).getByRole("button", { name: /chat navigation/i }),
+      within(titlebar!).getByRole("button", { name: /chat navigation/i }),
     ).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: "Toggle terminal" })).toHaveLength(1);
     expect(screen.getAllByRole("button", { name: "Close task tools" })).toHaveLength(1);
-    expect(within(mainHeader).queryByRole("button", { name: "Toggle terminal" })).toBeNull();
+    expect(within(titlebar!).queryByRole("button", { name: "Toggle terminal" })).toBeNull();
     expect(
       within(childHeader).getByRole("button", { name: "Toggle terminal" }),
     ).toBeInTheDocument();
@@ -397,9 +399,13 @@ describe("native runtime recovery UI", () => {
     ).toBeInTheDocument();
 
     fireEvent.click(within(child).getByRole("button", { name: "Close subagent transcript" }));
-    await waitFor(() => expect(document.querySelectorAll(".conversation-header")).toHaveLength(1));
-    expect(screen.getByRole("button", { name: "Toggle terminal" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Close task tools" })).toBeInTheDocument();
+    await waitFor(() => expect(document.querySelectorAll(".conversation-header")).toHaveLength(0));
+    expect(
+      within(titlebar!).getByRole("button", { name: "Toggle terminal" }),
+    ).toBeInTheDocument();
+    expect(
+      within(titlebar!).getByRole("button", { name: "Close task tools" }),
+    ).toBeInTheDocument();
   });
 
   it("auto-approves pending and later approvals after switching to full access mid-run", async () => {

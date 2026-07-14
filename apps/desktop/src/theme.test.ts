@@ -6,6 +6,8 @@ import {
   THEME_PRESET_GRID_ORDER,
   THEME_PRESETS,
   applyThemePreferences,
+  contrastRatio,
+  deriveTerminalColors,
   normalizeThemePreferences,
 } from "./theme";
 
@@ -81,5 +83,39 @@ describe("semantic theme catalog", () => {
     expect(root.dataset.theme).toBe("integrator");
     expect(root.style.getPropertyValue("--color-accent-primary")).toBeTruthy();
     expect(root.style.getPropertyValue("--color-diff-added")).toBeTruthy();
+    expect(root.style.getPropertyValue("--color-terminal-surface")).toBeTruthy();
+    expect(root.style.getPropertyValue("--color-terminal-text")).toBeTruthy();
+  });
+});
+
+describe("terminal surface", () => {
+  it("derives WCAG AA-legible terminal colors for every preset", () => {
+    for (const preset of THEME_PRESETS) {
+      const terminal = deriveTerminalColors(preset.colors, preset.appearance);
+      for (const token of [
+        "text",
+        "textMuted",
+        "command",
+        "success",
+        "error",
+        "warning",
+      ] as const) {
+        const ratio = contrastRatio(terminal[token], terminal.surface);
+        expect(
+          ratio,
+          `${preset.id}: terminal ${token} ${terminal[token]} on ${terminal.surface} is ${ratio.toFixed(2)}:1`,
+        ).toBeGreaterThanOrEqual(4.5);
+      }
+    }
+  });
+
+  it("keeps the terminal surface derivation stable for unparseable overrides", () => {
+    const preset = THEME_PRESETS[0];
+    const overridden = {
+      ...preset.colors,
+      "terminal.ansi0": "light-dawn-glow(unparseable)",
+    };
+    const terminal = deriveTerminalColors(overridden, preset.appearance, preset.colors);
+    expect(terminal).toEqual(deriveTerminalColors(preset.colors, preset.appearance));
   });
 });

@@ -7,6 +7,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type ReactNode,
 } from "react";
 import {
   AnimatePresence,
@@ -76,7 +77,6 @@ import {
 } from "./theme";
 import { Composer } from "./components/Composer";
 import { TaskStatusPill } from "./components/TaskStatusPill";
-import { ConversationHeader } from "./components/ConversationHeader";
 import { formatCompactTokenCount } from "./components/conversationFormatting";
 import { ResizeHandle } from "./components/ResizeHandle";
 import { TaskSidebar } from "./components/TaskSidebar";
@@ -277,6 +277,11 @@ function initialCenterView(): CenterView {
 
 function NativeTitlebar({
   context,
+  title,
+  detail,
+  leading,
+  tabs,
+  trailing,
   onOpenProject,
   onNewChat,
   onFocusComposer,
@@ -289,6 +294,11 @@ function NativeTitlebar({
   onOpenSetup,
 }: {
   context: string;
+  title?: string;
+  detail?: ReactNode;
+  leading?: ReactNode;
+  tabs?: ReactNode;
+  trailing?: ReactNode;
   onOpenProject: () => void;
   onNewChat: () => void;
   onFocusComposer: () => void;
@@ -312,8 +322,9 @@ function NativeTitlebar({
   return (
     <header className="native-titlebar">
       <div className="titlebar-drag" data-tauri-drag-region />
-      <div className="titlebar-brand-mini">
-        <span>AI</span>
+      <div className="titlebar-left">
+        <div className="titlebar-brand-mini">
+          <span>AI</span>
         <div className="titlebar-menu-group">
           <button
             type="button"
@@ -334,7 +345,7 @@ function NativeTitlebar({
                   setOpenMenu(null);
                 }}
               >
-                Open projectâ€¦
+                Open project…
               </button>
               <button
                 type="button"
@@ -459,22 +470,38 @@ function NativeTitlebar({
             </div>
           ) : null}
         </div>
+        </div>
+        {title ? (
+          <div className="titlebar-title">
+            {leading}
+            <h1>{title}</h1>
+            {detail ? <span className="titlebar-title-detail">{detail}</span> : null}
+          </div>
+        ) : null}
       </div>
-      <div className="titlebar-context">{context}</div>
-      <div className="window-controls">
-        <button type="button" aria-label="Minimize" onClick={() => void windowAction("minimize")}>
-          <Minus />
-        </button>
-        <button
-          type="button"
-          aria-label="Maximize or restore"
-          onClick={() => void windowAction("toggleMaximize")}
-        >
-          <Square />
-        </button>
-        <button type="button" aria-label="Close" onClick={() => void windowAction("close")}>
-          <X />
-        </button>
+      {tabs ? null : <div className="titlebar-context">{context}</div>}
+      <div className="titlebar-end">
+        {tabs}
+        {trailing}
+        <div className="window-controls">
+          <button
+            type="button"
+            aria-label="Minimize"
+            onClick={() => void windowAction("minimize")}
+          >
+            <Minus />
+          </button>
+          <button
+            type="button"
+            aria-label="Maximize or restore"
+            onClick={() => void windowAction("toggleMaximize")}
+          >
+            <Square />
+          </button>
+          <button type="button" aria-label="Close" onClick={() => void windowAction("close")}>
+            <X />
+          </button>
+        </div>
       </div>
     </header>
   );
@@ -640,7 +667,7 @@ function EmptyTaskState({ project }: { project: ProjectSummary }) {
   return (
     <section className="empty-task-state" aria-labelledby="empty-task-title">
       <span className="empty-task-mark" aria-hidden="true">
-        <img src="/brand/ai-integrator-mark-light.png" alt="" />
+        <span className="brand-mark-glyph brand-mark-glyph--lg" />
       </span>
       <span className="empty-task-kicker">{project.name}</span>
       <h2 id="empty-task-title">What are we working on?</h2>
@@ -2649,12 +2676,108 @@ export default function App() {
 
   return (
     <LazyMotion features={domMax} strict>
-      <div className="app-root">
+      <div
+        className="app-root"
+        data-sidebar-visible={screen === "workspace" && !sidebarCollapsed}
+        style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}
+      >
         <a className="skip-link" href="#main-content">
           Skip to main content
         </a>
         <NativeTitlebar
           context={titleContext}
+          title={screen === "workspace" ? (activeTask?.title ?? "New chat") : undefined}
+          detail={
+            screen === "workspace" && activeProject ? (
+              <>
+                {activeProject.name} · {snapshot.git.branch}
+              </>
+            ) : undefined
+          }
+          leading={
+            screen === "workspace" ? (
+              <button
+                className="icon-button subtle"
+                type="button"
+                onClick={() => setSidebarCollapsed((value) => !value)}
+                aria-label={sidebarCollapsed ? "Open chat navigation" : "Close chat navigation"}
+              >
+                {sidebarCollapsed ? <PanelLeftOpen /> : <PanelLeftClose />}
+              </button>
+            ) : undefined
+          }
+          tabs={
+            screen === "workspace" ? (
+              <div className="titlebar-view-tabs" role="tablist" aria-label="Task view">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={centerView === "task"}
+                  data-active={centerView === "task"}
+                  onClick={() => changeCenterView("task")}
+                >
+                  Task
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-label="Review"
+                  aria-selected={centerView === "review"}
+                  data-active={centerView === "review"}
+                  onClick={reviewChanges}
+                >
+                  Review{snapshot.git.files.length ? ` ${snapshot.git.files.length}` : ""}
+                </button>
+              </div>
+            ) : undefined
+          }
+          trailing={
+            screen === "workspace" ? (
+              <>
+                <button className="usage-compact" type="button" title={usagePillTitle}>
+                  {usagePillPercent !== undefined ? (
+                    <strong>{Math.round(usagePillPercent)}%</strong>
+                  ) : null}
+                  <span>{formatCompactTokenCount(displayedUsage.tokens)}</span>
+                  <span className="sr-only"> tokens</span>
+                </button>
+                {runtimeState?.turn?.status === "inProgress" ? (
+                  <button
+                    className="stop-turn-button"
+                    type="button"
+                    onClick={() => void stopTurn()}
+                    disabled={stoppingTurn || runtimeState.turn.stopRequested}
+                    aria-busy={stoppingTurn}
+                  >
+                    <CircleStop aria-hidden="true" />
+                    {runtimeState.turn.stopRequested || stoppingTurn ? "Stopping…" : "Stop"}
+                  </button>
+                ) : null}
+                {!selectedDelegation ? (
+                  <>
+                    <button
+                      className="icon-button subtle"
+                      type="button"
+                      onClick={() => toggleTerminal("main")}
+                      aria-label="Toggle terminal"
+                      aria-pressed={terminalOwner === "main"}
+                    >
+                      <TerminalSquare />
+                    </button>
+                    <button
+                      className="icon-button subtle"
+                      type="button"
+                      onClick={() => setRightRailOpen((value) => !value)}
+                      aria-label={rightRailOpen ? "Close task tools" : "Open task tools"}
+                      aria-pressed={rightRailOpen}
+                    >
+                      {rightRailOpen ? <PanelRightClose /> : <PanelRightOpen />}
+                    </button>
+                  </>
+                ) : null}
+              </>
+            ) : undefined
+          }
           onOpenProject={() => setAddProjectOpen(true)}
           onNewChat={() => void newTask()}
           onFocusComposer={focusComposer}
@@ -2767,78 +2890,6 @@ export default function App() {
                 data-subagent-open={Boolean(selectedDelegation)}
               >
                 <section className="workspace-main">
-                  <ConversationHeader
-                    title={activeTask?.title ?? "New chat"}
-                    detail={
-                      <>
-                        {activeProject?.name} · {snapshot.git.branch}
-                      </>
-                    }
-                    titleLevel={1}
-                    leading={
-                      <button
-                        className="icon-button subtle"
-                        type="button"
-                        onClick={() => setSidebarCollapsed((value) => !value)}
-                        aria-label={
-                          sidebarCollapsed ? "Open chat navigation" : "Close chat navigation"
-                        }
-                      >
-                        {sidebarCollapsed ? <PanelLeftOpen /> : <PanelLeftClose />}
-                      </button>
-                    }
-                    view={centerView}
-                    viewLabel="Task view"
-                    reviewCount={snapshot.git.files.length}
-                    onViewChange={(view) =>
-                      view === "review" ? reviewChanges() : changeCenterView(view)
-                    }
-                    actions={
-                      <>
-                        <button className="usage-compact" type="button" title={usagePillTitle}>
-                          {usagePillPercent !== undefined ? (
-                            <strong>{Math.round(usagePillPercent)}%</strong>
-                          ) : null}
-                          <span>{formatCompactTokenCount(displayedUsage.tokens)}</span>
-                          <span className="sr-only"> tokens</span>
-                        </button>
-                        {runtimeState?.turn?.status === "inProgress" ? (
-                          <button
-                            className="stop-turn-button"
-                            type="button"
-                            onClick={() => void stopTurn()}
-                            disabled={stoppingTurn || runtimeState.turn.stopRequested}
-                            aria-busy={stoppingTurn}
-                          >
-                            <CircleStop aria-hidden="true" />
-                            {runtimeState.turn.stopRequested || stoppingTurn ? "Stopping…" : "Stop"}
-                          </button>
-                        ) : null}
-                        {!selectedDelegation ? (
-                          <>
-                            <button
-                              className="icon-button subtle"
-                              type="button"
-                              onClick={() => toggleTerminal("main")}
-                              aria-label="Toggle terminal"
-                              aria-pressed={terminalOwner === "main"}
-                            >
-                              <TerminalSquare />
-                            </button>
-                            <button
-                              className="icon-button subtle"
-                              type="button"
-                              onClick={() => setRightRailOpen((value) => !value)}
-                              aria-label={rightRailOpen ? "Close task tools" : "Open task tools"}
-                              aria-pressed={rightRailOpen}
-                            >
-                              {rightRailOpen ? <PanelRightClose /> : <PanelRightOpen />}
-                            </button>
-                          </>
-                        ) : null}
-                      </>
-                    }
-                  />
                   <div className="workspace-announcements">
                     {operationError ? (
                       <div className="operation-message operation-message--error" role="alert">
@@ -3096,7 +3147,7 @@ export default function App() {
                       <Suspense
                         fallback={
                           <div className="terminal-drawer terminal-loading" role="status">
-                            Loading terminalâ€¦
+                            Loading terminal…
                           </div>
                         }
                       >
@@ -3105,6 +3156,7 @@ export default function App() {
                           open={terminalOwner === "main"}
                           project={activeProject}
                           onClose={() => setTerminalOwner(null)}
+                          motionScale={motionScale}
                         />
                       </Suspense>
                     ) : null}
@@ -3173,7 +3225,7 @@ export default function App() {
                               <Suspense
                                 fallback={
                                   <div className="terminal-drawer terminal-loading" role="status">
-                                    Loading terminalâ€¦
+                                    Loading terminal…
                                   </div>
                                 }
                               >
@@ -3182,6 +3234,7 @@ export default function App() {
                                   open={terminalOwner === selectedDelegation.id}
                                   project={activeProject}
                                   onClose={() => setTerminalOwner(null)}
+                                  motionScale={motionScale}
                                 />
                               </Suspense>
                             ) : undefined

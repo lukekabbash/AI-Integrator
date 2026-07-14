@@ -130,12 +130,102 @@ select:focus-visible,
   inset: 0 138px 0 0;
   z-index: 0;
 }
+.titlebar-left {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  z-index: 1;
+}
 .titlebar-brand-mini {
+  flex: none;
   display: flex;
   align-items: center;
   gap: 8px;
   font-size: 12px;
+}
+/* When the chat sidebar is open, the brand cluster spans its width so the
+   title divider lines up with the sidebar's right edge below it. The 18px
+   offset absorbs the titlebar's left padding and the title group's margin. */
+[data-sidebar-visible="true"] .titlebar-brand-mini {
+  width: calc(var(--sidebar-width, 272px) - 18px);
+}
+.native-titlebar .icon-button {
+  width: 26px;
+  height: 26px;
+  flex: none;
+}
+.titlebar-title {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-left: 4px;
+  padding-left: 9px;
+  border-left: 1px solid var(--color-border-subtle);
+}
+.titlebar-title h1 {
+  overflow: hidden;
+  max-width: clamp(120px, 24vw, 340px);
+  margin: 0;
+  color: var(--color-text-primary);
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.titlebar-title-detail {
+  overflow: hidden;
+  color: var(--color-text-tertiary);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.titlebar-view-tabs {
+  align-self: stretch;
+  margin-right: 4px;
+  display: flex;
+  align-items: stretch;
+}
+.titlebar-view-tabs button {
+  position: relative;
+  min-width: 50px;
+  padding: 0 7px;
+  border: 0;
+  color: var(--color-text-tertiary);
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.titlebar-view-tabs button:hover,
+.titlebar-view-tabs button[data-active="true"] {
+  color: var(--color-text-primary);
+}
+.titlebar-view-tabs button[data-active="true"]::after {
+  content: "";
+  position: absolute;
+  right: 8px;
+  bottom: 0;
+  left: 8px;
+  height: 2px;
+  border-radius: 2px 2px 0 0;
+  background: var(--color-accent);
+}
+.titlebar-end {
+  grid-column: 3;
+  justify-self: end;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  gap: 4px;
   z-index: 1;
+}
+.titlebar-end .usage-compact {
+  height: 24px;
+  margin-right: 2px;
+}
+.titlebar-end .stop-turn-button {
+  height: 26px;
 }
 .titlebar-menu-group {
   position: relative;
@@ -370,15 +460,20 @@ select:focus-visible,
   overflow: hidden;
   flex: none;
 }
-.brand-mark-frame img {
+.brand-mark-frame .brand-mark-glyph {
   width: 23px;
   height: 18px;
-  object-fit: contain;
-  transform: none;
 }
-/* The mark artwork is white; invert it so it stays visible on light surfaces. */
-[data-scheme="light"] .brand-mark-frame img {
-  filter: invert(1);
+/*
+ * The mark artwork ships as a single white alpha PNG. Rather than render it
+ * directly (invisible on light themes), we use it as a mask and paint it with
+ * --brand-mark-ink so it recolors per theme. See the token defaults below.
+ */
+.brand-mark-glyph {
+  display: block;
+  background-color: var(--brand-mark-ink);
+  -webkit-mask: url("/brand/ai-integrator-mark-light.png") center / contain no-repeat;
+  mask: url("/brand/ai-integrator-mark-light.png") center / contain no-repeat;
 }
 .brand-name {
   font-size: 13.5px;
@@ -1240,13 +1335,9 @@ kbd {
   display: inline-grid;
   place-items: center;
 }
-.empty-task-mark img {
+.brand-mark-glyph--lg {
   width: 40px;
   height: 32px;
-  object-fit: contain;
-}
-[data-scheme="light"] .empty-task-mark img {
-  filter: invert(1);
 }
 .empty-task-kicker {
   color: var(--color-text-secondary);
@@ -1941,17 +2032,17 @@ kbd {
 }
 .activity-event-summary {
   width: 100%;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  display: flex;
   align-items: center;
   gap: 4px;
 }
 .activity-event-toggle {
-  width: 100%;
+  flex: 1 1 auto;
+  min-width: 0;
   min-height: 26px;
   padding: 3px 8px 3px 4px;
   display: grid;
-  grid-template-columns: 18px minmax(0, 1fr) auto auto 14px;
+  grid-template-columns: 18px minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 7px;
   border: 0;
@@ -1966,6 +2057,25 @@ kbd {
 }
 .activity-event-toggle:disabled {
   cursor: default;
+}
+/* Fixed right-edge column so every row's chevron lines up, with or without
+   an open-file button beside it. */
+.activity-event-disclosure {
+  width: 18px;
+  height: 26px;
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+}
+button.activity-event-disclosure {
+  cursor: pointer;
+}
+button.activity-event-disclosure:hover {
+  background: color-mix(in srgb, var(--color-layer-1) 58%, transparent);
 }
 .activity-event-open-file {
   width: 26px;
@@ -5738,7 +5848,7 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   border: 1px solid var(--color-border-strong);
   border-radius: 12px;
   overflow: hidden;
-  background: var(--color-canvas);
+  background: var(--color-terminal-surface);
 }
 .runtime-terminal-stage {
   min-width: 0;
@@ -6178,9 +6288,20 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   flex: none;
   display: flex;
   flex-direction: column;
+  /* Bottom-anchored + clipped so the fixed-height inner content slides out of
+     the pane's bottom edge while the drawer's height animates open/closed. */
+  justify-content: flex-end;
+  overflow: hidden;
   border-top: 1px solid var(--color-border-base);
-  background: color-mix(in srgb, var(--color-terminal-ansi0) 60%, var(--color-canvas));
-  color: var(--color-terminal-ansi7);
+  background: var(--color-terminal-surface);
+  color: var(--color-terminal-text);
+}
+.terminal-drawer-inner {
+  height: 220px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 .terminal-header {
   height: 34px;
@@ -6195,24 +6316,24 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   font-weight: 600;
 }
 .terminal-header span {
-  color: var(--color-text-tertiary);
+  color: var(--color-terminal-text-muted);
 }
 .terminal-header button {
   margin-left: auto;
-  color: var(--color-text-secondary);
+  color: var(--color-terminal-text-muted);
   background: transparent;
   border: 0;
   cursor: pointer;
 }
 .terminal-header button:hover {
-  color: var(--color-text-primary);
+  color: var(--color-terminal-text);
 }
 .terminal-header .terminal-stop {
   margin-left: auto;
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  color: var(--color-warning);
+  color: var(--color-terminal-warning);
 }
 .terminal-header .terminal-stop svg {
   width: 12px;
@@ -6233,17 +6354,17 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   white-space: pre-wrap;
 }
 .terminal-body .terminal-command {
-  color: var(--color-terminal-ansi4);
+  color: var(--color-terminal-command);
 }
 .terminal-body .terminal-success {
-  color: var(--color-terminal-ansi2);
+  color: var(--color-terminal-success);
 }
 .terminal-body .terminal-line--stderr {
-  color: var(--color-terminal-ansi9);
+  color: var(--color-terminal-error);
 }
 .terminal-body .terminal-line--notice,
 .terminal-body .terminal-notice {
-  color: var(--color-text-tertiary);
+  color: var(--color-terminal-text-muted);
   font-style: italic;
 }
 .terminal-input-row {
@@ -6256,13 +6377,13 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
 }
 .terminal-input-row .terminal-command {
   flex: none;
-  color: var(--color-terminal-ansi4);
+  color: var(--color-terminal-command);
 }
 .terminal-input-row input {
   min-width: 0;
   flex: 1;
   border: 0;
-  color: var(--color-text-primary);
+  color: var(--color-terminal-text);
   background: transparent;
   font: inherit;
 }
@@ -6270,12 +6391,12 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   outline: none;
 }
 .terminal-input-row input::placeholder {
-  color: var(--color-text-tertiary);
+  color: var(--color-terminal-text-muted);
 }
 .terminal-prompt {
   display: flex;
   gap: 7px;
-  color: var(--color-terminal-ansi4);
+  color: var(--color-terminal-command);
 }
 
 /* Daily-use chat and project navigation */
@@ -7165,10 +7286,8 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   .diff-scroll > .diff-table {
     animation: panel-enter var(--duration-fast) var(--ease-standard) both;
   }
-  .terminal-drawer {
-    transform-origin: bottom center;
-    animation: terminal-enter var(--duration-moderate) var(--ease-standard) both;
-  }
+  /* The terminal drawer's slide is driven by motion/react in
+     TerminalDrawer.tsx so it can animate out as well as in. */
   /* The file view's "open" language, shared across the app's lists: rows
      slide in off their guide line as a group unfolds. */
   .project-chat-list .chat-row-shell,
@@ -7853,13 +7972,3 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   }
 }
 
-@keyframes terminal-enter {
-  from {
-    opacity: 0;
-    transform: translateY(12px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}

@@ -140,6 +140,26 @@ describe("RightRail", () => {
     expect(callbacks.onOpenProjectFile).toHaveBeenCalledWith(projectFiles[0]);
   });
 
+  it("resolves absolute transcript paths against the root-relative project tree", async () => {
+    const { callbacks } = setup({
+      openProjectFileRequest: { path: "/Users/dev/integrator/src/App.tsx", id: 2 },
+    });
+
+    expect(await screen.findByRole("tab", { name: /App\.tsx/ })).toBeInTheDocument();
+    expect(callbacks.onOpenProjectFile).toHaveBeenCalledWith(projectFiles[0]);
+  });
+
+  it("reports a transcript path that is not in the project tree", async () => {
+    const { callbacks } = setup({
+      openProjectFileRequest: { path: "/elsewhere/missing.ts", id: 3 },
+    });
+
+    expect(
+      await screen.findByText("Could not find /elsewhere/missing.ts in the project files."),
+    ).toBeInTheDocument();
+    expect(callbacks.onOpenProjectFile).not.toHaveBeenCalled();
+  });
+
   it("filters project files and keeps Git diffs out of the Files tab", () => {
     const { snapshot } = setup();
     fireEvent.click(screen.getByRole("tab", { name: "Files" }));

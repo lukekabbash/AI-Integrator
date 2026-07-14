@@ -9,9 +9,9 @@ function terminalTheme(): NonNullable<ConstructorParameters<typeof Terminal>[0]>
   const styles = getComputedStyle(document.documentElement);
   const color = (name: string) => styles.getPropertyValue(name).trim();
   return {
-    background: color("--color-canvas"),
-    foreground: color("--color-text-primary"),
-    cursor: color("--color-accent-primary"),
+    background: color("--color-terminal-surface"),
+    foreground: color("--color-terminal-text"),
+    cursor: color("--color-terminal-text"),
     selectionBackground: color("--color-selection-active"),
     black: color("--color-terminal-ansi0"),
     red: color("--color-terminal-ansi1"),

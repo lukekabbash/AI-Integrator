@@ -616,7 +616,7 @@ export function runtimeTranscript(state: RuntimeProjectionState): TranscriptEven
           diff,
           title: fileChangeVerb(change.changeKind),
           body: change.path,
-          expandedByDefault: true,
+          expandedByDefault: false,
         });
       });
     } else {
@@ -650,7 +650,7 @@ export function runtimeTranscript(state: RuntimeProjectionState): TranscriptEven
         filePath: path,
         diff,
         details: diff ? undefined : itemDetails(item),
-        expandedByDefault: Boolean(diff),
+        expandedByDefault: false,
       });
     }
   }
