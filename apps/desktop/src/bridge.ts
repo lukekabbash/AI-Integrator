@@ -313,6 +313,8 @@ export interface DiffFile {
   lines: DiffLine[];
   /** False only for a native status row whose patch is loaded on first open. */
   diffLoaded?: boolean;
+  /** False only when line counts are unknown (binary or oversized change). */
+  statsLoaded?: boolean;
   /** Native Git bounded the patch before returning it; the review is partial. */
   truncated?: boolean;
 }
@@ -326,6 +328,8 @@ export interface ProjectFileContent {
   path: string;
   content: string;
   isBinary: boolean;
+  /** Inline `data:` URL for image files, so the reader can show a preview. */
+  imageDataUrl?: string | null;
 }
 
 /** A file the user attached to the composer from anywhere on their computer. */
@@ -856,6 +860,8 @@ interface NativeFileStatus {
   indexStatus: string;
   worktreeStatus: string;
   path: string;
+  additions?: number | null;
+  deletions?: number | null;
 }
 
 interface NativeDiff {
@@ -2173,6 +2179,7 @@ export function parseDiffLines(patch: string): DiffLine[] {
 function summarizeNativeGitFile(status: NativeFileStatus): DiffFile {
   const staged = status.indexStatus !== " " && status.indexStatus !== "?";
   const code = staged ? status.indexStatus : status.worktreeStatus;
+  const statsLoaded = typeof status.additions === "number" && typeof status.deletions === "number";
   return {
     path: status.path,
     status:
@@ -2183,11 +2190,12 @@ function summarizeNativeGitFile(status: NativeFileStatus): DiffFile {
           : code === "R"
             ? "renamed"
             : "modified",
-    additions: 0,
-    deletions: 0,
+    additions: status.additions ?? 0,
+    deletions: status.deletions ?? 0,
     staged,
     lines: [],
     diffLoaded: false,
+    statsLoaded,
   };
 }
 
@@ -2224,6 +2232,7 @@ async function loadNativeGitFile(taskId: string, file: DiffFile): Promise<DiffFi
     deletions: lines.filter((line) => line.kind === "delete").length,
     lines,
     diffLoaded: true,
+    statsLoaded: true,
     truncated: diff.truncated,
   };
   const snapshot = nativeGitByTask.get(taskId);

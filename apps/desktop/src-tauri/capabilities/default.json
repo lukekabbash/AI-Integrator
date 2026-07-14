@@ -45,6 +45,7 @@
     "allow-project-file-opener-list",
     "allow-project-file-open",
     "allow-project-file-reveal",
+    "allow-attachment-preview",
     "allow-git-overview",
     "allow-terminal-open",
     "allow-terminal-run",

@@ -566,10 +566,7 @@ async fn run_child(
 async fn drain_diagnostic(mut stderr: impl tokio::io::AsyncRead + Unpin) -> String {
     let mut retained = Vec::with_capacity(DIAGNOSTIC_LIMIT);
     let mut buffer = [0_u8; 4096];
-    loop {
-        let Ok(count) = stderr.read(&mut buffer).await else {
-            break;
-        };
+    while let Ok(count) = stderr.read(&mut buffer).await {
         if count == 0 {
             break;
         }

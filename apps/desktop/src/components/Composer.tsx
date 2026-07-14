@@ -506,14 +506,14 @@ export function Composer({
     (entry) => entry.id !== PROVIDER_DEFAULT_MODEL,
   );
   const activeEntry = catalog.find((entry) => entry.id === model) ?? catalog[0];
-  const activeModel = activeEntry?.id ?? "";
+  const activeModel = activeEntry?.id ?? (model || PROVIDER_DEFAULT_MODEL);
   const modelOptions =
     catalog.length > 0
       ? catalog.map((entry) => ({ value: entry.id, label: entry.label }))
       : [
           {
-            value: "",
-            label: catalogLoaded ? "Model unavailable" : "Checking model…",
+            value: activeModel,
+            label: catalogLoaded ? activeModel : "Checking model…",
             disabled: true,
           },
         ];
@@ -1676,7 +1676,8 @@ export function Composer({
                     .filter((id) => id !== PROVIDER_DEFAULT_MODEL)
                     .map((id) => ({ id, label: id }));
                 const nextModel =
-                  nextRuntimeCatalog.find((entry) => entry.id !== PROVIDER_DEFAULT_MODEL)?.id ?? "";
+                  nextRuntimeCatalog.find((entry) => entry.id !== PROVIDER_DEFAULT_MODEL)?.id ??
+                  PROVIDER_DEFAULT_MODEL;
                 const nextEntry = nextRuntimeCatalog.find((entry) => entry.id === nextModel);
                 const nextEfforts = nextEntry?.efforts ?? [];
                 const nextEffort = resolveModelEffort(nextEntry, defaultEffort);

@@ -159,6 +159,12 @@ pub struct FileStatus {
     pub index_status: char,
     pub worktree_status: char,
     pub path: PathBuf,
+    /// Added/removed line counts for the row's diff scope. `None` when the
+    /// change is binary or the count is unavailable (e.g. plain `status()`).
+    #[serde(default)]
+    pub additions: Option<u64>,
+    #[serde(default)]
+    pub deletions: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -326,12 +332,47 @@ impl GitService {
             }
             _ => None,
         };
+        let mut files = status.files;
+        self.annotate_line_stats(root, &mut files);
         Ok(GitOverview {
             identity,
-            files: status.files,
+            files,
             history,
             push_preview,
         })
+    }
+
+    /// Best-effort added/removed line counts for the rail's file rows, from
+    /// two bounded `git diff --numstat` calls (worktree and index) plus
+    /// direct line counting for untracked files. Failures or binary changes
+    /// leave the affected counts as `None` instead of failing the overview.
+    fn annotate_line_stats(&self, repository: &Path, files: &mut [FileStatus]) {
+        let numstat = |cached: bool| {
+            let mut args = vec!["diff", "--numstat", "--no-renames", "-z"];
+            if cached {
+                args.push("--cached");
+            }
+            self.optional(repository, &args)
+                .ok()
+                .flatten()
+                .map(|output| parse_numstat(&output))
+                .unwrap_or_default()
+        };
+        let unstaged = numstat(false);
+        let staged = numstat(true);
+        for file in files {
+            let stats = if file.index_status == '?' {
+                count_untracked_lines(repository, &file.path).map(|lines| (Some(lines), Some(0)))
+            } else if file.index_status != ' ' {
+                staged.get(&file.path).copied()
+            } else {
+                unstaged.get(&file.path).copied()
+            };
+            if let Some((additions, deletions)) = stats {
+                file.additions = additions;
+                file.deletions = deletions;
+            }
+        }
     }
 
     /// Initialize a fresh repository in an existing empty directory and
@@ -407,6 +448,8 @@ impl GitService {
                     index_status,
                     worktree_status,
                     path: PathBuf::from(path),
+                    additions: None,
+                    deletions: None,
                 })
             })
             .collect())
@@ -1088,6 +1131,8 @@ fn parse_porcelain_v2(output: &str, include_files: bool) -> PorcelainStatus {
                 index_status: '?',
                 worktree_status: '?',
                 path: PathBuf::from(path),
+                additions: None,
+                deletions: None,
             }),
             _ => None,
         };
@@ -1110,11 +1155,59 @@ fn parse_v2_tracked(record: &str, fields: usize) -> Option<FileStatus> {
         index_status,
         worktree_status,
         path: PathBuf::from(path),
+        additions: None,
+        deletions: None,
     })
 }
 
 fn normalize_v2_status(status: char) -> char {
     if status == '.' { ' ' } else { status }
+}
+
+/// Parse NUL-terminated `git diff --numstat --no-renames -z` records into
+/// per-path line counts. Binary changes report `-` and parse to `None`.
+fn parse_numstat(output: &str) -> HashMap<PathBuf, (Option<u64>, Option<u64>)> {
+    let mut stats = HashMap::new();
+    for record in output.split_terminator('\0') {
+        let mut fields = record.splitn(3, '\t');
+        let (Some(added), Some(removed), Some(path)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if path.is_empty() {
+            continue;
+        }
+        stats.insert(PathBuf::from(path), (added.parse().ok(), removed.parse().ok()));
+    }
+    stats
+}
+
+const MAX_UNTRACKED_STAT_BYTES: u64 = 1_000_000;
+
+/// Line count for an untracked file so its rail row can show `+n` without
+/// generating a per-file diff. Returns `None` for binary, oversized, or
+/// unreadable files, and for paths that resolve outside the repository.
+fn count_untracked_lines(repository: &Path, path: &Path) -> Option<u64> {
+    let canonical = dunce::canonicalize(repository.join(path)).ok()?;
+    if !canonical.starts_with(repository) {
+        return None;
+    }
+    let metadata = fs::metadata(&canonical).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_UNTRACKED_STAT_BYTES {
+        return None;
+    }
+    let bytes = fs::read(&canonical).ok()?;
+    if bytes.contains(&0) {
+        return None;
+    }
+    if bytes.is_empty() {
+        return Some(0);
+    }
+    let mut lines = bytes.iter().filter(|byte| **byte == b'\n').count() as u64;
+    if bytes.last() != Some(&b'\n') {
+        lines += 1;
+    }
+    Some(lines)
 }
 
 fn sanitize_remote_url(value: &str) -> String {

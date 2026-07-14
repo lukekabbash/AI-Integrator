@@ -10,6 +10,8 @@ import {
 import { AnimatePresence, m as motion, useReducedMotion } from "motion/react";
 import {
   Activity,
+  ArrowDown,
+  ArrowUp,
   AtSign,
   ChevronDown,
   ChevronRight,
@@ -202,9 +204,6 @@ function GitPanel({
   const [stagedLimit, setStagedLimit] = useState(INITIAL_GIT_FILE_ROWS);
   const [unstagedLimit, setUnstagedLimit] = useState(INITIAL_GIT_FILE_ROWS);
   const [commitMenuOpen, setCommitMenuOpen] = useState(false);
-  const [pushConfirmation, setPushConfirmation] = useState<"existing" | "after-commit" | null>(
-    null,
-  );
   const [fileContextMenu, setFileContextMenu] = useState<{
     file: DiffFile;
     x: number;
@@ -258,7 +257,7 @@ function GitPanel({
     let deletions = 0;
     for (const file of git.files) {
       (file.staged ? staged : unstaged).push(file);
-      if (file.diffLoaded === false) lineStatsLoaded = false;
+      if (file.statsLoaded === false) lineStatsLoaded = false;
       additions += file.additions;
       deletions += file.deletions;
     }
@@ -345,12 +344,18 @@ function GitPanel({
     setBusy("commit-push");
     setActionError(null);
     setCommitMenuOpen(false);
+    let committed = false;
     try {
       await onCommit(message.trim());
+      committed = true;
       setMessage("");
-      setPushConfirmation("after-commit");
+      await onPush();
     } catch (error) {
-      setActionError(getErrorMessage(error));
+      setActionError(
+        committed
+          ? `Committed locally. Push failed: ${getErrorMessage(error)}`
+          : getErrorMessage(error),
+      );
     } finally {
       setBusy(null);
     }
@@ -363,13 +368,8 @@ function GitPanel({
     setActionError(null);
     try {
       await onPush();
-      setPushConfirmation(null);
     } catch (error) {
-      setActionError(
-        pushConfirmation === "after-commit"
-          ? `Committed locally. Push failed: ${getErrorMessage(error)}`
-          : getErrorMessage(error),
-      );
+      setActionError(getErrorMessage(error));
     } finally {
       setBusy(null);
     }
@@ -438,16 +438,19 @@ function GitPanel({
         );
       }}
     >
-      <button
-        className="git-stage-button"
-        type="button"
-        onClick={() => void runStage(file, !isStaged)}
-        disabled={stagingPath !== null || busy !== null}
-        aria-busy={stagingPath === file.path}
-        aria-label={`${isStaged ? "Unstage" : "Stage"} ${file.path}`}
-      >
-        {isStaged ? <Minus /> : <Plus />}
-      </button>
+      <span className="git-file-glyph">
+        <FileIcon fileName={file.path} />
+        <button
+          className="git-stage-button"
+          type="button"
+          onClick={() => void runStage(file, !isStaged)}
+          disabled={stagingPath !== null || busy !== null}
+          aria-busy={stagingPath === file.path}
+          aria-label={`${isStaged ? "Unstage" : "Stage"} ${file.path}`}
+        >
+          {isStaged ? <Minus /> : <Plus />}
+        </button>
+      </span>
       <button
         className="git-file-name"
         type="button"
@@ -462,12 +465,11 @@ function GitPanel({
         title={file.path}
         aria-pressed={activeFile?.path === file.path}
       >
-        <FileIcon fileName={file.path} />
         <span>{file.path.split("/").at(-1)}</span>
         <small>{file.path.split("/").slice(0, -1).join("/")}</small>
       </button>
       <span className="file-change-count">
-        {file.diffLoaded === false ? (
+        {file.statsLoaded === false ? (
           <small aria-label="Line counts load when this diff is opened">…</small>
         ) : (
           <>
@@ -490,6 +492,20 @@ function GitPanel({
             <small title={git.worktree}>{git.worktree || "Repository not loaded"}</small>
           </span>
         </div>
+        <Tooltip
+          label={`${git.ahead} ahead · ${git.behind} behind${git.upstream ? ` · ${git.upstream}` : ""}`}
+        >
+          <span
+            className="sync-pill"
+            data-dirty={git.ahead > 0 || git.behind > 0}
+            aria-label={`${git.ahead} commits ahead, ${git.behind} behind ${git.upstream || "upstream"}`}
+          >
+            <ArrowUp aria-hidden="true" />
+            {git.ahead}
+            <ArrowDown aria-hidden="true" />
+            {git.behind}
+          </span>
+        </Tooltip>
         <Tooltip label="Refresh Git status">
           <button
             className="icon-button subtle git-refresh-button"
@@ -502,14 +518,6 @@ function GitPanel({
             <RefreshCw className={busy === "refresh" ? "spin-slow" : undefined} />
           </button>
         </Tooltip>
-      </div>
-      <div className="sync-status">
-        <span>
-          {staged.length} staged · {unstaged.length} to review
-        </span>
-        <small>
-          {git.ahead} ahead · {git.behind} behind · {git.upstream}
-        </small>
       </div>
       <div className="git-overview-actions">
         <button
@@ -539,7 +547,7 @@ function GitPanel({
         </span>
       </div>
 
-      <div className="commit-composer">
+      <div className="commit-card">
         <label className="sr-only" htmlFor="git-commit-message">
           Commit message
         </label>
@@ -591,8 +599,7 @@ function GitPanel({
             </motion.span>
           </button>
         </Tooltip>
-      </div>
-      <div className="commit-split" ref={commitMenuRef}>
+        <div className="commit-split" ref={commitMenuRef}>
         <button
           className="primary-button commit-button"
           type="button"
@@ -639,22 +646,19 @@ function GitPanel({
             >
               <GitCommitHorizontal />
               <span>
-                <strong>Commit &amp; push…</strong>
-                <small>Commit locally, then review the push</small>
+                <strong>Commit &amp; push</strong>
+                <small>Commit locally, then push to {git.upstream || "upstream"}</small>
               </span>
             </button>
             <button
               type="button"
               role="menuitem"
-              onClick={() => {
-                setCommitMenuOpen(false);
-                setPushConfirmation("existing");
-              }}
+              onClick={() => void runPush()}
               disabled={git.ahead === 0}
             >
               <SquareArrowOutUpRight />
               <span>
-                <strong>Push{git.ahead ? ` ${git.ahead}` : ""}…</strong>
+                <strong>Push{git.ahead ? ` ${git.ahead}` : ""}</strong>
                 <small>
                   {git.ahead
                     ? `${git.ahead} local commit${git.ahead === 1 ? "" : "s"}`
@@ -664,40 +668,8 @@ function GitPanel({
             </button>
           </div>
         ) : null}
-      </div>
-      {pushConfirmation ? (
-        <div
-          className="push-confirmation"
-          role="dialog"
-          aria-label="Confirm Git push"
-          aria-describedby="push-confirmation-detail"
-        >
-          <span>
-            <strong>Push {git.branch}?</strong>
-            <small id="push-confirmation-detail">
-              {git.ahead} commit{git.ahead === 1 ? "" : "s"} to {git.upstream || "upstream"}
-              {git.behind ? ` · ${git.behind} behind` : ""}
-            </small>
-          </span>
-          <div>
-            <button
-              className="ghost-button"
-              type="button"
-              onClick={() => setPushConfirmation(null)}
-            >
-              Cancel
-            </button>
-            <button
-              className="primary-button"
-              type="button"
-              onClick={() => void runPush()}
-              disabled={git.ahead === 0 || busy !== null}
-            >
-              <SquareArrowOutUpRight /> {busy === "push" ? "Pushing…" : "Push now"}
-            </button>
-          </div>
         </div>
-      ) : null}
+      </div>
       {actionError ? (
         <p className="git-action-error" role="alert">
           {actionError}
@@ -1879,7 +1851,14 @@ function FilePanel({
                   </p>
                 ) : null}
                 {activeFile ? (
-                  activeFile.isBinary ? (
+                  activeFile.imageDataUrl ? (
+                    <div className="file-reader-image">
+                      <img
+                        src={activeFile.imageDataUrl}
+                        alt={activeFile.path.split("/").at(-1) ?? activeFile.path}
+                      />
+                    </div>
+                  ) : activeFile.isBinary ? (
                     <p className="empty-compact">
                       This binary file cannot be safely previewed as text.
                     </p>

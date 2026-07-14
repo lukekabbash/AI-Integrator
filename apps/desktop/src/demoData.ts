@@ -508,10 +508,43 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
     worktree: "Projects/AI Integrator",
     files: diff,
     commits: [
-      { id: "working", subject: "Working tree changes", relativeTime: "now", current: true },
-      { id: "d42e91b", subject: "Define local-first v1 contracts", relativeTime: "22m" },
-      { id: "8a7c10f", subject: "Add native workspace scaffold", relativeTime: "41m" },
-      { id: "2c18fd4", subject: "Initialize product specification", relativeTime: "2h" },
+      {
+        id: "working",
+        subject: "Working tree changes",
+        relativeTime: "now",
+        current: true,
+        parents: ["d42e91b"],
+        unpushed: true,
+      },
+      {
+        id: "d42e91b",
+        subject: "Define local-first v1 contracts",
+        relativeTime: "22m",
+        parents: ["8a7c10f"],
+        refs: ["feature/v1-native-app"],
+        unpushed: true,
+      },
+      {
+        id: "8a7c10f",
+        subject: "Add native workspace scaffold",
+        relativeTime: "41m",
+        parents: ["2c18fd4", "9e1f2a3"],
+        unpushed: true,
+      },
+      {
+        id: "9e1f2a3",
+        subject: "Prototype broker handshake",
+        relativeTime: "1h",
+        parents: ["2c18fd4"],
+        refs: ["spike/broker-handshake"],
+      },
+      {
+        id: "2c18fd4",
+        subject: "Initialize product specification",
+        relativeTime: "2h",
+        parents: [],
+        refs: ["origin/feature/v1-native-app", "main"],
+      },
     ],
   };
 

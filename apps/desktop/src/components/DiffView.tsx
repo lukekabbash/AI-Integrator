@@ -396,8 +396,8 @@ export function DiffView({
           </span>
         </div>
         <div className="diff-summary">
-          <span className="diff-add">{file.diffLoaded === false ? "…" : `+${file.additions}`}</span>
-          {file.diffLoaded === false ? null : (
+          <span className="diff-add">{file.statsLoaded === false ? "…" : `+${file.additions}`}</span>
+          {file.statsLoaded === false ? null : (
             <span className="diff-delete">−{file.deletions}</span>
           )}
         </div>

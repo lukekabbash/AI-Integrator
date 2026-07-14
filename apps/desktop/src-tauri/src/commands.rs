@@ -1484,6 +1484,11 @@ pub struct ProjectFileContent {
     path: String,
     content: String,
     is_binary: bool,
+    /// Inline `data:` URL for recognized image files so the renderer can show a
+    /// real preview instead of the "binary file" placeholder. `None` for text
+    /// files and for binaries we can't display as an image.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_data_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1605,6 +1610,23 @@ pub async fn project_file_reveal(
 /// Upper bound for inline attachment previews returned to the renderer.
 const ATTACHMENT_PREVIEW_MAX_BYTES: u64 = 12 * 1024 * 1024;
 
+/// Maps a lowercase file extension to an image MIME type when the extension
+/// names a format we can preview inline. Shared by the composer attachment
+/// preview and the in-app project file reader so both accept the same set.
+fn image_mime_for_extension(extension: &str) -> Option<&'static str> {
+    match extension {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "svg" => Some("image/svg+xml"),
+        "ico" => Some("image/x-icon"),
+        "avif" => Some("image/avif"),
+        _ => None,
+    }
+}
+
 /// Returns an inline `data:` URL preview for an image the user attached from
 /// the native file dialog. Attachment paths are user-picked and therefore not
 /// confined to a trusted project; only recognized image types under the size
@@ -1618,17 +1640,7 @@ pub async fn attachment_preview(path: PathBuf) -> CommandResult<Option<String>> 
             .and_then(|value| value.to_str())
             .map(|value| value.to_ascii_lowercase())
             .unwrap_or_default();
-        let mime = match extension.as_str() {
-            "png" => "image/png",
-            "jpg" | "jpeg" => "image/jpeg",
-            "gif" => "image/gif",
-            "webp" => "image/webp",
-            "bmp" => "image/bmp",
-            "svg" => "image/svg+xml",
-            "ico" => "image/x-icon",
-            "avif" => "image/avif",
-            _ => return None,
-        };
+        let mime = image_mime_for_extension(&extension)?;
         let metadata = fs::metadata(&path).ok()?;
         if !metadata.is_file() || metadata.len() > ATTACHMENT_PREVIEW_MAX_BYTES {
             return None;
@@ -4771,13 +4783,33 @@ fn read_project_file(
             "requested path is not a file".into(),
         ));
     }
-    if metadata.len() > MAX_PROJECT_FILE_BYTES {
+    // Recognized images are previewed inline as data URLs, so they earn the more
+    // generous attachment budget rather than the small text-preview limit.
+    let image_mime = canonical
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .and_then(|value| image_mime_for_extension(&value));
+    let size_limit = if image_mime.is_some() {
+        ATTACHMENT_PREVIEW_MAX_BYTES
+    } else {
+        MAX_PROJECT_FILE_BYTES
+    };
+    if metadata.len() > size_limit {
         return Err(IntegratorError::Unavailable(format!(
             "file is larger than the {} KB safe preview limit",
-            MAX_PROJECT_FILE_BYTES / 1_000
+            size_limit / 1_000
         )));
     }
     let bytes = fs::read(&canonical).map_err(io_error)?;
+    if let Some(mime) = image_mime {
+        return Ok(ProjectFileContent {
+            path: normalized_relative_path(&relative),
+            content: String::new(),
+            is_binary: true,
+            image_data_url: Some(format!("data:{mime};base64,{}", BASE64.encode(&bytes))),
+        });
+    }
     let is_binary = bytes.contains(&0);
     Ok(ProjectFileContent {
         path: normalized_relative_path(&relative),
@@ -4787,6 +4819,7 @@ fn read_project_file(
             String::from_utf8_lossy(&bytes).into_owned()
         },
         is_binary,
+        image_data_url: None,
     })
 }
 
@@ -5548,6 +5581,51 @@ mod tests {
         assert_eq!(content.path, "src/runtime/router.ts");
         assert_eq!(content.content, "export const route = true;\n");
         assert!(!content.is_binary);
+        assert!(content.image_data_url.is_none());
+
+        fs::remove_dir_all(&root).expect("clean up project directory");
+    }
+
+    #[test]
+    fn reads_an_image_file_as_an_inline_data_url_preview() {
+        let root = std::env::temp_dir().join(format!("project-image-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create project directory");
+        // A one-pixel PNG: real image bytes that also contain NUL, proving the
+        // image branch bypasses the text/binary heuristic.
+        let png = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        fs::write(root.join("logo.png"), png).expect("write image file");
+        let root = dunce::canonicalize(&root).expect("canonicalize project root");
+
+        let content = read_project_file(&root, "logo.png").expect("read image file");
+        assert_eq!(content.path, "logo.png");
+        assert!(content.content.is_empty());
+        assert!(content.is_binary);
+        let data_url = content.image_data_url.expect("image preview data url");
+        assert!(
+            data_url.starts_with("data:image/png;base64,"),
+            "unexpected data url prefix: {data_url}"
+        );
+
+        fs::remove_dir_all(&root).expect("clean up project directory");
+    }
+
+    #[test]
+    fn reads_a_non_image_binary_without_an_image_preview() {
+        let root = std::env::temp_dir().join(format!("project-binary-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create project directory");
+        fs::write(root.join("blob.bin"), [0x00, 0x01, 0x02, 0x00]).expect("write binary file");
+        let root = dunce::canonicalize(&root).expect("canonicalize project root");
+
+        let content = read_project_file(&root, "blob.bin").expect("read binary file");
+        assert!(content.is_binary);
+        assert!(content.content.is_empty());
+        assert!(content.image_data_url.is_none());
 
         fs::remove_dir_all(&root).expect("clean up project directory");
     }

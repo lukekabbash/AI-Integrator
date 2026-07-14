@@ -456,7 +456,11 @@ export function Transcript({
   const [copiedEventId, setCopiedEventId] = useState<string | null>(null);
   const [copyFailureId, setCopyFailureId] = useState<string | null>(null);
   const [hasNewContent, setHasNewContent] = useState(false);
-  const [liveStreamOpen, setLiveStreamOpen] = useState(false);
+  const [liveStream, setLiveStream] = useState({ running, open: false });
+  if (liveStream.running !== running) {
+    setLiveStream({ running, open: false });
+  }
+  const liveStreamOpen = liveStream.open;
   const clearCopyStatus = useRef<number | undefined>(undefined);
   const contentRef = useRef<HTMLDivElement>(null);
   const shouldFollowLatestRef = useRef(true);
@@ -473,11 +477,6 @@ export function Transcript({
     regenerateRef.current = onRegenerate;
     openFileRef.current = onOpenFile;
   }, [onAskAbout, onOpenFile, onRegenerate]);
-
-  // A fresh turn starts with the live stream folded back to one line.
-  useEffect(() => {
-    if (!running) setLiveStreamOpen(false);
-  }, [running]);
 
   const scheduleFollow = useCallback(() => {
     if (!shouldFollowLatestRef.current) return;
@@ -665,7 +664,9 @@ export function Transcript({
           <button
             className="task-now-toggle"
             type="button"
-            onClick={() => liveActivity && setLiveStreamOpen((value) => !value)}
+            onClick={() =>
+              liveActivity && setLiveStream((current) => ({ ...current, open: !current.open }))
+            }
             aria-expanded={liveActivity ? liveStreamOpen : undefined}
             disabled={!liveActivity}
             title={liveActivity ? "Show the live activity stream" : undefined}

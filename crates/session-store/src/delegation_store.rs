@@ -370,7 +370,7 @@ impl LocalStore {
                 result.push((delegation.clone(), message));
             }
         }
-        result.sort_by(|a, b| a.1.created_at.cmp(&b.1.created_at));
+        result.sort_by_key(|entry| entry.1.created_at);
         Ok(result)
     }
 }

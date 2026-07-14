@@ -9,13 +9,13 @@ interface TaskStatusPillProps {
   activeAgentCount?: number;
 }
 
-export function formatTokens(tokens: number): string {
+function formatTokens(tokens: number): string {
   if (tokens < 1_000) return `${tokens} tokens`;
   if (tokens < 1_000_000) return `${(tokens / 1_000).toFixed(tokens < 10_000 ? 1 : 0)}k tokens`;
   return `${(tokens / 1_000_000).toFixed(tokens < 10_000_000 ? 1 : 0)}m tokens`;
 }
 
-export function formatElapsed(since: string, nowMs: number): string {
+function formatElapsed(since: string, nowMs: number): string {
   const elapsedMs = nowMs - new Date(since).getTime();
   if (!Number.isFinite(elapsedMs) || elapsedMs < 0) return "";
   if (elapsedMs < 60_000) return `${(elapsedMs / 1_000).toFixed(1)}s`;

@@ -319,7 +319,7 @@ describe("RightRail", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("Provider is unavailable");
   });
 
-  it("keeps commit and push distinct inside the compact split action", async () => {
+  it("commits and pushes immediately from the compact split action", async () => {
     const onCommit = vi.fn().mockResolvedValue(undefined);
     const onPush = vi.fn().mockRejectedValue(new Error("Confirmed native push is unavailable"));
     setup({ onCommit, onPush });
@@ -331,14 +331,23 @@ describe("RightRail", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: /Commit & push/i }));
 
     await waitFor(() => expect(onCommit).toHaveBeenCalledWith("Ship the staged change"));
-    expect(onPush).not.toHaveBeenCalled();
-    expect(screen.getByRole("dialog", { name: "Confirm Git push" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /Push now/i }));
     await waitFor(() => expect(onPush).toHaveBeenCalledTimes(1));
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Committed locally. Push failed: Confirmed native push is unavailable",
     );
     expect(screen.getByRole("textbox", { name: "Commit message" })).toHaveValue("");
+  });
+
+  it("skips the commit when only pushing existing local commits", async () => {
+    const onCommit = vi.fn().mockResolvedValue(undefined);
+    const onPush = vi.fn().mockResolvedValue(undefined);
+    setup({ onCommit, onPush });
+
+    fireEvent.click(screen.getByRole("button", { name: "More commit actions" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /^Push/i }));
+
+    await waitFor(() => expect(onPush).toHaveBeenCalledTimes(1));
+    expect(onCommit).not.toHaveBeenCalled();
   });
 
   it("keeps Git panes independently scrollable with the graph last and resizable", () => {

@@ -2302,6 +2302,26 @@ export default function App() {
     setSnapshot((current) => ({ ...current, git }));
   };
 
+  const loadMoreGitHistory = async () => {
+    if (!activeTask) return;
+    const taskId = activeTask.id;
+    const page = await bridge.loadTaskGitHistory(taskId, snapshot.git.commits.length);
+    setSnapshot((current) => {
+      if (current.activeTaskId !== taskId) return current;
+      const known = new Set(current.git.commits.map((commit) => commit.id));
+      const git = {
+        ...current.git,
+        commits: [
+          ...current.git.commits,
+          ...page.commits.filter((commit) => !known.has(commit.id)),
+        ],
+        historyHasMore: page.hasMore,
+      };
+      taskGitCache.current.set(taskId, git);
+      return { ...current, git };
+    });
+  };
+
   const refreshGit = async () => {
     if (!activeTask) {
       setSnapshot((current) => ({
@@ -3423,6 +3443,7 @@ export default function App() {
                         onPush={push}
                         onReviewChanges={reviewChanges}
                         onRefreshGit={refreshGit}
+                        onLoadMoreGitHistory={loadMoreGitHistory}
                         onResize={(delta) =>
                           setRightRailWidth((current) => clampDimension(current - delta, 300, 520))
                         }
