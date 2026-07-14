@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { LazyMotion, domAnimation } from "motion/react";
 import { describe, expect, it, vi } from "vitest";
 import { createDemoSnapshot } from "../demoData";
 import type { DelegationView, ProjectFileContent, ProjectFileEntry } from "../bridge";
@@ -30,22 +31,46 @@ function setup(overrides?: Partial<Parameters<typeof RightRail>[0]>) {
     onRefreshGit: vi.fn().mockResolvedValue(undefined),
   };
   render(
-    <RightRail
-      git={snapshot.git}
-      children={snapshot.children}
-      usage={snapshot.usage}
-      activeFile={snapshot.git.files[0]}
-      projectId="integrator"
-      projectFiles={projectFiles}
-      projectFilesState="ready"
-      {...callbacks}
-      {...overrides}
-    />,
+    <LazyMotion features={domAnimation} strict>
+      <RightRail
+        git={snapshot.git}
+        children={snapshot.children}
+        usage={snapshot.usage}
+        activeFile={snapshot.git.files[0]}
+        projectId="integrator"
+        projectFiles={projectFiles}
+        projectFilesState="ready"
+        {...callbacks}
+        {...overrides}
+      />
+    </LazyMotion>,
   );
   return { snapshot, callbacks };
 }
 
 describe("RightRail", () => {
+  it("does not offer Git setup while repository detection is still running", () => {
+    setup({
+      gitLoading: true,
+      git: {
+        kind: "notRepository",
+        branch: "",
+        upstream: "",
+        ahead: 0,
+        behind: 0,
+        worktree: "/Users/me/Projects/existing-repository",
+        remotes: [],
+        files: [],
+        commits: [],
+      },
+    });
+
+    expect(screen.getByRole("status")).toHaveTextContent("Checking repository…");
+    expect(
+      screen.queryByRole("heading", { name: "Set up Git for this folder" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("treats an ordinary folder as an intentional Git setup state", async () => {
     const onInitializeGit = vi.fn().mockResolvedValue(undefined);
     setup({
@@ -71,7 +96,7 @@ describe("RightRail", () => {
     expect(onInitializeGit).toHaveBeenCalledOnce();
   });
 
-  it("surfaces local-only publishing and keeps remote management in the Git menu", () => {
+  it("surfaces local-only publishing and keeps remote management in the Git menu", async () => {
     const snapshot = createDemoSnapshot();
     setup({ git: { ...snapshot.git, upstream: "", remotes: [] } });
 
@@ -79,7 +104,10 @@ describe("RightRail", () => {
     expect(screen.getByRole("button", { name: "Publish to GitHub" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Connect remote" })).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "More Git actions" }));
-    expect(screen.getByRole("menuitem", { name: /Manage remotes/i })).toBeVisible();
+    // The menu springs in via motion, so wait for its enter animation.
+    await waitFor(() =>
+      expect(screen.getByRole("menuitem", { name: /Manage remotes/i })).toBeVisible(),
+    );
     // Commit & push stays discoverable even without a remote — disabled, with
     // the reason spelled out instead of vanishing from the menu.
     const commitAndPush = screen.getByRole("menuitem", { name: /Commit & push/i });

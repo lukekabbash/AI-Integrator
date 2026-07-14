@@ -56,8 +56,9 @@ import type {
 import { ResizeHandle } from "./ResizeHandle";
 import { Tooltip } from "./Tooltip";
 
+const loadGitRemoteDialog = () => import("./GitRemoteDialog");
 const GitRemoteDialog = lazy(() =>
-  import("./GitRemoteDialog").then((module) => ({ default: module.GitRemoteDialog })),
+  loadGitRemoteDialog().then((module) => ({ default: module.GitRemoteDialog })),
 );
 
 type RailTab = "git" | "agents" | "files" | "usage";
@@ -292,6 +293,8 @@ function collapseCommitRefs(refs: string[], upstream: string, branch: string): C
 
 interface RightRailProps {
   git: GitSnapshot;
+  /** True while the selected folder is being checked for an existing repository. */
+  gitLoading?: boolean;
   children: ChildAgent[];
   /** Live delegated subagents from the native broker; overrides `children`. */
   delegations?: DelegationView[];
@@ -406,6 +409,7 @@ function useDismissableMenu(
 
 function GitPanel({
   git,
+  gitLoading,
   activeFile,
   onSelectFile,
   onStageFile,
@@ -430,6 +434,7 @@ function GitPanel({
 }: Pick<
   RightRailProps,
   | "git"
+  | "gitLoading"
   | "activeFile"
   | "onSelectFile"
   | "onStageFile"
@@ -466,6 +471,12 @@ function GitPanel({
   const [remoteDialog, setRemoteDialog] = useState<
     "manage" | "connect" | "github" | "branch" | null
   >(null);
+  // Warm the lazy dialog chunk shortly after the panel mounts so the first
+  // open animates immediately instead of stalling on the import.
+  useEffect(() => {
+    const warm = window.setTimeout(() => void loadGitRemoteDialog(), 500);
+    return () => window.clearTimeout(warm);
+  }, []);
   const [fileContextMenu, setFileContextMenu] = useState<{
     file: DiffFile;
     x: number;
@@ -772,6 +783,67 @@ function GitPanel({
     </div>
   );
 
+  if (gitLoading) {
+    return (
+      <div
+        className="rail-panel git-panel git-panel--skeleton"
+        role="status"
+        aria-live="polite"
+        aria-label="Checking repository"
+      >
+        <span className="sr-only">Checking repository…</span>
+        <div className="git-skeleton-branch" aria-hidden="true">
+          <i className="git-skeleton-block git-skeleton-icon" />
+          <span>
+            <i className="git-skeleton-block git-skeleton-line git-skeleton-line--branch" />
+            <i className="git-skeleton-block git-skeleton-line git-skeleton-line--path" />
+          </span>
+          <i className="git-skeleton-block git-skeleton-sync" />
+        </div>
+        <div className="git-skeleton-summary" aria-hidden="true">
+          <i className="git-skeleton-block git-skeleton-review" />
+          <i className="git-skeleton-block git-skeleton-stat" />
+        </div>
+        <i className="git-skeleton-block git-skeleton-composer" aria-hidden="true" />
+        <i className="git-skeleton-block git-skeleton-commit" aria-hidden="true" />
+        <div className="git-skeleton-section" aria-hidden="true">
+          <div className="git-skeleton-section-head">
+            <i className="git-skeleton-block git-skeleton-label" />
+            <i className="git-skeleton-block git-skeleton-action" />
+          </div>
+          {[72, 58, 66].map((width) => (
+            <div className="git-skeleton-file" key={width}>
+              <i className="git-skeleton-block git-skeleton-file-icon" />
+              <i
+                className="git-skeleton-block git-skeleton-file-name"
+                style={{ width: `${width}%` }}
+              />
+              <i className="git-skeleton-block git-skeleton-file-stat" />
+            </div>
+          ))}
+        </div>
+        <div className="git-skeleton-graph" aria-hidden="true">
+          <div className="git-skeleton-section-head">
+            <i className="git-skeleton-block git-skeleton-label git-skeleton-label--graph" />
+            <i className="git-skeleton-block git-skeleton-action" />
+          </div>
+          {[78, 64, 70, 56].map((width) => (
+            <div className="git-skeleton-commit-row" key={width}>
+              <i className="git-skeleton-node" />
+              <span>
+                <i
+                  className="git-skeleton-block git-skeleton-commit-subject"
+                  style={{ width: `${width}%` }}
+                />
+                <i className="git-skeleton-block git-skeleton-commit-meta" />
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
   if (git.kind === "notRepository") {
     return (
       <div className="rail-panel git-panel git-panel--empty">
@@ -973,116 +1045,145 @@ function GitPanel({
           }}
           disabled={busy !== null}
         >
-          <ChevronDown />
-        </button>
-        {commitMenuOpen ? (
-          <div
-            className="compact-action-menu commit-action-menu"
-            role="menu"
-            aria-label="Git actions"
-            onKeyDown={handleMenuNavigation}
+          <motion.span
+            className="commit-menu-chevron"
+            aria-hidden="true"
+            animate={{ rotate: commitMenuOpen ? 180 : 0 }}
+            transition={
+              reduceMotion ? { duration: 0 } : { type: "spring", stiffness: 480, damping: 30 }
+            }
           >
-            <button
-              type="button"
-              role="menuitem"
-              onClick={() => void runCommitAndPush()}
-              disabled={!git.upstream || !message.trim() || !staged.length}
+            <ChevronDown />
+          </motion.span>
+        </button>
+        <AnimatePresence>
+          {commitMenuOpen ? (
+            <motion.div
+              className="compact-action-menu commit-action-menu"
+              role="menu"
+              aria-label="Git actions"
+              onKeyDown={handleMenuNavigation}
+              style={{ transformOrigin: "top right" }}
+              initial={reduceMotion ? { opacity: 0 } : { opacity: 0, y: -8, scale: 0.94 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={
+                reduceMotion
+                  ? { opacity: 0, transition: { duration: 0.08 } }
+                  : {
+                      opacity: 0,
+                      y: -6,
+                      scale: 0.97,
+                      transition: { duration: 0.12, ease: "easeIn" },
+                    }
+              }
+              transition={
+                reduceMotion
+                  ? { duration: 0.08 }
+                  : { type: "spring", stiffness: 560, damping: 34, mass: 0.7 }
+              }
             >
-              <GitCommitHorizontal />
-              <span>
-                <strong>Commit &amp; push</strong>
-                <small>
-                  {!git.upstream
-                    ? git.remotes.length
-                      ? "Publish this branch first to enable pushing"
-                      : "Connect a remote first to enable pushing"
-                    : !staged.length
-                      ? "Stage changes to commit"
-                      : !message.trim()
-                        ? "Write a commit message first"
-                        : `Commit locally, then push to ${git.upstream}`}
-                </small>
-              </span>
-            </button>
-            {git.upstream && git.ahead > 0 ? (
-              <button type="button" role="menuitem" onClick={() => void runPush()}>
-                <SquareArrowOutUpRight />
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => void runCommitAndPush()}
+                disabled={!git.upstream || !message.trim() || !staged.length}
+              >
+                <GitCommitHorizontal />
                 <span>
-                  <strong>Push {git.ahead}</strong>
+                  <strong>Commit &amp; push</strong>
                   <small>
-                    {git.ahead} local commit{git.ahead === 1 ? "" : "s"}
+                    {!git.upstream
+                      ? git.remotes.length
+                        ? "Publish this branch first to enable pushing"
+                        : "Connect a remote first to enable pushing"
+                      : !staged.length
+                        ? "Stage changes to commit"
+                        : !message.trim()
+                          ? "Write a commit message first"
+                          : `Commit locally, then push to ${git.upstream}`}
                   </small>
                 </span>
               </button>
-            ) : null}
-            {git.remotes.length || git.upstream ? (
+              {git.upstream && git.ahead > 0 ? (
+                <button type="button" role="menuitem" onClick={() => void runPush()}>
+                  <SquareArrowOutUpRight />
+                  <span>
+                    <strong>Push {git.ahead}</strong>
+                    <small>
+                      {git.ahead} local commit{git.ahead === 1 ? "" : "s"}
+                    </small>
+                  </span>
+                </button>
+              ) : null}
+              {git.remotes.length || git.upstream ? (
+                <span className="compact-action-menu-separator" role="separator" />
+              ) : null}
+              {git.remotes.length ? (
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setCommitMenuOpen(false);
+                    void runRemoteAction(() => onFetch?.() ?? Promise.resolve());
+                  }}
+                >
+                  <Download />
+                  <span>
+                    <strong>Fetch</strong>
+                    <small>Update remote branches</small>
+                  </span>
+                </button>
+              ) : null}
+              {git.upstream ? (
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setCommitMenuOpen(false);
+                    void runRemoteAction(() => onPull?.("fastForwardOnly") ?? Promise.resolve());
+                  }}
+                >
+                  <ArrowDown />
+                  <span>
+                    <strong>Pull</strong>
+                    <small>Fast-forward only</small>
+                  </span>
+                </button>
+              ) : null}
+              {!git.upstream && git.remotes.length ? (
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setCommitMenuOpen(false);
+                    setRemoteDialog("branch");
+                  }}
+                >
+                  <CloudUpload />
+                  <span>
+                    <strong>Publish branch</strong>
+                    <small>Set an upstream remote</small>
+                  </span>
+                </button>
+              ) : null}
               <span className="compact-action-menu-separator" role="separator" />
-            ) : null}
-            {git.remotes.length ? (
               <button
                 type="button"
                 role="menuitem"
                 onClick={() => {
                   setCommitMenuOpen(false);
-                  void runRemoteAction(() => onFetch?.() ?? Promise.resolve());
+                  setRemoteDialog("manage");
                 }}
               >
-                <Download />
+                <Link />
                 <span>
-                  <strong>Fetch</strong>
-                  <small>Update remote branches</small>
+                  <strong>Manage remotes</strong>
+                  <small>Add, edit, remove, or fetch</small>
                 </span>
               </button>
-            ) : null}
-            {git.upstream ? (
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  setCommitMenuOpen(false);
-                  void runRemoteAction(() => onPull?.("fastForwardOnly") ?? Promise.resolve());
-                }}
-              >
-                <ArrowDown />
-                <span>
-                  <strong>Pull</strong>
-                  <small>Fast-forward only</small>
-                </span>
-              </button>
-            ) : null}
-            {!git.upstream && git.remotes.length ? (
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  setCommitMenuOpen(false);
-                  setRemoteDialog("branch");
-                }}
-              >
-                <CloudUpload />
-                <span>
-                  <strong>Publish branch</strong>
-                  <small>Set an upstream remote</small>
-                </span>
-              </button>
-            ) : null}
-            <span className="compact-action-menu-separator" role="separator" />
-            <button
-              type="button"
-              role="menuitem"
-              onClick={() => {
-                setCommitMenuOpen(false);
-                setRemoteDialog("manage");
-              }}
-            >
-              <Link />
-              <span>
-                <strong>Manage remotes</strong>
-                <small>Add, edit, remove, or fetch</small>
-              </span>
-            </button>
-          </div>
-        ) : null}
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
       </div>
       {actionError ? (
         <p className="git-action-error" role="alert">

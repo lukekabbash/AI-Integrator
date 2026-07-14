@@ -558,6 +558,111 @@ describe("native trusted-project bridge", () => {
     });
   });
 
+  it("loads repository Git state immediately after cloning a project", async () => {
+    const root = "H:\\Code\\cloned-project";
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "local_export") {
+        return Promise.resolve({
+          projects: [],
+          tasks: [],
+          settings: [],
+          providerSessions: [],
+          composerDrafts: [],
+        });
+      }
+      if (command === "project_clone") {
+        return Promise.resolve({
+          id: "project-cloned",
+          displayName: "cloned-project",
+          repositoryRoot: root,
+          gitRepositoryRoot: root,
+          gitCommonDirectory: `${root}\\.git`,
+          createdAt: "2026-07-14T12:00:00Z",
+          lastOpenedAt: "2026-07-14T12:00:00Z",
+        });
+      }
+      if (command === "git_overview") {
+        return Promise.resolve({
+          identity: { root, branch: "main" },
+          files: [],
+          history: [],
+          remotes: [
+            {
+              name: "origin",
+              fetchUrl: "https://github.com/company/cloned-project.git",
+              pushUrl: "https://github.com/company/cloned-project.git",
+            },
+          ],
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    await bridge.loadWorkspace();
+    const project = await bridge.cloneProject({
+      remote: "https://github.com/company/cloned-project.git",
+      parent: "H:\\Code",
+      folderName: "cloned-project",
+    });
+
+    await expect(bridge.loadProjectGit(project.id)).resolves.toMatchObject({
+      kind: "repository",
+      branch: "main",
+      worktree: root,
+      remotes: [{ name: "origin" }],
+    });
+    expect(invokeMock).toHaveBeenCalledWith("git_overview", { repository: root });
+    expect(invokeMock).not.toHaveBeenCalledWith("project_register", expect.anything());
+  });
+
+  it("re-detects Git for an older saved project before showing setup", async () => {
+    const root = "H:\\Code\\existing-repository";
+    const savedProject = {
+      id: "project-existing",
+      displayName: "existing-repository",
+      repositoryRoot: root,
+      createdAt: "2025-03-10T12:00:00Z",
+      lastOpenedAt: "2026-07-14T12:00:00Z",
+    };
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "local_export") {
+        return Promise.resolve({
+          projects: [savedProject],
+          tasks: [],
+          settings: [],
+          providerSessions: [],
+          composerDrafts: [],
+        });
+      }
+      if (command === "project_register") {
+        return Promise.resolve({
+          ...savedProject,
+          gitRepositoryRoot: root,
+          gitCommonDirectory: `${root}\\.git`,
+        });
+      }
+      if (command === "git_overview") {
+        return Promise.resolve({
+          identity: { root, branch: "main" },
+          files: [],
+          history: [],
+          remotes: [],
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const workspace = await bridge.loadWorkspace();
+
+    await expect(bridge.loadProjectGit(workspace.projects[0]!.id)).resolves.toMatchObject({
+      kind: "repository",
+      branch: "main",
+      worktree: root,
+    });
+    expect(invokeMock).toHaveBeenCalledWith("project_register", { path: root });
+    expect(invokeMock).toHaveBeenCalledWith("git_overview", { repository: root });
+  });
+
   it("keeps external file actions typed and repository-scoped", async () => {
     openMock.mockResolvedValue("H:\\Code\\file-actions");
     invokeMock.mockResolvedValueOnce({

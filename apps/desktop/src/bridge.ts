@@ -1020,6 +1020,7 @@ interface NativeGitOverview {
 const nativeTaskIds = new Map<string, string>();
 const repositoryByTaskId = new Map<string, string>();
 const repositoryByProjectId = new Map<string, string>();
+const nativeProjectById = new Map<string, ProjectSummary>();
 const nativeGitByTask = new Map<string, GitSnapshot>();
 const codexThreadByTask = new Map<string, string>();
 const activeCodexThreads = new Set<string>();
@@ -1665,7 +1666,7 @@ function mapTaskStatus(state: NativeTask["state"]): TaskStatus {
 
 function mapProject(project: TrustedProject): ProjectSummary {
   repositoryByProjectId.set(project.id, project.repositoryRoot);
-  return {
+  const summary = {
     id: project.id,
     name: project.displayName,
     path: project.repositoryRoot,
@@ -1674,6 +1675,8 @@ function mapProject(project: TrustedProject): ProjectSummary {
     dirtyFiles: 0,
     expanded: true,
   };
+  nativeProjectById.set(summary.id, summary);
+  return summary;
 }
 
 function projectForPath(snapshot: WorkspaceSnapshot, path?: string): ProjectSummary {
@@ -1721,6 +1724,8 @@ async function loadNativeWorkspace(): Promise<WorkspaceSnapshot> {
     if (cachedNativeSettings === bootstrapSettings) cachedNativeSettings = undefined;
   }, 0);
   const snapshot = createEmptySnapshot();
+  nativeProjectById.clear();
+  repositoryByProjectId.clear();
   const projects: ProjectSummary[] = (local.projects ?? []).map(mapProject);
   const projectByPath = new Map(projects.map((project) => [project.path, project]));
   const runtimeByTask = new Map<string, RuntimeId>();
@@ -2357,6 +2362,11 @@ function notRepositorySnapshot(worktree: string): GitSnapshot {
 const verifiedNonRepositoryPaths = new Set<string>();
 
 function rememberProjectGitRoot(path: string, gitRepositoryRoot: string | undefined) {
+  for (const [projectId, project] of nativeProjectById) {
+    if (project.path === path) {
+      nativeProjectById.set(projectId, { ...project, gitRepositoryRoot });
+    }
+  }
   if (!cachedWorkspace) return;
   cachedWorkspace = {
     ...cachedWorkspace,
@@ -2408,7 +2418,9 @@ async function refreshNativeGit(taskId: string): Promise<GitSnapshot> {
 
 async function loadNativeProjectGit(projectId: string): Promise<GitSnapshot> {
   const workspace = cachedWorkspace ?? readDemoSnapshot();
-  const project = workspace.projects.find((candidate) => candidate.id === projectId);
+  const project =
+    nativeProjectById.get(projectId) ??
+    workspace.projects.find((candidate) => candidate.id === projectId);
   if (!project) throw new Error(`Unknown project: ${projectId}`);
   if (!(await resolveProjectGitRoot(project))) {
     return notRepositorySnapshot(project.path);
@@ -2644,6 +2656,8 @@ export const bridge: AppBridge = {
       await nativeInvoke("local_clear");
       cachedNativeSettings = undefined;
       cachedWorkspace = undefined;
+      nativeProjectById.clear();
+      repositoryByProjectId.clear();
       return;
     }
     try {

@@ -8,6 +8,7 @@ const { bridgeMock } = vi.hoisted(() => ({
     listSettings: vi.fn(),
     getAppInfo: vi.fn(),
     listRuntimeActionPlans: vi.fn(),
+    listModelCatalog: vi.fn(),
     setSetting: vi.fn(),
   },
 }));
@@ -92,6 +93,8 @@ describe("Runtime Settings command disclosure", () => {
       localOnly: true,
     });
     bridgeMock.listRuntimeActionPlans.mockResolvedValue([updatePlan]);
+    bridgeMock.listModelCatalog.mockResolvedValue([]);
+    bridgeMock.setSetting.mockResolvedValue(undefined);
   });
 
   it("opens an error-routed update as review-only, then re-probes after terminal exit", async () => {
@@ -145,6 +148,7 @@ describe("Runtime Settings command disclosure", () => {
 
     expect(screen.queryByRole("dialog", { name: "Update Codex" })).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Mock setup terminal")).not.toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "New chat route" })).toBeInTheDocument();
     expect(await screen.findByText("Claude")).toBeInTheDocument();
     expect(document.querySelector(".runtime-settings-stage")).toHaveAttribute(
       "data-focused",
@@ -202,6 +206,8 @@ describe("Runtime Settings command disclosure", () => {
     await waitFor(() => expect(screen.queryByText("Claude")).not.toBeInTheDocument());
     const stage = container.querySelector(".runtime-settings-stage");
     expect(stage).toHaveAttribute("data-focused", "true");
+    expect(stage).toHaveAttribute("data-terminal-active", "true");
+    expect(screen.queryByRole("heading", { name: "New chat route" })).not.toBeInTheDocument();
     expect(stage?.querySelector(".settings-runtime-row[data-active='true']")).toHaveTextContent(
       "Codex",
     );
@@ -224,7 +230,9 @@ describe("Runtime Settings command disclosure", () => {
       />,
     );
 
-    fireEvent.click(screen.getByText("Runtimes").closest("button") as HTMLButtonElement);
+    fireEvent.click(
+      screen.getByText("Models & runtimes").closest("button") as HTMLButtonElement,
+    );
     const runtimeRow = (await screen.findByText("Codex")).closest(".settings-runtime-row");
     expect(runtimeRow).not.toBeNull();
     fireEvent.click(within(runtimeRow as HTMLElement).getByRole("button", { name: "Update" }));
@@ -285,5 +293,66 @@ describe("Runtime Settings command disclosure", () => {
 
     fireEvent.click(within(dialog).getByRole("radio", { name: /^npm/ }));
     expect(dialog).toHaveTextContent("npm install -g @openai/codex@latest");
+  });
+
+  it("stores a separate preferred model and effort for each runtime", async () => {
+    bridgeMock.listModelCatalog.mockImplementation(async (runtimeId: string) =>
+      runtimeId === "claude"
+        ? [
+            {
+              id: "claude-sonnet",
+              label: "Claude Sonnet",
+              efforts: [
+                { id: "low", label: "Low" },
+                { id: "high", label: "High" },
+              ],
+              defaultEffort: "high",
+            },
+          ]
+        : [
+            {
+              id: "gpt-codex",
+              label: "GPT Codex",
+              efforts: [{ id: "medium", label: "Medium" }],
+              defaultEffort: "medium",
+            },
+          ],
+    );
+
+    render(
+      <SettingsView
+        preferences={DEFAULT_THEME_PREFERENCES}
+        runtimes={[
+          { ...runtime, status: "connected", models: ["gpt-codex"] },
+          { ...claudeRuntime, models: ["claude-sonnet"] },
+        ]}
+        usage={createEmptySnapshot().usage}
+        onChangePreferences={vi.fn()}
+        onResetPreferences={vi.fn()}
+        onBack={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Models & runtimes" }));
+    const claudeRow = (await screen.findByText("Claude")).closest(".settings-runtime-row");
+    expect(claudeRow).not.toBeNull();
+    fireEvent.click(within(claudeRow as HTMLElement).getByRole("button", { name: /Defaults/ }));
+
+    const model = await screen.findByRole("button", { name: "Preferred model for claude" });
+    fireEvent.click(model);
+    fireEvent.click(await screen.findByRole("option", { name: "Claude Sonnet" }));
+    const effort = await screen.findByRole("button", { name: "Preferred effort for claude" });
+    fireEvent.click(effort);
+    fireEvent.click(screen.getByRole("option", { name: "Low" }));
+
+    expect(bridgeMock.setSetting).toHaveBeenCalledWith(
+      "settings.models.defaultsByRuntime",
+      expect.objectContaining({
+        claude: { model: "claude-sonnet", effort: "low" },
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    expect(await screen.findByRole("heading", { name: "New chat route" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Default runtime" })).toHaveTextContent("Codex");
   });
 });

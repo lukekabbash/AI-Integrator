@@ -157,8 +157,7 @@ describe("AI Integrator desktop workspace", () => {
       "General",
       "Appearance",
       "Composer",
-      "Models",
-      "Runtimes",
+      "Models & runtimes",
       "Permissions",
       "Usage & budgets",
     ];
@@ -203,7 +202,9 @@ describe("AI Integrator desktop workspace", () => {
     expect(screen.getByRole("textbox", { name: "Search Settings" })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /^Models/ }));
-    expect(await screen.findByRole("heading", { name: "Models" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "Models & runtimes" }),
+    ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Default model" }));
     fireEvent.click(screen.getByRole("option", { name: "GPT-5.4" }));
     expect(window.localStorage.getItem("aiintegrator.settings.v1")).toContain(
@@ -271,6 +272,27 @@ describe("AI Integrator desktop workspace", () => {
 
     expect(await screen.findByRole("button", { name: "Runtime" })).toHaveTextContent("Claude Code");
     expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("Claude Fable 5");
+  });
+
+  it("inherits the last-used runtime when no runtime is favorited", async () => {
+    window.localStorage.setItem(
+      "aiintegrator.settings.v1",
+      JSON.stringify({
+        "settings.models.defaultRuntime": "",
+        "settings.models.lastRuntime": "claude",
+        "settings.models.defaultsByRuntime": {
+          claude: { model: "Claude Sonnet 5", effort: "high" },
+        },
+      }),
+    );
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /^New chat(?! in)/ }));
+
+    expect(await screen.findByRole("button", { name: "Runtime" })).toHaveTextContent(
+      "Claude Code",
+    );
+    expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("Claude Sonnet 5");
   });
 
   it("uses Settings changes when the next chat is created", async () => {

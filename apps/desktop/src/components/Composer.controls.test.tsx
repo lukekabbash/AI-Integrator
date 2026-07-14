@@ -129,4 +129,59 @@ describe("Composer compact controls", () => {
       effort: undefined,
     });
   });
+
+  it("recalls each runtime's preferred model and effort when switching", async () => {
+    const routeRuntimes: RuntimeConnection[] = [
+      ...runtimes,
+      {
+        id: "claude",
+        name: "Claude",
+        command: "claude",
+        status: "connected",
+        fidelity: "structured",
+        models: ["claude-sonnet", "claude-opus"],
+        detail: "Ready",
+      },
+    ];
+    vi.spyOn(bridge, "listModelCatalog").mockImplementation(async (runtime) =>
+      runtime === "claude"
+        ? [
+            {
+              id: "claude-sonnet",
+              label: "Claude Sonnet",
+              efforts: [
+                { id: "low", label: "Low" },
+                { id: "high", label: "High" },
+              ],
+              defaultEffort: "high",
+            },
+            { id: "claude-opus", label: "Claude Opus" },
+          ]
+        : [{ id: "gpt-5.6-luna", label: "GPT-5.6 Luna" }],
+    );
+    const onRoutingChange = vi.fn();
+
+    render(
+      <Composer
+        runtimes={routeRuntimes}
+        defaultRuntime="codex"
+        defaultModel="gpt-5.6-luna"
+        runtimeDefaults={{
+          codex: { model: "gpt-5.6-luna" },
+          claude: { model: "claude-sonnet", effort: "low" },
+        }}
+        onSend={vi.fn().mockResolvedValue(true)}
+        onRoutingChange={onRoutingChange}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Runtime" }));
+    fireEvent.click(screen.getByRole("option", { name: "Claude" }));
+
+    expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("claude-sonnet");
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("Claude Sonnet"),
+    );
+    expect(screen.getByRole("button", { name: "Reasoning effort" })).toHaveTextContent("Low");
+  });
 });

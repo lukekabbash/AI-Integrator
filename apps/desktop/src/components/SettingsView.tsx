@@ -20,6 +20,7 @@ import {
   Save,
   Search,
   ShieldCheck,
+  SlidersHorizontal,
   TriangleAlert,
   Trash2,
   Upload,
@@ -62,13 +63,17 @@ import { BrandMark } from "./BrandMark";
 import { Tooltip } from "./Tooltip";
 import { Dropdown, ProviderIcon } from "./Dropdown";
 import { RuntimeSetupTerminal } from "./RuntimeSetupTerminal";
+import {
+  normalizeRuntimeRouteDefaults,
+  readRuntimeRouteDefault,
+  RUNTIME_ROUTE_DEFAULTS_SETTING,
+} from "../routingDefaults";
 
 type SettingsSection =
   | "general"
   | "appearance"
   | "composer"
-  | "models"
-  | "runtimes"
+  | "models-runtimes"
   | "permissions"
   | "subagents"
   | "usage";
@@ -96,8 +101,12 @@ const settingsNav: Array<{ id: SettingsSection; label: string; hint: string; ico
   { id: "general", label: "General", hint: "Local app and data", icon: MonitorCog },
   { id: "appearance", label: "Appearance", hint: "Themes, type, motion", icon: Palette },
   { id: "composer", label: "Composer", hint: "Send behavior", icon: Braces },
-  { id: "models", label: "Models", hint: "Defaults for new chats", icon: Bot },
-  { id: "runtimes", label: "Runtimes", hint: "Connections and capability", icon: MonitorCog },
+  {
+    id: "models-runtimes",
+    label: "Models & runtimes",
+    hint: "Defaults, connections, and capability",
+    icon: Bot,
+  },
   { id: "permissions", label: "Permissions", hint: "Safe execution defaults", icon: ShieldCheck },
   { id: "subagents", label: "Subagents", hint: "Cross-provider handoff policy", icon: Users },
   { id: "usage", label: "Usage & budgets", hint: "Local usage evidence", icon: CircleDollarSign },
@@ -155,6 +164,7 @@ const DEFAULT_SETTINGS: SettingsMap = {
   "models.defaultRuntime": "codex",
   "models.defaultModel": "",
   "models.defaultEffort": "medium",
+  [RUNTIME_ROUTE_DEFAULTS_SETTING]: {},
   "permissions.defaultProfile": "project-write",
   // Consumed by the native delegation broker (peers_list / delegate_start
   // policy) and by the composer's delegation-mode default.
@@ -1138,12 +1148,16 @@ function RuntimeCommandReview({
   );
 }
 
-function RuntimeSettings({
+function ModelsAndRuntimesSettings({
   runtimes,
+  settings,
+  setSetting,
   actionRequest,
   onRefreshRuntimes,
 }: {
   runtimes: RuntimeConnection[];
+  settings: SettingsMap;
+  setSetting: (key: string, value: unknown) => void;
   actionRequest?: RuntimeActionRequest | null;
   onRefreshRuntimes?: () => Promise<RuntimeConnection[]>;
 }) {
@@ -1155,7 +1169,96 @@ function RuntimeSettings({
   const [loadingPlan, setLoadingPlan] = useState(false);
   const [checking, setChecking] = useState(false);
   const [activePlan, setActivePlan] = useState<RuntimeActionPlan | null>(null);
+  const [configuringRuntime, setConfiguringRuntime] = useState<RuntimeId | null>(null);
+  const [catalogs, setCatalogs] = useState<Record<string, ModelCatalogEntry[]>>({});
+  const catalogLoads = useRef(new Set<RuntimeId>());
   const [message, setMessage] = useState("");
+
+  const configuredDefaultRuntime = readSetting(
+    settings,
+    "models.defaultRuntime",
+    runtimes[0]?.id ?? "codex",
+  ) as RuntimeId;
+  const defaultRuntime = runtimes.some((runtime) => runtime.id === configuredDefaultRuntime)
+    ? configuredDefaultRuntime
+    : (runtimes[0]?.id ?? "codex");
+  const routeDefaults = normalizeRuntimeRouteDefaults(settings[RUNTIME_ROUTE_DEFAULTS_SETTING]);
+
+  const fallbackCatalog = useCallback(
+    (runtime: RuntimeId) =>
+      runtimes
+        .find((connection) => connection.id === runtime)
+        ?.models.filter((id) => id !== "Provider default")
+        .map((id) => ({ id, label: id })) ?? [],
+    [runtimes],
+  );
+
+  const catalogFor = (runtime: RuntimeId) =>
+    (catalogs[runtime] ?? fallbackCatalog(runtime)).filter(
+      (entry) => entry.id !== "Provider default",
+    );
+
+  const loadCatalog = useCallback(
+    (runtime: RuntimeId) => {
+      if (Object.hasOwn(catalogs, runtime) || catalogLoads.current.has(runtime)) return;
+      catalogLoads.current.add(runtime);
+      void bridge
+        .listModelCatalog(runtime)
+        .then((entries) =>
+          setCatalogs((current) => ({
+            ...current,
+            [runtime]: entries.filter((entry) => entry.id !== "Provider default"),
+          })),
+        )
+        .catch(() => setCatalogs((current) => ({ ...current, [runtime]: fallbackCatalog(runtime) })))
+        .finally(() => catalogLoads.current.delete(runtime));
+    },
+    [catalogs, fallbackCatalog],
+  );
+
+  useEffect(() => loadCatalog(defaultRuntime), [defaultRuntime, loadCatalog]);
+
+  const resolvedRoute = (runtime: RuntimeId) => {
+    const saved = readRuntimeRouteDefault(settings, runtime);
+    const catalog = catalogFor(runtime);
+    const model = catalog.some((entry) => entry.id === saved.model)
+      ? (saved.model ?? "")
+      : (catalog[0]?.id ?? saved.model ?? "");
+    const entry = catalog.find((candidate) => candidate.id === model);
+    return {
+      catalog,
+      model,
+      entry,
+      effort: resolveModelEffort(entry, saved.effort),
+      effortOptions: entry?.efforts ?? [],
+      loaded: Object.hasOwn(catalogs, runtime),
+    };
+  };
+
+  const writeRuntimeRoute = (
+    runtime: RuntimeId,
+    model: string,
+    effort: string | undefined,
+    mirrorGlobal = runtime === defaultRuntime,
+  ) => {
+    setSetting(RUNTIME_ROUTE_DEFAULTS_SETTING, {
+      ...routeDefaults,
+      [runtime]: { model, ...(effort ? { effort } : {}) },
+    });
+    if (!mirrorGlobal) return;
+    setSetting("models.defaultModel", model);
+    setSetting("models.defaultEffort", effort ?? "");
+  };
+
+  const changeDefaultRuntime = (runtime: RuntimeId) => {
+    const route = resolvedRoute(runtime);
+    const model = route.model || route.catalog[0]?.id || "";
+    const entry = route.catalog.find((candidate) => candidate.id === model);
+    const effort = resolveModelEffort(entry, route.effort);
+    setSetting("models.defaultRuntime", runtime);
+    writeRuntimeRoute(runtime, model, effort, true);
+    loadCatalog(runtime);
+  };
 
   const cancelPlanner = useCallback(() => {
     plannerRequestSequence.current += 1;
@@ -1165,6 +1268,7 @@ function RuntimeSettings({
 
   const openPlanner = useCallback(async (runtime: RuntimeConnection, kind: RuntimeActionKind) => {
     const requestId = ++plannerRequestSequence.current;
+    setConfiguringRuntime(null);
     setActivePlan(null);
     setPlanner({ runtime, kind, plans: [], selectedId: "" });
     setLoadingPlan(true);
@@ -1222,10 +1326,16 @@ function RuntimeSettings({
   };
 
   const selectedPlan = planner?.plans.find((plan) => plan.id === planner.selectedId);
-  const focusedRuntime = activePlan?.provider ?? planner?.runtime.id;
+  const terminalRuntime = activePlan?.provider ?? planner?.runtime.id;
+  const focusedRuntime = terminalRuntime ?? configuringRuntime ?? undefined;
   const visibleRuntimes = focusedRuntime
     ? runtimes.filter((runtime) => runtime.id === focusedRuntime)
     : runtimes;
+  const defaultRoute = resolvedRoute(defaultRuntime);
+  const configuredRoute = configuringRuntime ? resolvedRoute(configuringRuntime) : null;
+  const defaultRuntimeWarning = runtimeAuthWarning(
+    runtimes.find((runtime) => runtime.id === defaultRuntime),
+  );
   const startSelectedPlan = () => {
     if (!selectedPlan?.available) return;
     setActivePlan(selectedPlan);
@@ -1239,9 +1349,10 @@ function RuntimeSettings({
           <Bot />
         </span>
         <div>
-          <h1>Runtimes</h1>
+          <h1>Models &amp; runtimes</h1>
           <p>
-            Inspect, install, authenticate, update, and re-check the local CLIs Integrator can use.
+            Choose how new chats begin, then manage every local CLI and its preferred model in one
+            place.
           </p>
         </div>
         <button
@@ -1258,15 +1369,120 @@ function RuntimeSettings({
       <motion.div
         className="runtime-settings-stage"
         data-focused={Boolean(focusedRuntime)}
+        data-terminal-active={Boolean(terminalRuntime)}
         layout={!reduceMotion}
         transition={reduceMotion ? { duration: 0 } : navPillSpring}
       >
+        <AnimatePresence initial={false} mode="popLayout">
+          {!focusedRuntime ? (
+            <motion.section
+              className="settings-section runtime-route-defaults"
+              key="runtime-route-defaults"
+              layout={!reduceMotion}
+              initial={reduceMotion ? false : { opacity: 0, y: -8, filter: "blur(4px)" }}
+              animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+              exit={
+                reduceMotion
+                  ? { opacity: 0 }
+                  : { opacity: 0, y: -10, filter: "blur(5px)", transition: { duration: 0.16 } }
+              }
+              transition={reduceMotion ? { duration: 0 } : { duration: 0.24, ease: [0.2, 0, 0, 1] }}
+            >
+              <header>
+                <h2>New chat route</h2>
+                <p>
+                  The default runtime opens with its own remembered model and reasoning level.
+                </p>
+              </header>
+              <SettingRow
+                label="Default runtime"
+                description="Preselected for new chats; each runtime keeps the model preference you set below."
+              >
+                <Dropdown
+                  aria-label="Default runtime"
+                  value={defaultRuntime}
+                  onChange={(value) => changeDefaultRuntime(value as RuntimeId)}
+                  options={runtimes.map((runtime) => ({
+                    value: runtime.id,
+                    label:
+                      runtime.status === "not_installed"
+                        ? `${runtime.name} (not installed)`
+                        : runtime.name,
+                    disabled: runtime.status === "not_installed",
+                  }))}
+                />
+              </SettingRow>
+              <SettingRow
+                label="Default model"
+                description={`Remembered for ${runtimes.find((runtime) => runtime.id === defaultRuntime)?.name ?? defaultRuntime}. You can still change it in the composer.`}
+              >
+                <Dropdown
+                  aria-label="Default model"
+                  value={defaultRoute.model}
+                  onOpen={() => loadCatalog(defaultRuntime)}
+                  onChange={(value) => {
+                    const entry = defaultRoute.catalog.find((candidate) => candidate.id === value);
+                    writeRuntimeRoute(
+                      defaultRuntime,
+                      value,
+                      resolveModelEffort(entry, defaultRoute.effort),
+                    );
+                  }}
+                  options={
+                    defaultRoute.catalog.length > 0
+                      ? defaultRoute.catalog.map((entry) => ({
+                          value: entry.id,
+                          label: entry.label,
+                        }))
+                      : [
+                          {
+                            value: "",
+                            label: defaultRoute.loaded ? "Model unavailable" : "Checking model…",
+                            disabled: true,
+                          },
+                        ]
+                  }
+                />
+              </SettingRow>
+              <SettingRow
+                label="Default effort"
+                description="Shown only when the selected model advertises reasoning controls."
+              >
+                {defaultRoute.effortOptions.length > 0 ? (
+                  <Dropdown
+                    aria-label="Default effort"
+                    value={defaultRoute.effort ?? defaultRoute.effortOptions[0]?.id}
+                    onChange={(value) =>
+                      writeRuntimeRoute(defaultRuntime, defaultRoute.model, value)
+                    }
+                    options={defaultRoute.effortOptions.map((option) => ({
+                      value: option.id,
+                      label: option.label,
+                    }))}
+                  />
+                ) : (
+                  <span className="settings-unavailable" aria-label="Default effort unavailable">
+                    {defaultRoute.loaded ? "Not exposed by this model" : "Checking capability…"}
+                  </span>
+                )}
+              </SettingRow>
+              {defaultRuntimeWarning ? (
+                <div className="settings-callout settings-callout--warning runtime-route-warning">
+                  <TriangleAlert />
+                  <span>
+                    <strong>Vendor login warning</strong>
+                    <small>{defaultRuntimeWarning}</small>
+                  </span>
+                </div>
+              ) : null}
+            </motion.section>
+          ) : null}
+        </AnimatePresence>
         <section className="settings-section">
           <header>
-            <h2>Local runtime inventory</h2>
+            <h2>Runtime library</h2>
             <p>
-              Status combines executable discovery, version, authentication, and Integrator’s
-              compatibility floor. A login alone is not reported as ready.
+              Install, authenticate, update, and keep a preferred route for every local CLI.
             </p>
           </header>
           <div className="settings-runtime-list">
@@ -1328,6 +1544,19 @@ function RuntimeSettings({
                       </button>
                     ) : (
                       <>
+                        {configuringRuntime === runtime.id ? null : (
+                          <button
+                            className="secondary-button runtime-defaults-button"
+                            type="button"
+                            onClick={() => {
+                              setConfiguringRuntime(runtime.id);
+                              loadCatalog(runtime.id);
+                              setMessage("");
+                            }}
+                          >
+                            <SlidersHorizontal aria-hidden="true" /> Defaults
+                          </button>
+                        )}
                         <button
                           className={
                             runtime.status === "login_required"
@@ -1359,10 +1588,10 @@ function RuntimeSettings({
           </div>
         </section>
         <AnimatePresence initial={false} mode="popLayout">
-          {planner || activePlan ? (
+          {focusedRuntime ? (
             <motion.div
-              className="runtime-terminal-stage"
-              key={focusedRuntime}
+              className={terminalRuntime ? "runtime-terminal-stage" : "runtime-defaults-stage"}
+              key={terminalRuntime ? `terminal-stage-${terminalRuntime}` : `defaults-${focusedRuntime}`}
               layout={!reduceMotion}
               initial={
                 reduceMotion
@@ -1401,7 +1630,119 @@ function RuntimeSettings({
               style={{ transformOrigin: "top center" }}
             >
               <AnimatePresence initial={false} mode="wait">
-                {activePlan ? (
+                {configuringRuntime && configuredRoute ? (
+                  <motion.section
+                    className="runtime-default-editor"
+                    aria-labelledby={`runtime-default-editor-${configuringRuntime}`}
+                    key={`defaults-${configuringRuntime}`}
+                    layout={!reduceMotion}
+                    initial={reduceMotion ? false : { opacity: 0, y: 10, filter: "blur(4px)" }}
+                    animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                    exit={
+                      reduceMotion
+                        ? { opacity: 0 }
+                        : { opacity: 0, y: -8, filter: "blur(4px)" }
+                    }
+                    transition={
+                      reduceMotion ? { duration: 0 } : { duration: 0.22, ease: [0.2, 0, 0, 1] }
+                    }
+                  >
+                    <header>
+                      <span>
+                        <ProviderIcon
+                          provider={configuringRuntime}
+                          label={
+                            runtimes.find((runtime) => runtime.id === configuringRuntime)?.name ??
+                            configuringRuntime
+                          }
+                        />
+                      </span>
+                      <div>
+                        <h3 id={`runtime-default-editor-${configuringRuntime}`}>
+                          {runtimes.find((runtime) => runtime.id === configuringRuntime)?.name ??
+                            configuringRuntime}{" "}
+                          defaults
+                        </h3>
+                        <p>
+                          Recalled whenever you choose this runtime in a new chat. Existing chats
+                          keep their own route.
+                        </p>
+                      </div>
+                      <button
+                        className="secondary-button"
+                        type="button"
+                        onClick={() => setConfiguringRuntime(null)}
+                      >
+                        Done
+                      </button>
+                    </header>
+                    <SettingRow
+                      label="Preferred model"
+                      description="Used when this runtime is selected; still adjustable before every send."
+                    >
+                      <Dropdown
+                        aria-label={`Preferred model for ${configuringRuntime}`}
+                        value={configuredRoute.model}
+                        onOpen={() => loadCatalog(configuringRuntime)}
+                        onChange={(value) => {
+                          const entry = configuredRoute.catalog.find(
+                            (candidate) => candidate.id === value,
+                          );
+                          writeRuntimeRoute(
+                            configuringRuntime,
+                            value,
+                            resolveModelEffort(entry, configuredRoute.effort),
+                          );
+                        }}
+                        options={
+                          configuredRoute.catalog.length > 0
+                            ? configuredRoute.catalog.map((entry) => ({
+                                value: entry.id,
+                                label: entry.label,
+                              }))
+                            : [
+                                {
+                                  value: "",
+                                  label: configuredRoute.loaded
+                                    ? "Model unavailable"
+                                    : "Checking model…",
+                                  disabled: true,
+                                },
+                              ]
+                        }
+                      />
+                    </SettingRow>
+                    <SettingRow
+                      label="Preferred effort"
+                      description="Only provider-advertised reasoning levels are offered."
+                    >
+                      {configuredRoute.effortOptions.length > 0 ? (
+                        <Dropdown
+                          aria-label={`Preferred effort for ${configuringRuntime}`}
+                          value={
+                            configuredRoute.effort ?? configuredRoute.effortOptions[0]?.id
+                          }
+                          onChange={(value) =>
+                            writeRuntimeRoute(configuringRuntime, configuredRoute.model, value)
+                          }
+                          options={configuredRoute.effortOptions.map((option) => ({
+                            value: option.id,
+                            label: option.label,
+                          }))}
+                        />
+                      ) : (
+                        <span
+                          className="settings-unavailable"
+                          aria-label={`Preferred effort unavailable for ${configuringRuntime}`}
+                        >
+                          {configuredRoute.loaded
+                            ? "Not exposed by this model"
+                            : "Checking capability…"}
+                        </span>
+                      )}
+                    </SettingRow>
+                  </motion.section>
+                ) : activePlan ? (
                   <motion.div
                     className="runtime-terminal-content"
                     key={`terminal-${activePlan.id}`}
@@ -1764,183 +2105,6 @@ function UsageSettings({
           </p>
         ) : null}
       </section>
-    </>
-  );
-}
-
-function ModelsSettings({
-  runtimes,
-  settings,
-  setSetting,
-}: {
-  runtimes: RuntimeConnection[];
-  settings: SettingsMap;
-  setSetting: (key: string, value: unknown) => void;
-}) {
-  const [catalogs, setCatalogs] = useState<Record<string, ModelCatalogEntry[]>>({});
-  const configuredRuntime = readSetting(
-    settings,
-    "models.defaultRuntime",
-    runtimes[0]?.id ?? "codex",
-  ) as RuntimeId;
-  const runtimeId = runtimes.some((runtime) => runtime.id === configuredRuntime)
-    ? configuredRuntime
-    : (runtimes[0]?.id ?? "codex");
-  const selectedRuntime = runtimes.find((runtime) => runtime.id === runtimeId);
-  const fallbackCatalog =
-    selectedRuntime?.models
-      .filter((id) => id !== "Provider default")
-      .map((id) => ({ id, label: id })) ?? [];
-  const catalogLoaded = Object.hasOwn(catalogs, runtimeId);
-  const catalog = (catalogs[runtimeId] ?? fallbackCatalog).filter(
-    (entry) => entry.id !== "Provider default",
-  );
-  const configuredModel = readSetting(
-    settings,
-    "models.defaultModel",
-    catalog[0]?.id ?? "",
-  ) as string;
-  const selectedModel = catalog.some((entry) => entry.id === configuredModel)
-    ? configuredModel
-    : (catalog[0]?.id ?? "");
-  const selectedEntry = catalog.find((entry) => entry.id === selectedModel);
-  const effortOptions = selectedEntry?.efforts ?? [];
-  const configuredEffort = readSetting<string | undefined>(
-    settings,
-    "models.defaultEffort",
-    undefined,
-  );
-  const selectedEffort = resolveModelEffort(selectedEntry, configuredEffort);
-  const runtimeWarning = runtimeAuthWarning(selectedRuntime);
-
-  useEffect(() => {
-    if (!selectedModel || configuredModel === selectedModel) return;
-    setSetting("models.defaultModel", selectedModel);
-  }, [configuredModel, selectedModel, setSetting]);
-
-  useEffect(() => {
-    if (catalogs[runtimeId]) return;
-    let active = true;
-    void bridge
-      .listModelCatalog(runtimeId)
-      .then((entries) => {
-        if (active) {
-          setCatalogs((current) => ({ ...current, [runtimeId]: entries }));
-        }
-      })
-      .catch(() => undefined);
-    return () => {
-      active = false;
-    };
-  }, [catalogs, runtimeId]);
-
-  return (
-    <>
-      <div className="settings-page-heading">
-        <span>
-          <Bot />
-        </span>
-        <div>
-          <h1>Models</h1>
-          <p>Defaults are inherited by new chats and remain adjustable per turn.</p>
-        </div>
-      </div>
-      <section className="settings-section">
-        <header>
-          <h2>Routing defaults</h2>
-          <p>Provider and model identity stay visible before Send and in every run record.</p>
-        </header>
-        <SettingRow
-          label="Default runtime"
-          description="Preselected in the composer when a new chat starts."
-        >
-          <Dropdown
-            aria-label="Default runtime"
-            value={runtimeId}
-            onChange={(value) => {
-              const nextRuntime = value as RuntimeId;
-              setSetting("models.defaultRuntime", nextRuntime);
-              const nextCatalog =
-                catalogs[nextRuntime] ??
-                runtimes
-                  .find((runtime) => runtime.id === nextRuntime)
-                  ?.models.map((id) => ({
-                    id,
-                    label: id,
-                  }));
-              const nextEntry = nextCatalog?.[0];
-              if (nextEntry) {
-                setSetting("models.defaultModel", nextEntry.id);
-                const nextEffort = resolveModelEffort(nextEntry, configuredEffort);
-                if (nextEffort) setSetting("models.defaultEffort", nextEffort);
-              }
-            }}
-            options={runtimes.map((runtime) => ({
-              value: runtime.id,
-              label:
-                runtime.status === "not_installed"
-                  ? `${runtime.name} (not installed)`
-                  : runtime.name,
-              disabled: runtime.status === "not_installed",
-            }))}
-          />
-        </SettingRow>
-        <SettingRow
-          label="Default model"
-          description="Preselected for new chats on the chosen runtime; you can still change it per turn."
-        >
-          <Dropdown
-            aria-label="Default model"
-            value={selectedModel}
-            onChange={(value) => {
-              setSetting("models.defaultModel", value);
-              const nextEntry = catalog.find((entry) => entry.id === value);
-              const nextEffort = resolveModelEffort(nextEntry, configuredEffort);
-              if (nextEffort) setSetting("models.defaultEffort", nextEffort);
-            }}
-            options={
-              catalog.length > 0
-                ? catalog.map((entry) => ({ value: entry.id, label: entry.label }))
-                : [
-                    {
-                      value: "",
-                      label: catalogLoaded ? "Model unavailable" : "Checking model…",
-                      disabled: true,
-                    },
-                  ]
-            }
-          />
-        </SettingRow>
-        <SettingRow
-          label="Default effort"
-          description="Provider-advertised options for the selected model; unavailable when not exposed."
-        >
-          {effortOptions.length > 0 ? (
-            <Dropdown
-              aria-label="Default effort"
-              value={selectedEffort ?? effortOptions[0].id}
-              onChange={(value) => setSetting("models.defaultEffort", value)}
-              options={effortOptions.map((option) => ({
-                value: option.id,
-                label: option.label,
-              }))}
-            />
-          ) : (
-            <span className="settings-unavailable" aria-label="Default effort unavailable">
-              Not exposed by this model
-            </span>
-          )}
-        </SettingRow>
-      </section>
-      {runtimeWarning ? (
-        <div className="settings-callout settings-callout--warning">
-          <TriangleAlert />
-          <span>
-            <strong>Vendor login warning</strong>
-            <small>{runtimeWarning}</small>
-          </span>
-        </div>
-      ) : null}
     </>
   );
 }
@@ -2329,7 +2493,7 @@ export function SettingsView(props: SettingsViewProps) {
   const reduceMotion =
     Boolean(useReducedMotion()) || document.documentElement.dataset.motion === "none";
   const [section, setSection] = useState<SettingsSection>(
-    props.runtimeActionRequest ? "runtimes" : "appearance",
+    props.runtimeActionRequest ? "models-runtimes" : "appearance",
   );
   const [query, setQuery] = useState("");
   const [settings, setSettings] = useState<SettingsMap>(DEFAULT_SETTINGS);
@@ -2515,21 +2679,20 @@ export function SettingsView(props: SettingsViewProps) {
               onResetPreferences={props.onResetPreferences}
             />
           ) : null}
-          {section === "models" ? (
-            <ModelsSettings runtimes={props.runtimes} settings={settings} setSetting={setSetting} />
+          {section === "models-runtimes" ? (
+            <ModelsAndRuntimesSettings
+              runtimes={props.runtimes}
+              settings={settings}
+              setSetting={setSetting}
+              actionRequest={props.runtimeActionRequest}
+              onRefreshRuntimes={props.onRefreshRuntimes}
+            />
           ) : null}
           {section === "subagents" ? (
             <SubagentsSettings
               settings={settings}
               setSetting={setSetting}
               runtimes={props.runtimes}
-            />
-          ) : null}
-          {section === "runtimes" ? (
-            <RuntimeSettings
-              runtimes={props.runtimes}
-              actionRequest={props.runtimeActionRequest}
-              onRefreshRuntimes={props.onRefreshRuntimes}
             />
           ) : null}
           {section === "usage" ? (

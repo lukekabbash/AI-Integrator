@@ -26,8 +26,9 @@ AI Integrator is agent-first, calm, restrained, premium, and softly tactile. It 
 - Opening Settings replaces the project/task left rail with settings-category navigation.
 - It is not a right drawer, modal, overlay, or inspector tab.
 - `Back to workspace` restores the previous project, task, canvas tab, scroll/focus, and right-rail state.
-- Categories: General, Appearance, Composer, Models, Runtimes, Delegation, Skills, Permissions, Git & Worktrees, Terminal, Usage & Budgets, Memory & Context, Notifications, Accessibility, Advanced.
-- No Account or Integrator Billing category exists in v1. Vendor identities/plans live under Runtimes/Connections and Usage.
+- Categories: General, Appearance, Composer, Models and Runtimes, Delegation, Skills, Permissions, Git & Worktrees, Terminal, Usage & Budgets, Memory & Context, Notifications, Accessibility, Advanced.
+- No Account or Integrator Billing category exists in v1. Vendor identities/plans live under Models and Runtimes and Usage.
+- Models and Runtimes owns the optional favorite runtime, per-runtime model/config preferences, connection health, and the user-approved install, authentication, and update terminal flows. With no favorite, new chats inherit the last-used runtime. When a terminal flow is active, routing controls recede so the selected runtime and full terminal stage dominate.
 
 ## 3. Git and review
 
@@ -170,8 +171,7 @@ Before v1 visual freeze, approve interactive prototypes for:
 3. Git right rail plus large red/green syntax-aware review;
 4. integrated task terminal and user-owned Setup terminal;
 5. full-screen Settings: Appearance;
-6. full-screen Settings: Runtimes/Delegation/Usage;
+6. full-screen Settings: Models and Runtimes/Delegation/Usage;
 7. crash/reconnect/uncertain action recovery;
 8. Graphite, Forest, and Paper presets plus High Contrast;
 9. narrow window, 200% scaling, screen reader, IME, and keyboard-only flows.
-

@@ -99,6 +99,11 @@ import {
   taskActivityUpdate,
   type RuntimeProjectionState,
 } from "./runtimeProjection";
+import {
+  normalizeRuntimeRouteDefaults,
+  readRuntimeRouteDefault,
+  RUNTIME_ROUTE_DEFAULTS_SETTING,
+} from "./routingDefaults";
 import "./styles.css";
 
 const RightRail = lazy(() =>
@@ -1135,6 +1140,7 @@ export default function App() {
   const nativeHost = isNativeHost();
   const [snapshot, setSnapshot] = useState<WorkspaceSnapshot>(initialSnapshot);
   const [workspaceLoading, setWorkspaceLoading] = useState(isNativeHost);
+  const [gitLoading, setGitLoading] = useState(isNativeHost);
   const [openingProject, setOpeningProject] = useState(false);
   const [addProjectOpen, setAddProjectOpen] = useState(false);
   const [createProjectError, setCreateProjectError] = useState("");
@@ -1550,7 +1556,10 @@ export default function App() {
               );
               setActiveFilePath((current) => current || git.files[0]?.path || "");
             })
-            .catch(() => undefined);
+            .catch(() => undefined)
+            .finally(() => {
+              if (active) setGitLoading(false);
+            });
         } else {
           projectionReady.current = true;
         }
@@ -1558,7 +1567,10 @@ export default function App() {
         if (!active) return;
         setOperationError(error instanceof Error ? error.message : "Could not load the workspace");
       } finally {
-        if (active) setWorkspaceLoading(false);
+        if (active) {
+          setWorkspaceLoading(false);
+          if (!nativeHost) setGitLoading(false);
+        }
       }
     })();
     return () => {
@@ -1668,6 +1680,41 @@ export default function App() {
     snapshot.projects.find((project) => project.id === snapshot.activeProjectId) ??
     snapshot.projects.find((project) => project.id === activeTask?.projectId) ??
     snapshot.projects[0];
+  const configuredDefaultRuntime = localSettings["models.defaultRuntime"];
+  const favoriteRuntime =
+    typeof configuredDefaultRuntime === "string" &&
+    snapshot.runtimes.some((runtime) => runtime.id === configuredDefaultRuntime)
+      ? (configuredDefaultRuntime as RuntimeId)
+      : undefined;
+  const storedLastRuntime = localSettings["models.lastRuntime"];
+  const lastRuntime =
+    typeof storedLastRuntime === "string" &&
+    snapshot.runtimes.some((runtime) => runtime.id === storedLastRuntime)
+      ? (storedLastRuntime as RuntimeId)
+      : snapshot.tasks[0]?.runtime;
+  const settingsDefaultRuntime =
+    favoriteRuntime ??
+    lastRuntime ??
+    snapshot.runtimes.find((runtime) => runtime.status !== "not_installed")?.id ??
+    snapshot.runtimes[0]?.id ??
+    "codex";
+  const storedRuntimeDefaults = normalizeRuntimeRouteDefaults(
+    localSettings[RUNTIME_ROUTE_DEFAULTS_SETTING],
+  );
+  const settingsDefaultRoute = readRuntimeRouteDefault(localSettings, settingsDefaultRuntime);
+  const settingsDefaultModel =
+    settingsDefaultRoute.model ??
+    snapshot.runtimes
+      .find((runtime) => runtime.id === settingsDefaultRuntime)
+      ?.models.find((model) => model !== "Provider default") ??
+    "Provider default";
+  const composerRuntimeDefaults = {
+    ...storedRuntimeDefaults,
+    [settingsDefaultRuntime]: {
+      model: settingsDefaultModel,
+      ...(settingsDefaultRoute.effort ? { effort: settingsDefaultRoute.effort } : {}),
+    },
+  };
   useEffect(() => {
     if (!activeProject || activeTask) return;
     let active = true;
@@ -1685,6 +1732,9 @@ export default function App() {
         if (active) {
           setOperationError(error instanceof Error ? error.message : "Could not load Git state");
         }
+      })
+      .finally(() => {
+        if (active) setGitLoading(false);
       });
     return () => {
       active = false;
@@ -1903,10 +1953,14 @@ export default function App() {
     const cached = nativeHost ? undefined : snapshot.taskContexts[taskId];
     const cachedRuntime = nativeHost ? taskProjectionCache.current.get(taskId) : undefined;
     const cachedGit = nativeHost ? taskGitCache.current.get(taskId) : undefined;
+    const gitRefreshedAt = taskGitRefreshedAt.current.get(taskId) ?? 0;
+    const refreshTaskGit =
+      nativeHost && (!cachedGit || Date.now() - gitRefreshedAt >= GIT_CACHE_TTL_MS);
     // Cached conversations commit in the same frame. Authoritative storage
     // and Git refreshes still run below, but neither makes warm navigation
     // wait on SQLite or subprocess startup.
     setSwitchingTaskId(cachedRuntime ? "" : taskId);
+    setGitLoading(refreshTaskGit);
     setOperationError("");
     setRuntimeState(cachedRuntime ?? null);
     setSelectedDelegationId(undefined);
@@ -1954,8 +2008,7 @@ export default function App() {
       void reconcileTaskProjection(taskId, false, cachedRuntime).finally(() => {
         if (generation === navigationGeneration.current) setSwitchingTaskId("");
       });
-      const gitRefreshedAt = taskGitRefreshedAt.current.get(taskId) ?? 0;
-      if (!cachedGit || Date.now() - gitRefreshedAt >= GIT_CACHE_TTL_MS) {
+      if (refreshTaskGit) {
         void bridge
           .loadTaskGit(taskId)
           .then((git) => {
@@ -1974,6 +2027,9 @@ export default function App() {
           .catch((error: unknown) => {
             if (generation !== navigationGeneration.current) return;
             setOperationError(error instanceof Error ? error.message : "Could not load Git state");
+          })
+          .finally(() => {
+            if (generation === navigationGeneration.current) setGitLoading(false);
           });
       }
     } else if (generation === navigationGeneration.current) {
@@ -1994,6 +2050,7 @@ export default function App() {
       return;
     }
     ++navigationGeneration.current;
+    setGitLoading(nativeHost);
     setNewChatDraftKey((value) => value + 1);
     const empty = createEmptySnapshot();
     setRuntimeState(null);
@@ -2029,6 +2086,7 @@ export default function App() {
   };
 
   const mergeProject = (project: ProjectSummary) => {
+    setGitLoading(nativeHost);
     setSnapshot((current) => {
       const existingTasks = current.tasks.filter((task) => task.projectId === project.id);
       const sameProject = current.activeProjectId === project.id;
@@ -2373,6 +2431,10 @@ export default function App() {
       setPromotingDraftTaskId((current) => (current === targetTask.id ? "" : current));
       return false;
     }
+    setLocalSettings((current) => ({ ...current, "models.lastRuntime": input.runtime }));
+    void bridge
+      .setSetting("settings.models.lastRuntime", input.runtime)
+      .catch(() => undefined);
     if (input.draftRevision !== undefined) {
       const cleared = composerDraftStore.clear(
         { kind: "task", taskId: targetTask.id },
@@ -3108,15 +3170,8 @@ export default function App() {
         : "project-write";
     await sendTurn({
       prompt: priorUser.body,
-      runtime:
-        activeTask.runtime ??
-        (localSettings["models.defaultRuntime"] as RuntimeId | undefined) ??
-        "codex",
-      model:
-        activeTask.model ??
-        (typeof localSettings["models.defaultModel"] === "string"
-          ? localSettings["models.defaultModel"]
-          : "Provider default"),
+      runtime: activeTask.runtime ?? settingsDefaultRuntime,
+      model: activeTask.model ?? settingsDefaultModel,
       effort: activeTask.effort,
       permission: defaultPermission,
       delegation:
@@ -3534,22 +3589,13 @@ export default function App() {
                           }
                           runtimes={snapshot.runtimes}
                           defaultRuntime={
-                            activeTask?.runtime ??
-                            (localSettings["models.defaultRuntime"] as RuntimeId | undefined) ??
-                            "codex"
+                            activeTask?.runtime ?? settingsDefaultRuntime
                           }
-                          defaultModel={
-                            activeTask?.model ??
-                            (typeof localSettings["models.defaultModel"] === "string"
-                              ? localSettings["models.defaultModel"]
-                              : "Provider default")
-                          }
+                          defaultModel={activeTask?.model ?? settingsDefaultModel}
                           defaultEffort={
-                            activeTask?.effort ??
-                            (typeof localSettings["models.defaultEffort"] === "string"
-                              ? localSettings["models.defaultEffort"]
-                              : undefined)
+                            activeTask?.effort ?? settingsDefaultRoute.effort
                           }
+                          runtimeDefaults={composerRuntimeDefaults}
                           defaultPermission={
                             localSettings["permissions.defaultProfile"] === "read-only" ||
                             localSettings["permissions.defaultProfile"] === "ask" ||
@@ -3817,6 +3863,7 @@ export default function App() {
                     >
                       <RightRail
                         git={snapshot.git}
+                        gitLoading={gitLoading}
                         children={snapshot.children}
                         delegations={nativeHost ? delegations : undefined}
                         selectedDelegationId={selectedDelegation?.id}

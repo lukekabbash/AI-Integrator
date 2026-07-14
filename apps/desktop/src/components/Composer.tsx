@@ -30,6 +30,7 @@ import {
   type RuntimeId,
 } from "../bridge";
 import type { ComposerNotice } from "../composerNotices";
+import type { RuntimeRouteDefaults } from "../routingDefaults";
 import { Dropdown, ProviderIcon } from "./Dropdown";
 import { appendVoiceSegment, insertVoiceText, type VoiceInsertAnchor } from "./voiceTyping";
 
@@ -39,6 +40,8 @@ interface ComposerProps {
   defaultModel: string;
   /** Settings-provided reasoning effort, applied when the model supports it. */
   defaultEffort?: string;
+  /** Preferred model and effort recalled when the user switches runtimes. */
+  runtimeDefaults?: RuntimeRouteDefaults;
   /** Settings-provided permission profile preselected for new chats. */
   defaultPermission?: "read-only" | "project-write" | "ask" | "full-access";
   /** Settings-provided delegation mode preselected for new chats. */
@@ -415,6 +418,7 @@ export function Composer({
   defaultRuntime,
   defaultModel,
   defaultEffort,
+  runtimeDefaults,
   defaultPermission,
   defaultDelegation,
   enterToSend = true,
@@ -537,6 +541,7 @@ export function Composer({
         ];
   const effortOptions = activeEntry?.efforts ?? [];
   const activeEffort = resolveModelEffort(activeEntry, effort);
+  const preferredRuntimeEffort = runtimeDefaults?.[runtime]?.effort ?? defaultEffort;
   const draftValue = useMemo<ComposerDraftValue>(
     () => ({
       prompt,
@@ -1146,7 +1151,7 @@ export function Composer({
     if (!resolvedCatalog?.length || resolvedCatalog.some((entry) => entry.id === model)) return;
     const nextEntry = resolvedCatalog[0];
     if (!nextEntry) return;
-    const nextEffort = resolveModelEffort(nextEntry, defaultEffort);
+    const nextEffort = resolveModelEffort(nextEntry, preferredRuntimeEffort);
     let cancelled = false;
     void Promise.resolve().then(() => {
       if (cancelled) return;
@@ -1161,7 +1166,7 @@ export function Composer({
     return () => {
       cancelled = true;
     };
-  }, [defaultEffort, model, onRoutingChange, providerCatalogs, runtime]);
+  }, [model, onRoutingChange, preferredRuntimeEffort, providerCatalogs, runtime]);
 
   const submit = async () => {
     const trimmed = prompt.trim();
@@ -1731,7 +1736,10 @@ export function Composer({
                 // global default when the new model supports it.
                 const nextEntry = catalog.find((entry) => entry.id === next);
                 const nextEfforts = nextEntry?.efforts ?? [];
-                const nextEffort = resolveModelEffort(nextEntry, defaultEffort);
+                const nextEffort =
+                  nextEfforts.length > 0
+                    ? resolveModelEffort(nextEntry, preferredRuntimeEffort)
+                    : preferredRuntimeEffort;
                 setEffort(nextEffort);
                 emitRoutingChange(runtime, next, nextEfforts.length > 0 ? nextEffort : undefined);
               }}
@@ -1752,12 +1760,19 @@ export function Composer({
                   (runtimes.find((item) => item.id === nextRuntime)?.models ?? [])
                     .filter((id) => id !== PROVIDER_DEFAULT_MODEL)
                     .map((id) => ({ id, label: id }));
-                const nextModel =
-                  nextRuntimeCatalog.find((entry) => entry.id !== PROVIDER_DEFAULT_MODEL)?.id ??
-                  PROVIDER_DEFAULT_MODEL;
+                const preferredRoute = runtimeDefaults?.[nextRuntime];
+                const nextModel = nextRuntimeCatalog.some(
+                  (entry) => entry.id === preferredRoute?.model,
+                )
+                  ? (preferredRoute?.model ?? PROVIDER_DEFAULT_MODEL)
+                  : (nextRuntimeCatalog.find((entry) => entry.id !== PROVIDER_DEFAULT_MODEL)?.id ??
+                    PROVIDER_DEFAULT_MODEL);
                 const nextEntry = nextRuntimeCatalog.find((entry) => entry.id === nextModel);
                 const nextEfforts = nextEntry?.efforts ?? [];
-                const nextEffort = resolveModelEffort(nextEntry, defaultEffort);
+                const nextEffort =
+                  nextEfforts.length > 0
+                    ? resolveModelEffort(nextEntry, preferredRoute?.effort)
+                    : preferredRoute?.effort;
                 setRuntime(nextRuntime);
                 setModel(nextModel);
                 setEffort(nextEffort);
