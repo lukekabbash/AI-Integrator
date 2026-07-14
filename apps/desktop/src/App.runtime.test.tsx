@@ -382,7 +382,9 @@ describe("native runtime recovery UI", () => {
     expect(headers).toHaveLength(1);
     const childHeader = headers[0];
     const titlebar = document.querySelector<HTMLElement>(".native-titlebar");
+    const appRoot = document.querySelector<HTMLElement>(".app-root");
     expect(titlebar).not.toBeNull();
+    expect(appRoot).toHaveAttribute("data-subagent-visible", "true");
 
     expect(screen.getAllByRole("button", { name: /chat navigation/i })).toHaveLength(1);
     expect(
@@ -400,6 +402,7 @@ describe("native runtime recovery UI", () => {
 
     fireEvent.click(within(child).getByRole("button", { name: "Close subagent transcript" }));
     await waitFor(() => expect(document.querySelectorAll(".conversation-header")).toHaveLength(0));
+    expect(appRoot).toHaveAttribute("data-subagent-visible", "false");
     expect(
       within(titlebar!).getByRole("button", { name: "Toggle terminal" }),
     ).toBeInTheDocument();

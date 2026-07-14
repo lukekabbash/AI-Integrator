@@ -405,6 +405,8 @@ describe("Transcript", () => {
     );
 
     const group = screen.getByRole("button", { name: /Activity.*2 commands/ });
+    expect(group.querySelector(".activity-event-disclosure")).not.toBeNull();
+    expect(document.querySelector("button.activity-event-disclosure")).toBeNull();
     expect(screen.queryByText("passed")).not.toBeInTheDocument();
     fireEvent.click(group);
     expect(screen.getByText("pnpm test")).toBeInTheDocument();

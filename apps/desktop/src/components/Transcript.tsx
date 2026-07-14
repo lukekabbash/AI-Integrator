@@ -340,16 +340,27 @@ function ActivityEvent({
             <strong>{event.title ?? event.body}</strong>
             {event.title ? <span>{firstLine(event.body)}</span> : null}
           </span>
-          {event.changeStats ? (
-            <span
-              className="activity-diff-stats"
-              aria-label={`${event.changeStats.additions} lines added, ${event.changeStats.deletions} lines removed`}
-            >
-              <i>+{event.changeStats.additions}</i>
-              <b>−{event.changeStats.deletions}</b>
+          {event.changeStats || event.meta ? (
+            <span className="activity-event-meta">
+              {event.changeStats ? (
+                <span
+                  className="activity-diff-stats"
+                  aria-label={`${event.changeStats.additions} lines added, ${event.changeStats.deletions} lines removed`}
+                >
+                  <i>+{event.changeStats.additions}</i>
+                  <b>−{event.changeStats.deletions}</b>
+                </span>
+              ) : null}
+              {event.meta ? <span className="activity-meta">{event.meta}</span> : null}
             </span>
           ) : null}
-          {event.meta ? <span className="activity-meta">{event.meta}</span> : null}
+          <span className="activity-event-disclosure" aria-hidden="true">
+            {expandable ? (
+              <ChevronRight
+                className={expanded ? "disclosure disclosure--open-right" : "disclosure"}
+              />
+            ) : null}
+          </span>
         </button>
         {filePath && onOpenFile ? (
           <button
@@ -362,23 +373,6 @@ function ActivityEvent({
             <Search aria-hidden="true" />
           </button>
         ) : null}
-        {expandable ? (
-          // The toggle button already announces expansion; this mirror keeps
-          // the chevron clickable in its own fixed right-edge column.
-          <button
-            className="activity-event-disclosure"
-            type="button"
-            tabIndex={-1}
-            aria-hidden="true"
-            onClick={() => setExpanded((value) => !value)}
-          >
-            <ChevronRight
-              className={expanded ? "disclosure disclosure--open-right" : "disclosure"}
-            />
-          </button>
-        ) : (
-          <span className="activity-event-disclosure" aria-hidden="true" />
-        )}
       </div>
       <AnimatePresence initial={false}>
         {expanded && hasDetails ? (
@@ -884,4 +878,3 @@ function describeCurrentActivity(event: TranscriptEvent): string {
   if (event.title && detail && detail !== event.title) return `${event.title} · ${detail}`;
   return event.title ?? detail ?? "the task";
 }
-

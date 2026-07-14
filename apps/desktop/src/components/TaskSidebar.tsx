@@ -1,4 +1,5 @@
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { AnimatePresence, LayoutGroup, m as motion, useReducedMotion } from "motion/react";
 import {
   Archive,
@@ -13,6 +14,7 @@ import {
   Plus,
   Search,
   Settings,
+  X,
 } from "lucide-react";
 import type { ProjectSummary, TaskMessageSearchHit, TaskSummary } from "../bridge";
 import { AnimatedFolderIcon } from "./AnimatedFolderIcon";
@@ -166,6 +168,7 @@ export function TaskSidebar({
     Boolean(useReducedMotion()) ||
     (typeof document !== "undefined" && document.documentElement.dataset.motion === "none");
   const [query, setQuery] = useState("");
+  const [searchOpen, setSearchOpen] = useState(false);
   const [messageHits, setMessageHits] = useState<TaskMessageSearchHit[]>([]);
   const [messageSearchLoading, setMessageSearchLoading] = useState(false);
   const [searchResultLimit, setSearchResultLimit] = useState(INITIAL_SEARCH_RESULT_LIMIT);
@@ -178,6 +181,9 @@ export function TaskSidebar({
   const [showArchived, setShowArchived] = useState(false);
   const [projectChatLimits, setProjectChatLimits] = useState<Record<string, number>>({});
   const chatListRef = useRef<HTMLDivElement>(null);
+  const searchResultsRef = useRef<HTMLDivElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const searchButtonRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const searchGenerationRef = useRef(0);
@@ -217,6 +223,10 @@ export function TaskSidebar({
     [],
   );
 
+  useEffect(() => {
+    if (searchOpen) searchInputRef.current?.focus();
+  }, [searchOpen]);
+
   const updateSearch = (value: string) => {
     setQuery(value);
     setMessageHits([]);
@@ -241,6 +251,12 @@ export function TaskSidebar({
           if (searchGenerationRef.current === generation) setMessageSearchLoading(false);
         });
     }, 140);
+  };
+
+  const closeSearch = () => {
+    setSearchOpen(false);
+    updateSearch("");
+    searchButtonRef.current?.focus();
   };
 
   const deferredQuery = useDeferredValue(query);
@@ -288,9 +304,12 @@ export function TaskSidebar({
 
   const archivedCount = useMemo(() => tasks.filter((task) => task.archived).length, [tasks]);
 
-  const focusRelativeChat = (direction: 1 | -1) => {
+  const focusRelativeChat = (
+    direction: 1 | -1,
+    container: HTMLDivElement | null = chatListRef.current,
+  ) => {
     const buttons = Array.from(
-      chatListRef.current?.querySelectorAll<HTMLButtonElement>("[data-chat-select]") ?? [],
+      container?.querySelectorAll<HTMLButtonElement>("[data-chat-select]") ?? [],
     );
     if (buttons.length === 0) return;
     const current = buttons.indexOf(document.activeElement as HTMLButtonElement);
@@ -325,7 +344,12 @@ export function TaskSidebar({
 
   const renderChat = (
     task: TaskSummary,
-    options?: { showProject?: boolean; nested?: boolean; snippet?: string },
+    options?: {
+      showProject?: boolean;
+      nested?: boolean;
+      searchResult?: boolean;
+      snippet?: string;
+    },
   ) => {
     const project = projectById.get(task.projectId);
     const busy = taskActionBusyId === task.id;
@@ -337,7 +361,7 @@ export function TaskSidebar({
           showProject: options?.showProject,
           projectName: project?.name,
         });
-    if (renamingId === task.id) {
+    if (renamingId === task.id && !options?.searchResult) {
       return (
         <form
           className={`chat-rename-row${options?.nested ? " chat-rename-row--nested" : ""}`}
@@ -367,7 +391,7 @@ export function TaskSidebar({
         data-menu-open={openMenuId === task.id}
         key={task.id}
       >
-        {active ? (
+        {active && !options?.searchResult ? (
           <motion.span
             className="chat-row-active"
             layoutId={reduceMotion ? undefined : "sidebar-active-chat"}
@@ -380,7 +404,10 @@ export function TaskSidebar({
             className="chat-row"
             data-chat-select
             type="button"
-            onClick={() => onSelectTask(task.id)}
+            onClick={() => {
+              onSelectTask(task.id);
+              if (options?.searchResult) closeSearch();
+            }}
             aria-current={active ? "page" : undefined}
             data-status={task.status}
           >
@@ -406,20 +433,22 @@ export function TaskSidebar({
             {task.pinned ? <Pin className="chat-pin" aria-label="Pinned" /> : null}
           </button>
         </Tooltip>
-        <Tooltip label="More actions">
-          <button
-            className="chat-more-button"
-            type="button"
-            aria-label="More chat actions"
-            aria-expanded={openMenuId === task.id}
-            onClick={() => setOpenMenuId((current) => (current === task.id ? "" : task.id))}
-            disabled={busy}
-          >
-            <MoreHorizontal />
-          </button>
-        </Tooltip>
+        {!options?.searchResult ? (
+          <Tooltip label="More actions">
+            <button
+              className="chat-more-button"
+              type="button"
+              aria-label="More chat actions"
+              aria-expanded={openMenuId === task.id}
+              onClick={() => setOpenMenuId((current) => (current === task.id ? "" : task.id))}
+              disabled={busy}
+            >
+              <MoreHorizontal />
+            </button>
+          </Tooltip>
+        ) : null}
         <AnimatePresence>
-          {openMenuId === task.id ? (
+          {openMenuId === task.id && !options?.searchResult ? (
             <motion.div
               className="chat-action-menu"
               role="menu"
@@ -478,9 +507,27 @@ export function TaskSidebar({
   };
 
   return (
-    <aside className="task-sidebar" aria-label="Chat navigation">
+    <>
+      <aside className="task-sidebar" aria-label="Chat navigation">
       <div className="sidebar-brand-row">
         <BrandMark />
+        <Tooltip label="Search chats" hint={`${mod} K`}>
+          <motion.button
+            ref={searchButtonRef}
+            className="sidebar-search-button"
+            type="button"
+            aria-label="Search chats"
+            aria-haspopup="dialog"
+            aria-expanded={searchOpen}
+            onClick={() => {
+              setOpenMenuId("");
+              setSearchOpen(true);
+            }}
+            whileTap={reduceMotion ? undefined : { scale: 0.94 }}
+          >
+            <Search aria-hidden="true" />
+          </motion.button>
+        </Tooltip>
       </div>
 
       <motion.button
@@ -494,27 +541,6 @@ export function TaskSidebar({
         <span>New chat</span>
         <kbd>{mod} N</kbd>
       </motion.button>
-
-      <label className="sidebar-search">
-        <Search aria-hidden="true" />
-        <span className="sr-only">Search chats</span>
-        <input
-          aria-label="Search chats"
-          value={query}
-          onChange={(event) => updateSearch(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "ArrowDown") {
-              event.preventDefault();
-              focusRelativeChat(1);
-            } else if (event.key === "Escape") {
-              updateSearch("");
-              event.currentTarget.blur();
-            }
-          }}
-          placeholder="Search chats"
-        />
-        <kbd>{mod} K</kbd>
-      </label>
 
       <div
         className="sidebar-scroll"
@@ -543,50 +569,7 @@ export function TaskSidebar({
         </div>
 
         <LayoutGroup id="sidebar-chats">
-          {normalizedQuery ? (
-            <section
-              className="chat-section"
-              aria-label="Search results"
-              aria-busy={messageSearchLoading}
-            >
-              <div className="rail-section-heading rail-section-heading--later">
-                <span>Search results</span>
-                <small>{searchResults.length}</small>
-              </div>
-              {searchResults.length ? (
-                <>
-                  {visibleSearchResults.map((task) =>
-                    renderChat(task, {
-                      showProject: true,
-                      snippet: messageHitByTask.get(task.id),
-                    }),
-                  )}
-                  {searchResults.length > searchResultLimit ? (
-                    <button
-                      className="project-chat-more"
-                      type="button"
-                      onClick={() => setSearchResultLimit((current) => current + 120)}
-                    >
-                      Show more results
-                    </button>
-                  ) : null}
-                </>
-              ) : messageSearchLoading ? (
-                <div className="sidebar-chat-empty" role="status">
-                  <Search />
-                  <strong>Searching messages…</strong>
-                  <span>Looking through local chat history.</span>
-                </div>
-              ) : (
-                <div className="sidebar-chat-empty" role="status">
-                  <History />
-                  <strong>No matching chats</strong>
-                  <span>Try a chat title, project, or words from a message.</span>
-                </div>
-              )}
-            </section>
-          ) : (
-            <div className="project-tree" aria-label="Projects">
+          <div className="project-tree" aria-label="Projects">
               {projects.map((project) => {
                 const expanded = expandedProjects[project.id] ?? false;
                 const allProjectTasks = tasksByProject.get(project.id) ?? [];
@@ -709,8 +692,7 @@ export function TaskSidebar({
                   </span>
                 </button>
               ) : null}
-            </div>
-          )}
+          </div>
         </LayoutGroup>
 
         <button
@@ -740,6 +722,163 @@ export function TaskSidebar({
       {onResize ? (
         <ResizeHandle axis="horizontal" label="Resize chat sidebar" onResize={onResize} />
       ) : null}
-    </aside>
+      </aside>
+      {typeof document !== "undefined"
+        ? createPortal(
+            <AnimatePresence>
+              {searchOpen ? (
+                <motion.div
+                  className="search-modal-backdrop"
+                  role="presentation"
+                  initial={reduceMotion ? false : { opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={reduceMotion ? undefined : { opacity: 0 }}
+                  transition={{ duration: reduceMotion ? 0 : 0.16 }}
+                  onMouseDown={(event) => {
+                    if (event.target === event.currentTarget) closeSearch();
+                  }}
+                >
+                  <motion.section
+                    className="search-modal"
+                    role="dialog"
+                    aria-modal="true"
+                    aria-labelledby="chat-search-title"
+                    initial={reduceMotion ? false : { opacity: 0, y: -12, scale: 0.985 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={
+                      reduceMotion ? undefined : { opacity: 0, y: -8, scale: 0.99 }
+                    }
+                    transition={
+                      reduceMotion
+                        ? { duration: 0 }
+                        : { type: "spring", stiffness: 460, damping: 36, mass: 0.75 }
+                    }
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape") {
+                        event.preventDefault();
+                        closeSearch();
+                        return;
+                      }
+                      if (event.key !== "Tab") return;
+                      const focusable = Array.from(
+                        event.currentTarget.querySelectorAll<HTMLElement>(
+                          "button:not(:disabled), input:not(:disabled)",
+                        ),
+                      );
+                      const first = focusable[0];
+                      const last = focusable.at(-1);
+                      if (event.shiftKey && document.activeElement === first) {
+                        event.preventDefault();
+                        last?.focus();
+                      } else if (!event.shiftKey && document.activeElement === last) {
+                        event.preventDefault();
+                        first?.focus();
+                      }
+                    }}
+                  >
+                    <header className="search-modal-header">
+                      <h2 id="chat-search-title">Search chats</h2>
+                      <Tooltip label="Close search">
+                        <button
+                          className="search-modal-close"
+                          type="button"
+                          aria-label="Close search"
+                          onClick={closeSearch}
+                        >
+                          <X aria-hidden="true" />
+                        </button>
+                      </Tooltip>
+                    </header>
+                    <label className="search-modal-input">
+                      <Search aria-hidden="true" />
+                      <span className="sr-only">Search chats</span>
+                      <input
+                        ref={searchInputRef}
+                        aria-label="Search chats"
+                        value={query}
+                        onChange={(event) => updateSearch(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === "ArrowDown") {
+                            event.preventDefault();
+                            focusRelativeChat(1, searchResultsRef.current);
+                          }
+                        }}
+                        placeholder="Search chats, projects, and messages"
+                      />
+                      <kbd>{mod} K</kbd>
+                    </label>
+                    <div
+                      className="search-modal-results"
+                      ref={searchResultsRef}
+                      aria-busy={messageSearchLoading}
+                      onKeyDown={(event) => {
+                        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                          event.preventDefault();
+                          focusRelativeChat(
+                            event.key === "ArrowDown" ? 1 : -1,
+                            searchResultsRef.current,
+                          );
+                        }
+                      }}
+                    >
+                      {normalizedQuery ? (
+                        <>
+                          <div className="search-modal-results-heading">
+                            <span>Results</span>
+                            <small>
+                              {messageSearchLoading ? "Searching…" : searchResults.length}
+                            </small>
+                          </div>
+                          {searchResults.length ? (
+                            <div className="search-modal-result-list">
+                              {visibleSearchResults.map((task) =>
+                                renderChat(task, {
+                                  showProject: true,
+                                  searchResult: true,
+                                  snippet: messageHitByTask.get(task.id),
+                                }),
+                              )}
+                              {searchResults.length > searchResultLimit ? (
+                                <button
+                                  className="project-chat-more"
+                                  type="button"
+                                  onClick={() =>
+                                    setSearchResultLimit((current) => current + 120)
+                                  }
+                                >
+                                  Show more results
+                                </button>
+                              ) : null}
+                            </div>
+                          ) : messageSearchLoading ? (
+                            <div className="search-modal-state" role="status">
+                              <Search aria-hidden="true" />
+                              <strong>Searching…</strong>
+                              <span>Looking through your chat history.</span>
+                            </div>
+                          ) : (
+                            <div className="search-modal-state" role="status">
+                              <History aria-hidden="true" />
+                              <strong>No matching chats</strong>
+                              <span>Try a chat title, project, or words from a message.</span>
+                            </div>
+                          )}
+                        </>
+                      ) : (
+                        <div className="search-modal-state search-modal-state--idle">
+                          <Search aria-hidden="true" />
+                          <strong>Find any conversation</strong>
+                          <span>Search by chat title, project, or message text.</span>
+                        </div>
+                      )}
+                    </div>
+                  </motion.section>
+                </motion.div>
+              ) : null}
+            </AnimatePresence>,
+            document.body,
+          )
+        : null}
+    </>
   );
 }

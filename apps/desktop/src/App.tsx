@@ -282,6 +282,7 @@ function NativeTitlebar({
   leading,
   tabs,
   trailing,
+  motionScale,
   onOpenProject,
   onNewChat,
   onFocusComposer,
@@ -299,6 +300,7 @@ function NativeTitlebar({
   leading?: ReactNode;
   tabs?: ReactNode;
   trailing?: ReactNode;
+  motionScale: number;
   onOpenProject: () => void;
   onNewChat: () => void;
   onFocusComposer: () => void;
@@ -322,6 +324,7 @@ function NativeTitlebar({
   return (
     <header className="native-titlebar">
       <div className="titlebar-drag" data-tauri-drag-region />
+      <span className="titlebar-workspace-divider" aria-hidden="true" />
       <div className="titlebar-left">
         <div className="titlebar-brand-mini">
           <span>AI</span>
@@ -472,11 +475,20 @@ function NativeTitlebar({
         </div>
         </div>
         {title ? (
-          <div className="titlebar-title">
+          <motion.div
+            className="titlebar-title"
+            layout="position"
+            transition={{
+              layout: {
+                duration: 0.34 * motionScale,
+                ease: [0.33, 1, 0.15, 1] as const,
+              },
+            }}
+          >
             {leading}
             <h1>{title}</h1>
             {detail ? <span className="titlebar-title-detail">{detail}</span> : null}
-          </div>
+          </motion.div>
         ) : null}
       </div>
       {tabs ? null : <div className="titlebar-context">{context}</div>}
@@ -1847,9 +1859,7 @@ export default function App() {
         event.preventDefault();
         setSidebarCollapsed(false);
         window.setTimeout(() => {
-          const input = document.querySelector<HTMLInputElement>(".sidebar-search input");
-          input?.focus();
-          input?.select();
+          document.querySelector<HTMLButtonElement>(".sidebar-search-button")?.click();
         }, 0);
       }
     };
@@ -2679,7 +2689,14 @@ export default function App() {
       <div
         className="app-root"
         data-sidebar-visible={screen === "workspace" && !sidebarCollapsed}
-        style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}
+        data-rail-visible={screen === "workspace" && showRightRail}
+        data-subagent-visible={screen === "workspace" && Boolean(selectedDelegation)}
+        style={
+          {
+            "--sidebar-width": `${sidebarWidth}px`,
+            "--right-rail-width": `${rightRailWidth}px`,
+          } as CSSProperties
+        }
       >
         <a className="skip-link" href="#main-content">
           Skip to main content
@@ -2687,6 +2704,7 @@ export default function App() {
         <NativeTitlebar
           context={titleContext}
           title={screen === "workspace" ? (activeTask?.title ?? "New chat") : undefined}
+          motionScale={motionScale}
           detail={
             screen === "workspace" && activeProject ? (
               <>

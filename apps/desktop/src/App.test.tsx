@@ -38,10 +38,14 @@ describe("AI Integrator desktop workspace", () => {
 
   it("collapses and reopens both sidebars from the header corner buttons", async () => {
     render(<App />);
+    const appRoot = document.querySelector<HTMLElement>(".app-root");
+    expect(appRoot).not.toBeNull();
     expect(
       await screen.findByRole("complementary", { name: "Chat navigation" }),
     ).toBeInTheDocument();
     expect(await screen.findByRole("complementary", { name: "Task tools" })).toBeInTheDocument();
+    expect(appRoot).toHaveAttribute("data-sidebar-visible", "true");
+    expect(appRoot).toHaveAttribute("data-rail-visible", "true");
 
     // Collapse fully unmounts each panel once the slide-out animation ends.
     fireEvent.click(screen.getByRole("button", { name: "Close chat navigation" }));
@@ -50,18 +54,24 @@ describe("AI Integrator desktop workspace", () => {
         screen.queryByRole("complementary", { name: "Chat navigation" }),
       ).not.toBeInTheDocument(),
     );
+    expect(appRoot).toHaveAttribute("data-sidebar-visible", "false");
+    expect(appRoot).toHaveAttribute("data-rail-visible", "true");
     fireEvent.click(screen.getByRole("button", { name: "Close task tools" }));
     await waitFor(() =>
       expect(screen.queryByRole("complementary", { name: "Task tools" })).not.toBeInTheDocument(),
     );
+    expect(appRoot).toHaveAttribute("data-rail-visible", "false");
 
     // The corner buttons stay put and bring each panel back.
     fireEvent.click(screen.getByRole("button", { name: "Open chat navigation" }));
     expect(
       await screen.findByRole("complementary", { name: "Chat navigation" }),
     ).toBeInTheDocument();
+    expect(appRoot).toHaveAttribute("data-sidebar-visible", "true");
+    expect(appRoot).toHaveAttribute("data-rail-visible", "false");
     fireEvent.click(screen.getByRole("button", { name: "Open task tools" }));
     expect(await screen.findByRole("complementary", { name: "Task tools" })).toBeInTheDocument();
+    expect(appRoot).toHaveAttribute("data-rail-visible", "true");
   });
 
   it("loads the terminal on first use and keeps its session state mounted across toggles", async () => {
