@@ -16,10 +16,10 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use integrator_core::{
-    ApprovalDecision, ApprovalKind, ApprovalProjection, ConnectionState, IntegratorError,
-    LocalExport, ModeOption, ModeProjection, NewTask, ProjectId, ProviderKind, RuntimeBinding,
-    RuntimeProjection, RuntimeSession, Setting, StopRequestResult, Task, TaskId, TaskSnapshot,
-    TaskState, TransportRequestId, TrustedProject, TurnStatus, Versioned,
+    ApprovalDecision, ApprovalKind, ApprovalProjection, ComposerDraft, ConnectionState,
+    IntegratorError, LocalExport, ModeOption, ModeProjection, NewTask, ProjectId, ProviderKind,
+    RuntimeBinding, RuntimeProjection, RuntimeSession, Setting, StopRequestResult, Task, TaskId,
+    TaskSnapshot, TaskState, TransportRequestId, TrustedProject, TurnStatus, Versioned,
 };
 use integrator_runtime::{
     CommitResult, CreateWorktree, DiffResult, DiffScope, FileStatus, GitOverview, GitService,
@@ -532,9 +532,28 @@ fn native_slash_prompt<'a>(prompt: &'a str, name: &str) -> CommandResult<&'a str
 }
 
 #[tauri::command]
-pub async fn task_create(state: State<'_, AppState>, input: NewTask) -> CommandResult<Task> {
+pub async fn task_create(
+    state: State<'_, AppState>,
+    input: NewTask,
+    draft: Option<ComposerDraft>,
+) -> CommandResult<Task> {
     let store = Arc::clone(&state.store);
-    tauri::async_runtime::spawn_blocking(move || store.create_task(input))
+    tauri::async_runtime::spawn_blocking(move || match draft {
+        Some(draft) => store.create_task_with_project_draft(input, draft),
+        None => store.create_task(input),
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn composer_draft_save(
+    state: State<'_, AppState>,
+    draft: ComposerDraft,
+) -> CommandResult<()> {
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || store.upsert_composer_draft(draft))
         .await
         .map_err(|_| worker_error())?
         .map_err(Into::into)

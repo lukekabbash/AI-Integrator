@@ -1,5 +1,6 @@
 import type {
   ChildAgent,
+  ComposerDraft,
   DiffFile,
   GitSnapshot,
   ProjectSummary,
@@ -30,6 +31,7 @@ export interface WorkspaceSnapshot {
   >;
   lastTaskByProject: Record<string, string>;
   centerViewByTask: Record<string, "task" | "review">;
+  composerDrafts: ComposerDraft[];
 }
 
 export function createEmptySnapshot(): WorkspaceSnapshot {
@@ -66,6 +68,7 @@ export function createEmptySnapshot(): WorkspaceSnapshot {
     taskContexts: {},
     lastTaskByProject: {},
     centerViewByTask: {},
+    composerDrafts: [],
   };
 }
 
@@ -595,5 +598,6 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
       "theme-pass": "task",
       overnight: "task",
     },
+    composerDrafts: [],
   };
 }

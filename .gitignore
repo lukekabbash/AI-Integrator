@@ -2,12 +2,19 @@
 node_modules/
 dist/
 .vite/
+.cache/
+.turbo/
+.eslintcache
+.nyc_output/
 *.tsbuildinfo
 
 # Rust / Tauri
 target/
 src-tauri/target/
 /temp/
+/tmp/
+*.profraw
+*.lcov
 
 # Local environment and credentials
 .env
@@ -96,11 +103,17 @@ Thumbs.db
 *.bak
 *.orig
 *.rej
+*.swp
+*.swo
+*~
 
 # Test and coverage artifacts
 coverage/
 playwright-report/
 test-results/
+*.pid
+*.pid.lock
+*.trace
 
 # Packaging
 **/src-tauri/gen/

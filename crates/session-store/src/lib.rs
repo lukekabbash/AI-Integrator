@@ -8,9 +8,9 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use integrator_core::{
-    IntegratorError, LocalExport, NewTask, ProjectId, ProviderKind, ProviderSession,
-    ProviderSessionId, Result, RuntimeSession, RuntimeSessionId, Setting, Task, TaskId, TaskState,
-    TrustedProject, UsageProjection,
+    ComposerDraft, ComposerDraftAttachment, ComposerDraftOwner, IntegratorError, LocalExport,
+    NewTask, ProjectId, ProviderKind, ProviderSession, ProviderSessionId, Result, RuntimeSession,
+    RuntimeSessionId, Setting, Task, TaskId, TaskState, TrustedProject, UsageProjection,
 };
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -602,6 +602,33 @@ const MIGRATIONS: &[(i64, &str)] = &[
         );
         "#,
     ),
+    (
+        12,
+        r#"
+        CREATE TABLE composer_drafts (
+            draft_key TEXT PRIMARY KEY,
+            project_id TEXT REFERENCES trusted_projects(id) ON DELETE CASCADE,
+            task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+            prompt TEXT NOT NULL,
+            attachments_json TEXT NOT NULL,
+            runtime TEXT NOT NULL,
+            model TEXT NOT NULL,
+            effort TEXT,
+            permission TEXT NOT NULL,
+            delegation TEXT NOT NULL,
+            selection_start INTEGER NOT NULL,
+            selection_end INTEGER NOT NULL,
+            revision INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            CHECK ((project_id IS NOT NULL AND task_id IS NULL) OR
+                   (project_id IS NULL AND task_id IS NOT NULL))
+        );
+        CREATE UNIQUE INDEX composer_drafts_project_idx
+            ON composer_drafts(project_id) WHERE project_id IS NOT NULL;
+        CREATE UNIQUE INDEX composer_drafts_task_idx
+            ON composer_drafts(task_id) WHERE task_id IS NOT NULL;
+        "#,
+    ),
 ];
 
 pub struct LocalStore {
@@ -681,7 +708,8 @@ impl LocalStore {
         let transaction = connection.transaction().map_err(storage_error)?;
         transaction
             .execute_batch(
-                "DELETE FROM delegation_messages;
+                "DELETE FROM composer_drafts;
+                 DELETE FROM delegation_messages;
                  DELETE FROM delegations;
                  DELETE FROM codex_event_log;
                  DELETE FROM codex_approvals;
@@ -763,50 +791,144 @@ impl LocalStore {
     }
 
     pub fn create_task(&self, input: NewTask) -> Result<Task> {
-        let title = input.title.trim();
-        if title.is_empty() || title.chars().count() > 240 {
+        let task = build_task(input)?;
+        insert_task_row(&self.connection.lock(), &task)?;
+        Ok(task)
+    }
+
+    /// Creates the first durable task and moves its project-level new-chat
+    /// draft in the same transaction. A crash can therefore leave the draft
+    /// on either side of this boundary, but never detached from both owners.
+    pub fn create_task_with_project_draft(
+        &self,
+        input: NewTask,
+        draft: ComposerDraft,
+    ) -> Result<Task> {
+        let task = build_task(input)?;
+        let draft = normalize_composer_draft(draft)?;
+        let project_id = match draft.owner {
+            ComposerDraftOwner::NewChat { project_id } => project_id,
+            ComposerDraftOwner::Task { .. } => {
+                return Err(IntegratorError::InvalidInput(
+                    "only a new-chat draft can be promoted while creating a task".into(),
+                ));
+            }
+        };
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(storage_error)?;
+        let project_root = transaction
+            .query_row(
+                "SELECT repository_root FROM trusted_projects WHERE id = ?1",
+                [project_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| IntegratorError::NotFound(format!("project {project_id}")))?;
+        if task.repository_path.as_deref() != Some(Path::new(&project_root)) {
             return Err(IntegratorError::InvalidInput(
-                "task title must contain 1 to 240 characters".into(),
+                "new-chat draft project does not own the task repository".into(),
             ));
         }
-        let now = Utc::now();
-        let task = Task {
-            id: TaskId::new(),
-            title: title.to_owned(),
-            repository_path: input.repository_path,
-            worktree_path: input.worktree_path,
-            state: TaskState::Draft,
-            pinned: false,
-            archived: false,
-            runtime: normalize_optional_text(input.runtime, 64)?,
-            model: normalize_optional_text(input.model, 120)?,
-            effort: normalize_optional_text(input.effort, 64)?,
-            parent_task_id: input.parent_task_id,
-            created_at: now,
-            updated_at: now,
-        };
-        self.connection
-            .lock()
+        insert_task_row(&transaction, &task)?;
+
+        let mut task_draft = draft.clone();
+        task_draft.owner = ComposerDraftOwner::Task { task_id: task.id };
+        write_composer_draft(&transaction, &task_draft)?;
+
+        let mut project_tombstone = draft;
+        project_tombstone.prompt.clear();
+        project_tombstone.attachments.clear();
+        project_tombstone.selection_start = 0;
+        project_tombstone.selection_end = 0;
+        let (project_draft_key, _, _) = draft_identity(&project_tombstone.owner);
+        transaction
             .execute(
-                "INSERT INTO tasks(id, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                params![
-                    task.id.to_string(),
-                    task.title,
-                    path_text(task.repository_path.as_deref()),
-                    path_text(task.worktree_path.as_deref()),
-                    task.state.as_str(),
-                    task.pinned,
-                    task.archived,
-                    task.runtime,
-                    task.model,
-                    task.effort,
-                    task.parent_task_id.map(|id| id.to_string()),
-                    task.created_at.to_rfc3339(),
-                    task.updated_at.to_rfc3339(),
-                ],
+                "DELETE FROM composer_drafts WHERE draft_key = ?1 AND revision <= ?2",
+                params![project_draft_key, project_tombstone.revision as i64],
             )
             .map_err(storage_error)?;
+        write_composer_draft(&transaction, &project_tombstone)?;
+        transaction.commit().map_err(storage_error)?;
         Ok(task)
+    }
+
+    pub fn upsert_composer_draft(&self, draft: ComposerDraft) -> Result<()> {
+        let draft = normalize_composer_draft(draft)?;
+        let connection = self.connection.lock();
+        ensure_draft_owner(&connection, &draft.owner)?;
+        write_composer_draft(&connection, &draft)?;
+        Ok(())
+    }
+
+    pub fn list_composer_drafts(&self) -> Result<Vec<ComposerDraft>> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT project_id, task_id, prompt, attachments_json, runtime, model, effort, permission, delegation, selection_start, selection_end, revision, updated_at FROM composer_drafts ORDER BY updated_at DESC",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, String>(12)?,
+                ))
+            })
+            .map_err(storage_error)?;
+        rows.map(|row| {
+            let (
+                project_id,
+                task_id,
+                prompt,
+                attachments,
+                runtime,
+                model,
+                effort,
+                permission,
+                delegation,
+                selection_start,
+                selection_end,
+                revision,
+                updated_at,
+            ) = row.map_err(storage_error)?;
+            let owner = match (project_id, task_id) {
+                (Some(project_id), None) => ComposerDraftOwner::NewChat {
+                    project_id: ProjectId::from_str(&project_id).map_err(invalid_stored)?,
+                },
+                (None, Some(task_id)) => ComposerDraftOwner::Task {
+                    task_id: TaskId::from_str(&task_id).map_err(invalid_stored)?,
+                },
+                _ => return Err(invalid_stored("composer draft has invalid ownership")),
+            };
+            Ok(ComposerDraft {
+                owner,
+                prompt,
+                attachments: serde_json::from_str::<Vec<ComposerDraftAttachment>>(&attachments)
+                    .map_err(invalid_stored)?,
+                runtime,
+                model,
+                effort,
+                permission,
+                delegation,
+                selection_start: u32::try_from(selection_start).map_err(invalid_stored)?,
+                selection_end: u32::try_from(selection_end).map_err(invalid_stored)?,
+                revision: u64::try_from(revision).map_err(invalid_stored)?,
+                updated_at: parse_time(&updated_at)?,
+            })
+        })
+        .collect()
     }
 
     pub fn upsert_trusted_project(
@@ -1322,6 +1444,7 @@ impl LocalStore {
             settings: self.list_settings()?,
             provider_sessions: self.list_provider_sessions()?,
             runtime_sessions: self.list_runtime_sessions()?,
+            composer_drafts: self.list_composer_drafts()?,
         })
     }
 
@@ -1445,6 +1568,222 @@ fn parse_task_row(
         created_at: parse_time(&created)?,
         updated_at: parse_time(&updated)?,
     })
+}
+
+fn build_task(input: NewTask) -> Result<Task> {
+    let title = input.title.trim();
+    if title.is_empty() || title.chars().count() > 240 {
+        return Err(IntegratorError::InvalidInput(
+            "task title must contain 1 to 240 characters".into(),
+        ));
+    }
+    let now = Utc::now();
+    Ok(Task {
+        id: TaskId::new(),
+        title: title.to_owned(),
+        repository_path: input.repository_path,
+        worktree_path: input.worktree_path,
+        state: TaskState::Draft,
+        pinned: false,
+        archived: false,
+        runtime: normalize_optional_text(input.runtime, 64)?,
+        model: normalize_optional_text(input.model, 120)?,
+        effort: normalize_optional_text(input.effort, 64)?,
+        parent_task_id: input.parent_task_id,
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+fn insert_task_row(connection: &Connection, task: &Task) -> Result<()> {
+    connection
+        .execute(
+            "INSERT INTO tasks(id, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                task.id.to_string(),
+                &task.title,
+                path_text(task.repository_path.as_deref()),
+                path_text(task.worktree_path.as_deref()),
+                task.state.as_str(),
+                task.pinned,
+                task.archived,
+                &task.runtime,
+                &task.model,
+                &task.effort,
+                task.parent_task_id.map(|id| id.to_string()),
+                task.created_at.to_rfc3339(),
+                task.updated_at.to_rfc3339(),
+            ],
+        )
+        .map_err(storage_error)?;
+    Ok(())
+}
+
+fn normalize_composer_draft(mut draft: ComposerDraft) -> Result<ComposerDraft> {
+    const PROMPT_LIMIT: usize = 2 * 1024 * 1024;
+    const ATTACHMENT_LIMIT: usize = 64;
+    if draft.prompt.len() > PROMPT_LIMIT {
+        return Err(IntegratorError::InvalidInput(
+            "composer draft must not exceed 2 MiB".into(),
+        ));
+    }
+    if draft.attachments.len() > ATTACHMENT_LIMIT {
+        return Err(IntegratorError::InvalidInput(format!(
+            "composer draft must not contain more than {ATTACHMENT_LIMIT} attachments"
+        )));
+    }
+    for attachment in &draft.attachments {
+        if attachment.path.is_empty()
+            || attachment.path.chars().count() > 32_768
+            || attachment.path.contains('\0')
+            || attachment.name.is_empty()
+            || attachment.name.chars().count() > 512
+            || !matches!(attachment.kind.as_str(), "file" | "image")
+            || attachment
+                .entry
+                .as_deref()
+                .is_some_and(|entry| !matches!(entry, "file" | "folder"))
+        {
+            return Err(IntegratorError::InvalidInput(
+                "composer draft contains an invalid attachment reference".into(),
+            ));
+        }
+    }
+    let runtime = draft.runtime.trim();
+    if runtime.is_empty() || runtime.chars().count() > 64 {
+        return Err(IntegratorError::InvalidInput(
+            "composer runtime must contain 1 to 64 characters".into(),
+        ));
+    }
+    let model = draft.model.trim();
+    if model.is_empty() || model.chars().count() > 120 {
+        return Err(IntegratorError::InvalidInput(
+            "composer model must contain 1 to 120 characters".into(),
+        ));
+    }
+    draft.runtime = runtime.to_owned();
+    draft.model = model.to_owned();
+    draft.effort = normalize_optional_text(draft.effort, 64)?;
+    if !matches!(
+        draft.permission.as_str(),
+        "read-only" | "project-write" | "ask" | "full-access"
+    ) {
+        return Err(IntegratorError::InvalidInput(
+            "invalid composer permission profile".into(),
+        ));
+    }
+    if !matches!(
+        draft.delegation.as_str(),
+        "off" | "manual" | "balanced" | "budget-first"
+    ) {
+        return Err(IntegratorError::InvalidInput(
+            "invalid composer delegation mode".into(),
+        ));
+    }
+    let prompt_units = draft.prompt.encode_utf16().count();
+    if draft.selection_start as usize > prompt_units
+        || draft.selection_end as usize > prompt_units
+        || draft.selection_start > draft.selection_end
+    {
+        return Err(IntegratorError::InvalidInput(
+            "composer selection is outside the draft".into(),
+        ));
+    }
+    if draft.revision == 0 || draft.revision >= i64::MAX as u64 {
+        return Err(IntegratorError::InvalidInput(
+            "composer draft revision is outside the supported range".into(),
+        ));
+    }
+    draft.updated_at = Utc::now();
+    Ok(draft)
+}
+
+fn draft_identity(owner: &ComposerDraftOwner) -> (String, Option<String>, Option<String>) {
+    match owner {
+        ComposerDraftOwner::NewChat { project_id } => (
+            format!("project:{project_id}"),
+            Some(project_id.to_string()),
+            None,
+        ),
+        ComposerDraftOwner::Task { task_id } => {
+            (format!("task:{task_id}"), None, Some(task_id.to_string()))
+        }
+    }
+}
+
+fn ensure_draft_owner(connection: &Connection, owner: &ComposerDraftOwner) -> Result<()> {
+    let exists = match owner {
+        ComposerDraftOwner::NewChat { project_id } => connection
+            .query_row(
+                "SELECT 1 FROM trusted_projects WHERE id = ?1",
+                [project_id.to_string()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .is_some(),
+        ComposerDraftOwner::Task { task_id } => connection
+            .query_row(
+                "SELECT 1 FROM tasks WHERE id = ?1",
+                [task_id.to_string()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .is_some(),
+    };
+    if exists {
+        Ok(())
+    } else {
+        Err(IntegratorError::NotFound("composer draft owner".into()))
+    }
+}
+
+fn write_composer_draft(connection: &Connection, draft: &ComposerDraft) -> Result<()> {
+    let (draft_key, project_id, task_id) = draft_identity(&draft.owner);
+    let attachments = serde_json::to_string(&draft.attachments)?;
+    connection
+        .execute(
+            r#"
+            INSERT INTO composer_drafts(
+                draft_key, project_id, task_id, prompt, attachments_json, runtime, model,
+                effort, permission, delegation, selection_start, selection_end, revision, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            ON CONFLICT(draft_key) DO UPDATE SET
+                project_id=excluded.project_id,
+                task_id=excluded.task_id,
+                prompt=excluded.prompt,
+                attachments_json=excluded.attachments_json,
+                runtime=excluded.runtime,
+                model=excluded.model,
+                effort=excluded.effort,
+                permission=excluded.permission,
+                delegation=excluded.delegation,
+                selection_start=excluded.selection_start,
+                selection_end=excluded.selection_end,
+                revision=excluded.revision,
+                updated_at=excluded.updated_at
+            WHERE excluded.revision > composer_drafts.revision
+            "#,
+            params![
+                draft_key,
+                project_id,
+                task_id,
+                &draft.prompt,
+                attachments,
+                &draft.runtime,
+                &draft.model,
+                &draft.effort,
+                &draft.permission,
+                &draft.delegation,
+                i64::from(draft.selection_start),
+                i64::from(draft.selection_end),
+                draft.revision as i64,
+                draft.updated_at.to_rfc3339(),
+            ],
+        )
+        .map_err(storage_error)?;
+    Ok(())
 }
 
 fn normalize_optional_text(value: Option<String>, max_chars: usize) -> Result<Option<String>> {
@@ -2128,6 +2467,243 @@ mod tests {
             .expect("completed session");
         assert_eq!(completed.status, "completed");
         assert_eq!(completed.ended_at, Some(now));
+    }
+
+    fn draft_fixture(owner: ComposerDraftOwner, prompt: &str, revision: u64) -> ComposerDraft {
+        let selection = prompt.encode_utf16().count() as u32;
+        ComposerDraft {
+            owner,
+            prompt: prompt.into(),
+            attachments: Vec::new(),
+            runtime: "codex".into(),
+            model: "gpt-5.6-luna".into(),
+            effort: Some("high".into()),
+            permission: "project-write".into(),
+            delegation: "off".into(),
+            selection_start: selection,
+            selection_end: selection,
+            revision,
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn register_draft_project(store: &LocalStore, directory: &tempfile::TempDir) -> TrustedProject {
+        let repository = directory.path().join("repository");
+        let common = repository.join(".git");
+        std::fs::create_dir_all(&common).expect("fixture repository");
+        store
+            .upsert_trusted_project("Draft fixture", &repository, &common)
+            .expect("register draft project")
+    }
+
+    #[test]
+    fn happy_project_and_task_drafts_remain_isolated() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = LocalStore::open_in_memory().expect("open store");
+        let project = register_draft_project(&store, &directory);
+        let task = store
+            .create_task(NewTask {
+                title: "Existing conversation".into(),
+                repository_path: Some(project.repository_root.clone()),
+                worktree_path: None,
+                runtime: Some("codex".into()),
+                model: Some("gpt-5.6-luna".into()),
+                effort: Some("high".into()),
+                parent_task_id: None,
+            })
+            .expect("create task");
+        store
+            .upsert_composer_draft(draft_fixture(
+                ComposerDraftOwner::NewChat {
+                    project_id: project.id,
+                },
+                "A new chat thought",
+                1,
+            ))
+            .expect("save project draft");
+        store
+            .upsert_composer_draft(draft_fixture(
+                ComposerDraftOwner::Task { task_id: task.id },
+                "A reply for the existing chat",
+                1,
+            ))
+            .expect("save task draft");
+
+        let drafts = store.list_composer_drafts().expect("list drafts");
+        assert_eq!(drafts.len(), 2);
+        assert!(
+            drafts
+                .iter()
+                .any(|draft| draft.prompt == "A new chat thought")
+        );
+        assert!(
+            drafts
+                .iter()
+                .any(|draft| draft.prompt == "A reply for the existing chat")
+        );
+    }
+
+    #[test]
+    fn degraded_out_of_order_write_cannot_replace_a_newer_revision() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = LocalStore::open_in_memory().expect("open store");
+        let project = register_draft_project(&store, &directory);
+        let owner = ComposerDraftOwner::NewChat {
+            project_id: project.id,
+        };
+        store
+            .upsert_composer_draft(draft_fixture(owner.clone(), "newest", 4))
+            .expect("save newest");
+        store
+            .upsert_composer_draft(draft_fixture(owner, "stale", 3))
+            .expect("ignore stale");
+
+        let drafts = store.list_composer_drafts().expect("list drafts");
+        assert_eq!(drafts[0].prompt, "newest");
+        assert_eq!(drafts[0].revision, 4);
+    }
+
+    #[test]
+    fn restart_reopens_the_durable_draft() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = directory.path().join("draft-restart.sqlite3");
+        let expected_project = {
+            let store = LocalStore::open(&database).expect("first open");
+            let project = register_draft_project(&store, &directory);
+            store
+                .upsert_composer_draft(draft_fixture(
+                    ComposerDraftOwner::NewChat {
+                        project_id: project.id,
+                    },
+                    "Survive a hard restart",
+                    7,
+                ))
+                .expect("save draft");
+            project.id
+        };
+
+        let reopened = LocalStore::open(&database).expect("reopen store");
+        let drafts = reopened.list_composer_drafts().expect("restore drafts");
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].prompt, "Survive a hard restart");
+        assert_eq!(
+            drafts[0].owner,
+            ComposerDraftOwner::NewChat {
+                project_id: expected_project
+            }
+        );
+    }
+
+    #[test]
+    fn new_chat_promotion_atomically_rekeys_the_draft_to_the_created_task() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = LocalStore::open_in_memory().expect("open store");
+        let project = register_draft_project(&store, &directory);
+        let draft = draft_fixture(
+            ComposerDraftOwner::NewChat {
+                project_id: project.id,
+            },
+            "Create the task without losing me",
+            5,
+        );
+        store
+            .upsert_composer_draft(draft.clone())
+            .expect("save new-chat draft");
+        let task = store
+            .create_task_with_project_draft(
+                NewTask {
+                    title: "Promoted chat".into(),
+                    repository_path: Some(project.repository_root),
+                    worktree_path: None,
+                    runtime: Some("codex".into()),
+                    model: Some("gpt-5.6-luna".into()),
+                    effort: Some("high".into()),
+                    parent_task_id: None,
+                },
+                draft,
+            )
+            .expect("create task and promote draft");
+
+        let drafts = store.list_composer_drafts().expect("list promoted drafts");
+        let task_draft = drafts
+            .iter()
+            .find(|candidate| candidate.owner == ComposerDraftOwner::Task { task_id: task.id })
+            .expect("task draft");
+        let project_draft = drafts
+            .iter()
+            .find(|candidate| {
+                candidate.owner
+                    == ComposerDraftOwner::NewChat {
+                        project_id: project.id,
+                    }
+            })
+            .expect("project tombstone");
+        assert_eq!(task_draft.prompt, "Create the task without losing me");
+        assert!(project_draft.prompt.is_empty());
+        assert_eq!(project_draft.revision, task_draft.revision);
+    }
+
+    #[test]
+    fn cancellation_race_keeps_new_text_when_an_older_clear_arrives() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = LocalStore::open_in_memory().expect("open store");
+        let project = register_draft_project(&store, &directory);
+        let task = store
+            .create_task(NewTask {
+                title: "Cancellation race".into(),
+                repository_path: Some(project.repository_root),
+                worktree_path: None,
+                runtime: Some("codex".into()),
+                model: None,
+                effort: None,
+                parent_task_id: None,
+            })
+            .expect("create task");
+        let owner = ComposerDraftOwner::Task { task_id: task.id };
+        store
+            .upsert_composer_draft(draft_fixture(
+                owner.clone(),
+                "Typed while the send was settling",
+                12,
+            ))
+            .expect("save next draft");
+        store
+            .upsert_composer_draft(draft_fixture(owner, "", 11))
+            .expect("ignore stale clear");
+
+        let draft = store.list_composer_drafts().expect("list drafts").remove(0);
+        assert_eq!(draft.prompt, "Typed while the send was settling");
+        assert_eq!(draft.revision, 12);
+    }
+
+    #[test]
+    fn adversarial_unknown_owner_and_oversized_body_fail_closed() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let unknown = draft_fixture(
+            ComposerDraftOwner::NewChat {
+                project_id: ProjectId::new(),
+            },
+            "Untrusted owner",
+            1,
+        );
+        assert!(matches!(
+            store.upsert_composer_draft(unknown),
+            Err(IntegratorError::NotFound(_))
+        ));
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let project = register_draft_project(&store, &directory);
+        let oversized = draft_fixture(
+            ComposerDraftOwner::NewChat {
+                project_id: project.id,
+            },
+            &"x".repeat(2 * 1024 * 1024 + 1),
+            1,
+        );
+        assert!(matches!(
+            store.upsert_composer_draft(oversized),
+            Err(IntegratorError::InvalidInput(_))
+        ));
     }
 
     #[test]

@@ -347,6 +347,46 @@ export interface ContextAttachment {
   dataUrl?: string;
 }
 
+export type ComposerDraftOwner =
+  { kind: "newChat"; projectId: string } | { kind: "task"; taskId: string };
+
+export interface ComposerDraftAttachment extends ContextAttachment {
+  entry?: "file" | "folder";
+}
+
+export interface ComposerDraftValue {
+  prompt: string;
+  attachments: ComposerDraftAttachment[];
+  runtime: RuntimeId;
+  model: string;
+  effort?: string;
+  permission: "read-only" | "project-write" | "ask" | "full-access";
+  delegation: "off" | "manual" | "balanced" | "budget-first";
+  selectionStart: number;
+  selectionEnd: number;
+}
+
+export interface ComposerDraft extends ComposerDraftValue {
+  owner: ComposerDraftOwner;
+  revision: number;
+  updatedAt: string;
+}
+
+export function draftOwnerKey(owner: ComposerDraftOwner): string {
+  return owner.kind === "newChat" ? `project:${owner.projectId}` : `task:${owner.taskId}`;
+}
+
+export function persistableComposerAttachment(
+  attachment: ComposerDraftAttachment,
+): ComposerDraftAttachment {
+  return {
+    path: attachment.path,
+    name: attachment.name,
+    kind: attachment.kind,
+    ...(attachment.entry ? { entry: attachment.entry } : {}),
+  };
+}
+
 const IMAGE_ATTACHMENT_EXTENSIONS = new Set([
   "png",
   "jpg",
@@ -434,6 +474,8 @@ export interface StartTaskInput {
   effort?: string;
   permission: "read-only" | "project-write" | "ask" | "full-access";
   delegation: "off" | "manual" | "balanced" | "budget-first";
+  /** Project-level new-chat draft promoted atomically with native task creation. */
+  draft?: ComposerDraft;
 }
 
 export interface GenerateTaskTitleInput {
@@ -694,6 +736,8 @@ export interface AppBridge {
   probeRuntimes(): Promise<RuntimeConnection[]>;
   beginRuntimeLogin(runtime: RuntimeId): Promise<RuntimeConnection>;
   startTask(input: StartTaskInput): Promise<TaskSummary>;
+  /** Revisioned local persistence; stale writes are ignored by the native store. */
+  saveComposerDraft(draft: ComposerDraft): Promise<void>;
   /** Runs one isolated, provider-backed naming attempt for a newly created chat. */
   generateTaskTitle(input: GenerateTaskTitleInput): Promise<TaskNavigationMetadata | null>;
   loadTaskGit(taskId: string): Promise<GitSnapshot>;
@@ -860,6 +904,7 @@ interface NativeExport {
     provider: NativeProviderStatus["provider"];
     providerThreadId: string;
   }>;
+  composerDrafts?: ComposerDraft[];
 }
 
 interface NativeBootstrap {
@@ -1290,6 +1335,7 @@ function readDemoSnapshot(): WorkspaceSnapshot {
       taskContexts: parsed.taskContexts ?? activeContext,
       lastTaskByProject: parsed.lastTaskByProject ?? {},
       centerViewByTask: parsed.centerViewByTask ?? {},
+      composerDrafts: parsed.composerDrafts ?? [],
       activeProjectId:
         parsed.activeProjectId ??
         parsed.tasks.find((task) => task.id === parsed.activeTaskId)?.projectId ??
@@ -1665,6 +1711,7 @@ async function loadNativeWorkspace(): Promise<WorkspaceSnapshot> {
     lastTaskByProject,
     centerViewByTask: Object.fromEntries(tasks.map((task) => [task.id, "task" as const])),
     runtimes: [],
+    composerDrafts: local.composerDrafts ?? [],
   };
   // "Restore last workspace" is honored here: when disabled the app starts
   // with nothing active instead of reopening the previous project and chat.
@@ -2309,7 +2356,7 @@ export const bridge: AppBridge = {
     }
     return {
       applicationVersion: "browser-preview",
-      domainSchemaVersion: 2,
+      domainSchemaVersion: 4,
       dataDirectory: "Browser-managed local storage",
       localOnly: true,
     };
@@ -2440,13 +2487,14 @@ export const bridge: AppBridge = {
   exportLocalData: async () => {
     if (isTauri()) return nativeInvoke("local_export");
     return {
-      schemaVersion: 2,
+      schemaVersion: 4,
       exportedAt: new Date().toISOString(),
       projects: readDemoSnapshot().projects,
       tasks: readDemoSnapshot().tasks,
       settings: readBrowserSettings(),
       providerSessions: [],
       runtimeSessions: [],
+      composerDrafts: readDemoSnapshot().composerDrafts,
     };
   },
 
@@ -2690,6 +2738,7 @@ export const bridge: AppBridge = {
           model: input.model,
           effort: input.effort,
         },
+        draft: input.draft,
       });
       nativeTaskIds.set(task.id, task.id);
       repositoryByTaskId.set(task.id, project.path);
@@ -2742,6 +2791,40 @@ export const bridge: AppBridge = {
       archived: false,
       updatedAt: new Date().toISOString(),
     };
+  },
+
+  saveComposerDraft: async (draft) => {
+    const persisted: ComposerDraft = {
+      ...draft,
+      attachments: draft.attachments.map(persistableComposerAttachment),
+    };
+    if (isTauri()) {
+      await nativeInvoke("composer_draft_save", { draft: persisted });
+      if (cachedWorkspace) {
+        cachedWorkspace = {
+          ...cachedWorkspace,
+          composerDrafts: [
+            persisted,
+            ...cachedWorkspace.composerDrafts.filter(
+              (candidate) => draftOwnerKey(candidate.owner) !== draftOwnerKey(persisted.owner),
+            ),
+          ],
+        };
+      }
+      return;
+    }
+    const snapshot = cachedWorkspace ?? readDemoSnapshot();
+    const next = {
+      ...snapshot,
+      composerDrafts: [
+        persisted,
+        ...snapshot.composerDrafts.filter(
+          (candidate) => draftOwnerKey(candidate.owner) !== draftOwnerKey(persisted.owner),
+        ),
+      ],
+    };
+    cachedWorkspace = next;
+    writeDemoSnapshot(next);
   },
 
   loadTaskGit: async (taskId) => {
@@ -3364,7 +3447,10 @@ export const bridge: AppBridge = {
 
   persistSession: async (snapshot) => {
     if (isTauri()) {
-      cachedWorkspace = snapshot;
+      cachedWorkspace = {
+        ...snapshot,
+        composerDrafts: cachedWorkspace?.composerDrafts ?? snapshot.composerDrafts,
+      };
       writeStoredNavigation(snapshot);
       return;
     }
@@ -3391,7 +3477,12 @@ export const bridge: AppBridge = {
     const activeUsage = snapshot.activeTaskId
       ? (taskContexts[snapshot.activeTaskId]?.usage ?? snapshot.usage)
       : snapshot.usage;
-    const merged = { ...snapshot, taskContexts, usage: activeUsage };
+    const merged = {
+      ...snapshot,
+      taskContexts,
+      usage: activeUsage,
+      composerDrafts: previous.composerDrafts,
+    };
     cachedWorkspace = merged;
     writeStoredNavigation(merged);
     writeDemoSnapshot(merged);

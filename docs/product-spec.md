@@ -8,7 +8,9 @@
 
 ## 1. Executive summary
 
-AI Integrator is an accountless, local-first desktop workspace for directing coding agents through one restrained, task-centered interface. It does not replace the agents, proxy their model traffic, pool credentials, require an AI Integrator backend, or pretend that the same named model behaves identically in every harness. It launches and supervises the official runtimes already installed on the user's computer, normalizes their observable activity, and adds a shared layer for:
+AI Integrator is an accountless, local-first desktop control plane for orchestrating the coding agents already installed on the user's computer. It was created for the practical reality that a user may have several provider subscriptions and want to use each runtime where it is strongest or most economical. A high-judgment lead can plan, a lower-cost or subscription-backed runtime can investigate or implement a bounded slice, and the user can review the result in one task without manually copying context between products.
+
+It does not replace the agents, proxy their model traffic, pool credentials, require an AI Integrator backend, or pretend that the same named model behaves identically in every harness. It launches and supervises the official runtimes already installed on the user's computer, normalizes their observable activity, and adds a shared layer for:
 
 - Projects, tasks, worktrees, and cloned repositories.
 - Compact runtime, model, effort, environment, permission, and budget selection.
@@ -18,7 +20,7 @@ AI Integrator is an accountless, local-first desktop workspace for directing cod
 - Diffs, approvals, artifacts, evidence, and recovery.
 - Honest usage accounting and cost-aware routing.
 
-The product succeeds when a user can start with a broad contract, let a high-judgment lead agent delegate bounded work to cheaper or subscription-backed agents, review one coherent result, and continue with another runtime without manually reconstructing context.
+The product succeeds when a user can start with a broad contract, let a lead agent delegate bounded work across providers, review one coherent result, and continue with another runtime without manually reconstructing context. The product thesis and non-negotiable boundaries are defined in [product-thesis.md](product-thesis.md).
 
 ## 2. Product thesis
 
@@ -36,7 +38,7 @@ AI Integrator differentiates on five connected problems:
 
 > One task surface for every coding agent you already use, with portable skills, controlled delegation, shared permissions, and honest usage visibility.
 
-### 2.2 Experience promise
+### 2.2 Success condition
 
 The user should feel that they are supervising one capable engineering workspace, not operating a switchboard of vendor products.
 
@@ -51,7 +53,7 @@ The user should feel that they are supervising one capable engineering workspace
 - Make runtime/model/effort selection visible but visually secondary to the task.
 - Treat permissions, worktree isolation, and deployment boundaries as first-class product controls.
 - Provide model- and runtime-level usage reporting with explicit confidence labels.
-- Deliver one premium Windows/macOS experience with fast keyboard navigation, platform-native behavior, and excellent reduced-motion support.
+- Deliver one coherent Windows/macOS experience with fast keyboard navigation, platform-native behavior, and excellent reduced-motion support.
 - Make adding an ACP agent mostly a manifest and compatibility-test exercise.
 
 ### 3.2 Non-goals
@@ -833,7 +835,7 @@ Do not notify for routine child completion when the parent remains active unless
 
 ## 17. First-release scope
 
-### 17.1 Polished v1 MVP
+### 17.1 v1 MVP
 
 - One signed Windows/macOS desktop application from a shared Tauri 2, Rust, React, and TypeScript codebase.
 - Local projects and standalone tasks.

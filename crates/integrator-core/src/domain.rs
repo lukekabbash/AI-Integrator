@@ -289,6 +289,48 @@ pub struct LocalExport {
     pub settings: Vec<Setting>,
     pub provider_sessions: Vec<ProviderSession>,
     pub runtime_sessions: Vec<RuntimeSession>,
+    pub composer_drafts: Vec<ComposerDraft>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ComposerDraftOwner {
+    NewChat {
+        #[serde(rename = "projectId")]
+        project_id: ProjectId,
+    },
+    Task {
+        #[serde(rename = "taskId")]
+        task_id: TaskId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposerDraftAttachment {
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposerDraft {
+    pub owner: ComposerDraftOwner,
+    pub prompt: String,
+    pub attachments: Vec<ComposerDraftAttachment>,
+    pub runtime: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    pub permission: String,
+    pub delegation: String,
+    pub selection_start: u32,
+    pub selection_end: u32,
+    pub revision: u64,
+    pub updated_at: DateTime<Utc>,
 }
 
 uuid_id!(DelegationId);

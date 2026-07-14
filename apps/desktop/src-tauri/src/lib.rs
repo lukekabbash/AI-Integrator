@@ -62,6 +62,7 @@ pub fn run() {
             provider_discover,
             provider_action_list,
             task_create,
+            composer_draft_save,
             task_list,
             task_search_messages,
             task_set_state,

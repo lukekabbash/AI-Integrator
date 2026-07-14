@@ -9,6 +9,7 @@ Copy these documents into the target `docs/` directory and add them to `README.m
 
 | Source in this package | Canonical name | Owns |
 |---|---|---|
+| `product-thesis.md` | `docs/product-thesis.md` | why the product exists, agent-first/native meaning, orchestration model, and non-negotiable boundaries |
 | `v1-scope.md` | `docs/v1-scope.md` | definitive v1 in/out scope, milestones, release gates |
 | `architecture.md` | `docs/architecture.md` | one-codebase runtime/release architecture |
 | `local-first-contract.md` | `docs/local-first-contract.md` | identity, backend, storage, network, privacy, portability |

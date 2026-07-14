@@ -2,7 +2,7 @@
 
 **Purpose:** Record the product research and define implementation-grade visual, interaction, motion, and accessibility primitives for the desktop application.
 
-This is the concise research and brand foundation. The exhaustive, normative workspace specification—including open-project/new-task/clone semantics, component state machines, pane geometry, motion placement, platform behavior, performance, recovery, and QA—is [Agent workspace UI/UX primitives](ui-ux-primitives.md).
+This is a non-normative research and design reference. The exhaustive, normative workspace specification—including open-project/new-task/clone semantics, component state machines, pane geometry, motion placement, platform behavior, performance, recovery, and QA—is [Agent workspace UI/UX primitives](ui-ux-primitives.md).
 
 ## 1. Research method and limits
 

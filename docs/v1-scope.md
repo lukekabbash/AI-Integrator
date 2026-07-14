@@ -1,14 +1,14 @@
-# AI Integrator polished v1 MVP scope
+# AI Integrator v1 scope
 
 **Release description:** a shareable, dependable, local-first desktop application that lets one person supervise and coordinate installed coding agents through one task-oriented interface.  
 **Platforms:** Windows and macOS, same version and product.  
 **Identity:** local OS-user installation; no AI Integrator account.
 
-## 1. Product promise
+## 1. Product contract
 
 > Open a repository, choose the installed agent/model/effort you already pay for, delegate bounded work when useful, observe and control it, review the resulting code, and safely commit or push—all without moving credentials or project history into an AI Integrator cloud.
 
-The v1 must feel polished enough to share with real users. “MVP” means a deliberately narrow complete product, not rough scaffolding.
+The v1 must be a deliberately narrow, complete product rather than rough scaffolding. “MVP” describes delivery scope, not an excuse to leave the core loop untrustworthy.
 
 ## 2. Definitive v1 scope
 
@@ -146,7 +146,7 @@ Exit: the full loop passes through replay fixtures and live disposable repositor
 
 Exit: release-candidate gate passes on Windows x64, macOS arm64, and macOS Intel unless Intel is explicitly waived before implementation.
 
-### M3 — shareable v1
+### M3 — releasable v1
 
 - Signed/notarized immutable artifacts.
 - Static stable update channel and retained rollback artifact.

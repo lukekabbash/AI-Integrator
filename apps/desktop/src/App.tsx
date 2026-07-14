@@ -38,9 +38,13 @@ import {
 import {
   bridge,
   CHAT_TITLE_PLACEHOLDER,
+  draftOwnerKey,
   formatBridgeError,
   type ApprovalDecision,
   type ApprovalProjection,
+  type ComposerDraft,
+  type ComposerDraftOwner,
+  type ComposerDraftValue,
   type DelegationView,
   type DelegationRouting,
   type DiffFile,
@@ -66,6 +70,7 @@ import {
   isRuntimeUpdateRequired,
   type ComposerNotice,
 } from "./composerNotices";
+import { ComposerDraftStore } from "./composerDraftStore";
 import type { RuntimeActionRequest } from "./components/SettingsView";
 import { createDemoSnapshot, createEmptySnapshot, type WorkspaceSnapshot } from "./demoData";
 import {
@@ -905,6 +910,7 @@ export default function App() {
   const [switchingTaskId, setSwitchingTaskId] = useState("");
   const [taskActionBusyId, setTaskActionBusyId] = useState("");
   const [newChatDraftKey, setNewChatDraftKey] = useState(0);
+  const [promotingDraftTaskId, setPromotingDraftTaskId] = useState("");
   const [operationError, setOperationError] = useState("");
   const [composerError, setComposerError] = useState<ComposerErrorState | null>(null);
   const [operationStatus, setOperationStatus] = useState("");
@@ -913,6 +919,10 @@ export default function App() {
     taskId: string;
     event: TranscriptEvent;
   } | null>(null);
+  const [composerDraftStore] = useState(() => new ComposerDraftStore());
+  const draftPersistenceFailureShown = useRef(false);
+  const pendingDraftWrites = useRef(new Map<string, ComposerDraft>());
+  const draftWriterRunning = useRef(false);
   const [delegations, setDelegations] = useState<DelegationView[]>([]);
   const [selectedDelegationId, setSelectedDelegationId] = useState<string | undefined>();
   // Provider-reported subscription quota keyed by runtime (Codex today).
@@ -1276,6 +1286,7 @@ export default function App() {
             );
           }
         }
+        composerDraftStore.hydrate(loaded.composerDrafts);
         setSnapshot(loaded);
         taskRuntimeByIdRef.current = new Map(
           loaded.tasks.map((task) => [task.id, task.runtime] as const),
@@ -1323,7 +1334,7 @@ export default function App() {
       if (projectionFrame !== undefined) window.cancelAnimationFrame(projectionFrame);
       unlisten?.();
     };
-  }, [applyVerifiedRuntimeHealth, nativeHost, reconcileTaskProjection]);
+  }, [applyVerifiedRuntimeHealth, composerDraftStore, nativeHost, reconcileTaskProjection]);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => void bridge.persistSession(snapshot), 300);
@@ -1425,6 +1436,51 @@ export default function App() {
     snapshot.projects.find((project) => project.id === snapshot.activeProjectId) ??
     snapshot.projects.find((project) => project.id === activeTask?.projectId) ??
     snapshot.projects[0];
+  const activeDraftOwner: ComposerDraftOwner | undefined = activeProject
+    ? activeTask
+      ? { kind: "task", taskId: activeTask.id }
+      : { kind: "newChat", projectId: activeProject.id }
+    : undefined;
+  const activeComposerDraft = activeDraftOwner
+    ? composerDraftStore.read(activeDraftOwner)
+    : undefined;
+  const persistComposerDraft = (draft: ComposerDraft) => {
+    if (typeof bridge.saveComposerDraft !== "function") return;
+    pendingDraftWrites.current.set(draftOwnerKey(draft.owner), draft);
+    if (draftWriterRunning.current) return;
+    draftWriterRunning.current = true;
+    queueMicrotask(() => {
+      void (async () => {
+        try {
+          while (pendingDraftWrites.current.size > 0) {
+            const [key, next] = pendingDraftWrites.current.entries().next().value as [
+              string,
+              ComposerDraft,
+            ];
+            pendingDraftWrites.current.delete(key);
+            try {
+              await bridge.saveComposerDraft(next);
+            } catch {
+              if (!draftPersistenceFailureShown.current) {
+                draftPersistenceFailureShown.current = true;
+                setOperationError(
+                  "Draft recovery is temporarily unavailable. Your text remains in this open window.",
+                );
+              }
+            }
+          }
+        } finally {
+          draftWriterRunning.current = false;
+        }
+      })();
+    });
+  };
+  const updateActiveComposerDraft = (value: ComposerDraftValue): number => {
+    if (!activeDraftOwner) return 0;
+    const draft = composerDraftStore.update(activeDraftOwner, value);
+    persistComposerDraft(draft);
+    return draft.revision;
+  };
   const activeFile =
     snapshot.git.files.find((file) => file.path === activeFilePath) ?? snapshot.git.files[0];
   const activeProjectIdForFiles = activeProject?.id;
@@ -1838,7 +1894,18 @@ export default function App() {
         effort: options?.effort,
         permission: options?.permission ?? "project-write",
         delegation: options?.delegation ?? "balanced",
+        draft: options?.draft,
       });
+      if (options?.draft) {
+        const projectOwner = { kind: "newChat", projectId: project.id } as const;
+        const current = composerDraftStore.read(projectOwner) ?? options.draft;
+        const promoted = composerDraftStore.promote(project.id, task.id, current.revision);
+        if (promoted) {
+          persistComposerDraft(promoted.taskDraft);
+          persistComposerDraft(promoted.projectDraft);
+          setPromotingDraftTaskId(task.id);
+        }
+      }
       appendTask(task);
       setOperationStatus("Chat created");
       return task;
@@ -1921,6 +1988,7 @@ export default function App() {
     delegation: "off" | "manual" | "balanced" | "budget-first";
     nativeActionId?: string;
     nativeAction?: NativeActionReference;
+    draftRevision?: number;
   }): Promise<boolean> => {
     const project = activeProject;
     if (!project) {
@@ -1930,6 +1998,10 @@ export default function App() {
     setOperationError("");
     setComposerError(null);
     const isNewTask = !activeTask;
+    const submittedDraft =
+      activeDraftOwner && input.draftRevision !== undefined
+        ? composerDraftStore.read(activeDraftOwner)
+        : undefined;
     const targetTask =
       activeTask ??
       (await createTask(project, input.prompt, {
@@ -1938,6 +2010,7 @@ export default function App() {
         effort: input.effort,
         permission: input.permission,
         delegation: input.delegation,
+        draft: submittedDraft?.revision === input.draftRevision ? submittedDraft : undefined,
       }));
     if (!targetTask) return false;
     if (isNewTask) {
@@ -2023,8 +2096,17 @@ export default function App() {
       if (nativeHost) {
         void bridge.setTaskStatus?.(targetTask.id, "failed").catch(() => undefined);
       }
+      setPromotingDraftTaskId((current) => (current === targetTask.id ? "" : current));
       return false;
     }
+    if (input.draftRevision !== undefined) {
+      const cleared = composerDraftStore.clear(
+        { kind: "task", taskId: targetTask.id },
+        input.draftRevision,
+      );
+      if (cleared) persistComposerDraft(cleared);
+    }
+    setPromotingDraftTaskId((current) => (current === targetTask.id ? "" : current));
     try {
       if (bridge.updateTaskRouting) {
         await bridge.updateTaskRouting(targetTask.id, {
@@ -3106,7 +3188,11 @@ export default function App() {
                           />
                         ) : null}
                         <Composer
-                          key={activeTask?.id ?? `draft-${activeProject.id}-${newChatDraftKey}`}
+                          key={
+                            activeTask && promotingDraftTaskId !== activeTask.id
+                              ? activeTask.id
+                              : `draft-${activeProject.id}-${newChatDraftKey}`
+                          }
                           runtimes={snapshot.runtimes}
                           defaultRuntime={
                             activeTask?.runtime ??
@@ -3140,6 +3226,11 @@ export default function App() {
                               : "off"
                           }
                           enterToSend={localSettings["composer.enterToSend"] !== false}
+                          initialDraft={activeComposerDraft}
+                          onDraftChange={(value) => {
+                            updateActiveComposerDraft(value);
+                          }}
+                          onDraftSubmit={updateActiveComposerDraft}
                           contextFiles={contextFilePaths}
                           onRequestContextFiles={requestProjectFiles}
                           workingDirectory={activeTask?.worktree ?? activeProject.path}

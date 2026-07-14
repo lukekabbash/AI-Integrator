@@ -531,7 +531,7 @@ describe("AI Integrator desktop workspace", () => {
     expect(await screen.findByText("Queued for execution")).toBeInTheDocument();
   });
 
-  it("starts a clean local draft from New chat without creating durable chat junk", async () => {
+  it("reopens the same project-level new-chat draft without creating chat junk", async () => {
     const snapshot = createDemoSnapshot();
     snapshot.tasks = [];
     snapshot.activeTaskId = "";
@@ -539,15 +539,70 @@ describe("AI Integrator desktop workspace", () => {
     storeSnapshot(snapshot);
     render(<App />);
 
+    await screen.findByRole("heading", { name: "New chat" });
     const composer = await screen.findByRole("textbox", { name: "Task message" });
+    const saveDraft = vi.spyOn(bridge, "saveComposerDraft");
     fireEvent.change(composer, { target: { value: "unsent draft" } });
+    await waitFor(() =>
+      expect(saveDraft).toHaveBeenCalledWith(
+        expect.objectContaining({
+          owner: { kind: "newChat", projectId: snapshot.activeProjectId },
+          prompt: "unsent draft",
+        }),
+      ),
+    );
     const newChatLabel = await screen.findByText("New chat", {
       selector: ".new-task-button span",
     });
     fireEvent.click(newChatLabel.closest("button") as HTMLButtonElement);
     expect(await screen.findByRole("heading", { name: "New chat" })).toBeInTheDocument();
-    expect(screen.getByRole("textbox", { name: "Task message" })).toHaveValue("");
+    expect(screen.getByRole("textbox", { name: "Task message" })).toHaveValue("unsent draft");
     expect(screen.getByRole("heading", { name: "What are we working on?" })).toBeInTheDocument();
+  });
+
+  it("keeps independent drafts for a new chat and an ongoing chat", async () => {
+    const snapshot = createDemoSnapshot();
+    snapshot.composerDrafts = [];
+    storeSnapshot(snapshot);
+    const saveDraft = vi.spyOn(bridge, "saveComposerDraft");
+    render(<App />);
+
+    const composer = await screen.findByRole("textbox", { name: "Task message" });
+    fireEvent.change(composer, { target: { value: "Follow up in the existing chat" } });
+    await waitFor(() =>
+      expect(saveDraft).toHaveBeenCalledWith(
+        expect.objectContaining({
+          owner: { kind: "task", taskId: snapshot.activeTaskId },
+          prompt: "Follow up in the existing chat",
+        }),
+      ),
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: /^New chat(?! in)/ }));
+    const newComposer = await screen.findByRole("textbox", { name: "Task message" });
+    expect(newComposer).toHaveValue("");
+    fireEvent.change(newComposer, { target: { value: "Start a separate piece of work" } });
+    await waitFor(() =>
+      expect(saveDraft).toHaveBeenCalledWith(
+        expect.objectContaining({
+          owner: { kind: "newChat", projectId: snapshot.activeProjectId },
+          prompt: "Start a separate piece of work",
+        }),
+      ),
+    );
+
+    const sidebar = screen.getByRole("complementary", { name: "Chat navigation" });
+    fireEvent.click(
+      within(sidebar).getByRole("button", { name: /Construct the native v1 workspace/ }),
+    );
+    expect(await screen.findByRole("textbox", { name: "Task message" })).toHaveValue(
+      "Follow up in the existing chat",
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: /^New chat(?! in)/ }));
+    expect(await screen.findByRole("textbox", { name: "Task message" })).toHaveValue(
+      "Start a separate piece of work",
+    );
   });
 
   it("switches projects in one click and restores each project's last chat and center view", async () => {

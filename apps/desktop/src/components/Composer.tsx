@@ -17,9 +17,11 @@ import { FileIcon } from "./FileIcon";
 import {
   attachmentKind,
   bridge,
+  persistableComposerAttachment,
   PROVIDER_DEFAULT_MODEL,
   resolveModelEffort,
   type ContextAttachment,
+  type ComposerDraftValue,
   type ModeProjection,
   type ModelCatalogEntry,
   type NativeActionReference,
@@ -43,6 +45,12 @@ interface ComposerProps {
   defaultDelegation?: "off" | "manual" | "balanced" | "budget-first";
   /** When false, plain Enter inserts a newline and Ctrl/Cmd+Enter sends. */
   enterToSend?: boolean;
+  /** Memory-first state restored before this composer mounts. */
+  initialDraft?: ComposerDraftValue;
+  /** Runs after paint; owners persist it without putting storage on the input path. */
+  onDraftChange?: (value: ComposerDraftValue) => void;
+  /** Synchronously snapshots the exact submitted envelope and returns its durable revision. */
+  onDraftSubmit?: (value: ComposerDraftValue) => number;
   onSend: (value: {
     prompt: string;
     runtime: RuntimeId;
@@ -52,6 +60,7 @@ interface ComposerProps {
     delegation: "off" | "manual" | "balanced" | "budget-first";
     nativeActionId?: string;
     nativeAction?: NativeActionReference;
+    draftRevision?: number;
   }) => Promise<boolean>;
   /** Canonical trusted repository/worktree used for provider-native discovery. */
   workingDirectory?: string;
@@ -409,6 +418,9 @@ export function Composer({
   defaultPermission,
   defaultDelegation,
   enterToSend = true,
+  initialDraft,
+  onDraftChange,
+  onDraftSubmit,
   onSend,
   workingDirectory,
   onRoutingChange,
@@ -430,8 +442,8 @@ export function Composer({
   messageLabel = "Task message",
   sendLabel = "Send message",
 }: ComposerProps) {
-  const [prompt, setPrompt] = useState("");
-  const [caret, setCaret] = useState(0);
+  const [prompt, setPrompt] = useState(initialDraft?.prompt ?? "");
+  const [caret, setCaret] = useState(initialDraft?.selectionStart ?? 0);
   // Highlight is stored with the token key it belongs to, so a new token (or
   // a different query under it) derives back to the top match without effects.
   const [autocompleteHighlight, setAutocompleteHighlight] = useState<{
@@ -440,13 +452,13 @@ export function Composer({
   }>({ key: "", index: 0 });
   const [dismissedTokenKey, setDismissedTokenKey] = useState("");
   const [runtime, setRuntime] = useState<RuntimeId>(() =>
-    normalizeRuntime(runtimes, defaultRuntime),
+    normalizeRuntime(runtimes, initialDraft?.runtime ?? defaultRuntime),
   );
-  const [model, setModel] = useState(defaultModel);
-  const [effort, setEffort] = useState<string | undefined>(defaultEffort);
+  const [model, setModel] = useState(initialDraft?.model ?? defaultModel);
+  const [effort, setEffort] = useState<string | undefined>(initialDraft?.effort ?? defaultEffort);
   const [permission, setPermission] = useState<
     "read-only" | "project-write" | "ask" | "full-access"
-  >(defaultPermission ?? "project-write");
+  >(initialDraft?.permission ?? defaultPermission ?? "project-write");
   // Agent-driven permission changes (e.g. an approved plan exit) override
   // the picker even after the user touched it — the session already moved.
   // Applied once per request id with the adjust-state-during-render pattern.
@@ -456,10 +468,12 @@ export function Composer({
     setPermission(permissionRequest.value);
   }
   const [delegation, setDelegation] = useState<"off" | "manual" | "balanced" | "budget-first">(
-    defaultDelegation ?? "off",
+    initialDraft?.delegation ?? defaultDelegation ?? "off",
   );
   const [sending, setSending] = useState(false);
-  const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
+  const [attachments, setAttachments] = useState<ComposerAttachment[]>(
+    () => initialDraft?.attachments ?? [],
+  );
   const [attachmentError, setAttachmentError] = useState("");
   const [providerCatalogs, setProviderCatalogs] = useState<Record<string, ModelCatalogEntry[]>>({});
   const providerCatalogLoads = useRef(new Set<RuntimeId>());
@@ -495,7 +509,11 @@ export function Composer({
   const [dismissedNoticeIds, setDismissedNoticeIds] = useState<Set<string>>(new Set());
   const [noticeClock, setNoticeClock] = useState(() => Date.now());
   /** Once the user picks any routing value, settings defaults stop syncing. */
-  const routingTouched = useRef(false);
+  const routingTouched = useRef(Boolean(initialDraft));
+  const draftEmissionReadyRef = useRef(false);
+  const draftTouchedRef = useRef(false);
+  const suppressDraftEmissionRef = useRef(false);
+  const onDraftChangeRef = useRef(onDraftChange);
   const selectedRuntime = runtimes.find((item) => item.id === runtime) ?? runtimes[0];
   const catalogLoaded = Object.hasOwn(providerCatalogs, runtime);
   const runtimeCatalog =
@@ -519,6 +537,20 @@ export function Composer({
         ];
   const effortOptions = activeEntry?.efforts ?? [];
   const activeEffort = resolveModelEffort(activeEntry, effort);
+  const draftValue = useMemo<ComposerDraftValue>(
+    () => ({
+      prompt,
+      attachments: attachments.map(persistableComposerAttachment),
+      runtime,
+      model: activeModel,
+      effort,
+      permission,
+      delegation,
+      selectionStart: caret,
+      selectionEnd: caret,
+    }),
+    [activeModel, attachments, caret, delegation, effort, permission, prompt, runtime],
+  );
   const visibleNotices = notices.filter(
     (notice) =>
       !dismissedNoticeIds.has(notice.id) &&
@@ -526,6 +558,36 @@ export function Composer({
   );
   const voiceRecording = voicePhase === "recording";
   const voiceActive = voicePhase !== "idle";
+
+  useEffect(() => {
+    onDraftChangeRef.current = onDraftChange;
+  }, [onDraftChange]);
+
+  useEffect(() => {
+    if (!draftEmissionReadyRef.current) {
+      draftEmissionReadyRef.current = true;
+      if (!draftTouchedRef.current) return;
+    }
+    if (suppressDraftEmissionRef.current) {
+      if (!draftValue.prompt && draftValue.attachments.length === 0) return;
+      suppressDraftEmissionRef.current = false;
+    }
+    if (!draftTouchedRef.current && !draftValue.prompt && draftValue.attachments.length === 0) {
+      return;
+    }
+    onDraftChangeRef.current?.(draftValue);
+  }, [draftValue]);
+
+  useEffect(() => {
+    if (!initialDraft) return;
+    const frame = window.requestAnimationFrame(() => {
+      textareaRef.current?.setSelectionRange(
+        initialDraft.selectionStart,
+        initialDraft.selectionEnd,
+      );
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [initialDraft]);
 
   useEffect(() => {
     if (!controlsMenuOpen) return;
@@ -652,6 +714,7 @@ export function Composer({
     try {
       const picked = await pick();
       if (!picked?.length) return;
+      draftTouchedRef.current = true;
       setAttachments((current) => appendUniqueAttachments(current, picked));
     } catch (error) {
       setAttachmentError(
@@ -666,6 +729,7 @@ export function Composer({
     const token = autocompleteToken;
     if (!token) return;
     if (token.kind === "skill" && match.invocation === "interactiveOnly") return;
+    draftTouchedRef.current = true;
     if (token.kind === "file" && match.entry === "file") {
       const attachment = projectAttachment(match.value, "file");
       const before = prompt.slice(0, token.start);
@@ -708,6 +772,7 @@ export function Composer({
   const lastInsertIdRef = useRef(0);
   useEffect(() => {
     if (!insertRequest || insertRequest.id === lastInsertIdRef.current) return;
+    draftTouchedRef.current = true;
     lastInsertIdRef.current = insertRequest.id;
     const textarea = textareaRef.current;
     const start = textarea?.selectionStart ?? prompt.length;
@@ -1117,10 +1182,12 @@ export function Composer({
       : attachmentBlock;
     const nativeAction = completedNativeAction(trimmed, nativeActions);
     const nativeActionId = nativeAction?.id;
+    const draftRevision = onDraftSubmit?.(draftValue);
     setSending(true);
     // Clear immediately so the composer feels like a send action, not a
     // request that is waiting on provider/session startup. A rejected send
     // puts this exact draft back below.
+    suppressDraftEmissionRef.current = true;
     setPrompt("");
     setAttachments([]);
     const restoreDraft = () => {
@@ -1139,7 +1206,9 @@ export function Composer({
         ...(nativeAction
           ? { nativeAction: { name: nativeAction.name, kind: nativeAction.kind } }
           : {}),
+        ...(draftRevision !== undefined ? { draftRevision } : {}),
       });
+      suppressDraftEmissionRef.current = false;
       if (accepted === false) {
         restoreDraft();
       } else {
@@ -1147,6 +1216,7 @@ export function Composer({
       }
       textareaRef.current?.focus();
     } catch {
+      suppressDraftEmissionRef.current = false;
       restoreDraft();
     } finally {
       setSending(false);
@@ -1154,16 +1224,19 @@ export function Composer({
   };
 
   const changePermission = (next: string) => {
+    draftTouchedRef.current = true;
     routingTouched.current = true;
     setPermission(next as typeof permission);
     onPermissionChange?.(next as typeof permission);
   };
 
   const changeDelegation = (next: string) => {
+    draftTouchedRef.current = true;
     setDelegation(next as typeof delegation);
   };
 
   const changeEffort = (next: string) => {
+    draftTouchedRef.current = true;
     routingTouched.current = true;
     setEffort(next);
     emitRoutingChange(runtime, activeModel, next);
@@ -1346,6 +1419,7 @@ export function Composer({
               }
             }}
             onChange={(event) => {
+              draftTouchedRef.current = true;
               const nextPrompt = event.target.value;
               const nextCaret = event.target.selectionStart;
               if (nextPrompt.startsWith("/") && !prompt.startsWith("/") && nativeActionsError) {
@@ -1444,11 +1518,12 @@ export function Composer({
                   type="button"
                   aria-label={`Remove ${attachment.name}`}
                   title="Remove attachment"
-                  onClick={() =>
+                  onClick={() => {
+                    draftTouchedRef.current = true;
                     setAttachments((current) =>
                       current.filter((item) => item.path !== attachment.path),
-                    )
-                  }
+                    );
+                  }}
                 >
                   <X aria-hidden="true" />
                 </button>
@@ -1649,6 +1724,7 @@ export function Composer({
               onOpen={() => loadProviderCatalog(runtime)}
               value={activeModel}
               onChange={(next) => {
+                draftTouchedRef.current = true;
                 routingTouched.current = true;
                 setModel(next);
                 // Each model carries its own effort levels; prefer the user's
@@ -1668,6 +1744,7 @@ export function Composer({
               disabled={routingDisabled}
               value={runtime}
               onChange={(next) => {
+                draftTouchedRef.current = true;
                 routingTouched.current = true;
                 const nextRuntime = next as RuntimeId;
                 const nextRuntimeCatalog =
