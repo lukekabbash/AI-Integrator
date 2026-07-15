@@ -3924,74 +3924,15 @@ body[data-resizing="true"] .resize-handle::after {
   font-size: 10.5px;
   line-height: 1.5;
 }
-.branch-header {
-  height: 36px;
-  padding: 0 7px 0 10px;
-  display: flex;
-  align-items: center;
-  gap: 3px;
-}
-.branch-button {
-  min-width: 0;
-  flex: 1;
-  height: 30px;
-  padding: 0 5px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  border: 0;
-  border-radius: 7px;
-  color: var(--color-text-primary);
-  background: transparent;
-  cursor: pointer;
-}
-.branch-button:hover {
-  background: var(--color-layer-2);
-}
-.branch-button span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 11.5px;
-  font-weight: 590;
-}
-.branch-button svg {
-  width: 14px;
-}
-.branch-button svg:last-child {
-  margin-left: auto;
-  width: 11px;
-}
-.sync-pill {
-  height: 20px;
-  padding: 0 7px;
-  display: inline-flex;
-  flex: none;
-  align-items: center;
-  gap: 2px;
-  border: 1px solid var(--color-border-subtle);
-  border-radius: 99px;
-  color: var(--color-text-tertiary);
-  font: 9.5px var(--font-code);
-}
-.sync-pill svg {
-  width: 9px;
-  height: 9px;
-}
-.sync-pill svg:not(:first-child) {
-  margin-left: 3px;
-}
-.sync-pill[data-dirty="true"] {
-  border-color: var(--color-border-base);
-  color: var(--color-text-secondary);
-}
 .commit-card {
   position: relative;
-  margin: 0 10px 6px;
+  margin: 8px 10px 6px;
   border: 1px solid var(--color-border-base);
   border-radius: var(--radius-control);
   background: var(--color-layer-1);
+}
+.git-local-only + .commit-card {
+  margin-top: 0;
 }
 .commit-card:focus-within {
   border-color: var(--color-focus);
@@ -4081,57 +4022,17 @@ body[data-resizing="true"] .resize-handle::after {
   border-radius: var(--radius-control);
   background: color-mix(in srgb, var(--color-text-tertiary) 13%, transparent);
 }
-.git-skeleton-branch,
-.git-skeleton-summary,
+.git-skeleton-meta,
 .git-skeleton-file,
 .git-skeleton-section-head,
 .git-skeleton-commit-row {
   display: flex;
   align-items: center;
 }
-.git-skeleton-branch {
-  min-height: 39px;
-  gap: 9px;
-  padding: 0 3px;
-}
-.git-skeleton-branch > span {
-  min-width: 0;
-  flex: 1;
-  display: grid;
-  gap: 6px;
-}
-.git-skeleton-icon,
 .git-skeleton-file-icon {
   width: 17px;
   height: 17px;
   border-radius: 50%;
-}
-.git-skeleton-line {
-  height: 8px;
-}
-.git-skeleton-line--branch {
-  width: 44%;
-}
-.git-skeleton-line--path {
-  width: 68%;
-  height: 6px;
-  opacity: 0.68;
-}
-.git-skeleton-sync {
-  width: 22px;
-  height: 22px;
-  border-radius: 50%;
-}
-.git-skeleton-summary {
-  justify-content: space-between;
-}
-.git-skeleton-review {
-  width: 126px;
-  height: 32px;
-}
-.git-skeleton-stat {
-  width: 42px;
-  height: 8px;
 }
 .git-skeleton-composer {
   height: 86px;
@@ -4140,6 +4041,24 @@ body[data-resizing="true"] .resize-handle::after {
 .git-skeleton-commit {
   height: 34px;
   border-radius: var(--radius-control);
+}
+.git-skeleton-meta {
+  min-height: 22px;
+  gap: 8px;
+}
+.git-skeleton-sync {
+  width: 76px;
+  height: 7px;
+}
+.git-skeleton-stat {
+  width: 42px;
+  height: 8px;
+  margin-left: auto;
+}
+.git-skeleton-refresh {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
 }
 .git-skeleton-section,
 .git-skeleton-graph {
@@ -4442,16 +4361,15 @@ body[data-resizing="true"] .resize-handle::after {
 .git-remote-row svg {
   width: 11px;
 }
-.git-panel > .branch-header,
-.git-panel > .git-overview-actions,
 .git-panel > .commit-card,
 .git-panel > .commit-split,
+.git-panel > .git-commit-meta,
 .git-panel > .git-action-error {
   flex: none;
 }
 .commit-split {
   position: relative;
-  margin: 0 10px 8px;
+  margin: 0 10px 3px;
   display: grid;
   grid-template-columns: minmax(0, 1fr) 26px;
   border-radius: var(--radius-control);
@@ -4681,57 +4599,40 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   font-size: 9.5px;
   cursor: pointer;
 }
-.branch-header {
+.git-commit-meta {
+  min-height: 25px;
+  margin: 0 7px 5px 10px;
   display: flex;
   align-items: center;
-  gap: 4px;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--color-text-tertiary);
+  font: 9.5px var(--font-code);
 }
-.branch-header .branch-button {
-  min-width: 0;
-  flex: 1;
-}
-.branch-button > span {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.branch-button strong,
-.branch-button small {
-  overflow: hidden;
-  text-overflow: ellipsis;
+.git-sync-summary {
   white-space: nowrap;
 }
-.branch-button small {
-  color: var(--color-text-tertiary);
-  font: 9px var(--font-code);
+.git-sync-summary[data-dirty="true"] {
+  color: var(--color-text-secondary);
+}
+.git-commit-meta-actions {
+  min-width: 0;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
 }
 .git-refresh-button {
+  width: 22px;
+  height: 22px;
   flex: none;
 }
 .git-refresh-button svg {
-  width: 14px;
-}
-.git-overview-actions {
-  min-height: 28px;
-  padding: 2px 10px 8px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.git-overview-actions .secondary-button {
-  min-height: 28px;
-  padding: 0 9px;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 10px;
-}
-.git-overview-actions .secondary-button svg {
-  width: 12px;
+  width: 13px;
 }
 .git-line-summary {
-  margin-left: auto;
+  color: var(--color-text-tertiary);
 }
 .git-file-row {
   position: relative;
@@ -9323,6 +9224,9 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
 .titlebar-file-tabs .file-reader-tab[data-active="true"] {
   z-index: 2;
 }
+.titlebar-file-tabs .file-reader-tab > button[role="tab"] {
+  cursor: grab;
+}
 .titlebar-file-tabs .file-reader-tab[data-active="true"]::after {
   content: "";
   position: absolute;
@@ -9337,7 +9241,7 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
 .titlebar-file-tabs[data-dragging="true"] .file-reader-tab > button {
   cursor: grabbing;
 }
-@container file-tab (max-width: 84px) {
+@container file-tab (max-width: 62px) {
   .file-reader-tab > button[role="tab"] {
     justify-content: center;
     padding-inline: 4px;

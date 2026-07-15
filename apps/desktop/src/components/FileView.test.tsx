@@ -141,7 +141,10 @@ describe("FileWorkspace", () => {
     const firstSave = new Promise<void>((resolve) => {
       finishFirstSave = resolve;
     });
-    const onSave = vi.fn().mockImplementationOnce(() => firstSave).mockResolvedValue(undefined);
+    const onSave = vi
+      .fn()
+      .mockImplementationOnce(() => firstSave)
+      .mockResolvedValue(undefined);
     renderWorkspace({ editable: true, onSave });
     const editor = screen.getByRole("textbox", { name: "Edit src/App.tsx" });
 
@@ -195,9 +198,9 @@ describe("FileWorkspace", () => {
   });
 
   it("opens the in-file explain panel instead of sending the selection to chat", async () => {
-    const onExplainSelection = vi.fn().mockResolvedValue(
-      "This line declares a string constant used by the surrounding module.",
-    );
+    const onExplainSelection = vi
+      .fn()
+      .mockResolvedValue("This line declares a string constant used by the surrounding module.");
     const onAddComposerContext = vi.fn();
     renderWorkspace({
       onExplainSelection,
@@ -222,7 +225,9 @@ describe("FileWorkspace", () => {
     );
     expect(onAddComposerContext).not.toHaveBeenCalled();
 
-    expect(screen.getByRole("complementary", { name: /Explanation of App.tsx/ })).toBeInTheDocument();
+    expect(
+      screen.getByRole("complementary", { name: /Explanation of App.tsx/ }),
+    ).toBeInTheDocument();
     expect(screen.getByText("Explaining with Codex…")).toBeInTheDocument();
 
     await waitFor(() =>
@@ -239,9 +244,7 @@ describe("FileWorkspace", () => {
   });
 
   it("surfaces explain failures in the panel without leaving the file", async () => {
-    const onExplainSelection = vi
-      .fn()
-      .mockRejectedValue(new Error("provider timed out"));
+    const onExplainSelection = vi.fn().mockRejectedValue(new Error("provider timed out"));
     renderWorkspace({ onExplainSelection, explainAgentLabel: "Cursor" });
 
     const lines = selectFirstLine();

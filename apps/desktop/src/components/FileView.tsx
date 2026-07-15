@@ -12,10 +12,7 @@ import { createPortal } from "react-dom";
 import { AtSign, FileCode2, LoaderCircle, MessageCircleQuestion, X } from "lucide-react";
 import { AnimatePresence, m as motion, useReducedMotion } from "motion/react";
 import { FileIcon } from "./FileIcon";
-import {
-  type SelectionContext,
-  type SelectionPayload,
-} from "./SelectionActionPopover";
+import { type SelectionContext, type SelectionPayload } from "./SelectionActionPopover";
 import { selectionEndpointElement } from "./conversationFormatting";
 import { highlightCodeLine } from "./codeHighlight";
 import type { ProjectFileContent } from "../bridge";
@@ -149,7 +146,11 @@ function SelectionExplainPanel({
       aria-busy={state.status === "loading"}
       initial={still ? false : { opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
-      exit={still ? { opacity: 0, transition: { duration: 0 } } : { opacity: 0, y: 6, transition: MENU_EXIT }}
+      exit={
+        still
+          ? { opacity: 0, transition: { duration: 0 } }
+          : { opacity: 0, y: 6, transition: MENU_EXIT }
+      }
       transition={still ? { duration: 0 } : MENU_ENTER}
     >
       <header className="selection-explain-header">
@@ -282,7 +283,11 @@ function SelectionContextMenu({
           style={{ left, top }}
           initial={still ? false : { opacity: 0, y: 4 }}
           animate={{ opacity: 1, y: 0 }}
-          exit={still ? { opacity: 0, transition: { duration: 0 } } : { opacity: 0, y: 2, transition: MENU_EXIT }}
+          exit={
+            still
+              ? { opacity: 0, transition: { duration: 0 } }
+              : { opacity: 0, y: 2, transition: MENU_EXIT }
+          }
           transition={still ? { duration: 0 } : MENU_ENTER}
           // Acting on the selection must not collapse it first.
           onPointerDown={(event) => event.preventDefault()}
@@ -444,9 +449,7 @@ export function FileWorkspace({
           lastQueuedContentRef.current = persistedContentRef.current;
         }
         if (mountedRef.current && revision === saveRevisionRef.current) {
-          setSaveError(
-            error instanceof Error ? error.message : "The file could not be autosaved.",
-          );
+          setSaveError(error instanceof Error ? error.message : "The file could not be autosaved.");
         }
       } finally {
         if (mountedRef.current && revision === saveRevisionRef.current) setSaving(false);

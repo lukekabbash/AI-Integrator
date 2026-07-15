@@ -13,7 +13,6 @@ import { AnimatePresence, m as motion, useReducedMotion } from "motion/react";
 import {
   Activity,
   ArrowDown,
-  ArrowUp,
   AtSign,
   ChevronDown,
   ChevronRight,
@@ -413,7 +412,6 @@ function GitPanel({
   onCommit,
   onGenerateCommitMessage,
   onPush,
-  onReviewChanges,
   onRefreshGit,
   onInitializeGit,
   onAddRemote,
@@ -438,7 +436,6 @@ function GitPanel({
   | "onCommit"
   | "onGenerateCommitMessage"
   | "onPush"
-  | "onReviewChanges"
   | "onRefreshGit"
   | "onInitializeGit"
   | "onAddRemote"
@@ -798,20 +795,13 @@ function GitPanel({
         aria-label="Checking repository"
       >
         <span className="sr-only">Checking repository…</span>
-        <div className="git-skeleton-branch" aria-hidden="true">
-          <i className="git-skeleton-block git-skeleton-icon" />
-          <span>
-            <i className="git-skeleton-block git-skeleton-line git-skeleton-line--branch" />
-            <i className="git-skeleton-block git-skeleton-line git-skeleton-line--path" />
-          </span>
-          <i className="git-skeleton-block git-skeleton-sync" />
-        </div>
-        <div className="git-skeleton-summary" aria-hidden="true">
-          <i className="git-skeleton-block git-skeleton-review" />
-          <i className="git-skeleton-block git-skeleton-stat" />
-        </div>
         <i className="git-skeleton-block git-skeleton-composer" aria-hidden="true" />
         <i className="git-skeleton-block git-skeleton-commit" aria-hidden="true" />
+        <div className="git-skeleton-meta" aria-hidden="true">
+          <i className="git-skeleton-block git-skeleton-sync" />
+          <i className="git-skeleton-block git-skeleton-stat" />
+          <i className="git-skeleton-block git-skeleton-refresh" />
+        </div>
         <div className="git-skeleton-section" aria-hidden="true">
           <div className="git-skeleton-section-head">
             <i className="git-skeleton-block git-skeleton-label" />
@@ -883,41 +873,6 @@ function GitPanel({
 
   return (
     <div className="rail-panel git-panel">
-      <div className="branch-header">
-        <div className="branch-button" aria-label={`Current branch ${git.branch}`}>
-          <GitBranch />
-          <span>
-            <strong>{git.branch || "No branch"}</strong>
-            <small title={git.worktree}>{git.worktree || "Repository not loaded"}</small>
-          </span>
-        </div>
-        <Tooltip
-          label={`${git.ahead} ahead · ${git.behind} behind${git.upstream ? ` · ${git.upstream}` : ""}`}
-        >
-          <span
-            className="sync-pill"
-            data-dirty={git.ahead > 0 || git.behind > 0}
-            aria-label={`${git.ahead} commits ahead, ${git.behind} behind ${git.upstream || "upstream"}`}
-          >
-            <ArrowUp aria-hidden="true" />
-            {git.ahead}
-            <ArrowDown aria-hidden="true" />
-            {git.behind}
-          </span>
-        </Tooltip>
-        <Tooltip label="Refresh Git status">
-          <button
-            className="icon-button subtle git-refresh-button"
-            type="button"
-            onClick={() => void runRefresh()}
-            disabled={!onRefreshGit || busy !== null}
-            aria-label="Refresh Git status"
-            aria-busy={busy === "refresh"}
-          >
-            <RefreshCw className={busy === "refresh" ? "spin-slow" : undefined} />
-          </button>
-        </Tooltip>
-      </div>
       {git.remotes.length === 0 ? (
         <div className="git-local-only">
           <span>
@@ -940,34 +895,6 @@ function GitPanel({
           </button>
         </div>
       ) : null}
-      <div className="git-overview-actions">
-        <button
-          className="secondary-button"
-          type="button"
-          onClick={onReviewChanges}
-          disabled={!git.files.length || !onReviewChanges}
-        >
-          <GitCompare /> Review changes
-        </button>
-        <span
-          className="git-line-summary"
-          aria-label={
-            lineStatsLoaded
-              ? `${additions} lines added, ${deletions} lines removed`
-              : "Line counts load as diffs are opened"
-          }
-        >
-          {lineStatsLoaded ? (
-            <>
-              <i>+{additions}</i>
-              <b>−{deletions}</b>
-            </>
-          ) : (
-            <small>Counts on demand</small>
-          )}
-        </span>
-      </div>
-
       <div className="commit-card">
         <label className="sr-only" htmlFor="git-commit-message">
           Commit message
@@ -1190,6 +1117,50 @@ function GitPanel({
             </motion.div>
           ) : null}
         </AnimatePresence>
+      </div>
+      <div className="git-commit-meta">
+        <Tooltip
+          label={`${git.ahead} ahead · ${git.behind} behind${git.upstream ? ` · ${git.upstream}` : ""}`}
+        >
+          <span
+            className="git-sync-summary"
+            data-dirty={git.ahead > 0 || git.behind > 0}
+            aria-label={`${git.ahead} commits ahead, ${git.behind} behind ${git.upstream || "upstream"}`}
+          >
+            {git.ahead} ahead <span aria-hidden="true">·</span> {git.behind} behind
+          </span>
+        </Tooltip>
+        <div className="git-commit-meta-actions">
+          <span
+            className="git-line-summary"
+            aria-label={
+              lineStatsLoaded
+                ? `${additions} lines added, ${deletions} lines removed in the working tree`
+                : "Line counts load as diffs are opened"
+            }
+          >
+            {lineStatsLoaded ? (
+              <>
+                <i>+{additions}</i>
+                <b>−{deletions}</b>
+              </>
+            ) : (
+              <small>Counts on demand</small>
+            )}
+          </span>
+          <Tooltip label="Refresh Git status">
+            <button
+              className="icon-button subtle git-refresh-button"
+              type="button"
+              onClick={() => void runRefresh()}
+              disabled={!onRefreshGit || busy !== null}
+              aria-label="Refresh Git status"
+              aria-busy={busy === "refresh"}
+            >
+              <RefreshCw className={busy === "refresh" ? "spin-slow" : undefined} />
+            </button>
+          </Tooltip>
+        </div>
       </div>
       {actionError ? (
         <p className="git-action-error" role="alert">

@@ -8,7 +8,6 @@ import {
   useRef,
   useState,
   type CSSProperties,
-  type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
 import {
@@ -92,8 +91,8 @@ import {
   type ThemePreferences,
 } from "./theme";
 import { Composer } from "./components/Composer";
-import { FileIcon } from "./components/FileIcon";
 import { FileWorkspace, type FileSelectionPayload } from "./components/FileView";
+import { TitlebarFileTabs } from "./components/TitlebarFileTabs";
 import { resolveRequestedFile } from "./components/fileViewSupport";
 import { TaskStatusPill } from "./components/TaskStatusPill";
 import { QueuedMessages } from "./components/QueuedMessages";
@@ -1284,14 +1283,6 @@ export default function App() {
   const handledFileRequestRef = useRef<number | null>(null);
   // Refs mirror the tab state for the long-lived keyboard shortcut listener.
   const activeFileTabPathRef = useRef("");
-  const activeFileTabElementRef = useRef<HTMLDivElement>(null);
-  const fileTabPanRef = useRef<{
-    pointerId: number;
-    startX: number;
-    startScrollLeft: number;
-    moved: boolean;
-  } | null>(null);
-  const suppressFileTabClickRef = useRef(false);
   const closeFileTabRef = useRef<(path: string) => void>(() => undefined);
   const [sidebarWidth, setSidebarWidth] = useState(() =>
     storedDimension(SIDEBAR_WIDTH_STORAGE_KEY, 272, 220, 420),
@@ -2955,69 +2946,6 @@ export default function App() {
     ? openFileTabs.find((tab) => tab.path === activeFileTabPath)
     : undefined;
 
-  useEffect(() => {
-    const activeTab = activeFileTabElementRef.current;
-    if (!activeTab) return;
-    const revealActiveTab = () =>
-      activeTab.scrollIntoView?.({ behavior: "auto", block: "nearest", inline: "nearest" });
-    revealActiveTab();
-    const strip = activeTab.parentElement;
-    const observer =
-      strip && typeof ResizeObserver !== "undefined"
-        ? new ResizeObserver(revealActiveTab)
-        : undefined;
-    if (strip) observer?.observe(strip);
-    window.addEventListener("resize", revealActiveTab);
-    return () => {
-      observer?.disconnect();
-      window.removeEventListener("resize", revealActiveTab);
-    };
-  }, [activeFileTabPath]);
-
-  const beginFileTabPan = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (
-      event.button !== 0 ||
-      event.currentTarget.scrollWidth <= event.currentTarget.clientWidth ||
-      (event.target as HTMLElement).closest(".file-reader-tab-close")
-    ) {
-      return;
-    }
-    fileTabPanRef.current = {
-      pointerId: event.pointerId,
-      startX: event.clientX,
-      startScrollLeft: event.currentTarget.scrollLeft,
-      moved: false,
-    };
-    event.currentTarget.setPointerCapture(event.pointerId);
-  };
-
-  const moveFileTabPan = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const pan = fileTabPanRef.current;
-    if (!pan || pan.pointerId !== event.pointerId) return;
-    const delta = event.clientX - pan.startX;
-    if (!pan.moved && Math.abs(delta) < 4) return;
-    pan.moved = true;
-    suppressFileTabClickRef.current = true;
-    event.currentTarget.dataset.dragging = "true";
-    event.currentTarget.scrollLeft = pan.startScrollLeft - delta;
-    event.preventDefault();
-  };
-
-  const endFileTabPan = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const pan = fileTabPanRef.current;
-    if (!pan || pan.pointerId !== event.pointerId) return;
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-    delete event.currentTarget.dataset.dragging;
-    fileTabPanRef.current = null;
-    if (pan.moved) {
-      window.setTimeout(() => {
-        suppressFileTabClickRef.current = false;
-      }, 0);
-    }
-  };
-
   const openFileInCanvas = useCallback(
     async (file: Pick<ProjectFileEntry, "path">) => {
       const project = activeProject;
@@ -4099,69 +4027,12 @@ export default function App() {
           }
           resourceTabs={
             screen === "workspace" && !selectedDelegation && openFileTabs.length ? (
-              <div
-                className="titlebar-file-tabs"
-                role="tablist"
-                aria-label="Open files"
-                onPointerDown={beginFileTabPan}
-                onPointerMove={moveFileTabPan}
-                onPointerUp={endFileTabPan}
-                onPointerCancel={endFileTabPan}
-              >
-                <AnimatePresence initial={false}>
-                  {openFileTabs.map((tab) => (
-                    <motion.div
-                      layout="position"
-                      className="file-reader-tab"
-                      data-active={tab.path === activeFileTab?.path}
-                      key={tab.path}
-                      ref={tab.path === activeFileTab?.path ? activeFileTabElementRef : undefined}
-                      initial={{ opacity: 0, y: 5 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={{ opacity: 0, y: 3 }}
-                      transition={{ duration: 0.16, ease: "easeOut" }}
-                    >
-                      <button
-                        type="button"
-                        role="tab"
-                        aria-label={tab.path.split("/").at(-1)}
-                        aria-selected={tab.path === activeFileTab?.path}
-                        title={tab.path}
-                        onClick={(event) => {
-                          if (suppressFileTabClickRef.current) {
-                            event.preventDefault();
-                            return;
-                          }
-                          setActiveFileTabPath(tab.path);
-                        }}
-                        onAuxClick={(event) => {
-                          if (event.button === 1) {
-                            event.preventDefault();
-                            closeFileTab(tab.path);
-                          }
-                        }}
-                      >
-                        <FileIcon fileName={tab.path} />
-                        <span>{tab.path.split("/").at(-1)}</span>
-                      </button>
-                      <button
-                        className="file-reader-tab-close"
-                        type="button"
-                        aria-label={`Close ${tab.path}`}
-                        onClick={() => closeFileTab(tab.path)}
-                        onAuxClick={(event) => {
-                          if (event.button === 1) {
-                            event.preventDefault();
-                            closeFileTab(tab.path);
-                          }
-                        }}
-                      >
-                        <X />
-                      </button>
-                    </motion.div>
-                  ))}
-                </AnimatePresence>
-              </div>
+              <TitlebarFileTabs
+                tabs={openFileTabs}
+                activePath={activeFileTab?.path ?? ""}
+                onSelect={setActiveFileTabPath}
+                onClose={closeFileTab}
+              />
             ) : undefined
           }
           motionScale={motionScale}

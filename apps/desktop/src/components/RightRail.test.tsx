@@ -486,13 +486,17 @@ describe("RightRail", () => {
     await waitFor(() => expect(onRevealProjectFile).toHaveBeenCalledWith("src/App.tsx"));
   });
 
-  it("reviews changes, refreshes Git, and stages a whole group", async () => {
-    const onReviewChanges = vi.fn();
+  it("keeps Git metadata compact, refreshes Git, and stages a whole group", async () => {
     const onRefreshGit = vi.fn().mockResolvedValue(undefined);
-    const { callbacks } = setup({ onReviewChanges, onRefreshGit });
+    const { callbacks } = setup({ onRefreshGit });
 
-    fireEvent.click(screen.getByRole("button", { name: /Review changes/i }));
-    expect(onReviewChanges).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: /Review changes/i })).not.toBeInTheDocument();
+    expect(
+      screen.getByLabelText("2 commits ahead, 0 behind origin/feature/v1-native-app"),
+    ).toHaveTextContent("2 ahead · 0 behind");
+    expect(
+      screen.getByLabelText("62 lines added, 37 lines removed in the working tree"),
+    ).toHaveTextContent("+62−37");
 
     fireEvent.click(screen.getByRole("button", { name: "Refresh Git status" }));
     await waitFor(() => expect(onRefreshGit).toHaveBeenCalledTimes(1));
