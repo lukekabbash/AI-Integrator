@@ -626,11 +626,7 @@ async fn dispatch_tool(
             let summary = text_param(params, "summary")
                 .ok_or_else(|| IntegratorError::InvalidInput("summary is required".into()))?;
             let state = app.state::<AppState>();
-            state.store.set_delegation_result(
-                delegation_id,
-                DelegationStatus::Completed,
-                &summary,
-            )?;
+            state.store.complete_delegation(delegation_id, &summary)?;
             if let Some(child) = state
                 .delegation_children
                 .lock()

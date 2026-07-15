@@ -348,6 +348,60 @@ impl LocalStore {
         self.get_delegation(id)
     }
 
+    /// Complete a delegation and enqueue its deliverable for the orchestrator
+    /// in one transaction. The next parent turn can receive the result without
+    /// polling, while an earlier `delegation_status` call can acknowledge the
+    /// same message.
+    pub fn complete_delegation(&self, id: DelegationId, result: &str) -> Result<Delegation> {
+        let result = result.trim();
+        if result.is_empty() {
+            return Err(IntegratorError::InvalidInput(
+                "delegation result must not be empty".into(),
+            ));
+        }
+        let now = Utc::now();
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(storage_error)?;
+        let current_status = transaction
+            .query_row(
+                "SELECT status FROM delegations WHERE id = ?1",
+                [id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| IntegratorError::NotFound(format!("delegation {id}")))?;
+        if current_status == DelegationStatus::Completed.as_str() {
+            transaction.commit().map_err(storage_error)?;
+            drop(connection);
+            return self.get_delegation(id);
+        }
+        transaction
+            .execute(
+                "UPDATE delegations SET status = 'completed', result = ?1, updated_at = ?2 WHERE id = ?3",
+                params![
+                    bounded(result, RESULT_LIMIT),
+                    now.to_rfc3339(),
+                    id.to_string()
+                ],
+            )
+            .map_err(storage_error)?;
+        transaction
+            .execute(
+                "INSERT INTO delegation_messages(id, delegation_id, sender, body, created_at, delivered_at) VALUES (?1, ?2, 'child', ?3, ?4, NULL)",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    id.to_string(),
+                    bounded(result, MESSAGE_LIMIT),
+                    now.to_rfc3339(),
+                ],
+            )
+            .map_err(storage_error)?;
+        transaction.commit().map_err(storage_error)?;
+        drop(connection);
+        self.get_delegation(id)
+    }
+
     pub fn add_delegation_message(
         &self,
         delegation_id: DelegationId,
@@ -676,12 +730,35 @@ mod tests {
                 .expect("reject stale title")
         );
         let updated = store
-            .set_delegation_result(delegation.id, DelegationStatus::Completed, "done")
-            .expect("set result");
+            .complete_delegation(delegation.id, "done")
+            .expect("complete delegation");
         assert_eq!(updated.child_task_id, Some(child.id));
         assert_eq!(updated.status, DelegationStatus::Completed);
         assert_eq!(updated.result.as_deref(), Some("done"));
         assert_eq!(store.active_delegation_count(parent).expect("count"), 0);
+        let completion = store
+            .undelivered_delegation_messages(delegation.id, false)
+            .expect("completion message");
+        assert_eq!(completion.len(), 1);
+        assert_eq!(completion[0].body, "done");
+        store
+            .complete_delegation(delegation.id, "duplicate retry")
+            .expect("idempotent completion retry");
+        assert_eq!(
+            store
+                .undelivered_delegation_messages(delegation.id, false)
+                .expect("one completion message")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_delegation(delegation.id)
+                .expect("original result preserved")
+                .result
+                .as_deref(),
+            Some("done")
+        );
     }
 
     #[test]
