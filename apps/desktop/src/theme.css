@@ -32,6 +32,12 @@
   --color-status-warningSurface: #2b2517;
   --color-status-dangerSurface: #301d1c;
   --color-status-infoSurface: #242424;
+  --color-provider-codex: #8ebea6;
+  --color-provider-claude: #d69a75;
+  --color-provider-cursor: #8faec9;
+  --color-provider-grok: #c0c3cc;
+  --color-provider-antigravity: #9fa7d8;
+  --color-provider-custom: var(--color-accent-primary);
   --color-diff-added: #17211b;
   --color-diff-addedStrong: #2c4033;
   --color-diff-addedText: #b2cfba;

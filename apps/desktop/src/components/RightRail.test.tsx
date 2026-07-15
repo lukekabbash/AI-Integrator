@@ -216,10 +216,55 @@ describe("RightRail", () => {
       "2",
     );
 
-    fireEvent.click(screen.getAllByRole("button", { name: "View transcript" })[0]);
+    fireEvent.click(screen.getByRole("treeitem", { name: /Audit the interaction/ }));
     expect(onSelectDelegation).toHaveBeenCalledWith("delegation-root");
+    expect(screen.queryByRole("button", { name: /View transcript/i })).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Audit the interaction transcript")).not.toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /^Git/ })).toBeInTheDocument();
+  });
+
+  it("gives concurrent agents stable provider-colored glyphs and opens transcripts from the row", () => {
+    const statuses: DelegationView["status"][] = [
+      "starting",
+      "running",
+      "waiting",
+      "completed",
+      "failed",
+      "stopped",
+    ];
+    const delegations: DelegationView[] = Array.from({ length: 12 }, (_, index) => ({
+      id: `delegation-${index + 1}`,
+      parentTaskId: "task-root",
+      childTaskId: `task-child-${index + 1}`,
+      profileId: "codex-default",
+      profileLabel: "Codex builder",
+      runtime: "codex",
+      model: "gpt-5.6-codex",
+      title: `Agent ${index + 1}`,
+      brief: `Workstream ${index + 1}`,
+      status: statuses[index % statuses.length]!,
+      createdAt: new Date(Date.UTC(2026, 6, 12, 10, index)).toISOString(),
+      updatedAt: new Date(Date.UTC(2026, 6, 12, 10, index)).toISOString(),
+      unreadFromChild: 0,
+      pendingQuestions: [],
+    }));
+    const onSelectDelegation = vi.fn();
+    setup({ delegations, onSelectDelegation });
+
+    fireEvent.click(screen.getByRole("tab", { name: /Agents/ }));
+    const tree = screen.getByRole("tree", { name: "Subagent lineage" });
+    const glyphs = Array.from(tree.querySelectorAll<HTMLElement>(".agent-glyph"));
+    const firstTen = glyphs.slice(0, 10).map((glyph) => glyph.dataset.agentIcon);
+
+    expect(new Set(firstTen)).toHaveLength(10);
+    expect(glyphs[10]).toHaveAttribute("data-agent-icon", glyphs[0]!.dataset.agentIcon);
+    expect(glyphs[0]).toHaveAttribute("data-shade", "0");
+    expect(glyphs[10]).toHaveAttribute("data-shade", "1");
+    expect(tree.querySelectorAll(".agent-route .provider-icon")).toHaveLength(12);
+    expect(screen.getAllByText("gpt-5.6-codex")).toHaveLength(12);
+
+    fireEvent.click(screen.getByRole("treeitem", { name: /Agent 11/ }));
+    expect(onSelectDelegation).toHaveBeenCalledWith("delegation-11");
   });
 
   it("shows only the project file tree in Files and opens files toward the canvas", () => {
@@ -546,9 +591,8 @@ describe("RightRail", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("renders live delegations with working approve and nudge controls", async () => {
+  it("keeps live delegation actions compact and leaves messaging to the transcript pane", async () => {
     const onApproveDelegation = vi.fn().mockResolvedValue(undefined);
-    const onNudgeDelegation = vi.fn().mockResolvedValue(undefined);
     setup({
       delegations: [
         {
@@ -587,7 +631,6 @@ describe("RightRail", () => {
         },
       ],
       onApproveDelegation,
-      onNudgeDelegation,
     });
 
     fireEvent.click(screen.getByRole("tab", { name: /^Agents/ }));
@@ -596,13 +639,7 @@ describe("RightRail", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
     await waitFor(() => expect(onApproveDelegation).toHaveBeenCalledWith("delegation-1"));
-
-    const nudgeInput = screen.getByRole("textbox", { name: "Message Review the diff" });
-    fireEvent.change(nudgeInput, { target: { value: "Yes, include style nits" } });
-    fireEvent.keyDown(nudgeInput, { key: "Enter" });
-    await waitFor(() =>
-      expect(onNudgeDelegation).toHaveBeenCalledWith("delegation-2", "Yes, include style nits"),
-    );
+    expect(screen.queryByPlaceholderText("Nudge this subagent…")).not.toBeInTheDocument();
   });
 
   it("supports arrow-key navigation across rail tabs", () => {

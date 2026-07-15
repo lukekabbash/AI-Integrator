@@ -575,6 +575,41 @@ describe("native runtime recovery UI", () => {
     expect(screen.getByRole("button", { name: "Stop turn" })).toBeInTheDocument();
   });
 
+  it("reuses Git state without rechecking when switching chats in the same checkout", async () => {
+    const workspace = await bridgeMock.loadWorkspace();
+    workspace.tasks.push({
+      id: "task-2",
+      projectId: "project-1",
+      title: "Another chat",
+      status: "draft",
+      runtime: "codex",
+      model: "Provider default",
+      updatedAt: "2026-07-10T15:00:00Z",
+    });
+    workspace.git = {
+      ...workspace.git,
+      kind: "repository",
+      branch: "main",
+      worktree: "H:\\Code\\sample",
+    };
+    bridgeMock.loadWorkspace.mockResolvedValue(workspace);
+    bridgeMock.loadTaskGit.mockResolvedValue(workspace.git);
+    bridgeMock.loadTaskProjection.mockResolvedValue({
+      watermarkSeq: 0,
+      runtimeLive: false,
+      events: [],
+    });
+
+    render(<App />);
+    await waitFor(() => expect(bridgeMock.loadTaskGit).toHaveBeenCalledWith("task-1"));
+    bridgeMock.loadTaskGit.mockClear();
+
+    fireEvent.click(await screen.findByRole("button", { name: /Another chat/i }));
+    await waitFor(() => expect(bridgeMock.loadTaskProjection).toHaveBeenCalledWith("task-2"));
+
+    expect(bridgeMock.loadTaskGit).not.toHaveBeenCalled();
+  });
+
   it("loads the selected native diff when the header Review tab opens", async () => {
     const pendingFile = {
       path: "src/review.ts",

@@ -37,6 +37,8 @@ import {
   Users,
 } from "lucide-react";
 import { AnimatedFolderIcon } from "./AnimatedFolderIcon";
+import { AgentGlyph } from "./AgentGlyph";
+import { ProviderIcon } from "./Dropdown";
 import { FileIcon } from "./FileIcon";
 import { ProgressiveSurfaceControls } from "./FileView";
 import {
@@ -1500,23 +1502,84 @@ function GitPanel({
   );
 }
 
-function delegationDotStatus(status: DelegationView["status"]): string {
+function delegationStatusLabel(status: DelegationView["status"]): string {
   switch (status) {
     case "pending-approval":
-      return "waiting";
-    case "denied":
-    case "stopped":
-      return "failed";
+      return "Approval needed";
+    case "running":
+      return "Working";
+    case "completed":
+      return "Complete";
     default:
-      return status;
+      return status.charAt(0).toUpperCase() + status.slice(1);
   }
 }
 
-function delegationStatusLabel(status: DelegationView["status"]): string {
-  return status
-    .split("-")
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
+interface AgentVisualIdentity {
+  variant: number;
+  shade: number;
+}
+
+function agentVisualIdentities(
+  agents: Array<{ id: string; runtime: string }>,
+): Map<string, AgentVisualIdentity> {
+  const collisions = new Map<string, number>();
+  return new Map(
+    agents.map((agent, index) => {
+      const variant = index % 10;
+      const collisionKey = `${agent.runtime}:${variant}`;
+      const shade = collisions.get(collisionKey) ?? 0;
+      collisions.set(collisionKey, shade + 1);
+      return [agent.id, { variant, shade }] as const;
+    }),
+  );
+}
+
+function providerLabel(runtime: string): string {
+  switch (runtime) {
+    case "codex":
+      return "Codex";
+    case "claude":
+      return "Claude";
+    case "cursor":
+      return "Cursor";
+    case "grok":
+      return "Grok";
+    case "antigravity":
+      return "Antigravity";
+    default:
+      return runtime.charAt(0).toUpperCase() + runtime.slice(1);
+  }
+}
+
+function AgentRoute({
+  runtime,
+  model,
+  elapsed,
+}: {
+  runtime: string;
+  model?: string | null;
+  elapsed?: string;
+}) {
+  const label = providerLabel(runtime);
+  return (
+    <small className="agent-route">
+      <ProviderIcon provider={runtime} label={label} />
+      <span>{label}</span>
+      {model ? (
+        <>
+          <span aria-hidden="true">·</span>
+          <span>{model}</span>
+        </>
+      ) : null}
+      {elapsed ? (
+        <>
+          <span aria-hidden="true">·</span>
+          <span>{elapsed}</span>
+        </>
+      ) : null}
+    </small>
+  );
 }
 
 function delegationLineage(
@@ -1556,12 +1619,36 @@ function delegationLineage(
   return ordered;
 }
 
+function childAgentLineage(agents: ChildAgent[]): Array<{ agent: ChildAgent; depth: number }> {
+  const childrenByParent = new Map<string, ChildAgent[]>();
+  const roots: ChildAgent[] = [];
+  for (const agent of agents) {
+    if (!agent.parentId || !agents.some((candidate) => candidate.id === agent.parentId)) {
+      roots.push(agent);
+      continue;
+    }
+    const children = childrenByParent.get(agent.parentId) ?? [];
+    children.push(agent);
+    childrenByParent.set(agent.parentId, children);
+  }
+  const ordered: Array<{ agent: ChildAgent; depth: number }> = [];
+  const visited = new Set<string>();
+  const visit = (agent: ChildAgent, depth: number) => {
+    if (visited.has(agent.id)) return;
+    visited.add(agent.id);
+    ordered.push({ agent, depth });
+    for (const child of childrenByParent.get(agent.id) ?? []) visit(child, depth + 1);
+  };
+  for (const root of roots) visit(root, 0);
+  for (const agent of agents) visit(agent, 0);
+  return ordered;
+}
+
 function AgentPanel({
   agents,
   delegations,
   onApprove,
   onDeny,
-  onNudge,
   onStop,
   selectedDelegationId,
   onSelectDelegation,
@@ -1570,7 +1657,6 @@ function AgentPanel({
   delegations?: DelegationView[];
   onApprove?: (delegationId: string) => Promise<void>;
   onDeny?: (delegationId: string) => Promise<void>;
-  onNudge?: (delegationId: string, message: string) => Promise<void>;
   onStop?: (delegationId: string) => Promise<void>;
   selectedDelegationId?: string;
   onSelectDelegation: (delegationId: string) => void;
@@ -1579,78 +1665,58 @@ function AgentPanel({
     const selectedDelegation = delegations.find(
       (delegation) => delegation.id === selectedDelegationId,
     );
-    const activeCount = delegations.filter((delegation) =>
-      ["starting", "running", "waiting", "pending-approval"].includes(delegation.status),
-    ).length;
+    const identities = agentVisualIdentities(
+      [...delegations].sort(
+        (a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt) || a.id.localeCompare(b.id),
+      ),
+    );
     return (
       <div className="rail-panel agent-panel">
         <div className="subagent-lineage-pane">
-          <header className="rail-panel-header">
-            <span>
-              <Users /> Subagents
-            </span>
-            <small>
-              {delegations.length} total
-              {activeCount ? ` · ${activeCount} active` : ""}
-            </small>
-          </header>
-          <p className="rail-description">
-            Subagents delegated by this task's orchestrator. Messages never interrupt a running turn
-            — nudges are delivered when a subagent is idle.
-          </p>
           <div className="delegation-tree" role="tree" aria-label="Subagent lineage">
-            {delegationLineage(delegations).map(({ delegation, depth }, index) => (
-              <DelegationRow
-                key={delegation.id}
-                delegation={delegation}
-                depth={depth}
-                selected={delegation.id === selectedDelegation?.id}
-                focusable={
-                  delegation.id === selectedDelegation?.id || (!selectedDelegation && index === 0)
-                }
-                onApprove={onApprove}
-                onDeny={onDeny}
-                onNudge={onNudge}
-                onStop={onStop}
-                onOpen={() => onSelectDelegation(delegation.id)}
-              />
-            ))}
+            <AnimatePresence initial={false}>
+              {delegationLineage(delegations).map(({ delegation, depth }, index) => (
+                <DelegationRow
+                  key={delegation.id}
+                  delegation={delegation}
+                  depth={depth}
+                  identity={identities.get(delegation.id) ?? { variant: index % 10, shade: 0 }}
+                  selected={delegation.id === selectedDelegation?.id}
+                  focusable={
+                    delegation.id === selectedDelegation?.id || (!selectedDelegation && index === 0)
+                  }
+                  onApprove={onApprove}
+                  onDeny={onDeny}
+                  onStop={onStop}
+                  onOpen={() => onSelectDelegation(delegation.id)}
+                />
+              ))}
+            </AnimatePresence>
           </div>
         </div>
       </div>
     );
   }
-  const roots = agents.filter((agent) => !agent.parentId);
-  const childMap = new Map(
-    agents.map((agent) => [
-      agent.id,
-      agents.filter((candidate) => candidate.parentId === agent.id),
-    ]),
-  );
+  const identities = agentVisualIdentities(agents);
   return (
     <div className="rail-panel agent-panel">
-      <header className="rail-panel-header">
-        <span>
-          <Users /> Subagents
-        </span>
-      </header>
-      <p className="rail-description">
-        Subagents delegated by this task appear here. Enable delegation in the composer to let the
-        orchestrator spin them up.
-      </p>
-      {roots.length ? (
-        roots.map((root) => (
-          <div className="agent-tree" key={root.id}>
-            <AgentRow agent={root} root />
-            <div className="agent-children">
-              {(childMap.get(root.id) ?? []).map((agent) => (
-                <AgentRow agent={agent} key={agent.id} />
-              ))}
-            </div>
-          </div>
-        ))
+      {agents.length ? (
+        <div className="agent-tree" role="tree" aria-label="Agent lineage">
+          {childAgentLineage(agents).map(({ agent, depth }, index) => (
+            <AgentRow
+              agent={agent}
+              depth={depth}
+              identity={identities.get(agent.id) ?? { variant: index % 10, shade: 0 }}
+              key={agent.id}
+            />
+          ))}
+        </div>
       ) : (
-        <p className="empty-compact">No subagents have been delegated by this task.</p>
+        <div className="agent-empty">
+          <Users aria-hidden="true" />
+          <strong>No subagents yet</strong>
+          <span>Enable delegation in the composer when this task would benefit from help.</span>
+        </div>
       )}
     </div>
   );
@@ -1659,32 +1725,31 @@ function AgentPanel({
 function DelegationRow({
   delegation,
   depth,
+  identity,
   selected,
   focusable,
   onApprove,
   onDeny,
-  onNudge,
   onStop,
   onOpen,
 }: {
   delegation: DelegationView;
   depth: number;
+  identity: AgentVisualIdentity;
   selected: boolean;
   focusable: boolean;
   onApprove?: (delegationId: string) => Promise<void>;
   onDeny?: (delegationId: string) => Promise<void>;
-  onNudge?: (delegationId: string, message: string) => Promise<void>;
   onStop?: (delegationId: string) => Promise<void>;
   onOpen: () => void;
 }) {
-  const [nudge, setNudge] = useState("");
+  const reduceMotion = useReducedMotion();
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const active = ["starting", "running", "waiting"].includes(delegation.status);
-  const canMessage = Boolean(
-    delegation.childTaskId &&
-    !["pending-approval", "denied", "starting"].includes(delegation.status),
-  );
+  const canApprove = delegation.status === "pending-approval" && Boolean(onApprove);
+  const canDeny = delegation.status === "pending-approval" && Boolean(onDeny);
+  const canStop = active && Boolean(onStop) && !selected;
   const act = async (action: () => Promise<void>) => {
     setBusy(true);
     setActionError(null);
@@ -1697,15 +1762,26 @@ function DelegationRow({
     }
   };
   return (
-    <div
+    <motion.div
+      layout="position"
       className="agent-row delegation-row"
       data-status={delegation.status}
       data-selected={selected}
+      data-openable={Boolean(delegation.childTaskId)}
       role="treeitem"
       aria-level={depth + 1}
       aria-selected={selected}
       tabIndex={focusable ? 0 : -1}
       style={{ "--delegation-depth": depth } as CSSProperties}
+      initial={reduceMotion ? false : { opacity: 0, x: -5 }}
+      animate={{ opacity: 1, x: 0 }}
+      exit={reduceMotion ? { opacity: 0 } : { opacity: 0, x: -4 }}
+      transition={reduceMotion ? { duration: 0 } : { type: "spring", stiffness: 460, damping: 36 }}
+      onClick={(event) => {
+        if (!delegation.childTaskId) return;
+        if ((event.target as HTMLElement).closest("button, input")) return;
+        onOpen();
+      }}
       onKeyDown={(event) => {
         if (event.target !== event.currentTarget) return;
         const items = Array.from(
@@ -1731,19 +1807,31 @@ function DelegationRow({
         }
       }}
     >
-      <span className={`agent-avatar agent-avatar--${delegation.runtime}`}>
-        {delegation.profileLabel.slice(0, 1)}
-      </span>
+      <AgentGlyph
+        variant={identity.variant}
+        shade={identity.shade}
+        provider={delegation.runtime}
+        state={delegation.status}
+        label={delegation.title}
+      />
       <span className="agent-copy">
-        <strong>
-          {delegation.title}
-          <i>{delegation.profileLabel}</i>
-        </strong>
-        <span>
-          {delegationStatusLabel(delegation.status)}
-          {delegation.unreadFromChild > 0 ? ` · ${delegation.unreadFromChild} new message(s)` : ""}
+        <span className="agent-heading">
+          <strong>
+            {delegation.title}
+            <i>{delegation.profileLabel}</i>
+          </strong>
+          <span className="agent-state" data-status={delegation.status}>
+            {delegationStatusLabel(delegation.status)}
+          </span>
         </span>
-        <small>{[delegation.model, delegation.runtime].filter(Boolean).join(" · ")}</small>
+        <span className="agent-activity">{delegation.brief}</span>
+        <AgentRoute runtime={delegation.runtime} model={delegation.model} />
+        {delegation.unreadFromChild > 0 ? (
+          <span className="agent-unread">
+            {delegation.unreadFromChild} new message
+            {delegation.unreadFromChild === 1 ? "" : "s"}
+          </span>
+        ) : null}
         {delegation.pendingQuestions.map((question, index) => (
           <small className="delegation-question" key={index}>
             ❓ {question}
@@ -1752,84 +1840,90 @@ function DelegationRow({
         {delegation.result ? (
           <small className="delegation-result">{delegation.result}</small>
         ) : null}
-        <span className="delegation-actions">
-          {delegation.status === "pending-approval" && onApprove ? (
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => void act(() => onApprove(delegation.id))}
-            >
-              Approve
-            </button>
-          ) : null}
-          {delegation.status === "pending-approval" && onDeny ? (
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => void act(() => onDeny(delegation.id))}
-            >
-              Deny
-            </button>
-          ) : null}
-          {active && onStop && !selected ? (
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => void act(() => onStop(delegation.id))}
-            >
-              Stop
-            </button>
-          ) : null}
-          {delegation.childTaskId ? (
-            <button type="button" onClick={onOpen}>
-              {selected ? "Viewing transcript" : "View transcript"}
-            </button>
-          ) : null}
-        </span>
-        {canMessage && onNudge && !selected ? (
-          <span className="delegation-nudge">
-            <input
-              value={nudge}
-              placeholder="Nudge this subagent…"
-              aria-label={`Message ${delegation.title}`}
-              onChange={(event) => setNudge(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && nudge.trim()) {
-                  const message = nudge.trim();
-                  setNudge("");
-                  void act(() => onNudge(delegation.id, message));
-                }
-              }}
-            />
+        {canApprove || canDeny || canStop ? (
+          <span className="delegation-actions">
+            {canApprove && onApprove ? (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => void act(() => onApprove(delegation.id))}
+              >
+                Approve
+              </button>
+            ) : null}
+            {canDeny && onDeny ? (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => void act(() => onDeny(delegation.id))}
+              >
+                Deny
+              </button>
+            ) : null}
+            {canStop && onStop ? (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => void act(() => onStop(delegation.id))}
+              >
+                Stop
+              </button>
+            ) : null}
           </span>
         ) : null}
         {actionError ? <small className="delegation-error">{actionError}</small> : null}
       </span>
-      <span className={`status-dot status-dot--${delegationDotStatus(delegation.status)}`}>
-        <span className="sr-only">{delegation.status}</span>
-      </span>
-    </div>
+    </motion.div>
   );
 }
 
-function AgentRow({ agent, root = false }: { agent: ChildAgent; root?: boolean }) {
+function AgentRow({
+  agent,
+  depth,
+  identity,
+}: {
+  agent: ChildAgent;
+  depth: number;
+  identity: AgentVisualIdentity;
+}) {
+  const reduceMotion = useReducedMotion();
   return (
-    <div className="agent-row" data-root={root}>
-      <span className={`agent-avatar agent-avatar--${agent.runtime}`}>
-        {agent.name.slice(0, 1)}
-      </span>
+    <motion.div
+      layout="position"
+      className="agent-row"
+      data-status={agent.status}
+      role="treeitem"
+      aria-level={depth + 1}
+      style={{ "--delegation-depth": depth } as CSSProperties}
+      initial={reduceMotion ? false : { opacity: 0, x: -5 }}
+      animate={{ opacity: 1, x: 0 }}
+      transition={reduceMotion ? { duration: 0 } : { type: "spring", stiffness: 460, damping: 36 }}
+    >
+      <AgentGlyph
+        variant={identity.variant}
+        shade={identity.shade}
+        provider={agent.runtime}
+        state={agent.status}
+        label={agent.name}
+      />
       <span className="agent-copy">
-        <strong>
-          {agent.name}
-          <i>{agent.role}</i>
-        </strong>
-        <span>{agent.activity}</span>
-        <small>{[agent.model, agent.elapsed, agent.worktree].filter(Boolean).join(" · ")}</small>
+        <span className="agent-heading">
+          <strong>
+            {agent.name}
+            <i>{agent.role}</i>
+          </strong>
+          <span className="agent-state" data-status={agent.status}>
+            {agent.status === "running"
+              ? "Working"
+              : agent.status === "completed"
+                ? "Complete"
+                : agent.status.charAt(0).toUpperCase() + agent.status.slice(1)}
+          </span>
+        </span>
+        <span className="agent-activity">{agent.activity}</span>
+        <AgentRoute runtime={agent.runtime} model={agent.model} elapsed={agent.elapsed} />
       </span>
-      <span className={`status-dot status-dot--${agent.status}`}>
-        <span className="sr-only">{agent.status}</span>
-      </span>
-    </div>
+    </motion.div>
   );
 }
 
@@ -2636,7 +2730,6 @@ export function RightRail(props: RightRailProps) {
             delegations={props.delegations}
             onApprove={props.onApproveDelegation}
             onDeny={props.onDenyDelegation}
-            onNudge={props.onNudgeDelegation}
             onStop={props.onStopDelegation}
             selectedDelegationId={props.selectedDelegationId}
             onSelectDelegation={props.onSelectDelegation ?? (() => undefined)}

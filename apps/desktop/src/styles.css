@@ -4891,92 +4891,187 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
 }
 
 .agent-tree {
-  padding: 6px 8px;
+  padding: 8px 6px 12px;
 }
 .agent-row {
+  --agent-provider-color: var(--color-provider-custom);
   position: relative;
-  width: 100%;
-  min-height: 58px;
-  padding: 6px;
+  width: calc(100% - (var(--delegation-depth, 0) * 16px));
+  min-height: 62px;
+  margin-left: calc(var(--delegation-depth, 0) * 16px);
+  padding: 8px;
   display: grid;
-  grid-template-columns: 28px minmax(0, 1fr) 10px;
+  grid-template-columns: 30px minmax(0, 1fr);
   align-items: start;
-  gap: 8px;
-  border: 1px solid transparent;
+  gap: 9px;
+  border: 0;
   border-radius: var(--radius-control);
+  outline: none;
   color: var(--color-text-primary);
   background: transparent;
   text-align: left;
+  cursor: default;
+}
+.agent-row[data-openable="true"] {
   cursor: pointer;
 }
-.agent-row:hover {
-  border-color: var(--color-border-subtle);
-  background: var(--color-layer-1);
+.agent-row:hover,
+.agent-row:focus-visible {
+  background: color-mix(in srgb, var(--color-layer-1) 76%, transparent);
 }
-.agent-avatar {
-  width: 27px;
-  height: 27px;
+.agent-row:focus-visible {
+  box-shadow: inset 0 0 0 1px var(--color-focus);
+}
+.agent-glyph {
+  width: 30px;
+  height: 30px;
   display: grid;
   place-items: center;
-  border: 1px solid var(--color-border-base);
-  border-radius: 8px;
-  color: var(--color-text-primary);
-  background: var(--color-layer-2);
-  font-size: 11px;
-  font-weight: 700;
+  color: var(--agent-provider-color);
+  background: transparent;
+  flex: none;
 }
-.agent-avatar--claude {
-  color: #d59b7a;
+.agent-glyph svg {
+  width: 27px;
+  height: 27px;
+  overflow: visible;
 }
-.agent-avatar--cursor {
-  color: #8fb2ca;
+.agent-glyph[data-provider="codex"] {
+  --agent-provider-color: var(--color-provider-codex);
+}
+.agent-glyph[data-provider="claude"] {
+  --agent-provider-color: var(--color-provider-claude);
+}
+.agent-glyph[data-provider="cursor"] {
+  --agent-provider-color: var(--color-provider-cursor);
+}
+.agent-glyph[data-provider="grok"] {
+  --agent-provider-color: var(--color-provider-grok);
+}
+.agent-glyph[data-provider="antigravity"] {
+  --agent-provider-color: var(--color-provider-antigravity);
+}
+.agent-glyph[data-shade="1"] {
+  color: color-mix(in srgb, var(--agent-provider-color) 76%, var(--color-text-primary));
+}
+.agent-glyph[data-shade="2"] {
+  color: color-mix(in srgb, var(--agent-provider-color) 62%, var(--color-text-muted));
+}
+.agent-glyph[data-state="completed"],
+.agent-glyph[data-state="stopped"],
+.agent-glyph[data-state="denied"] {
+  opacity: 0.7;
 }
 .agent-copy {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 3px;
+}
+.agent-heading {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
 }
 .agent-copy strong {
+  min-width: 0;
   display: flex;
   gap: 6px;
   align-items: baseline;
+  overflow: hidden;
   font-size: 11px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .agent-copy i {
+  overflow: hidden;
   color: var(--color-text-tertiary);
   font-size: 9px;
   font-style: normal;
   font-weight: 400;
-}
-.agent-copy > span {
-  overflow: hidden;
-  color: var(--color-text-secondary);
-  font-size: 9.8px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.agent-copy small {
+.agent-state {
+  flex: none;
+  color: var(--color-text-tertiary);
+  font-size: 9px;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+.agent-state[data-status="pending-approval"],
+.agent-state[data-status="waiting"] {
+  color: var(--color-warning);
+}
+.agent-state[data-status="completed"] {
+  color: var(--color-success);
+}
+.agent-state[data-status="failed"],
+.agent-state[data-status="denied"] {
+  color: var(--color-danger);
+}
+.agent-activity {
+  overflow: hidden;
+  color: var(--color-text-secondary);
+  font-size: 9.8px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-route {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
   overflow: hidden;
   color: var(--color-text-tertiary);
   font: 9.5px var(--font-code);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.agent-children {
-  position: relative;
-  margin-left: 19px;
-  padding-left: 13px;
-  border-left: 1px solid var(--color-border-strong);
+.agent-route .provider-icon {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  flex: none;
 }
-.agent-children .agent-row::before {
-  content: "";
-  position: absolute;
-  top: 20px;
-  left: -14px;
-  width: 13px;
-  height: 1px;
-  background: var(--color-border-strong);
+.agent-route > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.agent-unread {
+  width: fit-content;
+  color: var(--color-info);
+  font-size: 9.5px;
+  line-height: 1.35;
+}
+.agent-empty {
+  min-height: 180px;
+  padding: 32px 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  color: var(--color-text-tertiary);
+  text-align: center;
+}
+.agent-empty svg {
+  width: 20px;
+  height: 20px;
+  margin-bottom: 3px;
+}
+.agent-empty strong {
+  color: var(--color-text-secondary);
+  font-size: 11px;
+}
+.agent-empty span {
+  max-width: 220px;
+  font-size: 10px;
+  line-height: 1.45;
 }
 .broker-message-box {
   margin: 8px 12px;
@@ -8514,8 +8609,7 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
      slide in off their guide line as a group unfolds. */
   .project-chat-list .chat-row-shell,
   .git-file-row,
-  .commit-row,
-  .delegation-tree .agent-row:not([data-selected="true"]) {
+  .commit-row {
     animation: row-slide-in var(--duration-fast) var(--ease-standard) both;
   }
   .subagent-conversation {
@@ -8672,42 +8766,36 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
 }
 
 .delegation-tree {
-  padding: 6px 8px 12px;
-}
-
-.delegation-row {
-  width: calc(100% - (var(--delegation-depth, 0) * 15px));
-  margin-left: calc(var(--delegation-depth, 0) * 15px);
+  padding: 8px 6px 12px;
 }
 
 .delegation-row[data-selected="true"] {
-  border-color: color-mix(in srgb, var(--color-accent) 24%, var(--color-border-subtle));
-  background: var(--color-accent-soft);
+  background: color-mix(in srgb, var(--color-accent-soft) 78%, transparent);
+  box-shadow: inset 2px 0 color-mix(in srgb, var(--color-accent) 72%, transparent);
 }
 
-.delegation-row[aria-level]:not([aria-level="1"])::before {
+.agent-row[aria-level]:not([aria-level="1"])::before {
   content: "";
   position: absolute;
   top: -7px;
   bottom: 50%;
-  left: -9px;
-  width: 8px;
+  left: -10px;
+  width: 9px;
   border-bottom: 1px solid var(--color-border-strong);
   border-left: 1px solid var(--color-border-strong);
   pointer-events: none;
 }
 
-.delegation-row .agent-copy {
-  gap: 4px;
-}
-
 .delegation-question {
-  color: var(--color-warning, #d97706);
+  color: var(--color-warning);
+  font: 9.5px var(--font-ui);
   white-space: normal;
 }
 
 .delegation-result {
   color: var(--color-text-tertiary);
+  font: 9.5px var(--font-ui);
+  line-height: 1.4;
   white-space: normal;
 }
 
@@ -8738,17 +8826,6 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
 .delegation-actions button:disabled {
   opacity: 0.5;
   cursor: default;
-}
-
-.delegation-nudge input {
-  width: 100%;
-  margin-top: 4px;
-  font-size: 12px;
-  padding: 4px 8px;
-  border-radius: var(--radius-control);
-  border: 1px solid var(--color-border-base);
-  background: transparent;
-  color: inherit;
 }
 
 .subagent-conversation {

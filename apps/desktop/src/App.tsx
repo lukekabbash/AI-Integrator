@@ -2142,15 +2142,35 @@ export default function App() {
     const empty = createEmptySnapshot();
     const cached = nativeHost ? undefined : snapshot.taskContexts[taskId];
     const cachedRuntime = nativeHost ? taskProjectionCache.current.get(taskId) : undefined;
-    const cachedGit = nativeHost ? taskGitCache.current.get(taskId) : undefined;
+    const activeTaskBeforeSwitch = snapshot.tasks.find((task) => task.id === snapshot.activeTaskId);
+    const repositoryFor = (task: TaskSummary | undefined) =>
+      task?.worktree ?? snapshot.projects.find((project) => project.id === task?.projectId)?.path;
+    const activeRepository = repositoryFor(activeTaskBeforeSwitch);
+    const targetRepository = repositoryFor(targetTask);
+    const sharesActiveRepository =
+      Boolean(activeRepository) && activeRepository === targetRepository;
+    const taskCachedGit = nativeHost ? taskGitCache.current.get(taskId) : undefined;
+    const cachedGit =
+      taskCachedGit ?? (nativeHost && sharesActiveRepository ? snapshot.git : undefined);
     const gitRefreshedAt = taskGitRefreshedAt.current.get(taskId) ?? 0;
     const refreshTaskGit =
-      nativeHost && (!cachedGit || Date.now() - gitRefreshedAt >= GIT_CACHE_TTL_MS);
-    // Cached conversations commit in the same frame. Authoritative storage
-    // and Git refreshes still run below, but neither makes warm navigation
-    // wait on SQLite or subprocess startup.
+      nativeHost &&
+      !sharesActiveRepository &&
+      (!taskCachedGit || Date.now() - gitRefreshedAt >= GIT_CACHE_TTL_MS);
+    // Cached conversations commit in the same frame. Authoritative transcript
+    // storage still reconciles below; Git only refreshes when checkout identity
+    // changes, and a stale cached checkout never gives way to a loading flash.
     setSwitchingTaskId(cachedRuntime ? "" : taskId);
-    setGitLoading(refreshTaskGit);
+    setGitLoading(refreshTaskGit && !cachedGit);
+    if (nativeHost && cachedGit && !taskCachedGit) {
+      taskGitCache.current.set(taskId, cachedGit);
+      taskGitRefreshedAt.current.set(
+        taskId,
+        activeTaskBeforeSwitch
+          ? (taskGitRefreshedAt.current.get(activeTaskBeforeSwitch.id) ?? Date.now())
+          : Date.now(),
+      );
+    }
     activeTaskIdRef.current = taskId;
     setOperationError("");
     setRuntimeState(cachedRuntime ?? null);
