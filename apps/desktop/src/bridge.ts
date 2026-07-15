@@ -124,6 +124,17 @@ export interface TaskMessageSearchHit {
   snippet: string;
 }
 
+export interface ArchivedTaskPage {
+  tasks: TaskSummary[];
+  nextCursor?: string;
+  total: number;
+}
+
+export interface SearchTaskMessagesOptions {
+  /** When true, include archived chats. Live sidebar search leaves this false. */
+  includeArchived?: boolean;
+}
+
 export interface TranscriptEvent {
   id: string;
   kind: "user" | "assistant" | "activity" | "tool" | "approval" | "checkpoint" | "notice";
@@ -754,11 +765,41 @@ export interface RuntimeProjectionEvent {
   projection: RuntimeProjection;
 }
 
+/** Compact cold-hydrate payload; live updates still use RuntimeProjectionEvent. */
+export interface TaskProjectionHydrate {
+  turn?: TurnProjection;
+  items: ItemProjection[];
+  plan: PlanStepProjection[];
+  planTruncated: boolean;
+  diff?: { body: string; truncated: boolean; seq: number; occurredAt: string };
+  usage?: RuntimeUsageProjection;
+  approvals: ApprovalProjection[];
+  mode?: ModeProjection;
+  connection?: ConnectionProjection;
+  error?: { message: string; retryable: boolean; seq: number; occurredAt: string };
+  firstSeen: Record<string, string>;
+  hasMoreOlder: boolean;
+  /** Oldest last_event_seq in this page; pass as beforeSeq to load older. */
+  beforeSeq?: number;
+}
+
 export interface TaskProjectionSnapshot {
-  events: RuntimeProjectionEvent[];
   watermarkSeq: number;
+  /** Current projection reset epoch; required with watermarkSeq for cache short-circuit. */
+  resetSeq: number;
   /** Native-process liveness attested while the snapshot was loaded. */
   runtimeLive: boolean;
+  /** Client cache matched known watermark + reset; hydrate omitted. */
+  cacheMatched?: boolean;
+  hydrate?: TaskProjectionHydrate;
+}
+
+export interface LoadTaskProjectionOptions {
+  knownWatermark?: number;
+  knownResetSeq?: number;
+  /** Load items/approvals with last_event_seq < beforeSeq. */
+  beforeSeq?: number;
+  limit?: number;
 }
 
 export type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
@@ -841,8 +882,17 @@ export interface AppBridge {
   exportLocalData(): Promise<unknown>;
   clearLocalData(): Promise<void>;
   loadWorkspace(): Promise<WorkspaceSnapshot>;
+  /** Paginated archived root chats for Archive UI (not part of workspace bootstrap). */
+  listArchivedTasks(input?: {
+    cursor?: string;
+    limit?: number;
+  }): Promise<ArchivedTaskPage>;
   /** Search locally persisted user/assistant message text without loading chat snapshots. */
-  searchTaskMessages(query: string, limit?: number): Promise<TaskMessageSearchHit[]>;
+  searchTaskMessages(
+    query: string,
+    limit?: number,
+    options?: SearchTaskMessagesOptions,
+  ): Promise<TaskMessageSearchHit[]>;
   openProject(): Promise<ProjectSummary | null>;
   /** Create `Documents/AI Integrator/Projects/<name>` (deduped), git-init it, and register it. */
   createProject(name: string): Promise<ProjectSummary>;
@@ -974,7 +1024,10 @@ export interface AppBridge {
   subscribeRuntimeProjections(
     listener: (event: RuntimeProjectionEvent) => void,
   ): Promise<() => void>;
-  loadTaskProjection(taskId: string): Promise<TaskProjectionSnapshot>;
+  loadTaskProjection(
+    taskId: string,
+    options?: LoadTaskProjectionOptions,
+  ): Promise<TaskProjectionSnapshot>;
   respondToApproval(
     taskId: string,
     approvalId: string,
@@ -1862,6 +1915,30 @@ function mapRuntime(status: NativeProviderStatus): RuntimeConnection {
   };
 }
 
+function mapNativeTaskSummary(
+  task: NativeTask,
+  projectId: string,
+  runtimeFallback: RuntimeId = "codex",
+): TaskSummary {
+  nativeTaskIds.set(task.id, task.id);
+  const reviewRoot = task.worktreePath ?? task.repositoryPath;
+  if (reviewRoot) repositoryByTaskId.set(task.id, reviewRoot);
+  return {
+    id: task.id,
+    projectId,
+    title: task.title,
+    status: mapTaskStatus(task.state),
+    runtime: mapStoredRuntime(task.runtime) ?? runtimeFallback,
+    model: task.model?.trim() || PROVIDER_DEFAULT_MODEL,
+    effort: task.effort?.trim() || undefined,
+    updatedAt: task.updatedAt,
+    worktree: task.worktreePath,
+    pinned: task.pinned,
+    archived: task.archived,
+    parentId: task.parentTaskId,
+  };
+}
+
 function mapTaskStatus(state: NativeTask["state"]): TaskStatus {
   if (state === "ready") return "draft";
   if (state === "cancelled") return "stopped";
@@ -1954,25 +2031,13 @@ async function loadNativeWorkspace(): Promise<WorkspaceSnapshot> {
       projects.push(project);
       projectByPath.set(projectPath, project);
     }
-    nativeTaskIds.set(task.id, task.id);
     // A writing task is reviewed in its assigned worktree, not the base
     // checkout. Project identity still derives from repositoryPath above.
-    const reviewRoot = task.worktreePath ?? task.repositoryPath;
-    if (reviewRoot) repositoryByTaskId.set(task.id, reviewRoot);
-    return {
-      id: task.id,
-      projectId: project.id,
-      title: task.title,
-      status: mapTaskStatus(task.state),
-      runtime: mapStoredRuntime(task.runtime) ?? runtimeByTask.get(task.id) ?? ("codex" as const),
-      model: task.model?.trim() || PROVIDER_DEFAULT_MODEL,
-      effort: task.effort?.trim() || undefined,
-      updatedAt: task.updatedAt,
-      worktree: task.worktreePath,
-      pinned: task.pinned,
-      archived: task.archived,
-      parentId: task.parentTaskId,
-    };
+    return mapNativeTaskSummary(
+      task,
+      project.id,
+      runtimeByTask.get(task.id) ?? ("codex" as const),
+    );
   });
   const lastTaskByProject: Record<string, string> = {};
   for (const task of tasks) lastTaskByProject[task.projectId] ??= task.id;
@@ -3043,7 +3108,23 @@ export const bridge: AppBridge = {
   },
 
   exportLocalData: async () => {
-    if (isTauri()) return nativeInvoke("local_export");
+    if (isTauri()) {
+      // Workspace bootstrap export is live-only; stitch archived pages back in
+      // so Settings → Export remains a complete local backup.
+      const base = await nativeInvoke<NativeExport>("local_export");
+      const archived: NativeTask[] = [];
+      let cursor: string | undefined;
+      do {
+        const page = await nativeInvoke<{
+          tasks: NativeTask[];
+          nextCursor?: string;
+          total: number;
+        }>("task_list_archived", { cursor, limit: 100 });
+        archived.push(...page.tasks);
+        cursor = page.nextCursor;
+      } while (cursor);
+      return { ...base, tasks: [...(base.tasks ?? []), ...archived] };
+    }
     return {
       schemaVersion: 4,
       exportedAt: new Date().toISOString(),
@@ -3078,21 +3159,96 @@ export const bridge: AppBridge = {
   loadWorkspace: async () => {
     if (isTauri()) return loadNativeWorkspace();
     const snapshot = readDemoSnapshot();
+    // Mirror native bootstrap: only live chats ride in the hot workspace set.
+    const liveTasks = snapshot.tasks.filter((task) => !task.archived);
+    const live: WorkspaceSnapshot = {
+      ...snapshot,
+      tasks: liveTasks,
+      activeTaskId: liveTasks.some((task) => task.id === snapshot.activeTaskId)
+        ? snapshot.activeTaskId
+        : (liveTasks[0]?.id ?? ""),
+      activeProjectId: liveTasks.some((task) => task.id === snapshot.activeTaskId)
+        ? snapshot.activeProjectId
+        : (liveTasks[0]?.projectId ?? snapshot.activeProjectId),
+    };
     const restoreLastWorkspace =
       readBrowserSettings().find((setting) => setting.key === "settings.general.openLastWorkspace")
         ?.value !== false;
-    return restoreLastWorkspace ? snapshot : { ...snapshot, activeTaskId: "", activeProjectId: "" };
+    return restoreLastWorkspace ? live : { ...live, activeTaskId: "", activeProjectId: "" };
   },
 
-  searchTaskMessages: async (query, requestedLimit = 30) => {
+  listArchivedTasks: async (input = {}) => {
+    const limit = Math.min(100, Math.max(1, Math.trunc(input.limit ?? 50) || 50));
+    if (isTauri()) {
+      const page = await nativeInvoke<{
+        tasks: NativeTask[];
+        nextCursor?: string;
+        total: number;
+      }>("task_list_archived", {
+        cursor: input.cursor,
+        limit,
+      });
+      const workspace = cachedWorkspace ?? createEmptySnapshot();
+      const projectByPath = new Map(workspace.projects.map((project) => [project.path, project]));
+      const tasks = page.tasks.map((task) => {
+        const projectPath = task.repositoryPath ?? "Local workspace";
+        let project = projectByPath.get(projectPath);
+        if (!project) {
+          project = projectForPath(workspace, task.repositoryPath);
+          projectByPath.set(projectPath, project);
+          if (cachedWorkspace) {
+            cachedWorkspace = {
+              ...cachedWorkspace,
+              projects: cachedWorkspace.projects.some((item) => item.id === project!.id)
+                ? cachedWorkspace.projects
+                : [...cachedWorkspace.projects, project],
+            };
+          }
+        }
+        return mapNativeTaskSummary(task, project.id);
+      });
+      return {
+        tasks,
+        nextCursor: page.nextCursor,
+        total: page.total,
+      };
+    }
+    const snapshot = readDemoSnapshot();
+    const all = snapshot.tasks
+      .filter((task) => task.archived && !task.parentId)
+      .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+    let start = 0;
+    if (input.cursor) {
+      const index = all.findIndex((task) => `${task.updatedAt}\t${task.id}` === input.cursor);
+      start = index >= 0 ? index + 1 : 0;
+    }
+    const slice = all.slice(start, start + limit);
+    const last = slice[slice.length - 1];
+    return {
+      tasks: slice,
+      nextCursor:
+        start + slice.length < all.length && last
+          ? `${last.updatedAt}\t${last.id}`
+          : undefined,
+      total: all.length,
+    };
+  },
+
+  searchTaskMessages: async (query, requestedLimit = 30, options) => {
     const limit = Math.min(50, Math.max(1, Math.trunc(requestedLimit) || 30));
+    const includeArchived = options?.includeArchived === true;
     if (query.trim().length < 2) return [];
     if (isTauri()) {
-      return nativeInvoke<TaskMessageSearchHit[]>("task_search_messages", { query, limit });
+      return nativeInvoke<TaskMessageSearchHit[]>("task_search_messages", {
+        query,
+        limit,
+        includeArchived,
+      });
     }
     const snapshot = readDemoSnapshot();
     const hits: TaskMessageSearchHit[] = [];
     for (const task of snapshot.tasks) {
+      if (!includeArchived && task.archived) continue;
       const snippet = browserMessageSearchSnippet(
         snapshot.taskContexts[task.id]?.transcript ?? [],
         query,
@@ -4125,6 +4281,35 @@ export const bridge: AppBridge = {
         taskId: nativeTaskId,
         input,
       });
+      if (cachedWorkspace) {
+        let nextTasks = cachedWorkspace.tasks;
+        if (task.archived) {
+          nextTasks = cachedWorkspace.tasks.filter((item) => item.id !== taskId);
+        } else if (cachedWorkspace.tasks.some((item) => item.id === taskId)) {
+          nextTasks = cachedWorkspace.tasks.map((item) =>
+            item.id === taskId
+              ? {
+                  ...item,
+                  title: task.title,
+                  pinned: task.pinned,
+                  archived: false,
+                  updatedAt: task.updatedAt,
+                }
+              : item,
+          );
+        } else {
+          const projectPath = task.repositoryPath ?? "Local workspace";
+          const project =
+            cachedWorkspace.projects.find((item) => item.path === projectPath) ??
+            projectForPath(cachedWorkspace, task.repositoryPath);
+          const projects = cachedWorkspace.projects.some((item) => item.id === project.id)
+            ? cachedWorkspace.projects
+            : [...cachedWorkspace.projects, project];
+          cachedWorkspace = { ...cachedWorkspace, projects };
+          nextTasks = [mapNativeTaskSummary(task, project.id), ...cachedWorkspace.tasks];
+        }
+        cachedWorkspace = { ...cachedWorkspace, tasks: nextTasks };
+      }
       return {
         taskId,
         title: task.title,
@@ -4133,15 +4318,46 @@ export const bridge: AppBridge = {
         updatedAt: task.updatedAt,
       };
     }
-    const snapshot = readDemoSnapshot();
-    const task = snapshot.tasks.find((item) => item.id === taskId);
+    const snapshot = cachedWorkspace ?? readDemoSnapshot();
+    const full = readDemoSnapshot();
+    const task =
+      snapshot.tasks.find((item) => item.id === taskId) ??
+      full.tasks.find((item) => item.id === taskId);
     if (!task) throw new Error(`Unknown chat: ${taskId}`);
-    return {
-      taskId,
+    const updatedAt = new Date().toISOString();
+    const archived = input.archived ?? task.archived ?? false;
+    const updated: TaskSummary = {
+      ...task,
       title: input.title?.trim() || task.title,
       pinned: input.pinned ?? task.pinned ?? false,
-      archived: input.archived ?? task.archived ?? false,
-      updatedAt: new Date().toISOString(),
+      archived,
+      updatedAt,
+    };
+    const without = full.tasks.filter((item) => item.id !== taskId);
+    const nextFull: WorkspaceSnapshot = {
+      ...full,
+      tasks: archived
+        ? [...without, updated]
+        : [updated, ...without.filter((item) => item.id !== taskId)],
+    };
+    writeDemoSnapshot(nextFull);
+    if (cachedWorkspace) {
+      cachedWorkspace = {
+        ...cachedWorkspace,
+        tasks: archived
+          ? cachedWorkspace.tasks.filter((item) => item.id !== taskId)
+          : [
+              updated,
+              ...cachedWorkspace.tasks.filter((item) => item.id !== taskId),
+            ],
+      };
+    }
+    return {
+      taskId,
+      title: updated.title,
+      pinned: updated.pinned ?? false,
+      archived: updated.archived ?? false,
+      updatedAt,
     };
   },
 
@@ -4412,9 +4628,30 @@ export const bridge: AppBridge = {
     });
   },
 
-  loadTaskProjection: async (taskId) => {
-    if (!isTauri()) return { events: [], watermarkSeq: 0, runtimeLive: false };
-    return nativeInvoke<TaskProjectionSnapshot>("task_snapshot", { taskId });
+  loadTaskProjection: async (taskId, options) => {
+    if (!isTauri()) {
+      return {
+        watermarkSeq: 0,
+        resetSeq: 0,
+        runtimeLive: false,
+        cacheMatched: false,
+        hydrate: {
+          items: [],
+          plan: [],
+          planTruncated: false,
+          approvals: [],
+          firstSeen: {},
+          hasMoreOlder: false,
+        },
+      };
+    }
+    return nativeInvoke<TaskProjectionSnapshot>("task_snapshot", {
+      taskId,
+      knownWatermark: options?.knownWatermark,
+      knownResetSeq: options?.knownResetSeq,
+      beforeSeq: options?.beforeSeq,
+      limit: options?.limit,
+    });
   },
 
   respondToApproval: async (taskId, approvalId, decision) => {

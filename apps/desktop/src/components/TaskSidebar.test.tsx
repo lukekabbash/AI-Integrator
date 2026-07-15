@@ -130,6 +130,55 @@ describe("TaskSidebar", () => {
     expect(name).toHaveAttribute("aria-expanded", "true");
   });
 
+  it("keeps the traveling selection target after collapsing and re-expanding the active project", async () => {
+    document.documentElement.dataset.motion = "none";
+    try {
+      const { snapshot } = setup();
+      const active = snapshot.projects.find((project) => project.id === snapshot.activeProjectId)!;
+      const activeChat = snapshot.tasks.find((task) => task.id === snapshot.activeTaskId)!;
+
+      fireEvent.click(screen.getByRole("button", { name: `Collapse ${active.name}` }));
+      expect(screen.getByRole("button", { name: `Expand ${active.name}` })).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: `Expand ${active.name}` }));
+      await waitFor(() => {
+        expect(
+          document.querySelector(`[data-traveling-selection="${activeChat.id}"]`),
+        ).toBeInTheDocument();
+      });
+      expect(
+        screen.getByRole("button", { name: new RegExp(activeChat.title) }).closest(".chat-row-shell"),
+      ).toHaveAttribute("data-traveling-selection", activeChat.id);
+    } finally {
+      delete document.documentElement.dataset.motion;
+    }
+  });
+
+  it("opens and closes the project clip without a stuck height under reduced motion", () => {
+    document.documentElement.dataset.motion = "none";
+    try {
+      const { snapshot } = setup();
+      const active = snapshot.projects.find((project) => project.id === snapshot.activeProjectId)!;
+
+      const openClip = document.querySelector(".project-chat-list-clip");
+      expect(openClip).toHaveAttribute("data-open", "true");
+      expect(openClip?.querySelector(".project-chat-list")).toBeTruthy();
+
+      fireEvent.click(screen.getByRole("button", { name: `Collapse ${active.name}` }));
+      expect(document.querySelector(".project-chat-list-clip")).toBeNull();
+      expect(
+        screen.queryByRole("button", { name: new RegExp(snapshot.tasks[0].title) }),
+      ).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: `Expand ${active.name}` }));
+      const reopened = document.querySelector(".project-chat-list-clip");
+      expect(reopened).toHaveAttribute("data-open", "true");
+      expect(screen.getByRole("button", { name: new RegExp(snapshot.tasks[0].title) })).toBeInTheDocument();
+    } finally {
+      delete document.documentElement.dataset.motion;
+    }
+  });
+
   it("shows five chats per project, pages ten at a time, and collapses back", () => {
     document.documentElement.dataset.motion = "none";
     try {
@@ -276,7 +325,11 @@ describe("TaskSidebar", () => {
       target: { value: "orchestrated emerald" },
     });
 
-    await waitFor(() => expect(onSearchMessages).toHaveBeenCalledWith("orchestrated emerald"));
+    await waitFor(() =>
+      expect(onSearchMessages).toHaveBeenCalledWith("orchestrated emerald", {
+        includeArchived: false,
+      }),
+    );
     const dialog = screen.getByRole("dialog", { name: "Search chats" });
     const result = await within(dialog).findByRole("button", {
       name: /Tune coordinated theme presets/i,

@@ -140,9 +140,17 @@ afterEach(() => {
 describe("SubagentConversation", () => {
   it("publishes child text once per frame and flushes completion immediately in order", async () => {
     vi.spyOn(bridge, "loadTaskProjection").mockResolvedValue({
-      events: [],
       watermarkSeq: 0,
+      resetSeq: 0,
       runtimeLive: true,
+      hydrate: {
+        items: [],
+        plan: [],
+        planTruncated: false,
+        approvals: [],
+        firstSeen: {},
+        hasMoreOlder: false,
+      },
     });
     let projectionListener: Parameters<typeof bridge.subscribeRuntimeProjections>[0] | undefined;
     vi.spyOn(bridge, "subscribeRuntimeProjections").mockImplementation(async (listener) => {
@@ -192,9 +200,17 @@ describe("SubagentConversation", () => {
 
   it("keeps Stop out of the open subagent header", async () => {
     vi.spyOn(bridge, "loadTaskProjection").mockResolvedValue({
-      events: [],
       watermarkSeq: 0,
+      resetSeq: 0,
       runtimeLive: true,
+      hydrate: {
+        items: [],
+        plan: [],
+        planTruncated: false,
+        approvals: [],
+        firstSeen: {},
+        hasMoreOlder: false,
+      },
     });
     vi.spyOn(bridge, "subscribeRuntimeProjections").mockResolvedValue(() => undefined);
     vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
@@ -216,9 +232,17 @@ describe("SubagentConversation", () => {
 
   it("reopens a stopped child and sends the provider/model selected in the shared composer", async () => {
     vi.spyOn(bridge, "loadTaskProjection").mockResolvedValue({
-      events: [],
       watermarkSeq: 0,
+      resetSeq: 0,
       runtimeLive: false,
+      hydrate: {
+        items: [],
+        plan: [],
+        planTruncated: false,
+        approvals: [],
+        firstSeen: {},
+        hasMoreOlder: false,
+      },
     });
     vi.spyOn(bridge, "loadTaskGit").mockResolvedValue(childGit);
     vi.spyOn(bridge, "subscribeRuntimeProjections").mockResolvedValue(() => undefined);
@@ -277,9 +301,17 @@ describe("SubagentConversation", () => {
 
   it("offers Cursor and Grok as reroute targets for a child", async () => {
     vi.spyOn(bridge, "loadTaskProjection").mockResolvedValue({
-      events: [],
       watermarkSeq: 0,
+      resetSeq: 0,
       runtimeLive: false,
+      hydrate: {
+        items: [],
+        plan: [],
+        planTruncated: false,
+        approvals: [],
+        firstSeen: {},
+        hasMoreOlder: false,
+      },
     });
     vi.spyOn(bridge, "loadTaskGit").mockResolvedValue(childGit);
     vi.spyOn(bridge, "subscribeRuntimeProjections").mockResolvedValue(() => undefined);
@@ -303,27 +335,23 @@ describe("SubagentConversation", () => {
   it("mirrors compact task controls, reports child tokens, and opens the child review", async () => {
     vi.spyOn(bridge, "loadTaskProjection").mockResolvedValue({
       watermarkSeq: 1,
+      resetSeq: 0,
       runtimeLive: false,
-      events: [
-        {
-          taskId: "task-child",
-          seq: 1,
-          providerSessionId: "session-child",
-          provider: "codex",
-          threadId: "thread-child",
-          occurredAt: "2026-07-12T10:06:00Z",
-          projection: {
-            kind: "usageChanged",
-            usage: {
-              inputTokens: 1_100_000,
-              cachedInputTokens: 100_000,
-              outputTokens: 200_000,
-              reasoningOutputTokens: 0,
-              totalTokens: 1_400_000,
-            },
-          },
+      hydrate: {
+        items: [],
+        plan: [],
+        planTruncated: false,
+        approvals: [],
+        usage: {
+          inputTokens: 1_100_000,
+          cachedInputTokens: 100_000,
+          outputTokens: 200_000,
+          reasoningOutputTokens: 0,
+          totalTokens: 1_400_000,
         },
-      ],
+        firstSeen: {},
+        hasMoreOlder: false,
+      },
     });
     const pendingChildGit: GitSnapshot = {
       ...childGit,
@@ -391,29 +419,24 @@ describe("SubagentConversation", () => {
 
   it("offers a noninterruptive Resume control for an interrupted subagent", async () => {
     vi.spyOn(bridge, "loadTaskProjection").mockResolvedValue({
-      events: [
-        {
-          taskId: "task-child",
-          seq: 1,
-          providerSessionId: "session-child",
-          provider: "codex",
-          threadId: "thread-child",
-          turnId: "turn-interrupted",
-          occurredAt: "2026-07-12T10:06:01Z",
-          projection: {
-            kind: "turnChanged",
-            turn: {
-              id: "turn-interrupted",
-              status: "interrupted",
-              stopRequested: false,
-              startedAt: "2026-07-12T10:05:00Z",
-              completedAt: "2026-07-12T10:06:00Z",
-            },
-          },
-        },
-      ],
       watermarkSeq: 1,
+      resetSeq: 0,
       runtimeLive: false,
+      hydrate: {
+        items: [],
+        plan: [],
+        planTruncated: false,
+        approvals: [],
+        turn: {
+          id: "turn-interrupted",
+          status: "interrupted",
+          stopRequested: false,
+          startedAt: "2026-07-12T10:05:00Z",
+          completedAt: "2026-07-12T10:06:00Z",
+        },
+        firstSeen: {},
+        hasMoreOlder: false,
+      },
     });
     vi.spyOn(bridge, "subscribeRuntimeProjections").mockResolvedValue(() => undefined);
     vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([

@@ -5,7 +5,12 @@ import { LazyMotion, domAnimation } from "motion/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProjectFileContent } from "../bridge";
 import { FileWorkspace } from "./FileView";
-import { resolveRequestedFile } from "./fileViewSupport";
+import {
+  indentGuideCount,
+  indentGuideCountsForLines,
+  leadingIndentColumns,
+  resolveRequestedFile,
+} from "./fileViewSupport";
 
 const textFile: ProjectFileContent = {
   path: "src/App.tsx",
@@ -83,11 +88,24 @@ describe("FileWorkspace", () => {
     expect(document.querySelector(".file-code-editor-highlight .syntax-keyword")).toHaveTextContent(
       "const",
     );
+    const gutterNumbers = [...document.querySelectorAll(".file-code-line-number")].map(
+      (node) => (node as HTMLElement).dataset.line,
+    );
+    expect(gutterNumbers).toEqual(["1", "2", "3"]);
+    // Highlight layer must mirror textarea text (including \\n) so native
+    // selection/caret geometry covers the colored glyphs underneath.
+    // Line numbers use ::before + data-line so they stay out of textContent.
+    expect(document.querySelector(".file-code-editor-highlight")?.textContent).toBe(
+      (editor as HTMLTextAreaElement).value,
+    );
 
     fireEvent.change(editor, { target: { value: "const value = 'edited';\n" } });
     expect(screen.getByText("Edited")).toBeInTheDocument();
     expect(document.querySelector(".file-code-editor-highlight .syntax-string")).toHaveTextContent(
       "'edited'",
+    );
+    expect(document.querySelector(".file-code-editor-highlight")?.textContent).toBe(
+      "const value = 'edited';\n",
     );
 
     await act(async () => {
@@ -97,6 +115,69 @@ describe("FileWorkspace", () => {
 
     expect(onSave).toHaveBeenCalledWith("const value = 'edited';\n");
     expect(screen.getByRole("textbox", { name: "Edit src/App.tsx" })).toBe(editor);
+  });
+
+  it("keeps highlight text (including newlines) aligned with the textarea after edits", () => {
+    renderWorkspace({ editable: true, onSave: vi.fn() });
+    const editor = screen.getByRole("textbox", { name: "Edit src/App.tsx" });
+    const nested =
+      "export function run() {\n  const value = 1;\n\n    return value;\n}\n";
+    fireEvent.change(editor, { target: { value: nested } });
+
+    const highlight = document.querySelector(".file-code-editor-highlight");
+    expect(highlight?.textContent).toBe(nested);
+    expect(highlight?.querySelectorAll(".file-code-editor-line")).toHaveLength(6);
+    expect(highlight?.querySelectorAll(".file-indent-guide").length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("paints indent guides for nested code in the reader and editor", () => {
+    const nested = "export function run() {\n  const value = 1;\n    return value;\n}\n";
+    renderWorkspace({ file: { ...textFile, content: nested } });
+
+    const readerGuides = document.querySelectorAll(
+      ".file-reader-lines .file-indent-guide",
+    );
+    expect(readerGuides.length).toBeGreaterThanOrEqual(3);
+
+    cleanup();
+    renderWorkspace({
+      editable: true,
+      onSave: vi.fn(),
+      file: { ...textFile, content: nested },
+    });
+    expect(document.querySelectorAll(".file-code-editor-highlight .file-code-line-number")).toHaveLength(
+      5,
+    );
+    expect(
+      document.querySelectorAll(".file-code-editor-highlight .file-indent-guide").length,
+    ).toBeGreaterThanOrEqual(3);
+  });
+
+  it("carries indent guides across blank lines so columns stay continuous", () => {
+    const nested = "function run() {\n  const value = 1;\n\n  return value;\n}\n";
+    renderWorkspace({
+      editable: true,
+      onSave: vi.fn(),
+      file: { ...textFile, content: nested },
+    });
+    const lines = [...document.querySelectorAll(".file-code-editor-line")];
+    // Blank line between two indent-1 lines should still paint one guide.
+    expect(lines[2]?.querySelectorAll(".file-indent-guide")).toHaveLength(1);
+  });
+
+  it("mirrors textarea scroll onto the highlight layer (numbers ride with highlight lines)", () => {
+    renderWorkspace({ editable: true, onSave: vi.fn() });
+    const editor = screen.getByRole("textbox", { name: "Edit src/App.tsx" });
+    const highlight = document.querySelector(".file-code-editor-highlight");
+    expect(highlight).toBeTruthy();
+    expect(document.querySelector(".file-code-gutter-inner")).not.toBeInTheDocument();
+
+    Object.defineProperty(editor, "scrollTop", { configurable: true, value: 128, writable: true });
+    Object.defineProperty(editor, "scrollLeft", { configurable: true, value: 24, writable: true });
+    fireEvent.scroll(editor);
+
+    expect(highlight).toHaveProperty("scrollTop", 128);
+    expect(highlight).toHaveProperty("scrollLeft", 24);
   });
 
   it("retries immediately with Cmd+S, surfaces failures, and leaves undo unclaimed", async () => {
@@ -293,5 +374,24 @@ describe("resolveRequestedFile", () => {
     );
     expect(resolveRequestedFile(files, "./README.md")?.path).toBe("README.md");
     expect(resolveRequestedFile(files, "/elsewhere/missing.ts")).toBeUndefined();
+  });
+});
+
+describe("file indent guides", () => {
+  it("counts leading columns and guide stops for spaces and tabs", () => {
+    expect(leadingIndentColumns("code")).toBe(0);
+    expect(leadingIndentColumns("  code")).toBe(2);
+    expect(leadingIndentColumns("    code")).toBe(4);
+    expect(leadingIndentColumns("\tcode")).toBe(2);
+    expect(leadingIndentColumns("\t\tcode")).toBe(4);
+    expect(indentGuideCount("code")).toBe(0);
+    expect(indentGuideCount("  code")).toBe(1);
+    expect(indentGuideCount("    return value;")).toBe(2);
+  });
+
+  it("carries guide counts across blank lines", () => {
+    expect(
+      indentGuideCountsForLines(["fn() {", "  a();", "", "  b();", "}"]),
+    ).toEqual([0, 1, 1, 1, 0]);
   });
 });

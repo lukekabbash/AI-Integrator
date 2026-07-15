@@ -4410,19 +4410,24 @@ kbd {
   font-size: 10.5px;
   line-height: 1.55;
   color: var(--color-text-primary);
+  tab-size: 2;
 }
 .file-reader-lines li {
+  position: relative;
   padding-inline: 8px;
   border-radius: 3px;
 }
 .file-reader-lines li::marker {
   color: var(--color-text-tertiary);
   font-size: 10px;
+  font-variant-numeric: tabular-nums;
 }
 .file-reader-lines li:hover {
   background: color-mix(in srgb, var(--color-layer-2) 70%, transparent);
 }
 .file-reader-lines code {
+  position: relative;
+  display: block;
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -6649,6 +6654,7 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   text-align: right;
   user-select: none;
   font-size: 9px;
+  font-variant-numeric: tabular-nums;
 }
 .diff-gutter {
   width: 18px;
@@ -8645,6 +8651,26 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
 .project-group[data-active="true"] .project-select-button > span {
   font-weight: 650;
 }
+/* Clip open/close via grid track interpolation — avoids JS height:"auto" thrash. */
+.project-chat-list-clip {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition:
+    grid-template-rows 220ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.project-chat-list-clip[data-open="true"] {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+.project-chat-list-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+.project-chat-list-clip[data-menu-open="true"] .project-chat-list-inner {
+  overflow: visible;
+}
 .project-chat-list {
   position: relative;
   overflow: hidden;
@@ -9627,10 +9653,8 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   }
   /* The terminal drawer's slide is driven by motion/react in
      TerminalDrawer.tsx so it can animate out as well as in. */
-  /* The file view's "open" language, shared across the app's lists: rows
-     slide in off their guide line as a group unfolds. Git file rows use
-     layout + AnimatePresence instead so worktree refreshes don't flash. */
-  .project-chat-list .chat-row-shell,
+  /* Project chat rows use Motion chatRowVariants for the cascade; commit
+     rows keep the shared CSS entrance. */
   .commit-row {
     animation: row-slide-in var(--duration-fast) var(--ease-standard) both;
   }
@@ -10475,6 +10499,24 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   flex: 1;
   overflow: hidden;
 }
+/* Static rail only — line numbers live on each highlight line so they cannot
+   drift ahead of the code they label. */
+.file-code-gutter {
+  position: absolute;
+  inset: 0 auto 0 0;
+  z-index: 0;
+  width: 3.25rem;
+  border-right: 1px solid var(--color-border-subtle);
+  background: color-mix(in srgb, var(--color-layer-1) 55%, transparent);
+  pointer-events: none;
+}
+.file-code-editor-surface {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  overflow: hidden;
+  background: transparent;
+}
 .file-code-editor-highlight,
 .file-workspace-editor {
   position: absolute;
@@ -10482,12 +10524,13 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   height: 100%;
   width: 100%;
   margin: 0;
-  padding: 10px 16px 20px;
+  /* Left padding clears the rail; numbers hang into that slot. */
+  padding: 10px 16px 20px 3.25rem;
   border: 0;
   font-family: var(--font-code);
   font-size: 11.5px;
   font-weight: 400;
-  line-height: 1.6;
+  line-height: calc(11.5px * 1.6);
   tab-size: 2;
   white-space: pre;
   overflow: auto;
@@ -10500,6 +10543,54 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
 }
 .file-code-editor-highlight::-webkit-scrollbar {
   display: none;
+}
+/* Inline + mirrored \\n so highlight metrics match the textarea; selection and
+   caret live on the textarea above this layer. */
+.file-code-editor-line {
+  position: relative;
+}
+.file-code-editor-line:empty::before {
+  content: "\200b";
+}
+.file-code-line-number {
+  position: absolute;
+  top: 0;
+  left: -3.25rem;
+  box-sizing: border-box;
+  width: 3.25rem;
+  height: 1lh;
+  padding: 0 10px 0 8px;
+  color: var(--color-text-tertiary);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  line-height: inherit;
+  text-align: right;
+  user-select: none;
+  pointer-events: none;
+}
+.file-code-line-number::before {
+  content: attr(data-line);
+}
+.file-indent-guides {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 1lh;
+  pointer-events: none;
+  user-select: none;
+}
+.file-indent-guide {
+  position: absolute;
+  top: 0;
+  /* Full line stride (1lh) so stacked segments abut into a solid column. */
+  height: 1lh;
+  width: 0;
+  border: 0;
+  border-left: 1px solid color-mix(in srgb, var(--color-border-strong) 55%, transparent);
+  background: none;
+  pointer-events: none;
+  user-select: none;
 }
 .file-workspace-editor {
   z-index: 1;

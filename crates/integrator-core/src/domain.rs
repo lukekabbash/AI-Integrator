@@ -330,6 +330,8 @@ pub struct LocalExport {
     pub schema_version: u32,
     pub exported_at: DateTime<Utc>,
     pub projects: Vec<TrustedProject>,
+    /// Live (non-archived) tasks only. Archived chats load through
+    /// `list_archived_tasks` so workspace bootstrap stays on the hot set.
     pub tasks: Vec<Task>,
     pub settings: Vec<Setting>,
     pub provider_sessions: Vec<ProviderSession>,
@@ -338,6 +340,16 @@ pub struct LocalExport {
     pub provider_resume_states: Vec<ProviderResumeState>,
     pub composer_drafts: Vec<ComposerDraft>,
     pub queued_messages: Vec<QueuedMessage>,
+}
+
+/// One page of archived root chats for the Archive sidebar/settings surfaces.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchivedTaskPage {
+    pub tasks: Vec<Task>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub total: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

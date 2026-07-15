@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     str::FromStr,
 };
 
@@ -8,7 +8,9 @@ use integrator_core::{
     ApprovalDecision, ApprovalProjection, ApprovalState, IntegratorError, ItemProjection,
     ItemStatus, NewTask, ProviderKind, ProviderSession, ProviderSessionId, Result, RuntimeBinding,
     RuntimeProjection, RuntimeProjectionEvent, RuntimeSession, RuntimeSessionId, StopRequestResult,
-    Task, TaskId, TaskSnapshot, TransportRequestId, TurnProjection, TurnStatus, UsageProjection,
+    TASK_PROJECTION_HYDRATE_TAIL, Task, TaskId, TaskProjectionConnectionHydrate,
+    TaskProjectionDiffHydrate, TaskProjectionErrorHydrate, TaskProjectionHydrate, TaskSnapshot,
+    TaskSnapshotQuery, TransportRequestId, TurnProjection, TurnStatus, UsageProjection,
 };
 use integrator_runtime::{
     ItemTextField, ProjectionMutation, ReducedProviderEvent, redact_and_bound,
@@ -224,8 +226,21 @@ impl LocalStore {
     }
 
     pub fn task_snapshot(&self, task_id: TaskId) -> Result<TaskSnapshot> {
+        self.task_snapshot_with(task_id, TaskSnapshotQuery::default())
+    }
+
+    /// Compact UI hydrate with optional watermark/reset if-match and tail windowing.
+    ///
+    /// Display-only: does not change what is persisted or what
+    /// `task_conversation_digest` returns for agent seeding.
+    pub fn task_snapshot_with(
+        &self,
+        task_id: TaskId,
+        query: TaskSnapshotQuery,
+    ) -> Result<TaskSnapshot> {
         let task = self.get_task(task_id)?;
         let connection = self.connection.lock();
+        let task_key = task_id.to_string();
         // A forked task owns copied projection rows but none of the source's
         // audit log, so the log alone would report a zero watermark and clamp
         // the entire copied transcript out of the result below. A task that
@@ -238,23 +253,169 @@ impl LocalStore {
                     (SELECT COALESCE(MAX(last_event_seq), 0) FROM codex_items WHERE task_id = ?1),
                     (SELECT COALESCE(MAX(last_event_seq), 0) FROM codex_turns WHERE task_id = ?1)
                 )",
-                [task_id.to_string()],
+                [&task_key],
                 |row| row.get::<_, i64>(0),
             )
             .map_err(storage_error)?;
-        // The append-only event log remains the audit source and sequence
-        // watermark. Renderer hydration reads only the transactionally updated
-        // current rows, so repeated streaming deltas do not cross SQLite/IPC.
+        let reset_seq = connection
+            .query_row(
+                "SELECT COALESCE(reset_seq, 0) FROM codex_task_projection WHERE task_id = ?1",
+                [&task_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .unwrap_or(0);
+
+        // Older pages only need the item/approval window; skip singleton work.
+        let older_page = query.before_seq.is_some();
+        if !older_page
+            && query.known_watermark == Some(watermark)
+            && query.known_reset_seq == Some(reset_seq)
+        {
+            return Ok(TaskSnapshot {
+                task,
+                watermark_seq: watermark,
+                reset_seq,
+                runtime_live: false,
+                cache_matched: true,
+                hydrate: None,
+            });
+        }
+
+        let limit = query
+            .limit
+            .unwrap_or(TASK_PROJECTION_HYDRATE_TAIL)
+            .max(1);
+        let before_seq = query.before_seq.unwrap_or(i64::MAX);
+
         let mut statement = connection
+            .prepare(
+                r#"
+            SELECT last_event_seq, snapshot_event_json FROM (
+                SELECT last_event_seq, snapshot_event_json FROM codex_items
+                    WHERE task_id = ?1
+                      AND last_event_seq > ?2
+                      AND last_event_seq <= ?3
+                      AND last_event_seq < ?4
+                      AND snapshot_event_json IS NOT NULL
+                UNION ALL
+                SELECT last_event_seq, snapshot_event_json FROM codex_approvals
+                    WHERE task_id = ?1
+                      AND last_event_seq > ?2
+                      AND last_event_seq <= ?3
+                      AND last_event_seq < ?4
+                      AND snapshot_event_json IS NOT NULL
+            )
+            ORDER BY last_event_seq DESC
+            LIMIT ?5
+            "#,
+            )
+            .map_err(storage_error)?;
+        let mut window_rows = statement
+            .query_map(
+                params![task_key, reset_seq, watermark, before_seq, limit as i64],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(storage_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        let fetched = window_rows.len();
+        // Reverse to ascending last_event_seq so item/approval array order
+        // matches the historical event-stream hydrate path.
+        window_rows.reverse();
+
+        let oldest_loaded = window_rows.first().map(|(seq, _)| *seq);
+        let has_more_older = match oldest_loaded {
+            Some(oldest) if fetched >= limit => connection
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM codex_items
+                            WHERE task_id = ?1 AND last_event_seq > ?2 AND last_event_seq < ?3
+                              AND last_event_seq <= ?4 AND snapshot_event_json IS NOT NULL
+                        UNION ALL
+                        SELECT 1 FROM codex_approvals
+                            WHERE task_id = ?1 AND last_event_seq > ?2 AND last_event_seq < ?3
+                              AND last_event_seq <= ?4 AND snapshot_event_json IS NOT NULL
+                    )",
+                    params![task_key, reset_seq, oldest, watermark],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(storage_error)?
+                > 0,
+            _ => false,
+        };
+
+        let mut items = Vec::new();
+        let mut approvals = Vec::new();
+        let mut first_seen = BTreeMap::new();
+        for (_seq, event_json) in &window_rows {
+            let event: RuntimeProjectionEvent = serde_json::from_str(event_json)?;
+            match event.projection {
+                RuntimeProjection::ItemChanged { item } => {
+                    first_seen.insert(item.id.clone(), event.occurred_at);
+                    items.push(item);
+                }
+                RuntimeProjection::ApprovalChanged { approval } => {
+                    first_seen.insert(approval.id.clone(), event.occurred_at);
+                    approvals.push(approval);
+                }
+                _ => {}
+            }
+        }
+
+        if older_page {
+            return Ok(TaskSnapshot {
+                task,
+                watermark_seq: watermark,
+                reset_seq,
+                runtime_live: false,
+                cache_matched: false,
+                hydrate: Some(TaskProjectionHydrate {
+                    turn: None,
+                    items,
+                    plan: Vec::new(),
+                    plan_truncated: false,
+                    diff: None,
+                    usage: None,
+                    approvals,
+                    mode: None,
+                    connection: None,
+                    error: None,
+                    first_seen,
+                    has_more_older,
+                    before_seq: oldest_loaded,
+                }),
+            });
+        }
+
+        let mut hydrate = TaskProjectionHydrate {
+            turn: None,
+            items,
+            plan: Vec::new(),
+            plan_truncated: false,
+            diff: None,
+            usage: None,
+            approvals,
+            mode: None,
+            connection: None,
+            error: None,
+            first_seen,
+            has_more_older,
+            before_seq: oldest_loaded,
+        };
+
+        // Singletons always hydrate fully (tiny); reset itself is baked into
+        // reset_seq rather than replaying a ProjectionReset wipe on the client.
+        let mut singleton_statement = connection
             .prepare(
                 r#"
             WITH boundary AS (
                 SELECT COALESCE(reset_seq, 0) AS reset_seq
                 FROM codex_task_projection WHERE task_id = ?1
-            ), current_events(seq, event_json) AS (
-                SELECT reset_seq, reset_event_json FROM codex_task_projection
-                    WHERE task_id=?1 AND reset_seq > 0
-                UNION ALL SELECT turn_seq, turn_event_json FROM codex_task_projection
+            )
+            SELECT seq, event_json FROM (
+                SELECT turn_seq AS seq, turn_event_json AS event_json FROM codex_task_projection
                     WHERE task_id=?1 AND turn_seq > (SELECT reset_seq FROM boundary)
                 UNION ALL SELECT plan_seq, plan_event_json FROM codex_task_projection
                     WHERE task_id=?1 AND plan_seq > (SELECT reset_seq FROM boundary)
@@ -268,33 +429,71 @@ impl LocalStore {
                     WHERE task_id=?1 AND error_seq > (SELECT reset_seq FROM boundary)
                 UNION ALL SELECT connection_seq, connection_event_json FROM codex_task_projection
                     WHERE task_id=?1 AND connection_seq > (SELECT reset_seq FROM boundary)
-                UNION ALL SELECT last_event_seq, snapshot_event_json FROM codex_items
-                    WHERE task_id=?1 AND last_event_seq > (SELECT reset_seq FROM boundary)
-                UNION ALL SELECT last_event_seq, snapshot_event_json FROM codex_approvals
-                    WHERE task_id=?1 AND last_event_seq > (SELECT reset_seq FROM boundary)
             )
-            SELECT event_json FROM current_events
             WHERE event_json IS NOT NULL AND seq <= ?2
             ORDER BY seq
             "#,
             )
             .map_err(storage_error)?;
-        let events = statement
-            .query_map(params![task_id.to_string(), watermark], |row| {
-                row.get::<_, String>(0)
+        let singleton_jsons = singleton_statement
+            .query_map(params![task_key, watermark], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(storage_error)?
-            .map(|row| {
-                Ok(serde_json::from_str::<RuntimeProjectionEvent>(
-                    &row.map_err(storage_error)?,
-                )?)
-            })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+
+        for (_seq, event_json) in singleton_jsons {
+            let event: RuntimeProjectionEvent = serde_json::from_str(&event_json)?;
+            match event.projection {
+                RuntimeProjection::TurnChanged { turn } => hydrate.turn = Some(turn),
+                RuntimeProjection::PlanChanged { steps, truncated } => {
+                    hydrate.plan = steps;
+                    hydrate.plan_truncated = truncated;
+                }
+                RuntimeProjection::DiffChanged { diff, truncated } => {
+                    hydrate.diff = Some(TaskProjectionDiffHydrate {
+                        body: diff,
+                        truncated,
+                        seq: event.seq,
+                        occurred_at: event.occurred_at,
+                    });
+                }
+                RuntimeProjection::UsageChanged { usage } => hydrate.usage = Some(usage),
+                RuntimeProjection::ModeChanged { mode } => hydrate.mode = Some(mode),
+                RuntimeProjection::TurnError {
+                    message,
+                    retryable,
+                } => {
+                    hydrate.error = Some(TaskProjectionErrorHydrate {
+                        message,
+                        retryable,
+                        seq: event.seq,
+                        occurred_at: event.occurred_at,
+                    });
+                }
+                RuntimeProjection::ConnectionChanged {
+                    state,
+                    reason,
+                    process_id,
+                } => {
+                    hydrate.connection = Some(TaskProjectionConnectionHydrate {
+                        state,
+                        reason,
+                        process_id,
+                    });
+                }
+                _ => {}
+            }
+        }
+
         Ok(TaskSnapshot {
             task,
-            events,
             watermark_seq: watermark,
+            reset_seq,
             runtime_live: false,
+            cache_matched: false,
+            hydrate: Some(hydrate),
         })
     }
 
@@ -905,25 +1104,42 @@ impl LocalStore {
     /// Search locally materialized user/assistant messages without loading
     /// task snapshots or waking a provider session. Results are bounded and
     /// deduplicated to one representative snippet per task.
-    pub fn search_task_messages(&self, query: &str, limit: usize) -> Result<Vec<(TaskId, String)>> {
+    ///
+    /// Archived chats are excluded unless `include_archived` is true so the
+    /// live sidebar search stays on the hot set.
+    pub fn search_task_messages(
+        &self,
+        query: &str,
+        limit: usize,
+        include_archived: bool,
+    ) -> Result<Vec<(TaskId, String)>> {
         let Some(expression) = message_search_expression(query) else {
             return Ok(Vec::new());
         };
         let limit = limit.clamp(1, 50);
         let candidate_limit = (limit * 8).clamp(limit, 400) as i64;
         let connection = self.connection.lock();
-        let mut statement = connection
-            .prepare(
-                r#"
+        let sql = if include_archived {
+            r#"
                 SELECT task_id,
                        snippet(codex_items_fts, 0, '', '', ' ... ', 22)
                 FROM codex_items_fts
                 WHERE codex_items_fts MATCH ?1
                 ORDER BY bm25(codex_items_fts), rowid DESC
                 LIMIT ?2
-                "#,
-            )
-            .map_err(storage_error)?;
+                "#
+        } else {
+            r#"
+                SELECT codex_items_fts.task_id,
+                       snippet(codex_items_fts, 0, '', '', ' ... ', 22)
+                FROM codex_items_fts
+                INNER JOIN tasks ON tasks.id = codex_items_fts.task_id
+                WHERE codex_items_fts MATCH ?1 AND tasks.archived = 0
+                ORDER BY bm25(codex_items_fts), codex_items_fts.rowid DESC
+                LIMIT ?2
+                "#
+        };
+        let mut statement = connection.prepare(sql).map_err(storage_error)?;
         let candidates = statement
             .query_map(params![expression, candidate_limit], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -1790,7 +2006,7 @@ mod tests {
     use chrono::DateTime;
     use integrator_core::{
         ApprovalKind, ConnectionState, ItemKind, ModeOption, ModeProjection, NewTask,
-        TransportRequestId, TurnStatus,
+        TaskSnapshotQuery, TransportRequestId, TurnStatus,
     };
 
     fn bound_store(provider: ProviderKind) -> (LocalStore, RuntimeBinding) {
@@ -1963,24 +2179,55 @@ mod tests {
             .expect("persist tool output");
 
         let matches = store
-            .search_task_messages("retry SQLite", 20)
+            .search_task_messages("retry SQLite", 20, false)
             .expect("search messages");
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].0, binding.task_id);
         assert!(matches[0].1.to_lowercase().contains("retry"));
         assert!(
             store
-                .search_task_messages("secret-tool-only-needle", 20)
+                .search_task_messages("secret-tool-only-needle", 20, false)
                 .expect("search tool-only text")
                 .is_empty()
         );
         assert!(
             store
-                .search_task_messages("retry OR \\\"migration", 20)
+                .search_task_messages("retry OR \\\"migration", 20, false)
                 .expect("sanitize FTS syntax")
                 .len()
                 <= 1
         );
+    }
+
+    #[test]
+    fn message_search_excludes_archived_tasks_unless_requested() {
+        let (store, binding) = bound_store(ProviderKind::Codex);
+        store
+            .apply_reduced_event(
+                &binding,
+                &completed_message(
+                    "archived-user",
+                    ItemKind::UserMessage,
+                    "Archive needle stays cold until requested",
+                ),
+            )
+            .expect("persist user message");
+        store
+            .update_task_metadata(binding.task_id, None, None, Some(true))
+            .expect("archive task");
+
+        assert!(
+            store
+                .search_task_messages("Archive needle", 20, false)
+                .expect("live search")
+                .is_empty(),
+            "archived chats must stay out of the live search hot path"
+        );
+        let included = store
+            .search_task_messages("Archive needle", 20, true)
+            .expect("archive-inclusive search");
+        assert_eq!(included.len(), 1);
+        assert_eq!(included[0].0, binding.task_id);
     }
 
     #[test]
@@ -2008,8 +2255,14 @@ mod tests {
             .expect("persist turn");
         let snapshot = store.task_snapshot(binding.task_id).expect("load snapshot");
         assert_eq!(snapshot.watermark_seq, event.seq);
-        assert_eq!(snapshot.events, vec![event]);
-        assert_eq!(snapshot.events[0].provider, "codex");
+        assert_eq!(snapshot.reset_seq, 0);
+        assert!(!snapshot.cache_matched);
+        let hydrate = snapshot.hydrate.expect("compact hydrate");
+        let RuntimeProjection::TurnChanged { turn } = event.projection else {
+            panic!("expected turn event");
+        };
+        assert_eq!(hydrate.turn.as_ref(), Some(&turn));
+        assert!(hydrate.items.is_empty());
     }
 
     #[test]
@@ -2120,9 +2373,7 @@ mod tests {
             .expect("persist verified native skill");
 
         let snapshot = store.task_snapshot(binding.task_id).expect("load snapshot");
-        let RuntimeProjection::ItemChanged { item } = &snapshot.events[0].projection else {
-            panic!("expected item snapshot");
-        };
+        let item = &snapshot.hydrate.expect("hydrate").items[0];
         assert_eq!(item.body.as_deref(), Some("/skill-creator build one"));
         assert_eq!(item.native_skill.as_deref(), Some("skill-creator"));
     }
@@ -2163,15 +2414,15 @@ mod tests {
 
         let snapshot = store.task_snapshot(binding.task_id).expect("load snapshot");
         assert_eq!(snapshot.watermark_seq, other.seq);
-        assert_eq!(snapshot.events.len(), 2);
-        assert_eq!(snapshot.events[0].seq, latest.seq);
-        assert_eq!(snapshot.events[0].occurred_at, occurred_at);
-        match &snapshot.events[0].projection {
-            RuntimeProjection::ItemChanged { item } => {
-                assert_eq!(item.body.as_deref(), Some("helloworld"));
-            }
-            projection => panic!("expected item projection, got {projection:?}"),
-        }
+        let hydrate = snapshot.hydrate.expect("hydrate");
+        assert_eq!(hydrate.items.len(), 2);
+        assert_eq!(hydrate.items[0].body.as_deref(), Some("helloworld"));
+        assert_eq!(
+            hydrate.first_seen.get(&hydrate.items[0].id),
+            Some(&occurred_at)
+        );
+        assert_eq!(hydrate.before_seq, Some(latest.seq));
+        assert!(!hydrate.has_more_older);
     }
 
     #[test]
@@ -2224,30 +2475,21 @@ mod tests {
         }
 
         let snapshot = store.task_snapshot(binding.task_id).expect("load snapshot");
-        assert_eq!(snapshot.events.len(), 4);
-        assert!(snapshot.events.iter().any(|event| matches!(
-            &event.projection,
-            RuntimeProjection::ConnectionChanged {
-                state: ConnectionState::Connected,
-                ..
-            }
-        )));
-        assert!(snapshot.events.iter().any(|event| matches!(
-            &event.projection,
-            RuntimeProjection::ModeChanged { mode } if mode.current_mode_id == "agent"
-        )));
-        assert!(snapshot.events.iter().any(|event| matches!(
-            &event.projection,
-            RuntimeProjection::ApprovalChanged { approval }
-                if approval.state == ApprovalState::Pending
-        )));
-        assert!(snapshot.events.iter().any(|event| matches!(
-            &event.projection,
-            RuntimeProjection::TurnError {
-                retryable: true,
-                ..
-            }
-        )));
+        let hydrate = snapshot.hydrate.expect("hydrate");
+        assert!(matches!(
+            hydrate.connection.as_ref(),
+            Some(connection) if connection.state == ConnectionState::Connected
+        ));
+        assert_eq!(
+            hydrate.mode.as_ref().map(|mode| mode.current_mode_id.as_str()),
+            Some("agent")
+        );
+        assert_eq!(hydrate.approvals.len(), 1);
+        assert_eq!(hydrate.approvals[0].state, ApprovalState::Pending);
+        assert!(matches!(
+            hydrate.error.as_ref(),
+            Some(error) if error.retryable
+        ));
         let connection = store.connection.lock();
         let audit_count: i64 = connection
             .query_row(
@@ -2373,16 +2615,15 @@ mod tests {
             .expect("persist post-reset item");
 
         let snapshot = store.task_snapshot(binding.task_id).expect("load snapshot");
-        assert_eq!(snapshot.events.len(), 2);
-        assert_eq!(snapshot.events[0], reset);
-        assert_eq!(snapshot.events[1].seq, reused.seq);
-        assert_eq!(snapshot.events[1].occurred_at, after_at);
-        match &snapshot.events[1].projection {
-            RuntimeProjection::ItemChanged { item } => {
-                assert_eq!(item.body.as_deref(), Some("after reset"));
-            }
-            projection => panic!("expected item projection, got {projection:?}"),
-        }
+        assert_eq!(snapshot.reset_seq, reset.seq);
+        let hydrate = snapshot.hydrate.expect("hydrate");
+        assert_eq!(hydrate.items.len(), 1);
+        assert_eq!(hydrate.items[0].body.as_deref(), Some("after reset"));
+        assert_eq!(
+            hydrate.first_seen.get(&hydrate.items[0].id),
+            Some(&after_at)
+        );
+        assert_eq!(hydrate.before_seq, Some(reused.seq));
     }
 
     #[test]
@@ -2406,16 +2647,15 @@ mod tests {
             .expect("persist duplicate delta");
 
         let snapshot = store.task_snapshot(binding.task_id).expect("load snapshot");
-        assert_eq!(snapshot.events.len(), 2);
-        assert_eq!(snapshot.events[0].seq, b.seq);
-        assert_eq!(snapshot.events[1].seq, a_latest.seq);
-        assert_eq!(snapshot.events[1].occurred_at, at);
-        match &snapshot.events[1].projection {
-            RuntimeProjection::ItemChanged { item } => {
-                assert_eq!(item.body.as_deref(), Some("samesame"));
-            }
-            projection => panic!("expected item projection, got {projection:?}"),
-        }
+        let hydrate = snapshot.hydrate.expect("hydrate");
+        assert_eq!(hydrate.items.len(), 2);
+        // Ascending last_event_seq: b then a_latest.
+        assert_eq!(hydrate.items[0].provider_item_id, "b");
+        assert_eq!(hydrate.items[1].provider_item_id, "a");
+        assert_eq!(hydrate.items[1].body.as_deref(), Some("samesame"));
+        assert_eq!(hydrate.first_seen.get(&hydrate.items[1].id), Some(&at));
+        assert_eq!(hydrate.before_seq, Some(b.seq));
+        assert_eq!(snapshot.watermark_seq, a_latest.seq);
         let connection = store.connection.lock();
         let audit_count: i64 = connection
             .query_row(
@@ -2478,7 +2718,15 @@ mod tests {
         let reopened = LocalStore::open(&database).expect("reopen store");
         let snapshot = reopened.task_snapshot(task.id).expect("load snapshot");
         assert_eq!(snapshot.watermark_seq, settled.seq);
-        assert_eq!(snapshot.events, vec![settled.clone()]);
+        let hydrate = snapshot.hydrate.expect("hydrate");
+        assert!(matches!(
+            hydrate.turn.as_ref(),
+            Some(TurnProjection {
+                status: TurnStatus::Interrupted,
+                stop_requested: false,
+                ..
+            })
+        ));
         assert!(matches!(
             settled.projection,
             RuntimeProjection::TurnChanged {
@@ -2490,6 +2738,159 @@ mod tests {
             }
         ));
         assert_eq!(redundant_event_projection_count(&reopened, task.id), 0);
+    }
+
+    #[test]
+    fn snapshot_watermark_and_reset_short_circuit_skips_hydrate() {
+        let (store, binding) = bound_store(ProviderKind::Codex);
+        let at = Utc::now();
+        store
+            .apply_reduced_event(&binding, &append_message("keep", "body", at, at))
+            .expect("persist item");
+        let full = store.task_snapshot(binding.task_id).expect("full hydrate");
+        assert!(full.hydrate.is_some());
+        assert!(!full.cache_matched);
+
+        let matched = store
+            .task_snapshot_with(
+                binding.task_id,
+                TaskSnapshotQuery {
+                    known_watermark: Some(full.watermark_seq),
+                    known_reset_seq: Some(full.reset_seq),
+                    ..TaskSnapshotQuery::default()
+                },
+            )
+            .expect("if-match hydrate");
+        assert!(matched.cache_matched);
+        assert!(matched.hydrate.is_none());
+        assert_eq!(matched.watermark_seq, full.watermark_seq);
+        assert_eq!(matched.reset_seq, full.reset_seq);
+
+        // Watermark alone is insufficient after a projection reset.
+        let reset = persist_reset(&store, &binding, at + chrono::Duration::milliseconds(1));
+        store
+            .apply_reduced_event(
+                &binding,
+                &append_message(
+                    "after",
+                    "new",
+                    at + chrono::Duration::milliseconds(2),
+                    at + chrono::Duration::milliseconds(2),
+                ),
+            )
+            .expect("persist post-reset item");
+        let stale_match = store
+            .task_snapshot_with(
+                binding.task_id,
+                TaskSnapshotQuery {
+                    known_watermark: Some(full.watermark_seq),
+                    known_reset_seq: Some(full.reset_seq),
+                    ..TaskSnapshotQuery::default()
+                },
+            )
+            .expect("stale if-match after reset");
+        assert!(!stale_match.cache_matched);
+        assert_eq!(stale_match.reset_seq, reset.seq);
+        assert_eq!(
+            stale_match
+                .hydrate
+                .expect("full hydrate after reset mismatch")
+                .items
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn snapshot_tail_window_reports_has_more_older_and_loads_prior_page() {
+        let (store, binding) = bound_store(ProviderKind::Codex);
+        let at = Utc::now();
+        for index in 0..5 {
+            store
+                .apply_reduced_event(
+                    &binding,
+                    &append_message(
+                        &format!("item-{index}"),
+                        &format!("body-{index}"),
+                        at + chrono::Duration::milliseconds(index),
+                        at + chrono::Duration::milliseconds(index),
+                    ),
+                )
+                .expect("persist item");
+        }
+
+        let tail = store
+            .task_snapshot_with(
+                binding.task_id,
+                TaskSnapshotQuery {
+                    limit: Some(2),
+                    ..TaskSnapshotQuery::default()
+                },
+            )
+            .expect("tail hydrate");
+        let hydrate = tail.hydrate.expect("hydrate");
+        assert_eq!(hydrate.items.len(), 2);
+        assert!(hydrate.has_more_older);
+        assert_eq!(
+            hydrate
+                .items
+                .iter()
+                .map(|item| item.provider_item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["item-3", "item-4"]
+        );
+        let before_seq = hydrate.before_seq.expect("before_seq cursor");
+
+        let older = store
+            .task_snapshot_with(
+                binding.task_id,
+                TaskSnapshotQuery {
+                    before_seq: Some(before_seq),
+                    limit: Some(2),
+                    ..TaskSnapshotQuery::default()
+                },
+            )
+            .expect("older page");
+        let older_hydrate = older.hydrate.expect("older hydrate");
+        assert_eq!(older_hydrate.items.len(), 2);
+        assert!(older_hydrate.has_more_older);
+        assert_eq!(
+            older_hydrate
+                .items
+                .iter()
+                .map(|item| item.provider_item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["item-1", "item-2"]
+        );
+
+        let oldest = store
+            .task_snapshot_with(
+                binding.task_id,
+                TaskSnapshotQuery {
+                    before_seq: older_hydrate.before_seq,
+                    limit: Some(2),
+                    ..TaskSnapshotQuery::default()
+                },
+            )
+            .expect("oldest page");
+        let oldest_hydrate = oldest.hydrate.expect("oldest hydrate");
+        assert_eq!(oldest_hydrate.items.len(), 1);
+        assert!(!oldest_hydrate.has_more_older);
+        assert_eq!(oldest_hydrate.items[0].provider_item_id, "item-0");
+    }
+
+    #[test]
+    fn snapshot_empty_task_returns_empty_compact_hydrate() {
+        let (store, binding) = bound_store(ProviderKind::Codex);
+        let snapshot = store.task_snapshot(binding.task_id).expect("empty hydrate");
+        assert_eq!(snapshot.watermark_seq, 0);
+        assert_eq!(snapshot.reset_seq, 0);
+        assert!(!snapshot.cache_matched);
+        let hydrate = snapshot.hydrate.expect("hydrate");
+        assert!(hydrate.items.is_empty());
+        assert!(hydrate.approvals.is_empty());
+        assert!(!hydrate.has_more_older);
+        assert!(hydrate.before_seq.is_none());
     }
 
     #[test]
@@ -2520,7 +2921,12 @@ mod tests {
         };
         let snapshot = store.task_snapshot(binding.task_id).expect("load snapshot");
         assert_eq!(snapshot.watermark_seq, watermark);
-        assert_eq!(snapshot.events, vec![event]);
+        let hydrate = snapshot.hydrate.expect("hydrate");
+        assert_eq!(hydrate.items.len(), 1);
+        let RuntimeProjection::ItemChanged { item } = event.projection else {
+            panic!("expected item event");
+        };
+        assert_eq!(hydrate.items[0].id, item.id);
         assert_eq!(
             redundant_event_projection_count(&store, binding.task_id),
             1,

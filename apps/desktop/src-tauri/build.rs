@@ -11,6 +11,7 @@ const APP_COMMANDS: &[&str] = &[
     "queued_message_take",
     "queued_message_set_dispatching",
     "task_list",
+    "task_list_archived",
     "task_search_messages",
     "task_set_state",
     "task_update_metadata",

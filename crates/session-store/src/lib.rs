@@ -8,7 +8,8 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use integrator_core::{
-    ComposerDraft, ComposerDraftAttachment, ComposerDraftOwner, IntegratorError, LocalExport,
+    ArchivedTaskPage, ComposerDraft, ComposerDraftAttachment, ComposerDraftOwner, IntegratorError,
+    LocalExport,
     NewQueuedMessage, NewTask, ProjectId, ProviderKind, ProviderResumeState, ProviderSession,
     ProviderSessionId, QueuedMessage, QueuedMessageId, QueuedMessageState, Result, RuntimeSession,
     RuntimeSessionId, Setting, Task, TaskId, TaskState, TrustedProject, UsageProjection,
@@ -1186,13 +1187,121 @@ impl LocalStore {
         Ok(project)
     }
 
+    /// Live navigation set: non-archived tasks ordered for the sidebar.
     pub fn list_tasks(&self) -> Result<Vec<Task>> {
+        self.query_tasks(
+            "SELECT id, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at FROM tasks WHERE archived = 0 ORDER BY pinned DESC, updated_at DESC",
+            [],
+        )
+    }
+
+    /// Every task including archived rows. Used for full local backups only —
+    /// workspace bootstrap and `task_list` stay on [`Self::list_tasks`].
+    pub fn list_all_tasks(&self) -> Result<Vec<Task>> {
+        self.query_tasks(
+            "SELECT id, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at FROM tasks ORDER BY pinned DESC, updated_at DESC",
+            [],
+        )
+    }
+
+    /// Paginated archived root chats for Archive UI. Cursor is opaque
+    /// `updated_at\\tid` keyset pagination (newest first).
+    pub fn list_archived_tasks(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<ArchivedTaskPage> {
+        let limit = limit.clamp(1, 100);
         let connection = self.connection.lock();
-        let mut statement = connection
-            .prepare("SELECT id, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at FROM tasks ORDER BY pinned DESC, updated_at DESC")
-            .map_err(storage_error)?;
+        let total = connection
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE archived = 1 AND parent_task_id IS NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(storage_error)? as u64;
+        let fetch_limit = (limit + 1) as i64;
+        let rows = if let Some(cursor) = cursor {
+            let (updated_at, id) = parse_archived_cursor(cursor)?;
+            let mut statement = connection
+                .prepare(
+                    "SELECT id, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at FROM tasks WHERE archived = 1 AND parent_task_id IS NULL AND (updated_at < ?1 OR (updated_at = ?1 AND id < ?2)) ORDER BY updated_at DESC, id DESC LIMIT ?3",
+                )
+                .map_err(storage_error)?;
+            let mapped = statement
+                .query_map(params![updated_at, id, fetch_limit], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, bool>(5)?,
+                        row.get::<_, bool>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, String>(12)?,
+                    ))
+                })
+                .map_err(storage_error)?;
+            mapped
+                .map(|row| parse_task_row(row.map_err(storage_error)?))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at FROM tasks WHERE archived = 1 AND parent_task_id IS NULL ORDER BY updated_at DESC, id DESC LIMIT ?1",
+                )
+                .map_err(storage_error)?;
+            let mapped = statement
+                .query_map(params![fetch_limit], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, bool>(5)?,
+                        row.get::<_, bool>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, String>(12)?,
+                    ))
+                })
+                .map_err(storage_error)?;
+            mapped
+                .map(|row| parse_task_row(row.map_err(storage_error)?))
+                .collect::<Result<Vec<_>>>()?
+        };
+        let next_cursor = if rows.len() > limit {
+            rows.get(limit - 1).map(|task| {
+                format_archived_cursor(&task.updated_at.to_rfc3339(), &task.id.to_string())
+            })
+        } else {
+            None
+        };
+        Ok(ArchivedTaskPage {
+            tasks: rows.into_iter().take(limit).collect(),
+            next_cursor,
+            total,
+        })
+    }
+
+    fn query_tasks(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<Task>> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(sql).map_err(storage_error)?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map(params, |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -1926,13 +2035,39 @@ impl LocalStore {
     }
 
     pub fn list_provider_resume_states(&self) -> Result<Vec<ProviderResumeState>> {
-        let mut states = Vec::new();
-        for task in self.list_tasks()? {
-            if let Some(state) = self.provider_resume_state(task.id)? {
-                states.push(state);
-            }
-        }
-        Ok(states)
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT task_id,provider,session_ref,repository_root,permission,delegation,updated_at FROM provider_resume_states ORDER BY updated_at DESC",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })
+            .map_err(storage_error)?;
+        rows.map(|row| {
+            let (task_id, provider, session_ref, repository_root, permission, delegation, updated_at) =
+                row.map_err(storage_error)?;
+            Ok(ProviderResumeState {
+                task_id: TaskId::from_str(&task_id).map_err(invalid_stored)?,
+                provider: ProviderKind::from_str(&provider)?,
+                session_ref,
+                repository_root: PathBuf::from(repository_root),
+                permission,
+                delegation,
+                updated_at: parse_time(&updated_at)?,
+            })
+        })
+        .collect()
     }
 
     fn list_all_queued_messages(&self) -> Result<Vec<QueuedMessage>> {
@@ -2018,6 +2153,22 @@ impl LocalStore {
 }
 
 #[allow(clippy::type_complexity)]
+fn format_archived_cursor(updated_at: &str, id: &str) -> String {
+    format!("{updated_at}\t{id}")
+}
+
+fn parse_archived_cursor(cursor: &str) -> Result<(String, String)> {
+    let (updated_at, id) = cursor.split_once('\t').ok_or_else(|| {
+        IntegratorError::InvalidInput("archived task cursor is invalid".into())
+    })?;
+    if updated_at.is_empty() || id.is_empty() {
+        return Err(IntegratorError::InvalidInput(
+            "archived task cursor is invalid".into(),
+        ));
+    }
+    Ok((updated_at.to_owned(), id.to_owned()))
+}
+
 fn parse_task_row(
     row: (
         String,
@@ -2603,12 +2754,11 @@ mod tests {
         store
             .task_snapshot(task_id)
             .expect("hydrate snapshot")
-            .events
+            .hydrate
+            .expect("compact hydrate")
+            .items
             .into_iter()
-            .filter_map(|event| match event.projection {
-                RuntimeProjection::ItemChanged { item, .. } => item.body,
-                _ => None,
-            })
+            .filter_map(|item| item.body)
             .collect()
     }
 
@@ -3333,7 +3483,10 @@ mod tests {
         let migrated_snapshot = migrated
             .task_snapshot(task_id)
             .expect("hydrate migrated legacy snapshot");
-        assert_eq!(migrated_snapshot.events, vec![legacy_event]);
+        let migrated_hydrate = migrated_snapshot.hydrate.expect("compact hydrate");
+        assert_eq!(migrated_hydrate.items.len(), 1);
+        assert_eq!(&migrated_hydrate.items[0], &legacy_item);
+        let _ = &legacy_event;
 
         let binding = RuntimeBinding {
             task_id,
@@ -3395,17 +3548,15 @@ mod tests {
             .task_snapshot(task_id)
             .expect("hydrate after reopen");
         assert_eq!(snapshot.watermark_seq, appended.seq);
-        assert_eq!(snapshot.events.len(), 2);
-        assert!(snapshot.events.iter().any(|event| matches!(
-            &event.projection,
-            RuntimeProjection::ItemChanged { item }
-                if item.body.as_deref() == Some("legacy materialized message")
-        )));
-        assert!(snapshot.events.iter().any(|event| matches!(
-            &event.projection,
-            RuntimeProjection::ItemChanged { item }
-                if item.body.as_deref() == Some("post-migration message")
-        )));
+        let hydrate = snapshot.hydrate.expect("compact hydrate");
+        assert_eq!(hydrate.items.len(), 2);
+        assert!(hydrate.items.iter().any(|item| {
+            item.body.as_deref() == Some("legacy materialized message")
+        }));
+        assert!(hydrate
+            .items
+            .iter()
+            .any(|item| item.body.as_deref() == Some("post-migration message")));
     }
 
     #[test]
@@ -3975,6 +4126,57 @@ mod tests {
             repository.exists(),
             "removal must never delete repository data"
         );
+    }
+
+    #[test]
+    fn list_tasks_keeps_archived_out_of_the_hot_set() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let live = store
+            .create_task(NewTask {
+                title: "Live chat".into(),
+                repository_path: None,
+                worktree_path: None,
+                runtime: None,
+                model: None,
+                effort: None,
+                parent_task_id: None,
+            })
+            .expect("create live");
+        let archived = store
+            .create_task(NewTask {
+                title: "Archived chat".into(),
+                repository_path: None,
+                worktree_path: None,
+                runtime: None,
+                model: None,
+                effort: None,
+                parent_task_id: None,
+            })
+            .expect("create archived");
+        store
+            .update_task_metadata(archived.id, None, None, Some(true))
+            .expect("archive");
+
+        let hot = store.list_tasks().expect("list live tasks");
+        assert_eq!(hot.len(), 1);
+        assert_eq!(hot[0].id, live.id);
+        assert!(!hot[0].archived);
+
+        let page = store
+            .list_archived_tasks(None, 50)
+            .expect("list archived");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.tasks.len(), 1);
+        assert_eq!(page.tasks[0].id, archived.id);
+        assert!(page.tasks[0].archived);
+        assert!(page.next_cursor.is_none());
+
+        let export = store.export().expect("export");
+        assert_eq!(export.tasks.len(), 1);
+        assert_eq!(export.tasks[0].id, live.id);
+
+        let all = store.list_all_tasks().expect("list all");
+        assert_eq!(all.len(), 2);
     }
 
     #[test]

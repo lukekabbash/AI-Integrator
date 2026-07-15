@@ -15,7 +15,64 @@ import { FileIcon } from "./FileIcon";
 import { type SelectionContext, type SelectionPayload } from "./SelectionActionPopover";
 import { selectionEndpointElement } from "./conversationFormatting";
 import { highlightCodeLine } from "./codeHighlight";
+import {
+  FILE_TAB_SIZE,
+  indentGuideCountsForLines,
+} from "./fileViewSupport";
 import type { ProjectFileContent } from "../bridge";
+
+function IndentGuides({ count }: { count: number }) {
+  if (count <= 0) return null;
+  return (
+    <span className="file-indent-guides" aria-hidden="true">
+      {Array.from({ length: count }, (_, index) => (
+        <span
+          className="file-indent-guide"
+          key={index}
+          style={{ left: `${index * FILE_TAB_SIZE}ch` }}
+        />
+      ))}
+    </span>
+  );
+}
+
+function FileHighlightLine({
+  path,
+  line,
+  lineNumber,
+  guideCount,
+  showNewline,
+  showLineNumber,
+}: {
+  path: string;
+  line: string;
+  lineNumber: number;
+  guideCount: number;
+  showNewline: boolean;
+  showLineNumber: boolean;
+}) {
+  return (
+    <span className="file-code-editor-line">
+      {[
+        showLineNumber ? (
+          <span
+            className="file-code-line-number"
+            key="n"
+            data-line={lineNumber}
+            aria-hidden="true"
+          />
+        ) : null,
+        <IndentGuides key="g" count={guideCount} />,
+        ...highlightCodeLine(line, path).map((token, tokenIndex) => (
+          <span className={`syntax-${token.kind}`} key={`t-${tokenIndex}`}>
+            {token.text}
+          </span>
+        )),
+        showNewline ? "\n" : null,
+      ]}
+    </span>
+  );
+}
 
 /** Selection payload from a file surface, with the file it came from. */
 export interface FileSelectionPayload extends SelectionPayload {
@@ -360,6 +417,14 @@ export function FileWorkspace({
   const canEdit = editable && Boolean(onSave) && !file.isBinary && !file.imageDataUrl;
   const dirty = canEdit && draft !== file.content;
   const editorLines = useMemo(() => draft.split("\n"), [draft]);
+  const editorGuideCounts = useMemo(
+    () => indentGuideCountsForLines(editorLines),
+    [editorLines],
+  );
+  const readerGuideCounts = useMemo(
+    () => indentGuideCountsForLines(lines.slice(0, lineLimit)),
+    [lines, lineLimit],
+  );
 
   useEffect(() => {
     draftRef.current = draft;
@@ -368,6 +433,17 @@ export function FileWorkspace({
   useEffect(() => {
     onSaveRef.current = onSave;
   }, [onSave]);
+
+  // After edits the browser may clamp scroll without firing scroll; keep the
+  // overlay pre locked to the textarea (caret/selection live on the textarea).
+  useEffect(() => {
+    if (!canEdit) return;
+    const editor = editorRef.current;
+    const highlight = highlightRef.current;
+    if (!editor || !highlight) return;
+    highlight.scrollTop = editor.scrollTop;
+    highlight.scrollLeft = editor.scrollLeft;
+  }, [canEdit, editorLines]);
 
   const resolveSelection = useCallback((range: Range) => {
     const container = linesRef.current;
@@ -554,39 +630,40 @@ export function FileWorkspace({
         </div>
       ) : canEdit ? (
         <div className="file-code-editor">
-          <pre className="file-code-editor-highlight" aria-hidden="true" ref={highlightRef}>
-            {editorLines.map((line, lineIndex) => (
-              <span className="file-code-editor-line" key={`${file.path}-${lineIndex}`}>
-                {highlightCodeLine(line, file.path).map((token, tokenIndex) => (
-                  <span
-                    className={`syntax-${token.kind}`}
-                    key={`${file.path}-${lineIndex}-${tokenIndex}`}
-                  >
-                    {token.text}
-                  </span>
-                ))}
-                {lineIndex < editorLines.length - 1 ? "\n" : null}
-              </span>
-            ))}
-          </pre>
-          <textarea
-            className="file-workspace-editor"
-            ref={editorRef}
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-            onKeyDown={onEditorKeyDown}
-            onScroll={(event) => {
-              if (!highlightRef.current) return;
-              highlightRef.current.scrollTop = event.currentTarget.scrollTop;
-              highlightRef.current.scrollLeft = event.currentTarget.scrollLeft;
-            }}
-            onContextMenu={openEditorSelectionMenu}
-            onClick={(event) => {
-              if (event.metaKey || event.ctrlKey) openEditorSelectionMenu(event);
-            }}
-            aria-label={`Edit ${file.path}`}
-            spellCheck={false}
-          />
+          <div className="file-code-gutter" aria-hidden="true" />
+          <div className="file-code-editor-surface">
+            <pre className="file-code-editor-highlight" aria-hidden="true" ref={highlightRef}>
+              {editorLines.map((line, lineIndex) => (
+                <FileHighlightLine
+                  key={`${file.path}-${lineIndex}`}
+                  path={file.path}
+                  line={line}
+                  lineNumber={lineIndex + 1}
+                  guideCount={editorGuideCounts[lineIndex] ?? 0}
+                  showNewline={lineIndex < editorLines.length - 1}
+                  showLineNumber
+                />
+              ))}
+            </pre>
+            <textarea
+              className="file-workspace-editor"
+              ref={editorRef}
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              onKeyDown={onEditorKeyDown}
+              onScroll={(event) => {
+                if (!highlightRef.current) return;
+                highlightRef.current.scrollTop = event.currentTarget.scrollTop;
+                highlightRef.current.scrollLeft = event.currentTarget.scrollLeft;
+              }}
+              onContextMenu={openEditorSelectionMenu}
+              onClick={(event) => {
+                if (event.metaKey || event.ctrlKey) openEditorSelectionMenu(event);
+              }}
+              aria-label={`Edit ${file.path}`}
+              spellCheck={false}
+            />
+          </div>
         </div>
       ) : (
         <div className="file-workspace-scroll">
@@ -602,14 +679,14 @@ export function FileWorkspace({
             {visibleLines.map((line, index) => (
               <li key={`${file.path}-${index}`} data-line={index + 1}>
                 <code>
-                  {highlightCodeLine(line, file.path).map((token, tokenIndex) => (
-                    <span
-                      className={`syntax-${token.kind}`}
-                      key={`${file.path}-${index}-${tokenIndex}`}
-                    >
-                      {token.text}
-                    </span>
-                  ))}
+                  {[
+                    <IndentGuides key="g" count={readerGuideCounts[index] ?? 0} />,
+                    ...highlightCodeLine(line, file.path).map((token, tokenIndex) => (
+                      <span className={`syntax-${token.kind}`} key={`t-${tokenIndex}`}>
+                        {token.text}
+                      </span>
+                    )),
+                  ]}
                 </code>
               </li>
             ))}

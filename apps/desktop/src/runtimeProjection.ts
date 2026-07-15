@@ -8,6 +8,7 @@ import type {
   PlanStepProjection,
   RuntimeProjectionEvent,
   RuntimeUsageProjection,
+  TaskProjectionHydrate,
   TaskStatus,
   TranscriptEvent,
   TurnProjection,
@@ -70,6 +71,8 @@ export function taskActivityUpdate(
 export interface RuntimeProjectionState {
   taskId: string;
   lastSeq: number;
+  /** Projection reset epoch from the last successful hydrate; used with lastSeq for cache if-match. */
+  resetSeq: number;
   turn?: TurnProjection;
   items: ItemProjection[];
   plan: PlanStepProjection[];
@@ -87,12 +90,17 @@ export interface RuntimeProjectionState {
    * keep events where they originally happened.
    */
   firstSeen: Record<string, string>;
+  /** True when older item/approval pages remain beyond the loaded window. */
+  hasMoreOlder: boolean;
+  /** Oldest loaded last_event_seq; cursor for load-older. */
+  oldestLoadedSeq?: number;
 }
 
 export function createRuntimeProjectionState(taskId: string): RuntimeProjectionState {
   return {
     taskId,
     lastSeq: 0,
+    resetSeq: 0,
     items: [],
     plan: [],
     planTruncated: false,
@@ -100,6 +108,80 @@ export function createRuntimeProjectionState(taskId: string): RuntimeProjectionS
     connection: { state: "reconciling", reason: "Loading persisted task state" },
     errors: [],
     firstSeen: {},
+    hasMoreOlder: false,
+  };
+}
+
+/**
+ * Build display state from a compact hydrate DTO without replaying event envelopes.
+ * Live streaming continues to use applyRuntimeProjection / applyRuntimeProjectionBatch.
+ */
+export function hydrateRuntimeProjectionState(
+  taskId: string,
+  hydrate: TaskProjectionHydrate,
+  watermarkSeq: number,
+  resetSeq: number,
+): RuntimeProjectionState {
+  const firstSeen: Record<string, string> = {};
+  for (const [id, occurredAt] of Object.entries(hydrate.firstSeen ?? {})) {
+    firstSeen[id] = typeof occurredAt === "string" ? occurredAt : String(occurredAt);
+  }
+  return {
+    taskId,
+    lastSeq: watermarkSeq,
+    resetSeq,
+    turn: hydrate.turn,
+    items: hydrate.items ?? [],
+    plan: hydrate.plan ?? [],
+    planTruncated: hydrate.planTruncated ?? false,
+    diff: hydrate.diff,
+    usage: hydrate.usage,
+    approvals: hydrate.approvals ?? [],
+    mode: hydrate.mode,
+    connection: hydrate.connection ?? {
+      state: "reconciling",
+      reason: "Loading persisted task state",
+    },
+    errors: hydrate.error
+      ? [
+          {
+            seq: hydrate.error.seq,
+            message: hydrate.error.message,
+            retryable: hydrate.error.retryable,
+            occurredAt: hydrate.error.occurredAt,
+          },
+        ]
+      : [],
+    firstSeen,
+    hasMoreOlder: hydrate.hasMoreOlder ?? false,
+    oldestLoadedSeq: hydrate.beforeSeq,
+  };
+}
+
+/** Merge an older page into already-loaded state without clobbering live updates. */
+export function mergeOlderProjectionHydrate(
+  state: RuntimeProjectionState,
+  hydrate: TaskProjectionHydrate,
+): RuntimeProjectionState {
+  const existingItemIds = new Set(state.items.map((item) => item.id));
+  const existingApprovalIds = new Set(state.approvals.map((approval) => approval.id));
+  const olderItems = (hydrate.items ?? []).filter((item) => !existingItemIds.has(item.id));
+  const olderApprovals = (hydrate.approvals ?? []).filter(
+    (approval) => !existingApprovalIds.has(approval.id),
+  );
+  const firstSeen = { ...state.firstSeen };
+  for (const [id, occurredAt] of Object.entries(hydrate.firstSeen ?? {})) {
+    if (!firstSeen[id]) {
+      firstSeen[id] = typeof occurredAt === "string" ? occurredAt : String(occurredAt);
+    }
+  }
+  return {
+    ...state,
+    items: [...olderItems, ...state.items],
+    approvals: [...olderApprovals, ...state.approvals],
+    firstSeen,
+    hasMoreOlder: hydrate.hasMoreOlder ?? false,
+    oldestLoadedSeq: hydrate.beforeSeq ?? state.oldestLoadedSeq,
   };
 }
 
@@ -207,6 +289,7 @@ export function applyRuntimeProjection(
       return {
         ...createRuntimeProjectionState(state.taskId),
         lastSeq: event.seq,
+        resetSeq: event.seq,
         connection: { state: "reconciling", reason: projection.reason },
       };
   }

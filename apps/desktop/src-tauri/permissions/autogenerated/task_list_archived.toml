@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-task-list-archived"
+description = "Enables the task_list_archived command without any pre-configured scope."
+commands.allow = ["task_list_archived"]
+
+[[permission]]
+identifier = "deny-task-list-archived"
+description = "Denies the task_list_archived command without any pre-configured scope."
+commands.deny = ["task_list_archived"]

@@ -418,6 +418,14 @@ describe("native trusted-project bridge", () => {
     expect(invokeMock).toHaveBeenCalledWith("task_search_messages", {
       query: "local message",
       limit: 40,
+      includeArchived: false,
+    });
+
+    await bridge.searchTaskMessages("archived hit", 20, { includeArchived: true });
+    expect(invokeMock).toHaveBeenCalledWith("task_search_messages", {
+      query: "archived hit",
+      limit: 20,
+      includeArchived: true,
     });
   });
 
@@ -833,21 +841,49 @@ describe("native trusted-project bridge", () => {
     const listener = vi.fn();
     listenMock.mockResolvedValue(unlisten);
     invokeMock
-      .mockResolvedValueOnce({ events: [], watermarkSeq: 41, runtimeLive: true })
+      .mockResolvedValueOnce({
+        watermarkSeq: 41,
+        resetSeq: 0,
+        runtimeLive: true,
+        cacheMatched: false,
+        hydrate: {
+          items: [],
+          plan: [],
+          planTruncated: false,
+          approvals: [],
+          firstSeen: {},
+          hasMoreOlder: false,
+        },
+      })
       .mockResolvedValueOnce({ id: "approval-1", state: "responding" })
       .mockResolvedValueOnce({ turnId: "turn-1", stopRequested: true, alreadyRequested: false });
 
     await expect(bridge.subscribeRuntimeProjections(listener)).resolves.toBe(unlisten);
     expect(listenMock).toHaveBeenCalledWith("runtime://projection", expect.any(Function));
     await expect(bridge.loadTaskProjection("task-1")).resolves.toEqual({
-      events: [],
       watermarkSeq: 41,
+      resetSeq: 0,
       runtimeLive: true,
+      cacheMatched: false,
+      hydrate: {
+        items: [],
+        plan: [],
+        planTruncated: false,
+        approvals: [],
+        firstSeen: {},
+        hasMoreOlder: false,
+      },
     });
     await bridge.respondToApproval("task-1", "approval-1", "acceptForSession");
     await bridge.stopTurn("task-1");
 
-    expect(invokeMock).toHaveBeenNthCalledWith(1, "task_snapshot", { taskId: "task-1" });
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "task_snapshot", {
+      taskId: "task-1",
+      knownWatermark: undefined,
+      knownResetSeq: undefined,
+      beforeSeq: undefined,
+      limit: undefined,
+    });
     expect(invokeMock).toHaveBeenNthCalledWith(2, "codex_respond_approval", {
       taskId: "task-1",
       approvalId: "approval-1",

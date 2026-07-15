@@ -33,6 +33,17 @@ describe("DiffView layout contract", () => {
     expect(rule(".turn--assistant")).toContain("font-size: var(--font-size-chat)");
   });
 
+  it("keeps diff gutters compact and distinct from the file-pane editor gutter", () => {
+    expect(rule(".diff-line-number")).toContain("font-size: 9px");
+    expect(rule(".diff-line-number")).toContain("font-variant-numeric: tabular-nums");
+    expect(rule(".diff-column-number")).toContain("width: 36px");
+    expect(rule(".file-code-gutter")).toContain("width: 3.25rem");
+    expect(rule(".file-code-line-number")).toContain("position: absolute");
+    expect(rule(".file-indent-guide")).toContain("border-left: 1px solid");
+    expect(rule(".file-indent-guide")).toContain("height: 1lh");
+    expect(rule(".file-indent-guide")).not.toMatch(/border(?:-left)?:\s*[^;]*dashed/);
+  });
+
   it("uses a low-chrome compact toolbar and rail-sized file preview text", () => {
     expect(rule(".diff-header")).toContain("min-height: 38px");
     expect(rule(".diff-workspace")).toContain("overflow: hidden");

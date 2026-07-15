@@ -16,6 +16,7 @@ import {
   applyRuntimeProjectionBatch,
   createRuntimeProjectionState,
   createRuntimeTranscriptDeriver,
+  hydrateRuntimeProjectionState,
   isFrameBatchableRuntimeProjection,
   type RuntimeProjectionState,
 } from "../runtimeProjection";
@@ -151,9 +152,19 @@ export function SubagentConversation({
         }
 
         const snapshot = await bridge.loadTaskProjection(childTaskId);
-        let next = applyRuntimeProjectionBatch(
-          createRuntimeProjectionState(childTaskId),
-          snapshot.events.sort((a, b) => a.seq - b.seq),
+        const hydrate = snapshot.hydrate ?? {
+          items: [],
+          plan: [],
+          planTruncated: false,
+          approvals: [],
+          firstSeen: {},
+          hasMoreOlder: false,
+        };
+        let next = hydrateRuntimeProjectionState(
+          childTaskId,
+          hydrate,
+          snapshot.watermarkSeq,
+          snapshot.resetSeq,
         );
         next = applyRuntimeProjectionBatch(
           next,

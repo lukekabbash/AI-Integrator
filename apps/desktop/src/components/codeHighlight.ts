@@ -112,7 +112,9 @@ function tokenKind(text: string, after: string): SyntaxTokenKind {
  * progressive while giving every visible context/change line semantic color.
  */
 export function highlightCodeLine(line: string, path: string): SyntaxToken[] {
-  if (!line) return [{ text: " ", kind: "plain" }];
+  // Empty lines must stay empty: a placeholder space shifts overlay-editor
+  // character offsets after blank lines and misaligns native selection.
+  if (!line) return [];
   const extension = extensionForPath(path);
   if (!SUPPORTED_EXTENSIONS.has(extension)) return [{ text: line, kind: "plain" }];
 

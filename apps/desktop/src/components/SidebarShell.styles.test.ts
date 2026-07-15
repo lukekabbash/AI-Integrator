@@ -75,4 +75,19 @@ describe("sidebar shell corners", () => {
       '.project-group[data-project-menu-open="true"] .project-header-actions',
     );
   });
+
+  it("clips project chat lists with grid 0fr/1fr instead of JS height auto", () => {
+    expect(rule(".project-chat-list-clip")).toContain("grid-template-rows: 0fr");
+    expect(rule(".project-chat-list-clip")).toContain(
+      "grid-template-rows 220ms cubic-bezier(0.2, 0.8, 0.2, 1)",
+    );
+    expect(rule('.project-chat-list-clip[data-open="true"]')).toContain(
+      "grid-template-rows: 1fr",
+    );
+    expect(rule(".project-chat-list-inner")).toContain("overflow: hidden");
+    expect(rule('.project-chat-list-clip[data-menu-open="true"] .project-chat-list-inner')).toContain(
+      "overflow: visible",
+    );
+    expect(rule('.project-chat-list[data-menu-open="true"]')).toContain("overflow: visible");
+  });
 });

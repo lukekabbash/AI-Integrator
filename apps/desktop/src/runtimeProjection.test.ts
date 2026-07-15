@@ -5,7 +5,9 @@ import {
   applyRuntimeProjectionBatch,
   createRuntimeProjectionState,
   createRuntimeTranscriptDeriver,
+  hydrateRuntimeProjectionState,
   isFrameBatchableRuntimeProjection,
+  mergeOlderProjectionHydrate,
   runtimeTranscript,
   taskActivityUpdate,
 } from "./runtimeProjection";
@@ -1387,8 +1389,8 @@ describe("turn settlement on provider errors", () => {
   });
 
   it("settles a hydrated turn, so a reload does not resurrect the stop button", () => {
-    // Hydration replays the stored turn and error snapshot events in seq order
-    // through this same reducer.
+    // Compact hydrate still applies the same turn/error semantics the live
+    // reducer would when those singletons are present.
     const hydrated = applyRuntimeProjectionBatch(createRuntimeProjectionState("task-1"), [
       startedTurn(1),
       event(2, { kind: "turnError", message: "usage limit reached", retryable: false }),
@@ -1617,5 +1619,120 @@ describe("runtime projection batch reducer", () => {
       expect(state).toEqual(expected);
       expect(runtimeTranscript(state)).toEqual(runtimeTranscript(expected));
     }
+  });
+});
+
+describe("compact hydrate and older-page merge", () => {
+  it("builds display state from a compact hydrate DTO without event replay", () => {
+    const state = hydrateRuntimeProjectionState(
+      "task-1",
+      {
+        turn: { id: "turn-1", status: "completed", stopRequested: false },
+        items: [
+          {
+            id: "item-1",
+            providerItemId: "p1",
+            kind: "agentMessage",
+            status: "completed",
+            body: "hello",
+            truncated: false,
+            updatedAt: "2026-07-10T16:00:00Z",
+          },
+        ],
+        plan: [],
+        planTruncated: false,
+        approvals: [],
+        connection: { state: "disconnected", reason: "idle" },
+        firstSeen: { "item-1": "2026-07-10T15:59:00Z" },
+        hasMoreOlder: true,
+        beforeSeq: 40,
+      },
+      50,
+      0,
+    );
+
+    expect(state.lastSeq).toBe(50);
+    expect(state.resetSeq).toBe(0);
+    expect(state.items).toHaveLength(1);
+    expect(state.firstSeen["item-1"]).toBe("2026-07-10T15:59:00Z");
+    expect(state.hasMoreOlder).toBe(true);
+    expect(state.oldestLoadedSeq).toBe(40);
+    expect(state.connection).toMatchObject({ state: "disconnected" });
+  });
+
+  it("merges an older page without dropping live items or firstSeen", () => {
+    const current = hydrateRuntimeProjectionState(
+      "task-1",
+      {
+        items: [
+          {
+            id: "new",
+            providerItemId: "n",
+            kind: "userMessage",
+            status: "completed",
+            body: "new",
+            truncated: false,
+            updatedAt: "2026-07-10T16:00:00Z",
+          },
+        ],
+        plan: [],
+        planTruncated: false,
+        approvals: [],
+        firstSeen: { new: "2026-07-10T16:00:00Z" },
+        hasMoreOlder: true,
+        beforeSeq: 20,
+      },
+      30,
+      0,
+    );
+    const merged = mergeOlderProjectionHydrate(current, {
+      items: [
+        {
+          id: "old",
+          providerItemId: "o",
+          kind: "userMessage",
+          status: "completed",
+          body: "old",
+          truncated: false,
+          updatedAt: "2026-07-10T15:00:00Z",
+        },
+        {
+          id: "new",
+          providerItemId: "n",
+          kind: "userMessage",
+          status: "completed",
+          body: "should-not-replace",
+          truncated: false,
+          updatedAt: "2026-07-10T16:00:00Z",
+        },
+      ],
+      plan: [],
+      planTruncated: false,
+      approvals: [],
+      firstSeen: {
+        old: "2026-07-10T15:00:00Z",
+        new: "2026-07-10T15:30:00Z",
+      },
+      hasMoreOlder: false,
+      beforeSeq: 10,
+    });
+
+    expect(merged.items.map((item) => item.id)).toEqual(["old", "new"]);
+    expect(merged.items.find((item) => item.id === "new")?.body).toBe("new");
+    expect(merged.firstSeen.new).toBe("2026-07-10T16:00:00Z");
+    expect(merged.firstSeen.old).toBe("2026-07-10T15:00:00Z");
+    expect(merged.hasMoreOlder).toBe(false);
+    expect(merged.oldestLoadedSeq).toBe(10);
+    expect(merged.lastSeq).toBe(30);
+  });
+
+  it("records resetSeq on projectionReset for cache if-match", () => {
+    const state = applyRuntimeProjection(
+      createRuntimeProjectionState("task-1"),
+      event(12, { kind: "projectionReset", reason: "replay" }),
+    );
+    expect(state.resetSeq).toBe(12);
+    expect(state.lastSeq).toBe(12);
+    expect(state.items).toHaveLength(0);
   });
 });

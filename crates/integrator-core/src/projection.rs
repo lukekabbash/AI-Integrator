@@ -1,7 +1,17 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{ProviderKind, ProviderSessionId, RuntimeSessionId, Task, TaskId};
+
+/// Newest item/approval rows returned on cold UI hydrate.
+///
+/// Kept above the transcript virtualization threshold (250) so a typical open
+/// paints without an immediate older-page fetch, while bounding SQLite/IPC
+/// deserialize cost for long chats. Agent seeding uses `task_conversation_digest`
+/// (unchanged); this constant is display-hydrate only.
+pub const TASK_PROJECTION_HYDRATE_TAIL: usize = 300;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "camelCase")]
@@ -388,15 +398,95 @@ pub struct RuntimeProjectionEvent {
     pub projection: RuntimeProjection,
 }
 
+/// Compact cold-hydrate payload for the renderer. Built from materialized
+/// current rows so the UI does not replay full `RuntimeProjectionEvent`
+/// envelopes through `applyRuntimeProjectionBatch`. Live streaming still uses
+/// those envelopes on `runtime://projection`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskProjectionHydrate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<TurnProjection>,
+    pub items: Vec<ItemProjection>,
+    pub plan: Vec<PlanStep>,
+    pub plan_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<TaskProjectionDiffHydrate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageProjection>,
+    pub approvals: Vec<ApprovalProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ModeProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<TaskProjectionConnectionHydrate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<TaskProjectionErrorHydrate>,
+    /// First-appearance timestamps in the current reset epoch (item/approval id → time).
+    pub first_seen: BTreeMap<String, DateTime<Utc>>,
+    pub has_more_older: bool,
+    /// Oldest `last_event_seq` included in this page; pass as `before_seq` to load older.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_seq: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskProjectionDiffHydrate {
+    pub body: String,
+    pub truncated: bool,
+    pub seq: i64,
+    pub occurred_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskProjectionConnectionHydrate {
+    pub state: ConnectionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskProjectionErrorHydrate {
+    pub message: String,
+    pub retryable: bool,
+    pub seq: i64,
+    pub occurred_at: DateTime<Utc>,
+}
+
+/// Optional if-match / windowing controls for UI hydrate.
+///
+/// Watermark alone is insufficient after `ProjectionReset`: the client must
+/// also present the reset epoch it cached. Agent digest / resume paths do not
+/// use this query.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TaskSnapshotQuery {
+    pub known_watermark: Option<i64>,
+    pub known_reset_seq: Option<i64>,
+    /// When set, return only older items/approvals with `last_event_seq < before_seq`.
+    pub before_seq: Option<i64>,
+    pub limit: Option<usize>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskSnapshot {
     pub task: Task,
-    pub events: Vec<RuntimeProjectionEvent>,
     pub watermark_seq: i64,
+    /// Current projection reset epoch. Required with `watermark_seq` for cache short-circuit.
+    pub reset_seq: i64,
     /// Attested by the native command after checking the in-process runtime
     /// registry. Store-only snapshots cannot claim process liveness.
     pub runtime_live: bool,
+    /// Client cache matched `known_watermark` + `known_reset_seq`; `hydrate` is omitted.
+    #[serde(default)]
+    pub cache_matched: bool,
+    /// Compact UI state. Absent when `cache_matched` or on a pure older-page miss with no rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hydrate: Option<TaskProjectionHydrate>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

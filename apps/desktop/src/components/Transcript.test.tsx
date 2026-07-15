@@ -4,6 +4,10 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TranscriptEvent } from "../bridge";
 import { Transcript } from "./Transcript";
+import {
+  readTranscriptViewportState,
+  writeTranscriptViewportState,
+} from "./transcriptViewportState";
 
 const event = (id: string, kind: TranscriptEvent["kind"], body: string): TranscriptEvent => ({
   id,
@@ -16,6 +20,7 @@ describe("Transcript", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    localStorage.clear();
   });
 
   it("branches from turn-final replies, not intermediate agent bubbles", () => {
@@ -371,7 +376,7 @@ describe("Transcript", () => {
     expect(items[3]).toHaveTextContent("Child");
   });
 
-  it("shows jump-to-latest when new content arrives after scrolling away", () => {
+  it("shows jump-to-latest when new content arrives after scrolling away", async () => {
     const scrollContainerRef = { current: null as HTMLDivElement | null };
     let contentHeight = 220;
     const { rerender } = render(
@@ -391,6 +396,8 @@ describe("Transcript", () => {
       configurable: true,
       get: () => 100,
     });
+    await waitFor(() => expect(scrollContainer.scrollTop).toBe(120));
+
     scrollContainer.scrollTop = 0;
     fireEvent.scroll(scrollContainer);
 
@@ -474,7 +481,251 @@ describe("Transcript", () => {
     expect(screen.queryByRole("button", { name: /Jump to latest/ })).not.toBeInTheDocument();
   });
 
-  it("ignores reconstructed history while still flagging a changed tail", () => {
+  it("follows latest across a shared scroll shell remount despite early top scroll", async () => {
+    const scrollContainerRef = { current: null as HTMLDivElement | null };
+    let contentHeight = 500;
+    const { rerender } = render(
+      <div data-testid="transcript-scroll" ref={scrollContainerRef}>
+        <Transcript
+          key="chat-a"
+          ownerKey="task:chat-a"
+          events={[
+            event("a-1", "user", "A question"),
+            event("a-2", "assistant", "A answer"),
+          ]}
+          scrollContainerRef={scrollContainerRef}
+        />
+      </div>,
+    );
+    const scrollContainer = screen.getByTestId("transcript-scroll");
+    Object.defineProperty(scrollContainer, "scrollHeight", {
+      configurable: true,
+      get: () => contentHeight,
+    });
+    Object.defineProperty(scrollContainer, "clientHeight", {
+      configurable: true,
+      get: () => 100,
+    });
+    await waitFor(() => expect(scrollContainer.scrollTop).toBe(400));
+
+    // Carry residual scrollTop into the next chat (shared shell does not remount).
+    contentHeight = 800;
+    scrollContainer.scrollTop = 0;
+    rerender(
+      <div data-testid="transcript-scroll" ref={scrollContainerRef}>
+        <Transcript
+          key="chat-b"
+          ownerKey="task:chat-b"
+          events={[
+            event("b-1", "user", "B question"),
+            event("b-2", "assistant", "B answer"),
+            event("b-3", "assistant", "B latest"),
+          ]}
+          scrollContainerRef={scrollContainerRef}
+        />
+      </div>,
+    );
+    fireEvent.scroll(scrollContainer);
+
+    await waitFor(() => expect(scrollContainer.scrollTop).toBe(700));
+    expect(readTranscriptViewportState("task:chat-b")?.following).not.toBe(false);
+  });
+
+  it("ignores near-top scroll during open settle and still follows latest", async () => {
+    localStorage.clear();
+    const scrollContainerRef = { current: null as HTMLDivElement | null };
+    render(
+      <div data-testid="transcript-scroll" ref={scrollContainerRef}>
+        <Transcript
+          ownerKey="task:settle-follow"
+          events={[
+            event("u-1", "user", "Question"),
+            event("a-1", "assistant", "Answer"),
+          ]}
+          scrollContainerRef={scrollContainerRef}
+        />
+      </div>,
+    );
+    const scrollContainer = screen.getByTestId("transcript-scroll");
+    Object.defineProperty(scrollContainer, "scrollHeight", { configurable: true, value: 500 });
+    Object.defineProperty(scrollContainer, "clientHeight", { configurable: true, value: 100 });
+    scrollContainer.scrollTop = 0;
+    fireEvent.scroll(scrollContainer);
+
+    await waitFor(() => expect(scrollContainer.scrollTop).toBe(400));
+    expect(readTranscriptViewportState("task:settle-follow")?.following).not.toBe(false);
+  });
+
+  it("follows latest after empty-to-hydrated open on a shared scroll shell", async () => {
+    const scrollContainerRef = { current: null as HTMLDivElement | null };
+    let contentHeight = 0;
+    const { rerender } = render(
+      <div data-testid="transcript-scroll" ref={scrollContainerRef}>
+        <Transcript
+          ownerKey="task:cold-hydrate"
+          events={[]}
+          scrollContainerRef={scrollContainerRef}
+        />
+      </div>,
+    );
+    const scrollContainer = screen.getByTestId("transcript-scroll");
+    Object.defineProperty(scrollContainer, "scrollHeight", {
+      configurable: true,
+      get: () => contentHeight,
+    });
+    Object.defineProperty(scrollContainer, "clientHeight", {
+      configurable: true,
+      get: () => 100,
+    });
+    scrollContainer.scrollTop = 0;
+    fireEvent.scroll(scrollContainer);
+
+    contentHeight = 600;
+    rerender(
+      <div data-testid="transcript-scroll" ref={scrollContainerRef}>
+        <Transcript
+          ownerKey="task:cold-hydrate"
+          events={[
+            event("u-1", "user", "Hydrated question"),
+            event("a-1", "assistant", "Hydrated answer"),
+          ]}
+          scrollContainerRef={scrollContainerRef}
+        />
+      </div>,
+    );
+
+    await waitFor(() => expect(scrollContainer.scrollTop).toBe(500));
+  });
+
+  it("restores a saved reading anchor despite open-settle scroll noise", async () => {
+    localStorage.clear();
+    writeTranscriptViewportState("task:restore-mid", {
+      following: false,
+      anchor: { eventId: "mid-1", offsetPx: 0 },
+      expanded: {},
+      updatedAt: Date.now(),
+    });
+    const scrollContainerRef = { current: null as HTMLDivElement | null };
+    render(
+      <div data-testid="transcript-scroll" ref={scrollContainerRef}>
+        <Transcript
+          ownerKey="task:restore-mid"
+          events={[
+            event("early-1", "user", "Early"),
+            event("mid-1", "assistant", "Mid answer"),
+            event("late-1", "assistant", "Latest answer"),
+          ]}
+          scrollContainerRef={scrollContainerRef}
+        />
+      </div>,
+    );
+    const scrollContainer = screen.getByTestId("transcript-scroll");
+    Object.defineProperty(scrollContainer, "scrollHeight", { configurable: true, value: 900 });
+    Object.defineProperty(scrollContainer, "clientHeight", { configurable: true, value: 100 });
+    scrollContainer.scrollTop = 0;
+    fireEvent.scroll(scrollContainer);
+
+    await waitFor(() =>
+      expect(document.querySelector('[data-event-id="mid-1"]')).not.toBeNull(),
+    );
+    // Must not snap to latest from settle noise.
+    await waitFor(() => expect(scrollContainer.scrollTop).toBeLessThan(800));
+    expect(readTranscriptViewportState("task:restore-mid")?.following).toBe(false);
+  });
+
+  it("does not load older pages during open settle when parked at top", async () => {
+    const onLoadOlder = vi.fn();
+    const scrollContainerRef = { current: null as HTMLDivElement | null };
+    render(
+      <div data-testid="transcript-scroll" ref={scrollContainerRef}>
+        <Transcript
+          ownerKey="task:titan-open"
+          events={Array.from({ length: 40 }, (_, index) =>
+            event(`e-${index}`, "assistant", `Message ${index}`),
+          )}
+          hasMoreOlder
+          onLoadOlder={onLoadOlder}
+          scrollContainerRef={scrollContainerRef}
+        />
+      </div>,
+    );
+    const scrollContainer = screen.getByTestId("transcript-scroll");
+    Object.defineProperty(scrollContainer, "scrollHeight", { configurable: true, value: 2000 });
+    Object.defineProperty(scrollContainer, "clientHeight", { configurable: true, value: 100 });
+    scrollContainer.scrollTop = 0;
+    fireEvent.scroll(scrollContainer);
+
+    await waitFor(() => expect(scrollContainer.scrollTop).toBe(1900));
+    expect(onLoadOlder).not.toHaveBeenCalled();
+  });
+
+  it("loads older pages after settle with upward intent and anchors the prepend", async () => {
+    const onLoadOlder = vi.fn();
+    const scrollContainerRef = { current: null as HTMLDivElement | null };
+    let contentHeight = 1000;
+    const baseEvents = Array.from({ length: 20 }, (_, index) =>
+      event(`e-${index}`, "assistant", `Message ${index}`),
+    );
+    const { rerender } = render(
+      <div data-testid="transcript-scroll" ref={scrollContainerRef}>
+        <Transcript
+          ownerKey="task:paginate"
+          events={baseEvents}
+          hasMoreOlder
+          onLoadOlder={onLoadOlder}
+          scrollContainerRef={scrollContainerRef}
+        />
+      </div>,
+    );
+    const scrollContainer = screen.getByTestId("transcript-scroll");
+    Object.defineProperty(scrollContainer, "scrollHeight", {
+      configurable: true,
+      get: () => contentHeight,
+    });
+    Object.defineProperty(scrollContainer, "clientHeight", {
+      configurable: true,
+      get: () => 100,
+    });
+    await waitFor(() => expect(scrollContainer.scrollTop).toBe(900));
+
+    fireEvent.wheel(scrollContainer, { deltaY: -40 });
+    scrollContainer.scrollTop = 40;
+    fireEvent.scroll(scrollContainer);
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+
+    // Still at top after request: latch must not cascade without leaving the band.
+    fireEvent.scroll(scrollContainer);
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+
+    contentHeight = 1600;
+    const olderEvents = Array.from({ length: 10 }, (_, index) =>
+      event(`older-${index}`, "assistant", `Older ${index}`),
+    );
+    rerender(
+      <div data-testid="transcript-scroll" ref={scrollContainerRef}>
+        <Transcript
+          ownerKey="task:paginate"
+          events={[...olderEvents, ...baseEvents]}
+          hasMoreOlder
+          onLoadOlder={onLoadOlder}
+          scrollContainerRef={scrollContainerRef}
+        />
+      </div>,
+    );
+
+    await waitFor(() => expect(scrollContainer.scrollTop).toBe(640));
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+
+    // Leave the top band, then re-enter with upward intent for a second page.
+    scrollContainer.scrollTop = 200;
+    fireEvent.scroll(scrollContainer);
+    fireEvent.wheel(scrollContainer, { deltaY: -20 });
+    scrollContainer.scrollTop = 30;
+    fireEvent.scroll(scrollContainer);
+    expect(onLoadOlder).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores reconstructed history while still flagging a changed tail", async () => {
     const scrollContainerRef = { current: null as HTMLDivElement | null };
     const firstResponse = event("assistant-1", "assistant", "First response.");
     const { rerender } = render(
@@ -485,6 +736,7 @@ describe("Transcript", () => {
     const scrollContainer = screen.getByTestId("transcript-scroll");
     Object.defineProperty(scrollContainer, "scrollHeight", { configurable: true, value: 220 });
     Object.defineProperty(scrollContainer, "clientHeight", { configurable: true, value: 100 });
+    await waitFor(() => expect(scrollContainer.scrollTop).toBe(120));
     scrollContainer.scrollTop = 0;
     fireEvent.scroll(scrollContainer);
 
@@ -506,7 +758,7 @@ describe("Transcript", () => {
     expect(screen.getByRole("button", { name: /Jump to latest/ })).toBeInTheDocument();
   });
 
-  it("detects streamed text behind the compact live activity row", () => {
+  it("detects streamed text behind the compact live activity row", async () => {
     const scrollContainerRef = { current: null as HTMLDivElement | null };
     const liveActivity: TranscriptEvent = {
       ...event("activity-1", "activity", "1 tool"),
@@ -525,6 +777,7 @@ describe("Transcript", () => {
     const scrollContainer = screen.getByTestId("transcript-scroll");
     Object.defineProperty(scrollContainer, "scrollHeight", { configurable: true, value: 220 });
     Object.defineProperty(scrollContainer, "clientHeight", { configurable: true, value: 100 });
+    await waitFor(() => expect(scrollContainer.scrollTop).toBe(120));
     scrollContainer.scrollTop = 0;
     fireEvent.scroll(scrollContainer);
 

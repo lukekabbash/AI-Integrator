@@ -1,13 +1,15 @@
 import {
+  memo,
   useDeferredValue,
   useEffect,
   useMemo,
   useRef,
   useState,
   type ReactElement,
+  type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
-import { AnimatePresence, LayoutGroup, m as motion, useReducedMotion } from "motion/react";
+import { AnimatePresence, m as motion, useReducedMotion } from "motion/react";
 import {
   Archive,
   ArchiveRestore,
@@ -54,12 +56,21 @@ function MenuActionTooltip({
 interface TaskSidebarProps {
   projects: ProjectSummary[];
   tasks: TaskSummary[];
+  /** Server-reported archived root count for the Archive badge. */
+  archivedTotal?: number;
+  archivedLoading?: boolean;
+  archivedHasMore?: boolean;
+  onEnsureArchived?: () => void;
+  onLoadMoreArchived?: () => void;
   activeProjectId: string;
   activeTaskId: string;
   openingProject: boolean;
   metadataActionsEnabled: boolean;
   taskActionBusyId: string;
-  onSearchMessages?: (query: string) => Promise<TaskMessageSearchHit[]>;
+  onSearchMessages?: (
+    query: string,
+    options?: { includeArchived?: boolean },
+  ) => Promise<TaskMessageSearchHit[]>;
   onSelectProject: (projectId: string) => void;
   onSelectTask: (taskId: string) => void;
   onNewTask: () => void;
@@ -162,11 +173,6 @@ function chatMeta(
   return relative ? `${prefix}${relative}` : `${prefix}${statusLabel[task.status]}`;
 }
 
-const expandTransition = {
-  duration: 0.22,
-  ease: [0.2, 0.8, 0.2, 1] as const,
-};
-
 const menuSpring = {
   type: "spring" as const,
   stiffness: 540,
@@ -177,6 +183,8 @@ const menuSpring = {
 const INITIAL_PROJECT_CHAT_LIMIT = 5;
 const PROJECT_CHAT_PAGE_SIZE = 10;
 const INITIAL_SEARCH_RESULT_LIMIT = 80;
+/** Matches `.project-chat-list-clip` grid-template-rows timing. */
+const PROJECT_CHAT_LIST_CLIP_MS = 220;
 /** Rename / Copy / Pin / Archive / Delete — used to decide flip-up vs down. */
 const CHAT_ACTION_MENU_HEIGHT = 168;
 const PROJECT_ACTION_MENU_HEIGHT = 112;
@@ -219,16 +227,73 @@ const chatRowVariants = {
   }),
 };
 
-const chatListLayoutSpring = {
-  type: "spring" as const,
-  stiffness: 560,
-  damping: 44,
-  mass: 0.6,
-};
+/** CSS grid 0fr/1fr clip — avoids Motion height:"auto" measure thrash. */
+function ProjectChatListClip({
+  open,
+  menuOpen,
+  reduceMotion,
+  children,
+}: {
+  open: boolean;
+  menuOpen: boolean;
+  reduceMotion: boolean;
+  children: () => ReactNode;
+}) {
+  const [mounted, setMounted] = useState(open);
+  const [clipOpen, setClipOpen] = useState(open);
 
-export function TaskSidebar({
+  useEffect(() => {
+    if (open) {
+      setMounted(true);
+      if (reduceMotion) {
+        setClipOpen(true);
+        return;
+      }
+      const frame = window.requestAnimationFrame(() => setClipOpen(true));
+      return () => window.cancelAnimationFrame(frame);
+    }
+    setClipOpen(false);
+    if (reduceMotion) {
+      setMounted(false);
+      return;
+    }
+    // Safety if transitionend is skipped (e.g. display:none mid-flight).
+    const timer = window.setTimeout(() => setMounted(false), PROJECT_CHAT_LIST_CLIP_MS + 40);
+    return () => window.clearTimeout(timer);
+  }, [open, reduceMotion]);
+
+  if (!mounted) return null;
+
+  return (
+    <div
+      className="project-chat-list-clip"
+      data-open={clipOpen ? "true" : "false"}
+      data-menu-open={menuOpen ? "true" : "false"}
+      onTransitionEnd={(event) => {
+        if (event.target !== event.currentTarget) return;
+        if (event.propertyName !== "grid-template-rows") return;
+        if (!open) setMounted(false);
+      }}
+    >
+      <div className="project-chat-list-inner">
+        <div className="project-chat-list" data-menu-open={menuOpen ? "true" : "false"}>
+          {children()}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Memoized so App's ~RAF `runtimeState` stream commits do not reconcile the
+ * Motion / TravelingSelection / Tooltip sidebar tree when task props are idle. */
+export const TaskSidebar = memo(function TaskSidebar({
   projects,
   tasks,
+  archivedTotal,
+  archivedLoading = false,
+  archivedHasMore = false,
+  onEnsureArchived,
+  onLoadMoreArchived,
   activeProjectId,
   activeTaskId,
   openingProject,
@@ -355,7 +420,7 @@ export function TaskSidebar({
     }
     setMessageSearchLoading(true);
     searchTimerRef.current = setTimeout(() => {
-      void onSearchMessages(normalized)
+      void onSearchMessages(normalized, { includeArchived: showArchived })
         .then((hits) => {
           if (searchGenerationRef.current === generation) setMessageHits(hits);
         })
@@ -384,16 +449,23 @@ export function TaskSidebar({
     () => new Map(projects.map((project) => [project.id, project])),
     [projects],
   );
+  const searchTasks = useMemo(
+    () =>
+      showArchived
+        ? tasks.filter((task) => task.archived)
+        : tasks.filter((task) => !task.archived),
+    [showArchived, tasks],
+  );
   const searchResults = useMemo(() => {
     if (!normalizedQuery) return [];
     const titleMatches = sortTasks(
-      tasks.filter((task) => {
+      searchTasks.filter((task) => {
         const project = projectById.get(task.projectId);
         return `${task.title} ${project?.name ?? ""}`.toLowerCase().includes(normalizedQuery);
       }),
     );
     const seen = new Set(titleMatches.map((task) => task.id));
-    const taskById = new Map(tasks.map((task) => [task.id, task]));
+    const taskById = new Map(searchTasks.map((task) => [task.id, task]));
     for (const hit of messageHits) {
       const task = taskById.get(hit.taskId);
       if (task && !seen.has(task.id)) {
@@ -402,7 +474,7 @@ export function TaskSidebar({
       }
     }
     return titleMatches;
-  }, [messageHits, normalizedQuery, projectById, tasks]);
+  }, [messageHits, normalizedQuery, projectById, searchTasks]);
   const visibleSearchResults = searchResults.slice(0, searchResultLimit);
 
   const tasksByProject = useMemo(() => {
@@ -417,17 +489,24 @@ export function TaskSidebar({
     return map;
   }, [projects, tasks]);
 
+  const ensureArchivedRef = useRef(onEnsureArchived);
+  ensureArchivedRef.current = onEnsureArchived;
+  useEffect(() => {
+    if (showArchived) ensureArchivedRef.current?.();
+  }, [showArchived]);
+
   const archivedCount = useMemo(() => {
     // Archived projects count once each; chats inside them ride along
     // implicitly, so only individually archived chats elsewhere add up.
     const archivedProjectIds = new Set(
       projects.filter((project) => project.archived).map((project) => project.id),
     );
-    const archivedTasks = tasks.filter(
-      (task) => task.archived && !archivedProjectIds.has(task.projectId),
-    ).length;
-    return archivedTasks + archivedProjectIds.size;
-  }, [projects, tasks]);
+    const archivedChatCount =
+      typeof archivedTotal === "number"
+        ? archivedTotal
+        : tasks.filter((task) => task.archived && !archivedProjectIds.has(task.projectId)).length;
+    return archivedChatCount + archivedProjectIds.size;
+  }, [archivedTotal, projects, tasks]);
 
   const visibleProjects = useMemo(() => {
     // The archive lists archived projects plus any live project holding
@@ -850,8 +929,7 @@ export function TaskSidebar({
             ) : null}
           </div>
 
-          <LayoutGroup id="sidebar-chats">
-            <div className="project-tree" aria-label="Projects">
+          <div className="project-tree" aria-label="Projects">
               <TravelingSelection
                 activeKey={activeTaskId}
                 className="chat-row-active"
@@ -859,7 +937,7 @@ export function TaskSidebar({
                 layoutKey={`${showArchived}:${visibleProjects
                   .map(
                     (project) =>
-                      `${project.id}:${isProjectExpanded(project.id)}:${projectChatLimits[project.id] ?? INITIAL_PROJECT_CHAT_LIMIT}:${project.pinned ? 1 : 0}:${project.archived ? 1 : 0}`,
+                      `${project.id}:${projectChatLimits[project.id] ?? INITIAL_PROJECT_CHAT_LIMIT}:${project.pinned ? 1 : 0}:${project.archived ? 1 : 0}`,
                   )
                   .join("|")}:${tasks
                   .map((task) => `${task.id}:${task.projectId}:${task.updatedAt}:${task.archived}`)
@@ -868,7 +946,9 @@ export function TaskSidebar({
               {visibleProjects.map((project) => {
                 const expanded = isProjectExpanded(project.id);
                 const allProjectTasks = tasksByProject.get(project.id) ?? [];
-                const projectChats = expanded ? chatsForProject(project.id) : [];
+                // Keep chat rows available while the clip is closing so the
+                // fold-shut animation is not emptied mid-flight.
+                const projectChats = chatsForProject(project.id);
                 const chatLimit = projectChatLimits[project.id] ?? INITIAL_PROJECT_CHAT_LIMIT;
                 const visibleProjectChats = projectChats.slice(0, chatLimit);
                 const activeProjectChat = projectChats.find((task) => task.id === activeTaskId);
@@ -893,18 +973,13 @@ export function TaskSidebar({
                     (openMenuId && projectChats.some((task) => task.id === openMenuId)),
                 );
                 return (
-                  <motion.div
+                  <div
                     className="project-group"
                     data-active={project.id === activeProjectId}
                     data-archived={showArchived && project.archived ? "true" : undefined}
                     data-menu-open={menuOpenInProject ? "true" : undefined}
                     data-project-menu-open={projectMenuOpen ? "true" : undefined}
                     key={project.id}
-                    layout={reduceMotion ? false : "position"}
-                    layoutDependency={`${expanded}:${showArchived}:${visibleProjectChats
-                      .map((task) => task.id)
-                      .join(",")}`}
-                    transition={reduceMotion ? { duration: 0 } : { layout: chatListLayoutSpring }}
                   >
                     <div className="project-group-header">
                       <button
@@ -1095,126 +1170,129 @@ export function TaskSidebar({
                         </AnimatePresence>
                       </span>
                     </div>
-                    <AnimatePresence initial={false}>
-                      {expanded ? (
-                        <motion.div
-                          className="project-chat-list"
-                          data-menu-open={menuOpenInProject ? "true" : "false"}
-                          initial={reduceMotion ? false : { height: 0, opacity: 0 }}
-                          animate={{ height: "auto", opacity: 1 }}
-                          exit={reduceMotion ? undefined : { height: 0, opacity: 0 }}
-                          transition={expandTransition}
-                        >
-                          {projectChats.length ? (
-                            <>
-                              <AnimatePresence initial={false} mode="popLayout">
-                                {visibleProjectChats.map((task, index) => {
-                                  const stagger = Math.min(
-                                    Math.max(0, index - (projectRevealFrom[project.id] ?? index)),
-                                    PROJECT_CHAT_PAGE_SIZE - 1,
-                                  );
-                                  return (
-                                    <motion.div
-                                      key={task.id}
-                                      className="chat-reveal"
-                                      custom={stagger}
-                                      variants={reduceMotion ? undefined : chatRowVariants}
-                                      initial={reduceMotion ? false : "hidden"}
-                                      animate="visible"
-                                      exit={reduceMotion ? undefined : "exit"}
-                                      style={{
-                                        position: "relative",
-                                        overflow:
-                                          openMenuId === task.id || renamingId === task.id
-                                            ? "visible"
-                                            : "hidden",
-                                        zIndex: openMenuId === task.id ? 5 : undefined,
-                                      }}
-                                    >
-                                      {renderChat(task, { nested: true })}
-                                    </motion.div>
-                                  );
-                                })}
-                              </AnimatePresence>
-                              {hiddenChatCount > 0 || chatLimit > INITIAL_PROJECT_CHAT_LIMIT ? (
-                                <motion.div
-                                  className="project-chat-footer"
-                                  layout={reduceMotion ? false : "position"}
-                                  layoutDependency={chatLimit}
-                                  transition={
-                                    reduceMotion
-                                      ? { duration: 0 }
-                                      : { layout: chatListLayoutSpring }
-                                  }
-                                >
-                                  {hiddenChatCount > 0 ? (
-                                    <motion.button
-                                      className="project-chat-more"
-                                      type="button"
-                                      whileTap={reduceMotion ? undefined : { scale: 0.98 }}
-                                      onClick={() => {
-                                        setProjectRevealFrom((current) => ({
-                                          ...current,
-                                          [project.id]: Math.min(chatLimit, projectChats.length),
-                                        }));
-                                        setProjectChatLimits((current) => ({
-                                          ...current,
-                                          [project.id]: chatLimit + PROJECT_CHAT_PAGE_SIZE,
-                                        }));
-                                      }}
-                                    >
-                                      <ChevronDown aria-hidden="true" />
-                                      Show {Math.min(PROJECT_CHAT_PAGE_SIZE, hiddenChatCount)} more
-                                    </motion.button>
-                                  ) : null}
-                                  {chatLimit > INITIAL_PROJECT_CHAT_LIMIT ? (
-                                    <motion.button
-                                      className="project-chat-more project-chat-less"
-                                      type="button"
-                                      whileTap={reduceMotion ? undefined : { scale: 0.98 }}
-                                      onClick={() => {
-                                        setProjectRevealFrom((current) => ({
-                                          ...current,
-                                          [project.id]: INITIAL_PROJECT_CHAT_LIMIT,
-                                        }));
-                                        setProjectChatLimits((current) => ({
-                                          ...current,
-                                          [project.id]: INITIAL_PROJECT_CHAT_LIMIT,
-                                        }));
-                                      }}
-                                    >
-                                      <ChevronUp aria-hidden="true" />
-                                      Show less
-                                    </motion.button>
-                                  ) : null}
-                                </motion.div>
-                              ) : null}
-                            </>
-                          ) : (
-                            <p className="project-chat-empty" role="status">
-                              {showArchived && !project.archived
-                                ? "No archived chats"
-                                : "No chats yet"}
-                            </p>
-                          )}
-                        </motion.div>
-                      ) : null}
-                    </AnimatePresence>
-                  </motion.div>
+                    <ProjectChatListClip
+                      open={expanded}
+                      menuOpen={menuOpenInProject}
+                      reduceMotion={Boolean(reduceMotion)}
+                    >
+                      {() =>
+                        projectChats.length ? (
+                          <>
+                            <AnimatePresence initial={false}>
+                              {visibleProjectChats.map((task, index) => {
+                                const stagger = Math.min(
+                                  Math.max(0, index - (projectRevealFrom[project.id] ?? index)),
+                                  PROJECT_CHAT_PAGE_SIZE - 1,
+                                );
+                                return (
+                                  <motion.div
+                                    key={task.id}
+                                    className="chat-reveal"
+                                    custom={stagger}
+                                    variants={reduceMotion ? undefined : chatRowVariants}
+                                    initial={reduceMotion ? false : "hidden"}
+                                    animate="visible"
+                                    exit={reduceMotion ? undefined : "exit"}
+                                    style={{
+                                      position: "relative",
+                                      overflow:
+                                        openMenuId === task.id || renamingId === task.id
+                                          ? "visible"
+                                          : "hidden",
+                                      zIndex: openMenuId === task.id ? 5 : undefined,
+                                    }}
+                                  >
+                                    {renderChat(task, { nested: true })}
+                                  </motion.div>
+                                );
+                              })}
+                            </AnimatePresence>
+                            {hiddenChatCount > 0 || chatLimit > INITIAL_PROJECT_CHAT_LIMIT ? (
+                              <div className="project-chat-footer">
+                                {hiddenChatCount > 0 ? (
+                                  <motion.button
+                                    className="project-chat-more"
+                                    type="button"
+                                    whileTap={reduceMotion ? undefined : { scale: 0.98 }}
+                                    onClick={() => {
+                                      setProjectRevealFrom((current) => ({
+                                        ...current,
+                                        [project.id]: Math.min(chatLimit, projectChats.length),
+                                      }));
+                                      setProjectChatLimits((current) => ({
+                                        ...current,
+                                        [project.id]: chatLimit + PROJECT_CHAT_PAGE_SIZE,
+                                      }));
+                                    }}
+                                  >
+                                    <ChevronDown aria-hidden="true" />
+                                    Show {Math.min(PROJECT_CHAT_PAGE_SIZE, hiddenChatCount)} more
+                                  </motion.button>
+                                ) : null}
+                                {chatLimit > INITIAL_PROJECT_CHAT_LIMIT ? (
+                                  <motion.button
+                                    className="project-chat-more project-chat-less"
+                                    type="button"
+                                    whileTap={reduceMotion ? undefined : { scale: 0.98 }}
+                                    onClick={() => {
+                                      setProjectRevealFrom((current) => ({
+                                        ...current,
+                                        [project.id]: INITIAL_PROJECT_CHAT_LIMIT,
+                                      }));
+                                      setProjectChatLimits((current) => ({
+                                        ...current,
+                                        [project.id]: INITIAL_PROJECT_CHAT_LIMIT,
+                                      }));
+                                    }}
+                                  >
+                                    <ChevronUp aria-hidden="true" />
+                                    Show less
+                                  </motion.button>
+                                ) : null}
+                              </div>
+                            ) : null}
+                          </>
+                        ) : (
+                          <p className="project-chat-empty" role="status">
+                            {showArchived && !project.archived
+                              ? "No archived chats"
+                              : "No chats yet"}
+                          </p>
+                        )
+                      }
+                    </ProjectChatListClip>
+                  </div>
                 );
               })}
               {visibleProjects.length === 0 && projects.length > 0 ? (
                 showArchived ? (
                   <div className="sidebar-chat-empty" role="status">
                     <Archive aria-hidden="true" />
-                    <strong>Nothing archived</strong>
-                    <span>Archived chats and projects will show up here.</span>
+                    <strong>
+                      {archivedLoading ? "Loading archive…" : "Nothing archived"}
+                    </strong>
+                    <span>
+                      {archivedLoading
+                        ? "Fetching archived chats from local storage."
+                        : "Archived chats and projects will show up here."}
+                    </span>
                   </div>
                 ) : (
                   <p className="project-chat-empty" role="status">
                     All projects are archived
                   </p>
                 )
+              ) : null}
+              {showArchived && archivedHasMore ? (
+                <button
+                  className="project-chat-more"
+                  type="button"
+                  disabled={archivedLoading}
+                  onClick={() => onLoadMoreArchived?.()}
+                >
+                  <ChevronDown aria-hidden="true" />
+                  {archivedLoading ? "Loading…" : "Show more archived chats"}
+                </button>
               ) : null}
               {projects.length === 0 ? (
                 <button className="sidebar-empty-project" type="button" onClick={onOpenProject}>
@@ -1226,7 +1304,6 @@ export function TaskSidebar({
                 </button>
               ) : null}
             </div>
-          </LayoutGroup>
 
           <button
             className="utility-row archived-toggle"
@@ -1414,4 +1491,4 @@ export function TaskSidebar({
         : null}
     </>
   );
-}
+});

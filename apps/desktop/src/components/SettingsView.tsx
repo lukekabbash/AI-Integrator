@@ -87,11 +87,14 @@ interface SettingsViewProps {
   preferences: ThemePreferences;
   runtimes: RuntimeConnection[];
   usage: UsageSnapshot;
-  /** Same workspace data the chat sidebar renders; the Archive section is a
-   * roomier view over it, not a second store. */
+  /** Live chats plus lazily loaded archived roots for the Archive section. */
   projects?: ProjectSummary[];
   tasks?: TaskSummary[];
   taskActionBusyId?: string;
+  archivedLoading?: boolean;
+  archivedHasMore?: boolean;
+  onEnsureArchived?: () => void;
+  onLoadMoreArchived?: () => void;
   /** Select the chat and return to the workspace screen. */
   onOpenTask?: (taskId: string) => void;
   onUpdateTask?: (taskId: string, patch: { archived?: boolean }) => void;
@@ -2562,6 +2565,10 @@ interface ArchiveSettingsProps {
   projects: ProjectSummary[];
   tasks: TaskSummary[];
   taskActionBusyId?: string;
+  archivedLoading?: boolean;
+  archivedHasMore?: boolean;
+  onEnsureArchived?: () => void;
+  onLoadMoreArchived?: () => void;
   settings: SettingsMap;
   setSetting: (key: string, value: unknown) => void;
   onOpenTask?: (taskId: string) => void;
@@ -2582,6 +2589,10 @@ function ArchiveSettings({
   projects,
   tasks,
   taskActionBusyId,
+  archivedLoading = false,
+  archivedHasMore = false,
+  onEnsureArchived,
+  onLoadMoreArchived,
   settings,
   setSetting,
   onOpenTask,
@@ -2592,6 +2603,11 @@ function ArchiveSettings({
   onDeleteArchivedChats,
 }: ArchiveSettingsProps) {
   const [filter, setFilter] = useState("");
+  const ensureArchivedRef = useRef(onEnsureArchived);
+  ensureArchivedRef.current = onEnsureArchived;
+  useEffect(() => {
+    ensureArchivedRef.current?.();
+  }, []);
   const projectNames = useMemo(
     () => new Map(projects.map((project) => [project.id, project.name])),
     [projects],
@@ -2679,7 +2695,11 @@ function ArchiveSettings({
             />
           </label>
         ) : null}
-        {archivedChats.length === 0 ? (
+        {archivedLoading && archivedChats.length === 0 ? (
+          <p className="archive-empty" role="status">
+            Loading archived chats…
+          </p>
+        ) : archivedChats.length === 0 ? (
           <p className="archive-empty" role="status">
             Nothing archived. Chats you archive from the sidebar will show up here.
           </p>
@@ -2745,6 +2765,16 @@ function ArchiveSettings({
             </div>
           ))
         )}
+        {archivedHasMore ? (
+          <button
+            className="archive-action"
+            type="button"
+            disabled={archivedLoading}
+            onClick={() => onLoadMoreArchived?.()}
+          >
+            {archivedLoading ? "Loading…" : "Show more archived chats"}
+          </button>
+        ) : null}
       </section>
       {archivedProjects.length > 0 ? (
         <section className="settings-section">
@@ -3000,6 +3030,10 @@ export function SettingsView(props: SettingsViewProps) {
               projects={props.projects ?? []}
               tasks={props.tasks ?? []}
               taskActionBusyId={props.taskActionBusyId}
+              archivedLoading={props.archivedLoading}
+              archivedHasMore={props.archivedHasMore}
+              onEnsureArchived={props.onEnsureArchived}
+              onLoadMoreArchived={props.onLoadMoreArchived}
               settings={settings}
               setSetting={setSetting}
               onOpenTask={props.onOpenTask}

@@ -17,10 +17,12 @@ use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use integrator_core::{
     ApprovalDecision, ApprovalKind, ApprovalProjection, ComposerDraft, ConnectionState,
-    IntegratorError, LocalExport, ModeOption, ModeProjection, NewQueuedMessage, NewTask, ProjectId,
+    ArchivedTaskPage, IntegratorError, LocalExport, ModeOption, ModeProjection, NewQueuedMessage,
+    NewTask, ProjectId,
     ProviderKind, ProviderResumeState, QueuedMessage, QueuedMessageId, QueuedMessageState,
     RuntimeBinding, RuntimeProjection, RuntimeSession, Setting, StopRequestResult, Task, TaskId,
-    TaskSnapshot, TaskState, TransportRequestId, TrustedProject, TurnStatus, Versioned,
+    TaskSnapshot, TaskSnapshotQuery, TaskState, TransportRequestId, TrustedProject, TurnStatus,
+    Versioned,
 };
 use integrator_runtime::{
     CommitResult, CreateWorktree, DiffResult, DiffScope, FileStatus, GitOverview, GitRemote,
@@ -645,6 +647,21 @@ pub async fn task_list(state: State<'_, AppState>) -> CommandResult<Vec<Task>> {
         .map_err(Into::into)
 }
 
+#[tauri::command]
+pub async fn task_list_archived(
+    state: State<'_, AppState>,
+    cursor: Option<String>,
+    limit: Option<usize>,
+) -> CommandResult<ArchivedTaskPage> {
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || {
+        store.list_archived_tasks(cursor.as_deref(), limit.unwrap_or(50))
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskMessageSearchHit {
@@ -657,11 +674,16 @@ pub async fn task_search_messages(
     state: State<'_, AppState>,
     query: String,
     limit: Option<usize>,
+    include_archived: Option<bool>,
 ) -> CommandResult<Vec<TaskMessageSearchHit>> {
     let store = Arc::clone(&state.store);
     tauri::async_runtime::spawn_blocking(move || {
         store
-            .search_task_messages(&query, limit.unwrap_or(30))
+            .search_task_messages(
+                &query,
+                limit.unwrap_or(30),
+                include_archived.unwrap_or(false),
+            )
             .map(|matches| {
                 matches
                     .into_iter()
@@ -3487,13 +3509,23 @@ pub async fn task_snapshot(
     app: AppHandle<tauri::Wry>,
     state: State<'_, AppState>,
     task_id: TaskId,
+    known_watermark: Option<i64>,
+    known_reset_seq: Option<i64>,
+    before_seq: Option<i64>,
+    limit: Option<usize>,
 ) -> CommandResult<TaskSnapshot> {
+    let older_page = before_seq.is_some();
     // A turn left pending/in-progress by a previous app run can never finish:
     // provider processes do not survive the app. Settle it as interrupted
     // before reading, so reopening a task does not rehydrate a phantom
-    // streaming turn whose timer counts from hours ago.
-    let runtime_live = task_has_live_runtime(&state, task_id).await;
-    if !runtime_live {
+    // streaming turn whose timer counts from hours ago. Older-page fetches
+    // are read-only windows and skip settlement.
+    let runtime_live = if older_page {
+        false
+    } else {
+        task_has_live_runtime(&state, task_id).await
+    };
+    if !older_page && !runtime_live {
         let store = Arc::clone(&state.store);
         let settled =
             tauri::async_runtime::spawn_blocking(move || store.settle_interrupted_turn(task_id))
@@ -3520,11 +3552,22 @@ pub async fn task_snapshot(
         }
     }
     let store = Arc::clone(&state.store);
-    let mut snapshot = tauri::async_runtime::spawn_blocking(move || store.task_snapshot(task_id))
-        .await
-        .map_err(|_| worker_error())?
-        .map_err(CommandError::from)?;
-    snapshot.runtime_live = runtime_live;
+    let query = TaskSnapshotQuery {
+        known_watermark,
+        known_reset_seq,
+        before_seq,
+        limit,
+    };
+    let mut snapshot =
+        tauri::async_runtime::spawn_blocking(move || store.task_snapshot_with(task_id, query))
+            .await
+            .map_err(|_| worker_error())?
+            .map_err(CommandError::from)?;
+    snapshot.runtime_live = if older_page {
+        false
+    } else {
+        runtime_live
+    };
     Ok(snapshot)
 }
 

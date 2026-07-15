@@ -123,6 +123,33 @@ describe("DiffView", () => {
     );
   });
 
+  it("keeps empty change rows non-collapsing in unified and split views", () => {
+    const emptyFile = {
+      ...file,
+      path: "src/blank.ts",
+      additions: 1,
+      deletions: 1,
+      lines: [
+        { kind: "hunk" as const, content: "@@ -1,2 +1,2 @@" },
+        { kind: "delete" as const, oldNumber: 1, content: "" },
+        { kind: "add" as const, newNumber: 1, content: "" },
+        { kind: "context" as const, oldNumber: 2, newNumber: 2, content: "export {};" },
+      ],
+    };
+    const { rerender } = render(
+      <DiffView file={emptyFile} viewMode="unified" onViewModeChange={vi.fn()} />,
+    );
+
+    expect(document.querySelector(".diff-line--delete .diff-code code")?.textContent).toBe(" ");
+    expect(document.querySelector(".diff-line--add .diff-code code")?.textContent).toBe(" ");
+    expect(document.querySelectorAll(".diff-line-number")).toHaveLength(6);
+
+    rerender(<DiffView file={emptyFile} viewMode="split" onViewModeChange={vi.fn()} />);
+    expect(document.querySelector(".diff-split-code--delete code")?.textContent).toBe(" ");
+    expect(document.querySelector(".diff-split-code--add code")?.textContent).toBe(" ");
+    expect(document.querySelector(".diff-table--split")).toBeInTheDocument();
+  });
+
   it("renders the inline variant unified-only with just the file name", () => {
     render(
       <DiffView

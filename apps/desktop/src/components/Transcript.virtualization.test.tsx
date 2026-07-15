@@ -283,6 +283,124 @@ describe("Transcript measured virtualization", () => {
     expect(screen.getByText("Activity 173")).toBeInTheDocument();
   });
 
+  it("keeps mid-chat restore despite open-settle scroll noise", async () => {
+    const events = Array.from({ length: 500 }, (_, index) => activityEvent(index));
+    writeTranscriptViewportState("task:restore-settle-noise", {
+      anchor: { eventId: "activity-173", offsetPx: 0 },
+      following: false,
+      expanded: {},
+      updatedAt: Date.now(),
+    });
+
+    const { scroll } = renderWithViewport(events, "task:restore-settle-noise");
+    scroll().scrollTop = 0;
+    fireEvent.scroll(scroll());
+
+    await waitFor(() =>
+      expect(document.querySelector('[data-event-id="activity-173"]')).not.toBeNull(),
+    );
+    expect(screen.getByText("Activity 173")).toBeInTheDocument();
+    // Settled restore must not invent follow-to-end from residual top scroll.
+    await waitFor(() => {
+      const latest = document.querySelector('[data-event-id="activity-499"]');
+      expect(latest).toBeNull();
+    });
+  });
+
+  it("follows latest on shared-parent remount for a virtualized chat", async () => {
+    const scrollRef = { current: null as HTMLDivElement | null };
+    const shortEvents = Array.from({ length: 10 }, (_, index) => activityEvent(index));
+    const longEvents = Array.from({ length: 300 }, (_, index) => activityEvent(index + 1000));
+
+    const { rerender } = render(
+      <div
+        data-testid="virtual-scroll"
+        ref={(node) => {
+          scrollRef.current = node;
+          if (!node) return;
+          Object.defineProperty(node, "clientHeight", { configurable: true, value: 400 });
+          Object.defineProperty(node, "scrollHeight", {
+            configurable: true,
+            get: () => {
+              const list = node.querySelector<HTMLElement>(".transcript-virtual-list");
+              const count =
+                Number(list?.style.height?.replace("px", "")) ||
+                (node.querySelectorAll("[data-event-id]").length || 1) * 40;
+              return count;
+            },
+          });
+          Object.defineProperty(node, "scrollTo", {
+            configurable: true,
+            value: (options: ScrollToOptions) => {
+              const requested = Number(options.top ?? 0);
+              node.scrollTop = Math.max(
+                0,
+                Math.min(requested, node.scrollHeight - node.clientHeight),
+              );
+              node.dispatchEvent(new Event("scroll"));
+            },
+          });
+        }}
+        style={{ height: 400, overflow: "auto" }}
+      >
+        <Transcript
+          key="short"
+          ownerKey="task:virt-a"
+          events={shortEvents}
+          scrollContainerRef={scrollRef}
+        />
+      </div>,
+    );
+
+    await waitFor(() => expect(scrollRef.current?.scrollTop ?? 0).toBeGreaterThan(0));
+    if (scrollRef.current) scrollRef.current.scrollTop = 0;
+
+    rerender(
+      <div
+        data-testid="virtual-scroll"
+        ref={(node) => {
+          scrollRef.current = node;
+          if (!node) return;
+          Object.defineProperty(node, "clientHeight", { configurable: true, value: 400 });
+          Object.defineProperty(node, "scrollHeight", {
+            configurable: true,
+            get: () => {
+              const list = node.querySelector<HTMLElement>(".transcript-virtual-list");
+              return Number.parseFloat(list?.style.height ?? "") || longEvents.length * 40;
+            },
+          });
+          Object.defineProperty(node, "scrollTo", {
+            configurable: true,
+            value: (options: ScrollToOptions) => {
+              const requested = Number(options.top ?? 0);
+              node.scrollTop = Math.max(
+                0,
+                Math.min(requested, node.scrollHeight - node.clientHeight),
+              );
+              node.dispatchEvent(new Event("scroll"));
+            },
+          });
+        }}
+        style={{ height: 400, overflow: "auto" }}
+      >
+        <Transcript
+          key="long"
+          ownerKey="task:virt-b"
+          events={longEvents}
+          scrollContainerRef={scrollRef}
+        />
+      </div>,
+    );
+    fireEvent.scroll(scrollRef.current!);
+
+    await waitFor(() => {
+      const container = scrollRef.current!;
+      const distance =
+        container.scrollHeight - container.scrollTop - container.clientHeight;
+      expect(distance).toBeLessThanOrEqual(96);
+    });
+  });
+
   it("restores disclosure state from task-local view metadata", () => {
     const group: TranscriptEvent = {
       ...activityEvent(1, "One child"),

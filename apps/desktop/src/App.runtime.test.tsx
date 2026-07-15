@@ -34,6 +34,7 @@ const { bridgeMock } = vi.hoisted(() => ({
     revealProjectFile: vi.fn(),
     listNativeProviderActions: vi.fn(),
     searchTaskMessages: vi.fn(),
+    listArchivedTasks: vi.fn(),
     supportsTaskMetadata: vi.fn(),
     updateTaskMetadata: vi.fn(),
     updateTaskRouting: vi.fn(),
@@ -71,8 +72,12 @@ vi.mock("./bridge", async (importOriginal) => {
 vi.mock("./components/RightRail", () => ({ RightRail: () => null }));
 
 import App from "./App";
-import type { RuntimeProjectionEvent } from "./bridge";
+import type { RuntimeProjectionEvent, TaskProjectionSnapshot } from "./bridge";
 import { createEmptySnapshot } from "./demoData";
+import {
+  applyRuntimeProjectionBatch,
+  createRuntimeProjectionState,
+} from "./runtimeProjection";
 
 let runtimeListener: ((event: RuntimeProjectionEvent) => void) | undefined;
 let delegationListener: ((parentTaskId: string) => void) | undefined;
@@ -90,6 +95,39 @@ function projection(
     turnId: "turn-1",
     occurredAt: "2026-07-10T16:00:00Z",
     projection: value,
+  };
+}
+
+function projectionSnapshot(input: {
+  events?: RuntimeProjectionEvent[];
+  watermarkSeq: number;
+  runtimeLive: boolean;
+  resetSeq?: number;
+  taskId?: string;
+}): TaskProjectionSnapshot {
+  const taskId = input.taskId ?? input.events?.[0]?.taskId ?? "task-1";
+  const state = applyRuntimeProjectionBatch(
+    createRuntimeProjectionState(taskId),
+    [...(input.events ?? [])].sort((a, b) => a.seq - b.seq),
+  );
+  return {
+    watermarkSeq: input.watermarkSeq,
+    resetSeq: input.resetSeq ?? 0,
+    runtimeLive: input.runtimeLive,
+    hydrate: {
+      turn: state.turn,
+      items: state.items,
+      plan: state.plan,
+      planTruncated: state.planTruncated,
+      diff: state.diff,
+      usage: state.usage,
+      approvals: state.approvals,
+      mode: state.mode,
+      connection: state.connection,
+      error: state.errors[0],
+      firstSeen: state.firstSeen,
+      hasMoreOlder: false,
+    },
   };
 }
 
@@ -137,6 +175,7 @@ describe("native runtime recovery UI", () => {
     });
     bridgeMock.supportsTaskMetadata.mockReturnValue(true);
     bridgeMock.searchTaskMessages.mockResolvedValue([]);
+    bridgeMock.listArchivedTasks.mockResolvedValue({ tasks: [], total: 0 });
     bridgeMock.listNativeProviderActions.mockResolvedValue([]);
     bridgeMock.listDelegations.mockResolvedValue([]);
     bridgeMock.listModelCatalog.mockResolvedValue([]);
@@ -225,7 +264,7 @@ describe("native runtime recovery UI", () => {
           },
         }),
       );
-      return {
+      return projectionSnapshot({
         watermarkSeq: 8,
         runtimeLive: true,
         events: [
@@ -263,7 +302,7 @@ describe("native runtime recovery UI", () => {
             },
           }),
         ],
-      };
+      });
     });
     bridgeMock.respondToApproval.mockResolvedValue({});
     bridgeMock.setTaskStatus.mockResolvedValue(undefined);
@@ -314,7 +353,7 @@ describe("native runtime recovery UI", () => {
   });
 
   it("offers a noninterruptive resume control for a transport-interrupted turn", async () => {
-    bridgeMock.loadTaskProjection.mockResolvedValue({
+    bridgeMock.loadTaskProjection.mockResolvedValue(projectionSnapshot({
       watermarkSeq: 1,
       runtimeLive: false,
       events: [
@@ -329,7 +368,7 @@ describe("native runtime recovery UI", () => {
           },
         }),
       ],
-    });
+    }));
     bridgeMock.sendTurn.mockResolvedValue({
       id: "resume-user",
       kind: "user",
@@ -355,7 +394,7 @@ describe("native runtime recovery UI", () => {
   });
 
   it("hides resume recovery when the user stopped the turn", async () => {
-    bridgeMock.loadTaskProjection.mockResolvedValue({
+    bridgeMock.loadTaskProjection.mockResolvedValue(projectionSnapshot({
       watermarkSeq: 1,
       runtimeLive: false,
       events: [
@@ -370,7 +409,7 @@ describe("native runtime recovery UI", () => {
           },
         }),
       ],
-    });
+    }));
 
     render(<App />);
     await waitFor(() => expect(bridgeMock.loadTaskProjection).toHaveBeenCalled());
@@ -382,7 +421,7 @@ describe("native runtime recovery UI", () => {
     bridgeMock.listSettings.mockResolvedValue([
       { key: "settings.general.autoResumeInterruptedTurns", value: true },
     ]);
-    bridgeMock.loadTaskProjection.mockResolvedValue({
+    bridgeMock.loadTaskProjection.mockResolvedValue(projectionSnapshot({
       watermarkSeq: 1,
       runtimeLive: false,
       events: [
@@ -397,7 +436,7 @@ describe("native runtime recovery UI", () => {
           },
         }),
       ],
-    });
+    }));
     bridgeMock.sendTurn.mockResolvedValue({
       id: "resume-user",
       kind: "user",
@@ -462,6 +501,11 @@ describe("native runtime recovery UI", () => {
         publicationFrame(0);
       });
       expect(await screen.findByText("Dense stream 64")).toBeInTheDocument();
+      // Text-only itemChanged frames must not churn sidebar task status.
+      const sidebar = screen.getByLabelText("Chat navigation");
+      expect(
+        within(sidebar).getByRole("button", { name: /Native recovery task/ }),
+      ).toHaveAttribute("data-status", "running");
 
       act(() => {
         for (const [frameId, callback] of [...frameCallbacks]) {
@@ -764,9 +808,9 @@ describe("native runtime recovery UI", () => {
     bridgeMock.loadWorkspace.mockResolvedValue(workspace);
     bridgeMock.loadTaskProjection.mockImplementation(async (taskId: string) => {
       if (taskId === "task-1") {
-        return { watermarkSeq: 0, runtimeLive: false, events: [] };
+        return projectionSnapshot({ watermarkSeq: 0, runtimeLive: false, events: [] });
       }
-      return {
+      return projectionSnapshot({
         watermarkSeq: 2,
         runtimeLive: true,
         events: [
@@ -791,13 +835,17 @@ describe("native runtime recovery UI", () => {
             taskId: "task-2",
           },
         ],
-      };
+      });
     });
 
     render(<App />);
-    await waitFor(() => expect(bridgeMock.loadTaskProjection).toHaveBeenCalledWith("task-2"));
+    await waitFor(() =>
+      expect(bridgeMock.loadTaskProjection).toHaveBeenCalledWith("task-2", expect.any(Object)),
+    );
     fireEvent.click(await screen.findByRole("button", { name: /Foreground task/i }));
-    await waitFor(() => expect(bridgeMock.loadTaskProjection).toHaveBeenCalledWith("task-1"));
+    await waitFor(() =>
+      expect(bridgeMock.loadTaskProjection).toHaveBeenCalledWith("task-1", expect.any(Object)),
+    );
     fireEvent.click(await screen.findByRole("button", { name: /Background live task/i }));
 
     await waitFor(() => {
@@ -829,18 +877,20 @@ describe("native runtime recovery UI", () => {
     };
     bridgeMock.loadWorkspace.mockResolvedValue(workspace);
     bridgeMock.loadTaskGit.mockResolvedValue(workspace.git);
-    bridgeMock.loadTaskProjection.mockResolvedValue({
+    bridgeMock.loadTaskProjection.mockResolvedValue(projectionSnapshot({
       watermarkSeq: 0,
       runtimeLive: false,
       events: [],
-    });
+    }));
 
     render(<App />);
     await waitFor(() => expect(bridgeMock.loadTaskGit).toHaveBeenCalledWith("task-1"));
     bridgeMock.loadTaskGit.mockClear();
 
     fireEvent.click(await screen.findByRole("button", { name: /Another chat/i }));
-    await waitFor(() => expect(bridgeMock.loadTaskProjection).toHaveBeenCalledWith("task-2"));
+    await waitFor(() =>
+      expect(bridgeMock.loadTaskProjection).toHaveBeenCalledWith("task-2", expect.any(Object)),
+    );
 
     expect(bridgeMock.loadTaskGit).not.toHaveBeenCalled();
   });
@@ -1144,7 +1194,7 @@ describe("native runtime recovery UI", () => {
     workspace.activeTaskId = "task-1";
     bridgeMock.loadWorkspace.mockResolvedValue(workspace);
     bridgeMock.setSessionMode.mockResolvedValue(undefined);
-    bridgeMock.loadTaskProjection.mockResolvedValue({
+    bridgeMock.loadTaskProjection.mockResolvedValue(projectionSnapshot({
       watermarkSeq: 6,
       runtimeLive: true,
       events: [
@@ -1164,7 +1214,7 @@ describe("native runtime recovery UI", () => {
           },
         }),
       ],
-    });
+    }));
 
     render(<App />);
     const modePicker = await screen.findByRole("button", { name: "Agent mode" }, { timeout: 5000 });
@@ -1221,11 +1271,11 @@ describe("native runtime recovery UI", () => {
     workspace.activeProjectId = "project-1";
     workspace.activeTaskId = "task-1";
     bridgeMock.loadWorkspace.mockResolvedValue(workspace);
-    bridgeMock.loadTaskProjection.mockResolvedValue({
+    bridgeMock.loadTaskProjection.mockResolvedValue(projectionSnapshot({
       watermarkSeq: 0,
       runtimeLive: false,
       events: [],
-    });
+    }));
     bridgeMock.probeRuntimes.mockReturnValue(new Promise(() => undefined));
     bridgeMock.sendTurn.mockResolvedValue(undefined);
 
@@ -1512,15 +1562,17 @@ describe("native runtime recovery UI", () => {
     workspace.activeProjectId = "project-1";
     workspace.activeTaskId = "task-1";
     bridgeMock.loadWorkspace.mockResolvedValue(workspace);
-    bridgeMock.loadTaskProjection.mockResolvedValue({
+    bridgeMock.loadTaskProjection.mockResolvedValue(projectionSnapshot({
       watermarkSeq: 0,
       runtimeLive: false,
       events: [],
-    });
+    }));
 
     render(<App />);
     const background = await screen.findByRole("button", { name: /Background task/i });
-    await waitFor(() => expect(bridgeMock.loadTaskProjection).toHaveBeenCalledWith("task-1"));
+    await waitFor(() =>
+      expect(bridgeMock.loadTaskProjection).toHaveBeenCalledWith("task-1", expect.any(Object)),
+    );
 
     act(() => {
       runtimeListener?.({

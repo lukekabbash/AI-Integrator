@@ -13,8 +13,9 @@ import {
 import {
   AnimatePresence,
   LazyMotion,
-  // domMax, not domAnimation: layout animations (the traveling selection
-  // pill's layoutId) are only included in the max feature bundle.
+  // domMax, not domAnimation: layout / layoutId animations (SlidingTabIndicator,
+  // settings nav, RightRail file lists, etc.) are only in the max feature bundle.
+  // TravelingSelection does not use layoutId — it animates measured x/y/size.
   domMax,
   m as motion,
   useReducedMotion,
@@ -109,7 +110,9 @@ import {
   applyRuntimeProjectionBatch,
   createRuntimeProjectionState,
   createRuntimeTranscriptDeriver,
+  hydrateRuntimeProjectionState,
   isFrameBatchableRuntimeProjection,
+  mergeOlderProjectionHydrate,
   taskActivityUpdate,
   type RuntimeProjectionState,
   type TranscriptDensity,
@@ -1349,6 +1352,12 @@ export default function App() {
   const [deleteArchivedChatsProjectId, setDeleteArchivedChatsProjectId] = useState("");
   const [deleteArchivedChatsBusy, setDeleteArchivedChatsBusy] = useState(false);
   const [deleteArchivedChatsError, setDeleteArchivedChatsError] = useState("");
+  /** Lazily loaded archived roots — kept out of the hot workspace snapshot. */
+  const [archivedTasks, setArchivedTasks] = useState<TaskSummary[]>([]);
+  const [archivedTotal, setArchivedTotal] = useState(0);
+  const [archivedNextCursor, setArchivedNextCursor] = useState<string | undefined>();
+  const [archivedLoading, setArchivedLoading] = useState(false);
+  const archivedCatalogReady = useRef(false);
   const [creatingTask, setCreatingTask] = useState(false);
   const [switchingTaskId, setSwitchingTaskId] = useState("");
   const [taskActionBusyId, setTaskActionBusyId] = useState("");
@@ -1675,15 +1684,35 @@ export default function App() {
       if (!preserveBufferedEvents) projectionBuffer.current = [];
       setRuntimeState(cachedState ?? createRuntimeProjectionState(taskId));
       try {
-        const loaded = await bridge.loadTaskProjection(taskId);
-        let next = applyRuntimeProjectionBatch(
-          createRuntimeProjectionState(taskId),
-          [...loaded.events].sort((a, b) => a.seq - b.seq),
-        );
-        next = {
-          ...next,
-          lastSeq: Math.max(next.lastSeq, loaded.watermarkSeq),
-        };
+        const loaded = await bridge.loadTaskProjection(taskId, {
+          knownWatermark: cachedState?.lastSeq,
+          knownResetSeq: cachedState?.resetSeq,
+        });
+        let next: RuntimeProjectionState;
+        if (loaded.cacheMatched && cachedState) {
+          // Watermark + reset epoch match: keep cached display state. Still
+          // merge buffered live events and apply runtimeLive settlement below.
+          next = {
+            ...cachedState,
+            lastSeq: Math.max(cachedState.lastSeq, loaded.watermarkSeq),
+            resetSeq: loaded.resetSeq,
+          };
+        } else {
+          const hydrate = loaded.hydrate ?? {
+            items: [],
+            plan: [],
+            planTruncated: false,
+            approvals: [],
+            firstSeen: {},
+            hasMoreOlder: false,
+          };
+          next = hydrateRuntimeProjectionState(
+            taskId,
+            hydrate,
+            loaded.watermarkSeq,
+            loaded.resetSeq,
+          );
+        }
         let runtimeLive = loaded.runtimeLive;
         const bufferedEvents = projectionBuffer.current
           .filter((candidate) => candidate.taskId === taskId && candidate.seq > loaded.watermarkSeq)
@@ -1760,6 +1789,35 @@ export default function App() {
     },
     [],
   );
+
+  const loadOlderInFlightRef = useRef<string | null>(null);
+  const loadOlderTaskProjection = useCallback(async (taskId: string) => {
+    const current = taskProjectionCache.current.get(taskId);
+    if (!current?.hasMoreOlder || current.oldestLoadedSeq === undefined) return;
+    if (projectionTaskId.current !== taskId || !projectionReady.current) return;
+    const beforeSeq = current.oldestLoadedSeq;
+    const flightKey = `${taskId}:${beforeSeq}`;
+    if (loadOlderInFlightRef.current === flightKey) return;
+    loadOlderInFlightRef.current = flightKey;
+    try {
+      const loaded = await bridge.loadTaskProjection(taskId, { beforeSeq });
+      if (projectionTaskId.current !== taskId || !projectionReady.current) return;
+      const hydrate = loaded.hydrate;
+      if (!hydrate) return;
+      setRuntimeState((prev) => {
+        if (!prev || prev.taskId !== taskId) return prev;
+        const next = mergeOlderProjectionHydrate(prev, hydrate);
+        taskProjectionCache.current.set(taskId, next);
+        return next;
+      });
+    } catch {
+      // Degraded: keep the already-loaded window; user can scroll again later.
+    } finally {
+      if (loadOlderInFlightRef.current === flightKey) {
+        loadOlderInFlightRef.current = null;
+      }
+    }
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -1936,6 +1994,13 @@ export default function App() {
         // Provider discovery and transcript reconciliation are independent,
         // read-only refreshes and must not gate that first paint.
         setWorkspaceLoading(false);
+        // Badge count only — do not hydrate archived chat rows into the hot set.
+        void bridge
+          .listArchivedTasks({ limit: 1 })
+          .then((page) => {
+            if (active) setArchivedTotal(page.total);
+          })
+          .catch(() => undefined);
         if (nativeHost) {
           void Promise.resolve(bridge.probeRuntimes?.())
             .then((runtimes) => {
@@ -2086,10 +2151,16 @@ export default function App() {
     };
   }, [nativeHost, refreshDelegations]);
 
-  const activeTask = snapshot.tasks.find((task) => task.id === snapshot.activeTaskId);
+  const activeTask =
+    snapshot.tasks.find((task) => task.id === snapshot.activeTaskId) ??
+    archivedTasks.find((task) => task.id === snapshot.activeTaskId);
   const rootTasks = useMemo(
-    () => snapshot.tasks.filter((task) => !task.parentId),
+    () => snapshot.tasks.filter((task) => !task.parentId && !task.archived),
     [snapshot.tasks],
+  );
+  const sidebarTasks = useMemo(
+    () => [...rootTasks, ...archivedTasks.filter((task) => !task.parentId)],
+    [archivedTasks, rootTasks],
   );
   const activeProject =
     snapshot.projects.find((project) => project.id === snapshot.activeProjectId) ??
@@ -2098,16 +2169,16 @@ export default function App() {
   const deleteProjectTarget = deleteProjectId
     ? snapshot.projects.find((project) => project.id === deleteProjectId)
     : undefined;
-  const deleteTaskTarget = deleteTaskId
-    ? snapshot.tasks.find((task) => task.id === deleteTaskId)
-    : undefined;
+  const deleteTaskTarget =
+    deleteTaskId
+      ? (snapshot.tasks.find((task) => task.id === deleteTaskId) ??
+        archivedTasks.find((task) => task.id === deleteTaskId))
+      : undefined;
   const deleteArchivedChatsTarget = deleteArchivedChatsProjectId
     ? snapshot.projects.find((project) => project.id === deleteArchivedChatsProjectId)
     : undefined;
   const deleteArchivedChatsCount = deleteArchivedChatsProjectId
-    ? snapshot.tasks.filter(
-        (task) => task.projectId === deleteArchivedChatsProjectId && task.archived,
-      ).length
+    ? archivedTasks.filter((task) => task.projectId === deleteArchivedChatsProjectId).length
     : 0;
   const configuredDefaultRuntime = localSettings["models.defaultRuntime"];
   const favoriteRuntime =
@@ -2372,8 +2443,18 @@ export default function App() {
   );
 
   const selectTask = (taskId: string) => {
-    const targetTask = snapshot.tasks.find((task) => task.id === taskId);
+    const targetTask =
+      snapshot.tasks.find((task) => task.id === taskId) ??
+      archivedTasks.find((task) => task.id === taskId);
     if (!targetTask || switchingTaskId === taskId) return;
+    // Opening an archived chat keeps it out of the live sidebar list but needs
+    // a snapshot row so projection/git hydration can key off activeTaskId.
+    if (targetTask.archived && !snapshot.tasks.some((task) => task.id === taskId)) {
+      setSnapshot((current) => ({
+        ...current,
+        tasks: [...current.tasks, targetTask],
+      }));
+    }
     if (taskId === snapshot.activeTaskId) {
       setScreen("workspace");
       return;
@@ -3242,6 +3323,76 @@ export default function App() {
     }));
   };
 
+  const evictTaskHotCaches = (taskId: string, projectId?: string) => {
+    taskProjectionCache.current.delete(taskId);
+    taskGitCache.current.delete(taskId);
+    taskGitRefreshedAt.current.delete(taskId);
+    taskGitInvalidatedPaths.current.delete(taskId);
+    setSnapshot((current) => {
+      const { [taskId]: _context, ...taskContexts } = current.taskContexts;
+      const { [taskId]: _center, ...centerViewByTask } = current.centerViewByTask;
+      const { [taskId]: _files, ...openFilesByTask } = current.openFilesByTask;
+      const lastTaskByProject = { ...current.lastTaskByProject };
+      if (projectId && lastTaskByProject[projectId] === taskId) {
+        const replacement = current.tasks.find(
+          (task) =>
+            task.id !== taskId &&
+            task.projectId === projectId &&
+            !task.archived &&
+            !task.parentId,
+        );
+        if (replacement) lastTaskByProject[projectId] = replacement.id;
+        else delete lastTaskByProject[projectId];
+      }
+      return {
+        ...current,
+        taskContexts,
+        centerViewByTask,
+        openFilesByTask,
+        lastTaskByProject,
+      };
+    });
+  };
+
+  const ensureArchivedCatalog = useCallback(
+    async (options?: { reset?: boolean; more?: boolean }) => {
+      if (archivedLoading) return;
+      if (options?.more) {
+        if (!archivedNextCursor) return;
+      } else if (!options?.reset && archivedCatalogReady.current) {
+        return;
+      }
+      setArchivedLoading(true);
+      try {
+        if (options?.reset) {
+          archivedCatalogReady.current = false;
+          setArchivedTasks([]);
+          setArchivedNextCursor(undefined);
+          setArchivedTotal(0);
+        }
+        const page = await bridge.listArchivedTasks({
+          cursor: options?.more ? archivedNextCursor : undefined,
+          limit: 50,
+        });
+        setArchivedTasks((current) => {
+          if (options?.more) {
+            const seen = new Set(current.map((task) => task.id));
+            return [...current, ...page.tasks.filter((task) => !seen.has(task.id))];
+          }
+          return page.tasks;
+        });
+        setArchivedNextCursor(page.nextCursor);
+        setArchivedTotal(page.total);
+        archivedCatalogReady.current = true;
+      } catch (error) {
+        setOperationError(formatBridgeError(error, "Could not load archived chats"));
+      } finally {
+        setArchivedLoading(false);
+      }
+    },
+    [archivedLoading, archivedNextCursor],
+  );
+
   const updateTaskMetadata = async (
     taskId: string,
     patch: { title?: string; pinned?: boolean; archived?: boolean },
@@ -3250,40 +3401,76 @@ export default function App() {
     setTaskActionBusyId(taskId);
     setOperationError("");
     try {
+      const existing =
+        snapshot.tasks.find((task) => task.id === taskId) ??
+        archivedTasks.find((task) => task.id === taskId);
       const updated = await bridge.updateTaskMetadata(taskId, patch);
-      const nextTasks = snapshot.tasks.map((task) =>
-        task.id === taskId
-          ? {
-              ...task,
-              title: updated.title,
-              pinned: updated.pinned,
-              archived: updated.archived,
-              updatedAt: updated.updatedAt,
-            }
-          : task,
-      );
-      setSnapshot((current) => ({ ...current, tasks: nextTasks }));
-      if (updated.archived && snapshot.activeTaskId === taskId) {
-        const archivedTask = nextTasks.find((task) => task.id === taskId);
-        const replacement = nextTasks.find(
-          (task) => task.projectId === archivedTask?.projectId && !task.archived,
+      const nextSummary: TaskSummary = {
+        ...(existing ?? {
+          id: taskId,
+          projectId: snapshot.activeProjectId,
+          title: updated.title,
+          status: "draft" as const,
+          runtime: "codex" as const,
+          model: "",
+          updatedAt: updated.updatedAt,
+        }),
+        title: updated.title,
+        pinned: updated.pinned,
+        archived: updated.archived,
+        updatedAt: updated.updatedAt,
+      };
+      if (updated.archived) {
+        evictTaskHotCaches(taskId, nextSummary.projectId);
+        setSnapshot((current) => ({
+          ...current,
+          tasks: current.tasks.filter((task) => task.id !== taskId),
+        }));
+        setArchivedTotal((total) =>
+          archivedTasks.some((task) => task.id === taskId) ? total : total + 1,
         );
-        if (replacement) void selectTask(replacement.id);
-        else if (archivedTask) {
-          const empty = createEmptySnapshot();
-          setRuntimeState(null);
-          setCenterView("task");
-          setActiveFileKey("");
-          setSnapshot((current) => ({
-            ...current,
-            activeProjectId: archivedTask.projectId,
-            activeTaskId: "",
-            transcript: [],
-            git: empty.git,
-            usage: empty.usage,
-            children: [],
-          }));
+        setArchivedTasks((current) => {
+          const without = current.filter((task) => task.id !== taskId);
+          return [nextSummary, ...without].sort(
+            (a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt),
+          );
+        });
+        if (snapshot.activeTaskId === taskId) {
+          const replacement = snapshot.tasks.find(
+            (task) =>
+              task.id !== taskId &&
+              task.projectId === nextSummary.projectId &&
+              !task.archived &&
+              !task.parentId,
+          );
+          if (replacement) void selectTask(replacement.id);
+          else {
+            const empty = createEmptySnapshot();
+            setRuntimeState(null);
+            setCenterView("task");
+            setActiveFileKey("");
+            setSnapshot((current) => ({
+              ...current,
+              activeProjectId: nextSummary.projectId,
+              activeTaskId: "",
+              transcript: [],
+              git: empty.git,
+              usage: empty.usage,
+              children: [],
+            }));
+          }
         }
+      } else {
+        taskProjectionCache.current.delete(taskId);
+        setArchivedTasks((current) => current.filter((task) => task.id !== taskId));
+        setArchivedTotal((total) => Math.max(0, total - 1));
+        setSnapshot((current) => ({
+          ...current,
+          tasks: [
+            { ...nextSummary, archived: false },
+            ...current.tasks.filter((task) => task.id !== taskId),
+          ],
+        }));
       }
     } catch (error) {
       setOperationError(error instanceof Error ? error.message : "Could not update that chat");
@@ -3375,6 +3562,85 @@ export default function App() {
     }
   };
 
+  // Sidebar callbacks must keep stable identities across `runtimeState` stream
+  // frames; otherwise memo(TaskSidebar) still re-renders every RAF.
+  const sidebarHandlersRef = useRef({
+    selectProject,
+    selectTask,
+    newTask,
+    ensureArchivedCatalog,
+    updateTaskMetadata,
+    forkTask,
+    updateProjectMetadata,
+  });
+  sidebarHandlersRef.current = {
+    selectProject,
+    selectTask,
+    newTask,
+    ensureArchivedCatalog,
+    updateTaskMetadata,
+    forkTask,
+    updateProjectMetadata,
+  };
+  const handleSidebarSelectProject = useCallback((projectId: string) => {
+    sidebarHandlersRef.current.selectProject(projectId);
+  }, []);
+  const handleSidebarSelectTask = useCallback((taskId: string) => {
+    void sidebarHandlersRef.current.selectTask(taskId);
+  }, []);
+  const handleSidebarNewTask = useCallback(() => {
+    void sidebarHandlersRef.current.newTask();
+  }, []);
+  const handleSidebarNewTaskInProject = useCallback((projectId: string) => {
+    void sidebarHandlersRef.current.newTask(projectId);
+  }, []);
+  const handleSidebarEnsureArchived = useCallback(() => {
+    void sidebarHandlersRef.current.ensureArchivedCatalog();
+  }, []);
+  const handleSidebarLoadMoreArchived = useCallback(() => {
+    void sidebarHandlersRef.current.ensureArchivedCatalog({ more: true });
+  }, []);
+  const handleSidebarUpdateTask = useCallback(
+    (taskId: string, patch: { title?: string; pinned?: boolean; archived?: boolean }) => {
+      void sidebarHandlersRef.current.updateTaskMetadata(taskId, patch);
+    },
+    [],
+  );
+  const handleSidebarCopyTask = useCallback((taskId: string) => {
+    void sidebarHandlersRef.current.forkTask(taskId);
+  }, []);
+  const handleSidebarUpdateProject = useCallback(
+    (projectId: string, patch: { pinned?: boolean; archived?: boolean }) => {
+      void sidebarHandlersRef.current.updateProjectMetadata(projectId, patch);
+    },
+    [],
+  );
+  const handleSidebarDeleteProject = useCallback((projectId: string) => {
+    setDeleteProjectError("");
+    setDeleteProjectId(projectId);
+  }, []);
+  const handleSidebarDeleteTask = useCallback((taskId: string) => {
+    setDeleteTaskError("");
+    setDeleteTaskId(taskId);
+  }, []);
+  const handleSidebarDeleteArchivedChats = useCallback((projectId: string) => {
+    setDeleteArchivedChatsError("");
+    void sidebarHandlersRef.current.ensureArchivedCatalog().then(() =>
+      setDeleteArchivedChatsProjectId(projectId),
+    );
+  }, []);
+  const handleSidebarOpenProject = useCallback(() => setAddProjectOpen(true), []);
+  const handleSidebarOpenSettings = useCallback(() => setScreen("settings"), []);
+  const handleSidebarSearchMessages = useCallback(
+    (query: string, options?: { includeArchived?: boolean }) =>
+      bridge.searchTaskMessages(query, 40, options),
+    [],
+  );
+  const handleSidebarResize = useCallback((delta: number) => {
+    setSidebarWidth((current) => clampDimension(current + delta, 220, 420));
+  }, []);
+  const metadataActionsEnabled = useMemo(() => bridge.supportsTaskMetadata(), []);
+
   const confirmDeleteProject = async (scope: DeleteProjectScope) => {
     if (!deleteProjectId || deleteProjectBusy) return;
     setDeleteProjectBusy(true);
@@ -3431,10 +3697,13 @@ export default function App() {
     setDeleteTaskError("");
     setOperationError("");
     const removedId = deleteTaskId;
-    const removed = snapshot.tasks.find((task) => task.id === removedId);
+    const removed =
+      snapshot.tasks.find((task) => task.id === removedId) ??
+      archivedTasks.find((task) => task.id === removedId);
     const wasActive = snapshot.activeTaskId === removedId;
     try {
       await bridge.removeTask(removedId);
+      evictTaskHotCaches(removedId, removed?.projectId);
       const remainingTasks = snapshot.tasks.filter((task) => task.id !== removedId);
       const nextActiveTaskId = wasActive
         ? (remainingTasks.find(
@@ -3460,6 +3729,10 @@ export default function App() {
         ),
         queuedMessages: current.queuedMessages.filter((message) => message.taskId !== removedId),
       }));
+      if (removed?.archived) {
+        setArchivedTasks((current) => current.filter((task) => task.id !== removedId));
+        setArchivedTotal((total) => Math.max(0, total - 1));
+      }
       setDeleteTaskId("");
       if (wasActive) setRuntimeState(null);
     } catch (error) {
@@ -3477,25 +3750,32 @@ export default function App() {
     setDeleteArchivedChatsError("");
     setOperationError("");
     const projectId = deleteArchivedChatsProjectId;
-    const targets = snapshot.tasks.filter((task) => task.projectId === projectId && task.archived);
-    const wasActive = targets.some((task) => task.id === snapshot.activeTaskId);
     try {
-      for (const task of targets) {
+      const projectTargets: TaskSummary[] = [];
+      let cursor: string | undefined;
+      do {
+        const page = await bridge.listArchivedTasks({ cursor, limit: 100 });
+        projectTargets.push(...page.tasks.filter((task) => task.projectId === projectId));
+        cursor = page.nextCursor;
+      } while (cursor);
+      const wasActive = projectTargets.some((task) => task.id === snapshot.activeTaskId);
+      for (const task of projectTargets) {
         await bridge.removeTask(task.id);
+        evictTaskHotCaches(task.id, task.projectId);
       }
-      const removedIds = new Set(targets.map((task) => task.id));
-      const remainingTasks = snapshot.tasks.filter((task) => !removedIds.has(task.id));
+      const removedIds = new Set(projectTargets.map((task) => task.id));
+      const remainingLive = snapshot.tasks.filter((task) => !removedIds.has(task.id));
       const nextActiveTaskId = wasActive
-        ? (remainingTasks.find(
+        ? (remainingLive.find(
             (task) => task.projectId === projectId && !task.archived && !task.parentId,
           )?.id ??
-          remainingTasks.find((task) => !task.archived && !task.parentId)?.id ??
+          remainingLive.find((task) => !task.archived && !task.parentId)?.id ??
           "")
         : snapshot.activeTaskId;
       const empty = createEmptySnapshot();
       setSnapshot((current) => ({
         ...current,
-        tasks: remainingTasks,
+        tasks: remainingLive,
         activeTaskId: nextActiveTaskId,
         transcript: nextActiveTaskId === current.activeTaskId ? current.transcript : [],
         git: nextActiveTaskId === current.activeTaskId ? current.git : empty.git,
@@ -3508,6 +3788,8 @@ export default function App() {
           (message) => !removedIds.has(message.taskId),
         ),
       }));
+      setArchivedTasks((current) => current.filter((task) => !removedIds.has(task.id)));
+      setArchivedTotal((total) => Math.max(0, total - removedIds.size));
       setDeleteArchivedChatsProjectId("");
       if (wasActive) setRuntimeState(null);
     } catch (error) {
@@ -3534,66 +3816,79 @@ export default function App() {
     return () => window.clearInterval(id);
   }, []);
   useEffect(() => {
-    if (retentionSweepBusy.current) return;
-    const tasks = snapshot.tasks;
-    if (!tasks.length) return;
+    if (retentionSweepBusy.current || workspaceLoading) return;
+    const liveTasks = snapshot.tasks.filter((task) => !task.archived);
     const now = Date.now();
     const nowIso = new Date(now).toISOString();
-    // Reconcile archival stamps first: archived chats keep or gain a stamp,
-    // restored or removed chats lose theirs. A pass that changes stamps stops
-    // there and lets the re-run act on the persisted result.
-    const stamps = readArchivedAtMap(localSettings[ARCHIVED_AT_SETTING_KEY]);
-    const nextStamps: Record<string, string> = {};
-    let stampsChanged = false;
-    for (const task of tasks) {
-      if (!task.archived) continue;
-      const existing = stamps[task.id];
-      nextStamps[task.id] = existing ?? nowIso;
-      if (!existing) stampsChanged = true;
-    }
-    if (Object.keys(stamps).length !== Object.keys(nextStamps).length) stampsChanged = true;
-    if (stampsChanged) {
-      setLocalSettings((current) => ({ ...current, [ARCHIVED_AT_SETTING_KEY]: nextStamps }));
-      void bridge
-        .setSetting(`settings.${ARCHIVED_AT_SETTING_KEY}`, nextStamps)
-        .catch(() => undefined);
-      return;
-    }
     const readChoice = (key: string) => {
       const value = localSettings[key];
       return typeof value === "string" ? value : "never";
     };
     const archiveMs = ARCHIVE_RETENTION_MS[readChoice("archive.autoArchiveAfter")];
     const deleteMs = ARCHIVE_RETENTION_MS[readChoice("archive.autoDeleteAfter")];
-    if (!archiveMs && !deleteMs) return;
-    const idle = (task: TaskSummary) =>
-      task.id !== snapshot.activeTaskId &&
-      !task.parentId &&
-      !RETENTION_BUSY_STATUSES.has(task.status);
-    const toArchive =
-      archiveMs && bridge.supportsTaskMetadata()
-        ? tasks.filter((task) => {
-            if (task.archived || task.pinned || !idle(task)) return false;
-            const updatedAt = Date.parse(task.updatedAt);
-            return Number.isFinite(updatedAt) && now - updatedAt > archiveMs;
-          })
-        : [];
-    const toDelete = deleteMs
-      ? tasks.filter((task) => {
-          if (!task.archived || !idle(task)) return false;
-          const archivedAt = Date.parse(nextStamps[task.id] ?? "");
-          return Number.isFinite(archivedAt) && now - archivedAt > deleteMs;
-        })
-      : [];
-    if (!toArchive.length && !toDelete.length) return;
+    if (!archiveMs && !deleteMs && !Object.keys(readArchivedAtMap(localSettings[ARCHIVED_AT_SETTING_KEY])).length) {
+      return;
+    }
     retentionSweepBusy.current = true;
     void (async () => {
       try {
+        // Archived chats live outside the hot snapshot; page them for stamps
+        // and auto-delete. Live auto-archive still uses the hot task list.
+        const archived: TaskSummary[] = [];
+        let cursor: string | undefined;
+        do {
+          const page = await bridge.listArchivedTasks({ cursor, limit: 100 });
+          archived.push(...page.tasks);
+          cursor = page.nextCursor;
+        } while (cursor);
+
+        const stamps = readArchivedAtMap(localSettings[ARCHIVED_AT_SETTING_KEY]);
+        const nextStamps: Record<string, string> = {};
+        let stampsChanged = false;
+        for (const task of archived) {
+          const existing = stamps[task.id];
+          nextStamps[task.id] = existing ?? nowIso;
+          if (!existing) stampsChanged = true;
+        }
+        if (Object.keys(stamps).length !== Object.keys(nextStamps).length) {
+          stampsChanged = true;
+        }
+        if (stampsChanged) {
+          setLocalSettings((current) => ({ ...current, [ARCHIVED_AT_SETTING_KEY]: nextStamps }));
+          await bridge
+            .setSetting(`settings.${ARCHIVED_AT_SETTING_KEY}`, nextStamps)
+            .catch(() => undefined);
+          return;
+        }
+
+        if (!archiveMs && !deleteMs) return;
+        const idle = (task: TaskSummary) =>
+          task.id !== snapshot.activeTaskId &&
+          !task.parentId &&
+          !RETENTION_BUSY_STATUSES.has(task.status);
+        const toArchive =
+          archiveMs && bridge.supportsTaskMetadata()
+            ? liveTasks.filter((task) => {
+                if (task.pinned || !idle(task)) return false;
+                const updatedAt = Date.parse(task.updatedAt);
+                return Number.isFinite(updatedAt) && now - updatedAt > archiveMs;
+              })
+            : [];
+        const toDelete = deleteMs
+          ? archived.filter((task) => {
+              if (!idle(task)) return false;
+              const archivedAt = Date.parse(nextStamps[task.id] ?? "");
+              return Number.isFinite(archivedAt) && now - archivedAt > deleteMs;
+            })
+          : [];
+        if (!toArchive.length && !toDelete.length) return;
+
         const archivedIds = new Set<string>();
         for (const task of toArchive) {
           try {
             await bridge.updateTaskMetadata(task.id, { archived: true });
             archivedIds.add(task.id);
+            evictTaskHotCaches(task.id, task.projectId);
           } catch {
             // Leave it for the next sweep; retention must never surface errors.
           }
@@ -3603,6 +3898,7 @@ export default function App() {
           try {
             await bridge.removeTask(task.id);
             removedIds.add(task.id);
+            evictTaskHotCaches(task.id, task.projectId);
           } catch {
             // Same: skip and retry on a later pass.
           }
@@ -3610,9 +3906,9 @@ export default function App() {
         if (archivedIds.size || removedIds.size) {
           setSnapshot((current) => ({
             ...current,
-            tasks: current.tasks
-              .filter((task) => !removedIds.has(task.id))
-              .map((task) => (archivedIds.has(task.id) ? { ...task, archived: true } : task)),
+            tasks: current.tasks.filter(
+              (task) => !removedIds.has(task.id) && !archivedIds.has(task.id),
+            ),
             composerDrafts: current.composerDrafts.filter(
               (draft) => draft.owner.kind !== "task" || !removedIds.has(draft.owner.taskId),
             ),
@@ -3620,6 +3916,15 @@ export default function App() {
               (message) => !removedIds.has(message.taskId),
             ),
           }));
+          setArchivedTasks((current) => [
+            ...toArchive
+              .filter((task) => archivedIds.has(task.id))
+              .map((task) => ({ ...task, archived: true as const })),
+            ...current.filter((task) => !removedIds.has(task.id) && !archivedIds.has(task.id)),
+          ]);
+          setArchivedTotal((total) =>
+            Math.max(0, total + archivedIds.size - removedIds.size),
+          );
         }
         if (removedIds.size) {
           const prunedStamps = Object.fromEntries(
@@ -3634,7 +3939,7 @@ export default function App() {
         retentionSweepBusy.current = false;
       }
     })();
-  }, [snapshot.tasks, snapshot.activeTaskId, localSettings, retentionTick]);
+  }, [snapshot.tasks, snapshot.activeTaskId, localSettings, retentionTick, workspaceLoading]);
 
   const selectFile = (file: DiffFile) => {
     setReviewLoadError(null);
@@ -4989,7 +5294,7 @@ export default function App() {
                 runtimes={snapshot.runtimes}
                 usage={displayedUsage}
                 projects={snapshot.projects}
-                tasks={rootTasks}
+                tasks={sidebarTasks}
                 taskActionBusyId={taskActionBusyId}
                 onOpenTask={(taskId) => {
                   setScreen("workspace");
@@ -5009,8 +5314,14 @@ export default function App() {
                 }}
                 onDeleteArchivedChats={(projectId) => {
                   setDeleteArchivedChatsError("");
-                  setDeleteArchivedChatsProjectId(projectId);
+                  void ensureArchivedCatalog().then(() =>
+                    setDeleteArchivedChatsProjectId(projectId),
+                  );
                 }}
+                onEnsureArchived={() => void ensureArchivedCatalog()}
+                onLoadMoreArchived={() => void ensureArchivedCatalog({ more: true })}
+                archivedHasMore={Boolean(archivedNextCursor)}
+                archivedLoading={archivedLoading}
                 onChangePreferences={setTheme}
                 onResetPreferences={resetTheme}
                 runtimeActionRequest={runtimeActionRequest}
@@ -5070,37 +5381,31 @@ export default function App() {
                   >
                     <TaskSidebar
                       projects={snapshot.projects}
-                      tasks={rootTasks}
+                      tasks={sidebarTasks}
+                      archivedTotal={archivedTotal}
+                      archivedLoading={archivedLoading}
+                      archivedHasMore={Boolean(archivedNextCursor)}
+                      onEnsureArchived={handleSidebarEnsureArchived}
+                      onLoadMoreArchived={handleSidebarLoadMoreArchived}
                       activeProjectId={snapshot.activeProjectId}
                       activeTaskId={snapshot.activeTaskId}
-                      metadataActionsEnabled={bridge.supportsTaskMetadata()}
+                      metadataActionsEnabled={metadataActionsEnabled}
                       taskActionBusyId={taskActionBusyId}
-                      onSearchMessages={(query) => bridge.searchTaskMessages(query, 40)}
-                      onSelectProject={selectProject}
-                      onSelectTask={(taskId) => void selectTask(taskId)}
-                      onNewTask={() => void newTask()}
-                      onNewTaskInProject={(projectId) => void newTask(projectId)}
-                      onOpenProject={() => setAddProjectOpen(true)}
+                      onSearchMessages={handleSidebarSearchMessages}
+                      onSelectProject={handleSidebarSelectProject}
+                      onSelectTask={handleSidebarSelectTask}
+                      onNewTask={handleSidebarNewTask}
+                      onNewTaskInProject={handleSidebarNewTaskInProject}
+                      onOpenProject={handleSidebarOpenProject}
                       openingProject={openingProject}
-                      onUpdateTask={(taskId, patch) => void updateTaskMetadata(taskId, patch)}
-                      onCopyTask={(taskId) => void forkTask(taskId)}
-                      onUpdateProject={(projectId, patch) => void updateProjectMetadata(projectId, patch)}
-                      onDeleteProject={(projectId) => {
-                        setDeleteProjectError("");
-                        setDeleteProjectId(projectId);
-                      }}
-                      onDeleteTask={(taskId) => {
-                        setDeleteTaskError("");
-                        setDeleteTaskId(taskId);
-                      }}
-                      onDeleteArchivedChats={(projectId) => {
-                        setDeleteArchivedChatsError("");
-                        setDeleteArchivedChatsProjectId(projectId);
-                      }}
-                      onOpenSettings={() => setScreen("settings")}
-                      onResize={(delta) =>
-                        setSidebarWidth((current) => clampDimension(current + delta, 220, 420))
-                      }
+                      onUpdateTask={handleSidebarUpdateTask}
+                      onCopyTask={handleSidebarCopyTask}
+                      onUpdateProject={handleSidebarUpdateProject}
+                      onDeleteProject={handleSidebarDeleteProject}
+                      onDeleteTask={handleSidebarDeleteTask}
+                      onDeleteArchivedChats={handleSidebarDeleteArchivedChats}
+                      onOpenSettings={handleSidebarOpenSettings}
+                      onResize={handleSidebarResize}
                     />
                   </motion.div>
                 ) : null}
@@ -5183,6 +5488,12 @@ export default function App() {
                                 events={projectedTranscript}
                                 scrollContainerRef={transcriptScrollRef}
                                 running={nativeTurnRunning || optimisticTurnStarting}
+                                hasMoreOlder={runtimeState?.hasMoreOlder}
+                                onLoadOlder={
+                                  activeTask
+                                    ? () => void loadOlderTaskProjection(activeTask.id)
+                                    : undefined
+                                }
                                 modelForEvent={
                                   localSettings["transcript.showModel"] !== false
                                     ? (event) =>

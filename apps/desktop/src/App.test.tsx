@@ -269,7 +269,12 @@ describe("AI Integrator desktop workspace", () => {
     );
 
     // Demo data starts with nothing archived; the list explains itself.
-    expect(screen.getByText(/Nothing archived/i)).toBeInTheDocument();
+    expect(await screen.findByText(/Nothing archived/i)).toBeInTheDocument();
+
+    // Restore the default so later tests are not left with an active retention
+    // sweep from this settings change.
+    fireEvent.click(screen.getByRole("button", { name: "Auto-delete archived chats" }));
+    fireEvent.click(screen.getByRole("option", { name: "Never" }));
   });
 
   it("uses each selected model's advertised effort list in Settings", async () => {

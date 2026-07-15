@@ -48,6 +48,8 @@ const FOLLOW_THRESHOLD_PX = 96;
 const VIRTUALIZATION_THRESHOLD = 250;
 const MINIMUM_ROW_HEIGHT_PX = 26;
 const OVERSCAN_VIEWPORTS = 1.5;
+/** Max time the open-settle lock may suppress scroll-driven follow/pagination. */
+const OPEN_SETTLE_TIMEOUT_MS = 150;
 
 interface TranscriptProps {
   events: TranscriptEvent[];
@@ -56,6 +58,10 @@ interface TranscriptProps {
   /** Emergency fallback for platform-specific rendering issues. */
   virtualizationEnabled?: boolean;
   running?: boolean;
+  /** True when older hydrated pages remain above the loaded window. */
+  hasMoreOlder?: boolean;
+  /** Fetch the next older page when the user scrolls near the top. */
+  onLoadOlder?: () => void;
   /** The scroll viewport owned by the workspace shell. */
   scrollContainerRef?: React.RefObject<HTMLDivElement | null>;
   /** Moves a selected answer into the caller-owned composer draft. */
@@ -78,6 +84,8 @@ interface TranscriptProps {
   /** Selection-to-chat from transcript-embedded diffs. */
   onAddDiffSelection?: (payload: DiffSelectionPayload) => void;
 }
+
+const LOAD_OLDER_THRESHOLD_PX = 96;
 
 interface AttachmentPreviewCache {
   values: Map<string, string | null>;
@@ -792,6 +800,8 @@ export function Transcript({
   ownerKey,
   virtualizationEnabled: virtualizationAllowed = true,
   running = false,
+  hasMoreOlder = false,
+  onLoadOlder,
   scrollContainerRef,
   onAskAbout,
   modelForEvent,
@@ -832,12 +842,27 @@ export function Transcript({
   const eventsRef = useRef(events);
   eventsRef.current = events;
   const renderedEventCountRef = useRef(events.length);
+  const openIntentRef = useRef<"follow" | "restore">(
+    initialViewportState?.following === false && initialViewportState.anchor
+      ? "restore"
+      : "follow",
+  );
+  const openSettledRef = useRef(false);
+  const sawNonEmptyRef = useRef(events.length > 0);
+  const openSettleTimeoutRef = useRef<number | undefined>(undefined);
+  const paginationArmedRef = useRef(false);
+  const loadOlderRequestedRef = useRef(false);
+  const pendingPrependAnchorRef = useRef<{
+    scrollHeight: number;
+    scrollTop: number;
+  } | null>(null);
   const shouldFollowLatestRef = useRef(initialViewportState?.following ?? true);
   const previousEventsRef = useRef<TranscriptEvent[] | null>(null);
   const previousRunningRef = useRef(running);
   const previousLatestUserIdRef = useRef<string | undefined>(undefined);
   const scheduledFrameRef = useRef<number | undefined>(undefined);
   const restoreFrameRef = useRef<number | undefined>(undefined);
+  const prependAnchorFrameRef = useRef<number | undefined>(undefined);
   const saveViewportTimerRef = useRef<number | undefined>(undefined);
   const viewportStateRef = useRef<TranscriptViewportState>(
     initialViewportState ?? {
@@ -971,9 +996,31 @@ export function Transcript({
     }
     saveViewportTimerRef.current = window.setTimeout(() => {
       saveViewportTimerRef.current = undefined;
+      // Open-settle scroll noise must not persist a false Reading state.
+      if (!openSettledRef.current && openIntentRef.current === "follow") return;
       writeTranscriptViewportState(ownerKey, viewportStateRef.current);
     }, 180);
   }, [ownerKey]);
+
+  const markOpenSettled = useCallback(() => {
+    if (openSettledRef.current) return;
+    openSettledRef.current = true;
+    if (openSettleTimeoutRef.current !== undefined) {
+      window.clearTimeout(openSettleTimeoutRef.current);
+      openSettleTimeoutRef.current = undefined;
+    }
+    if (openIntentRef.current === "follow") {
+      shouldFollowLatestRef.current = true;
+      viewportStateRef.current.following = true;
+      queueViewportSave();
+    }
+  }, [queueViewportSave]);
+
+  const armPagination = useCallback(() => {
+    paginationArmedRef.current = true;
+    // Trusted user input ends settle early so intentional scroll-away is not swallowed.
+    markOpenSettled();
+  }, [markOpenSettled]);
 
   const captureVisibleAnchor = useCallback((): TranscriptAnchor | undefined => {
     const container = scrollContainerRef?.current;
@@ -1121,17 +1168,48 @@ export function Transcript({
     // attached, and reading it now would drop the initial scroll-to-bottom.
     scheduledFrameRef.current = window.requestAnimationFrame(() => {
       scheduledFrameRef.current = undefined;
-      if (shouldFollowLatestRef.current && scrollContainerRef?.current) {
-        scrollToLatest(scrollContainerRef.current);
+      // During open settle, prefer declared follow intent over any scroll-derived flag.
+      if (
+        !shouldFollowLatestRef.current &&
+        !(openSettledRef.current === false && openIntentRef.current === "follow")
+      ) {
+        return;
+      }
+      const container = scrollContainerRef?.current;
+      if (!container) return;
+      if (openSettledRef.current === false && openIntentRef.current === "follow") {
+        shouldFollowLatestRef.current = true;
+      }
+      scrollToLatest(container);
+      if (eventsRef.current.length === 0 || container.scrollHeight <= 0) return;
+      const distanceFromLatest =
+        container.scrollHeight - container.scrollTop - container.clientHeight;
+      if (distanceFromLatest <= FOLLOW_THRESHOLD_PX) {
+        markOpenSettled();
       }
     });
-  }, [scrollContainerRef]);
+  }, [markOpenSettled, scrollContainerRef]);
+
+  useEffect(() => {
+    // Reset pagination latch only when the owned transcript changes — not when
+    // an older page prepends (that would cascade while still parked at top).
+    loadOlderRequestedRef.current = false;
+    paginationArmedRef.current = false;
+  }, [ownerKey]);
+
+  useEffect(() => {
+    if (hasMoreOlder === false) loadOlderRequestedRef.current = false;
+  }, [hasMoreOlder]);
 
   useEffect(() => {
     const container = scrollContainerRef?.current;
     if (!container) return;
 
     const handleScroll = () => {
+      // Shared-shell open race: residual scrollTop / clamp fires scroll before
+      // follow/restore lands. Ignore Follow/Reading and load-older until settled.
+      if (!openSettledRef.current) return;
+
       const distanceFromLatest =
         container.scrollHeight - container.scrollTop - container.clientHeight;
       const shouldFollow = distanceFromLatest <= FOLLOW_THRESHOLD_PX;
@@ -1141,15 +1219,125 @@ export function Transcript({
       if (!shouldFollow) {
         viewportStateRef.current.anchor = captureVisibleAnchor() ?? viewportStateRef.current.anchor;
       }
+      // Hysteresis: only allow another older-page request after leaving the top band.
+      if (loadOlderRequestedRef.current && container.scrollTop > LOAD_OLDER_THRESHOLD_PX) {
+        loadOlderRequestedRef.current = false;
+      }
+      if (
+        hasMoreOlder &&
+        onLoadOlder &&
+        paginationArmedRef.current &&
+        !loadOlderRequestedRef.current &&
+        container.scrollTop <= LOAD_OLDER_THRESHOLD_PX
+      ) {
+        pendingPrependAnchorRef.current = {
+          scrollHeight: container.scrollHeight,
+          scrollTop: container.scrollTop,
+        };
+        loadOlderRequestedRef.current = true;
+        onLoadOlder();
+      }
       queueViewportSave();
+    };
+
+    const handleWheel = (event: WheelEvent) => {
+      if (event.deltaY < 0) armPagination();
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "PageUp" || event.key === "Home" || event.key === "ArrowUp") {
+        armPagination();
+      }
+    };
+    let lastTouchY: number | undefined;
+    const handleTouchStart = (event: TouchEvent) => {
+      lastTouchY = event.touches[0]?.clientY;
+    };
+    const handleTouchMove = (event: TouchEvent) => {
+      const y = event.touches[0]?.clientY;
+      if (lastTouchY !== undefined && y !== undefined && y > lastTouchY) {
+        armPagination();
+      }
+      lastTouchY = y;
     };
 
     // Follow state changes only on real scroll events. Probing the position
     // here would read scrollTop 0 on a freshly mounted, already-populated
     // chat and misfile "just opened" as "scrolled away from the latest".
     container.addEventListener("scroll", handleScroll, { passive: true });
-    return () => container.removeEventListener("scroll", handleScroll);
-  }, [captureVisibleAnchor, queueViewportSave, scrollContainerRef]);
+    container.addEventListener("wheel", handleWheel, { passive: true });
+    container.addEventListener("keydown", handleKeyDown);
+    container.addEventListener("touchstart", handleTouchStart, { passive: true });
+    container.addEventListener("touchmove", handleTouchMove, { passive: true });
+    return () => {
+      container.removeEventListener("scroll", handleScroll);
+      container.removeEventListener("wheel", handleWheel);
+      container.removeEventListener("keydown", handleKeyDown);
+      container.removeEventListener("touchstart", handleTouchStart);
+      container.removeEventListener("touchmove", handleTouchMove);
+    };
+  }, [
+    armPagination,
+    captureVisibleAnchor,
+    hasMoreOlder,
+    onLoadOlder,
+    queueViewportSave,
+    scrollContainerRef,
+  ]);
+
+  useLayoutEffect(() => {
+    const pending = pendingPrependAnchorRef.current;
+    const container = scrollContainerRef?.current;
+    if (!pending || !container) return;
+
+    const apply = () => {
+      const node = scrollContainerRef?.current;
+      if (!node || pendingPrependAnchorRef.current !== pending) return;
+      pendingPrependAnchorRef.current = null;
+      node.scrollTop =
+        pending.scrollTop + Math.max(0, node.scrollHeight - pending.scrollHeight);
+    };
+
+    if (prependAnchorFrameRef.current !== undefined) {
+      window.cancelAnimationFrame(prependAnchorFrameRef.current);
+      prependAnchorFrameRef.current = undefined;
+    }
+    if (virtualizationEnabled) {
+      prependAnchorFrameRef.current = window.requestAnimationFrame(() => {
+        prependAnchorFrameRef.current = window.requestAnimationFrame(() => {
+          prependAnchorFrameRef.current = undefined;
+          apply();
+        });
+      });
+    } else {
+      apply();
+    }
+  }, [events, scrollContainerRef, virtualizationEnabled]);
+
+  useEffect(() => {
+    if (openSettledRef.current || events.length === 0) return;
+    if (openSettleTimeoutRef.current !== undefined) {
+      window.clearTimeout(openSettleTimeoutRef.current);
+    }
+    openSettleTimeoutRef.current = window.setTimeout(() => {
+      openSettleTimeoutRef.current = undefined;
+      if (openSettledRef.current) return;
+      if (openIntentRef.current === "follow") {
+        shouldFollowLatestRef.current = true;
+        viewportStateRef.current.following = true;
+        const container = scrollContainerRef?.current;
+        if (container && eventsRef.current.length > 0) {
+          scrollToLatest(container);
+        }
+      }
+      markOpenSettled();
+    }, OPEN_SETTLE_TIMEOUT_MS);
+    return () => {
+      if (openSettleTimeoutRef.current !== undefined) {
+        window.clearTimeout(openSettleTimeoutRef.current);
+        openSettleTimeoutRef.current = undefined;
+      }
+    };
+  }, [events.length, markOpenSettled, scrollContainerRef]);
 
   useEffect(() => {
     const content = contentRef.current;
@@ -1197,9 +1385,17 @@ export function Transcript({
   useLayoutEffect(() => {
     const previousEvents = previousEventsRef.current;
     const isInitialLayout = previousEvents === null;
+    const transitioningToNonEmpty =
+      previousEvents !== null &&
+      previousEvents.length === 0 &&
+      events.length > 0 &&
+      !sawNonEmptyRef.current;
+    if (events.length > 0) sawNonEmptyRef.current = true;
+    const treatAsInitialOpen = isInitialLayout || transitioningToNonEmpty;
+
     if (
-      isInitialLayout &&
-      !shouldFollowLatestRef.current &&
+      treatAsInitialOpen &&
+      openIntentRef.current === "restore" &&
       initialViewportState?.anchor &&
       virtualizationEnabled &&
       !scrollElement
@@ -1208,6 +1404,7 @@ export function Transcript({
     }
     const hasNewUserMessage =
       !isInitialLayout &&
+      !transitioningToNonEmpty &&
       latestUserId !== undefined &&
       latestUserId !== previousLatestUserIdRef.current;
     const hasTranscriptChanged =
@@ -1219,13 +1416,20 @@ export function Transcript({
     previousLatestUserIdRef.current = latestUserId;
 
     if (
-      isInitialLayout &&
-      !shouldFollowLatestRef.current &&
-      initialViewportState?.anchor &&
-      restoreAnchor(initialViewportState.anchor)
+      treatAsInitialOpen &&
+      openIntentRef.current === "restore" &&
+      initialViewportState?.anchor
     ) {
-      setHasNewContent(false);
-    } else if (isInitialLayout || hasNewUserMessage || shouldFollowLatestRef.current) {
+      if (restoreAnchor(initialViewportState.anchor)) {
+        setHasNewContent(false);
+        markOpenSettled();
+      } else if (events.length > 0) {
+        // Anchor missing from the loaded window — stay Reading; do not invent follow.
+        setHasNewContent(false);
+        markOpenSettled();
+      }
+      // Empty cold open: wait for hydrate before restoring or settling.
+    } else if (treatAsInitialOpen || hasNewUserMessage || shouldFollowLatestRef.current) {
       shouldFollowLatestRef.current = true;
       viewportStateRef.current.following = true;
       setHasNewContent(false);
@@ -1237,6 +1441,7 @@ export function Transcript({
     events,
     initialViewportState,
     latestUserId,
+    markOpenSettled,
     restoreAnchor,
     running,
     scheduleFollow,
@@ -1270,13 +1475,25 @@ export function Transcript({
         window.clearTimeout(saveViewportTimerRef.current);
         saveViewportTimerRef.current = undefined;
       }
+      if (openSettleTimeoutRef.current !== undefined) {
+        window.clearTimeout(openSettleTimeoutRef.current);
+      }
       if (scheduledFrameRef.current !== undefined) {
         window.cancelAnimationFrame(scheduledFrameRef.current);
       }
       if (restoreFrameRef.current !== undefined) {
         window.cancelAnimationFrame(restoreFrameRef.current);
       }
-      if (ownerKey) writeTranscriptViewportState(ownerKey, viewportStateRef.current);
+      if (prependAnchorFrameRef.current !== undefined) {
+        window.cancelAnimationFrame(prependAnchorFrameRef.current);
+      }
+      if (ownerKey) {
+        // Avoid poisoning storage with open-settle false Reading.
+        if (!openSettledRef.current && openIntentRef.current === "follow") {
+          viewportStateRef.current.following = true;
+        }
+        writeTranscriptViewportState(ownerKey, viewportStateRef.current);
+      }
     },
     [ownerKey],
   );

@@ -92,10 +92,12 @@ function resolveDiffSelection(range: Range, container: HTMLElement): SelectionCo
 }
 
 function DiffCode({ line, path }: { line: DiffLine; path: string }) {
-  const tokens = useMemo(
-    () => line.tokens ?? highlightCodeLine(line.content, path),
-    [line.content, line.tokens, path],
-  );
+  const tokens = useMemo(() => {
+    const resolved = line.tokens ?? highlightCodeLine(line.content, path);
+    // File overlay keeps empty lines tokenless for caret geometry; diffs still
+    // need a non-collapsing strut so stacked/split rows keep their height.
+    return resolved.length > 0 ? resolved : [{ text: " ", kind: "plain" as const }];
+  }, [line.content, line.tokens, path]);
   return (
     <>
       {tokens.map((token, index) => (
