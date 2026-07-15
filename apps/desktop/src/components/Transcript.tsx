@@ -300,17 +300,19 @@ function EventIcon({ event }: { event: TranscriptEvent }) {
   return <FileSearch />;
 }
 
-function ActivityEvent({
-  event,
-  nested = false,
-  onOpenFile,
-  onAddDiffSelection,
-}: {
+interface ActivityEventProps {
   event: TranscriptEvent;
   nested?: boolean;
   onOpenFile?: (path: string) => void;
   onAddDiffSelection?: (payload: DiffSelectionPayload) => void;
-}) {
+}
+
+const ActivityEvent = memo(function ActivityEventRow({
+  event,
+  nested = false,
+  onOpenFile,
+  onAddDiffSelection,
+}: ActivityEventProps): React.ReactElement {
   const [expanded, setExpanded] = useState(event.expandedByDefault ?? false);
   const hasChildren = Boolean(event.children?.length);
   const hasDetails = Boolean(event.details?.length);
@@ -440,7 +442,7 @@ function ActivityEvent({
       </AnimatePresence>
     </div>
   );
-}
+});
 
 export function Transcript({
   events,
@@ -471,12 +473,14 @@ export function Transcript({
   const askAboutRef = useRef(onAskAbout);
   const regenerateRef = useRef(onRegenerate);
   const openFileRef = useRef(onOpenFile);
+  const addDiffSelectionRef = useRef(onAddDiffSelection);
 
   useEffect(() => {
     askAboutRef.current = onAskAbout;
     regenerateRef.current = onRegenerate;
     openFileRef.current = onOpenFile;
-  }, [onAskAbout, onOpenFile, onRegenerate]);
+    addDiffSelectionRef.current = onAddDiffSelection;
+  }, [onAddDiffSelection, onAskAbout, onOpenFile, onRegenerate]);
 
   const scheduleFollow = useCallback(() => {
     if (!shouldFollowLatestRef.current) return;
@@ -602,6 +606,10 @@ export function Transcript({
   const askAbout = useCallback((body: string) => askAboutRef.current?.(body), []);
   const regenerate = useCallback(() => regenerateRef.current?.(), []);
   const openFile = useCallback((path: string) => openFileRef.current?.(path), []);
+  const addDiffSelection = useCallback(
+    (payload: DiffSelectionPayload) => addDiffSelectionRef.current?.(payload),
+    [],
+  );
 
   return (
     <div className="transcript" ref={contentRef} aria-label="Task transcript">
@@ -654,7 +662,7 @@ export function Transcript({
             event={event}
             key={event.id}
             onOpenFile={onOpenFile ? openFile : undefined}
-            onAddDiffSelection={onAddDiffSelection}
+            onAddDiffSelection={onAddDiffSelection ? addDiffSelection : undefined}
           />
         );
       })}
@@ -725,7 +733,7 @@ export function Transcript({
                         event={child}
                         nested
                         onOpenFile={onOpenFile ? openFile : undefined}
-                        onAddDiffSelection={onAddDiffSelection}
+                        onAddDiffSelection={onAddDiffSelection ? addDiffSelection : undefined}
                       />
                     </motion.div>
                   ),

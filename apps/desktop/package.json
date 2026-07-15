@@ -10,6 +10,7 @@
     "tauri": "tauri",
     "check": "tsc -b --pretty false",
     "test": "vitest run",
+    "perf:projection": "node ./scripts/renderer-projection-benchmark.mjs",
     "lint": "eslint . --max-warnings 0",
     "format": "prettier --check ."
   },

@@ -309,6 +309,129 @@ describe("native runtime recovery UI", () => {
     await waitFor(() => expect(bridgeMock.stopTurn).toHaveBeenCalledWith("task-1"));
   });
 
+  it("publishes main text once per frame and flushes an urgent event in order", async () => {
+    render(<App />);
+    await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
+
+    const frameCallbacks = new Map<number, FrameRequestCallback>();
+    let nextFrameId = 0;
+    const requestFrame = vi
+      .spyOn(window, "requestAnimationFrame")
+      .mockImplementation((callback) => {
+        nextFrameId += 1;
+        frameCallbacks.set(nextFrameId, callback);
+        return nextFrameId;
+      });
+    const cancelFrame = vi
+      .spyOn(window, "cancelAnimationFrame")
+      .mockImplementation((id) => void frameCallbacks.delete(id));
+    const streamingItem = (body: string) => ({
+      id: "codex:thread-1:turn-1:item-streaming",
+      providerItemId: "item-streaming",
+      kind: "agentMessage" as const,
+      status: "inProgress" as const,
+      body,
+      truncated: false,
+      updatedAt: "2026-07-10T16:00:02Z",
+    });
+
+    try {
+      act(() => {
+        for (let index = 0; index < 64; index += 1) {
+          runtimeListener?.(
+            projection(10 + index, {
+              kind: "itemChanged",
+              item: streamingItem(`Dense stream ${index + 1}`),
+            }),
+          );
+        }
+      });
+
+      expect(screen.queryByText("Dense stream 64")).not.toBeInTheDocument();
+      expect(requestFrame).toHaveBeenCalledTimes(1);
+      expect(frameCallbacks.size).toBe(1);
+
+      const [publicationFrameId, publicationFrame] = [...frameCallbacks.entries()][0];
+      act(() => {
+        frameCallbacks.delete(publicationFrameId);
+        publicationFrame(0);
+      });
+      expect(await screen.findByText("Dense stream 64")).toBeInTheDocument();
+
+      act(() => {
+        for (const [frameId, callback] of [...frameCallbacks]) {
+          frameCallbacks.delete(frameId);
+          callback(0);
+        }
+      });
+      requestFrame.mockClear();
+      cancelFrame.mockClear();
+
+      act(() => {
+        runtimeListener?.(
+          projection(74, {
+            kind: "itemChanged",
+            item: streamingItem("Buffered immediately before urgent state"),
+          }),
+        );
+      });
+      expect(frameCallbacks.size).toBe(1);
+      const pendingPublication = [...frameCallbacks.keys()][0];
+
+      act(() => {
+        runtimeListener?.(
+          projection(75, {
+            kind: "connectionChanged",
+            state: "gap",
+            reason: "urgent receiver gap",
+          }),
+        );
+      });
+
+      expect(cancelFrame).toHaveBeenCalledWith(pendingPublication);
+      expect(
+        await screen.findByText("Buffered immediately before urgent state"),
+      ).toBeInTheDocument();
+      expect(screen.getByText("urgent receiver gap")).toBeInTheDocument();
+    } finally {
+      requestFrame.mockRestore();
+      cancelFrame.mockRestore();
+    }
+  });
+
+  it("preserves health-error clearing across connected then disconnected events", async () => {
+    render(<App />);
+    await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
+
+    act(() => {
+      runtimeListener?.(
+        projection(10, {
+          kind: "turnError",
+          message: "Provider connection lost",
+          retryable: true,
+        }),
+      );
+      runtimeListener?.(
+        projection(11, {
+          kind: "connectionChanged",
+          state: "connected",
+          processId: "process-verified",
+        }),
+      );
+      runtimeListener?.(
+        projection(12, {
+          kind: "connectionChanged",
+          state: "disconnected",
+          reason: "Provider process exited after verification",
+        }),
+      );
+    });
+
+    expect(await screen.findByText("Codex is disconnected")).toBeVisible();
+    expect(screen.getByText("Provider process exited after verification")).toBeVisible();
+    expect(screen.queryByText("Provider connection lost")).not.toBeInTheDocument();
+  });
+
   it("queues a typed follow-up instead of starting a competing turn", async () => {
     render(<App />);
     await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });

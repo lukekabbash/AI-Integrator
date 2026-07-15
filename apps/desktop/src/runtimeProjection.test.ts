@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { RuntimeProjectionEvent } from "./bridge";
 import {
   applyRuntimeProjection,
+  applyRuntimeProjectionBatch,
   createRuntimeProjectionState,
   createRuntimeTranscriptDeriver,
   isFrameBatchableRuntimeProjection,
@@ -856,5 +857,189 @@ describe("runtime projection reducer", () => {
         }),
       ),
     ).toBe(false);
+  });
+});
+
+describe("runtime projection batch reducer", () => {
+  const projectedItem = (
+    id: string,
+    body: string,
+    status: "inProgress" | "completed" = "inProgress",
+  ) => ({
+    id,
+    providerItemId: id,
+    kind: "agentMessage" as const,
+    status,
+    body,
+    truncated: false,
+    updatedAt: "2026-07-10T16:00:00Z",
+  });
+
+  const sequentiallyReduce = (
+    events: readonly RuntimeProjectionEvent[],
+    initial = createRuntimeProjectionState("task-1"),
+  ) => events.reduce(applyRuntimeProjection, initial);
+
+  it("matches the canonical reducer at every prefix of a mixed ordered stream", () => {
+    const stream: RuntimeProjectionEvent[] = [
+      event(1, {
+        kind: "turnChanged",
+        turn: { id: "turn-1", status: "inProgress", stopRequested: false },
+      }),
+      event(2, { kind: "itemChanged", item: projectedItem("message-a", "a") }),
+      event(3, { kind: "itemChanged", item: projectedItem("message-b", "b") }),
+      {
+        ...event(999, { kind: "itemChanged", item: projectedItem("wrong-task", "ignored") }),
+        taskId: "task-2",
+      },
+      event(3, { kind: "itemChanged", item: projectedItem("duplicate-seq", "ignored") }),
+      event(5, {
+        kind: "approvalChanged",
+        approval: {
+          id: "message-a",
+          requestId: { kind: "string", value: "request-a" },
+          approvalKind: "commandExecution",
+          state: "pending",
+          updatedAt: "2026-07-10T16:00:05Z",
+        },
+      }),
+      event(6, {
+        kind: "itemChanged",
+        item: projectedItem("message-a", "a complete", "completed"),
+      }),
+      event(7, {
+        kind: "planChanged",
+        steps: [{ index: 0, text: "Read", status: "completed" }],
+        truncated: false,
+      }),
+      event(8, { kind: "diffChanged", diff: "@@ -1 +1 @@\n-old\n+new", truncated: false }),
+      event(9, {
+        kind: "usageChanged",
+        usage: {
+          inputTokens: 10,
+          cachedInputTokens: 2,
+          outputTokens: 4,
+          reasoningOutputTokens: 1,
+          totalTokens: 17,
+        },
+      }),
+      event(10, {
+        kind: "modeChanged",
+        mode: { currentModeId: "agent", availableModes: [{ id: "agent", name: "Agent" }] },
+      }),
+      event(11, { kind: "turnError", message: "temporary failure", retryable: true }),
+      event(12, { kind: "connectionChanged", state: "gap", reason: "receiver lagged" }),
+      event(13, { kind: "projectionReset", reason: "authoritative replay" }),
+      event(12, { kind: "itemChanged", item: projectedItem("stale-after-reset", "ignored") }),
+      event(14, { kind: "itemChanged", item: projectedItem("message-a", "new epoch") }),
+      event(15, { kind: "itemChanged", item: projectedItem("message-c", "c") }),
+      event(16, {
+        kind: "turnChanged",
+        turn: { id: "turn-2", status: "completed", stopRequested: false },
+      }),
+    ];
+
+    for (let length = 0; length <= stream.length; length += 1) {
+      const prefix = stream.slice(0, length);
+      const sequential = sequentiallyReduce(prefix);
+      const batched = applyRuntimeProjectionBatch(createRuntimeProjectionState("task-1"), prefix);
+      expect(batched).toEqual(sequential);
+      expect(runtimeTranscript(batched)).toEqual(runtimeTranscript(sequential));
+    }
+  });
+
+  it("preserves rejection identity and first-index replacement without mutating inputs", () => {
+    const first = projectedItem("duplicate", "first");
+    const second = projectedItem("duplicate", "second");
+    const initial = {
+      ...createRuntimeProjectionState("task-1"),
+      lastSeq: 20,
+      items: [first, second],
+      firstSeen: { duplicate: "2026-07-10T15:59:00Z" },
+    };
+    const rejected = [
+      Object.freeze(event(20, { kind: "itemChanged", item: projectedItem("duplicate", "stale") })),
+      Object.freeze({
+        ...event(100, { kind: "itemChanged", item: projectedItem("other", "wrong task") }),
+        taskId: "task-2",
+      }),
+    ];
+
+    expect(applyRuntimeProjectionBatch(initial, rejected)).toBe(initial);
+
+    const replacement = Object.freeze(
+      event(21, { kind: "itemChanged", item: projectedItem("duplicate", "replacement") }),
+    );
+    const appended = Object.freeze(
+      event(22, { kind: "itemChanged", item: projectedItem("appended", "new") }),
+    );
+    const source = Object.freeze([replacement, appended]);
+    const batched = applyRuntimeProjectionBatch(initial, source);
+    const sequential = sequentiallyReduce(source, initial);
+
+    expect(batched).toEqual(sequential);
+    expect(batched.items[0]).toBe(
+      replacement.projection.kind === "itemChanged" ? replacement.projection.item : undefined,
+    );
+    expect(batched.items[1]).toBe(second);
+    expect(initial.items).toEqual([first, second]);
+  });
+
+  it("keeps unchanged item and cached transcript row identities across a dense update run", () => {
+    const stable = projectedItem("stable", "unchanged", "completed");
+    const streaming = projectedItem("streaming", "chunk 0");
+    const initial = applyRuntimeProjectionBatch(createRuntimeProjectionState("task-1"), [
+      event(1, { kind: "itemChanged", item: stable }),
+      event(2, { kind: "itemChanged", item: streaming }),
+    ]);
+    const deriveTranscript = createRuntimeTranscriptDeriver();
+    const stableRow = deriveTranscript(initial).find((entry) => entry.id === stable.id);
+    const updates = Array.from({ length: 32 }, (_, index) =>
+      event(3 + index, {
+        kind: "itemChanged",
+        item: projectedItem("streaming", `chunk ${index + 1}`),
+      }),
+    );
+
+    const batched = applyRuntimeProjectionBatch(initial, updates);
+    expect(batched).toEqual(sequentiallyReduce(updates, initial));
+    expect(batched.items.find((item) => item.id === stable.id)).toBe(stable);
+    expect(deriveTranscript(batched).find((entry) => entry.id === stable.id)).toBe(stableRow);
+  });
+
+  it("matches sequential reduction across different publication partitions", () => {
+    const stream: RuntimeProjectionEvent[] = [
+      event(1, { kind: "itemChanged", item: projectedItem("message-a", "a1") }),
+      event(2, { kind: "itemChanged", item: projectedItem("message-a", "a2") }),
+      event(3, { kind: "connectionChanged", state: "connected", processId: "process-1" }),
+      event(4, { kind: "itemChanged", item: projectedItem("message-b", "b1") }),
+      event(5, {
+        kind: "approvalChanged",
+        approval: {
+          id: "approval-a",
+          requestId: { kind: "number", value: 5 },
+          approvalKind: "fileChange",
+          state: "pending",
+          updatedAt: "2026-07-10T16:00:05Z",
+        },
+      }),
+      event(6, { kind: "projectionReset", reason: "authoritative replay" }),
+      event(7, { kind: "itemChanged", item: projectedItem("message-c", "c1") }),
+      event(8, { kind: "turnError", message: "retry later", retryable: true }),
+      event(9, { kind: "itemChanged", item: projectedItem("message-c", "c2", "completed") }),
+    ];
+    const expected = sequentiallyReduce(stream);
+
+    for (const partition of [[9], [1, 1, 1, 1, 1, 1, 1, 1, 1], [2, 1, 3, 3], [3, 2, 1, 3]]) {
+      let state = createRuntimeProjectionState("task-1");
+      let offset = 0;
+      for (const size of partition) {
+        state = applyRuntimeProjectionBatch(state, stream.slice(offset, offset + size));
+        offset += size;
+      }
+      expect(offset).toBe(stream.length);
+      expect(state).toEqual(expected);
+      expect(runtimeTranscript(state)).toEqual(runtimeTranscript(expected));
+    }
   });
 });

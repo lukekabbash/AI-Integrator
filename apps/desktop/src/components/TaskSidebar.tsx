@@ -211,6 +211,10 @@ export function TaskSidebar({
   // Index each project's newest reveal started at, so only freshly exposed
   // rows pick up a cascade delay — settled rows never re-stagger.
   const [projectRevealFrom, setProjectRevealFrom] = useState<Record<string, number>>({});
+  // Project whose collapse should hide the active-chat pill: the pill fades
+  // in place while the chat rows fold under the clip, instead of trailing
+  // them over the groups below.
+  const [projectHidingSelection, setProjectHidingSelection] = useState("");
   const chatListRef = useRef<HTMLDivElement>(null);
   const searchResultsRef = useRef<HTMLDivElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -334,6 +338,11 @@ export function TaskSidebar({
   }, [projects, tasks]);
 
   const archivedCount = useMemo(() => tasks.filter((task) => task.archived).length, [tasks]);
+
+  const selectionFadingForProject =
+    Boolean(projectHidingSelection) &&
+    !(expandedProjects[projectHidingSelection] ?? false) &&
+    (tasksByProject.get(projectHidingSelection) ?? []).some((task) => task.id === activeTaskId);
 
   const focusRelativeChat = (
     direction: 1 | -1,
@@ -607,6 +616,7 @@ export function TaskSidebar({
               <TravelingSelection
                 activeKey={activeTaskId}
                 className="chat-row-active"
+                visible={!selectionFadingForProject}
                 layoutKey={`${showArchived}:${projects
                   .map(
                     (project) =>
@@ -650,12 +660,20 @@ export function TaskSidebar({
                         type="button"
                         aria-label={`${expanded ? "Collapse" : "Expand"} ${project.name}`}
                         aria-expanded={expanded}
-                        onClick={() =>
+                        onClick={() => {
+                          if (expanded) {
+                            const containsActiveChat = (tasksByProject.get(project.id) ?? []).some(
+                              (task) => task.id === activeTaskId,
+                            );
+                            if (containsActiveChat) setProjectHidingSelection(project.id);
+                          } else if (projectHidingSelection === project.id) {
+                            setProjectHidingSelection("");
+                          }
                           setExpandedProjects((current) => ({
                             ...current,
                             [project.id]: !expanded,
-                          }))
-                        }
+                          }));
+                        }}
                       >
                         <ChevronDown
                           className={expanded ? "disclosure disclosure--open" : "disclosure"}

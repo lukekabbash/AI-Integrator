@@ -13,7 +13,7 @@ import {
   type TranscriptEvent,
 } from "../bridge";
 import {
-  applyRuntimeProjection,
+  applyRuntimeProjectionBatch,
   createRuntimeProjectionState,
   createRuntimeTranscriptDeriver,
   isFrameBatchableRuntimeProjection,
@@ -109,9 +109,10 @@ export function SubagentConversation({
     const applyEvents = (events: RuntimeProjectionEvent[]) => {
       if (events.length === 0) return;
       setProjection((current) => {
-        let next = current ?? createRuntimeProjectionState(childTaskId);
-        for (const event of events) next = applyRuntimeProjection(next, event);
-        return next;
+        return applyRuntimeProjectionBatch(
+          current ?? createRuntimeProjectionState(childTaskId),
+          events,
+        );
       });
     };
     const flushFrameEvents = () => {
@@ -143,15 +144,16 @@ export function SubagentConversation({
         }
 
         const snapshot = await bridge.loadTaskProjection(childTaskId);
-        let next = createRuntimeProjectionState(childTaskId);
-        for (const event of snapshot.events.sort((a, b) => a.seq - b.seq)) {
-          next = applyRuntimeProjection(next, event);
-        }
-        for (const event of buffered
-          .filter((candidate) => candidate.seq > snapshot.watermarkSeq)
-          .sort((a, b) => a.seq - b.seq)) {
-          next = applyRuntimeProjection(next, event);
-        }
+        let next = applyRuntimeProjectionBatch(
+          createRuntimeProjectionState(childTaskId),
+          snapshot.events.sort((a, b) => a.seq - b.seq),
+        );
+        next = applyRuntimeProjectionBatch(
+          next,
+          buffered
+            .filter((candidate) => candidate.seq > snapshot.watermarkSeq)
+            .sort((a, b) => a.seq - b.seq),
+        );
         if (!disposed) {
           ready = true;
           setProjection(next);

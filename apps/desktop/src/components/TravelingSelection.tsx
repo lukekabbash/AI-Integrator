@@ -13,7 +13,6 @@ interface TravelingSelectionProps {
   className: string;
   layoutKey: string;
   visible?: boolean;
-  onHidden?: () => void;
 }
 
 const selectionSpring = {
@@ -66,13 +65,16 @@ export function TravelingSelection({
   className,
   layoutKey,
   visible = true,
-  onHidden,
 }: TravelingSelectionProps) {
   const reduceMotion =
     Boolean(useReducedMotion()) ||
     (typeof document !== "undefined" && document.documentElement.dataset.motion === "none");
   const [bounds, setBounds] = useState<SelectionBounds | null>(null);
   const markerRef = useRef<HTMLSpanElement>(null);
+  const visibleRef = useRef(visible);
+  useLayoutEffect(() => {
+    visibleRef.current = visible;
+  }, [visible]);
 
   useLayoutEffect(() => {
     const container = markerRef.current?.parentElement;
@@ -95,6 +97,9 @@ export function TravelingSelection({
         setBounds(null);
         return;
       }
+      // While fading out (e.g. its folder is sliding shut) the pill stays
+      // frozen in place instead of chasing the moving rows.
+      if (!visibleRef.current) return;
       const next = measureTarget(target, container);
       setBounds((current) => (sameBounds(current, next) ? current : next));
     };
@@ -145,9 +150,6 @@ export function TravelingSelection({
               opacity: { duration: visible ? 0.08 : 0.07, ease: "easeOut" },
             }
       }
-      onAnimationComplete={() => {
-        if (!visible) onHidden?.();
-      }}
       aria-hidden="true"
     />
   );

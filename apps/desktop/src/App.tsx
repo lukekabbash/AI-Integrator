@@ -102,6 +102,7 @@ import { SlidingTabIndicator } from "./components/SlidingTabIndicator";
 import { TaskSidebar } from "./components/TaskSidebar";
 import {
   applyRuntimeProjection,
+  applyRuntimeProjectionBatch,
   createRuntimeProjectionState,
   createRuntimeTranscriptDeriver,
   isFrameBatchableRuntimeProjection,
@@ -1533,18 +1534,19 @@ export default function App() {
       setRuntimeState(cachedState ?? createRuntimeProjectionState(taskId));
       try {
         const loaded = await bridge.loadTaskProjection(taskId);
-        let next = createRuntimeProjectionState(taskId);
-        for (const event of [...loaded.events].sort((a, b) => a.seq - b.seq)) {
-          next = applyRuntimeProjection(next, event);
-        }
+        let next = applyRuntimeProjectionBatch(
+          createRuntimeProjectionState(taskId),
+          [...loaded.events].sort((a, b) => a.seq - b.seq),
+        );
         next = {
           ...next,
           lastSeq: Math.max(next.lastSeq, loaded.watermarkSeq),
         };
         let runtimeLive = loaded.runtimeLive;
-        for (const event of projectionBuffer.current
+        const bufferedEvents = projectionBuffer.current
           .filter((candidate) => candidate.taskId === taskId && candidate.seq > loaded.watermarkSeq)
-          .sort((a, b) => a.seq - b.seq)) {
+          .sort((a, b) => a.seq - b.seq);
+        for (const event of bufferedEvents) {
           if (
             (event.projection.kind === "connectionChanged" &&
               event.projection.state !== "disconnected") ||
@@ -1554,8 +1556,8 @@ export default function App() {
           ) {
             runtimeLive = true;
           }
-          next = applyRuntimeProjection(next, event);
         }
+        next = applyRuntimeProjectionBatch(next, bufferedEvents);
         if (generation !== projectionGeneration.current) return;
         projectionBuffer.current = [];
         projectionReady.current = true;
@@ -1630,7 +1632,20 @@ export default function App() {
       if (applicable.length === 0) return;
       setRuntimeState((current) => {
         let next = current ?? createRuntimeProjectionState(taskId);
+        let pending: RuntimeProjectionEvent[] = [];
+        const flushPending = () => {
+          next = applyRuntimeProjectionBatch(next, pending);
+          pending = [];
+        };
         for (const event of applicable) {
+          if (
+            event.projection.kind !== "connectionChanged" &&
+            event.projection.kind !== "turnError"
+          ) {
+            pending.push(event);
+            continue;
+          }
+          flushPending();
           const verified = recordRuntimeVerificationEvent(event, verifiedRuntimesRef.current);
           next = applyRuntimeProjection(next, event);
           if (verified) {
@@ -1641,6 +1656,7 @@ export default function App() {
             );
           }
         }
+        flushPending();
         taskProjectionCache.current.set(taskId, next);
         return next;
       });

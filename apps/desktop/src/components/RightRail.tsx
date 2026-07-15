@@ -2039,14 +2039,13 @@ function FilePanel({
 >) {
   const [filter, setFilter] = useState("");
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(() => new Set());
-  const [folderAwaitingSelectionFade, setFolderAwaitingSelectionFade] = useState("");
+  const [folderHidingSelection, setFolderHidingSelection] = useState("");
   const [renamingPath, setRenamingPath] = useState("");
   const [renameError, setRenameError] = useState("");
   const [fileActionError, setFileActionError] = useState("");
   const [contextMenu, setContextMenu] = useState<FileContextMenuState | null>(null);
   const [folderMenu, setFolderMenu] = useState<{ path: string; x: number; y: number } | null>(null);
   const folderMenuRef = useRef<HTMLDivElement>(null);
-  const fileTreeRef = useRef<HTMLDivElement>(null);
   const [treeWindow, setTreeWindow] = useState({
     key: "",
     limit: INITIAL_FILE_TREE_ENTRIES,
@@ -2071,8 +2070,8 @@ function FilePanel({
     () => fileOpeners.filter((opener) => opener.id === "cursor" || opener.id === "vscode"),
     [fileOpeners],
   );
-  const selectionFadingForFolder = folderAwaitingSelectionFade
-    ? activeFilePath?.startsWith(`${folderAwaitingSelectionFade.slice("project:".length)}/`)
+  const selectionFadingForFolder = folderHidingSelection
+    ? activeFilePath?.startsWith(`${folderHidingSelection.slice("project:".length)}/`)
     : false;
 
   const toggleFolder = (path: string) => {
@@ -2082,32 +2081,17 @@ function FilePanel({
         next.delete(path);
         return next;
       });
-      if (folderAwaitingSelectionFade === path) setFolderAwaitingSelectionFade("");
+      if (folderHidingSelection === path) setFolderHidingSelection("");
       return;
     }
 
+    // Collapse immediately so the folder slides shut as usual; the selection
+    // pill just fades out in place instead of traveling with the rows.
     const folderPath = path.slice("project:".length);
-    const containsActiveFile = activeFilePath?.startsWith(`${folderPath}/`);
-    const activeSelectionIsMounted = Array.from(
-      fileTreeRef.current?.querySelectorAll<HTMLElement>("[data-traveling-selection]") ?? [],
-    ).some((element) => element.dataset.travelingSelection === activeFilePath);
-    if (containsActiveFile && activeSelectionIsMounted && !selectionFadingForFolder) {
-      setFolderAwaitingSelectionFade(path);
-      return;
-    }
-
+    if (activeFilePath?.startsWith(`${folderPath}/`)) setFolderHidingSelection(path);
     setCollapsedFolders((current) => {
       const next = new Set(current);
       next.add(path);
-      return next;
-    });
-  };
-
-  const finishPendingFolderCollapse = () => {
-    if (!folderAwaitingSelectionFade) return;
-    setCollapsedFolders((current) => {
-      const next = new Set(current);
-      next.add(folderAwaitingSelectionFade);
       return next;
     });
   };
@@ -2278,7 +2262,7 @@ function FilePanel({
               {fileActionError}
             </p>
           ) : null}
-          <div ref={fileTreeRef} className="file-tree" aria-label="Project files">
+          <div className="file-tree" aria-label="Project files">
             <TravelingSelection
               activeKey={activeFilePath}
               className="file-tree-active"
@@ -2288,7 +2272,6 @@ function FilePanel({
                 .sort()
                 .join("|")}:${treeProjectFiles.map((file) => file.path).join("|")}`}
               visible={!selectionFadingForFolder}
-              onHidden={finishPendingFolderCollapse}
             />
             {projectFilesState === "loading" ? (
               <p className="empty-compact">Reading trusted project files…</p>
@@ -2308,7 +2291,6 @@ function FilePanel({
                 onCancelRename={() => setRenamingPath("")}
                 onContextMenu={openContextMenu}
                 onFolderContextMenu={onMentionProjectFolder ? openFolderMenu : undefined}
-                selectionExitingPath={selectionFadingForFolder ? activeFilePath : ""}
               />
             ) : null}
             {projectFilesState === "ready" ? (
@@ -2568,7 +2550,6 @@ function ProjectTree({
   activePath,
   openingPath,
   renamingPath,
-  selectionExitingPath,
   path = "",
   depth = 0,
 }: ProjectTreeCallbacks & {
@@ -2579,7 +2560,6 @@ function ProjectTree({
   activePath?: string;
   openingPath?: string;
   renamingPath?: string;
-  selectionExitingPath?: string;
   path?: string;
   depth?: number;
 }) {
@@ -2617,7 +2597,7 @@ function ProjectTree({
                   initial={{ height: 0, opacity: 0 }}
                   animate={{ height: "auto", opacity: 1 }}
                   exit={{ height: 0, opacity: 0 }}
-                  transition={{ duration: 0.18, ease: "easeInOut" }}
+                  transition={{ duration: 0.26, ease: [0.2, 0.8, 0.2, 1] }}
                 >
                   <ProjectTree
                     node={child}
@@ -2633,7 +2613,6 @@ function ProjectTree({
                     activePath={activePath}
                     openingPath={openingPath}
                     renamingPath={renamingPath}
-                    selectionExitingPath={selectionExitingPath}
                     path={folderPath}
                     depth={depth + 1}
                   />
@@ -2659,11 +2638,8 @@ function ProjectTree({
             data-tree-depth={depth}
             style={{ "--tree-depth": depth } as CSSProperties}
             initial={{ opacity: 0, x: -4 }}
-            animate={{ opacity: selectionExitingPath === file.path ? 0 : 1, x: 0 }}
-            transition={{
-              duration: selectionExitingPath === file.path ? 0.05 : 0.14,
-              ease: "easeOut",
-            }}
+            animate={{ opacity: 1, x: 0 }}
+            transition={{ duration: 0.14, ease: "easeOut" }}
             onClick={() => onOpenFile(file)}
             onDoubleClick={() => onStartRename?.(file)}
             onContextMenu={(event) => {

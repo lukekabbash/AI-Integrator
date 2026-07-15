@@ -370,7 +370,7 @@ describe("RightRail", () => {
     expect(screen.getByTitle("Open src/runtime/router.ts")).toHaveAttribute("data-tree-depth", "2");
   });
 
-  it("fades the selection pill before its active folder collapses and restores it in place", async () => {
+  it("collapses the active folder immediately while the selection pill fades in place", async () => {
     setup({
       activeFilePath: "src/runtime/router.ts",
       projectFiles: [
@@ -382,14 +382,9 @@ describe("RightRail", () => {
 
     await waitFor(() => expect(document.querySelector(".file-tree-active")).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "Collapse folder src/runtime" }));
-    expect(screen.getByRole("button", { name: "Collapse folder src/runtime" })).toBeInTheDocument();
-    await waitFor(() =>
-      expect(document.querySelector(".file-tree-active")).toHaveStyle({ opacity: "0" }),
-    );
-    expect(screen.getByTitle("Open src/runtime/router.ts")).toHaveStyle({ opacity: "0" });
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Expand folder src/runtime" })).toBeInTheDocument(),
-    );
+    // The slide starts right away — no deferred collapse.
+    expect(screen.getByRole("button", { name: "Expand folder src/runtime" })).toBeInTheDocument();
+    // The pill is removed once the sliding rows unmount, never re-shown.
     await waitFor(() =>
       expect(document.querySelector(".file-tree-active")).not.toBeInTheDocument(),
     );
