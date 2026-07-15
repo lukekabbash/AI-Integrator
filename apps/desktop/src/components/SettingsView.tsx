@@ -663,6 +663,10 @@ function AppearanceSettings({
         <div className="theme-grid" role="radiogroup" aria-label="Theme preset">
           {THEME_PRESET_GRID_ORDER.map((themeId) => {
             const theme = getThemePreset(themeId);
+            const previewDetail =
+              theme.colors["accent.secondary"] === theme.colors["accent.primary"]
+                ? theme.colors["diff.addedStrong"]
+                : theme.colors["accent.secondary"];
             return (
               <button
                 className="theme-swatch"
@@ -683,7 +687,7 @@ function AppearanceSettings({
                   <i style={{ background: theme.colors["surface.rail"] }} />
                   <b style={{ background: theme.colors["surface.layer1"] }} />
                   <em style={{ background: theme.colors["accent.primary"] }} />
-                  <small style={{ background: theme.colors["diff.addedStrong"] }} />
+                  <small style={{ background: previewDetail }} />
                 </span>
                 <span>
                   <strong>{theme.label}</strong>

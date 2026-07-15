@@ -99,13 +99,13 @@ sidebar.
 
 ## Provider support matrix (v1)
 
-| Provider    | As orchestrator (tools)         | As child target                                                                         |
-| ----------- | ------------------------------- | --------------------------------------------------------------------------------------- |
-| Claude      | yes (`--mcp-config`)            | yes (child tools too)                                                                   |
-| Cursor      | yes (ACP `mcpServers`)          | yes (child tools via ACP `mcpServers`; Agent mode pinned; unattended auto-allow)        |
-| Codex       | no (deferred: config injection) | yes (approval policy `never`, no child tools — results captured from transcript digest) |
-| Antigravity | no                              | yes (no child tools)                                                                    |
-| Grok        | no                              | yes (no child tools; unattended auto-allow)                                             |
+| Provider    | As orchestrator (tools)                   | As child target                                                                         |
+| ----------- | ----------------------------------------- | --------------------------------------------------------------------------------------- |
+| Claude      | yes (`--mcp-config`)                      | yes (child tools too)                                                                   |
+| Cursor      | yes (ACP `mcpServers`)                    | yes (child tools via ACP `mcpServers`; Agent mode pinned; unattended auto-allow)        |
+| Codex       | yes (`thread/start` task-scoped `config`) | yes (approval policy `never`, no child tools — results captured from transcript digest) |
+| Antigravity | no (no safe per-session MCP config input) | yes (no child tools)                                                                    |
+| Grok        | yes (ACP `mcpServers`)                    | yes (no child tools; unattended auto-allow)                                             |
 
 Children without child tools still receive nudges (injected as turns) and
 still produce results (digest capture on completion); they just can't ask
@@ -162,6 +162,6 @@ extension); values the agent does not advertise are dropped, never failed.
 
 ## Deferred (explicitly out of v1)
 
-Codex/agy orchestrator tool injection; per-delegation worktree leases;
-mid-session MCP hot-attach; cross-repo delegation; token budget metering per
-delegation. (Cursor/Grok children shipped post-v1 — see the support matrix.)
+Antigravity orchestrator tool injection; per-delegation worktree leases;
+cross-repo delegation; token budget metering per delegation. (Cursor/Grok
+children shipped post-v1 — see the support matrix.)

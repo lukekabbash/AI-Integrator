@@ -5,6 +5,7 @@ import {
   Archive,
   ArchiveRestore,
   ChevronDown,
+  ChevronUp,
   Folder,
   History,
   MoreHorizontal,
@@ -21,6 +22,7 @@ import { AnimatedFolderIcon } from "./AnimatedFolderIcon";
 import { BrandMark } from "./BrandMark";
 import { ResizeHandle } from "./ResizeHandle";
 import { Tooltip } from "./Tooltip";
+import { TravelingSelection } from "./TravelingSelection";
 
 interface TaskSidebarProps {
   projects: ProjectSummary[];
@@ -135,16 +137,42 @@ const menuSpring = {
   mass: 0.7,
 };
 
-const activeSpring = {
-  type: "spring" as const,
-  stiffness: 460,
-  damping: 38,
-  mass: 0.7,
+const INITIAL_PROJECT_CHAT_LIMIT = 5;
+const PROJECT_CHAT_PAGE_SIZE = 10;
+const INITIAL_SEARCH_RESULT_LIMIT = 80;
+
+/** Keep paging on compositor-friendly properties. The previous height-per-row
+ * animation forced layout on every frame and made the sidebar judder. */
+const chatRowVariants = {
+  hidden: { opacity: 0, y: -5, scale: 0.985 },
+  visible: (stagger: number) => ({
+    opacity: 1,
+    y: 0,
+    scale: 1,
+    transition: {
+      duration: 0.18,
+      ease: [0.2, 0, 0, 1] as const,
+      delay: Math.min(stagger, 5) * 0.014,
+    },
+  }),
+  exit: (stagger: number) => ({
+    opacity: 0,
+    y: -4,
+    scale: 0.99,
+    transition: {
+      duration: 0.12,
+      ease: [0.4, 0, 1, 1] as const,
+      delay: Math.min(stagger, 3) * 0.01,
+    },
+  }),
 };
 
-const INITIAL_PROJECT_CHAT_LIMIT = 80;
-const PROJECT_CHAT_PAGE_SIZE = 120;
-const INITIAL_SEARCH_RESULT_LIMIT = 80;
+const chatListLayoutSpring = {
+  type: "spring" as const,
+  stiffness: 560,
+  damping: 44,
+  mass: 0.6,
+};
 
 export function TaskSidebar({
   projects,
@@ -180,6 +208,9 @@ export function TaskSidebar({
   const [renameValue, setRenameValue] = useState("");
   const [showArchived, setShowArchived] = useState(false);
   const [projectChatLimits, setProjectChatLimits] = useState<Record<string, number>>({});
+  // Index each project's newest reveal started at, so only freshly exposed
+  // rows pick up a cascade delay — settled rows never re-stagger.
+  const [projectRevealFrom, setProjectRevealFrom] = useState<Record<string, number>>({});
   const chatListRef = useRef<HTMLDivElement>(null);
   const searchResultsRef = useRef<HTMLDivElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -389,16 +420,9 @@ export function TaskSidebar({
         className={`chat-row-shell${options?.nested ? " chat-row-shell--nested" : ""}${options?.showProject ? " chat-row-shell--search" : ""}`}
         data-active={active}
         data-menu-open={openMenuId === task.id}
+        data-traveling-selection={options?.searchResult ? undefined : task.id}
         key={task.id}
       >
-        {active && !options?.searchResult ? (
-          <motion.span
-            className="chat-row-active"
-            layoutId={reduceMotion ? undefined : "sidebar-active-chat"}
-            transition={reduceMotion ? { duration: 0 } : activeSpring}
-            aria-hidden="true"
-          />
-        ) : null}
         <Tooltip label={task.title} hint={meta} placement="right">
           <button
             className="chat-row"
@@ -580,6 +604,18 @@ export function TaskSidebar({
 
           <LayoutGroup id="sidebar-chats">
             <div className="project-tree" aria-label="Projects">
+              <TravelingSelection
+                activeKey={activeTaskId}
+                className="chat-row-active"
+                layoutKey={`${showArchived}:${projects
+                  .map(
+                    (project) =>
+                      `${project.id}:${expandedProjects[project.id] ?? false}:${projectChatLimits[project.id] ?? INITIAL_PROJECT_CHAT_LIMIT}`,
+                  )
+                  .join("|")}:${tasks
+                  .map((task) => `${task.id}:${task.projectId}:${task.updatedAt}:${task.archived}`)
+                  .join("|")}`}
+              />
               {projects.map((project) => {
                 const expanded = expandedProjects[project.id] ?? false;
                 const allProjectTasks = tasksByProject.get(project.id) ?? [];
@@ -598,10 +634,15 @@ export function TaskSidebar({
                   ? allProjectTasks.filter((task) => task.archived).length
                   : allProjectTasks.filter((task) => !task.archived).length;
                 return (
-                  <div
+                  <motion.div
                     className="project-group"
                     data-active={project.id === activeProjectId}
                     key={project.id}
+                    layout={reduceMotion ? false : "position"}
+                    layoutDependency={`${expanded}:${showArchived}:${visibleProjectChats
+                      .map((task) => task.id)
+                      .join(",")}`}
+                    transition={reduceMotion ? { duration: 0 } : { layout: chatListLayoutSpring }}
                   >
                     <div className="project-group-header">
                       <button
@@ -663,23 +704,87 @@ export function TaskSidebar({
                         >
                           {projectChats.length ? (
                             <>
-                              {visibleProjectChats.map((task) =>
-                                renderChat(task, { nested: true }),
-                              )}
-                              {hiddenChatCount > 0 ? (
-                                <button
-                                  className="project-chat-more"
-                                  type="button"
-                                  onClick={() =>
-                                    setProjectChatLimits((current) => ({
-                                      ...current,
-                                      [project.id]: chatLimit + PROJECT_CHAT_PAGE_SIZE,
-                                    }))
+                              <AnimatePresence initial={false} mode="popLayout">
+                                {visibleProjectChats.map((task, index) => {
+                                  const stagger = Math.min(
+                                    Math.max(0, index - (projectRevealFrom[project.id] ?? index)),
+                                    PROJECT_CHAT_PAGE_SIZE - 1,
+                                  );
+                                  return (
+                                    <motion.div
+                                      key={task.id}
+                                      className="chat-reveal"
+                                      custom={stagger}
+                                      variants={reduceMotion ? undefined : chatRowVariants}
+                                      initial={reduceMotion ? false : "hidden"}
+                                      animate="visible"
+                                      exit={reduceMotion ? undefined : "exit"}
+                                      style={{
+                                        position: "relative",
+                                        overflow:
+                                          openMenuId === task.id || renamingId === task.id
+                                            ? "visible"
+                                            : "hidden",
+                                        zIndex: openMenuId === task.id ? 5 : undefined,
+                                      }}
+                                    >
+                                      {renderChat(task, { nested: true })}
+                                    </motion.div>
+                                  );
+                                })}
+                              </AnimatePresence>
+                              {hiddenChatCount > 0 || chatLimit > INITIAL_PROJECT_CHAT_LIMIT ? (
+                                <motion.div
+                                  className="project-chat-footer"
+                                  layout={reduceMotion ? false : "position"}
+                                  layoutDependency={chatLimit}
+                                  transition={
+                                    reduceMotion
+                                      ? { duration: 0 }
+                                      : { layout: chatListLayoutSpring }
                                   }
                                 >
-                                  Show {Math.min(PROJECT_CHAT_PAGE_SIZE, hiddenChatCount)} older
-                                  chats
-                                </button>
+                                  {hiddenChatCount > 0 ? (
+                                    <motion.button
+                                      className="project-chat-more"
+                                      type="button"
+                                      whileTap={reduceMotion ? undefined : { scale: 0.98 }}
+                                      onClick={() => {
+                                        setProjectRevealFrom((current) => ({
+                                          ...current,
+                                          [project.id]: Math.min(chatLimit, projectChats.length),
+                                        }));
+                                        setProjectChatLimits((current) => ({
+                                          ...current,
+                                          [project.id]: chatLimit + PROJECT_CHAT_PAGE_SIZE,
+                                        }));
+                                      }}
+                                    >
+                                      <ChevronDown aria-hidden="true" />
+                                      Show {Math.min(PROJECT_CHAT_PAGE_SIZE, hiddenChatCount)} more
+                                    </motion.button>
+                                  ) : null}
+                                  {chatLimit > INITIAL_PROJECT_CHAT_LIMIT ? (
+                                    <motion.button
+                                      className="project-chat-more project-chat-less"
+                                      type="button"
+                                      whileTap={reduceMotion ? undefined : { scale: 0.98 }}
+                                      onClick={() => {
+                                        setProjectRevealFrom((current) => ({
+                                          ...current,
+                                          [project.id]: INITIAL_PROJECT_CHAT_LIMIT,
+                                        }));
+                                        setProjectChatLimits((current) => ({
+                                          ...current,
+                                          [project.id]: INITIAL_PROJECT_CHAT_LIMIT,
+                                        }));
+                                      }}
+                                    >
+                                      <ChevronUp aria-hidden="true" />
+                                      Show less
+                                    </motion.button>
+                                  ) : null}
+                                </motion.div>
                               ) : null}
                             </>
                           ) : (
@@ -690,7 +795,7 @@ export function TaskSidebar({
                         </motion.div>
                       ) : null}
                     </AnimatePresence>
-                  </div>
+                  </motion.div>
                 );
               })}
               {projects.length === 0 ? (

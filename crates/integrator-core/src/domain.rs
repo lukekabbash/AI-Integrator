@@ -44,6 +44,7 @@ uuid_id!(TaskId);
 uuid_id!(RuntimeSessionId);
 uuid_id!(ProviderSessionId);
 uuid_id!(ProjectId);
+uuid_id!(QueuedMessageId);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -295,6 +296,7 @@ pub struct LocalExport {
     pub provider_sessions: Vec<ProviderSession>,
     pub runtime_sessions: Vec<RuntimeSession>,
     pub composer_drafts: Vec<ComposerDraft>,
+    pub queued_messages: Vec<QueuedMessage>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -335,6 +337,74 @@ pub struct ComposerDraft {
     pub selection_start: u32,
     pub selection_end: u32,
     pub revision: u64,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum QueuedMessageState {
+    Queued,
+    Dispatching,
+}
+
+impl QueuedMessageState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Dispatching => "dispatching",
+        }
+    }
+}
+
+impl FromStr for QueuedMessageState {
+    type Err = crate::IntegratorError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "dispatching" => Ok(Self::Dispatching),
+            _ => Err(crate::IntegratorError::InvalidInput(format!(
+                "unknown queued message state: {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewQueuedMessage {
+    pub task_id: TaskId,
+    pub prompt: String,
+    pub attachments: Vec<ComposerDraftAttachment>,
+    pub runtime: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    pub permission: String,
+    pub delegation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_action_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedMessage {
+    pub id: QueuedMessageId,
+    pub task_id: TaskId,
+    pub prompt: String,
+    pub attachments: Vec<ComposerDraftAttachment>,
+    pub runtime: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    pub permission: String,
+    pub delegation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_action_id: Option<String>,
+    pub position: u32,
+    pub state: QueuedMessageState,
+    pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 

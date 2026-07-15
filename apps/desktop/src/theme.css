@@ -19,6 +19,7 @@
   --color-selection-active: #333333;
   --color-selection-text: #ffffff;
   --color-accent-primary: #e6e6e6;
+  --color-accent-secondary: #e6e6e6;
   --color-accent-hover: #ffffff;
   --color-accent-pressed: #bfbfbf;
   --color-accent-subtle: #292929;
@@ -160,13 +161,13 @@
   --hairline: var(--color-border-subtle);
   --border-strong: var(--color-border-strong);
   --accent: var(--color-accent-primary);
+  --accent-secondary: var(--color-accent-secondary);
   --accent-hover: var(--color-accent-hover);
   --accent-pressed: var(--color-accent-pressed);
 
-  /* Ink used to paint the masked brand mark (see .brand-mark-glyph). Defaults to
-     the theme's near-white ink with a faint accent wash so the lockup quietly
-     picks up each dark theme's hue; light themes lean into the accent below. */
-  --brand-mark-ink: color-mix(in srgb, var(--color-text-primary) 80%, var(--color-accent-primary));
+  /* Keep the brand mark neutral across dark presets. Theme color belongs to the
+     interface around the identity, not inside the identity itself. */
+  --brand-mark-ink: var(--color-text-primary);
 }
 
 :root[data-appearance="light"] {
@@ -333,6 +334,7 @@ samp,
     --color-selection-active: Highlight;
     --color-selection-text: HighlightText;
     --color-accent-primary: LinkText;
+    --color-accent-secondary: LinkText;
     --color-accent-hover: LinkText;
     --color-accent-pressed: VisitedText;
     --color-accent-subtle: Canvas;

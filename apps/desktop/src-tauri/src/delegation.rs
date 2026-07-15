@@ -325,6 +325,27 @@ pub fn broker_env(
     ]
 }
 
+/// Thread-scoped Codex config for the local delegation broker. Keeping this
+/// on `thread/start` avoids mutating the user's global Codex configuration and
+/// gives every task its own broker scope and short-lived app-run token.
+pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) -> Result<Value> {
+    let executable = std::env::current_exe().map_err(IntegratorError::from)?;
+    let env: serde_json::Map<String, Value> = broker_env(info, role, scope, mode)
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), Value::String(value)))
+        .collect();
+    Ok(json!({
+        "mcp_servers": {
+            "integrator": {
+                "command": executable.to_string_lossy(),
+                "args": ["--broker-mcp"],
+                "env": env,
+                "required": true,
+            }
+        }
+    }))
+}
+
 /// Writes the Claude-CLI MCP config file for one session and returns its
 /// path. One file per scope so concurrent sessions never clobber each other.
 pub fn write_mcp_config(
@@ -1156,7 +1177,7 @@ async fn spawn_codex_child(
         alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         binding: Arc::new(std::sync::Mutex::new(Some(binding))),
         context_primer: Arc::new(std::sync::Mutex::new(None)),
-        pending_native_skill: Arc::new(std::sync::Mutex::new(None)),
+        pending_user_prompt: Arc::new(std::sync::Mutex::new(None)),
     };
     crate::commands::spawn_projection_pump(app.clone(), Arc::clone(&state.store), runtime.clone());
     let child = DelegationChild {
@@ -2171,6 +2192,54 @@ mod tests {
             prune_stale_mcp_configs_in(root.path()).expect("idempotent cleanup"),
             0
         );
+    }
+
+    #[test]
+    fn codex_mcp_config_is_thread_scoped_and_required() {
+        let config = codex_mcp_config(
+            &BrokerInfo {
+                port: 43123,
+                token: "ephemeral-test-token".into(),
+            },
+            "orchestrator",
+            "task-1",
+            "balanced",
+        )
+        .expect("Codex MCP config");
+
+        let server = &config["mcp_servers"]["integrator"];
+        assert_eq!(server["args"], json!(["--broker-mcp"]));
+        assert_eq!(server["required"], json!(true));
+        assert_eq!(
+            server["env"]["INTEGRATOR_BROKER_ADDR"],
+            json!("127.0.0.1:43123")
+        );
+        assert_eq!(server["env"]["INTEGRATOR_BROKER_SCOPE"], json!("task-1"));
+        assert_eq!(server["env"]["INTEGRATOR_BROKER_MODE"], json!("balanced"));
+    }
+
+    #[test]
+    fn acp_mcp_entry_carries_the_orchestrator_scope_for_cursor_and_grok() {
+        let entry = acp_mcp_server_entry(
+            &BrokerInfo {
+                port: 43124,
+                token: "ephemeral-test-token".into(),
+            },
+            "orchestrator",
+            "task-2",
+            "manual",
+        )
+        .expect("ACP MCP entry");
+
+        assert_eq!(entry["name"], json!("integrator"));
+        assert_eq!(entry["args"], json!(["--broker-mcp"]));
+        let env = entry["env"].as_array().expect("ACP env array");
+        assert!(env.iter().any(|value| {
+            value["name"] == "INTEGRATOR_BROKER_SCOPE" && value["value"] == "task-2"
+        }));
+        assert!(env.iter().any(|value| {
+            value["name"] == "INTEGRATOR_BROKER_MODE" && value["value"] == "manual"
+        }));
     }
 
     #[test]

@@ -55,7 +55,7 @@ describe("TaskSidebar", () => {
     expect(screen.queryByText("Coding session", { selector: ".chat-row-title" })).toBeNull();
   });
 
-  it("nests chats under the expanded active project", () => {
+  it("nests chats under the expanded active project", async () => {
     const { snapshot } = setup();
     const active = snapshot.projects.find((project) => project.id === snapshot.activeProjectId)!;
     expect(screen.getByRole("button", { name: `Collapse ${active.name}` })).toHaveAttribute(
@@ -69,7 +69,13 @@ describe("TaskSidebar", () => {
     for (const chat of integratorChats) {
       expect(screen.getByRole("button", { name: new RegExp(chat.title) })).toBeInTheDocument();
     }
-    expect(document.querySelectorAll(".chat-row-active")).toHaveLength(1);
+    await waitFor(() => expect(document.querySelectorAll(".chat-row-active")).toHaveLength(1));
+    expect(document.querySelector(".chat-row-active")?.parentElement).toHaveClass("project-tree");
+    expect(
+      screen
+        .getByRole("button", { name: new RegExp(snapshot.tasks[0].title) })
+        .closest(".chat-row-shell"),
+    ).not.toContainElement(document.querySelector(".chat-row-active"));
   });
 
   it("reveals nested chats when expanding another project", () => {
@@ -85,22 +91,35 @@ describe("TaskSidebar", () => {
     expect(callbacks.onSelectProject).toHaveBeenCalledWith("lotmind");
   });
 
-  it("bounds large project histories while keeping the active chat reachable", () => {
-    const snapshot = createDemoSnapshot();
-    const tasks = Array.from({ length: 250 }, (_, index) => ({
-      ...snapshot.tasks[0],
-      id: `bulk-${index}`,
-      projectId: snapshot.activeProjectId,
-      title: `Bulk chat ${index}`,
-      status: "completed" as const,
-      updatedAt: new Date(Date.UTC(2026, 6, 12, 12, 0) - index * 60_000).toISOString(),
-    }));
-    setup({ tasks, activeTaskId: "bulk-249" });
+  it("shows five chats per project, pages ten at a time, and collapses back", () => {
+    document.documentElement.dataset.motion = "none";
+    try {
+      const snapshot = createDemoSnapshot();
+      const tasks = Array.from({ length: 250 }, (_, index) => ({
+        ...snapshot.tasks[0],
+        id: `bulk-${index}`,
+        projectId: snapshot.activeProjectId,
+        title: `Bulk chat ${index}`,
+        status: "completed" as const,
+        updatedAt: new Date(Date.UTC(2026, 6, 12, 12, 0) - index * 60_000).toISOString(),
+      }));
+      setup({ tasks, activeTaskId: "bulk-249" });
 
-    expect(screen.getByRole("button", { name: /^Bulk chat 249/ })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /^Bulk chat 100/ })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Show 120 older chats" }));
-    expect(screen.getByRole("button", { name: /^Bulk chat 100/ })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /^Bulk chat 249$/ })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /^Bulk chat 4$/ })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /^Bulk chat 5$/ })).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "Show 10 more" }));
+      expect(screen.getByRole("button", { name: /^Bulk chat 14$/ })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /^Bulk chat 15$/ })).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "Show less" }));
+      expect(screen.queryByRole("button", { name: /^Bulk chat 14$/ })).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /^Bulk chat 4$/ })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Show less" })).not.toBeInTheDocument();
+    } finally {
+      delete document.documentElement.dataset.motion;
+    }
   });
 
   it("selects a chat nested under a non-active project", () => {

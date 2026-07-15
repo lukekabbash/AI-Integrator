@@ -16,10 +16,10 @@ use tokio::sync::Mutex;
 /// One connected Codex app-server process plus the task/thread binding the
 /// projection pump uses to attribute events.
 #[derive(Clone, Debug)]
-pub struct PendingNativeSkill {
-    pub name: String,
+pub struct PendingUserPrompt {
     pub wire_prompt: String,
     pub visible_prompt: String,
+    pub native_skill: Option<String>,
     pub provider_item_id: Option<String>,
 }
 
@@ -36,9 +36,9 @@ pub struct CodexRuntime {
     /// freshly created provider thread, so a new session inherits the task's
     /// prior context (possibly produced by a different provider).
     pub context_primer: Arc<std::sync::Mutex<Option<String>>>,
-    /// Rewrites Codex's `$skill` wire echo back to the visible `/skill` draft
-    /// and stamps the resulting durable user item as a verified skill call.
-    pub pending_native_skill: Arc<std::sync::Mutex<Option<PendingNativeSkill>>>,
+    /// Keeps provider-only context out of the durable user transcript and,
+    /// when applicable, stamps a verified native skill invocation.
+    pub pending_user_prompt: Arc<std::sync::Mutex<Option<PendingUserPrompt>>>,
 }
 
 /// A permission option advertised by an ACP `session/request_permission`
@@ -246,6 +246,7 @@ impl AppState {
         fs::create_dir_all(&data_directory)?;
         let store = LocalStore::open(data_directory.join("integrator.sqlite3"))?;
         store.interrupt_unfinished_runtime_sessions()?;
+        store.recover_dispatching_queued_messages()?;
         Ok(Self {
             store: Arc::new(store),
             data_directory,

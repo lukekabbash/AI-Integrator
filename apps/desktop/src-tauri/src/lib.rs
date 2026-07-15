@@ -2,6 +2,7 @@
 
 mod broker_mcp;
 mod chat_title;
+mod code_explain;
 mod commands;
 mod commit_message;
 mod delegation;
@@ -10,6 +11,7 @@ mod runtime_setup;
 mod state;
 
 use chat_title::task_generate_title;
+use code_explain::selection_explain;
 use commands::*;
 use commit_message::git_generate_commit_message;
 use delegation::{
@@ -63,6 +65,11 @@ pub fn run() {
             provider_action_list,
             task_create,
             composer_draft_save,
+            queued_message_enqueue,
+            queued_message_list,
+            queued_message_reorder,
+            queued_message_take,
+            queued_message_set_dispatching,
             task_list,
             task_search_messages,
             task_set_state,
@@ -95,7 +102,9 @@ pub fn run() {
             git_worktree_create,
             project_file_list,
             project_file_read,
+            project_file_write,
             project_file_rename,
+            selection_explain,
             project_file_opener_list,
             project_file_open,
             project_file_reveal,
@@ -135,6 +144,7 @@ pub fn run() {
             codex_resume_thread,
             codex_start_turn,
             codex_interrupt_turn,
+            codex_steer_turn,
             task_snapshot,
             codex_respond_approval,
             codex_stop_turn,

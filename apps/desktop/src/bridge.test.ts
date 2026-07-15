@@ -663,6 +663,62 @@ describe("native trusted-project bridge", () => {
     expect(invokeMock).toHaveBeenCalledWith("git_overview", { repository: root });
   });
 
+  it("stages project changes before a chat has created a task", async () => {
+    const root = "H:\\Code\\new-chat-project";
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "local_export") {
+        return Promise.resolve({
+          projects: [
+            {
+              id: "project-new-chat",
+              displayName: "new-chat-project",
+              repositoryRoot: root,
+              gitRepositoryRoot: root,
+              gitCommonDirectory: `${root}\\.git`,
+              createdAt: "2026-07-14T12:00:00Z",
+              lastOpenedAt: "2026-07-14T12:00:00Z",
+            },
+          ],
+          tasks: [],
+          settings: [],
+          providerSessions: [],
+          composerDrafts: [],
+        });
+      }
+      if (command === "git_overview") {
+        return Promise.resolve({
+          identity: { root, branch: "main" },
+          files: [
+            {
+              indexStatus: "M",
+              worktreeStatus: " ",
+              path: "src/App.tsx",
+              stagedAdditions: 2,
+              stagedDeletions: 0,
+            },
+          ],
+          history: [],
+          remotes: [],
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const workspace = await bridge.loadWorkspace();
+    const projectId = workspace.projects[0]!.id;
+    await expect(bridge.stageProjectFiles(projectId, ["src/App.tsx"], true)).resolves.toMatchObject(
+      {
+        kind: "repository",
+        files: [{ path: "src/App.tsx", staged: true }],
+      },
+    );
+    expect(invokeMock).toHaveBeenCalledWith("git_stage", {
+      repository: root,
+      paths: ["src/App.tsx"],
+    });
+    expect(invokeMock).toHaveBeenCalledWith("git_overview", { repository: root });
+  });
+
   it("projects a partially staged path into independent staged and unstaged files", async () => {
     const root = "H:\\Code\\partial";
     invokeMock.mockImplementation((command: string) => {
@@ -1040,13 +1096,153 @@ describe("native trusted-project bridge", () => {
       threadId: "thread-task-codex-a",
       prompt: "Run Codex A",
       repository: "H:\\Code\\integrator-3",
+      nativeActionId: undefined,
+      delegation: "off",
     });
     expect(invokeMock).toHaveBeenCalledWith("codex_start_turn", {
       taskId: "task-codex-b",
       threadId: "thread-task-codex-b",
       prompt: "Run Codex B",
       repository: "H:\\Code\\integrator-3",
+      nativeActionId: undefined,
+      delegation: "off",
     });
+  });
+
+  it("starts Codex with broker delegation and rethreads only when the mode changes", async () => {
+    let threadStarts = 0;
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "app_bootstrap") return { value: {} };
+      if (command === "local_export") {
+        return {
+          projects: [
+            {
+              id: "project-codex-delegation",
+              displayName: "integrator-3",
+              repositoryRoot: "H:\\Code\\integrator-3",
+              gitCommonDirectory: "H:\\Code\\integrator-3\\.git",
+              createdAt: "2026-07-13T00:00:00Z",
+              lastOpenedAt: "2026-07-13T00:00:00Z",
+            },
+          ],
+          tasks: [
+            {
+              id: "task-codex-delegation",
+              title: "Codex delegation",
+              repositoryPath: "H:\\Code\\integrator-3",
+              state: "ready",
+              pinned: false,
+              archived: false,
+              runtime: "codex",
+              model: "Provider default",
+              createdAt: "2026-07-13T00:00:00Z",
+              updatedAt: "2026-07-13T00:00:00Z",
+            },
+          ],
+          settings: [],
+          providerSessions: [],
+          runtimeSessions: [],
+        };
+      }
+      if (command === "codex_start_thread") {
+        threadStarts += 1;
+        return { thread: { id: `thread-codex-delegation-${threadStarts}` } };
+      }
+      if (command === "codex_start_turn") return { turn: { id: "turn-codex-delegation" } };
+      return undefined;
+    });
+
+    await bridge.loadWorkspace();
+    const input = {
+      taskId: "task-codex-delegation",
+      prompt: "Delegate this bounded task",
+      runtime: "codex" as const,
+      model: "Provider default",
+      permission: "project-write" as const,
+      delegation: "balanced" as const,
+    };
+    await bridge.sendTurn(input);
+    await bridge.sendTurn(input);
+    await bridge.sendTurn({ ...input, delegation: "manual" });
+
+    expect(
+      invokeMock.mock.calls
+        .filter(([command]) => command === "codex_start_thread")
+        .map(([, args]) => args?.delegation),
+    ).toEqual(["balanced", "manual"]);
+    expect(
+      invokeMock.mock.calls
+        .filter(([command]) => command === "codex_start_turn")
+        .map(([, args]) => [args?.threadId, args?.delegation]),
+    ).toEqual([
+      ["thread-codex-delegation-1", "balanced"],
+      ["thread-codex-delegation-1", "balanced"],
+      ["thread-codex-delegation-2", "manual"],
+    ]);
+  });
+
+  it("recreates a Grok ACP session when its broker delegation mode changes", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "app_bootstrap") return { value: {} };
+      if (command === "local_export") {
+        return {
+          projects: [
+            {
+              id: "project-grok-delegation",
+              displayName: "integrator-3",
+              repositoryRoot: "H:\\Code\\integrator-3",
+              gitCommonDirectory: "H:\\Code\\integrator-3\\.git",
+              createdAt: "2026-07-13T00:00:00Z",
+              lastOpenedAt: "2026-07-13T00:00:00Z",
+            },
+          ],
+          tasks: [
+            {
+              id: "task-grok-delegation",
+              title: "Grok delegation",
+              repositoryPath: "H:\\Code\\integrator-3",
+              state: "ready",
+              pinned: false,
+              archived: false,
+              runtime: "grok",
+              model: "Provider default",
+              createdAt: "2026-07-13T00:00:00Z",
+              updatedAt: "2026-07-13T00:00:00Z",
+            },
+          ],
+          settings: [],
+          providerSessions: [],
+          runtimeSessions: [],
+        };
+      }
+      if (command === "acp_start_session") return { sessionId: "grok-session" };
+      if (command === "acp_send_turn") return { turnId: "grok-turn" };
+      return undefined;
+    });
+
+    await bridge.loadWorkspace();
+    const input = {
+      taskId: "task-grok-delegation",
+      prompt: "Delegate from Grok",
+      runtime: "grok" as const,
+      model: "Provider default",
+      permission: "project-write" as const,
+      delegation: "balanced" as const,
+    };
+    await bridge.sendTurn(input);
+    await bridge.sendTurn(input);
+    await bridge.sendTurn({ ...input, delegation: "budget-first" });
+
+    expect(
+      invokeMock.mock.calls
+        .filter(([command]) => command === "acp_start_session")
+        .map(([, args]) => args?.delegation),
+    ).toEqual(["balanced", "budget-first"]);
+    expect(
+      invokeMock.mock.calls
+        .filter(([command]) => command === "acp_send_turn")
+        .map(([, args]) => args?.delegation),
+    ).toEqual(["balanced", "balanced", "budget-first"]);
   });
 
   it("replaces a persisted Codex thread that the provider no longer recognizes", async () => {
@@ -1130,6 +1326,7 @@ describe("native trusted-project bridge", () => {
       prompt: "/openai-docs build the chat app",
       repository: "H:\\Code\\integrator-3",
       nativeActionId: "opaque-openai-docs",
+      delegation: "off",
     });
   });
 
@@ -1209,6 +1406,7 @@ describe("native trusted-project bridge", () => {
       prompt: "/openai-docs build the chat app",
       repository: "H:\\Code\\integrator-3",
       nativeActionId: "opaque-openai-docs-race",
+      delegation: "off",
     });
   });
 
@@ -1377,6 +1575,65 @@ describe("native trusted-project bridge", () => {
     });
     expect(invokeMock).toHaveBeenNthCalledWith(6, "voice_typing_stop", undefined);
     expect(listenMock).toHaveBeenCalledWith("voice-typing://event", expect.any(Function));
+  });
+
+  it("keeps queued-message mutations behind narrow task-scoped commands", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    await bridge.clearLocalData();
+    invokeMock.mockReset();
+    const input = {
+      taskId: "task-queue",
+      prompt: "Review the latest diff",
+      attachments: [{ path: "src/App.tsx", name: "App.tsx", kind: "file" as const }],
+      runtime: "claude" as const,
+      model: "claude-sonnet-5",
+      effort: "medium",
+      permission: "project-write" as const,
+      delegation: "balanced" as const,
+    };
+    const queued = {
+      ...input,
+      id: "queue-1",
+      position: 0,
+      state: "queued" as const,
+      createdAt: "2026-07-14T19:00:00Z",
+      updatedAt: "2026-07-14T19:00:00Z",
+    };
+    const dispatching = { ...queued, state: "dispatching" as const };
+    invokeMock
+      .mockResolvedValueOnce(queued)
+      .mockResolvedValueOnce([queued])
+      .mockResolvedValueOnce([queued])
+      .mockResolvedValueOnce(dispatching)
+      .mockResolvedValueOnce(dispatching);
+
+    await expect(bridge.enqueueMessage(input)).resolves.toEqual(queued);
+    await expect(bridge.listQueuedMessages("task-queue")).resolves.toEqual([queued]);
+    await expect(bridge.reorderQueuedMessages("task-queue", ["queue-1"])).resolves.toEqual([
+      queued,
+    ]);
+    await expect(
+      bridge.setQueuedMessageDispatching("task-queue", "queue-1", true),
+    ).resolves.toEqual(dispatching);
+    await expect(bridge.takeQueuedMessage("task-queue", "queue-1")).resolves.toEqual(dispatching);
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "queued_message_enqueue", { input });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "queued_message_list", {
+      taskId: "task-queue",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(3, "queued_message_reorder", {
+      taskId: "task-queue",
+      orderedIds: ["queue-1"],
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(4, "queued_message_set_dispatching", {
+      taskId: "task-queue",
+      messageId: "queue-1",
+      dispatching: true,
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(5, "queued_message_take", {
+      taskId: "task-queue",
+      messageId: "queue-1",
+    });
   });
 
   it("keeps storage and usage reads on narrow native commands", async () => {

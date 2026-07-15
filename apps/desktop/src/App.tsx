@@ -8,6 +8,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
 import {
@@ -21,7 +22,6 @@ import {
 } from "motion/react";
 import {
   ArrowRight,
-  CircleStop,
   ClipboardList,
   Download,
   FileDiff,
@@ -50,12 +50,14 @@ import {
   type ComposerDraftOwner,
   type ComposerDraftValue,
   type CloneProjectInput,
+  type ComposerDraftAttachment,
   type DelegationView,
   type DelegationRouting,
   type DiffFile,
   type GitSnapshot,
   type GithubRepositoryCatalog,
   type NativeActionReference,
+  type QueuedMessage,
   type ProjectFileContent,
   type ProjectFileEntry,
   type ProjectFileOpener,
@@ -79,6 +81,7 @@ import {
 import { ComposerDraftStore } from "./composerDraftStore";
 import type { RuntimeActionRequest } from "./components/SettingsView";
 import { createDemoSnapshot, createEmptySnapshot, type WorkspaceSnapshot } from "./demoData";
+import { reconcileGitSnapshot } from "./gitSnapshot";
 import {
   initializeTheme,
   normalizeThemePreferences,
@@ -89,9 +92,14 @@ import {
   type ThemePreferences,
 } from "./theme";
 import { Composer } from "./components/Composer";
+import { FileIcon } from "./components/FileIcon";
+import { FileWorkspace, type FileSelectionPayload } from "./components/FileView";
+import { resolveRequestedFile } from "./components/fileViewSupport";
 import { TaskStatusPill } from "./components/TaskStatusPill";
+import { QueuedMessages } from "./components/QueuedMessages";
 import { formatCompactTokenCount } from "./components/conversationFormatting";
 import { ResizeHandle } from "./components/ResizeHandle";
+import { SlidingTabIndicator } from "./components/SlidingTabIndicator";
 import { TaskSidebar } from "./components/TaskSidebar";
 import {
   applyRuntimeProjection,
@@ -130,6 +138,20 @@ const TerminalDrawer = lazy(() =>
 );
 const EVENT_MODELS_STORAGE_KEY = "integrator.transcript.eventModels";
 
+type ComposerTurnInput = {
+  prompt: string;
+  draftPrompt?: string;
+  attachments?: QueuedMessage["attachments"];
+  runtime: RuntimeId;
+  model: string;
+  effort?: string;
+  permission: "read-only" | "project-write" | "ask" | "full-access";
+  delegation: "off" | "manual" | "balanced" | "budget-first";
+  nativeActionId?: string;
+  nativeAction?: NativeActionReference;
+  draftRevision?: number;
+};
+
 /** Brand-cased words for turning raw model ids into display labels. */
 const MODEL_LABEL_WORDS: Record<string, string> = {
   gpt: "GPT",
@@ -155,6 +177,15 @@ function formatModelLabel(modelId?: string): string {
     .split(/(\s+|-)/)
     .map((token) => MODEL_LABEL_WORDS[token.toLowerCase()] ?? token)
     .join("");
+}
+
+function queuedMessagePrompt(message: QueuedMessage): string {
+  const prompt = message.prompt.trim();
+  const attachmentBlock =
+    message.attachments.length > 0
+      ? `Attached files:\n${message.attachments.map((attachment) => `- ${attachment.path}`).join("\n")}`
+      : "";
+  return prompt ? (attachmentBlock ? `${prompt}\n\n${attachmentBlock}` : prompt) : attachmentBlock;
 }
 
 function runtimeLabel(runtime: RuntimeId): string {
@@ -299,6 +330,9 @@ function NativeTitlebar({
   detail,
   leading,
   tabs,
+  resourceTabs,
+  titleActive = true,
+  onTitleSelect,
   trailing,
   subagentHeaderRef,
   motionScale,
@@ -318,6 +352,12 @@ function NativeTitlebar({
   detail?: ReactNode;
   leading?: ReactNode;
   tabs?: ReactNode;
+  /** Open file tabs docked beside the chat title, sharing its resource row. */
+  resourceTabs?: ReactNode;
+  /** False while an open file owns the canvas; the title dims and becomes the
+   * way back to the conversation. */
+  titleActive?: boolean;
+  onTitleSelect?: () => void;
   trailing?: ReactNode;
   subagentHeaderRef?: (node: HTMLDivElement | null) => void;
   motionScale: number;
@@ -498,6 +538,7 @@ function NativeTitlebar({
         {title ? (
           <motion.div
             className="titlebar-title"
+            data-active={titleActive}
             layout="position"
             transition={{
               layout: {
@@ -507,20 +548,45 @@ function NativeTitlebar({
             }}
           >
             {leading}
-            <h1>
-              <motion.span
-                className="titlebar-title-copy"
-                key={title}
-                initial={motionScale === 0 ? false : { opacity: 0, y: 2, filter: "blur(2px)" }}
-                animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
-                transition={{ duration: 0.2 * motionScale, ease: [0.2, 0, 0, 1] }}
-              >
-                {title}
-              </motion.span>
-            </h1>
-            {detail ? <span className="titlebar-title-detail">{detail}</span> : null}
+            <div className="titlebar-heading">
+              <h1>
+                {onTitleSelect ? (
+                  <button
+                    className="titlebar-title-button"
+                    type="button"
+                    onClick={onTitleSelect}
+                    aria-current={titleActive ? "page" : undefined}
+                    title="Back to the conversation"
+                  >
+                    <motion.span
+                      className="titlebar-title-copy"
+                      key={title}
+                      initial={
+                        motionScale === 0 ? false : { opacity: 0, y: 2, filter: "blur(2px)" }
+                      }
+                      animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                      transition={{ duration: 0.2 * motionScale, ease: [0.2, 0, 0, 1] }}
+                    >
+                      {title}
+                    </motion.span>
+                  </button>
+                ) : (
+                  <motion.span
+                    className="titlebar-title-copy"
+                    key={title}
+                    initial={motionScale === 0 ? false : { opacity: 0, y: 2, filter: "blur(2px)" }}
+                    animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                    transition={{ duration: 0.2 * motionScale, ease: [0.2, 0, 0, 1] }}
+                  >
+                    {title}
+                  </motion.span>
+                )}
+              </h1>
+              {detail ? <span className="titlebar-title-detail">{detail}</span> : null}
+            </div>
           </motion.div>
         ) : null}
+        {resourceTabs}
       </div>
       {tabs || title ? null : <div className="titlebar-context">{context}</div>}
       <div className="titlebar-end">
@@ -1183,6 +1249,13 @@ export default function App() {
   // settles. Cleared if the user sends their own message first.
   const pendingPlanBuildRef = useRef("");
   const [stoppingTurn, setStoppingTurn] = useState(false);
+  const [queueBusyId, setQueueBusyId] = useState("");
+  const queueBusyIdRef = useRef("");
+  const priorityQueueIdRef = useRef("");
+  const queuePausedTaskIdsRef = useRef(new Set<string>());
+  const queueAwaitingTurnRef = useRef<{ taskId: string; previousTurnId?: string } | undefined>(
+    undefined,
+  );
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
   const [screen, setScreen] = useState<Screen>(initialScreen);
   const [runtimeActionRequest, setRuntimeActionRequest] = useState<RuntimeActionRequest | null>(
@@ -1202,6 +1275,24 @@ export default function App() {
     path: string;
     id: number;
   } | null>(null);
+  // First-class canvas file tabs, shown beside the chat title. Contents live
+  // here; per-task paths persist through snapshot.openFilesByTask.
+  const [openFileTabs, setOpenFileTabs] = useState<ProjectFileContent[]>([]);
+  const [activeFileTabPath, setActiveFileTabPath] = useState("");
+  const [fileTabOpeningPath, setFileTabOpeningPath] = useState("");
+  const fileTabsCache = useRef(new Map<string, { tabs: ProjectFileContent[]; active: string }>());
+  const handledFileRequestRef = useRef<number | null>(null);
+  // Refs mirror the tab state for the long-lived keyboard shortcut listener.
+  const activeFileTabPathRef = useRef("");
+  const activeFileTabElementRef = useRef<HTMLDivElement>(null);
+  const fileTabPanRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startScrollLeft: number;
+    moved: boolean;
+  } | null>(null);
+  const suppressFileTabClickRef = useRef(false);
+  const closeFileTabRef = useRef<(path: string) => void>(() => undefined);
   const [sidebarWidth, setSidebarWidth] = useState(() =>
     storedDimension(SIDEBAR_WIDTH_STORAGE_KEY, 272, 220, 420),
   );
@@ -1238,6 +1329,16 @@ export default function App() {
     text: string;
   } | null>(null);
   const composerInsertSequence = useRef(0);
+  const [composerAttachment, setComposerAttachment] = useState<{
+    id: number;
+    attachment: ComposerDraftAttachment;
+  } | null>(null);
+  const composerAttachmentSequence = useRef(0);
+  const [composerRestore, setComposerRestore] = useState<{
+    id: number;
+    value: ComposerDraftValue;
+  } | null>(null);
+  const composerRestoreSequence = useRef(0);
   const projectionBuffer = useRef<RuntimeProjectionEvent[]>([]);
   const projectionReady = useRef(false);
   const projectionTaskId = useRef("");
@@ -1253,6 +1354,7 @@ export default function App() {
   const taskGitRefreshedAt = useRef(new Map<string, number>());
   const taskGitGeneration = useRef(new Map<string, number>());
   const scheduledTaskGitRefresh = useRef(new Map<string, number>());
+  const taskGitInvalidatedPaths = useRef(new Map<string, Set<string>>());
   const projectFilesCache = useRef(new Map<string, ProjectFileEntry[]>());
   const activeProjectForFilesRef = useRef<string | undefined>(undefined);
   const composerNoticeSequence = useRef(0);
@@ -1320,22 +1422,37 @@ export default function App() {
   );
 
   const refreshTaskGitSnapshot = useCallback(
-    async (taskId: string): Promise<GitSnapshot | undefined> => {
+    async (
+      taskId: string,
+      invalidatedPaths?: ReadonlySet<string>,
+    ): Promise<GitSnapshot | undefined> => {
       const generation = (taskGitGeneration.current.get(taskId) ?? 0) + 1;
       taskGitGeneration.current.set(taskId, generation);
-      const git = await bridge.loadTaskGit(taskId);
+      const incoming = await bridge.loadTaskGit(taskId);
+      const git = reconcileGitSnapshot(
+        taskGitCache.current.get(taskId),
+        incoming,
+        invalidatedPaths,
+      );
       return applyTaskGitSnapshot(taskId, git, generation) ? git : undefined;
     },
     [applyTaskGitSnapshot],
   );
 
   const scheduleTaskGitRefresh = useCallback(
-    (taskId: string) => {
+    (taskId: string, paths: string[]) => {
+      if (paths.length) {
+        const invalidated = taskGitInvalidatedPaths.current.get(taskId) ?? new Set<string>();
+        for (const path of paths) invalidated.add(path);
+        taskGitInvalidatedPaths.current.set(taskId, invalidated);
+      }
       const pending = scheduledTaskGitRefresh.current.get(taskId);
       if (pending !== undefined) window.clearTimeout(pending);
       const timer = window.setTimeout(() => {
         scheduledTaskGitRefresh.current.delete(taskId);
-        void refreshTaskGitSnapshot(taskId).catch(() => undefined);
+        const invalidated = taskGitInvalidatedPaths.current.get(taskId);
+        taskGitInvalidatedPaths.current.delete(taskId);
+        void refreshTaskGitSnapshot(taskId, invalidated).catch(() => undefined);
       }, 250);
       scheduledTaskGitRefresh.current.set(taskId, timer);
     },
@@ -1468,6 +1585,7 @@ export default function App() {
     let unlisten: (() => void) | undefined;
     let projectionFrame: number | undefined;
     const scheduledGitRefreshes = scheduledTaskGitRefresh.current;
+    const invalidatedGitPaths = taskGitInvalidatedPaths.current;
     const frameEvents: RuntimeProjectionEvent[] = [];
     const applyLiveProjectionBatch = (events: RuntimeProjectionEvent[]) => {
       const taskId = projectionTaskId.current;
@@ -1502,7 +1620,10 @@ export default function App() {
               event.projection.kind === "itemChanged" &&
               event.projection.item.kind === "fileChange"
             ) {
-              scheduleTaskGitRefresh(event.taskId);
+              scheduleTaskGitRefresh(
+                event.taskId,
+                event.projection.item.fileChanges?.map((change) => change.path) ?? [],
+              );
             }
             if (!projectionReady.current) {
               recordRuntimeVerificationEvent(event, verifiedRuntimesRef.current);
@@ -1529,10 +1650,12 @@ export default function App() {
                 const pendingRefresh = scheduledTaskGitRefresh.current.get(event.taskId);
                 if (pendingRefresh !== undefined) window.clearTimeout(pendingRefresh);
                 scheduledTaskGitRefresh.current.delete(event.taskId);
+                const invalidated = taskGitInvalidatedPaths.current.get(event.taskId);
+                taskGitInvalidatedPaths.current.delete(event.taskId);
                 void bridge
                   .setTaskStatus?.(event.taskId, persistedActivity.status)
                   .catch(() => undefined);
-                void refreshTaskGitSnapshot(event.taskId).catch(() => undefined);
+                void refreshTaskGitSnapshot(event.taskId, invalidated).catch(() => undefined);
               }
             }
             if (!projectionReady.current) {
@@ -1642,6 +1765,7 @@ export default function App() {
         window.clearTimeout(timer);
       }
       scheduledGitRefreshes.clear();
+      invalidatedGitPaths.clear();
       if (projectionFrame !== undefined) window.cancelAnimationFrame(projectionFrame);
       unlisten?.();
     };
@@ -2239,6 +2363,10 @@ export default function App() {
 
   const appendTask = (task: TaskSummary) => {
     const empty = createEmptySnapshot();
+    const git = snapshot.activeProjectId === task.projectId ? snapshot.git : empty.git;
+    activeTaskIdRef.current = task.id;
+    taskGitCache.current.set(task.id, git);
+    taskGitRefreshedAt.current.set(task.id, Date.now());
     setSnapshot((current) => ({
       ...current,
       activeTaskId: task.id,
@@ -2250,7 +2378,7 @@ export default function App() {
       centerViewByTask: { ...current.centerViewByTask, [task.id]: "task" },
       tasks: [task, ...current.tasks.filter((item) => item.id !== task.id)],
       transcript: [],
-      git: empty.git,
+      git,
       usage: empty.usage,
       children: [],
     }));
@@ -2363,6 +2491,11 @@ export default function App() {
       if (key === "n") {
         event.preventDefault();
         void newTask();
+      } else if (key === "w" && activeFileTabPathRef.current) {
+        // Cmd/Ctrl+W closes the active canvas file tab; without one the
+        // shortcut keeps its native window meaning.
+        event.preventDefault();
+        closeFileTabRef.current(activeFileTabPathRef.current);
       } else if (key === "k") {
         event.preventDefault();
         setSidebarCollapsed(false);
@@ -2376,17 +2509,7 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProject?.id, nativeHost]);
 
-  const sendTurn = async (input: {
-    prompt: string;
-    runtime: RuntimeId;
-    model: string;
-    effort?: string;
-    permission: "read-only" | "project-write" | "ask" | "full-access";
-    delegation: "off" | "manual" | "balanced" | "budget-first";
-    nativeActionId?: string;
-    nativeAction?: NativeActionReference;
-    draftRevision?: number;
-  }): Promise<boolean> => {
+  const sendTurn = async (input: ComposerTurnInput): Promise<boolean> => {
     const project = activeProject;
     if (!project) {
       setOperationError("Open a project before starting a task.");
@@ -2463,7 +2586,16 @@ export default function App() {
     }
     let event: TranscriptEvent;
     try {
-      const { nativeAction, ...turnInput } = input;
+      const { nativeAction } = input;
+      const turnInput = {
+        prompt: input.prompt,
+        runtime: input.runtime,
+        model: input.model,
+        effort: input.effort,
+        permission: input.permission,
+        delegation: input.delegation,
+        nativeActionId: input.nativeActionId,
+      };
       event = await bridge.sendTurn({ ...turnInput, taskId: targetTask.id });
       if (!nativeHost && nativeAction?.kind === "skill") {
         event = { ...event, nativeSkill: nativeAction.name };
@@ -2578,8 +2710,167 @@ export default function App() {
     return true;
   };
 
+  const replaceTaskQueue = (taskId: string, messages: QueuedMessage[]) => {
+    setSnapshot((current) => ({
+      ...current,
+      queuedMessages: [
+        ...current.queuedMessages.filter((message) => message.taskId !== taskId),
+        ...messages,
+      ],
+    }));
+  };
+
+  const refreshTaskQueue = async (taskId: string) => {
+    const messages = await bridge.listQueuedMessages(taskId);
+    replaceTaskQueue(taskId, messages);
+    return messages;
+  };
+
+  const submitComposerTurn = async (input: ComposerTurnInput): Promise<boolean> => {
+    const task = activeTask;
+    const turnBusy = Boolean(
+      task &&
+      ((runtimeState?.taskId === task.id && runtimeState.turn?.status === "inProgress") ||
+        optimisticUserMessage?.taskId === task.id),
+    );
+    if (!task || (!turnBusy && !queuePausedTaskIdsRef.current.has(task.id))) {
+      return sendTurn(input);
+    }
+
+    try {
+      const message = await bridge.enqueueMessage({
+        taskId: task.id,
+        prompt: input.draftPrompt ?? input.prompt,
+        attachments: input.attachments ?? [],
+        runtime: input.runtime,
+        model: input.model,
+        effort: input.effort,
+        permission: input.permission,
+        delegation: input.delegation,
+        nativeActionId: input.nativeActionId,
+      });
+      setSnapshot((current) => ({
+        ...current,
+        queuedMessages: [...current.queuedMessages, message],
+      }));
+      if (input.draftRevision !== undefined) {
+        const cleared = composerDraftStore.clear(
+          { kind: "task", taskId: task.id },
+          input.draftRevision,
+        );
+        if (cleared) persistComposerDraft(cleared);
+      }
+      setOperationStatus("Message queued");
+      return true;
+    } catch (error) {
+      setOperationError(formatBridgeError(error, "The message could not be queued"));
+      return false;
+    }
+  };
+
+  const reorderQueuedMessages = async (orderedIds: string[]) => {
+    if (!activeTask || queueBusyIdRef.current) return;
+    const taskId = activeTask.id;
+    const previous = snapshot.queuedMessages.filter((message) => message.taskId === taskId);
+    const byId = new Map(previous.map((message) => [message.id, message]));
+    replaceTaskQueue(
+      taskId,
+      orderedIds.flatMap((id, position) => {
+        const message = byId.get(id);
+        return message ? [{ ...message, position }] : [];
+      }),
+    );
+    try {
+      replaceTaskQueue(taskId, await bridge.reorderQueuedMessages(taskId, orderedIds));
+    } catch (error) {
+      replaceTaskQueue(taskId, previous);
+      setOperationError(formatBridgeError(error, "The queue could not be reordered"));
+    }
+  };
+
+  const restoreQueuedMessage = async (messageId: string) => {
+    if (!activeTask || queueBusyIdRef.current) return;
+    const taskId = activeTask.id;
+    const owner: ComposerDraftOwner = { kind: "task", taskId };
+    const currentDraft = composerDraftStore.read(owner);
+    let preservedDraft: QueuedMessage | undefined;
+    setQueueBusyId(messageId);
+    queueBusyIdRef.current = messageId;
+    setOperationError("");
+    try {
+      if (
+        currentDraft &&
+        (currentDraft.prompt.trim().length > 0 || currentDraft.attachments.length > 0)
+      ) {
+        preservedDraft = await bridge.enqueueMessage({
+          taskId,
+          prompt: currentDraft.prompt,
+          attachments: currentDraft.attachments,
+          runtime: currentDraft.runtime,
+          model: currentDraft.model,
+          effort: currentDraft.effort,
+          permission: currentDraft.permission,
+          delegation: currentDraft.delegation,
+        });
+      }
+      let message: QueuedMessage;
+      try {
+        message = await bridge.takeQueuedMessage(taskId, messageId);
+      } catch (error) {
+        if (preservedDraft) {
+          await bridge.takeQueuedMessage(taskId, preservedDraft.id).catch(() => undefined);
+        }
+        throw error;
+      }
+      await refreshTaskQueue(taskId);
+      const value: ComposerDraftValue = {
+        prompt: message.prompt,
+        attachments: message.attachments,
+        runtime: message.runtime,
+        model: message.model,
+        effort: message.effort,
+        permission: message.permission,
+        delegation: message.delegation,
+        selectionStart: message.prompt.length,
+        selectionEnd: message.prompt.length,
+      };
+      persistComposerDraft(composerDraftStore.update(owner, value));
+      composerRestoreSequence.current += 1;
+      setComposerRestore({ id: composerRestoreSequence.current, value });
+      setOperationStatus(preservedDraft ? "Drafts swapped" : "Message returned to the composer");
+    } catch (error) {
+      setOperationError(formatBridgeError(error, "The message could not be returned"));
+      await refreshTaskQueue(taskId).catch(() => undefined);
+    } finally {
+      queueBusyIdRef.current = "";
+      setQueueBusyId("");
+    }
+  };
+
+  const deleteQueuedMessage = async (messageId: string) => {
+    if (!activeTask || queueBusyIdRef.current) return;
+    const taskId = activeTask.id;
+    setQueueBusyId(messageId);
+    queueBusyIdRef.current = messageId;
+    setOperationError("");
+    try {
+      await bridge.takeQueuedMessage(taskId, messageId);
+      await refreshTaskQueue(taskId);
+      setOperationStatus("Queued message removed");
+    } catch (error) {
+      setOperationError(formatBridgeError(error, "The queued message could not be removed"));
+      await refreshTaskQueue(taskId).catch(() => undefined);
+    } finally {
+      queueBusyIdRef.current = "";
+      setQueueBusyId("");
+    }
+  };
+
   const changeCenterView = (view: CenterView) => {
     setCenterView(view);
+    // Picking a task view mode always surfaces the task itself; open file
+    // tabs stay open but release the canvas.
+    setActiveFileTabPath("");
     if (!activeTask) return;
     setSnapshot((current) => ({
       ...current,
@@ -2646,17 +2937,253 @@ export default function App() {
     changeCenterView("review");
   };
 
+  /** A transcript file action opens the file as a first-class canvas tab. */
   const openTranscriptFile = (path: string) => {
-    setRightRailOpen(true);
     setOpenProjectFileRequest({ path, id: Date.now() });
   };
 
-  const openProjectFile = async (file: ProjectFileEntry): Promise<ProjectFileContent> => {
-    if (!activeProject) {
-      throw new Error("Open a project before browsing files.");
+  /** Tabs belong to the active task, or to the project while drafting a new
+   * chat, matching how centerView is remembered per task. */
+  const fileTabOwnerKey = snapshot.activeTaskId
+    ? snapshot.activeTaskId
+    : snapshot.activeProjectId
+      ? `project:${snapshot.activeProjectId}`
+      : "";
+  const fileTabOwnerRef = useRef(fileTabOwnerKey);
+  const fileTabRestoreGeneration = useRef(0);
+  const activeFileTab = activeFileTabPath
+    ? openFileTabs.find((tab) => tab.path === activeFileTabPath)
+    : undefined;
+
+  useEffect(() => {
+    const activeTab = activeFileTabElementRef.current;
+    if (!activeTab) return;
+    const revealActiveTab = () =>
+      activeTab.scrollIntoView?.({ behavior: "auto", block: "nearest", inline: "nearest" });
+    revealActiveTab();
+    const strip = activeTab.parentElement;
+    const observer =
+      strip && typeof ResizeObserver !== "undefined"
+        ? new ResizeObserver(revealActiveTab)
+        : undefined;
+    if (strip) observer?.observe(strip);
+    window.addEventListener("resize", revealActiveTab);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", revealActiveTab);
+    };
+  }, [activeFileTabPath]);
+
+  const beginFileTabPan = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (
+      event.button !== 0 ||
+      event.currentTarget.scrollWidth <= event.currentTarget.clientWidth ||
+      (event.target as HTMLElement).closest(".file-reader-tab-close")
+    ) {
+      return;
     }
-    setOperationError("");
-    return bridge.readProjectFile(activeProject.id, file.path);
+    fileTabPanRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startScrollLeft: event.currentTarget.scrollLeft,
+      moved: false,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const moveFileTabPan = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const pan = fileTabPanRef.current;
+    if (!pan || pan.pointerId !== event.pointerId) return;
+    const delta = event.clientX - pan.startX;
+    if (!pan.moved && Math.abs(delta) < 4) return;
+    pan.moved = true;
+    suppressFileTabClickRef.current = true;
+    event.currentTarget.dataset.dragging = "true";
+    event.currentTarget.scrollLeft = pan.startScrollLeft - delta;
+    event.preventDefault();
+  };
+
+  const endFileTabPan = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const pan = fileTabPanRef.current;
+    if (!pan || pan.pointerId !== event.pointerId) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    delete event.currentTarget.dataset.dragging;
+    fileTabPanRef.current = null;
+    if (pan.moved) {
+      window.setTimeout(() => {
+        suppressFileTabClickRef.current = false;
+      }, 0);
+    }
+  };
+
+  const openFileInCanvas = useCallback(
+    async (file: Pick<ProjectFileEntry, "path">) => {
+      const project = activeProject;
+      if (!project) return;
+      setOperationError("");
+      const existing = openFileTabs.find((tab) => tab.path === file.path);
+      if (existing) {
+        setActiveFileTabPath(existing.path);
+        return;
+      }
+      setFileTabOpeningPath(file.path);
+      try {
+        const content = await bridge.readProjectFile(project.id, file.path);
+        setOpenFileTabs((current) => [
+          ...current.filter((tab) => tab.path !== content.path),
+          content,
+        ]);
+        setActiveFileTabPath(content.path);
+      } catch (error) {
+        setOperationError(
+          error instanceof Error ? error.message : "Could not open that project file.",
+        );
+      } finally {
+        setFileTabOpeningPath("");
+      }
+    },
+    [activeProject, openFileTabs],
+  );
+
+  const closeFileTab = (path: string) => {
+    const closingIndex = openFileTabs.findIndex((tab) => tab.path === path);
+    const next = openFileTabs.filter((tab) => tab.path !== path);
+    setOpenFileTabs(next);
+    if (activeFileTabPath === path) {
+      setActiveFileTabPath(next[closingIndex]?.path ?? next[closingIndex - 1]?.path ?? "");
+    }
+  };
+  useEffect(() => {
+    activeFileTabPathRef.current = activeFileTabPath;
+    closeFileTabRef.current = closeFileTab;
+  });
+
+  // Swapping tasks swaps the titlebar file tabs with them: warm tabs come from
+  // the in-memory cache, cold ones re-read their persisted paths.
+  useEffect(() => {
+    if (fileTabOwnerRef.current === fileTabOwnerKey) return;
+    fileTabOwnerRef.current = fileTabOwnerKey;
+    const generation = ++fileTabRestoreGeneration.current;
+    setFileTabOpeningPath("");
+    const cached = fileTabsCache.current.get(fileTabOwnerKey);
+    if (cached) {
+      setOpenFileTabs(cached.tabs);
+      setActiveFileTabPath(cached.active);
+      return;
+    }
+    setOpenFileTabs([]);
+    setActiveFileTabPath("");
+    const stored = snapshot.openFilesByTask[fileTabOwnerKey];
+    const project = activeProject;
+    if (!stored?.paths.length || !project) return;
+    void Promise.all(
+      stored.paths.map((path) => bridge.readProjectFile(project.id, path).catch(() => null)),
+    ).then((contents) => {
+      if (generation !== fileTabRestoreGeneration.current) return;
+      if (fileTabOwnerRef.current !== fileTabOwnerKey) return;
+      const tabs = contents.filter((content): content is ProjectFileContent => Boolean(content));
+      if (!tabs.length) return;
+      setOpenFileTabs(tabs);
+      setActiveFileTabPath(tabs.some((tab) => tab.path === stored.active) ? stored.active : "");
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fileTabOwnerKey]);
+
+  // Mirror the open tabs into the snapshot (paths only) and the warm cache, so
+  // they survive task switches now and app restarts via stored navigation.
+  useEffect(() => {
+    const key = fileTabOwnerRef.current;
+    if (!key || key !== fileTabOwnerKey) return;
+    fileTabsCache.current.set(key, { tabs: openFileTabs, active: activeFileTabPath });
+    const paths = openFileTabs.map((tab) => tab.path);
+    setSnapshot((current) => {
+      const existing = current.openFilesByTask[key];
+      if (
+        existing
+          ? existing.active === activeFileTabPath && existing.paths.join("\n") === paths.join("\n")
+          : paths.length === 0
+      ) {
+        return current;
+      }
+      return {
+        ...current,
+        openFilesByTask: {
+          ...current.openFilesByTask,
+          [key]: { paths, active: activeFileTabPath },
+        },
+      };
+    });
+  }, [openFileTabs, activeFileTabPath, fileTabOwnerKey]);
+
+  // Transcript-requested opens resolve loose paths against the project tree,
+  // retrying until the bounded scan is ready.
+  useEffect(() => {
+    if (!openProjectFileRequest) return;
+    if (handledFileRequestRef.current === openProjectFileRequest.id) return;
+    requestProjectFiles();
+    const file = resolveRequestedFile(projectFiles, openProjectFileRequest.path);
+    if (!file && projectFilesState !== "ready") return;
+    // Mark the request handled inside the timer so a StrictMode remount that
+    // clears the pending timeout does not swallow the open or its error.
+    const timer = window.setTimeout(() => {
+      handledFileRequestRef.current = openProjectFileRequest.id;
+      if (!file) {
+        setOperationError(`Could not find ${openProjectFileRequest.path} in the project files.`);
+        return;
+      }
+      void openFileInCanvas(file);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [
+    openProjectFileRequest,
+    projectFiles,
+    projectFilesState,
+    openFileInCanvas,
+    requestProjectFiles,
+  ]);
+
+  /** Writes an autosaved edit through the trusted-project boundary, then
+   * refreshes the tab content and lets Git catch up on the change. */
+  const saveFileTab = async (path: string, content: string) => {
+    if (!activeProject) throw new Error("Open a project before editing files.");
+    const saved = await bridge.writeProjectFile(activeProject.id, path, content);
+    setOpenFileTabs((current) => current.map((tab) => (tab.path === saved.path ? saved : tab)));
+    if (activeTask) {
+      scheduleTaskGitRefresh(activeTask.id, [saved.path]);
+    } else {
+      const projectId = activeProject.id;
+      void bridge
+        .loadProjectGit(projectId)
+        .then((git) =>
+          setSnapshot((current) =>
+            current.activeProjectId === projectId && !current.activeTaskId
+              ? { ...current, git }
+              : current,
+          ),
+        )
+        .catch(() => undefined);
+    }
+  };
+
+  /** Right-click "Ask about this" from the file reader: stay on the file
+   * canvas and ask the active runtime to explain the selection through the
+   * isolated helper boundary. Add to chat remains the path into the transcript. */
+  const explainFileSelection = async (payload: FileSelectionPayload) => {
+    if (!activeProject) {
+      throw new Error("Open a project before asking about a selection.");
+    }
+    return bridge.explainSelection(
+      activeProject.id,
+      activeTask?.runtime ?? settingsDefaultRuntime,
+      {
+        path: payload.path,
+        startLine: payload.startLine,
+        endLine: payload.endLine,
+        text: payload.text,
+      },
+    );
   };
 
   const renameProjectFile = async (file: ProjectFileEntry, newName: string) => {
@@ -2664,6 +3191,13 @@ export default function App() {
       throw new Error("Open a project before renaming files.");
     }
     await bridge.renameProjectFile(activeProject.id, file.path, newName);
+    const parent = file.path.split("/").slice(0, -1).join("/");
+    const nextPath = parent ? `${parent}/${newName}` : newName;
+    // Keep any open canvas tab pointing at the renamed file.
+    setOpenFileTabs((current) =>
+      current.map((tab) => (tab.path === file.path ? { ...tab, path: nextPath } : tab)),
+    );
+    setActiveFileTabPath((current) => (current === file.path ? nextPath : current));
     try {
       const files = await bridge.listProjectFiles(activeProject.id);
       projectFilesCache.current.set(activeProject.id, files);
@@ -2678,6 +3212,38 @@ export default function App() {
   const insertIntoComposer = (text: string) => {
     composerInsertSequence.current += 1;
     setComposerInsert({ id: composerInsertSequence.current, text });
+    setActiveFileTabPath("");
+    changeCenterView("task");
+    setScreen("workspace");
+  };
+
+  /** Attaches highlighted lines to the composer as a removable context card
+   * labeled `name.ext (start – end)`, like an @mention that carries the
+   * selected snippet. */
+  const addSelectionAsComposerContext = (payload: FileSelectionPayload) => {
+    const name = payload.path.split("/").at(-1) ?? payload.path;
+    const range =
+      payload.startLine !== undefined
+        ? payload.endLine !== undefined && payload.endLine !== payload.startLine
+          ? `${payload.startLine} – ${payload.endLine}`
+          : `${payload.startLine}`
+        : "";
+    composerAttachmentSequence.current += 1;
+    setComposerAttachment({
+      id: composerAttachmentSequence.current,
+      attachment: {
+        path: payload.path,
+        name: range ? `${name} (${range})` : name,
+        kind: "file",
+        entry: "file",
+        selection: {
+          startLine: payload.startLine,
+          endLine: payload.endLine,
+          text: payload.text,
+        },
+      },
+    });
+    setActiveFileTabPath("");
     changeCenterView("task");
     setScreen("workspace");
   };
@@ -2735,15 +3301,35 @@ export default function App() {
   const revealGitFile = (file: DiffFile) => revealProjectPath(file.path);
 
   const stageFile = async (file: DiffFile, staged: boolean) => {
-    if (!activeTask) return;
-    const git = await bridge.stageFiles(activeTask.id, [file.path], staged);
-    applyTaskGitSnapshot(activeTask.id, git);
+    if (activeTask) {
+      const git = await bridge.stageFiles(activeTask.id, [file.path], staged);
+      applyTaskGitSnapshot(activeTask.id, git);
+      return;
+    }
+    if (!activeProject) return;
+    const projectId = activeProject.id;
+    const git = await bridge.stageProjectFiles(projectId, [file.path], staged);
+    setSnapshot((current) =>
+      current.activeProjectId === projectId && !current.activeTaskId
+        ? { ...current, git }
+        : current,
+    );
   };
 
   const commit = async (message: string) => {
-    if (!activeTask) return;
-    const git = await bridge.commit(activeTask.id, message);
-    applyTaskGitSnapshot(activeTask.id, git);
+    if (activeTask) {
+      const git = await bridge.commit(activeTask.id, message);
+      applyTaskGitSnapshot(activeTask.id, git);
+      return;
+    }
+    if (!activeProject) return;
+    const projectId = activeProject.id;
+    const git = await bridge.commitProject(projectId, message);
+    setSnapshot((current) =>
+      current.activeProjectId === projectId && !current.activeTaskId
+        ? { ...current, git }
+        : current,
+    );
   };
 
   const generateCommitMessage = async () => {
@@ -2757,23 +3343,29 @@ export default function App() {
   };
 
   const push = async () => {
-    if (!activeTask) return;
-    const preview = await bridge.previewPush(activeTask.id);
+    if (!activeTask && !activeProject) return;
+    const preview = activeTask
+      ? await bridge.previewPush(activeTask.id)
+      : await bridge.previewProjectPush(activeProject!.id);
     if (!preview.remote || !preview.upstream) {
       throw new Error("Push requires an existing tracked upstream branch.");
     }
-    const result = await bridge.confirmPush(activeTask.id, {
+    const confirmation = {
       expectedHead: preview.head,
       expectedBranch: preview.branch,
       expectedRemote: preview.remote,
       expectedRemoteUrl: preview.sanitizedRemoteUrl,
       expectedUpstream: preview.upstream,
       expectedRefspec: preview.refspec,
-    });
+    };
+    const result = activeTask
+      ? await bridge.confirmPush(activeTask.id, confirmation)
+      : await bridge.confirmProjectPush(activeProject!.id, confirmation);
     if (result.outcome === "outcomeUncertain") {
       throw new Error(`${result.summary} Refresh Git status before retrying.`);
     }
-    await refreshTaskGitSnapshot(activeTask.id);
+    if (activeTask) await refreshTaskGitSnapshot(activeTask.id);
+    else await refreshGit();
   };
 
   const loadMoreGitHistory = async () => {
@@ -2890,32 +3482,41 @@ export default function App() {
   // selected patch is loaded exactly once and failures become retryable.
   useEffect(() => {
     const taskId = activeTask?.id;
+    const projectId = activeProject?.id;
     const file = activeFile;
     if (
       centerView !== "review" ||
       !nativeHost ||
       reviewRefreshing ||
-      !taskId ||
+      (!taskId && !projectId) ||
       !file ||
       file.diffLoaded !== false
     ) {
       return;
     }
     let active = true;
-    void bridge
-      .loadTaskGitFile(taskId, file)
+    const loadFile = taskId
+      ? bridge.loadTaskGitFile(taskId, file)
+      : bridge.loadProjectGitFile(projectId!, file);
+    void loadFile
       .then((loaded) => {
         if (!active) return;
         setReviewLoadError(null);
         setSnapshot((current) => {
-          if (current.activeTaskId !== taskId) return current;
+          if (
+            taskId
+              ? current.activeTaskId !== taskId
+              : current.activeTaskId || current.activeProjectId !== projectId
+          ) {
+            return current;
+          }
           const git = {
             ...current.git,
             files: current.git.files.map((candidate) =>
               diffFileKey(candidate) === diffFileKey(loaded) ? loaded : candidate,
             ),
           };
-          taskGitCache.current.set(taskId, git);
+          if (taskId) taskGitCache.current.set(taskId, git);
           return { ...current, git };
         });
       })
@@ -2927,7 +3528,15 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, [activeFile, activeTask?.id, centerView, nativeHost, reviewRefreshing, reviewRetryVersion]);
+  }, [
+    activeFile,
+    activeProject?.id,
+    activeTask?.id,
+    centerView,
+    nativeHost,
+    reviewRefreshing,
+    reviewRetryVersion,
+  ]);
 
   const pendingApproval = runtimeState?.approvals.find(
     (approval) => approval.state === "pending" || approval.state === "responseFailed",
@@ -2974,6 +3583,15 @@ export default function App() {
   // If startup fails, sendTurn clears the optimistic item and Composer
   // restores the draft instead.
   const optimisticTurnStarting = Boolean(optimisticForActiveTask && !providerHasOptimisticMessage);
+  const activeQueuedMessages = useMemo(
+    () =>
+      activeTask
+        ? snapshot.queuedMessages
+            .filter((message) => message.taskId === activeTask.id)
+            .sort((left, right) => left.position - right.position)
+        : [],
+    [activeTask, snapshot.queuedMessages],
+  );
   const runtimeUsage = runtimeState?.usage;
   const displayedUsage = runtimeUsage
     ? {
@@ -3150,6 +3768,7 @@ export default function App() {
   useEffect(() => {
     if (!activeTask || pendingPlanBuildRef.current !== activeTask.id) return;
     if (activeTurnStatus !== "completed") return;
+    if (activeQueuedMessages.length > 0 || optimisticTurnStarting) return;
     pendingPlanBuildRef.current = "";
     const build = {
       prompt: "Implement the approved plan.",
@@ -3164,7 +3783,7 @@ export default function App() {
     const timer = window.setTimeout(() => void sendTurn(build), 0);
     return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- fires only on turn settlement for the flagged task
-  }, [activeTurnStatus, activeTask?.id]);
+  }, [activeQueuedMessages.length, activeTurnStatus, activeTask?.id, optimisticTurnStarting]);
 
   // Each reply is stamped with the model that was routed when it first
   // appeared, so switching models later never rewrites past attribution.
@@ -3233,12 +3852,16 @@ export default function App() {
     });
   };
 
-  const stopTurn = async () => {
-    if (!activeTask || stoppingTurn) return;
+  const stopTurn = async (continueQueue = false) => {
+    if (!activeTask || stoppingTurn) return false;
+    const taskId = activeTask.id;
+    const pauseQueue =
+      !continueQueue && snapshot.queuedMessages.some((message) => message.taskId === taskId);
+    if (pauseQueue) queuePausedTaskIdsRef.current.add(taskId);
     setStoppingTurn(true);
     setOperationError("");
     try {
-      const result = await bridge.stopTurn(activeTask.id);
+      const result = await bridge.stopTurn(taskId);
       setOperationStatus(
         result.settled
           ? "Session was no longer running — marked as stopped"
@@ -3246,12 +3869,144 @@ export default function App() {
             ? "Stop was already requested"
             : "Stop requested",
       );
+      return true;
     } catch (error) {
+      if (pauseQueue) queuePausedTaskIdsRef.current.delete(taskId);
       setOperationError(error instanceof Error ? error.message : "Could not stop this turn");
+      return false;
     } finally {
       setStoppingTurn(false);
     }
   };
+
+  const dispatchQueuedMessage = async (message: QueuedMessage, sendNow = false) => {
+    if (!activeTask || message.taskId !== activeTask.id) return;
+    if (sendNow) queuePausedTaskIdsRef.current.delete(message.taskId);
+    const continuingPriority =
+      priorityQueueIdRef.current === message.id && queueBusyIdRef.current === message.id;
+    if (queueBusyIdRef.current && !continuingPriority) return;
+    queueBusyIdRef.current = message.id;
+    setQueueBusyId(message.id);
+    setOperationError("");
+    let waitingForStop = false;
+    try {
+      const dispatching = await bridge.setQueuedMessageDispatching(
+        message.taskId,
+        message.id,
+        true,
+      );
+      setSnapshot((current) => ({
+        ...current,
+        queuedMessages: current.queuedMessages.map((candidate) =>
+          candidate.id === dispatching.id ? dispatching : candidate,
+        ),
+      }));
+
+      const turn = runtimeState?.taskId === activeTask.id ? runtimeState.turn : undefined;
+      if (sendNow && turn?.status === "inProgress") {
+        if (!message.nativeActionId) {
+          const steered = await bridge.steerTurn(
+            activeTask.id,
+            turn.id,
+            queuedMessagePrompt(message),
+          );
+          if (steered) {
+            await bridge.takeQueuedMessage(message.taskId, message.id);
+            await refreshTaskQueue(message.taskId);
+            setOperationStatus("Message sent into the active turn");
+            return;
+          }
+        }
+        priorityQueueIdRef.current = message.id;
+        waitingForStop = await stopTurn(true);
+        if (!waitingForStop) throw new Error("The active turn could not be stopped");
+        setOperationStatus("Stopping the current turn, then sending this message");
+        return;
+      }
+
+      priorityQueueIdRef.current = "";
+      const accepted = await sendTurn({
+        prompt: queuedMessagePrompt(message),
+        runtime: message.runtime,
+        model: message.model,
+        effort: message.effort,
+        permission: message.permission,
+        delegation: message.delegation,
+        nativeActionId: message.nativeActionId,
+      });
+      if (!accepted) throw new Error("The queued turn could not be started");
+      if (nativeHost) {
+        queueAwaitingTurnRef.current = {
+          taskId: message.taskId,
+          previousTurnId: turn?.id,
+        };
+      }
+      await bridge.takeQueuedMessage(message.taskId, message.id);
+      await refreshTaskQueue(message.taskId);
+      setOperationStatus("Queued message sent");
+    } catch (error) {
+      await bridge
+        .setQueuedMessageDispatching(message.taskId, message.id, false)
+        .then((queued) => {
+          setSnapshot((current) => ({
+            ...current,
+            queuedMessages: current.queuedMessages.map((candidate) =>
+              candidate.id === queued.id ? queued : candidate,
+            ),
+          }));
+        })
+        .catch(() => undefined);
+      priorityQueueIdRef.current = "";
+      setOperationError(formatBridgeError(error, "The queued message could not be sent"));
+    } finally {
+      if (!waitingForStop) {
+        queueBusyIdRef.current = "";
+        setQueueBusyId("");
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (!activeTask || workspaceLoading) return;
+    if (nativeHost && runtimeState?.taskId !== activeTask.id) return;
+    const awaitingTurn = queueAwaitingTurnRef.current;
+    if (awaitingTurn?.taskId === activeTask.id) {
+      const turn = runtimeState?.turn;
+      if (turn?.status === "inProgress" && turn.id !== awaitingTurn.previousTurnId) {
+        queueAwaitingTurnRef.current = undefined;
+      } else {
+        return;
+      }
+    }
+    if (nativeTurnRunning || optimisticTurnStarting) return;
+    const priorityId = priorityQueueIdRef.current;
+    if (!priorityId && queuePausedTaskIdsRef.current.has(activeTask.id)) return;
+    if (queueBusyIdRef.current && queueBusyIdRef.current !== priorityId) return;
+    const message =
+      (priorityId
+        ? activeQueuedMessages.find((candidate) => candidate.id === priorityId)
+        : undefined) ?? activeQueuedMessages.find((candidate) => candidate.state === "queued");
+    if (!message) {
+      if (priorityId) {
+        priorityQueueIdRef.current = "";
+        queueBusyIdRef.current = "";
+        setQueueBusyId("");
+      }
+      return;
+    }
+    const timer = window.setTimeout(() => void dispatchQueuedMessage(message), 0);
+    return () => window.clearTimeout(timer);
+    // Dispatch is intentionally edge-triggered by durable queue and provider projection state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    activeQueuedMessages,
+    activeTask?.id,
+    nativeHost,
+    nativeTurnRunning,
+    optimisticTurnStarting,
+    runtimeState?.taskId,
+    workspaceLoading,
+  ]);
 
   const focusComposer = () => {
     setScreen("workspace");
@@ -3319,6 +4074,7 @@ export default function App() {
         data-sidebar-visible={screen === "workspace" && !sidebarCollapsed}
         data-rail-visible={screen === "workspace" && showRightRail}
         data-subagent-visible={screen === "workspace" && Boolean(selectedDelegation)}
+        data-file-active={screen === "workspace" && Boolean(activeFileTab)}
         style={
           {
             "--sidebar-width": `${sidebarWidth}px`,
@@ -3332,6 +4088,82 @@ export default function App() {
         <NativeTitlebar
           context={titleContext}
           title={screen === "workspace" ? (activeTask?.title ?? "New chat") : undefined}
+          titleActive={!activeFileTab}
+          onTitleSelect={
+            screen === "workspace"
+              ? () => {
+                  setActiveFileTabPath("");
+                  changeCenterView("task");
+                }
+              : undefined
+          }
+          resourceTabs={
+            screen === "workspace" && !selectedDelegation && openFileTabs.length ? (
+              <div
+                className="titlebar-file-tabs"
+                role="tablist"
+                aria-label="Open files"
+                onPointerDown={beginFileTabPan}
+                onPointerMove={moveFileTabPan}
+                onPointerUp={endFileTabPan}
+                onPointerCancel={endFileTabPan}
+              >
+                <AnimatePresence initial={false}>
+                  {openFileTabs.map((tab) => (
+                    <motion.div
+                      layout="position"
+                      className="file-reader-tab"
+                      data-active={tab.path === activeFileTab?.path}
+                      key={tab.path}
+                      ref={tab.path === activeFileTab?.path ? activeFileTabElementRef : undefined}
+                      initial={{ opacity: 0, y: 5 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: 3 }}
+                      transition={{ duration: 0.16, ease: "easeOut" }}
+                    >
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-label={tab.path.split("/").at(-1)}
+                        aria-selected={tab.path === activeFileTab?.path}
+                        title={tab.path}
+                        onClick={(event) => {
+                          if (suppressFileTabClickRef.current) {
+                            event.preventDefault();
+                            return;
+                          }
+                          setActiveFileTabPath(tab.path);
+                        }}
+                        onAuxClick={(event) => {
+                          if (event.button === 1) {
+                            event.preventDefault();
+                            closeFileTab(tab.path);
+                          }
+                        }}
+                      >
+                        <FileIcon fileName={tab.path} />
+                        <span>{tab.path.split("/").at(-1)}</span>
+                      </button>
+                      <button
+                        className="file-reader-tab-close"
+                        type="button"
+                        aria-label={`Close ${tab.path}`}
+                        onClick={() => closeFileTab(tab.path)}
+                        onAuxClick={(event) => {
+                          if (event.button === 1) {
+                            event.preventDefault();
+                            closeFileTab(tab.path);
+                          }
+                        }}
+                      >
+                        <X />
+                      </button>
+                    </motion.div>
+                  ))}
+                </AnimatePresence>
+              </div>
+            ) : undefined
+          }
           motionScale={motionScale}
           subagentHeaderRef={setSubagentHeaderTarget}
           detail={
@@ -3363,6 +4195,9 @@ export default function App() {
                   data-active={centerView === "task"}
                   onClick={() => changeCenterView("task")}
                 >
+                  {centerView === "task" ? (
+                    <SlidingTabIndicator layoutId="workspace-view-tab-indicator" />
+                  ) : null}
                   Task
                 </button>
                 <button
@@ -3373,6 +4208,9 @@ export default function App() {
                   data-active={centerView === "review"}
                   onClick={reviewChanges}
                 >
+                  {centerView === "review" ? (
+                    <SlidingTabIndicator layoutId="workspace-view-tab-indicator" />
+                  ) : null}
                   Review{snapshot.git.files.length ? ` ${snapshot.git.files.length}` : ""}
                 </button>
               </div>
@@ -3388,18 +4226,6 @@ export default function App() {
                   <span>{formatCompactTokenCount(displayedUsage.tokens)}</span>
                   <span className="sr-only"> tokens</span>
                 </button>
-                {runtimeState?.turn?.status === "inProgress" ? (
-                  <button
-                    className="stop-turn-button"
-                    type="button"
-                    onClick={() => void stopTurn()}
-                    disabled={stoppingTurn || runtimeState.turn.stopRequested}
-                    aria-busy={stoppingTurn}
-                  >
-                    <CircleStop aria-hidden="true" />
-                    {runtimeState.turn.stopRequested || stoppingTurn ? "Stopping…" : "Stop"}
-                  </button>
-                ) : null}
                 <button
                   className="icon-button subtle"
                   type="button"
@@ -3564,6 +4390,24 @@ export default function App() {
                         busy={openingProject}
                         onOpenProject={() => setAddProjectOpen(true)}
                       />
+                    ) : activeFileTabPath ? (
+                      activeFileTab ? (
+                        <FileWorkspace
+                          key={activeFileTab.path}
+                          file={activeFileTab}
+                          editable={nativeHost}
+                          onSave={(content) => saveFileTab(activeFileTab.path, content)}
+                          onExplainSelection={explainFileSelection}
+                          onAddComposerContext={addSelectionAsComposerContext}
+                          explainAgentLabel={runtimeLabel(
+                            activeTask?.runtime ?? settingsDefaultRuntime,
+                          )}
+                        />
+                      ) : (
+                        <div className="route-loading" role="status" aria-live="polite">
+                          Opening {activeFileTabPath.split("/").at(-1)}…
+                        </div>
+                      )
                     ) : centerView === "task" ? (
                       <>
                         <div className="transcript-scroll" ref={transcriptScrollRef}>
@@ -3605,19 +4449,6 @@ export default function App() {
                             <EmptyTaskState project={activeProject} />
                           )}
                         </div>
-                        <AnimatePresence initial={false}>
-                          {activeTask && (nativeTurnRunning || optimisticTurnStarting) ? (
-                            <TaskStatusPill
-                              key="task-status-pill"
-                              runningSince={
-                                runtimeState?.turn?.startedAt ??
-                                optimisticForActiveTask?.event.timestamp
-                              }
-                              usage={runtimeUsage}
-                              activeAgentCount={activeAgentCount}
-                            />
-                          ) : null}
-                        </AnimatePresence>
                         {pendingApproval ? (
                           <ApprovalControl
                             approval={pendingApproval}
@@ -3631,6 +4462,46 @@ export default function App() {
                             }
                           />
                         ) : null}
+                        <AnimatePresence initial={false}>
+                          {activeTask &&
+                          (nativeTurnRunning ||
+                            optimisticTurnStarting ||
+                            activeQueuedMessages.length > 0) ? (
+                            <TaskStatusPill
+                              key="task-status-pill"
+                              runningSince={
+                                nativeTurnRunning || optimisticTurnStarting
+                                  ? (runtimeState?.turn?.startedAt ??
+                                    optimisticForActiveTask?.event.timestamp)
+                                  : undefined
+                              }
+                              usage={runtimeUsage}
+                              activeAgentCount={activeAgentCount}
+                              queue={
+                                activeQueuedMessages.length > 0 ? (
+                                  <QueuedMessages
+                                    messages={activeQueuedMessages}
+                                    busyId={queueBusyId || undefined}
+                                    disabled={Boolean(queueBusyId)}
+                                    onSendNow={(messageId) => {
+                                      const message = activeQueuedMessages.find(
+                                        (candidate) => candidate.id === messageId,
+                                      );
+                                      if (message) void dispatchQueuedMessage(message, true);
+                                    }}
+                                    onReturnToComposer={(messageId) =>
+                                      void restoreQueuedMessage(messageId)
+                                    }
+                                    onDelete={(messageId) => void deleteQueuedMessage(messageId)}
+                                    onReorder={(orderedIds) =>
+                                      void reorderQueuedMessages(orderedIds)
+                                    }
+                                  />
+                                ) : undefined
+                              }
+                            />
+                          ) : null}
+                        </AnimatePresence>
                         <Composer
                           key={
                             activeTask && promotingDraftTaskId !== activeTask.id
@@ -3669,15 +4540,25 @@ export default function App() {
                           onInsertHandled={(id) =>
                             setComposerInsert((current) => (current?.id === id ? null : current))
                           }
+                          attachmentRequest={composerAttachment}
+                          onAttachmentHandled={(id) =>
+                            setComposerAttachment((current) =>
+                              current?.id === id ? null : current,
+                            )
+                          }
+                          restoreRequest={composerRestore}
+                          onRestoreHandled={(id) =>
+                            setComposerRestore((current) => (current?.id === id ? null : current))
+                          }
                           notices={composerNotices}
                           running={
                             Boolean(activeTask) &&
                             runtimeState?.taskId === activeTask?.id &&
                             runtimeState?.turn?.status === "inProgress"
                           }
-                          stopping={stoppingTurn || Boolean(runtimeState?.turn?.stopRequested)}
+                          stopping={stoppingTurn}
                           onStop={() => void stopTurn()}
-                          onSend={sendTurn}
+                          onSend={submitComposerTurn}
                           sessionModes={
                             activeTask?.runtime === "cursor" ? activeRuntimeState?.mode : undefined
                           }
@@ -3708,6 +4589,7 @@ export default function App() {
                           onRoutingChange={
                             activeTask
                               ? (routing) => {
+                                  if (nativeTurnRunning || optimisticTurnStarting) return;
                                   setSnapshot((current) => ({
                                     ...current,
                                     tasks: current.tasks.map((task) =>
@@ -3940,13 +4822,13 @@ export default function App() {
                         projectFiles={projectFiles}
                         projectFilesState={projectFilesState}
                         onRequestProjectFiles={requestProjectFiles}
-                        openProjectFileRequest={openProjectFileRequest}
                         onSelectFile={selectFile}
-                        onOpenProjectFile={openProjectFile}
+                        onOpenFile={(file) => void openFileInCanvas(file)}
+                        activeFilePath={activeFileTabPath}
+                        openingFilePath={fileTabOpeningPath}
                         onRenameProjectFile={renameProjectFile}
                         onMentionProjectFile={mentionProjectFile}
                         onMentionProjectFolder={mentionProjectFolder}
-                        onAddFileSelection={(payload) => addSelectionToChat(payload, "file")}
                         fileOpeners={projectFileOpeners}
                         onOpenGitFileExternal={nativeHost ? openGitFileExternal : undefined}
                         onRevealGitFile={nativeHost ? revealGitFile : undefined}
@@ -3954,9 +4836,19 @@ export default function App() {
                         onRevealProjectFile={nativeHost ? revealProjectPath : undefined}
                         onStageFile={stageFile}
                         onStageFiles={async (paths, staged) => {
-                          if (!activeTask) return;
-                          const git = await bridge.stageFiles(activeTask.id, paths, staged);
-                          applyTaskGitSnapshot(activeTask.id, git);
+                          if (activeTask) {
+                            const git = await bridge.stageFiles(activeTask.id, paths, staged);
+                            applyTaskGitSnapshot(activeTask.id, git);
+                            return;
+                          }
+                          if (!activeProject) return;
+                          const projectId = activeProject.id;
+                          const git = await bridge.stageProjectFiles(projectId, paths, staged);
+                          setSnapshot((current) =>
+                            current.activeProjectId === projectId && !current.activeTaskId
+                              ? { ...current, git }
+                              : current,
+                          );
                         }}
                         onCommit={commit}
                         onGenerateCommitMessage={

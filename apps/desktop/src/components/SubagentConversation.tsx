@@ -19,6 +19,7 @@ import {
   type RuntimeProjectionState,
 } from "../runtimeProjection";
 import { Composer } from "./Composer";
+import { SlidingTabIndicator } from "./SlidingTabIndicator";
 import { TaskStatusPill } from "./TaskStatusPill";
 import { formatCompactTokenCount } from "./conversationFormatting";
 import { Dropdown } from "./Dropdown";
@@ -321,6 +322,9 @@ export function SubagentConversation({
                   data-active={centerView === "task"}
                   onClick={() => setCenterView("task")}
                 >
+                  {centerView === "task" ? (
+                    <SlidingTabIndicator layoutId={`subagent-view-tab-${delegation.id}`} />
+                  ) : null}
                   Task
                 </button>
                 <button
@@ -335,6 +339,9 @@ export function SubagentConversation({
                     setReviewLoading(true);
                   }}
                 >
+                  {centerView === "review" ? (
+                    <SlidingTabIndicator layoutId={`subagent-view-tab-${delegation.id}`} />
+                  ) : null}
                   Review{git?.files.length ? ` ${git.files.length}` : ""}
                 </button>
               </div>

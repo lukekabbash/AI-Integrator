@@ -294,6 +294,29 @@ impl CodexClient {
         approval_policy: &str,
         sandbox: &str,
     ) -> Result<Value> {
+        self.start_thread_with_policies_and_config(
+            cwd,
+            model,
+            reasoning_effort,
+            approval_policy,
+            sandbox,
+            None,
+        )
+        .await
+    }
+
+    /// Starts a thread with an ephemeral config layer owned by the embedding
+    /// client. Integrator uses this for its task-scoped broker MCP server so
+    /// it never has to modify the user's global or project Codex config.
+    pub async fn start_thread_with_policies_and_config(
+        &self,
+        cwd: &Path,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+        approval_policy: &str,
+        sandbox: &str,
+        config: Option<Value>,
+    ) -> Result<Value> {
         if !matches!(
             approval_policy,
             "untrusted" | "on-request" | "on-failure" | "never"
@@ -327,6 +350,14 @@ impl CodexClient {
         }
         if let Some(effort) = reasoning_effort {
             params["reasoningEffort"] = Value::String(effort.into());
+        }
+        if let Some(config) = config {
+            if !config.is_object() {
+                return Err(IntegratorError::InvalidInput(
+                    "thread config must be an object".into(),
+                ));
+            }
+            params["config"] = config;
         }
         self.request("thread/start", params).await
     }
@@ -379,13 +410,7 @@ impl CodexClient {
         skill: Option<&CodexSkillSelection>,
     ) -> Result<Value> {
         validate_protocol_id(thread_id, "thread")?;
-        let prompt = prompt.trim();
-        if prompt.is_empty() || prompt.len() > 2 * 1024 * 1024 {
-            return Err(IntegratorError::InvalidInput(
-                "prompt must contain 1 byte to 2 MiB".into(),
-            ));
-        }
-        let mut input = vec![json!({ "type": "text", "text": prompt, "text_elements": [] })];
+        let mut input = turn_text_input(prompt)?;
         if let Some(skill) = skill {
             validate_skill_selection(skill)?;
             input.push(json!({
@@ -407,6 +432,19 @@ impl CodexClient {
         self.request(
             "turn/interrupt",
             json!({ "threadId": thread_id, "turnId": turn_id }),
+        )
+        .await
+    }
+
+    pub async fn steer_turn(
+        &self,
+        thread_id: &str,
+        expected_turn_id: &str,
+        prompt: &str,
+    ) -> Result<Value> {
+        self.request(
+            "turn/steer",
+            steer_turn_params(thread_id, expected_turn_id, prompt)?,
         )
         .await
     }
@@ -705,6 +743,28 @@ fn validate_protocol_id(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn turn_text_input(prompt: &str) -> Result<Vec<Value>> {
+    let prompt = prompt.trim();
+    if prompt.is_empty() || prompt.len() > 2 * 1024 * 1024 {
+        return Err(IntegratorError::InvalidInput(
+            "prompt must contain 1 byte to 2 MiB".into(),
+        ));
+    }
+    Ok(vec![
+        json!({ "type": "text", "text": prompt, "text_elements": [] }),
+    ])
+}
+
+fn steer_turn_params(thread_id: &str, expected_turn_id: &str, prompt: &str) -> Result<Value> {
+    validate_protocol_id(thread_id, "thread")?;
+    validate_protocol_id(expected_turn_id, "turn")?;
+    Ok(json!({
+        "threadId": thread_id,
+        "input": turn_text_input(prompt)?,
+        "expectedTurnId": expected_turn_id,
+    }))
+}
+
 fn validate_skill_selection(skill: &CodexSkillSelection) -> Result<()> {
     if skill.name.trim().is_empty() || skill.name.len() > 256 || skill.name.contains(['\r', '\n']) {
         return Err(IntegratorError::InvalidInput(
@@ -928,6 +988,22 @@ mod tests {
     fn protocol_ids_are_strictly_bounded() {
         assert!(validate_protocol_id("thread_123", "thread").is_ok());
         assert!(validate_protocol_id("../thread", "thread").is_err());
+    }
+
+    #[test]
+    fn steer_turn_uses_the_active_turn_contract_and_bounded_text_input() {
+        assert_eq!(
+            steer_turn_params("thread-1", "turn-1", "  follow up  ")
+                .expect("valid steering params"),
+            json!({
+                "threadId": "thread-1",
+                "input": [{ "type": "text", "text": "follow up", "text_elements": [] }],
+                "expectedTurnId": "turn-1",
+            })
+        );
+        assert!(steer_turn_params("../thread", "turn-1", "follow up").is_err());
+        assert!(steer_turn_params("thread-1", "turn-1", "   ").is_err());
+        assert!(steer_turn_params("thread-1", "turn-1", &"x".repeat(2 * 1024 * 1024 + 1)).is_err());
     }
 
     #[test]

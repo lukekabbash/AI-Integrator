@@ -36,12 +36,10 @@ import {
   SquareArrowOutUpRight,
   Sparkles,
   Users,
-  X,
 } from "lucide-react";
 import { AnimatedFolderIcon } from "./AnimatedFolderIcon";
 import { FileIcon } from "./FileIcon";
-import { SelectionActionPopover, type SelectionPayload } from "./SelectionActionPopover";
-import { selectionEndpointElement } from "./conversationFormatting";
+import { ProgressiveSurfaceControls } from "./FileView";
 import {
   diffFileKey,
   type ChildAgent,
@@ -49,13 +47,16 @@ import {
   type DiffFile,
   type GitCommit,
   type GitSnapshot,
-  type ProjectFileContent,
   type ProjectFileEntry,
   type ProjectFileOpener,
   type UsageSnapshot,
 } from "../bridge";
 import { ResizeHandle } from "./ResizeHandle";
+import { SlidingTabIndicator } from "./SlidingTabIndicator";
 import { Tooltip } from "./Tooltip";
+import { TravelingSelection } from "./TravelingSelection";
+
+export type { FileSelectionPayload } from "./FileView";
 
 const loadGitRemoteDialog = () => import("./GitRemoteDialog");
 const GitRemoteDialog = lazy(() =>
@@ -64,15 +65,8 @@ const GitRemoteDialog = lazy(() =>
 
 type RailTab = "git" | "agents" | "files" | "usage";
 
-/** Selection payload from the file preview, with the file it came from. */
-export interface FileSelectionPayload extends SelectionPayload {
-  path: string;
-}
-
 const INITIAL_FILE_TREE_ENTRIES = 300;
 const FILE_TREE_CHUNK = 300;
-const INITIAL_FILE_PREVIEW_LINES = 400;
-const FILE_PREVIEW_CHUNK = 400;
 const INITIAL_GIT_FILE_ROWS = 200;
 const GIT_FILE_CHUNK = 200;
 
@@ -313,18 +307,19 @@ interface RightRailProps {
   projectFilesState?: "loading" | "ready" | "unavailable";
   /** Starts the bounded project scan only when the Files surface is opened. */
   onRequestProjectFiles?: () => void;
-  /** A transcript action requesting a file be opened in the Files tab. */
-  openProjectFileRequest?: { path: string; id: number } | null;
   onSelectFile: (file: DiffFile) => void;
-  onOpenProjectFile?: (file: ProjectFileEntry) => Promise<ProjectFileContent>;
+  /** Opens a project file as a first-class titlebar tab in the primary canvas. */
+  onOpenFile?: (file: ProjectFileEntry) => void;
+  /** The canvas file tab currently shown, highlighted in the tree. */
+  activeFilePath?: string;
+  /** A file mid-open toward the canvas, marked busy in the tree. */
+  openingFilePath?: string;
   /** Renames a project file in place; the caller refreshes the file list. */
   onRenameProjectFile?: (file: ProjectFileEntry, newName: string) => Promise<void>;
   /** Inserts the file as an @context mention into the main chat composer. */
   onMentionProjectFile?: (file: ProjectFileEntry) => void;
   /** Inserts a folder as an @context mention into the main chat composer. */
   onMentionProjectFolder?: (path: string) => void;
-  /** Selection-to-chat from the file preview: quoted lines land in the composer. */
-  onAddFileSelection?: (payload: FileSelectionPayload) => void;
   /** Native-detected, allowlisted external targets for Git file actions. */
   fileOpeners?: ProjectFileOpener[];
   onOpenGitFileExternal?: (file: DiffFile, openerId: string) => Promise<void>;
@@ -725,64 +720,74 @@ function GitPanel({
     });
   };
 
-  const fileRow = (file: DiffFile, isStaged: boolean) => (
-    <div
-      className="git-file-row"
-      data-active={activeFile ? diffFileKey(activeFile) === diffFileKey(file) : false}
-      key={diffFileKey(file)}
-      onContextMenu={(event) => {
-        event.preventDefault();
-        openFileContextMenu(
-          file,
-          event.clientX,
-          event.clientY,
-          event.currentTarget.querySelector<HTMLButtonElement>(".git-file-name"),
-        );
-      }}
-    >
-      <span className="git-file-glyph">
-        <FileIcon fileName={file.path} />
-        <button
-          className="git-stage-button"
-          type="button"
-          onClick={() => void runStage(file, !isStaged)}
-          disabled={stagingPath !== null || busy !== null}
-          aria-busy={stagingPath === file.path}
-          aria-label={`${isStaged ? "Unstage" : "Stage"} ${file.path}`}
-        >
-          {isStaged ? <Minus /> : <Plus />}
-        </button>
-      </span>
-      <button
-        className="git-file-name"
-        type="button"
-        onClick={() => onSelectFile(file)}
-        onKeyDown={(event) => {
-          if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
-            event.preventDefault();
-            const bounds = event.currentTarget.getBoundingClientRect();
-            openFileContextMenu(file, bounds.right - 12, bounds.bottom, event.currentTarget, true);
-          }
+  const fileRow = (file: DiffFile, isStaged: boolean) => {
+    const key = diffFileKey(file);
+    return (
+      <div
+        className="git-file-row"
+        data-active={activeFile ? diffFileKey(activeFile) === diffFileKey(file) : false}
+        data-traveling-selection={key}
+        key={key}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          openFileContextMenu(
+            file,
+            event.clientX,
+            event.clientY,
+            event.currentTarget.querySelector<HTMLButtonElement>(".git-file-name"),
+          );
         }}
-        title={file.path}
-        aria-pressed={activeFile ? diffFileKey(activeFile) === diffFileKey(file) : false}
       >
-        <span>{file.path.split("/").at(-1)}</span>
-        <small>{file.path.split("/").slice(0, -1).join("/")}</small>
-      </button>
-      <span className="file-change-count">
-        {file.statsLoaded === false ? (
-          <small aria-label="Line counts load when this diff is opened">…</small>
-        ) : (
-          <>
-            <i>+{file.additions}</i>
-            <b>−{file.deletions}</b>
-          </>
-        )}
-      </span>
-      <span className="file-state">{file.status.at(0)?.toUpperCase()}</span>
-    </div>
-  );
+        <span className="git-file-glyph">
+          <FileIcon fileName={file.path} />
+          <button
+            className="git-stage-button"
+            type="button"
+            onClick={() => void runStage(file, !isStaged)}
+            disabled={stagingPath !== null || busy !== null}
+            aria-busy={stagingPath === file.path}
+            aria-label={`${isStaged ? "Unstage" : "Stage"} ${file.path}`}
+          >
+            {isStaged ? <Minus /> : <Plus />}
+          </button>
+        </span>
+        <button
+          className="git-file-name"
+          type="button"
+          onClick={() => onSelectFile(file)}
+          onKeyDown={(event) => {
+            if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+              event.preventDefault();
+              const bounds = event.currentTarget.getBoundingClientRect();
+              openFileContextMenu(
+                file,
+                bounds.right - 12,
+                bounds.bottom,
+                event.currentTarget,
+                true,
+              );
+            }
+          }}
+          title={file.path}
+          aria-pressed={activeFile ? diffFileKey(activeFile) === diffFileKey(file) : false}
+        >
+          <span>{file.path.split("/").at(-1)}</span>
+          <small>{file.path.split("/").slice(0, -1).join("/")}</small>
+        </button>
+        <span className="file-change-count">
+          {file.statsLoaded === false ? (
+            <small aria-label="Line counts load when this diff is opened">…</small>
+          ) : (
+            <>
+              <i>+{file.additions}</i>
+              <b>−{file.deletions}</b>
+            </>
+          )}
+        </span>
+        <span className="file-state">{file.status.at(0)?.toUpperCase()}</span>
+      </div>
+    );
+  };
 
   if (gitLoading) {
     return (
@@ -1232,6 +1237,11 @@ function GitPanel({
             <small>{staged.length}</small>
           </div>
           <div className="git-section-body">
+            <TravelingSelection
+              activeKey={activeFile ? diffFileKey(activeFile) : ""}
+              className="git-file-active"
+              layoutKey={`${stagedLimit}:${staged.map(diffFileKey).join("|")}`}
+            />
             {staged.length ? (
               <>
                 {staged.slice(0, stagedLimit).map((file) => fileRow(file, true))}
@@ -1272,6 +1282,11 @@ function GitPanel({
             <small>{unstaged.length}</small>
           </div>
           <div className="git-section-body">
+            <TravelingSelection
+              activeKey={activeFile ? diffFileKey(activeFile) : ""}
+              className="git-file-active"
+              layoutKey={`${unstagedLimit}:${unstaged.map(diffFileKey).join("|")}`}
+            />
             {unstaged.length ? (
               <>
                 {unstaged.slice(0, unstagedLimit).map((file) => fileRow(file, false))}
@@ -1855,155 +1870,34 @@ interface FileContextMenuState {
   keyboard: boolean;
 }
 
-function ProgressiveSurfaceControls({
-  shown,
-  total,
-  noun,
-  chunk,
-  onShowMore,
-  onShowAll,
-}: {
-  shown: number;
-  total: number;
-  noun: string;
-  chunk: number;
-  onShowMore: () => void;
-  onShowAll: () => void;
-}) {
-  if (shown >= total) return null;
-  return (
-    <div className="progressive-surface-controls">
-      <span role="status" aria-live="polite">
-        Showing {shown.toLocaleString()} of {total.toLocaleString()} {noun}
-      </span>
-      <button className="secondary-button" type="button" onClick={onShowMore}>
-        Show next {Math.min(chunk, total - shown).toLocaleString()} {noun}
-      </button>
-      <button className="secondary-button" type="button" onClick={onShowAll}>
-        Show all {total.toLocaleString()} {noun}
-      </button>
-    </div>
-  );
-}
-
-function FilePreview({
-  file,
-  onAddSelection,
-}: {
-  file: ProjectFileContent;
-  onAddSelection?: (payload: FileSelectionPayload) => void;
-}) {
-  const lines = useMemo(() => file.content.split("\n"), [file.content]);
-  const [lineLimit, setLineLimit] = useState(INITIAL_FILE_PREVIEW_LINES);
-  const visibleLines = lines.slice(0, lineLimit);
-  const linesRef = useRef<HTMLOListElement>(null);
-  const resolveSelection = useCallback((range: Range) => {
-    const container = linesRef.current;
-    if (!container) return null;
-    const startRow = selectionEndpointElement(range.startContainer, "li[data-line]", container);
-    const endRow = selectionEndpointElement(range.endContainer, "li[data-line]", container);
-    const startLine = startRow ? Number(startRow.dataset.line) : undefined;
-    const endLine = endRow ? Number(endRow.dataset.line) : undefined;
-    // List markers are CSS counters, so the raw selection text is clean code.
-    return { text: range.toString(), startLine, endLine };
-  }, []);
-  return (
-    <motion.div
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      transition={{ duration: 0.14, ease: "easeOut" }}
-    >
-      {onAddSelection ? (
-        <SelectionActionPopover
-          containerRef={linesRef}
-          resolve={resolveSelection}
-          label={`Selection actions for ${file.path}`}
-          onAction={(payload) => onAddSelection({ ...payload, path: file.path })}
-        />
-      ) : null}
-      <ol className="file-reader-lines" aria-label={`Contents of ${file.path}`} ref={linesRef}>
-        {visibleLines.map((line, index) => (
-          <li key={`${file.path}-${index}`} data-line={index + 1}>
-            <code>
-              {highlightFileLine(line).map((token, tokenIndex) => (
-                <span
-                  className={`syntax-${token.kind}`}
-                  key={`${file.path}-${index}-${tokenIndex}`}
-                >
-                  {token.text}
-                </span>
-              ))}
-            </code>
-          </li>
-        ))}
-      </ol>
-      <ProgressiveSurfaceControls
-        shown={visibleLines.length}
-        total={lines.length}
-        noun="lines"
-        chunk={FILE_PREVIEW_CHUNK}
-        onShowMore={() => setLineLimit((current) => current + FILE_PREVIEW_CHUNK)}
-        onShowAll={() => setLineLimit(lines.length)}
-      />
-    </motion.div>
-  );
-}
-
-/** Transcript tool events may carry absolute or "./"-prefixed paths while the
- * project tree is root-relative; resolve by exact match first, then by the
- * longest tree path the requested path ends with. */
-function resolveRequestedFile(
-  files: ProjectFileEntry[],
-  requestedPath: string,
-): ProjectFileEntry | undefined {
-  const normalize = (path: string) => path.replace(/\\/g, "/").replace(/^\.\//, "");
-  const requested = normalize(requestedPath);
-  let suffixMatch: ProjectFileEntry | undefined;
-  let suffixMatchLength = 0;
-  for (const file of files) {
-    const candidate = normalize(file.path);
-    if (candidate === requested) return file;
-    if (requested.endsWith(`/${candidate}`) && candidate.length > suffixMatchLength) {
-      suffixMatch = file;
-      suffixMatchLength = candidate.length;
-    }
-  }
-  return suffixMatch;
-}
-
 function FilePanel({
   projectFiles = [],
   projectFilesState = "unavailable",
-  openProjectFileRequest,
   fileOpeners = [],
-  onOpenProjectFile,
+  onOpenFile,
+  activeFilePath = "",
+  openingFilePath = "",
   onRenameProjectFile,
   onMentionProjectFile,
   onMentionProjectFolder,
-  onAddFileSelection,
   onOpenProjectFileExternal,
   onRevealProjectFile,
 }: Pick<
   RightRailProps,
   | "projectFiles"
   | "projectFilesState"
-  | "openProjectFileRequest"
   | "fileOpeners"
-  | "onOpenProjectFile"
+  | "onOpenFile"
+  | "activeFilePath"
+  | "openingFilePath"
   | "onRenameProjectFile"
   | "onMentionProjectFile"
   | "onMentionProjectFolder"
-  | "onAddFileSelection"
   | "onOpenProjectFileExternal"
   | "onRevealProjectFile"
 >) {
   const [filter, setFilter] = useState("");
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(() => new Set());
-  const [openTabs, setOpenTabs] = useState<ProjectFileContent[]>([]);
-  const [activePath, setActivePath] = useState<string>("");
-  const [openingPath, setOpeningPath] = useState<string>("");
-  const [readError, setReadError] = useState("");
-  const [readerRatio, setReaderRatio] = useState(0.5);
   const [renamingPath, setRenamingPath] = useState("");
   const [renameError, setRenameError] = useState("");
   const [fileActionError, setFileActionError] = useState("");
@@ -2014,9 +1908,7 @@ function FilePanel({
     key: "",
     limit: INITIAL_FILE_TREE_ENTRIES,
   });
-  const handledOpenRequestRef = useRef<number | null>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
-  const splitRef = useRef<HTMLDivElement>(null);
   const normalizedFilter = filter.trim().toLocaleLowerCase();
   const visibleProjectFiles = useMemo(
     () =>
@@ -2032,8 +1924,6 @@ function FilePanel({
     [treeLimit, visibleProjectFiles],
   );
   const projectTree = useMemo(() => buildProjectTree(treeProjectFiles), [treeProjectFiles]);
-  const activeFile = openTabs.find((file) => file.path === activePath) ?? openTabs[0];
-  const readerOpen = Boolean(activeFile || openingPath || readError);
   const supportedFileOpeners = useMemo(
     () => fileOpeners.filter((opener) => opener.id === "cursor" || opener.id === "vscode"),
     [fileOpeners],
@@ -2044,72 +1934,6 @@ function FilePanel({
       const next = new Set(current);
       if (next.has(path)) next.delete(path);
       else next.add(path);
-      return next;
-    });
-  };
-
-  const openProjectFile = useCallback(
-    async (file: ProjectFileEntry) => {
-      const existing = openTabs.find((tab) => tab.path === file.path);
-      if (existing) {
-        setActivePath(existing.path);
-        setReadError("");
-        return;
-      }
-      if (!onOpenProjectFile) {
-        setReadError("Project file reading is unavailable in this build.");
-        return;
-      }
-      setOpeningPath(file.path);
-      setReadError("");
-      try {
-        const content = await onOpenProjectFile(file);
-        setOpenTabs((current) =>
-          [content, ...current.filter((tab) => tab.path !== content.path)].slice(0, 8),
-        );
-        setActivePath(content.path);
-      } catch (error) {
-        setReadError(
-          error instanceof Error
-            ? error.message
-            : typeof error === "object" &&
-                error &&
-                "message" in error &&
-                typeof error.message === "string"
-              ? error.message
-              : "Could not open that project file.",
-        );
-      } finally {
-        setOpeningPath("");
-      }
-    },
-    [onOpenProjectFile, openTabs],
-  );
-
-  useEffect(() => {
-    if (!openProjectFileRequest) return;
-    if (handledOpenRequestRef.current === openProjectFileRequest.id) return;
-    const file = resolveRequestedFile(projectFiles, openProjectFileRequest.path);
-    // Retry while the tree is still loading; once it is ready an unresolved
-    // path gets surfaced in the reader instead of failing silently.
-    if (!file && projectFilesState !== "ready") return;
-    // Mark the request handled inside the timer so a StrictMode remount that
-    // clears the pending timeout does not swallow the open or its error.
-    const timer = window.setTimeout(() => {
-      handledOpenRequestRef.current = openProjectFileRequest.id;
-      if (!file) {
-        setReadError(`Could not find ${openProjectFileRequest.path} in the project files.`);
-        return;
-      }
-      void openProjectFile(file);
-    }, 0);
-    return () => window.clearTimeout(timer);
-  }, [openProjectFileRequest, projectFiles, projectFilesState, openProjectFile]);
-
-  const closeTab = (path: string) => {
-    setOpenTabs((current) => {
-      const next = current.filter((tab) => tab.path !== path);
-      if (activePath === path) setActivePath(next[0]?.path ?? "");
       return next;
     });
   };
@@ -2205,14 +2029,8 @@ function FilePanel({
     if (!newName || newName === currentName || !onRenameProjectFile) return;
     setRenameError("");
     try {
+      // The canvas owner keeps any open file tab pointing at the renamed file.
       await onRenameProjectFile(file, newName);
-      const parent = file.path.split("/").slice(0, -1).join("/");
-      const nextPath = parent ? `${parent}/${newName}` : newName;
-      // Keep any open reader tab pointing at the renamed file.
-      setOpenTabs((current) =>
-        current.map((tab) => (tab.path === file.path ? { ...tab, path: nextPath } : tab)),
-      );
-      setActivePath((current) => (current === file.path ? nextPath : current));
     } catch (error) {
       setRenameError(
         error instanceof Error ? error.message : "Could not rename that project file.",
@@ -2266,12 +2084,7 @@ function FilePanel({
               : "Unavailable"}
         </small>
       </header>
-      <div
-        className="file-panel-split"
-        data-reader-open={readerOpen}
-        ref={splitRef}
-        style={{ "--file-reader-ratio": `${readerRatio * 100}%` } as CSSProperties}
-      >
+      <div className="file-panel-split">
         <div className="file-tree-pane">
           <label className="rail-filter">
             <span className="sr-only">Filter files</span>
@@ -2292,6 +2105,15 @@ function FilePanel({
             </p>
           ) : null}
           <div className="file-tree" aria-label="Project files">
+            <TravelingSelection
+              activeKey={activeFilePath}
+              className="file-tree-active"
+              layoutKey={`${normalizedFilter}:${treeLimit}:${renamingPath}:${Array.from(
+                collapsedFolders,
+              )
+                .sort()
+                .join("|")}:${treeProjectFiles.map((file) => file.path).join("|")}`}
+            />
             {projectFilesState === "loading" ? (
               <p className="empty-compact">Reading trusted project files…</p>
             ) : null}
@@ -2301,9 +2123,9 @@ function FilePanel({
                 collapsedFolders={collapsedFolders}
                 forceExpanded={Boolean(normalizedFilter)}
                 onToggleFolder={toggleFolder}
-                onOpenFile={(file) => void openProjectFile(file)}
-                activePath={activePath}
-                openingPath={openingPath}
+                onOpenFile={(file) => onOpenFile?.(file)}
+                activePath={activeFilePath}
+                openingPath={openingFilePath}
                 renamingPath={renamingPath}
                 onStartRename={onRenameProjectFile ? startRename : undefined}
                 onCommitRename={(file, name) => void commitRename(file, name)}
@@ -2344,110 +2166,6 @@ function FilePanel({
             ) : null}
           </div>
         </div>
-        {readerOpen ? (
-          <ResizeHandle
-            axis="vertical"
-            label="Resize file preview"
-            onResize={(delta) => {
-              const height = splitRef.current?.getBoundingClientRect().height ?? 1;
-              setReaderRatio((current) => Math.max(0.24, Math.min(0.82, current - delta / height)));
-            }}
-          />
-        ) : null}
-        <AnimatePresence initial={false}>
-          {readerOpen ? (
-            <motion.div
-              key="file-reader"
-              className="file-reader-pane"
-              aria-label="Open project files"
-              initial={{ opacity: 0, y: 18 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 18 }}
-              transition={{ duration: 0.18, ease: "easeOut" }}
-            >
-              {openTabs.length ? (
-                <div className="file-reader-tabs" role="tablist" aria-label="Open files">
-                  <AnimatePresence initial={false}>
-                    {openTabs.map((tab) => (
-                      <motion.div
-                        layout
-                        className="file-reader-tab"
-                        data-active={tab.path === (activeFile?.path ?? "")}
-                        key={tab.path}
-                        initial={{ opacity: 0, y: 8, maxWidth: 0 }}
-                        animate={{ opacity: 1, y: 0, maxWidth: 140 }}
-                        exit={{ opacity: 0, y: 4, maxWidth: 0 }}
-                        transition={{ duration: 0.16, ease: "easeOut" }}
-                      >
-                        <button
-                          type="button"
-                          role="tab"
-                          aria-selected={tab.path === (activeFile?.path ?? "")}
-                          title={tab.path}
-                          onClick={() => setActivePath(tab.path)}
-                        >
-                          <FileIcon fileName={tab.path} />
-                          <span>{tab.path.split("/").at(-1)}</span>
-                        </button>
-                        <button
-                          className="file-reader-tab-close"
-                          type="button"
-                          aria-label={`Close ${tab.path}`}
-                          onClick={() => closeTab(tab.path)}
-                          onAuxClick={(event) => {
-                            if (event.button === 1) {
-                              event.preventDefault();
-                              closeTab(tab.path);
-                            }
-                          }}
-                        >
-                          <X />
-                        </button>
-                      </motion.div>
-                    ))}
-                  </AnimatePresence>
-                </div>
-              ) : null}
-              <div className="file-reader-body">
-                {readError ? (
-                  <p className="empty-compact" role="alert">
-                    {readError}
-                  </p>
-                ) : null}
-                {openingPath && !activeFile ? (
-                  <p className="empty-compact" role="status">
-                    Opening {openingPath.split("/").at(-1)}…
-                  </p>
-                ) : null}
-                {activeFile ? (
-                  activeFile.imageDataUrl ? (
-                    <div className="file-reader-image">
-                      <img
-                        src={activeFile.imageDataUrl}
-                        alt={activeFile.path.split("/").at(-1) ?? activeFile.path}
-                      />
-                    </div>
-                  ) : activeFile.isBinary ? (
-                    <p className="empty-compact">
-                      This binary file cannot be safely previewed as text.
-                    </p>
-                  ) : (
-                    <FilePreview
-                      key={activeFile.path}
-                      file={activeFile}
-                      onAddSelection={onAddFileSelection}
-                    />
-                  )
-                ) : null}
-              </div>
-            </motion.div>
-          ) : null}
-        </AnimatePresence>
-        {!readerOpen ? (
-          <p className="empty-compact file-reader-placeholder">
-            Select a file from the project tree to preview it.
-          </p>
-        ) : null}
       </div>
       {contextMenu ? (
         <div
@@ -2478,11 +2196,11 @@ function FilePanel({
             type="button"
             role="menuitem"
             onClick={() => {
-              void openProjectFile(contextMenu.file);
+              onOpenFile?.(contextMenu.file);
               setContextMenu(null);
             }}
           >
-            <FolderOpen /> Open preview
+            <FolderOpen /> Open file
           </button>
           {supportedFileOpeners.length || onRevealProjectFile ? (
             <div className="compact-action-menu-separator" role="separator" />
@@ -2570,83 +2288,6 @@ function FilePanel({
       ) : null}
     </div>
   );
-}
-
-interface FileSyntaxToken {
-  text: string;
-  kind: "keyword" | "string" | "type" | "comment" | "function" | "plain";
-}
-
-const FILE_KEYWORDS = new Set([
-  "as",
-  "async",
-  "await",
-  "break",
-  "case",
-  "catch",
-  "class",
-  "const",
-  "continue",
-  "default",
-  "else",
-  "export",
-  "extends",
-  "fn",
-  "for",
-  "from",
-  "function",
-  "if",
-  "impl",
-  "import",
-  "in",
-  "interface",
-  "let",
-  "match",
-  "mod",
-  "mut",
-  "new",
-  "pub",
-  "return",
-  "self",
-  "static",
-  "struct",
-  "switch",
-  "throw",
-  "try",
-  "type",
-  "use",
-  "var",
-  "while",
-]);
-
-function highlightFileLine(line: string): FileSyntaxToken[] {
-  if (!line) return [{ text: " ", kind: "plain" }];
-  const tokens: FileSyntaxToken[] = [];
-  const pattern =
-    /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\/\/.*|#.*|\/\*.*?\*\/|\b[A-Za-z_$][\w$]*\b)/g;
-  let cursor = 0;
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(line))) {
-    if (match.index > cursor) tokens.push({ text: line.slice(cursor, match.index), kind: "plain" });
-    const text = match[0];
-    const after = line.slice(match.index + text.length);
-    const kind =
-      text.startsWith("//") || text.startsWith("#") || text.startsWith("/*")
-        ? "comment"
-        : /^["'`]/.test(text)
-          ? "string"
-          : FILE_KEYWORDS.has(text)
-            ? "keyword"
-            : /^[A-Z]/.test(text)
-              ? "type"
-              : /^\s*\(/.test(after)
-                ? "function"
-                : "plain";
-    tokens.push({ text, kind });
-    cursor = match.index + text.length;
-  }
-  if (cursor < line.length) tokens.push({ text: line.slice(cursor), kind: "plain" });
-  return tokens.length ? tokens : [{ text: line, kind: "plain" }];
 }
 
 interface ProjectTreeNode {
@@ -2857,6 +2498,7 @@ function ProjectTree({
             aria-current={activePath === file.path ? "page" : undefined}
             aria-busy={openingPath === file.path}
             data-active={activePath === file.path}
+            data-traveling-selection={file.path}
           >
             <FileIcon fileName={file.path} />
             <span>{file.path.split("/").at(-1)}</span>
@@ -2938,18 +2580,6 @@ export function RightRail(props: RightRailProps) {
     kind: props.git.kind ?? (props.git.worktree ? "repository" : "notRepository"),
     remotes: props.git.remotes ?? [],
   };
-  const handledTabRequestRef = useRef<number | null>(null);
-  useEffect(() => {
-    const request = props.openProjectFileRequest;
-    if (!request || handledTabRequestRef.current === request.id) return;
-    // Mark the request handled inside the timer so a StrictMode remount that
-    // clears the pending timeout does not swallow the tab switch.
-    const timer = window.setTimeout(() => {
-      handledTabRequestRef.current = request.id;
-      setTab("files");
-    }, 0);
-    return () => window.clearTimeout(timer);
-  }, [props.openProjectFileRequest]);
   useEffect(() => {
     if (tab === "files") onRequestProjectFiles?.();
   }, [onRequestProjectFiles, tab]);
@@ -3020,6 +2650,7 @@ export function RightRail(props: RightRailProps) {
             onClick={() => setTab(item.id)}
             onKeyDown={(event) => moveTabFocus(event, index)}
           >
+            {tab === item.id ? <SlidingTabIndicator layoutId="task-tools-tab-indicator" /> : null}
             <item.icon />
             <span>{item.label}</span>
             {item.count !== undefined ? <small>{item.count}</small> : null}
@@ -3041,18 +2672,18 @@ export function RightRail(props: RightRailProps) {
           />
         ) : null}
         {tab === "files" ? (
-          // Keyed by project so open tabs, filter, and folder state reset
-          // naturally when the selected project changes.
+          // Keyed by project so filter and folder state reset naturally when
+          // the selected project changes.
           <FilePanel
             key={props.projectId ?? "no-project"}
             projectFiles={props.projectFiles}
             projectFilesState={props.projectFilesState}
-            openProjectFileRequest={props.openProjectFileRequest}
-            onOpenProjectFile={props.onOpenProjectFile}
+            onOpenFile={props.onOpenFile}
+            activeFilePath={props.activeFilePath}
+            openingFilePath={props.openingFilePath}
             onRenameProjectFile={props.onRenameProjectFile}
             onMentionProjectFile={props.onMentionProjectFile}
             onMentionProjectFolder={props.onMentionProjectFolder}
-            onAddFileSelection={props.onAddFileSelection}
             fileOpeners={props.fileOpeners}
             onOpenProjectFileExternal={props.onOpenProjectFileExternal}
             onRevealProjectFile={props.onRevealProjectFile}

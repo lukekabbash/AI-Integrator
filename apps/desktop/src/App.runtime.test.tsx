@@ -23,7 +23,9 @@ const { bridgeMock } = vi.hoisted(() => ({
     startTask: vi.fn(),
     generateTaskTitle: vi.fn(),
     loadTaskGit: vi.fn(),
+    loadProjectGit: vi.fn(),
     loadTaskGitFile: vi.fn(),
+    loadProjectGitFile: vi.fn(),
     listProjectFiles: vi.fn(),
     readProjectFile: vi.fn(),
     listProjectFileOpeners: vi.fn(),
@@ -36,16 +38,26 @@ const { bridgeMock } = vi.hoisted(() => ({
     updateTaskRouting: vi.fn(),
     setTaskStatus: vi.fn(),
     sendTurn: vi.fn(),
+    enqueueMessage: vi.fn(),
+    listQueuedMessages: vi.fn(),
+    reorderQueuedMessages: vi.fn(),
+    takeQueuedMessage: vi.fn(),
+    setQueuedMessageDispatching: vi.fn(),
+    steerTurn: vi.fn(),
     listModelCatalog: vi.fn(),
     listDelegations: vi.fn(),
     subscribeDelegationUpdates: vi.fn(),
     sendDelegationMessage: vi.fn(),
     stopDelegation: vi.fn(),
     stageFiles: vi.fn(),
+    stageProjectFiles: vi.fn(),
     commit: vi.fn(),
+    commitProject: vi.fn(),
     generateCommitMessage: vi.fn(),
     previewPush: vi.fn(),
+    previewProjectPush: vi.fn(),
     confirmPush: vi.fn(),
+    confirmProjectPush: vi.fn(),
     push: vi.fn(),
   },
 }));
@@ -54,6 +66,8 @@ vi.mock("./bridge", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./bridge")>();
   return { ...actual, bridge: bridgeMock };
 });
+
+vi.mock("./components/RightRail", () => ({ RightRail: () => null }));
 
 import App from "./App";
 import type { RuntimeProjectionEvent } from "./bridge";
@@ -74,6 +88,23 @@ function projection(
     turnId: "turn-1",
     occurredAt: "2026-07-10T16:00:00Z",
     projection: value,
+  };
+}
+
+function queuedMessage(prompt = "Follow up") {
+  return {
+    taskId: "task-1",
+    id: "queued-1",
+    prompt,
+    attachments: [],
+    runtime: "codex" as const,
+    model: "Provider default",
+    permission: "project-write" as const,
+    delegation: "off" as const,
+    position: 0,
+    state: "queued" as const,
+    createdAt: "2026-07-10T16:00:02Z",
+    updatedAt: "2026-07-10T16:00:02Z",
   };
 }
 
@@ -108,6 +139,32 @@ describe("native runtime recovery UI", () => {
     bridgeMock.listModelCatalog.mockResolvedValue([]);
     bridgeMock.listSettings.mockResolvedValue([]);
     bridgeMock.generateTaskTitle.mockResolvedValue(null);
+    bridgeMock.listQueuedMessages.mockResolvedValue([]);
+    bridgeMock.steerTurn.mockResolvedValue(false);
+    bridgeMock.enqueueMessage.mockImplementation(async (input) => ({
+      ...input,
+      id: "queued-1",
+      position: 0,
+      state: "queued",
+      createdAt: "2026-07-10T16:00:02Z",
+      updatedAt: "2026-07-10T16:00:02Z",
+    }));
+    bridgeMock.setQueuedMessageDispatching.mockImplementation(
+      async (_taskId, _messageId, dispatching) => ({
+        taskId: "task-1",
+        id: "queued-1",
+        prompt: "Follow up",
+        attachments: [],
+        runtime: "codex",
+        model: "Provider default",
+        permission: "project-write",
+        delegation: "off",
+        position: 0,
+        state: dispatching ? "dispatching" : "queued",
+        createdAt: "2026-07-10T16:00:02Z",
+        updatedAt: "2026-07-10T16:00:02Z",
+      }),
+    );
     bridgeMock.generateCommitMessage.mockResolvedValue("feat: generate commit subjects");
     bridgeMock.getAppInfo.mockResolvedValue({
       applicationVersion: "test",
@@ -143,6 +200,9 @@ describe("native runtime recovery UI", () => {
     bridgeMock.loadWorkspace.mockResolvedValue(workspace);
     bridgeMock.listProjectFiles.mockResolvedValue([]);
     bridgeMock.loadTaskGit.mockResolvedValue(workspace.git);
+    bridgeMock.loadProjectGit.mockResolvedValue(workspace.git);
+    bridgeMock.loadTaskGitFile.mockImplementation(async (_taskId, file) => file);
+    bridgeMock.loadProjectGitFile.mockImplementation(async (_projectId, file) => file);
     bridgeMock.loadTaskProjection.mockImplementation(async () => {
       runtimeListener?.(
         projection(9, {
@@ -242,6 +302,194 @@ describe("native runtime recovery UI", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Stop turn" }));
     await waitFor(() => expect(bridgeMock.stopTurn).toHaveBeenCalledWith("task-1"));
+  });
+
+  it("queues a typed follow-up instead of starting a competing turn", async () => {
+    render(<App />);
+    await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Task message" }), {
+      target: { value: "Follow up" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(bridgeMock.enqueueMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          taskId: "task-1",
+          prompt: "Follow up",
+          attachments: [],
+          runtime: "codex",
+        }),
+      ),
+    );
+    expect(bridgeMock.sendTurn).not.toHaveBeenCalled();
+    expect(screen.getByText("Follow up")).toBeInTheDocument();
+  });
+
+  it("steers a supported active turn when Send now is selected", async () => {
+    bridgeMock.steerTurn.mockResolvedValue(true);
+    bridgeMock.takeQueuedMessage.mockResolvedValue(queuedMessage());
+    bridgeMock.listQueuedMessages.mockResolvedValue([]);
+    render(<App />);
+    await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Task message" }), {
+      target: { value: "Follow up" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Send now: Follow up" }));
+
+    await waitFor(() =>
+      expect(bridgeMock.steerTurn).toHaveBeenCalledWith("task-1", "turn-1", "Follow up"),
+    );
+    expect(bridgeMock.stopTurn).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByText("Follow up")).not.toBeInTheDocument());
+  });
+
+  it("interrupts then dispatches Send now when native steering is unavailable", async () => {
+    const workspace = await bridgeMock.loadWorkspace();
+    workspace.queuedMessages = [queuedMessage()];
+    bridgeMock.loadWorkspace.mockResolvedValue(workspace);
+    bridgeMock.takeQueuedMessage.mockResolvedValue(queuedMessage());
+    bridgeMock.listQueuedMessages.mockResolvedValue([]);
+    bridgeMock.sendTurn.mockResolvedValue(undefined);
+    render(<App />);
+    await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
+
+    fireEvent.click(screen.getByRole("button", { name: "Send now: Follow up" }));
+    await waitFor(() => expect(bridgeMock.stopTurn).toHaveBeenCalledWith("task-1"));
+    expect(bridgeMock.sendTurn).not.toHaveBeenCalled();
+
+    act(() => {
+      runtimeListener?.(
+        projection(10, {
+          kind: "turnChanged",
+          turn: {
+            id: "turn-1",
+            status: "interrupted",
+            stopRequested: true,
+            completedAt: "2026-07-10T16:00:03Z",
+          },
+        }),
+      );
+    });
+
+    await waitFor(() =>
+      expect(bridgeMock.sendTurn).toHaveBeenCalledWith(
+        expect.objectContaining({ taskId: "task-1", prompt: "Follow up" }),
+      ),
+    );
+  });
+
+  it("leaves queued work paused after a manual Stop until Send now is selected", async () => {
+    const workspace = await bridgeMock.loadWorkspace();
+    workspace.queuedMessages = [queuedMessage()];
+    bridgeMock.loadWorkspace.mockResolvedValue(workspace);
+    bridgeMock.takeQueuedMessage.mockResolvedValue(queuedMessage());
+    bridgeMock.listQueuedMessages.mockResolvedValue([]);
+    bridgeMock.sendTurn.mockResolvedValue(undefined);
+    render(<App />);
+    await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop turn" }));
+    await waitFor(() => expect(bridgeMock.stopTurn).toHaveBeenCalledWith("task-1"));
+    act(() => {
+      runtimeListener?.(
+        projection(10, {
+          kind: "turnChanged",
+          turn: {
+            id: "turn-1",
+            status: "interrupted",
+            stopRequested: true,
+            completedAt: "2026-07-10T16:00:03Z",
+          },
+        }),
+      );
+    });
+
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 20));
+    });
+    expect(bridgeMock.sendTurn).not.toHaveBeenCalled();
+    expect(screen.getByText("Follow up")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Send now: Follow up" }));
+    await waitFor(() =>
+      expect(bridgeMock.sendTurn).toHaveBeenCalledWith(
+        expect.objectContaining({ taskId: "task-1", prompt: "Follow up" }),
+      ),
+    );
+  });
+
+  it("automatically drains the next queued message when the active turn settles", async () => {
+    const workspace = await bridgeMock.loadWorkspace();
+    workspace.queuedMessages = [queuedMessage()];
+    bridgeMock.loadWorkspace.mockResolvedValue(workspace);
+    bridgeMock.takeQueuedMessage.mockResolvedValue(queuedMessage());
+    bridgeMock.listQueuedMessages.mockResolvedValue([]);
+    bridgeMock.sendTurn.mockResolvedValue(undefined);
+    render(<App />);
+    await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
+
+    act(() => {
+      runtimeListener?.(
+        projection(10, {
+          kind: "turnChanged",
+          turn: {
+            id: "turn-1",
+            status: "completed",
+            stopRequested: false,
+            completedAt: "2026-07-10T16:00:03Z",
+          },
+        }),
+      );
+    });
+
+    await waitFor(() =>
+      expect(bridgeMock.sendTurn).toHaveBeenCalledWith(
+        expect.objectContaining({ taskId: "task-1", prompt: "Follow up" }),
+      ),
+    );
+  });
+
+  it("returns a queued message to the composer for editing", async () => {
+    const workspace = await bridgeMock.loadWorkspace();
+    workspace.queuedMessages = [queuedMessage("Revise this")];
+    bridgeMock.loadWorkspace.mockResolvedValue(workspace);
+    bridgeMock.takeQueuedMessage.mockResolvedValue(queuedMessage("Revise this"));
+    bridgeMock.listQueuedMessages.mockResolvedValue([]);
+    render(<App />);
+    await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit in composer: Revise this" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("textbox", { name: "Task message" })).toHaveValue("Revise this"),
+    );
+    await waitFor(() =>
+      expect(screen.queryByText("Revise this", { selector: ".queued-message-text" })).toBeNull(),
+    );
+  });
+
+  it("removes a queued message without changing the composer draft", async () => {
+    const workspace = await bridgeMock.loadWorkspace();
+    workspace.queuedMessages = [queuedMessage("Discard this")];
+    bridgeMock.loadWorkspace.mockResolvedValue(workspace);
+    bridgeMock.takeQueuedMessage.mockResolvedValue(queuedMessage("Discard this"));
+    bridgeMock.listQueuedMessages.mockResolvedValue([]);
+    render(<App />);
+    await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove from queue: Discard this" }));
+
+    await waitFor(() =>
+      expect(bridgeMock.takeQueuedMessage).toHaveBeenCalledWith("task-1", "queued-1"),
+    );
+    await waitFor(() =>
+      expect(screen.queryByText("Discard this", { selector: ".queued-message-text" })).toBeNull(),
+    );
+    expect(screen.getByRole("textbox", { name: "Task message" })).toHaveValue("");
   });
 
   it("preserves a live turn and its timer when switching away and back", async () => {
@@ -1040,8 +1288,91 @@ describe("native runtime recovery UI", () => {
     expect(bridgeMock.loadTaskGit).toHaveBeenCalledTimes(1);
   });
 
-  it("shows the serialized Cursor failure instead of replacing it with a generic turn error", async () => {
-    bridgeMock.sendTurn.mockRejectedValue({
+  it("keeps project Git usable while a new chat becomes its first task", async () => {
+    const workspace = createEmptySnapshot();
+    workspace.projects = [
+      {
+        id: "project-1",
+        name: "sample",
+        path: "H:\\Code\\sample",
+        gitRepositoryRoot: "H:\\Code\\sample",
+        branch: "main",
+        dirtyFiles: 1,
+        expanded: true,
+      },
+    ];
+    workspace.activeProjectId = "project-1";
+    workspace.git = {
+      ...workspace.git,
+      kind: "repository",
+      branch: "main",
+      worktree: "H:\\Code\\sample",
+      files: [
+        {
+          path: "src/new-chat.ts",
+          status: "modified",
+          additions: 2,
+          deletions: 0,
+          staged: false,
+          lines: [],
+        },
+      ],
+    };
+    workspace.runtimes = [
+      {
+        id: "codex",
+        name: "Codex",
+        command: "codex",
+        status: "connected",
+        fidelity: "native",
+        models: ["Provider default"],
+        detail: "Authenticated local CLI",
+      },
+    ];
+    const stagedGit = {
+      ...workspace.git,
+      files: workspace.git.files.map((file) => ({ ...file, staged: true })),
+    };
+    bridgeMock.loadWorkspace.mockResolvedValue(workspace);
+    bridgeMock.loadProjectGit.mockResolvedValue(workspace.git);
+    bridgeMock.stageProjectFiles.mockResolvedValue(stagedGit);
+    bridgeMock.startTask.mockResolvedValue({
+      id: "task-new-chat",
+      projectId: "project-1",
+      title: "Coding session",
+      status: "draft",
+      runtime: "codex",
+      model: "Provider default",
+      updatedAt: "2026-07-14T19:00:00Z",
+    });
+    bridgeMock.sendTurn.mockResolvedValue(undefined);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Stage all" }));
+    await waitFor(() =>
+      expect(bridgeMock.stageProjectFiles).toHaveBeenCalledWith(
+        "project-1",
+        ["src/new-chat.ts"],
+        true,
+      ),
+    );
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Task message" }), {
+      target: { value: "Start from this repository" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(bridgeMock.sendTurn).toHaveBeenCalledWith(
+        expect.objectContaining({ taskId: "task-new-chat" }),
+      ),
+    );
+    expect(screen.getByText("new-chat.ts")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Set up Git for this folder" })).toBeNull();
+  });
+
+  it("shows a serialized queue failure instead of replacing it with a generic error", async () => {
+    bridgeMock.enqueueMessage.mockRejectedValue({
       code: "provider-disconnected",
       message: "Cursor session is not bound to this task",
     });
@@ -1056,6 +1387,6 @@ describe("native runtime recovery UI", () => {
     const notice = await screen.findByRole("alert");
     expect(notice).toHaveTextContent("Cursor session is not bound to this task");
     expect(notice).toHaveTextContent("provider-disconnected");
-    expect(notice).not.toHaveTextContent("The turn could not be started");
+    expect(notice).not.toHaveTextContent("The message could not be queued");
   });
 });

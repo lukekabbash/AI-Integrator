@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { LazyMotion, domAnimation } from "motion/react";
+import { LazyMotion, domMax } from "motion/react";
 import { describe, expect, it, vi } from "vitest";
 import { createDemoSnapshot } from "../demoData";
-import type { DelegationView, ProjectFileContent, ProjectFileEntry } from "../bridge";
+import type { DelegationView, ProjectFileEntry } from "../bridge";
 import { RightRail } from "./RightRail";
 
 const projectFiles: ProjectFileEntry[] = [
@@ -17,11 +17,7 @@ function setup(overrides?: Partial<Parameters<typeof RightRail>[0]>) {
   const snapshot = createDemoSnapshot();
   const callbacks = {
     onSelectFile: vi.fn(),
-    onOpenProjectFile: vi.fn(async (file: ProjectFileEntry): Promise<ProjectFileContent> => ({
-      path: file.path,
-      content: `// contents of ${file.path}\nexport {};\n`,
-      isBinary: false,
-    })),
+    onOpenFile: vi.fn(),
     onStageFile: vi.fn().mockResolvedValue(undefined),
     onStageFiles: vi.fn().mockResolvedValue(undefined),
     onCommit: vi.fn().mockResolvedValue(undefined),
@@ -31,7 +27,7 @@ function setup(overrides?: Partial<Parameters<typeof RightRail>[0]>) {
     onRefreshGit: vi.fn().mockResolvedValue(undefined),
   };
   render(
-    <LazyMotion features={domAnimation} strict>
+    <LazyMotion features={domMax} strict>
       <RightRail
         git={snapshot.git}
         children={snapshot.children}
@@ -49,6 +45,22 @@ function setup(overrides?: Partial<Parameters<typeof RightRail>[0]>) {
 }
 
 describe("RightRail", () => {
+  it("moves one selection line through click and keyboard tab changes", () => {
+    setup();
+    const tabs = screen.getByRole("tablist", { name: "Task tools" });
+    const git = within(tabs).getByRole("tab", { name: /^Git/ });
+    const agents = within(tabs).getByRole("tab", { name: /^Agents/ });
+
+    expect(git.querySelector(".sliding-tab-indicator")).toBeInTheDocument();
+    expect(tabs.querySelectorAll(".sliding-tab-indicator")).toHaveLength(1);
+
+    fireEvent.keyDown(git, { key: "ArrowRight" });
+    expect(agents).toHaveAttribute("aria-selected", "true");
+    expect(agents.querySelector(".sliding-tab-indicator")).toBeInTheDocument();
+    expect(git.querySelector(".sliding-tab-indicator")).not.toBeInTheDocument();
+    expect(tabs.querySelectorAll(".sliding-tab-indicator")).toHaveLength(1);
+  });
+
   it("does not offer Git setup while repository detection is still running", () => {
     setup({
       gitLoading: true,
@@ -210,62 +222,35 @@ describe("RightRail", () => {
     expect(screen.getByRole("tab", { name: /^Git/ })).toBeInTheDocument();
   });
 
-  it("shows only the project file tree in Files and opens a reader tab", async () => {
+  it("shows only the project file tree in Files and opens files toward the canvas", () => {
     const { callbacks } = setup();
     fireEvent.click(screen.getByRole("tab", { name: "Files" }));
 
     expect(screen.getByRole("tabpanel")).toHaveAccessibleName("Files");
     expect(screen.queryByText(/Changed files reported by Git/i)).not.toBeInTheDocument();
+    // The rail is navigator-only: no embedded reader, tabs, or resize split.
     expect(screen.queryByRole("region", { name: "Open files in review" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("separator", { name: "Resize file preview" }),
+    ).not.toBeInTheDocument();
     expect(screen.getByTitle("Open src/App.tsx")).toBeInTheDocument();
-    expect(
-      screen.getByText("Select a file from the project tree to preview it."),
-    ).toBeInTheDocument();
 
-    callbacks.onOpenProjectFile.mockResolvedValueOnce({
-      path: "src/App.tsx",
-      content: 'const value = "ok";\nfunction run() {}\n',
-      isBinary: false,
-    });
     fireEvent.click(screen.getByTitle("Open src/App.tsx"));
-    await waitFor(() => expect(callbacks.onOpenProjectFile).toHaveBeenCalledTimes(1));
-    expect(await screen.findByRole("tab", { name: /App\.tsx/ })).toBeInTheDocument();
-    expect(screen.getByRole("separator", { name: "Resize file preview" })).toBeInTheDocument();
-    expect(screen.getByLabelText("Contents of src/App.tsx")).toHaveTextContent(
-      'const value = "ok";',
+    expect(callbacks.onOpenFile).toHaveBeenCalledWith(projectFiles[0]);
+  });
+
+  it("highlights the canvas-active file in the tree", async () => {
+    setup({ activeFilePath: "src/App.tsx" });
+    fireEvent.click(screen.getByRole("tab", { name: "Files" }));
+
+    expect(screen.getByTitle("Open src/App.tsx")).toHaveAttribute("aria-current", "page");
+    expect(screen.getByTitle("Open src/bridge.ts")).not.toHaveAttribute("aria-current");
+    await waitFor(() =>
+      expect(document.querySelector(".file-tree-active")?.parentElement).toHaveClass("file-tree"),
     );
-    expect(screen.getByText("const", { selector: ".syntax-keyword" })).toBeInTheDocument();
-    expect(screen.getByText('"ok"', { selector: ".syntax-string" })).toBeInTheDocument();
-  });
-
-  it("opens a transcript-requested file directly in the Files tab", async () => {
-    const { callbacks } = setup({
-      openProjectFileRequest: { path: "src/App.tsx", id: 1 },
-    });
-
-    expect(await screen.findByRole("tab", { name: /App\.tsx/ })).toBeInTheDocument();
-    expect(screen.getByLabelText("Contents of src/App.tsx")).toBeInTheDocument();
-    expect(callbacks.onOpenProjectFile).toHaveBeenCalledWith(projectFiles[0]);
-  });
-
-  it("resolves absolute transcript paths against the root-relative project tree", async () => {
-    const { callbacks } = setup({
-      openProjectFileRequest: { path: "/Users/dev/integrator/src/App.tsx", id: 2 },
-    });
-
-    expect(await screen.findByRole("tab", { name: /App\.tsx/ })).toBeInTheDocument();
-    expect(callbacks.onOpenProjectFile).toHaveBeenCalledWith(projectFiles[0]);
-  });
-
-  it("reports a transcript path that is not in the project tree", async () => {
-    const { callbacks } = setup({
-      openProjectFileRequest: { path: "/elsewhere/missing.ts", id: 3 },
-    });
-
-    expect(
-      await screen.findByText("Could not find /elsewhere/missing.ts in the project files."),
-    ).toBeInTheDocument();
-    expect(callbacks.onOpenProjectFile).not.toHaveBeenCalled();
+    expect(screen.getByTitle("Open src/App.tsx")).not.toContainElement(
+      document.querySelector(".file-tree-active"),
+    );
   });
 
   it("filters project files and keeps Git diffs out of the Files tab", () => {
@@ -300,25 +285,6 @@ describe("RightRail", () => {
     expect(tree.querySelectorAll("[title^='Open file-']")).toHaveLength(1);
   }, 12_000);
 
-  it("progressively mounts large text previews with an explicit show-all action", async () => {
-    const content = Array.from({ length: 1_200 }, (_, index) => `preview-line-${index}`).join("\n");
-    const { callbacks } = setup();
-    callbacks.onOpenProjectFile.mockResolvedValueOnce({
-      path: "src/App.tsx",
-      content,
-      isBinary: false,
-    });
-    fireEvent.click(screen.getByRole("tab", { name: "Files" }));
-    fireEvent.click(screen.getByTitle("Open src/App.tsx"));
-
-    const preview = await screen.findByLabelText("Contents of src/App.tsx");
-    expect(preview.querySelectorAll("li")).toHaveLength(400);
-    expect(preview).not.toHaveTextContent("preview-line-1199");
-    fireEvent.click(screen.getByRole("button", { name: "Show all 1,200 lines" }));
-    expect(preview.querySelectorAll("li")).toHaveLength(1_200);
-    expect(preview).toHaveTextContent("preview-line-1199");
-  });
-
   it("indents nested folders and files by their tree depth", () => {
     setup({
       projectFiles: [
@@ -338,21 +304,6 @@ describe("RightRail", () => {
       "1",
     );
     expect(screen.getByTitle("Open src/runtime/router.ts")).toHaveAttribute("data-tree-depth", "2");
-  });
-
-  it("closes an open reader tab", async () => {
-    setup();
-    fireEvent.click(screen.getByRole("tab", { name: "Files" }));
-    fireEvent.click(screen.getByTitle("Open README.md"));
-    expect(await screen.findByRole("tab", { name: /README\.md/ })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Close README.md" }));
-    // The tab leaves through a short exit animation before unmounting.
-    await waitFor(() =>
-      expect(screen.queryByRole("tab", { name: /README\.md/ })).not.toBeInTheDocument(),
-    );
-    expect(
-      screen.getByText("Select a file from the project tree to preview it."),
-    ).toBeInTheDocument();
   });
 
   it("marks unavailable vendor plan data instead of inventing a plan percentage", () => {

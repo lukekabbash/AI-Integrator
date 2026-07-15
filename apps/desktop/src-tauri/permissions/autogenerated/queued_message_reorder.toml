@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-queued-message-reorder"
+description = "Enables the queued_message_reorder command without any pre-configured scope."
+commands.allow = ["queued_message_reorder"]
+
+[[permission]]
+identifier = "deny-queued-message-reorder"
+description = "Denies the queued_message_reorder command without any pre-configured scope."
+commands.deny = ["queued_message_reorder"]

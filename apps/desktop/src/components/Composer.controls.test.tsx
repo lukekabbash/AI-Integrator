@@ -93,6 +93,8 @@ describe("Composer compact controls", () => {
     await waitFor(() =>
       expect(onSend).toHaveBeenCalledWith({
         prompt: "Use the compact controls.",
+        draftPrompt: "Use the compact controls.",
+        attachments: [],
         runtime: "codex",
         model: "gpt-5.6-luna",
         effort: "low",
@@ -183,5 +185,45 @@ describe("Composer compact controls", () => {
       expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("Claude Sonnet"),
     );
     expect(screen.getByRole("button", { name: "Reasoning effort" })).toHaveTextContent("Low");
+  });
+
+  it("keeps delegation off when the selected runtime cannot host the broker", async () => {
+    const antigravity: RuntimeConnection = {
+      id: "antigravity",
+      name: "Antigravity",
+      command: "agy",
+      status: "connected",
+      fidelity: "structured",
+      models: ["gemini-3.5-flash"],
+      detail: "Ready",
+    };
+    vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
+      { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash" },
+    ]);
+    const onSend = vi.fn().mockResolvedValue(true);
+
+    render(
+      <Composer
+        runtimes={[antigravity]}
+        defaultRuntime="antigravity"
+        defaultModel="gemini-3.5-flash"
+        defaultDelegation="balanced"
+        onSend={onSend}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "Delegation unavailable for this runtime" }),
+    ).toBeDisabled();
+    fireEvent.change(screen.getByRole("textbox", { name: "Task message" }), {
+      target: { value: "Run without broker delegation." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(onSend).toHaveBeenCalledWith(
+        expect.objectContaining({ runtime: "antigravity", delegation: "off" }),
+      ),
+    );
   });
 });

@@ -13,8 +13,8 @@ import {
 
 describe("semantic theme catalog", () => {
   it("ships the full preset catalog with a complete semantic palette", () => {
-    expect(THEME_PRESETS).toHaveLength(24);
-    expect(new Set(THEME_PRESETS.map((preset) => preset.id)).size).toBe(24);
+    expect(THEME_PRESETS).toHaveLength(28);
+    expect(new Set(THEME_PRESETS.map((preset) => preset.id)).size).toBe(28);
     for (const preset of THEME_PRESETS) {
       expect(Object.keys(preset.colors)).toHaveLength(THEME_COLOR_TOKENS.length);
       expect(preset.colors["diff.added"]).not.toBe(preset.colors["diff.removed"]);
@@ -28,6 +28,25 @@ describe("semantic theme catalog", () => {
     expect(serialized).not.toContain("purple");
   });
 
+  it("keeps Usonian federal blue primary and brick red secondary", () => {
+    const usonian = THEME_PRESETS.find((preset) => preset.id === "usonian");
+    expect(usonian?.colors["accent.primary"]).toBe("#365f82");
+    expect(usonian?.colors["accent.secondary"]).toBe("#a6504b");
+  });
+
+  it("keeps selected-row text legible in every preset", () => {
+    for (const preset of THEME_PRESETS) {
+      const ratio = contrastRatio(
+        preset.colors["selection.text"],
+        preset.colors["selection.active"],
+      );
+      expect(
+        ratio,
+        `${preset.id}: selection text contrast is ${ratio.toFixed(2)}:1`,
+      ).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
   it("groups dark and light appearance presets while preserving their color progression", () => {
     expect(THEME_PRESET_GRID_ORDER).toEqual([
       "integrator",
@@ -39,15 +58,19 @@ describe("semantic theme catalog", () => {
       "forest",
       "juniper",
       "ocean",
+      "glory",
       "high-contrast",
       "midnight",
       "slate",
+      "storm",
       "graphite",
       "velvet",
       "iris",
       "orchid",
       "dawn",
+      "usonian",
       "sand",
+      "limestone",
       "paper",
       "sage",
       "arctic",
@@ -62,7 +85,7 @@ describe("semantic theme catalog", () => {
       THEME_PRESET_GRID_ORDER.map(
         (id) => THEME_PRESETS.find((preset) => preset.id === id)?.appearance,
       ),
-    ).toEqual([...Array<string>(16).fill("dark"), ...Array<string>(8).fill("light")]);
+    ).toEqual([...Array<string>(18).fill("dark"), ...Array<string>(10).fill("light")]);
   });
 
   it("normalizes unsafe imported preferences", () => {

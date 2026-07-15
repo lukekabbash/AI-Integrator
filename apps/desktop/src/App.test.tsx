@@ -36,6 +36,24 @@ describe("AI Integrator desktop workspace", () => {
     expect(screen.getByPlaceholderText("Commit message")).toBeInTheDocument();
   });
 
+  it("moves one selection line between Task and Review", async () => {
+    render(<App />);
+    const tabs = await screen.findByRole("tablist", { name: "Task view" });
+    const task = within(tabs).getByRole("tab", { name: "Task" });
+    const review = within(tabs).getByRole("tab", { name: "Review" });
+
+    expect(task.querySelector(".sliding-tab-indicator")).toBeInTheDocument();
+    expect(tabs.querySelectorAll(".sliding-tab-indicator")).toHaveLength(1);
+
+    fireEvent.click(review);
+    await waitFor(() => {
+      expect(review).toHaveAttribute("aria-selected", "true");
+      expect(review.querySelector(".sliding-tab-indicator")).toBeInTheDocument();
+      expect(task.querySelector(".sliding-tab-indicator")).not.toBeInTheDocument();
+      expect(tabs.querySelectorAll(".sliding-tab-indicator")).toHaveLength(1);
+    });
+  });
+
   it("collapses and reopens both sidebars from the header corner buttons", async () => {
     render(<App />);
     const appRoot = document.querySelector<HTMLElement>(".app-root");
@@ -431,13 +449,51 @@ describe("AI Integrator desktop workspace", () => {
     );
   });
 
-  it("opens a trusted project file from the Files tree into the rail reader", async () => {
+  it("opens a trusted project file as a first-class titlebar tab in the canvas", async () => {
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("tab", { name: "Files" }));
-    fireEvent.click(await screen.findByTitle("Open src/runtime/router.ts"));
-    expect(await screen.findByRole("tab", { name: /router\.ts/ })).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("tab", { name: "Files" }, { timeout: 5000 }));
+    fireEvent.click(await screen.findByTitle("Open src/runtime/router.ts", {}, { timeout: 5000 }));
+    // The file becomes a titlebar tab owning the primary canvas.
+    const fileTab = await screen.findByRole("tab", { name: /router\.ts/ });
+    expect(fileTab).toHaveAttribute("aria-selected", "true");
     expect(await screen.findByLabelText("Contents of src/runtime/router.ts")).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "Task message" })).not.toBeInTheDocument();
+
+    fireEvent.click(
+      await screen.findByTitle("Open src/components/UsageMeter.tsx", {}, { timeout: 5000 }),
+    );
+    await screen.findByRole("tab", { name: /UsageMeter\.tsx/ }, { timeout: 5000 });
+    const openFiles = screen.getByRole("tablist", { name: "Open files" });
+    expect(
+      within(openFiles)
+        .getAllByRole("tab")
+        .map((tab) => tab.textContent),
+    ).toEqual(["router.ts", "UsageMeter.tsx"]);
+    expect(screen.getByRole("tab", { name: /UsageMeter\.tsx/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+
+    const titleHeading = screen.getByRole("heading", { name: /Construct the native v1 workspace/ });
+    expect(titleHeading.parentElement).toHaveClass("titlebar-heading");
+    expect(titleHeading.parentElement).toHaveTextContent("AI Integrator · feature/v1-native-app");
+
+    // The chat title is the way home; the tab stays open.
+    fireEvent.click(screen.getByTitle("Back to the conversation"));
+    expect(screen.getByRole("textbox", { name: "Task message" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /router\.ts/ })).toHaveAttribute(
+      "aria-selected",
+      "false",
+    );
+
+    // Clicking the tab returns the file to the canvas; closing it comes home.
+    fireEvent.click(screen.getByRole("tab", { name: /router\.ts/ }));
+    expect(await screen.findByLabelText("Contents of src/runtime/router.ts")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Close src/runtime/router.ts" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("tab", { name: /router\.ts/ })).not.toBeInTheDocument(),
+    );
 
     fireEvent.click(screen.getByRole("tab", { name: "Task" }));
     const composer = screen.getByRole("textbox", { name: "Task message" });

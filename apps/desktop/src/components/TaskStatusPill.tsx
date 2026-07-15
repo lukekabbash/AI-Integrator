@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { AnimatePresence, m as motion } from "motion/react";
 import type { RuntimeUsageProjection } from "../bridge";
 
@@ -7,6 +7,8 @@ interface TaskStatusPillProps {
   runningSince?: string;
   usage?: RuntimeUsageProjection;
   activeAgentCount?: number;
+  /** Pending follow-ups render in the shelf attached behind the composer. */
+  queue?: ReactNode;
 }
 
 function formatTokens(tokens: number): string {
@@ -52,9 +54,13 @@ function ClockFace() {
   );
 }
 
-/** Floating run vitals — elapsed time, live tokens, and agent count — pinned
- *  just above the composer while a turn is in flight. */
-export function TaskStatusPill({ runningSince, usage, activeAgentCount }: TaskStatusPillProps) {
+/** Floating run vitals centered above the composer-attached queue shelf. */
+export function TaskStatusPill({
+  runningSince,
+  usage,
+  activeAgentCount,
+  queue,
+}: TaskStatusPillProps) {
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   // Tenth-of-a-second ticks while the timer reads in seconds; once it rolls
@@ -72,46 +78,70 @@ export function TaskStatusPill({ runningSince, usage, activeAgentCount }: TaskSt
     return () => window.clearTimeout(timeout);
   }, [runningSince]);
 
-  if (!runningSince) return null;
+  if (!runningSince && !queue) return null;
 
-  const elapsed = formatElapsed(runningSince, nowMs);
+  const elapsed = runningSince ? formatElapsed(runningSince, nowMs) : "";
   // Crossfade only when the unit rolls over (s → m → h m); within a unit the
   // digits update in place under tabular-nums.
   const elapsedUnit = elapsed.replace(/[\d.]+/g, "");
 
   return (
     <div className="task-status-anchor">
-      <motion.div
-        className="task-status-pill"
-        initial={{ opacity: 0, y: 8, scale: 0.96 }}
-        animate={{ opacity: 1, y: 0, scale: 1 }}
-        exit={{ opacity: 0, y: 8, scale: 0.96 }}
-        transition={{ duration: 0.28, ease: [0.32, 0.72, 0.24, 1] }}
-      >
-        <span className="task-status-pill-item">
-          <ClockFace />
-          <AnimatePresence initial={false} mode="wait">
-            <motion.span
-              className="task-status-pill-elapsed"
-              key={elapsedUnit}
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              transition={{ duration: 0.4, ease: "easeOut" }}
+      <div className="task-status-float-row" data-has-queue={queue ? true : undefined}>
+        <AnimatePresence initial={false}>
+          {runningSince ? (
+            <motion.div
+              key="run-vitals"
+              className="task-status-pill"
+              layout="position"
+              initial={{ opacity: 0, y: 8, scale: 0.96 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 8, scale: 0.96 }}
+              transition={{ duration: 0.28, ease: [0.32, 0.72, 0.24, 1] }}
             >
-              {elapsed}
-            </motion.span>
-          </AnimatePresence>
-        </span>
-        {usage ? (
-          <span className="task-status-pill-item">{formatTokens(usage.totalTokens)}</span>
-        ) : null}
-        {activeAgentCount ? (
-          <span className="task-status-pill-item">
-            {activeAgentCount} {activeAgentCount === 1 ? "agent" : "agents"}
-          </span>
-        ) : null}
-      </motion.div>
+              <span className="task-status-pill-item">
+                <ClockFace />
+                <AnimatePresence initial={false} mode="wait">
+                  <motion.span
+                    className="task-status-pill-elapsed"
+                    key={elapsedUnit}
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.4, ease: "easeOut" }}
+                  >
+                    {elapsed}
+                  </motion.span>
+                </AnimatePresence>
+              </span>
+              {usage ? (
+                <span className="task-status-pill-item">{formatTokens(usage.totalTokens)}</span>
+              ) : null}
+              {activeAgentCount ? (
+                <span className="task-status-pill-item">
+                  {activeAgentCount} {activeAgentCount === 1 ? "agent" : "agents"}
+                </span>
+              ) : null}
+            </motion.div>
+          ) : null}
+          {queue ? (
+            <motion.div
+              key="queued-messages"
+              className="queued-messages-surface"
+              layout
+              initial={{ opacity: 0, x: 8, scale: 0.96 }}
+              animate={{ opacity: 1, x: 0, scale: 1 }}
+              exit={{ opacity: 0, x: 8, scale: 0.96 }}
+              transition={{
+                opacity: { duration: 0.18, ease: "easeOut" },
+                layout: { type: "spring", stiffness: 430, damping: 34, mass: 0.72 },
+              }}
+            >
+              {queue}
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
+      </div>
     </div>
   );
 }

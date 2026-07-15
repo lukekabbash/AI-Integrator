@@ -17,9 +17,10 @@ use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use integrator_core::{
     ApprovalDecision, ApprovalKind, ApprovalProjection, ComposerDraft, ConnectionState,
-    IntegratorError, LocalExport, ModeOption, ModeProjection, NewTask, ProjectId, ProviderKind,
-    RuntimeBinding, RuntimeProjection, RuntimeSession, Setting, StopRequestResult, Task, TaskId,
-    TaskSnapshot, TaskState, TransportRequestId, TrustedProject, TurnStatus, Versioned,
+    IntegratorError, LocalExport, ModeOption, ModeProjection, NewQueuedMessage, NewTask, ProjectId,
+    ProviderKind, QueuedMessage, QueuedMessageId, QueuedMessageState, RuntimeBinding,
+    RuntimeProjection, RuntimeSession, Setting, StopRequestResult, Task, TaskId, TaskSnapshot,
+    TaskState, TransportRequestId, TrustedProject, TurnStatus, Versioned,
 };
 use integrator_runtime::{
     CommitResult, CreateWorktree, DiffResult, DiffScope, FileStatus, GitOverview, GitRemote,
@@ -47,8 +48,8 @@ use crate::native_actions::{
     discover_file_actions, parse_acp_actions,
 };
 use crate::state::{
-    AcpPermissionOption, AcpRuntime, AppState, CodexRuntime, PendingNativeSkill,
-    PendingStructuredPermission, StructuredRuntime, VoiceTypingCommand, VoiceTypingSession,
+    AcpPermissionOption, AcpRuntime, AppState, CodexRuntime, PendingStructuredPermission,
+    PendingUserPrompt, StructuredRuntime, VoiceTypingCommand, VoiceTypingSession,
     remove_task_runtime, replace_task_runtime,
 };
 
@@ -557,6 +558,82 @@ pub async fn composer_draft_save(
         .await
         .map_err(|_| worker_error())?
         .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn queued_message_enqueue(
+    state: State<'_, AppState>,
+    input: NewQueuedMessage,
+) -> CommandResult<QueuedMessage> {
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || store.enqueue_message(input))
+        .await
+        .map_err(|_| worker_error())?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn queued_message_list(
+    state: State<'_, AppState>,
+    task_id: TaskId,
+) -> CommandResult<Vec<QueuedMessage>> {
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || store.list_queued_messages(task_id))
+        .await
+        .map_err(|_| worker_error())?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn queued_message_reorder(
+    state: State<'_, AppState>,
+    task_id: TaskId,
+    ordered_ids: Vec<QueuedMessageId>,
+) -> CommandResult<Vec<QueuedMessage>> {
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || {
+        store.reorder_queued_messages(task_id, &ordered_ids)
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn queued_message_take(
+    state: State<'_, AppState>,
+    task_id: TaskId,
+    message_id: QueuedMessageId,
+) -> CommandResult<QueuedMessage> {
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || store.take_queued_message(task_id, message_id))
+        .await
+        .map_err(|_| worker_error())?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn queued_message_set_dispatching(
+    state: State<'_, AppState>,
+    task_id: TaskId,
+    message_id: QueuedMessageId,
+    dispatching: bool,
+) -> CommandResult<QueuedMessage> {
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || {
+        store.set_queued_message_state(
+            task_id,
+            message_id,
+            if dispatching {
+                QueuedMessageState::Dispatching
+            } else {
+                QueuedMessageState::Queued
+            },
+        )
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -1741,6 +1818,13 @@ pub struct ProjectFileContent {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ProjectFileWriteInput {
+    path: String,
+    content: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectFileRenameInput {
     path: String,
     new_name: String,
@@ -1794,6 +1878,24 @@ pub async fn project_file_read(
         .await
         .map_err(|_| worker_error())?
         .map_err(Into::into)
+}
+
+/// Writes UTF-8 text back to one trusted project file. The same containment,
+/// sensitivity, and size boundaries as reading apply, and only files that
+/// already exist can be edited so the renderer never creates new paths.
+#[tauri::command]
+pub async fn project_file_write(
+    state: State<'_, AppState>,
+    repository: PathBuf,
+    input: ProjectFileWriteInput,
+) -> CommandResult<ProjectFileContent> {
+    let root = authorized_project_directory(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        write_project_file(&root, &input.path, &input.content)
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -2377,7 +2479,7 @@ pub async fn codex_connect(
         alive: Arc::new(AtomicBool::new(true)),
         binding: Arc::new(std::sync::Mutex::new(None)),
         context_primer: Arc::new(std::sync::Mutex::new(None)),
-        pending_native_skill: Arc::new(std::sync::Mutex::new(None)),
+        pending_user_prompt: Arc::new(std::sync::Mutex::new(None)),
     };
     if let Some(task_id) = task_id {
         let store = Arc::clone(&state.store);
@@ -2535,22 +2637,22 @@ fn pump_provider_event(
             Utc::now(),
         ),
     };
-    annotate_codex_native_skill(runtime, &mut reduced);
+    annotate_codex_user_prompt(runtime, &mut reduced);
     if let Ok(event) = store.apply_reduced_event(binding, &reduced) {
         let _ = app.emit("runtime://projection", &event);
     }
 }
 
-fn annotate_codex_native_skill(runtime: &CodexRuntime, reduced: &mut ReducedProviderEvent) {
+fn annotate_codex_user_prompt(runtime: &CodexRuntime, reduced: &mut ReducedProviderEvent) {
     let mut pending = runtime
-        .pending_native_skill
+        .pending_user_prompt
         .lock()
-        .expect("native skill lock");
-    annotate_pending_native_skill(&mut pending, reduced);
+        .expect("user prompt lock");
+    annotate_pending_user_prompt(&mut pending, reduced);
 }
 
-fn annotate_pending_native_skill(
-    pending: &mut Option<PendingNativeSkill>,
+fn annotate_pending_user_prompt(
+    pending: &mut Option<PendingUserPrompt>,
     reduced: &mut ReducedProviderEvent,
 ) {
     let item = match &mut reduced.mutation {
@@ -2575,7 +2677,7 @@ fn annotate_pending_native_skill(
     }
     pending.provider_item_id = Some(item.provider_item_id.clone());
     item.body = Some(pending.visible_prompt.clone());
-    item.native_skill = Some(pending.name.clone());
+    item.native_skill = pending.native_skill.clone();
 }
 
 fn pump_connection_event(
@@ -2685,6 +2787,7 @@ pub async fn codex_start_thread(
     model: Option<String>,
     effort: Option<String>,
     permission: Option<String>,
+    delegation: Option<String>,
 ) -> CommandResult<Value> {
     state.store.get_task(task_id).map_err(CommandError::from)?;
     // Map the UI permission profile onto Codex's approval-policy/sandbox
@@ -2703,14 +2806,37 @@ pub async fn codex_start_thread(
         }
     };
     let runtime = codex_runtime(&state, Some(task_id)).await?;
+    let codex_config = if let Some(mode) = delegation.as_deref().filter(|mode| *mode != "off") {
+        let broker = state
+            .broker
+            .lock()
+            .expect("broker lock")
+            .clone()
+            .ok_or_else(|| CommandError {
+                code: "provider-unavailable",
+                message: "the delegation broker is not ready; retry this turn".into(),
+            })?;
+        Some(
+            crate::delegation::codex_mcp_config(
+                &broker,
+                "orchestrator",
+                &task_id.to_string(),
+                mode,
+            )
+            .map_err(CommandError::from)?,
+        )
+    } else {
+        None
+    };
     let response = runtime
         .client
-        .start_thread_with_policies(
+        .start_thread_with_policies_and_config(
             &cwd,
             model.as_deref(),
             effort.as_deref(),
             approval_policy,
             sandbox,
+            codex_config,
         )
         .await
         .map_err(CommandError::from)?;
@@ -2827,6 +2953,7 @@ pub async fn codex_start_turn(
     prompt: String,
     repository: PathBuf,
     native_action_id: Option<String>,
+    delegation: Option<String>,
 ) -> CommandResult<Value> {
     let repository = authorized_task_directory(&state, task_id, repository).await?;
     let runtime = codex_runtime(&state, Some(task_id)).await?;
@@ -2893,7 +3020,7 @@ pub async fn codex_start_turn(
             .map(|(_, text)| text.as_str())
             .unwrap_or(prompt.as_str())
     });
-    let wire_prompt = if native_action_id.is_some() {
+    let mut wire_prompt = if native_action_id.is_some() {
         // Preserve Codex's recommended `$name` text at byte zero alongside
         // a typed skill item, or the exact goal objective after setting goal
         // state. Native actions must not be silently converted back into a
@@ -2903,18 +3030,25 @@ pub async fn codex_start_turn(
         apply_context_primer(&runtime.context_primer, visible_wire)
             .unwrap_or_else(|| visible_wire.to_owned())
     };
+    if let Some(mode) = delegation.as_deref().filter(|mode| *mode != "off")
+        && native_action_id.is_none()
+    {
+        let mut preface = crate::delegation::orchestrator_preamble(&state.store, mode);
+        if let Some(updates) = crate::delegation::pending_updates_block(&state.store, task_id) {
+            preface.push_str(&updates);
+        }
+        wire_prompt = format!("{preface}{wire_prompt}");
+    }
     *runtime
-        .pending_native_skill
+        .pending_user_prompt
         .lock()
-        .expect("native skill lock") =
-        skill
-            .as_ref()
-            .map(|(selection, skill_prompt)| PendingNativeSkill {
-                name: selection.name.clone(),
-                wire_prompt: skill_prompt.clone(),
-                visible_prompt: prompt.clone(),
-                provider_item_id: None,
-            });
+        .expect("user prompt lock") =
+        (wire_prompt != prompt || skill.is_some()).then(|| PendingUserPrompt {
+            wire_prompt: wire_prompt.clone(),
+            visible_prompt: prompt.clone(),
+            native_skill: skill.as_ref().map(|(selection, _)| selection.name.clone()),
+            provider_item_id: None,
+        });
     let response = runtime
         .client
         .start_turn_with_skill(
@@ -2927,9 +3061,9 @@ pub async fn codex_start_turn(
         Ok(response) => response,
         Err(error) => {
             *runtime
-                .pending_native_skill
+                .pending_user_prompt
                 .lock()
-                .expect("native skill lock") = None;
+                .expect("user prompt lock") = None;
             return Err(CommandError::from(error));
         }
     };
@@ -2947,6 +3081,32 @@ pub async fn codex_interrupt_turn(
         .await?
         .client
         .interrupt_turn(&thread_id, &turn_id)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn codex_steer_turn(
+    state: State<'_, AppState>,
+    task_id: TaskId,
+    expected_turn_id: String,
+    prompt: String,
+) -> CommandResult<Value> {
+    let runtime = codex_runtime(&state, Some(task_id)).await?;
+    let thread_id = runtime
+        .binding
+        .lock()
+        .expect("binding lock")
+        .clone()
+        .filter(|binding| binding.task_id == task_id)
+        .and_then(|binding| binding.thread_id)
+        .ok_or_else(|| CommandError {
+            code: "provider-disconnected",
+            message: "Codex thread is not connected for this task".into(),
+        })?;
+    runtime
+        .client
+        .steer_turn(&thread_id, &expected_turn_id, &prompt)
         .await
         .map_err(Into::into)
 }
@@ -3127,7 +3287,7 @@ pub async fn codex_stop_turn(
     if let Some(event) = &persisted.event {
         let _ = app.emit("runtime://projection", event);
     }
-    if !persisted.result.already_requested && !persisted.result.settled {
+    if !persisted.result.settled {
         // The persisted stop is provider-neutral; route the wire-level
         // interrupt to whichever runtime owns this task.
         let routed: Result<(), CommandError> = async {
@@ -3299,19 +3459,25 @@ pub async fn acp_start_session(
     // natively. The tool preamble is queued one-shot for the first turn.
     let mut mcp_servers = Vec::new();
     if let Some(mode) = delegation.as_deref().filter(|mode| *mode != "off") {
-        let broker = state.broker.lock().expect("broker lock").clone();
-        if let Some(info) = broker
-            && let Ok(entry) = crate::delegation::acp_mcp_server_entry(
-                &info,
-                "orchestrator",
-                &task_id.to_string(),
-                mode,
-            )
-        {
-            mcp_servers.push(entry);
-            *runtime.delegation_preamble.lock().expect("preamble lock") =
-                Some(crate::delegation::orchestrator_preamble(&state.store, mode));
-        }
+        let broker = state
+            .broker
+            .lock()
+            .expect("broker lock")
+            .clone()
+            .ok_or_else(|| CommandError {
+                code: "provider-unavailable",
+                message: "the delegation broker is not ready; retry this turn".into(),
+            })?;
+        let entry = crate::delegation::acp_mcp_server_entry(
+            &broker,
+            "orchestrator",
+            &task_id.to_string(),
+            mode,
+        )
+        .map_err(CommandError::from)?;
+        mcp_servers.push(entry);
+        *runtime.delegation_preamble.lock().expect("preamble lock") =
+            Some(crate::delegation::orchestrator_preamble(&state.store, mode));
     }
     let response = runtime
         .client
@@ -3692,6 +3858,16 @@ pub async fn structured_cli_start_turn(
         .filter(|action| action.kind == NativeActionKind::Skill)
         .map(|action| action.name.clone());
     let structured_provider = structured_provider(&provider)?;
+    if matches!(structured_provider, StructuredCliProvider::Antigravity)
+        && delegation.as_deref().is_some_and(|mode| mode != "off")
+    {
+        return Err(CommandError {
+            code: "provider-unavailable",
+            message:
+                "Antigravity cannot lead brokered delegation; choose Codex, Claude, Cursor, or Grok"
+                    .into(),
+        });
+    }
     let permission_mode = match permission.as_str() {
         "read-only" => StructuredPermissionMode::ReadOnly,
         "project-write" => StructuredPermissionMode::AcceptEdits,
@@ -3790,17 +3966,25 @@ pub async fn structured_cli_start_turn(
             wire_prompt = format!("{preface}{wire_prompt}");
         }
         if matches!(structured_provider, StructuredCliProvider::Claude) {
-            let broker = state.broker.lock().expect("broker lock").clone();
-            if let Some(info) = broker {
-                mcp_config_path = crate::delegation::write_mcp_config(
+            let broker = state
+                .broker
+                .lock()
+                .expect("broker lock")
+                .clone()
+                .ok_or_else(|| CommandError {
+                    code: "provider-unavailable",
+                    message: "the delegation broker is not ready; retry this turn".into(),
+                })?;
+            mcp_config_path = Some(
+                crate::delegation::write_mcp_config(
                     &app,
-                    &info,
+                    &broker,
                     "orchestrator",
                     &task_id.to_string(),
                     mode,
                 )
-                .ok();
-            }
+                .map_err(CommandError::from)?,
+            );
         }
     }
 
@@ -5108,15 +5292,69 @@ fn read_project_file(
             image_data_url: Some(format!("data:{mime};base64,{}", BASE64.encode(&bytes))),
         });
     }
-    let is_binary = bytes.contains(&0);
+    match String::from_utf8(bytes) {
+        Ok(content) if !content.contains('\0') => Ok(ProjectFileContent {
+            path: normalized_relative_path(&relative),
+            content,
+            is_binary: false,
+            image_data_url: None,
+        }),
+        Ok(_) | Err(_) => Ok(ProjectFileContent {
+            path: normalized_relative_path(&relative),
+            content: String::new(),
+            is_binary: true,
+            image_data_url: None,
+        }),
+    }
+}
+
+/// Writes edited text back to one existing file inside an explicitly trusted
+/// repository. Reuses the reading boundary (containment, sensitive-file
+/// denial, size limit) and additionally refuses binary targets, so the manual
+/// editor can only touch files the reader could already show as text.
+fn write_project_file(
+    root: &Path,
+    requested_path: &str,
+    content: &str,
+) -> integrator_core::Result<ProjectFileContent> {
+    let relative = validate_project_relative_path(requested_path)?;
+    if is_sensitive_project_file(&relative) {
+        return Err(IntegratorError::Unauthorized(
+            "sensitive project files cannot be edited".into(),
+        ));
+    }
+    let candidate = root.join(&relative);
+    let canonical = dunce::canonicalize(&candidate).map_err(io_error)?;
+    if !canonical.starts_with(root) {
+        return Err(IntegratorError::Unauthorized(
+            "file is outside the trusted repository".into(),
+        ));
+    }
+    let metadata = fs::metadata(&canonical).map_err(io_error)?;
+    if !metadata.is_file() {
+        return Err(IntegratorError::InvalidInput(
+            "requested path is not a file".into(),
+        ));
+    }
+    if content.len() as u64 > MAX_PROJECT_FILE_BYTES {
+        return Err(IntegratorError::Unavailable(format!(
+            "edited content is larger than the {} KB safe editing limit",
+            MAX_PROJECT_FILE_BYTES / 1_000
+        )));
+    }
+    // Refuse to clobber binaries: a text write over a binary file is always a
+    // corruption, never an edit the reader could have produced.
+    let existing = fs::read(&canonical).map_err(io_error)?;
+    if existing.contains(&0) || std::str::from_utf8(&existing).is_err() {
+        return Err(IntegratorError::InvalidInput(
+            "binary files cannot be edited as text".into(),
+        ));
+    }
+    fs::write(&canonical, content).map_err(io_error)?;
     Ok(ProjectFileContent {
         path: normalized_relative_path(&relative),
-        content: if is_binary {
-            String::new()
-        } else {
-            String::from_utf8_lossy(&bytes).into_owned()
-        },
-        is_binary,
+        content: content.to_owned(),
+        is_binary: false,
         image_data_url: None,
     })
 }
@@ -5567,10 +5805,10 @@ mod tests {
 
     #[test]
     fn codex_native_skill_annotation_restores_visible_text_and_tracks_the_provider_item() {
-        let mut pending = Some(PendingNativeSkill {
-            name: "skill-creator".into(),
+        let mut pending = Some(PendingUserPrompt {
             wire_prompt: "$skill-creator build one".into(),
             visible_prompt: "/skill-creator build one".into(),
+            native_skill: Some("skill-creator".into()),
             provider_item_id: None,
         });
         let occurred_at = Utc::now();
@@ -5587,7 +5825,7 @@ mod tests {
             occurred_at,
         };
 
-        annotate_pending_native_skill(&mut pending, &mut reduced);
+        annotate_pending_user_prompt(&mut pending, &mut reduced);
 
         let ProjectionMutation::ReplaceItem(item) = &reduced.mutation else {
             panic!("expected replaced user item");
@@ -5610,7 +5848,7 @@ mod tests {
             mutation: ProjectionMutation::MergeItem(codex_user_item("user-1", "normalized")),
             occurred_at,
         };
-        annotate_pending_native_skill(&mut pending, &mut update);
+        annotate_pending_user_prompt(&mut pending, &mut update);
         let ProjectionMutation::MergeItem(item) = &update.mutation else {
             panic!("expected merged user item");
         };
@@ -5619,11 +5857,41 @@ mod tests {
     }
 
     #[test]
+    fn codex_user_prompt_annotation_hides_provider_only_context() {
+        let visible_prompt = "Review the queue behavior";
+        let wire_prompt =
+            format!("<delegation>provider-only instructions</delegation>\n\n{visible_prompt}");
+        let mut pending = Some(PendingUserPrompt {
+            wire_prompt: wire_prompt.clone(),
+            visible_prompt: visible_prompt.into(),
+            native_skill: None,
+            provider_item_id: None,
+        });
+        let mut reduced = ReducedProviderEvent {
+            method: "item/completed".into(),
+            thread_id: "thread-1".into(),
+            turn_id: Some("turn-1".into()),
+            audit_json: "{}".into(),
+            audit_truncated: false,
+            mutation: ProjectionMutation::ReplaceItem(codex_user_item("user-1", &wire_prompt)),
+            occurred_at: Utc::now(),
+        };
+
+        annotate_pending_user_prompt(&mut pending, &mut reduced);
+
+        let ProjectionMutation::ReplaceItem(item) = &reduced.mutation else {
+            panic!("expected replaced user item");
+        };
+        assert_eq!(item.body.as_deref(), Some(visible_prompt));
+        assert_eq!(item.native_skill, None);
+    }
+
+    #[test]
     fn codex_native_skill_annotation_ignores_unrelated_user_text() {
-        let mut pending = Some(PendingNativeSkill {
-            name: "skill-creator".into(),
+        let mut pending = Some(PendingUserPrompt {
             wire_prompt: "$skill-creator build one".into(),
             visible_prompt: "/skill-creator build one".into(),
+            native_skill: Some("skill-creator".into()),
             provider_item_id: None,
         });
         let mut reduced = ReducedProviderEvent {
@@ -5639,7 +5907,7 @@ mod tests {
             occurred_at: Utc::now(),
         };
 
-        annotate_pending_native_skill(&mut pending, &mut reduced);
+        annotate_pending_user_prompt(&mut pending, &mut reduced);
 
         let ProjectionMutation::ReplaceItem(item) = &reduced.mutation else {
             panic!("expected replaced user item");
@@ -5924,6 +6192,35 @@ mod tests {
         assert!(content.is_binary);
         assert!(content.content.is_empty());
         assert!(content.image_data_url.is_none());
+
+        fs::remove_dir_all(&root).expect("clean up project directory");
+    }
+
+    #[test]
+    fn project_file_writes_stay_inside_the_safe_utf8_boundary() {
+        let root = std::env::temp_dir().join(format!("project-write-{}", uuid::Uuid::new_v4()));
+        let nested = root.join("src");
+        fs::create_dir_all(&nested).expect("create project directory");
+        fs::write(nested.join("main.rs"), "fn main() {}\n").expect("write text fixture");
+        fs::write(nested.join("invalid.bin"), [0xff, 0xfe, 0xfd])
+            .expect("write invalid utf8 fixture");
+        let root = dunce::canonicalize(&root).expect("canonicalize project root");
+
+        let saved = write_project_file(&root, "src/main.rs", "fn main() { println!(\"safe\"); }\n")
+            .expect("write safe utf8 text");
+        assert_eq!(saved.content, "fn main() { println!(\"safe\"); }\n");
+        assert_eq!(
+            fs::read_to_string(root.join("src/main.rs")).expect("read saved fixture"),
+            saved.content
+        );
+
+        assert!(write_project_file(&root, "src/invalid.bin", "replacement").is_err());
+        assert!(write_project_file(&root, ".env", "SECRET=exposed").is_err());
+        assert!(write_project_file(&root, "../outside.txt", "escape").is_err());
+
+        let binary = read_project_file(&root, "src/invalid.bin").expect("read invalid utf8 file");
+        assert!(binary.is_binary);
+        assert!(binary.content.is_empty());
 
         fs::remove_dir_all(&root).expect("clean up project directory");
     }

@@ -20,7 +20,7 @@ import {
   persistableComposerAttachment,
   PROVIDER_DEFAULT_MODEL,
   resolveModelEffort,
-  type ContextAttachment,
+  type ComposerDraftAttachment,
   type ComposerDraftValue,
   type ModeProjection,
   type ModelCatalogEntry,
@@ -56,6 +56,8 @@ interface ComposerProps {
   onDraftSubmit?: (value: ComposerDraftValue) => number;
   onSend: (value: {
     prompt: string;
+    draftPrompt: string;
+    attachments: ComposerDraftAttachment[];
     runtime: RuntimeId;
     model: string;
     effort?: string;
@@ -93,6 +95,12 @@ interface ComposerProps {
   insertRequest?: { id: number; text: string } | null;
   /** Confirms an insert request was applied so the owner can clear it. */
   onInsertHandled?: (id: number) => void;
+  /** Host-driven context cards (e.g. a highlighted selection from a file). */
+  attachmentRequest?: { id: number; attachment: ComposerDraftAttachment } | null;
+  onAttachmentHandled?: (id: number) => void;
+  /** Replaces the current draft with a queued message selected for editing. */
+  restoreRequest?: { id: number; value: ComposerDraftValue } | null;
+  onRestoreHandled?: (id: number) => void;
   /** Blocking or actionable runtime feedback docked immediately above the composer. */
   notices?: ComposerNotice[];
   /** True while the active task's turn is in progress; swaps send for stop. */
@@ -165,7 +173,7 @@ interface ContextIndex {
   children: Map<string, { folders: string[]; files: string[] }>;
 }
 
-interface ComposerAttachment extends ContextAttachment {
+interface ComposerAttachment extends ComposerDraftAttachment {
   /** Project folders use the same compact context treatment as files, while
    * retaining a truthful folder icon. Picker attachments leave this unset. */
   entry?: "file" | "folder";
@@ -377,16 +385,24 @@ function detachCommittedProjectReferences(
   };
 }
 
+/** Selection cards from the same file are distinct per line range, while
+ * whole-file references keep deduplicating by path alone. */
+function attachmentIdentity(attachment: ComposerAttachment): string {
+  return attachment.selection
+    ? `${attachment.path}#${attachment.selection.startLine ?? ""}-${attachment.selection.endLine ?? ""}`
+    : attachment.path;
+}
+
 function appendUniqueAttachments(
   current: ComposerAttachment[],
   additions: ComposerAttachment[],
 ): ComposerAttachment[] {
-  const existing = new Set(current.map((attachment) => attachment.path));
+  const existing = new Set(current.map(attachmentIdentity));
   return [
     ...current,
     ...additions.filter((attachment) => {
-      if (existing.has(attachment.path)) return false;
-      existing.add(attachment.path);
+      if (existing.has(attachmentIdentity(attachment))) return false;
+      existing.add(attachmentIdentity(attachment));
       return true;
     }),
   ];
@@ -436,6 +452,10 @@ export function Composer({
   onRequestContextFiles,
   insertRequest = null,
   onInsertHandled,
+  attachmentRequest = null,
+  onAttachmentHandled,
+  restoreRequest = null,
+  onRestoreHandled,
   notices = [],
   running = false,
   stopping = false,
@@ -472,7 +492,9 @@ export function Composer({
     setPermission(permissionRequest.value);
   }
   const [delegation, setDelegation] = useState<"off" | "manual" | "balanced" | "budget-first">(
-    initialDraft?.delegation ?? defaultDelegation ?? "off",
+    runtime === "antigravity" || runtime === "custom"
+      ? "off"
+      : (initialDraft?.delegation ?? defaultDelegation ?? "off"),
   );
   const [sending, setSending] = useState(false);
   const [attachments, setAttachments] = useState<ComposerAttachment[]>(
@@ -542,6 +564,9 @@ export function Composer({
   const effortOptions = activeEntry?.efforts ?? [];
   const activeEffort = resolveModelEffort(activeEntry, effort);
   const preferredRuntimeEffort = runtimeDefaults?.[runtime]?.effort ?? defaultEffort;
+  const delegationAvailable = runtime !== "antigravity" && runtime !== "custom";
+  const delegationControlDisabled = delegationDisabled || !delegationAvailable;
+  const effectiveDelegation = delegationAvailable ? delegation : "off";
   const draftValue = useMemo<ComposerDraftValue>(
     () => ({
       prompt,
@@ -550,11 +575,11 @@ export function Composer({
       model: activeModel,
       effort,
       permission,
-      delegation,
+      delegation: effectiveDelegation,
       selectionStart: caret,
       selectionEnd: caret,
     }),
-    [activeModel, attachments, caret, delegation, effort, permission, prompt, runtime],
+    [activeModel, attachments, caret, effectiveDelegation, effort, permission, prompt, runtime],
   );
   const visibleNotices = notices.filter(
     (notice) =>
@@ -563,6 +588,11 @@ export function Composer({
   );
   const voiceRecording = voicePhase === "recording";
   const voiceActive = voicePhase !== "idle";
+  const motionDisabled =
+    typeof document !== "undefined" &&
+    (document.documentElement.dataset.motion === "none" ||
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
+  const draftPresent = Boolean(prompt.trim()) || attachments.length > 0;
 
   useEffect(() => {
     onDraftChangeRef.current = onDraftChange;
@@ -808,6 +838,50 @@ export function Composer({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- consumes the request exactly once per id
   }, [insertRequest]);
 
+  // Applies host-driven context cards (a highlighted selection sent from the
+  // file canvas). The card is removable like any picker attachment.
+  const lastAttachmentIdRef = useRef(0);
+  useEffect(() => {
+    if (!attachmentRequest || attachmentRequest.id === lastAttachmentIdRef.current) return;
+    draftTouchedRef.current = true;
+    lastAttachmentIdRef.current = attachmentRequest.id;
+    setAttachments((current) => appendUniqueAttachments(current, [attachmentRequest.attachment]));
+    onAttachmentHandled?.(attachmentRequest.id);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- consumes the request exactly once per id
+  }, [attachmentRequest]);
+
+  const lastRestoreIdRef = useRef(0);
+  useEffect(() => {
+    if (!restoreRequest || restoreRequest.id === lastRestoreIdRef.current) return;
+    lastRestoreIdRef.current = restoreRequest.id;
+    const value = restoreRequest.value;
+    const position = value.selectionEnd;
+    draftTouchedRef.current = true;
+    suppressDraftEmissionRef.current = true;
+    setPrompt(value.prompt);
+    setAttachments(value.attachments);
+    const restoredRuntime = normalizeRuntime(runtimes, value.runtime);
+    setRuntime(restoredRuntime);
+    setModel(value.model);
+    setEffort(value.effort);
+    setPermission(value.permission);
+    setDelegation(
+      restoredRuntime === "antigravity" || restoredRuntime === "custom" ? "off" : value.delegation,
+    );
+    setCaret(position);
+    resetVoiceBaseline(value.prompt, position);
+    queueMicrotask(() => {
+      suppressDraftEmissionRef.current = false;
+    });
+    onRestoreHandled?.(restoreRequest.id);
+    requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+      textareaRef.current?.setSelectionRange(value.selectionStart, value.selectionEnd);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- consumes the request exactly once per id
+  }, [restoreRequest]);
+
   // Grow the textarea with its content (up to the CSS max-height) instead of
   // scrolling a fixed three-row box.
   useEffect(() => {
@@ -845,7 +919,8 @@ export function Composer({
   // untouched pickers in sync so persisted defaults actually take effect.
   useEffect(() => {
     if (routingTouched.current) return;
-    setRuntime(normalizeRuntime(runtimes, defaultRuntime));
+    const nextRuntime = normalizeRuntime(runtimes, defaultRuntime);
+    setRuntime(nextRuntime);
     setModel(defaultModel);
     setPermission(defaultPermission ?? "project-write");
     setEffort(defaultEffort);
@@ -1176,9 +1251,30 @@ export function Composer({
     // Picker attachments and committed @references share one plain-text
     // context block. Providers retain the same path context, while the
     // transcript can re-render the same compact cards after sending.
+    // Selection cards additionally quote their highlighted lines so the
+    // provider sees the exact snippet without re-reading the file.
+    const selectionRange = (attachment: ComposerAttachment): string => {
+      const selection = attachment.selection;
+      if (!selection?.startLine) return "";
+      return selection.endLine && selection.endLine !== selection.startLine
+        ? ` (lines ${selection.startLine}-${selection.endLine})`
+        : ` (line ${selection.startLine})`;
+    };
+    const selectionBlocks = attachments
+      .filter((attachment) => attachment.selection?.text)
+      .map((attachment) => {
+        const text = attachment.selection?.text ?? "";
+        const fence = text.includes("```") ? "````" : "```";
+        return `Selected from ${attachment.path}${selectionRange(attachment)}:\n${fence}\n${text}\n${fence}`;
+      });
     const attachmentBlock =
       attachments.length > 0
-        ? `Attached files:\n${attachments.map((attachment) => `- ${attachment.path}`).join("\n")}`
+        ? [
+            `Attached files:\n${attachments
+              .map((attachment) => `- ${attachment.path}${selectionRange(attachment)}`)
+              .join("\n")}`,
+            ...selectionBlocks,
+          ].join("\n\n")
         : "";
     const outgoing = trimmed
       ? attachmentBlock
@@ -1202,11 +1298,13 @@ export function Composer({
     try {
       const accepted = await onSend({
         prompt: outgoing,
+        draftPrompt: submittedDraft,
+        attachments: submittedAttachments.map(persistableComposerAttachment),
         runtime,
         model: activeModel,
         effort: effortOptions.length > 0 ? activeEffort : undefined,
         permission,
-        delegation,
+        delegation: effectiveDelegation,
         ...(nativeActionId ? { nativeActionId } : {}),
         ...(nativeAction
           ? { nativeAction: { name: nativeAction.name, kind: nativeAction.kind } }
@@ -1281,7 +1379,7 @@ export function Composer({
       ? sessionModes?.currentModeId
       : controlsSubmenu === "permission"
         ? permission
-        : delegation;
+        : effectiveDelegation;
   const chooseCompactControl = (value: string) => {
     if (controlsSubmenu === "mode") onSessionModeChange?.(value);
     if (controlsSubmenu === "permission") changePermission(value);
@@ -1507,7 +1605,7 @@ export function Composer({
                 className={`composer-attachment${
                   attachment.dataUrl ? " composer-attachment--image" : ""
                 }`}
-                key={attachment.path}
+                key={attachmentIdentity(attachment)}
                 title={attachment.path}
               >
                 {attachment.dataUrl ? (
@@ -1526,7 +1624,9 @@ export function Composer({
                   onClick={() => {
                     draftTouchedRef.current = true;
                     setAttachments((current) =>
-                      current.filter((item) => item.path !== attachment.path),
+                      current.filter(
+                        (item) => attachmentIdentity(item) !== attachmentIdentity(attachment),
+                      ),
                     );
                   }}
                 >
@@ -1578,10 +1678,12 @@ export function Composer({
               />
               <Dropdown
                 className="compact-select"
-                aria-label="Delegation"
-                disabled={delegationDisabled}
+                aria-label={
+                  delegationAvailable ? "Delegation" : "Delegation unavailable for this runtime"
+                }
+                disabled={delegationControlDisabled}
                 leading={<Users />}
-                value={delegation}
+                value={effectiveDelegation}
                 onChange={changeDelegation}
                 options={delegationOptions}
                 compact
@@ -1661,7 +1763,7 @@ export function Composer({
                       role="menuitem"
                       aria-haspopup="menu"
                       aria-expanded={controlsSubmenu === "delegation"}
-                      disabled={delegationDisabled}
+                      disabled={delegationControlDisabled}
                       onPointerEnter={() => setControlsSubmenu("delegation")}
                       onFocus={() => setControlsSubmenu("delegation")}
                       onClick={() => setControlsSubmenu("delegation")}
@@ -1671,8 +1773,8 @@ export function Composer({
                     >
                       <span>Delegation</span>
                       <small>
-                        {delegationOptions.find((option) => option.value === delegation)?.label ??
-                          delegation}
+                        {delegationOptions.find((option) => option.value === effectiveDelegation)
+                          ?.label ?? effectiveDelegation}
                       </small>
                     </button>
                     <AnimatePresence>
@@ -1776,6 +1878,9 @@ export function Composer({
                 setRuntime(nextRuntime);
                 setModel(nextModel);
                 setEffort(nextEffort);
+                if (nextRuntime === "antigravity" || nextRuntime === "custom") {
+                  setDelegation("off");
+                }
                 loadProviderCatalog(nextRuntime);
                 if (nextModel) {
                   emitRoutingChange(
@@ -1836,30 +1941,57 @@ export function Composer({
               options={microphoneOptions}
               compact
             />
-            {running && onStop && !prompt.trim() && attachments.length === 0 ? (
-              <motion.button
-                className="send-button send-button--stop"
-                type="button"
-                onClick={onStop}
-                disabled={stopping}
-                aria-label={stopping ? "Stopping turn" : "Stop turn"}
-                title={stopping ? "Stopping…" : "Stop the current turn"}
-                whileTap={{ scale: 0.94 }}
-              >
-                <Square />
-              </motion.button>
-            ) : (
-              <motion.button
-                className="send-button"
-                type="button"
-                onClick={() => void submit()}
-                disabled={(!prompt.trim() && attachments.length === 0) || !activeModel || sending}
-                aria-label={sending ? "Sending" : sendLabel}
-                whileTap={{ scale: 0.94 }}
-              >
-                <ArrowUp />
-              </motion.button>
-            )}
+            <div className="composer-send-stack">
+              {/* With a draft in progress a full-size stop overlays above the
+                  send position, so sending queued follow-ups is never blocked
+                  by an in-flight turn. */}
+              <AnimatePresence initial={false}>
+                {running && onStop && draftPresent ? (
+                  <motion.button
+                    key="stacked-stop"
+                    className="send-button send-button--stop send-button--stop-stacked"
+                    type="button"
+                    onClick={onStop}
+                    disabled={stopping}
+                    aria-label={stopping ? "Stopping turn" : "Stop turn"}
+                    title={stopping ? "Stopping…" : "Stop the current turn"}
+                    initial={{ opacity: 0, y: 6, scale: 0.94 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: 6, scale: 0.94 }}
+                    transition={
+                      motionDisabled ? { duration: 0 } : { duration: 0.14, ease: [0.2, 0, 0, 1] }
+                    }
+                    whileTap={motionDisabled ? undefined : { scale: 0.94 }}
+                  >
+                    <Square />
+                  </motion.button>
+                ) : null}
+              </AnimatePresence>
+              {running && onStop && !draftPresent ? (
+                <motion.button
+                  className="send-button send-button--stop"
+                  type="button"
+                  onClick={onStop}
+                  disabled={stopping}
+                  aria-label={stopping ? "Stopping turn" : "Stop turn"}
+                  title={stopping ? "Stopping…" : "Stop the current turn"}
+                  whileTap={motionDisabled ? undefined : { scale: 0.94 }}
+                >
+                  <Square />
+                </motion.button>
+              ) : (
+                <motion.button
+                  className="send-button"
+                  type="button"
+                  onClick={() => void submit()}
+                  disabled={(!prompt.trim() && attachments.length === 0) || !activeModel || sending}
+                  aria-label={sending ? "Sending" : sendLabel}
+                  whileTap={motionDisabled ? undefined : { scale: 0.94 }}
+                >
+                  <ArrowUp />
+                </motion.button>
+              )}
+            </div>
           </div>
         </div>
       </div>

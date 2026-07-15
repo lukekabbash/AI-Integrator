@@ -1,6 +1,7 @@
 import type {
   ChildAgent,
   ComposerDraft,
+  QueuedMessage,
   DiffFile,
   GitSnapshot,
   ProjectSummary,
@@ -31,7 +32,11 @@ export interface WorkspaceSnapshot {
   >;
   lastTaskByProject: Record<string, string>;
   centerViewByTask: Record<string, "task" | "review">;
+  /** Titlebar file tabs per task (or `project:<id>` for a draft chat). Paths
+   * only — contents are re-read when the owning task becomes active. */
+  openFilesByTask: Record<string, { paths: string[]; active: string }>;
   composerDrafts: ComposerDraft[];
+  queuedMessages: QueuedMessage[];
 }
 
 export function createEmptySnapshot(): WorkspaceSnapshot {
@@ -70,7 +75,9 @@ export function createEmptySnapshot(): WorkspaceSnapshot {
     taskContexts: {},
     lastTaskByProject: {},
     centerViewByTask: {},
+    openFilesByTask: {},
     composerDrafts: [],
+    queuedMessages: [],
   };
 }
 
@@ -611,6 +618,8 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
       "theme-pass": "task",
       overnight: "task",
     },
+    openFilesByTask: {},
     composerDrafts: [],
+    queuedMessages: [],
   };
 }

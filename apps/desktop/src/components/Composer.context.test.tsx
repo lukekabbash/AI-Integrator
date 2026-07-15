@@ -199,3 +199,88 @@ describe("composer attachments", () => {
     expect(screen.queryByText("a.txt")).toBeNull();
   });
 });
+
+describe("selection context cards", () => {
+  it("attaches a host-sent selection as a removable range-labeled card", async () => {
+    const onSend = vi.fn().mockResolvedValue(true);
+    const onAttachmentHandled = vi.fn();
+    const selection = {
+      path: "apps/desktop/src/App.tsx",
+      name: "App.tsx (101 – 156)",
+      kind: "file" as const,
+      entry: "file" as const,
+      selection: { startLine: 101, endLine: 156, text: "const value = 1;" },
+    };
+    render(
+      <LazyMotion features={domAnimation} strict>
+        <Composer
+          runtimes={[codex]}
+          defaultRuntime="codex"
+          defaultModel="gpt-5.3-codex"
+          contextFiles={contextFiles}
+          onSend={onSend}
+          attachmentRequest={{ id: 1, attachment: selection }}
+          onAttachmentHandled={onAttachmentHandled}
+        />
+      </LazyMotion>,
+    );
+
+    // The card shows the file name plus the highlighted line range.
+    expect(await screen.findByText("App.tsx (101 – 156)")).toBeInTheDocument();
+    expect(onAttachmentHandled).toHaveBeenCalledWith(1);
+
+    const textbox = screen.getByRole("textbox", { name: "Task message" });
+    fireEvent.change(textbox, { target: { value: "Explain this part" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+    const outgoing = onSend.mock.calls[0][0];
+    expect(outgoing.prompt).toContain("apps/desktop/src/App.tsx (lines 101-156)");
+    expect(outgoing.prompt).toContain("const value = 1;");
+  });
+
+  it("removes a selection card without touching a whole-file card for the same path", async () => {
+    const wholeFile = {
+      path: "apps/desktop/src/App.tsx",
+      name: "App.tsx",
+      kind: "file" as const,
+      entry: "file" as const,
+    };
+    const selection = {
+      ...wholeFile,
+      name: "App.tsx (7)",
+      selection: { startLine: 7, endLine: 7, text: "let x = 1;" },
+    };
+    const { rerender } = render(
+      <LazyMotion features={domAnimation} strict>
+        <Composer
+          runtimes={[codex]}
+          defaultRuntime="codex"
+          defaultModel="gpt-5.3-codex"
+          contextFiles={contextFiles}
+          onSend={vi.fn().mockResolvedValue(true)}
+          attachmentRequest={{ id: 1, attachment: wholeFile }}
+        />
+      </LazyMotion>,
+    );
+    rerender(
+      <LazyMotion features={domAnimation} strict>
+        <Composer
+          runtimes={[codex]}
+          defaultRuntime="codex"
+          defaultModel="gpt-5.3-codex"
+          contextFiles={contextFiles}
+          onSend={vi.fn().mockResolvedValue(true)}
+          attachmentRequest={{ id: 2, attachment: selection }}
+        />
+      </LazyMotion>,
+    );
+
+    expect(await screen.findByText("App.tsx (7)")).toBeInTheDocument();
+    expect(screen.getByText("App.tsx")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove App.tsx (7)" }));
+    await waitFor(() => expect(screen.queryByText("App.tsx (7)")).not.toBeInTheDocument());
+    expect(screen.getByText("App.tsx")).toBeInTheDocument();
+  });
+});

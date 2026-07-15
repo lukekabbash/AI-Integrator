@@ -9,6 +9,7 @@ export type ThemeId =
   | "midnight"
   | "slate"
   | "ocean"
+  | "glory"
   | "forest"
   | "juniper"
   | "sand"
@@ -23,7 +24,10 @@ export type ThemeId =
   | "velvet"
   | "brass"
   | "espresso"
+  | "storm"
   | "porcelain"
+  | "usonian"
+  | "limestone"
   | "sage"
   | "lilac"
   | "high-contrast";
@@ -47,6 +51,7 @@ export const THEME_COLOR_TOKENS = [
   "selection.active",
   "selection.text",
   "accent.primary",
+  "accent.secondary",
   "accent.hover",
   "accent.pressed",
   "accent.subtle",
@@ -110,6 +115,7 @@ type ThemeSourcePalette = Readonly<{
   border: readonly [string, string];
   interaction: readonly [string, string, string];
   accent: readonly [string, string, string, string, string];
+  secondaryAccent?: string;
   status: readonly [string, string, string, string];
   statusSurface: readonly [string, string, string, string];
   diff: readonly [string, string, string, string, string, string, string];
@@ -165,6 +171,7 @@ function themeColors(palette: ThemeSourcePalette): ThemeColors {
     "selection.active": selected,
     "selection.text": selectedText,
     "accent.primary": accent,
+    "accent.secondary": palette.secondaryAccent ?? accent,
     "accent.hover": accentHover,
     "accent.pressed": accentPressed,
     "accent.subtle": accentSubtle,
@@ -1042,6 +1049,151 @@ export const THEME_PRESETS = [
     }),
   },
   {
+    id: "glory",
+    label: "Glory",
+    appearance: "dark",
+    description: "Muted Ukrainian blue with a quiet field of wheat-gold.",
+    colors: themeColors({
+      surface: ["#101722", "#151e2b", "#1a2533", "#1f2c3c", "#253446", "#2d3e52", "#070b12dc"],
+      text: ["#f2f1e8", "#c8c8b9", "#91989b", "#10130c"],
+      border: ["#2a3a4c", "#50657a"],
+      interaction: ["#d2b84f", "#574d22", "#fffbed"],
+      accent: ["#c7ab43", "#d7bd58", "#aa8f30", "#40391d", "#151104"],
+      status: ["#79b88d", "#d8b654", "#dc7770", "#79a9cf"],
+      statusSurface: ["#1b3528", "#3b3215", "#43211f", "#1c3349"],
+      diff: ["#193629", "#28583d", "#a0d3af", "#412020", "#6b302e", "#f0aaa4", "#182330"],
+      syntax: ["#d5ba52", "#9fc18b", "#7faed2", "#72c4bd", "#d9dde0", "#d89b68", "#748394"],
+      ansi: [
+        "#131c29",
+        "#d5706a",
+        "#73b288",
+        "#c9ad45",
+        "#6f9fc9",
+        "#a78da8",
+        "#68aaa8",
+        "#ced2cf",
+        "#647486",
+        "#ec8b84",
+        "#8fca9e",
+        "#dbc45f",
+        "#8eb9dc",
+        "#bfa3bd",
+        "#83c2bd",
+        "#f2f1e8",
+      ],
+      chrome: ["#141d29", "#e4e3da"],
+    }),
+  },
+  {
+    id: "storm",
+    label: "Storm",
+    appearance: "dark",
+    description: "Storm-gray layers lit by a restrained amber horizon.",
+    colors: themeColors({
+      surface: ["#14171a", "#191d21", "#1e2328", "#242a30", "#2a3138", "#323b44", "#080a0cdd"],
+      text: ["#f1f1ed", "#c5c7c6", "#90979b", "#11110e"],
+      border: ["#30373e", "#555f67"],
+      interaction: ["#cbb17d", "#51452f", "#fffaf0"],
+      accent: ["#bda16b", "#ceb481", "#9e824f", "#3f3627", "#171106"],
+      status: ["#75b58a", "#d4aa5d", "#d97772", "#7ba9c3"],
+      statusSurface: ["#1c3528", "#393018", "#402222", "#203440"],
+      diff: ["#1b3528", "#2a563c", "#a0d2af", "#402122", "#693031", "#efaaa6", "#1d2227"],
+      syntax: ["#cbb17d", "#9fc18c", "#83abc4", "#7fc1b7", "#d7d9d9", "#d69770", "#7c858b"],
+      ansi: [
+        "#181c20",
+        "#d2706b",
+        "#70af85",
+        "#cba253",
+        "#749bb7",
+        "#a58e9f",
+        "#6aa5a2",
+        "#cbcaca",
+        "#6d767d",
+        "#e98b84",
+        "#8ac69b",
+        "#ddbc73",
+        "#91b4ca",
+        "#bca4b5",
+        "#84bdb8",
+        "#f1f1ed",
+      ],
+      chrome: ["#181c20", "#dedfdd"],
+    }),
+  },
+  {
+    id: "usonian",
+    label: "Usonian",
+    appearance: "light",
+    description: "Warm American white with muted federal blue and brick red.",
+    colors: themeColors({
+      surface: ["#f3f1ec", "#e8e8e4", "#f8f7f3", "#fcfbf8", "#ecebe6", "#ffffff", "#242c37d1"],
+      text: ["#202936", "#4e5968", "#68717d", "#fbfaf6"],
+      border: ["#d7d8d6", "#a8adb2"],
+      interaction: ["#315a7d", "#d2e0eb", "#122638"],
+      accent: ["#365f82", "#2b506f", "#223f59", "#dce6ed", "#ffffff"],
+      secondaryAccent: "#a6504b",
+      status: ["#3b7850", "#916814", "#a64c48", "#315f84"],
+      statusSurface: ["#ddebe0", "#f3e8ca", "#f1dfdc", "#dce7ee"],
+      diff: ["#e0ece2", "#badbc1", "#285f3a", "#f2e0dd", "#e4beba", "#8e3d3a", "#f6f5f1"],
+      syntax: ["#9b4541", "#477338", "#8a621b", "#2b6f70", "#314a63", "#a35531", "#707984"],
+      ansi: [
+        "#29323d",
+        "#a74a46",
+        "#39784f",
+        "#8d671c",
+        "#365f84",
+        "#80617d",
+        "#2b7472",
+        "#dbdcd9",
+        "#69727c",
+        "#bf5f59",
+        "#539568",
+        "#a98232",
+        "#527c9f",
+        "#9b7b98",
+        "#49918e",
+        "#ffffff",
+      ],
+      chrome: ["#e8e7e2", "#25303d"],
+    }),
+  },
+  {
+    id: "limestone",
+    label: "Limestone",
+    appearance: "light",
+    description: "Mineral cream grounded by muted olive and weathered bronze.",
+    colors: themeColors({
+      surface: ["#f0eee7", "#e6e3da", "#f6f4ee", "#faf9f5", "#ebe8df", "#fffefb", "#302e27d1"],
+      text: ["#292a25", "#575a50", "#6d7065", "#fffefb"],
+      border: ["#d8d4c9", "#afa99b"],
+      interaction: ["#687046", "#dde2ca", "#252b12"],
+      accent: ["#6c7349", "#59603c", "#464c2f", "#e4e7d7", "#ffffff"],
+      status: ["#42764e", "#8e691c", "#a84943", "#3c6e83"],
+      statusSurface: ["#e0ebdf", "#f1e8cc", "#f2dfdc", "#dfe9ec"],
+      diff: ["#e2ece0", "#bed9bc", "#315f39", "#f2e0dc", "#e5bdb7", "#8d3d36", "#f5f3ed"],
+      syntax: ["#626b42", "#4f7338", "#88631d", "#28716a", "#41473f", "#9a552f", "#74766d"],
+      ansi: [
+        "#32332e",
+        "#a74d46",
+        "#41764d",
+        "#8a681f",
+        "#466d82",
+        "#786778",
+        "#34736e",
+        "#dcd9d0",
+        "#707168",
+        "#be6259",
+        "#5a9365",
+        "#a28137",
+        "#63879a",
+        "#927f91",
+        "#52908a",
+        "#fffefb",
+      ],
+      chrome: ["#e6e3da", "#2d2f29"],
+    }),
+  },
+  {
     id: "high-contrast",
     label: "High Contrast",
     appearance: "dark",
@@ -1091,15 +1243,19 @@ export const THEME_PRESET_GRID_ORDER = [
   "forest",
   "juniper",
   "ocean",
+  "glory",
   "high-contrast",
   "midnight",
   "slate",
+  "storm",
   "graphite",
   "velvet",
   "iris",
   "orchid",
   "dawn",
+  "usonian",
   "sand",
+  "limestone",
   "paper",
   "sage",
   "arctic",

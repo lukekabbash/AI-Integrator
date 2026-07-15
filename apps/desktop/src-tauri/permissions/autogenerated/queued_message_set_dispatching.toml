@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-queued-message-set-dispatching"
+description = "Enables the queued_message_set_dispatching command without any pre-configured scope."
+commands.allow = ["queued_message_set_dispatching"]
+
+[[permission]]
+identifier = "deny-queued-message-set-dispatching"
+description = "Denies the queued_message_set_dispatching command without any pre-configured scope."
+commands.deny = ["queued_message_set_dispatching"]
