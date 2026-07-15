@@ -694,6 +694,16 @@ const MIGRATIONS: &[(i64, &str)] = &[
         );
         "#,
     ),
+    (
+        17,
+        r#"
+        CREATE TABLE task_edit_context (
+            task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+            body TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    ),
 ];
 
 pub struct LocalStore {
@@ -1868,6 +1878,17 @@ impl LocalStore {
         Ok(())
     }
 
+    pub fn clear_provider_resume_state(&self, task_id: TaskId) -> Result<()> {
+        let connection = self.connection.lock();
+        connection
+            .execute(
+                "DELETE FROM provider_resume_states WHERE task_id = ?1",
+                [task_id.to_string()],
+            )
+            .map_err(storage_error)?;
+        Ok(())
+    }
+
     pub fn provider_resume_state(&self, task_id: TaskId) -> Result<Option<ProviderResumeState>> {
         let row = self
             .connection
@@ -2517,9 +2538,299 @@ mod tests {
     use super::*;
     use integrator_core::{
         ItemKind, ItemProjection, ItemStatus, RuntimeBinding, RuntimeProjection,
-        RuntimeProjectionEvent,
+        RuntimeProjectionEvent, TurnProjection, TurnStatus,
     };
     use integrator_runtime::{ProjectionMutation, ReducedProviderEvent};
+
+    /// Drives the real ingest path so the forked rows under test are the ones
+    /// a live provider would actually have written.
+    fn seed_conversation(store: &LocalStore, task_id: TaskId) -> Vec<RuntimeProjectionEvent> {
+        let binding = store
+            .create_runtime_binding(task_id, "fork-process", ProviderKind::Codex)
+            .expect("create runtime binding");
+        let binding = store
+            .attach_provider_thread(&binding, "fork-thread")
+            .expect("attach provider thread");
+        let started = Utc::now();
+        [
+            (ItemKind::UserMessage, "port the parser to the new lexer"),
+            (ItemKind::AgentMessage, "here is the port"),
+            (ItemKind::UserMessage, "now delete the old lexer"),
+            (ItemKind::AgentMessage, "deleted"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (kind, body))| {
+            let item = ItemProjection {
+                id: format!("codex:fork-thread:turn-1:item-{index}"),
+                provider_item_id: format!("item-{index}"),
+                kind,
+                status: ItemStatus::Completed,
+                title: None,
+                body: Some(body.into()),
+                native_skill: None,
+                command: None,
+                cwd: None,
+                output: None,
+                exit_code: None,
+                file_changes: None,
+                mcp_server: None,
+                mcp_tool: None,
+                tool_input: None,
+                truncated: false,
+                updated_at: started + chrono::Duration::seconds(index as i64),
+            };
+            store
+                .apply_reduced_event(
+                    &binding,
+                    &ReducedProviderEvent {
+                        method: "item/completed".into(),
+                        thread_id: "fork-thread".into(),
+                        turn_id: Some("turn-1".into()),
+                        audit_json: "{}".into(),
+                        audit_truncated: false,
+                        mutation: ProjectionMutation::ReplaceItem(item),
+                        occurred_at: started + chrono::Duration::seconds(index as i64),
+                    },
+                )
+                .expect("apply seeded event")
+        })
+        .collect()
+    }
+
+    fn item_bodies(store: &LocalStore, task_id: TaskId) -> Vec<String> {
+        store
+            .task_snapshot(task_id)
+            .expect("hydrate snapshot")
+            .events
+            .into_iter()
+            .filter_map(|event| match event.projection {
+                RuntimeProjection::ItemChanged { item, .. } => item.body,
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn fork_source(store: &LocalStore) -> Task {
+        store
+            .create_task(NewTask {
+                title: "Port the parser".into(),
+                repository_path: Some(PathBuf::from("/repo")),
+                worktree_path: None,
+                runtime: Some("codex".into()),
+                model: Some("gpt-5-codex".into()),
+                effort: Some("high".into()),
+                parent_task_id: None,
+            })
+            .expect("create fork source")
+    }
+
+    #[test]
+    fn whole_fork_copies_the_transcript_and_leaves_the_source_untouched() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let source = fork_source(&store);
+        seed_conversation(&store, source.id);
+
+        let fork = store
+            .fork_task(source.id, None, "Port the parser: Copy 1".into())
+            .expect("fork whole task");
+
+        assert_ne!(fork.id, source.id);
+        assert_eq!(fork.title, "Port the parser: Copy 1");
+        // Routing settings must survive or the copy answers with a different
+        // model than the conversation it continues.
+        assert_eq!(fork.runtime, source.runtime);
+        assert_eq!(fork.model, source.model);
+        assert_eq!(fork.effort, source.effort);
+        assert_eq!(fork.repository_path, source.repository_path);
+
+        assert_eq!(
+            item_bodies(&store, fork.id),
+            vec![
+                "port the parser to the new lexer",
+                "here is the port",
+                "now delete the old lexer",
+                "deleted",
+            ]
+        );
+        assert_eq!(item_bodies(&store, source.id), item_bodies(&store, fork.id));
+
+        // Renaming or deleting a fork must not reach back into the source.
+        store
+            .update_task_metadata(fork.id, Some("Renamed fork".into()), None, None)
+            .expect("rename fork");
+        assert_eq!(store.get_task(source.id).expect("reread source").title, "Port the parser");
+        store.remove_task(fork.id).expect("remove fork");
+        assert_eq!(item_bodies(&store, source.id).len(), 4);
+    }
+
+    #[test]
+    fn branch_truncates_at_the_chosen_item_and_digests_only_the_kept_history() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let source = fork_source(&store);
+        seed_conversation(&store, source.id);
+
+        let branch = store
+            .fork_task(
+                source.id,
+                Some("codex:fork-thread:turn-1:item-1"),
+                "Port the parser: Branch 1".into(),
+            )
+            .expect("branch at the first reply");
+
+        assert_eq!(
+            item_bodies(&store, branch.id),
+            vec!["port the parser to the new lexer", "here is the port"]
+        );
+
+        // The digest is what the branch's first prompt actually carries to a
+        // fresh provider session, so truncation has to hold there too.
+        let digest = store
+            .task_conversation_digest(branch.id, 6 * 1024)
+            .expect("branch digest")
+            .expect("branch has history");
+        assert!(digest.contains("here is the port"));
+        assert!(
+            !digest.contains("now delete the old lexer"),
+            "history past the branch point leaked into the digest: {digest}"
+        );
+
+        // Resuming would make the provider replay its own untruncated
+        // transcript and ignore every row copied above.
+        assert!(
+            store
+                .provider_resume_state(branch.id)
+                .expect("read branch resume state")
+                .is_none()
+        );
+        assert!(
+            !store
+                .list_provider_sessions()
+                .expect("list sessions")
+                .iter()
+                .any(|session| session.task_id == branch.id
+                    && session.provider_thread_id == "fork-thread"),
+            "the branch must not claim the source's provider thread"
+        );
+    }
+
+    #[test]
+    fn truncate_from_edit_clears_the_tip_and_drops_resume_state() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let source = fork_source(&store);
+        seed_conversation(&store, source.id);
+        store
+            .upsert_provider_resume_state(&ProviderResumeState {
+                task_id: source.id,
+                provider: ProviderKind::Codex,
+                session_ref: "resume-thread".into(),
+                repository_root: PathBuf::from("/repo"),
+                permission: "project-write".into(),
+                delegation: "off".into(),
+                updated_at: Utc::now(),
+            })
+            .expect("seed resume state");
+
+        // item-2 is the second user message ("now delete…"); cutting there
+        // keeps the first exchange and drops that prompt plus its reply.
+        store
+            .truncate_task_from(source.id, "codex:fork-thread:turn-1:item-2", false)
+            .expect("truncate without salvage");
+        assert_eq!(
+            item_bodies(&store, source.id),
+            vec!["port the parser to the new lexer", "here is the port"]
+        );
+        assert!(
+            store
+                .provider_resume_state(source.id)
+                .expect("read resume")
+                .is_none()
+        );
+        let digest = store
+            .task_conversation_digest(source.id, 6 * 1024)
+            .expect("digest")
+            .expect("history");
+        assert!(!digest.contains("deleted"));
+        assert!(!digest.contains("discarded by a later edit"));
+    }
+
+    #[test]
+    fn truncate_with_save_context_keeps_discarded_replies_in_the_digest() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let source = fork_source(&store);
+        seed_conversation(&store, source.id);
+
+        store
+            .truncate_task_from(source.id, "codex:fork-thread:turn-1:item-2", true)
+            .expect("truncate with salvage");
+
+        assert_eq!(
+            item_bodies(&store, source.id),
+            vec!["port the parser to the new lexer", "here is the port"]
+        );
+        let digest = store
+            .task_conversation_digest(source.id, 6 * 1024)
+            .expect("digest")
+            .expect("history");
+        assert!(
+            digest.contains("deleted"),
+            "salvaged assistant reply missing from digest: {digest}"
+        );
+        assert!(digest.contains("discarded by a later edit"));
+    }
+
+    #[test]
+    fn fork_is_refused_mid_turn_and_for_an_unknown_branch_point() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let source = fork_source(&store);
+        seed_conversation(&store, source.id);
+
+        assert!(matches!(
+            store.fork_task(source.id, Some("codex:fork-thread:turn-1:item-99"), "x".into()),
+            Err(IntegratorError::NotFound(_))
+        ));
+
+        let binding = store
+            .create_runtime_binding(source.id, "running-process", ProviderKind::Codex)
+            .expect("create runtime binding");
+        let binding = store
+            .attach_provider_thread(&binding, "fork-thread")
+            .expect("attach provider thread");
+        store
+            .apply_reduced_event(
+                &binding,
+                &ReducedProviderEvent {
+                    method: "turn/started".into(),
+                    thread_id: "fork-thread".into(),
+                    turn_id: Some("turn-2".into()),
+                    audit_json: "{}".into(),
+                    audit_truncated: false,
+                    mutation: ProjectionMutation::Turn(TurnProjection {
+                        id: "turn-2".into(),
+                        status: TurnStatus::InProgress,
+                        stop_requested: false,
+                        error: None,
+                        started_at: Some(Utc::now()),
+                        completed_at: None,
+                    }),
+                    occurred_at: Utc::now(),
+                },
+            )
+            .expect("start a turn");
+
+        assert!(matches!(
+            store.fork_task(source.id, None, "Port the parser: Copy 1".into()),
+            Err(IntegratorError::InvalidInput(_))
+        ));
+        // The refusal must not leave a half-built task behind.
+        assert!(
+            !store
+                .list_tasks()
+                .expect("list tasks")
+                .iter()
+                .any(|task| task.title == "Port the parser: Copy 1")
+        );
+    }
 
     fn create_naming_task(store: &LocalStore) -> Task {
         store

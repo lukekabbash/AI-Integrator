@@ -471,20 +471,19 @@ describe("runtime projection reducer", () => {
     const transcript = runtimeTranscript(state);
     expect(transcript.map((entry) => entry.id)).toEqual([
       "msg-before-approval",
-      "activity-group-command-before-approval",
+      "command-before-approval",
+      "runtime-approval-approval-stack",
+      "tool-after-approval",
       "msg-after-approval",
     ]);
-    expect(transcript[1]).toMatchObject({
-      expandedByDefault: false,
-      children: [
-        expect.objectContaining({ activityType: "command" }),
-        expect.objectContaining({ kind: "approval", status: "warning" }),
-        expect.objectContaining({ kind: "tool" }),
-      ],
+    expect(transcript[2]).toMatchObject({
+      kind: "approval",
+      status: "warning",
     });
-    expect(transcript[1].body).toContain("1 command");
-    expect(transcript[1].body).toContain("1 approval");
-    expect(transcript[1].body).toContain("1 tool");
+    expect(transcript[3]).toMatchObject({
+      kind: "tool",
+      title: expect.stringMatching(/^Edit/i),
+    });
   });
 
   it("surfaces tool call details for expansion", () => {
@@ -673,6 +672,362 @@ describe("runtime projection reducer", () => {
       additions: 2,
       deletions: 1,
     });
+  });
+
+  it("groups contiguous file edits into an Edits summary with aggregated diffs", () => {
+    let state = createRuntimeProjectionState("task-1");
+    const files = ["src/a.ts", "src/b.ts", "src/c.ts"];
+    for (const [index, path] of files.entries()) {
+      const timestamp = `2026-07-10T16:00:0${index}Z`;
+      state = applyRuntimeProjection(state, {
+        ...event(90 + index, {
+          kind: "itemChanged",
+          item: {
+            id: `file-${index}`,
+            providerItemId: `file-${index}`,
+            kind: "fileChange",
+            status: "completed",
+            fileChanges: [
+              {
+                path,
+                changeKind: "modify",
+                patch: "@@ -1,1 +1,1 @@\n-old\n+new",
+              },
+            ],
+            truncated: false,
+            updatedAt: timestamp,
+          },
+        }),
+        occurredAt: timestamp,
+      });
+    }
+
+    const transcript = runtimeTranscript(state);
+    expect(transcript).toHaveLength(1);
+    expect(transcript[0]).toMatchObject({
+      title: "Edits",
+      body: "3 files",
+      activityType: "file",
+      changeStats: { additions: 3, deletions: 3 },
+      children: [
+        expect.objectContaining({ title: "Edited", body: "src/a.ts" }),
+        expect.objectContaining({ title: "Edited", body: "src/b.ts" }),
+        expect.objectContaining({ title: "Edited", body: "src/c.ts" }),
+      ],
+    });
+    expect(runtimeTranscript(state, "verbose")).toHaveLength(3);
+  });
+
+  it("collapses settled mid-turn activity into Worked for above the final reply", () => {
+    let state = createRuntimeProjectionState("task-1");
+    state = applyRuntimeProjection(
+      state,
+      event(100, {
+        kind: "turnChanged",
+        turn: {
+          id: "turn-1",
+          status: "inProgress",
+          stopRequested: false,
+          startedAt: "2026-07-10T16:00:00Z",
+        },
+      }),
+    );
+    const liveItems = [
+      {
+        id: "user-1",
+        providerItemId: "user-1",
+        kind: "userMessage" as const,
+        status: "completed" as const,
+        body: "Fix the flaky test",
+        truncated: false,
+        updatedAt: "2026-07-10T16:00:00Z",
+      },
+      {
+        id: "command-1",
+        providerItemId: "command-1",
+        kind: "commandExecution" as const,
+        status: "completed" as const,
+        command: "pnpm test",
+        output: "failed",
+        truncated: false,
+        updatedAt: "2026-07-10T16:00:10Z",
+      },
+      {
+        id: "tool-1",
+        providerItemId: "tool-1",
+        kind: "mcpTool" as const,
+        status: "completed" as const,
+        mcpTool: "edit",
+        toolInput: '{"path":"src/App.tsx"}',
+        fileChanges: [
+          {
+            path: "src/App.tsx",
+            changeKind: "modify" as const,
+            patch: "@@ -1,1 +1,1 @@\n-old\n+new",
+          },
+        ],
+        truncated: false,
+        updatedAt: "2026-07-10T16:00:20Z",
+      },
+      {
+        id: "assistant-1",
+        providerItemId: "assistant-1",
+        kind: "agentMessage" as const,
+        status: "completed" as const,
+        body: "The flaky test is fixed.",
+        truncated: false,
+        updatedAt: "2026-07-10T16:01:35Z",
+      },
+    ];
+    for (const [index, item] of liveItems.entries()) {
+      state = applyRuntimeProjection(state, {
+        ...event(101 + index, { kind: "itemChanged", item }),
+        occurredAt: item.updatedAt,
+      });
+    }
+
+    const live = runtimeTranscript(state);
+    expect(live.map((entry) => entry.kind)).toEqual(["user", "tool", "tool", "assistant"]);
+    expect(live.some((entry) => entry.title === "Worked for")).toBe(false);
+
+    state = applyRuntimeProjection(
+      state,
+      event(110, {
+        kind: "turnChanged",
+        turn: {
+          id: "turn-1",
+          status: "completed",
+          stopRequested: false,
+          startedAt: "2026-07-10T16:00:00Z",
+          completedAt: "2026-07-10T16:01:35Z",
+        },
+      }),
+    );
+
+    const settled = runtimeTranscript(state);
+    expect(settled.map((entry) => entry.id)).toEqual([
+      "user-1",
+      "worked-for-assistant-1",
+      "assistant-1",
+    ]);
+    expect(settled[1]).toMatchObject({
+      title: "Worked for",
+      body: "1m 35s",
+      expandedByDefault: false,
+      children: expect.any(Array),
+    });
+    expect(settled[1].children?.length).toBeGreaterThanOrEqual(2);
+    expect(settled[2]).toMatchObject({ kind: "assistant", body: "The flaky test is fixed." });
+
+    expect(runtimeTranscript(state, "verbose").some((entry) => entry.title === "Worked for")).toBe(
+      false,
+    );
+  });
+
+  it("folds mid-turn assistant replies into Worked for in chronological order", () => {
+    let state = createRuntimeProjectionState("task-1");
+    state = applyRuntimeProjection(
+      state,
+      event(120, {
+        kind: "turnChanged",
+        turn: {
+          id: "turn-1",
+          status: "completed",
+          stopRequested: false,
+          startedAt: "2026-07-10T15:00:00Z",
+          completedAt: "2026-07-10T16:01:35Z",
+        },
+      }),
+    );
+    const items = [
+      {
+        id: "user-2",
+        providerItemId: "user-2",
+        kind: "userMessage" as const,
+        status: "completed" as const,
+        body: "Ship the fix",
+        truncated: false,
+        updatedAt: "2026-07-10T15:00:00Z",
+      },
+      {
+        id: "assistant-early",
+        providerItemId: "assistant-early",
+        kind: "agentMessage" as const,
+        status: "completed" as const,
+        body: "I will inspect the failure first.",
+        truncated: false,
+        updatedAt: "2026-07-10T15:00:05Z",
+      },
+      {
+        id: "command-2",
+        providerItemId: "command-2",
+        kind: "commandExecution" as const,
+        status: "completed" as const,
+        command: "pnpm test",
+        truncated: false,
+        updatedAt: "2026-07-10T15:00:30Z",
+      },
+      {
+        id: "assistant-mid",
+        providerItemId: "assistant-mid",
+        kind: "agentMessage" as const,
+        status: "completed" as const,
+        body: "Tests are green; applying the patch.",
+        truncated: false,
+        updatedAt: "2026-07-10T15:00:45Z",
+      },
+      {
+        id: "assistant-final",
+        providerItemId: "assistant-final",
+        kind: "agentMessage" as const,
+        status: "completed" as const,
+        body: "Done.",
+        truncated: false,
+        updatedAt: "2026-07-10T16:01:35Z",
+      },
+    ];
+    for (const [index, item] of items.entries()) {
+      state = applyRuntimeProjection(state, {
+        ...event(121 + index, { kind: "itemChanged", item }),
+        occurredAt: item.updatedAt,
+      });
+    }
+    state = applyRuntimeProjection(state, {
+      ...event(130, {
+        kind: "approvalChanged",
+        approval: {
+          id: "approval-open",
+          requestId: { kind: "string", value: "request-open" },
+          approvalKind: "commandExecution",
+          state: "pending",
+          command: "rm -rf build",
+          reason: "Destructive command",
+          updatedAt: "2026-07-10T15:00:20Z",
+        },
+      }),
+      occurredAt: "2026-07-10T15:00:20Z",
+    });
+
+    const transcript = runtimeTranscript(state);
+    expect(transcript.map((entry) => entry.id)).toEqual([
+      "user-2",
+      "worked-for-assistant-final",
+      "runtime-approval-approval-open",
+      "worked-for-assistant-final-1",
+      "assistant-final",
+    ]);
+    expect(transcript[1]).toMatchObject({
+      title: "Worked for",
+      children: [expect.objectContaining({ id: "assistant-early", kind: "assistant" })],
+    });
+    expect(transcript[2]).toMatchObject({ kind: "approval", status: "warning" });
+    expect(transcript[3]).toMatchObject({
+      title: "Worked for",
+      children: [
+        expect.objectContaining({ id: "command-2" }),
+        expect.objectContaining({ id: "assistant-mid", kind: "assistant" }),
+      ],
+    });
+    expect(transcript[4]).toMatchObject({ kind: "assistant", body: "Done." });
+  });
+
+  it("keeps prior Worked for rows collapsed when a new turn starts", () => {
+    let state = createRuntimeProjectionState("task-1");
+    state = applyRuntimeProjection(
+      state,
+      event(200, {
+        kind: "turnChanged",
+        turn: {
+          id: "turn-1",
+          status: "completed",
+          stopRequested: false,
+          startedAt: "2026-07-10T16:00:00Z",
+          completedAt: "2026-07-10T16:01:00Z",
+        },
+      }),
+    );
+    for (const [index, item] of [
+      {
+        id: "user-a",
+        providerItemId: "user-a",
+        kind: "userMessage" as const,
+        status: "completed" as const,
+        body: "First ask",
+        truncated: false,
+        updatedAt: "2026-07-10T16:00:00Z",
+      },
+      {
+        id: "command-a",
+        providerItemId: "command-a",
+        kind: "commandExecution" as const,
+        status: "completed" as const,
+        command: "pnpm test",
+        truncated: false,
+        updatedAt: "2026-07-10T16:00:20Z",
+      },
+      {
+        id: "assistant-a",
+        providerItemId: "assistant-a",
+        kind: "agentMessage" as const,
+        status: "completed" as const,
+        body: "First answer",
+        truncated: false,
+        updatedAt: "2026-07-10T16:01:00Z",
+      },
+    ].entries()) {
+      state = applyRuntimeProjection(state, {
+        ...event(201 + index, { kind: "itemChanged", item }),
+        occurredAt: item.updatedAt,
+      });
+    }
+
+    expect(runtimeTranscript(state).map((entry) => entry.id)).toEqual([
+      "user-a",
+      "worked-for-assistant-a",
+      "assistant-a",
+    ]);
+
+    // Follow-up send starts a new in-progress turn — prior Worked for must stay.
+    state = applyRuntimeProjection(
+      state,
+      event(210, {
+        kind: "turnChanged",
+        turn: {
+          id: "turn-2",
+          status: "inProgress",
+          stopRequested: false,
+          startedAt: "2026-07-10T16:02:00Z",
+        },
+      }),
+    );
+    state = applyRuntimeProjection(state, {
+      ...event(211, {
+        kind: "itemChanged",
+        item: {
+          id: "user-b",
+          providerItemId: "user-b",
+          kind: "userMessage",
+          status: "completed",
+          body: "Second ask",
+          truncated: false,
+          updatedAt: "2026-07-10T16:02:00Z",
+        },
+      }),
+      occurredAt: "2026-07-10T16:02:00Z",
+    });
+
+    const transcript = runtimeTranscript(state);
+    expect(transcript.map((entry) => entry.id)).toEqual([
+      "user-a",
+      "worked-for-assistant-a",
+      "assistant-a",
+      "user-b",
+    ]);
+    expect(transcript[1]).toMatchObject({
+      title: "Worked for",
+      children: [expect.objectContaining({ id: "command-a" })],
+    });
+    expect(transcript.some((entry) => entry.id === "command-a")).toBe(false);
   });
 
   it("tracks session mode snapshots for the composer mode picker", () => {
@@ -986,6 +1341,98 @@ describe("runtime projection reducer", () => {
         }),
       ),
     ).toBe(false);
+  });
+});
+
+describe("turn settlement on provider errors", () => {
+  const startedTurn = (seq: number) =>
+    event(seq, {
+      kind: "turnChanged",
+      turn: { id: "turn-1", status: "inProgress", stopRequested: false },
+    });
+
+  it("settles the turn when the provider will not retry", () => {
+    const running = applyRuntimeProjection(createRuntimeProjectionState("task-1"), startedTurn(1));
+    expect(running.turn).toMatchObject({ status: "inProgress" });
+
+    const limited = applyRuntimeProjection(
+      running,
+      event(2, {
+        kind: "turnError",
+        message: "You've hit your usage limit. Try again at 3pm.",
+        retryable: false,
+      }),
+    );
+
+    // Without this the composer stays pinned to stop and the queue never
+    // drains, because both read `turn.status`.
+    expect(limited.turn).toMatchObject({
+      id: "turn-1",
+      status: "failed",
+      error: "You've hit your usage limit. Try again at 3pm.",
+      completedAt: "2026-07-10T16:00:00Z",
+    });
+    expect(limited.errors).toMatchObject([{ retryable: false }]);
+  });
+
+  it("leaves the turn running while the provider is still retrying", () => {
+    const running = applyRuntimeProjection(createRuntimeProjectionState("task-1"), startedTurn(1));
+    const retrying = applyRuntimeProjection(
+      running,
+      event(2, { kind: "turnError", message: "stream disconnected", retryable: true }),
+    );
+
+    expect(retrying.turn).toMatchObject({ status: "inProgress" });
+    expect(retrying.errors).toMatchObject([{ retryable: true }]);
+  });
+
+  it("settles a hydrated turn, so a reload does not resurrect the stop button", () => {
+    // Hydration replays the stored turn and error snapshot events in seq order
+    // through this same reducer.
+    const hydrated = applyRuntimeProjectionBatch(createRuntimeProjectionState("task-1"), [
+      startedTurn(1),
+      event(2, { kind: "turnError", message: "usage limit reached", retryable: false }),
+    ]);
+
+    expect(hydrated.turn).toMatchObject({ status: "failed" });
+  });
+
+  it("lets a provider that reports its own outcome win over the settled guess", () => {
+    const limited = applyRuntimeProjectionBatch(createRuntimeProjectionState("task-1"), [
+      startedTurn(1),
+      event(2, { kind: "turnError", message: "usage limit reached", retryable: false }),
+    ]);
+
+    // A provider that does close the turn after erroring stays authoritative.
+    const closed = applyRuntimeProjection(
+      limited,
+      event(3, {
+        kind: "turnChanged",
+        turn: { id: "turn-1", status: "interrupted", stopRequested: false },
+      }),
+    );
+    expect(closed.turn).toMatchObject({ status: "interrupted" });
+
+    // And a fresh turn still clears the stale error rather than inheriting it.
+    const retried = applyRuntimeProjection(
+      closed,
+      event(4, {
+        kind: "turnChanged",
+        turn: { id: "turn-2", status: "inProgress", stopRequested: false },
+      }),
+    );
+    expect(retried.turn).toMatchObject({ id: "turn-2", status: "inProgress" });
+    expect(retried.errors).toHaveLength(0);
+  });
+
+  it("ignores a non-retryable error that arrives with no turn to settle", () => {
+    const state = applyRuntimeProjection(
+      createRuntimeProjectionState("task-1"),
+      event(1, { kind: "turnError", message: "runtime is not installed", retryable: false }),
+    );
+
+    expect(state.turn).toBeUndefined();
+    expect(state.errors).toHaveLength(1);
   });
 });
 

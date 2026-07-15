@@ -1269,6 +1269,63 @@ describe("native runtime recovery UI", () => {
     expect(screen.queryByText("gemini turn execution is not implemented")).not.toBeInTheDocument();
   });
 
+  it("hands the composer back after a usage limit ends the turn", async () => {
+    render(<App />);
+    await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
+
+    act(() => {
+      runtimeListener?.(
+        projection(10, {
+          kind: "turnChanged",
+          turn: { id: "turn-1", status: "inProgress", stopRequested: false },
+        }),
+      );
+    });
+    expect(await screen.findByRole("button", { name: "Stop turn" })).toBeInTheDocument();
+
+    act(() => {
+      runtimeListener?.(
+        projection(11, {
+          kind: "turnError",
+          message: "You've hit your usage limit.",
+          retryable: false,
+        }),
+      );
+    });
+
+    // The provider has given up on the turn, so the composer goes back to send
+    // rather than leaving stop as the only control on a turn nothing is running.
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Stop turn" })).not.toBeInTheDocument(),
+    );
+    expect(screen.getByRole("button", { name: "Send message" })).toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toHaveTextContent("usage limit");
+  });
+
+  it("keeps stop available while the provider is still retrying", async () => {
+    render(<App />);
+    await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
+
+    act(() => {
+      runtimeListener?.(
+        projection(10, {
+          kind: "turnChanged",
+          turn: { id: "turn-1", status: "inProgress", stopRequested: false },
+        }),
+      );
+      runtimeListener?.(
+        projection(11, {
+          kind: "turnError",
+          message: "stream disconnected",
+          retryable: true,
+        }),
+      );
+    });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("stream disconnected");
+    expect(screen.getByRole("button", { name: "Stop turn" })).toBeInTheDocument();
+  });
+
   it("routes a provider version error into disclosed Runtime Settings without executing it", async () => {
     bridgeMock.listRuntimeActionPlans.mockResolvedValue([
       {

@@ -718,6 +718,57 @@ pub async fn task_update_metadata(
     .map_err(Into::into)
 }
 
+/// Copies a chat into a new one, keeping the transcript up to and including
+/// `through_event_id`, or all of it when that is absent. The new chat carries
+/// no provider resume state, so its first prompt starts a fresh provider
+/// session seeded from the copied transcript rather than resuming the source's
+/// thread.
+#[tauri::command]
+pub async fn task_fork(
+    state: State<'_, AppState>,
+    task_id: TaskId,
+    through_event_id: Option<String>,
+    title: String,
+) -> CommandResult<Task> {
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || {
+        store.fork_task(task_id, through_event_id.as_deref(), title)
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
+}
+
+/// Truncate a chat from a user message onward so an edit can re-send from that
+/// point. Drops the live runtime binding and resume state so the next turn
+/// cannot silently resume the discarded provider transcript.
+#[tauri::command]
+pub async fn task_truncate_from(
+    state: State<'_, AppState>,
+    task_id: TaskId,
+    from_event_id: String,
+    save_context: bool,
+) -> CommandResult<()> {
+    {
+        let mut runtimes = state.codex.lock().await;
+        remove_task_runtime(&mut *runtimes, task_id);
+    }
+    {
+        let mut runtimes = state.structured.lock().await;
+        remove_task_runtime(&mut *runtimes, task_id);
+    }
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || {
+        // Edit is allowed mid-stream; settle any tip that Stop has not closed
+        // yet so the truncate is not refused as still running.
+        let _ = store.settle_stopped_turn(task_id)?;
+        store.truncate_task_from(task_id, &from_event_id, save_context)
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
+}
+
 #[tauri::command]
 pub async fn task_update_routing(
     state: State<'_, AppState>,
@@ -2045,6 +2096,97 @@ pub async fn attachment_preview(path: PathBuf) -> CommandResult<Option<String>> 
     })
     .await
     .map_err(|_| worker_error())
+}
+
+/// A clipboard image saved under the local Integrator data directory so the
+/// composer can attach a real path (and inline preview) without granting the
+/// renderer arbitrary write authority.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PastedImageAttachment {
+    path: PathBuf,
+    name: String,
+    kind: &'static str,
+    data_url: String,
+}
+
+fn extension_for_image_mime(mime: &str) -> Option<&'static str> {
+    match mime.trim().to_ascii_lowercase().as_str() {
+        "image/png" => Some("png"),
+        "image/jpeg" | "image/jpg" => Some("jpg"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        "image/bmp" => Some("bmp"),
+        "image/svg+xml" => Some("svg"),
+        "image/x-icon" | "image/vnd.microsoft.icon" => Some("ico"),
+        "image/avif" => Some("avif"),
+        _ => None,
+    }
+}
+
+fn save_pasted_image_bytes(
+    data_directory: &Path,
+    bytes: &[u8],
+    mime: &str,
+) -> CommandResult<PastedImageAttachment> {
+    let extension = extension_for_image_mime(mime).ok_or_else(|| CommandError {
+        code: "invalid-input",
+        message: format!("Unsupported clipboard image type: {mime}"),
+    })?;
+    if bytes.is_empty() {
+        return Err(CommandError {
+            code: "invalid-input",
+            message: "Clipboard image was empty.".into(),
+        });
+    }
+    if bytes.len() as u64 > ATTACHMENT_PREVIEW_MAX_BYTES {
+        return Err(CommandError {
+            code: "invalid-input",
+            message: format!(
+                "Clipboard image exceeds the {} MB attachment limit.",
+                ATTACHMENT_PREVIEW_MAX_BYTES / (1024 * 1024)
+            ),
+        });
+    }
+    let directory = data_directory.join("pasted-attachments");
+    fs::create_dir_all(&directory).map_err(|error| CommandError {
+        code: "io",
+        message: format!("Could not create pasted-attachments directory: {error}"),
+    })?;
+    let name = format!("pasted-image-{}.{}", uuid::Uuid::new_v4(), extension);
+    let path = directory.join(&name);
+    fs::write(&path, bytes).map_err(|error| CommandError {
+        code: "io",
+        message: format!("Could not save clipboard image: {error}"),
+    })?;
+    let mime = image_mime_for_extension(extension).unwrap_or("application/octet-stream");
+    Ok(PastedImageAttachment {
+        path,
+        name,
+        kind: "image",
+        data_url: format!("data:{mime};base64,{}", BASE64.encode(bytes)),
+    })
+}
+
+/// Persists a clipboard image under the app data directory and returns a
+/// composer-ready attachment (absolute path + inline preview). The renderer
+/// only supplies bytes and a MIME type — never a write path.
+#[tauri::command]
+pub async fn attachment_save_paste(
+    state: State<'_, AppState>,
+    bytes_base64: String,
+    mime_type: String,
+) -> CommandResult<PastedImageAttachment> {
+    let data_directory = state.data_directory.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = BASE64.decode(bytes_base64.trim()).map_err(|_| CommandError {
+            code: "invalid-input",
+            message: "Clipboard image encoding was invalid.".into(),
+        })?;
+        save_pasted_image_bytes(&data_directory, &bytes, &mime_type)
+    })
+    .await
+    .map_err(|_| worker_error())?
 }
 
 #[tauri::command]
@@ -6904,6 +7046,36 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).expect("clean up project directory");
+    }
+
+    #[test]
+    fn saves_a_pasted_clipboard_image_under_app_data() {
+        let root = std::env::temp_dir().join(format!("pasted-image-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create data directory");
+        let png = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+
+        let saved = save_pasted_image_bytes(&root, &png, "image/png").expect("save paste");
+        assert_eq!(saved.kind, "image");
+        assert!(saved.name.ends_with(".png"));
+        assert!(saved.path.starts_with(root.join("pasted-attachments")));
+        assert_eq!(fs::read(&saved.path).expect("read saved paste"), png);
+        assert!(saved.data_url.starts_with("data:image/png;base64,"));
+
+        fs::remove_dir_all(&root).expect("clean up data directory");
+    }
+
+    #[test]
+    fn rejects_unsupported_clipboard_image_types() {
+        let root = std::env::temp_dir().join(format!("pasted-reject-{}", uuid::Uuid::new_v4()));
+        let error = save_pasted_image_bytes(&root, b"not-an-image", "application/pdf")
+            .expect_err("unsupported mime");
+        assert_eq!(error.code, "invalid-input");
     }
 
     #[test]

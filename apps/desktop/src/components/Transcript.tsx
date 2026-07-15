@@ -13,24 +13,29 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { AnimatePresence, m as motion } from "motion/react";
 import {
+  BookOpen,
   Check,
   ChevronDown,
   ChevronRight,
   ChevronUp,
   Circle,
   Copy,
-  FileSearch,
-  GitCommit,
+  CornerDownLeft,
+  GitBranch,
   Info,
+  Layers,
   MessageCircleQuestion,
+  Pencil,
   RefreshCw,
   Search,
   TerminalSquare,
+  Wrench,
   X,
 } from "lucide-react";
 import { bridge, openExternalLink, attachmentKind, type TranscriptEvent } from "../bridge";
 import { DiffView, type DiffSelectionPayload } from "./DiffView";
 import { FileIcon } from "./FileIcon";
+import { Tooltip } from "./Tooltip";
 import { splitAttachmentBlock } from "./conversationFormatting";
 import { stabilizeStreamingMarkdown } from "./streamStableMarkdown";
 import {
@@ -62,6 +67,13 @@ interface TranscriptProps {
   showTimestamps?: boolean;
   /** Re-runs the prompt that produced the latest assistant reply. */
   onRegenerate?: () => void;
+  /** Copies the chat up to this reply into a new one to follow up in. */
+  onBranch?: (eventId: string) => void;
+  /**
+   * Returns a user message to the composer for editing. Allowed while a turn
+   * is streaming — the host cancels first, then restores the prompt.
+   */
+  onEditUserMessage?: (eventId: string, body: string) => void;
   /** Opens an observable file in the Files tab of the right rail. */
   onOpenFile?: (path: string) => void;
   /** Selection-to-chat from transcript-embedded diffs. */
@@ -210,6 +222,11 @@ const UserMessage = memo(function UserMessage({
   timestamp,
   showTimestamp,
   previewCache,
+  copied,
+  copyFailed,
+  canEdit,
+  onCopy,
+  onEdit,
 }: {
   id: string;
   body: string;
@@ -217,51 +234,88 @@ const UserMessage = memo(function UserMessage({
   timestamp: string;
   showTimestamp: boolean;
   previewCache: AttachmentPreviewCache;
+  copied: boolean;
+  copyFailed: boolean;
+  canEdit: boolean;
+  onCopy: (id: string, body: string) => void;
+  onEdit: (id: string, body: string) => void;
 }) {
   const skillPrefix = nativeSkill ? `/${nativeSkill}` : "";
   const hasVerifiedSkill =
     Boolean(skillPrefix) && (body === skillPrefix || body.startsWith(`${skillPrefix} `));
   const { text, attachments } = splitAttachmentBlock(body);
   const tail = hasVerifiedSkill ? text.slice(skillPrefix.length) : text;
+  const clock = showTimestamp ? formatClock(timestamp) : "";
   return (
-    <section
-      className="turn turn--user"
-      data-event-id={id}
-      aria-label="Your message"
-      title={showTimestamp ? formatClock(timestamp) : undefined}
-    >
-      <p>
-        {hasVerifiedSkill ? (
-          <strong
-            className="native-skill-token"
-            aria-label={`Native skill ${skillPrefix}`}
-            title="Provider-native skill"
-          >
-            {skillPrefix}
-          </strong>
-        ) : null}
-        {mentionSegments(tail).map((segment, index) =>
-          typeof segment === "string" ? (
-            segment
-          ) : (
+    <div className="turn-user-wrap">
+      <section className="turn turn--user" data-event-id={id} aria-label="Your message">
+        <p>
+          {hasVerifiedSkill ? (
             <strong
-              className="context-mention-token"
-              key={`${segment.mention}-${index}`}
-              title="Context mention"
+              className="native-skill-token"
+              aria-label={`Native skill ${skillPrefix}`}
+              title="Provider-native skill"
             >
-              {segment.mention}
+              {skillPrefix}
             </strong>
-          ),
-        )}
-      </p>
-      {attachments.length > 0 ? (
-        <span className="user-attachments" aria-label="Attached files">
-          {attachments.map((path) => (
-            <AttachmentThumb key={path} path={path} previewCache={previewCache} />
-          ))}
-        </span>
-      ) : null}
-    </section>
+          ) : null}
+          {mentionSegments(tail).map((segment, index) =>
+            typeof segment === "string" ? (
+              segment
+            ) : (
+              <strong
+                className="context-mention-token"
+                key={`${segment.mention}-${index}`}
+                title="Context mention"
+              >
+                {segment.mention}
+              </strong>
+            ),
+          )}
+        </p>
+        {attachments.length > 0 ? (
+          <span className="user-attachments" aria-label="Attached files">
+            {attachments.map((path) => (
+              <AttachmentThumb key={path} path={path} previewCache={previewCache} />
+            ))}
+          </span>
+        ) : null}
+      </section>
+      <div className="message-footer message-footer--user">
+        {clock ? (
+          <time className="message-time" dateTime={timestamp}>
+            {clock}
+          </time>
+        ) : null}
+        <div className="message-actions">
+          <Tooltip
+            label={
+              copyFailed ? "Clipboard unavailable" : copied ? "Copied" : "Copy message"
+            }
+          >
+            <button
+              type="button"
+              className={copied ? "is-copied" : undefined}
+              onClick={() => onCopy(id, body)}
+              aria-label="Copy this message"
+            >
+              {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
+            </button>
+          </Tooltip>
+          {canEdit ? (
+            <Tooltip label="Edit" hint="Return to composer and continue from here">
+              <button
+                type="button"
+                onClick={() => onEdit(id, body)}
+                aria-label="Edit this message"
+              >
+                <CornerDownLeft aria-hidden="true" />
+              </button>
+            </Tooltip>
+          ) : null}
+        </div>
+      </div>
+    </div>
   );
 });
 
@@ -276,9 +330,11 @@ const AssistantMessage = memo(function AssistantMessage({
   isLatestAssistant,
   running,
   canRegenerate,
+  canBranch,
   canAskAbout,
   onCopy,
   onRegenerate,
+  onBranch,
   onAskAbout,
 }: {
   id: string;
@@ -291,12 +347,15 @@ const AssistantMessage = memo(function AssistantMessage({
   isLatestAssistant: boolean;
   running: boolean;
   canRegenerate: boolean;
+  canBranch: boolean;
   canAskAbout: boolean;
   onCopy: (id: string, body: string) => void;
   onRegenerate: () => void;
+  onBranch: (id: string) => void;
   onAskAbout: (body: string) => void;
 }) {
   const clock = showTimestamp ? formatClock(timestamp) : "";
+  const showTurnActions = canBranch && !running;
   return (
     <section className="turn turn--assistant" data-event-id={id} aria-label="Agent response">
       {modelLabel ? (
@@ -305,39 +364,56 @@ const AssistantMessage = memo(function AssistantMessage({
         </header>
       ) : null}
       <MarkdownBody body={body} streaming={running} />
-      <div className="message-actions">
-        <button
-          type="button"
-          className={copied ? "is-copied" : undefined}
-          onClick={() => onCopy(id, body)}
-          aria-label="Copy this response"
-          title={copyFailed ? "The system clipboard is unavailable." : "Copy this response"}
-        >
-          {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
-          <span>{copied ? "Copied" : "Copy"}</span>
-        </button>
-        {canRegenerate && isLatestAssistant && !running ? (
-          <button
-            type="button"
-            onClick={onRegenerate}
-            aria-label="Regenerate this response"
-            title="Run the same prompt again"
+      <div className="message-footer message-footer--assistant">
+        <div className="message-actions">
+          <Tooltip
+            label={
+              copyFailed ? "Clipboard unavailable" : copied ? "Copied" : "Copy response"
+            }
           >
-            <RefreshCw aria-hidden="true" />
-            <span>Regenerate</span>
-          </button>
-        ) : null}
-        {canAskAbout ? (
-          <button
-            type="button"
-            onClick={() => onAskAbout(body)}
-            aria-label="Ask a follow-up about this response"
-            title="Ask a follow-up about this response"
-          >
-            <MessageCircleQuestion aria-hidden="true" />
-            <span>Ask about this</span>
-          </button>
-        ) : null}
+            <button
+              type="button"
+              className={copied ? "is-copied" : undefined}
+              onClick={() => onCopy(id, body)}
+              aria-label="Copy this response"
+            >
+              {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
+            </button>
+          </Tooltip>
+          {showTurnActions ? (
+            <Tooltip label="Branch" hint="Continue in a copy that ends here">
+              <button
+                type="button"
+                onClick={() => onBranch(id)}
+                aria-label="Branch the chat from this response"
+              >
+                <GitBranch aria-hidden="true" />
+              </button>
+            </Tooltip>
+          ) : null}
+          {showTurnActions && canRegenerate && isLatestAssistant ? (
+            <Tooltip label="Regenerate" hint="Run the same prompt again">
+              <button
+                type="button"
+                onClick={onRegenerate}
+                aria-label="Regenerate this response"
+              >
+                <RefreshCw aria-hidden="true" />
+              </button>
+            </Tooltip>
+          ) : null}
+          {showTurnActions && canAskAbout ? (
+            <Tooltip label="Ask about this" hint="Draft a follow-up in the composer">
+              <button
+                type="button"
+                onClick={() => onAskAbout(body)}
+                aria-label="Ask a follow-up about this response"
+              >
+                <MessageCircleQuestion aria-hidden="true" />
+              </button>
+            </Tooltip>
+          ) : null}
+        </div>
         {clock ? (
           <time className="message-time" dateTime={timestamp}>
             {clock}
@@ -368,13 +444,81 @@ const NoticeMessage = memo(function NoticeMessage({
   );
 });
 
+function activityGlyphKind(
+  event: TranscriptEvent,
+): "edit" | "read" | "search" | "command" | "tool" | "activity" | "approval" | "reasoning" | "other" {
+  const title = event.title ?? "";
+  if (/^(Read|Reads|Reading)\b/i.test(title)) return "read";
+  if (/^(Search|Searches|Searching|Searched)\b/i.test(title)) return "search";
+  if (/^(Edit|Edits|Editing|Edited|Creat|Creating|Created|Added|Deleted|Renamed|Changed)\b/i.test(title)) {
+    return "edit";
+  }
+  if (event.activityType === "file") return "edit";
+  if (event.activityType === "command" || /^(Command|Commands|Running)\b/i.test(title)) {
+    return "command";
+  }
+  if (event.activityType === "approval" || event.kind === "approval") return "approval";
+  if (event.activityType === "reasoning") return "reasoning";
+  if (event.activityType === "tool") return "tool";
+  if (
+    event.kind === "activity" ||
+    /^(Activity|Working|Worked)\b/i.test(title) ||
+    Boolean(event.children?.length)
+  ) {
+    return "activity";
+  }
+  return "other";
+}
+
 function EventIcon({ event }: { event: TranscriptEvent }) {
-  if (event.status === "success") return <Check />;
-  if (event.status === "running") return <Circle className="spin-slow" />;
-  if (event.kind === "tool") return <TerminalSquare />;
-  if (event.kind === "checkpoint") return <GitCommit />;
-  if (event.kind === "notice") return <Info />;
-  return <FileSearch />;
+  if (event.status === "error") return <X aria-hidden="true" />;
+  if (event.status === "warning") return <Info aria-hidden="true" />;
+
+  const running = event.status === "running";
+  const kind = activityGlyphKind(event);
+  const activeClass = running ? "activity-icon--active" : undefined;
+
+  switch (kind) {
+    case "edit":
+      return (
+        <Pencil
+          className={running ? "activity-icon-pencil--writing" : undefined}
+          aria-hidden="true"
+        />
+      );
+    case "read":
+      return <BookOpen className={activeClass} aria-hidden="true" />;
+    case "search":
+      return <Search className={activeClass} aria-hidden="true" />;
+    case "command":
+      return running ? (
+        <Circle className="spin-slow" aria-hidden="true" />
+      ) : (
+        <TerminalSquare aria-hidden="true" />
+      );
+    case "tool":
+      return running ? (
+        <Circle className="spin-slow" aria-hidden="true" />
+      ) : (
+        <Wrench aria-hidden="true" />
+      );
+    case "approval":
+      return <MessageCircleQuestion className={activeClass} aria-hidden="true" />;
+    case "reasoning":
+      return running ? (
+        <Circle className="spin-slow" aria-hidden="true" />
+      ) : (
+        <Info aria-hidden="true" />
+      );
+    case "activity":
+      return running ? (
+        <Circle className="spin-slow" aria-hidden="true" />
+      ) : (
+        <Layers aria-hidden="true" />
+      );
+    default:
+      return running ? <Circle className="spin-slow" aria-hidden="true" /> : null;
+  }
 }
 
 interface ActivityEventProps {
@@ -399,30 +543,67 @@ const ActivityEvent = memo(function ActivityEventRow({
   const hasDetails = Boolean(event.details?.length);
   const hasDiff = Boolean(event.diff?.lines.length);
   const filePath = event.filePath ?? event.diff?.path;
+  const displayBody = activityDisplayBody(event);
+  const pathOnlyBody = Boolean(filePath && event.body === filePath);
   const hasLongBody = Boolean(
-    event.title && event.body && (event.body.length > 96 || event.body.includes("\n")),
+    event.title &&
+      event.body &&
+      !pathOnlyBody &&
+      (event.body.length > 96 || event.body.includes("\n")),
   );
   const expandable = hasChildren || hasDetails || hasLongBody || hasDiff;
+  const canOpenFile = Boolean(filePath && onOpenFile && event.title);
+  const isWorkedFor = event.title === "Worked for";
+  const toggleExpanded = () => {
+    if (expandable) onExpandedChange(event.id, !expanded);
+  };
   return (
-    <div
-      className={`activity-event${hasChildren ? " activity-event--group" : ""}${nested ? " activity-event--nested" : ""}`}
+    <motion.div
+      className={`activity-event${hasChildren ? " activity-event--group" : ""}${nested ? " activity-event--nested" : ""}${isWorkedFor ? " activity-event--worked-for" : ""}`}
       data-event-id={event.id}
       data-status={event.status ?? "neutral"}
+      initial={isWorkedFor ? { opacity: 0, y: -6 } : false}
+      animate={{ opacity: 1, y: 0 }}
+      exit={isWorkedFor ? { opacity: 0, height: 0, marginBottom: 0 } : undefined}
+      transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
     >
       <div className="activity-event-summary">
-        <button
+        <div
           className="activity-event-toggle"
-          type="button"
-          onClick={() => expandable && onExpandedChange(event.id, !expanded)}
+          role={expandable ? "button" : undefined}
+          tabIndex={expandable ? 0 : undefined}
           aria-expanded={expandable ? expanded : undefined}
-          disabled={!expandable}
+          onClick={toggleExpanded}
+          onKeyDown={(keyboardEvent) => {
+            if (!expandable) return;
+            if (keyboardEvent.key === "Enter" || keyboardEvent.key === " ") {
+              keyboardEvent.preventDefault();
+              toggleExpanded();
+            }
+          }}
         >
           <span className="activity-icon">
             <EventIcon event={event} />
           </span>
           <span className="activity-copy">
             <strong>{event.title ?? event.body}</strong>
-            {event.title ? <span>{firstLine(event.body)}</span> : null}
+            {canOpenFile && filePath && onOpenFile ? (
+              <button
+                className="activity-file-name"
+                type="button"
+                title={filePath}
+                aria-label={`Open ${filePath} in Files`}
+                onClick={(clickEvent) => {
+                  clickEvent.stopPropagation();
+                  onOpenFile(filePath);
+                }}
+                onKeyDown={(keyboardEvent) => keyboardEvent.stopPropagation()}
+              >
+                {displayBody}
+              </button>
+            ) : event.title ? (
+              <span title={pathOnlyBody && filePath ? filePath : undefined}>{displayBody}</span>
+            ) : null}
           </span>
           {event.changeStats || event.meta ? (
             <span className="activity-event-meta">
@@ -445,18 +626,7 @@ const ActivityEvent = memo(function ActivityEventRow({
               />
             ) : null}
           </span>
-        </button>
-        {filePath && onOpenFile ? (
-          <button
-            className="activity-event-open-file"
-            type="button"
-            onClick={() => onOpenFile(filePath)}
-            aria-label={`Open ${filePath} in Files`}
-            title="Open in Files"
-          >
-            <Search aria-hidden="true" />
-          </button>
-        ) : null}
+        </div>
       </div>
       <AnimatePresence initial={false}>
         {expanded && hasDetails ? (
@@ -494,17 +664,28 @@ const ActivityEvent = memo(function ActivityEventRow({
             exit={{ height: 0, opacity: 0 }}
             transition={{ duration: 0.18 }}
           >
-            {event.children.map((child) => (
-              <ActivityEvent
-                event={child}
-                key={child.id}
-                nested
-                isExpanded={isExpanded}
-                onExpandedChange={onExpandedChange}
-                onOpenFile={onOpenFile}
-                onAddDiffSelection={onAddDiffSelection}
-              />
-            ))}
+            {event.children.map((child) =>
+              child.kind === "assistant" ? (
+                <section
+                  className="activity-nested-assistant"
+                  data-event-id={child.id}
+                  key={child.id}
+                  aria-label="Agent response"
+                >
+                  <MarkdownBody body={child.body} streaming={false} />
+                </section>
+              ) : (
+                <ActivityEvent
+                  event={child}
+                  key={child.id}
+                  nested
+                  isExpanded={isExpanded}
+                  onExpandedChange={onExpandedChange}
+                  onOpenFile={onOpenFile}
+                  onAddDiffSelection={onAddDiffSelection}
+                />
+              ),
+            )}
           </motion.div>
         ) : null}
         {expanded && event.diff ? (
@@ -524,7 +705,7 @@ const ActivityEvent = memo(function ActivityEventRow({
           </motion.div>
         ) : null}
       </AnimatePresence>
-    </div>
+    </motion.div>
   );
 });
 
@@ -595,6 +776,8 @@ export function Transcript({
   modelForEvent,
   showTimestamps = true,
   onRegenerate,
+  onBranch,
+  onEditUserMessage,
   onOpenFile,
   onAddDiffSelection,
 }: TranscriptProps) {
@@ -644,6 +827,8 @@ export function Transcript({
   );
   const askAboutRef = useRef(onAskAbout);
   const regenerateRef = useRef(onRegenerate);
+  const branchRef = useRef(onBranch);
+  const editUserRef = useRef(onEditUserMessage);
   const openFileRef = useRef(onOpenFile);
   const addDiffSelectionRef = useRef(onAddDiffSelection);
 
@@ -665,6 +850,10 @@ export function Transcript({
     [scrollContainerRef, virtualizationEnabled],
   );
   const { lastAssistantId, latestUserId } = findRecentMessageIds(events, renderedEventCount);
+  const turnFinalAssistantIds = useMemo(
+    () => findTurnFinalAssistantIds(events, renderedEventCount),
+    [events, renderedEventCount],
+  );
   const currentActivity = liveActivity
     ? findActivityLeaf(liveActivity)
     : running
@@ -740,9 +929,11 @@ export function Transcript({
   useEffect(() => {
     askAboutRef.current = onAskAbout;
     regenerateRef.current = onRegenerate;
+    branchRef.current = onBranch;
+    editUserRef.current = onEditUserMessage;
     openFileRef.current = onOpenFile;
     addDiffSelectionRef.current = onAddDiffSelection;
-  }, [onAddDiffSelection, onAskAbout, onOpenFile, onRegenerate]);
+  }, [onAddDiffSelection, onAskAbout, onBranch, onEditUserMessage, onOpenFile, onRegenerate]);
 
   const queueViewportSave = useCallback(() => {
     if (!ownerKey) return;
@@ -1087,6 +1278,11 @@ export function Transcript({
 
   const askAbout = useCallback((body: string) => askAboutRef.current?.(body), []);
   const regenerate = useCallback(() => regenerateRef.current?.(), []);
+  const branch = useCallback((id: string) => branchRef.current?.(id), []);
+  const editUser = useCallback(
+    (id: string, body: string) => editUserRef.current?.(id, body),
+    [],
+  );
   const openFile = useCallback((path: string) => openFileRef.current?.(path), []);
   const addDiffSelection = useCallback(
     (payload: DiffSelectionPayload) => addDiffSelectionRef.current?.(payload),
@@ -1104,6 +1300,11 @@ export function Transcript({
           timestamp={event.timestamp}
           showTimestamp={showTimestamps}
           previewCache={previewCacheRef.current}
+          copied={copiedEventId === event.id}
+          copyFailed={copyFailureId === event.id}
+          canEdit={Boolean(onEditUserMessage)}
+          onCopy={copyMessage}
+          onEdit={editUser}
         />
       );
     }
@@ -1122,9 +1323,11 @@ export function Transcript({
           isLatestAssistant={isLatestAssistant}
           running={isLatestAssistant && running}
           canRegenerate={Boolean(onRegenerate)}
+          canBranch={Boolean(onBranch) && turnFinalAssistantIds.has(event.id)}
           canAskAbout={Boolean(onAskAbout)}
           onCopy={copyMessage}
           onRegenerate={regenerate}
+          onBranch={branch}
           onAskAbout={askAbout}
         />
       );
@@ -1346,6 +1549,22 @@ function firstLine(body?: string): string {
   return line.length > 140 ? `${line.slice(0, 140)}…` : line;
 }
 
+function fileName(path: string): string {
+  return path.split(/[\\/]/).filter(Boolean).at(-1) || path;
+}
+
+/** Collapse absolute/relative file paths to basename in activity rows; keep
+ *  full path on filePath / hover / open-file for identity and search. */
+function activityDisplayBody(event: TranscriptEvent): string {
+  const body = firstLine(event.body);
+  const path = event.filePath ?? event.diff?.path;
+  if (!path) return body;
+  if (event.activityType === "file" || body === path || body === firstLine(path)) {
+    return fileName(path);
+  }
+  return body;
+}
+
 function findRecentMessageIds(
   events: TranscriptEvent[],
   renderedEventCount: number,
@@ -1361,6 +1580,30 @@ function findRecentMessageIds(
     if (lastAssistantId && latestUserId) break;
   }
   return { lastAssistantId, latestUserId };
+}
+
+/** Assistant replies that close a turn: last agent message before the next
+ *  user message, plus the open trailing reply at the end of the transcript. */
+function findTurnFinalAssistantIds(
+  events: TranscriptEvent[],
+  renderedEventCount: number,
+): Set<string> {
+  const ids = new Set<string>();
+  let pendingAssistantId: string | undefined;
+  const limit = Math.min(events.length, renderedEventCount);
+  for (let index = 0; index < limit; index += 1) {
+    const event = events[index];
+    if (event.kind === "assistant") {
+      pendingAssistantId = event.id;
+      continue;
+    }
+    if (event.kind === "user" && pendingAssistantId) {
+      ids.add(pendingAssistantId);
+      pendingAssistantId = undefined;
+    }
+  }
+  if (pendingAssistantId) ids.add(pendingAssistantId);
+  return ids;
 }
 
 function transcriptTailChanged(
@@ -1475,7 +1718,7 @@ function findActivityLeaf(event: TranscriptEvent): TranscriptEvent {
 }
 
 function describeCurrentActivity(event: TranscriptEvent): string {
-  const detail = firstLine(event.body);
+  const detail = activityDisplayBody(event);
   if (event.activityType === "command" && detail) return detail;
   if (event.title && detail && detail !== event.title) return `${event.title} · ${detail}`;
   return event.title ?? detail ?? "the task";

@@ -19,6 +19,7 @@ import {
   ChevronDown,
   ChevronRight,
   CircleDollarSign,
+  Cloud,
   Copy,
   CloudUpload,
   Download,
@@ -28,6 +29,7 @@ import {
   GitBranch,
   GitCommitHorizontal,
   GitCompare,
+  Laptop,
   Link,
   Minus,
   Pencil,
@@ -101,6 +103,9 @@ const gitFileLayoutSpring = {
 const GRAPH_LANE_WIDTH = 9;
 const GRAPH_ROW_HEIGHT = 35;
 const GRAPH_MAX_LANES = 6;
+/** Breathing room on both edges so the widest node — the current-commit ring
+ * at r=5.6 plus its 1px stroke — is never clipped by the cell's viewBox. */
+const GRAPH_EDGE_PAD = 2.5;
 /** One vivid hue per lane, Cursor-style, so a side branch reads as a single
  * colored thread. Lane 0 follows the app accent; the rest are fixed hues
  * chosen to stay legible on both light and dark themes. */
@@ -178,7 +183,7 @@ function buildCommitGraph(commits: GitCommit[]): CommitGraphRow[] {
 }
 
 function graphLaneX(lane: number): number {
-  return 4.5 + lane * GRAPH_LANE_WIDTH;
+  return GRAPH_EDGE_PAD + 4.5 + lane * GRAPH_LANE_WIDTH;
 }
 
 function graphEdgePath(edge: CommitGraphEdge, half: "top" | "bottom"): string {
@@ -206,7 +211,7 @@ function CommitGraphCell({
   merge: boolean;
   tooltip: string;
 }) {
-  const width = row.laneCount * GRAPH_LANE_WIDTH;
+  const width = row.laneCount * GRAPH_LANE_WIDTH + GRAPH_EDGE_PAD * 2;
   const laneColor = GRAPH_LANE_COLORS[row.lane % GRAPH_LANE_COLORS.length];
   const edges = [
     ...row.incoming.map((edge) => ({ edge, half: "top" as const })),
@@ -497,6 +502,8 @@ function GitPanel({
   const [remoteDialog, setRemoteDialog] = useState<
     "manage" | "connect" | "github" | "branch" | null
   >(null);
+  /** Push menu anchored to a local commit's laptop icon; key is `id-index`. */
+  const [pushMenu, setPushMenu] = useState<{ key: string; x: number; y: number } | null>(null);
   // Warm the lazy dialog chunk shortly after the panel mounts so the first
   // open animates immediately instead of stalling on the import.
   useEffect(() => {
@@ -514,6 +521,8 @@ function GitPanel({
   const [paneRatios, setPaneRatios] = useState({ staged: 0.24, graph: 0.38 });
   const commitMenuRef = useRef<HTMLDivElement>(null);
   const commitMenuTriggerRef = useRef<HTMLButtonElement>(null);
+  const pushMenuRef = useRef<HTMLDivElement>(null);
+  const pushMenuAnchorRef = useRef<HTMLButtonElement | null>(null);
   const fileContextMenuRef = useRef<HTMLDivElement>(null);
   const openInTriggerRef = useRef<HTMLButtonElement>(null);
   const workspaceRef = useRef<HTMLDivElement>(null);
@@ -526,6 +535,43 @@ function GitPanel({
   }, []);
   useDismissableMenu(commitMenuOpen, commitMenuRef, dismissCommitMenu);
   useDismissableMenu(Boolean(fileContextMenu), fileContextMenuRef, dismissFileContextMenu);
+  // Bespoke dismissal for the commit push menu: pointerdowns on the anchor
+  // button fall through so its onClick can toggle the menu closed instead of
+  // dismiss-then-reopen.
+  useEffect(() => {
+    if (!pushMenu) return;
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (pushMenuRef.current?.contains(target)) return;
+      if (pushMenuAnchorRef.current?.contains(target)) return;
+      setPushMenu(null);
+    };
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setPushMenu(null);
+      pushMenuAnchorRef.current?.focus();
+    };
+    const onBlur = () => setPushMenu(null);
+    window.addEventListener("pointerdown", onPointerDown, true);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown, true);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, [pushMenu]);
+  useEffect(() => {
+    if (!pushMenu) return;
+    const timer = window.setTimeout(
+      () =>
+        pushMenuRef.current
+          ?.querySelector<HTMLElement>("[role='menuitem']:not(:disabled)")
+          ?.focus(),
+      0,
+    );
+    return () => window.clearTimeout(timer);
+  }, [pushMenu]);
   useEffect(() => {
     if (!commitMenuOpen) return;
     const timer = window.setTimeout(
@@ -564,6 +610,11 @@ function GitPanel({
   }, [git.files]);
   const graphRows = useMemo(() => buildCommitGraph(git.commits), [git.commits]);
   const supportedFileOpeners = fileOpeners;
+  const upstreamRemoteName = git.upstream.includes("/") ? git.upstream.split("/")[0] : "";
+  const upstreamRemote = git.remotes.find((remote) => remote.name === upstreamRemoteName);
+  // Without an upstream the cloud tooltip still names the remote the history
+  // was compared against when there is exactly one candidate.
+  const syncRemote = upstreamRemote ?? (git.remotes.length === 1 ? git.remotes[0] : undefined);
 
   const runStage = async (file: DiffFile, nextStaged: boolean) => {
     setStagingPath(file.path);
@@ -696,7 +747,17 @@ function GitPanel({
     try {
       await onPush();
     } catch (error) {
-      setActionError(getErrorMessage(error));
+      const raw = getErrorMessage(error);
+      if (/fetch first|non-fast-forward|failed to push some refs/i.test(raw)) {
+        setActionError(
+          "The remote has commits you don't have locally, so the push was rejected. Pull first, then push again.",
+        );
+        // The local remote-tracking ref is stale; refresh it so the commit
+        // cloud/laptop icons and ahead/behind counts match reality.
+        void onFetch?.().catch(() => undefined);
+      } else {
+        setActionError(raw);
+      }
     } finally {
       setBusy(null);
     }
@@ -1349,6 +1410,8 @@ function GitPanel({
               git.commits.map((commit, index) => {
                 const merge = (commit.parents?.length ?? 0) > 1;
                 const unpushed = commit.unpushed === true;
+                const local = unpushed;
+                const rowKey = `${commit.id}-${index}`;
                 return (
                   <div
                     className="commit-row"
@@ -1387,6 +1450,73 @@ function GitPanel({
                         {unpushed ? <i className="commit-local-flag"> · local</i> : null}
                       </small>
                     </span>
+                    <span className="commit-sync">
+                      {local ? (
+                        <Tooltip
+                          label="Only on this computer"
+                          hint={
+                            git.upstream
+                              ? `Push to ${git.upstream}`
+                              : git.remotes.length
+                                ? "Choose a remote to push to"
+                                : "Connect a remote to push"
+                          }
+                          placement="left"
+                        >
+                          <button
+                            type="button"
+                            className="commit-sync-button"
+                            aria-label={`Push options for commit ${commit.id}`}
+                            aria-haspopup="menu"
+                            aria-expanded={pushMenu?.key === rowKey}
+                            onClick={(event) => {
+                              const bounds = event.currentTarget.getBoundingClientRect();
+                              const anchor = event.currentTarget;
+                              // Icons are only as fresh as the last fetch, so
+                              // sync the remote-tracking ref in the background
+                              // while the menu is up; a stale ref here means a
+                              // rejected push.
+                              if (git.upstream && pushMenu?.key !== rowKey) {
+                                void onFetch?.(upstreamRemoteName || undefined).catch(
+                                  () => undefined,
+                                );
+                              }
+                              setPushMenu((current) => {
+                                if (current?.key === rowKey) return null;
+                                pushMenuAnchorRef.current = anchor;
+                                return {
+                                  key: rowKey,
+                                  x: Math.max(
+                                    4,
+                                    Math.min(bounds.right, window.innerWidth - 4) - 232,
+                                  ),
+                                  y: Math.min(
+                                    bounds.bottom + 4,
+                                    Math.max(4, window.innerHeight - 216),
+                                  ),
+                                };
+                              });
+                            }}
+                          >
+                            <Laptop aria-hidden="true" />
+                          </button>
+                        </Tooltip>
+                      ) : (
+                        <Tooltip
+                          label={`On ${upstreamRemoteName || "remote"}`}
+                          hint={upstreamRemote?.pushUrl || git.upstream || undefined}
+                          placement="left"
+                        >
+                          <span
+                            className="commit-sync-badge"
+                            role="img"
+                            aria-label={`On ${git.upstream || "remote"}`}
+                          >
+                            <Cloud aria-hidden="true" />
+                          </span>
+                        </Tooltip>
+                      )}
+                    </span>
                   </div>
                 );
               })
@@ -1406,6 +1536,129 @@ function GitPanel({
           </div>
         </section>
       </div>
+
+      <AnimatePresence>
+        {pushMenu ? (
+          <motion.div
+            ref={pushMenuRef}
+            className="compact-action-menu commit-push-menu"
+            role="menu"
+            aria-label="Push this commit to a remote"
+            onKeyDown={handleMenuNavigation}
+            style={{ left: pushMenu.x, top: pushMenu.y, transformOrigin: "top right" }}
+            initial={reduceMotion ? { opacity: 0 } : { opacity: 0, y: -8, scale: 0.94 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={
+              reduceMotion
+                ? { opacity: 0, transition: { duration: 0.08 } }
+                : {
+                    opacity: 0,
+                    y: -6,
+                    scale: 0.97,
+                    transition: { duration: 0.12, ease: "easeIn" },
+                  }
+            }
+            transition={
+              reduceMotion
+                ? { duration: 0.08 }
+                : { type: "spring", stiffness: 560, damping: 34, mass: 0.7 }
+            }
+          >
+            {git.remotes.length ? (
+              <>
+                {git.upstream && git.behind > 0 ? (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={!onPull || busy !== null}
+                    onClick={() => {
+                      setPushMenu(null);
+                      void runRemoteAction(
+                        () =>
+                          onPull?.(git.ahead > 0 ? "rebase" : "fastForwardOnly") ??
+                          Promise.resolve(),
+                      );
+                    }}
+                  >
+                    <ArrowDown />
+                    <span>
+                      <strong>Pull latest first</strong>
+                      <small>
+                        {git.upstream} has {git.behind} newer commit{git.behind === 1 ? "" : "s"}
+                        {git.ahead > 0 ? " — pulls with rebase" : ""}
+                      </small>
+                    </span>
+                  </button>
+                ) : null}
+                {git.remotes.map((remote) => {
+                  const isUpstream = Boolean(git.upstream) && remote.name === upstreamRemoteName;
+                  return (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      key={remote.name}
+                      disabled={busy !== null || (!isUpstream && !onPublishBranch)}
+                      onClick={() => {
+                        setPushMenu(null);
+                        if (isUpstream) void runPush();
+                        else
+                          void runRemoteAction(
+                            () => onPublishBranch?.(remote.name) ?? Promise.resolve(),
+                          );
+                      }}
+                    >
+                      <CloudUpload />
+                      <span>
+                        <strong>Push to {remote.name}</strong>
+                        <small>
+                          {isUpstream
+                            ? git.behind > 0
+                              ? `Remote has newer commits — pull first`
+                              : `${git.ahead} local commit${git.ahead === 1 ? "" : "s"} → ${git.upstream}`
+                            : remote.pushUrl}
+                        </small>
+                      </span>
+                    </button>
+                  );
+                })}
+              </>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={!onPublishGithub || busy !== null}
+                  onClick={() => {
+                    setPushMenu(null);
+                    setRemoteDialog("github");
+                  }}
+                >
+                  <CloudUpload />
+                  <span>
+                    <strong>Publish to GitHub</strong>
+                    <small>Create or pair a repository</small>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={!onAddRemote || busy !== null}
+                  onClick={() => {
+                    setPushMenu(null);
+                    setRemoteDialog("connect");
+                  }}
+                >
+                  <Link />
+                  <span>
+                    <strong>Connect a remote</strong>
+                    <small>Paste an existing remote URL</small>
+                  </span>
+                </button>
+              </>
+            )}
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
 
       {fileContextMenu ? (
         <div

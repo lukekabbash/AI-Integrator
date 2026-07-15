@@ -408,6 +408,21 @@ function appendUniqueAttachments(
   ];
 }
 
+/** Collect image files from a paste event. Prefer `files` when present so we
+ * do not double-count the same clipboard entry through `items`. */
+function clipboardImageFiles(data: DataTransfer | null): File[] {
+  if (!data) return [];
+  const fromFiles = [...data.files].filter((file) => file.type.startsWith("image/"));
+  if (fromFiles.length > 0) return fromFiles;
+  const fromItems: File[] = [];
+  for (const item of data.items) {
+    if (item.kind !== "file" || !item.type.startsWith("image/")) continue;
+    const file = item.getAsFile();
+    if (file) fromItems.push(file);
+  }
+  return fromItems;
+}
+
 function encodePcm16(samples: Float32Array, sourceRate: number): number[] {
   const targetRate = 24000;
   const outputLength = Math.max(1, Math.round((samples.length * targetRate) / sourceRate));
@@ -754,6 +769,23 @@ export function Composer({
     } catch (error) {
       setAttachmentError(
         error instanceof Error ? error.message : "Could not attach files from this computer.",
+      );
+    } finally {
+      textareaRef.current?.focus();
+    }
+  };
+
+  const attachClipboardImages = async (files: File[]) => {
+    const save = bridge.savePastedImageAttachment;
+    if (!save || files.length === 0) return;
+    setAttachmentError("");
+    try {
+      const saved = await Promise.all(files.map((file) => save(file, file.name || undefined)));
+      draftTouchedRef.current = true;
+      setAttachments((current) => appendUniqueAttachments(current, saved));
+    } catch (error) {
+      setAttachmentError(
+        error instanceof Error ? error.message : "Could not attach the clipboard image.",
       );
     } finally {
       textareaRef.current?.focus();
@@ -1554,6 +1586,12 @@ export function Composer({
               setCaret(committedCaret);
             }}
             onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
+            onPaste={(event) => {
+              const images = clipboardImageFiles(event.clipboardData);
+              if (images.length === 0) return;
+              event.preventDefault();
+              void attachClipboardImages(images);
+            }}
             onKeyDown={(event) => {
               if (autocompleteOpen) {
                 if (event.key === "Escape") {

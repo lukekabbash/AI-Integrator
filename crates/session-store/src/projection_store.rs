@@ -1,18 +1,21 @@
-use std::{collections::HashSet, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use integrator_core::{
     ApprovalDecision, ApprovalProjection, ApprovalState, IntegratorError, ItemProjection,
-    ItemStatus, ProviderKind, ProviderSession, ProviderSessionId, Result, RuntimeBinding,
+    ItemStatus, NewTask, ProviderKind, ProviderSession, ProviderSessionId, Result, RuntimeBinding,
     RuntimeProjection, RuntimeProjectionEvent, RuntimeSession, RuntimeSessionId, StopRequestResult,
-    TaskId, TaskSnapshot, TransportRequestId, TurnProjection, TurnStatus, UsageProjection,
+    Task, TaskId, TaskSnapshot, TransportRequestId, TurnProjection, TurnStatus, UsageProjection,
 };
 use integrator_runtime::{
     ItemTextField, ProjectionMutation, ReducedProviderEvent, redact_and_bound,
 };
 use rusqlite::{OptionalExtension, Transaction, params};
 
-use super::{LocalStore, invalid_stored, parse_time, storage_error};
+use super::{LocalStore, build_task, insert_task_row, invalid_stored, parse_time, storage_error};
 
 const RENDERER_CONTENT_LIMIT: usize = 480 * 1024;
 const ITEM_BODY_LIMIT: usize = 2 * 1024 * 1024;
@@ -223,9 +226,18 @@ impl LocalStore {
     pub fn task_snapshot(&self, task_id: TaskId) -> Result<TaskSnapshot> {
         let task = self.get_task(task_id)?;
         let connection = self.connection.lock();
+        // A forked task owns copied projection rows but none of the source's
+        // audit log, so the log alone would report a zero watermark and clamp
+        // the entire copied transcript out of the result below. A task that
+        // recorded its own events can never have a projection seq above its
+        // log's, so widening the watermark this way leaves those unchanged.
         let watermark = connection
             .query_row(
-                "SELECT COALESCE(MAX(seq), 0) FROM codex_event_log WHERE task_id = ?1",
+                "SELECT MAX(
+                    (SELECT COALESCE(MAX(seq), 0) FROM codex_event_log WHERE task_id = ?1),
+                    (SELECT COALESCE(MAX(last_event_seq), 0) FROM codex_items WHERE task_id = ?1),
+                    (SELECT COALESCE(MAX(last_event_seq), 0) FROM codex_turns WHERE task_id = ?1)
+                )",
                 [task_id.to_string()],
                 |row| row.get::<_, i64>(0),
             )
@@ -284,6 +296,177 @@ impl LocalStore {
             watermark_seq: watermark,
             runtime_live: false,
         })
+    }
+
+    /// Copies a task's persisted conversation into a new task, keeping every
+    /// item up to and including `through_stable_id`, or all of them when it is
+    /// `None`. Returns the new task.
+    ///
+    /// The fork deliberately gets no `provider_resume_states` row. Resuming
+    /// makes the provider reload its own transcript and ignore this store
+    /// entirely, which would both silently undo the truncation and leave two
+    /// tasks writing into one provider thread. Without a resume state the
+    /// fork's next prompt opens a fresh provider session that is seeded from
+    /// the copied rows via `task_conversation_digest`.
+    ///
+    /// Approvals and the audit log are not copied: a pending approval in a
+    /// fork would try to answer a process that no longer owns the thread, and
+    /// the log records events this task never received.
+    pub fn fork_task(
+        &self,
+        task_id: TaskId,
+        through_stable_id: Option<&str>,
+        title: String,
+    ) -> Result<Task> {
+        let source = self.get_task(task_id)?;
+        let fork = build_task(NewTask {
+            title,
+            repository_path: source.repository_path.clone(),
+            worktree_path: source.worktree_path.clone(),
+            runtime: source.runtime.clone(),
+            model: source.model.clone(),
+            effort: source.effort.clone(),
+            // Keeps a fork of a delegated child inside the same lineage, and a
+            // fork of a top-level chat top-level.
+            parent_task_id: source.parent_task_id,
+        })?;
+        let now = Utc::now();
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(storage_error)?;
+
+        // A half-written turn would be copied mid-flight and then never
+        // settle, because the runtime that owns it belongs to the source.
+        let in_flight = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM codex_turns WHERE task_id = ?1 AND status IN (?2, ?3)",
+                params![
+                    task_id.to_string(),
+                    TurnStatus::Pending.as_str(),
+                    TurnStatus::InProgress.as_str()
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(storage_error)?;
+        if in_flight > 0 {
+            return Err(IntegratorError::InvalidInput(
+                "cannot copy a chat while it is still running".into(),
+            ));
+        }
+
+        let cutoff = match through_stable_id {
+            Some(stable_id) => transaction
+                .query_row(
+                    "SELECT last_event_seq FROM codex_items WHERE task_id = ?1 AND stable_id = ?2 ORDER BY last_event_seq DESC LIMIT 1",
+                    params![task_id.to_string(), stable_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(storage_error)?
+                .ok_or_else(|| {
+                    IntegratorError::NotFound(format!("transcript item {stable_id}"))
+                })?,
+            None => i64::MAX,
+        };
+
+        insert_task_row(&transaction, &fork)?;
+
+        let sessions = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id, provider, provider_thread_id, created_at FROM provider_sessions WHERE task_id = ?1 ORDER BY created_at",
+                )
+                .map_err(storage_error)?;
+            let rows = statement
+                .query_map([task_id.to_string()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(storage_error)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(storage_error)?;
+            rows
+        };
+
+        // One fork session per source session, rather than collapsing them,
+        // so the (provider_session_id, turn_id, item_id) primary key stays as
+        // unique in the fork as it was in the source.
+        let mut session_map: HashMap<String, String> = HashMap::new();
+        for (old_session_id, provider, old_thread_id, created_at) in &sessions {
+            let new_session_id = ProviderSessionId::new().to_string();
+            // provider_sessions is UNIQUE(provider, provider_thread_id), and
+            // reusing the source's thread id would collide. This synthetic id
+            // is unique per fork and matches no real provider thread, so
+            // get_or_create_provider_session can never route live events here:
+            // the session exists only to own copied history.
+            transaction
+                .execute(
+                    "INSERT INTO provider_sessions(id, task_id, provider, provider_thread_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        new_session_id,
+                        fork.id.to_string(),
+                        provider,
+                        format!("integrator-fork:{}:{old_thread_id}", fork.id),
+                        created_at,
+                        now.to_rfc3339()
+                    ],
+                )
+                .map_err(storage_error)?;
+            // snapshot_event_json is a serialized RuntimeProjectionEvent whose
+            // taskId/providerSessionId would otherwise still name the source,
+            // sending the fork's hydrated events to the wrong task. json_set
+            // leaves the NULL rows NULL, which task_snapshot already skips.
+            transaction
+                .execute(
+                    "INSERT INTO codex_turns(provider_session_id, task_id, thread_id, turn_id, status, stop_requested, error, started_at, completed_at, projection_json, last_event_seq, first_event_seq, first_occurred_at, snapshot_event_json)
+                     SELECT ?1, ?2, thread_id, turn_id, status, 0, error, started_at, completed_at, projection_json, last_event_seq, first_event_seq, first_occurred_at,
+                            json_set(snapshot_event_json, '$.taskId', ?2, '$.providerSessionId', ?1)
+                     FROM codex_turns WHERE provider_session_id = ?3 AND last_event_seq <= ?4",
+                    params![new_session_id, fork.id.to_string(), old_session_id, cutoff],
+                )
+                .map_err(storage_error)?;
+            transaction
+                .execute(
+                    "INSERT INTO codex_items(provider_session_id, task_id, thread_id, turn_id, item_id, stable_id, kind, status, title, body, command_text, cwd, output, exit_code, file_changes_json, mcp_server, mcp_tool, truncated, updated_at, projection_json, last_event_seq, first_event_seq, first_occurred_at, snapshot_event_json)
+                     SELECT ?1, ?2, thread_id, turn_id, item_id, stable_id, kind, status, title, body, command_text, cwd, output, exit_code, file_changes_json, mcp_server, mcp_tool, truncated, updated_at, projection_json, last_event_seq, first_event_seq, first_occurred_at,
+                            json_set(snapshot_event_json, '$.taskId', ?2, '$.providerSessionId', ?1)
+                     FROM codex_items WHERE provider_session_id = ?3 AND last_event_seq <= ?4",
+                    params![new_session_id, fork.id.to_string(), old_session_id, cutoff],
+                )
+                .map_err(storage_error)?;
+            session_map.insert(old_session_id.clone(), new_session_id);
+        }
+
+        let source_projection = transaction
+            .query_row(
+                "SELECT provider_session_id, thread_id FROM codex_task_projection WHERE task_id = ?1",
+                [task_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        if let Some((old_session_id, thread_id)) = source_projection
+            && let Some(new_session_id) = session_map.get(&old_session_id)
+        {
+            // task_snapshot reads reset_seq from this row through a scalar
+            // subquery, and a missing row makes that NULL, which turns every
+            // seq comparison NULL and hides the whole transcript. The fork
+            // needs the row to exist, but inherits none of the source's
+            // plan/diff/usage: those describe work the fork has not done, and
+            // for a truncated fork they describe work past the branch point.
+            transaction
+                .execute(
+                    "INSERT INTO codex_task_projection(task_id, provider_session_id, thread_id) VALUES (?1, ?2, ?3)",
+                    params![fork.id.to_string(), new_session_id, thread_id],
+                )
+                .map_err(storage_error)?;
+        }
+
+        transaction.commit().map_err(storage_error)?;
+        Ok(fork)
     }
 
     pub fn prepare_approval_response(
@@ -459,6 +642,14 @@ impl LocalStore {
         max_bytes: usize,
     ) -> Result<Option<String>> {
         let connection = self.connection.lock();
+        let edit_context = connection
+            .query_row(
+                "SELECT body FROM task_edit_context WHERE task_id = ?1",
+                [task_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
         let mut statement = connection
             .prepare(
                 "SELECT kind, body, title FROM codex_items WHERE task_id = ?1 AND kind IN ('user_message', 'agent_message') AND body IS NOT NULL ORDER BY last_event_seq DESC LIMIT 40",
@@ -475,7 +666,7 @@ impl LocalStore {
             .map_err(storage_error)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(storage_error)?;
-        if rows.is_empty() {
+        if rows.is_empty() && edit_context.as_ref().is_none_or(|body| body.trim().is_empty()) {
             return Ok(None);
         }
         const MESSAGE_LIMIT: usize = 700;
@@ -508,11 +699,170 @@ impl LocalStore {
             used += line.len();
             lines.push(line);
         }
+        lines.reverse();
+        if let Some(salvage) = edit_context {
+            let salvage = salvage.trim();
+            if !salvage.is_empty() {
+                let header = "Assistant replies discarded by a later edit (kept as context):";
+                let block = format!("{header}\n\n{salvage}");
+                if used + block.len() <= max_bytes {
+                    lines.push(block);
+                } else if used < max_bytes {
+                    let mut clipped = salvage.to_owned();
+                    let budget = max_bytes.saturating_sub(used + header.len() + 4);
+                    if budget > 0 {
+                        let mut boundary = budget.min(clipped.len());
+                        while boundary > 0 && !clipped.is_char_boundary(boundary) {
+                            boundary -= 1;
+                        }
+                        clipped.truncate(boundary);
+                        if !clipped.is_empty() {
+                            lines.push(format!("{header}\n\n{clipped}…"));
+                        }
+                    }
+                }
+            }
+        }
         if lines.is_empty() {
             return Ok(None);
         }
-        lines.reverse();
         Ok(Some(lines.join("\n\n")))
+    }
+
+    /// Drops the transcript from `from_stable_id` onward so a re-sent edit can
+    /// become the new tip. Clears provider resume state so the next turn opens
+    /// a fresh session seeded from the remaining rows (plus optional salvage).
+    ///
+    /// When `save_context` is true, assistant replies that sat below the edit
+    /// point are kept in `task_edit_context` and re-injected via the digest.
+    pub fn truncate_task_from(
+        &self,
+        task_id: TaskId,
+        from_stable_id: &str,
+        save_context: bool,
+    ) -> Result<()> {
+        let _ = self.get_task(task_id)?;
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(storage_error)?;
+
+        let in_flight = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM codex_turns WHERE task_id = ?1 AND status IN (?2, ?3)",
+                params![
+                    task_id.to_string(),
+                    TurnStatus::Pending.as_str(),
+                    TurnStatus::InProgress.as_str()
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(storage_error)?;
+        if in_flight > 0 {
+            return Err(IntegratorError::InvalidInput(
+                "cannot edit a chat while it is still running".into(),
+            ));
+        }
+
+        let cutoff = transaction
+            .query_row(
+                "SELECT last_event_seq FROM codex_items WHERE task_id = ?1 AND stable_id = ?2 ORDER BY last_event_seq DESC LIMIT 1",
+                params![task_id.to_string(), from_stable_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| {
+                IntegratorError::NotFound(format!("transcript item {from_stable_id}"))
+            })?;
+
+        if save_context {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT body FROM codex_items WHERE task_id = ?1 AND kind = 'agent_message' AND body IS NOT NULL AND last_event_seq > ?2 ORDER BY last_event_seq ASC LIMIT 40",
+                )
+                .map_err(storage_error)?;
+            let bodies = statement
+                .query_map(params![task_id.to_string(), cutoff], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(storage_error)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(storage_error)?;
+            drop(statement);
+            let salvage = bodies
+                .into_iter()
+                .map(|body| body.trim().to_owned())
+                .filter(|body| !body.is_empty())
+                .map(|body| format!("Assistant: {body}"))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if salvage.is_empty() {
+                transaction
+                    .execute(
+                        "DELETE FROM task_edit_context WHERE task_id = ?1",
+                        [task_id.to_string()],
+                    )
+                    .map_err(storage_error)?;
+            } else {
+                transaction
+                    .execute(
+                        "INSERT INTO task_edit_context(task_id, body, updated_at) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(task_id) DO UPDATE SET body = excluded.body, updated_at = excluded.updated_at",
+                        params![task_id.to_string(), salvage, Utc::now().to_rfc3339()],
+                    )
+                    .map_err(storage_error)?;
+            }
+        } else {
+            transaction
+                .execute(
+                    "DELETE FROM task_edit_context WHERE task_id = ?1",
+                    [task_id.to_string()],
+                )
+                .map_err(storage_error)?;
+        }
+
+        transaction
+            .execute(
+                "DELETE FROM codex_items WHERE task_id = ?1 AND last_event_seq >= ?2",
+                params![task_id.to_string(), cutoff],
+            )
+            .map_err(storage_error)?;
+        transaction
+            .execute(
+                "DELETE FROM codex_turns WHERE task_id = ?1 AND last_event_seq >= ?2",
+                params![task_id.to_string(), cutoff],
+            )
+            .map_err(storage_error)?;
+        transaction
+            .execute(
+                "DELETE FROM codex_approvals WHERE task_id = ?1 AND last_event_seq >= ?2",
+                params![task_id.to_string(), cutoff],
+            )
+            .map_err(storage_error)?;
+        // Resume would reload the provider's untruncated transcript and undo
+        // the cut; the next prompt must open a digest-seeded session instead.
+        transaction
+            .execute(
+                "DELETE FROM provider_resume_states WHERE task_id = ?1",
+                [task_id.to_string()],
+            )
+            .map_err(storage_error)?;
+        // Plan/diff/usage describe work past the edit point; clear them so the
+        // right rail does not keep advertising discarded results.
+        transaction
+            .execute(
+                "UPDATE codex_task_projection SET current_turn_id=NULL, plan_json=NULL, plan_truncated=0, plan_seq=0, plan_event_json=NULL, diff=NULL, diff_truncated=0, diff_seq=0, diff_event_json=NULL, usage_json=NULL, usage_seq=0, usage_event_json=NULL, turn_seq=0, turn_event_json=NULL, mode_seq=0, mode_event_json=NULL, error_seq=0, error_event_json=NULL WHERE task_id=?1",
+                [task_id.to_string()],
+            )
+            .map_err(storage_error)?;
+        transaction
+            .execute(
+                "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
+                params![Utc::now().to_rfc3339(), task_id.to_string()],
+            )
+            .map_err(storage_error)?;
+
+        transaction.commit().map_err(storage_error)?;
+        Ok(())
     }
 
     /// Newest persisted transcript item seq for a task, or 0 when the task
@@ -696,6 +1046,59 @@ impl LocalStore {
         transaction.commit().map_err(storage_error)?;
         Ok(event)
     }
+}
+
+/// Mark the newest unfinished turn for a task as failed after the provider
+/// reported an error it will not retry (a usage limit, most often). Providers
+/// do not reliably close such a turn with `turn/completed`, so without this the
+/// stored turn stays unfinished: it rehydrates as running after a reload, and
+/// the stale-turn sweep later settles it as `interrupted` long after the fact.
+///
+/// Deliberately emits no projection of its own. The caller's `TurnError` is
+/// already broadcast, and the renderer settles its own copy of the turn from
+/// that same event — on both the live and hydration paths.
+fn settle_failed_turn(
+    transaction: &Transaction<'_>,
+    task_id: TaskId,
+    message: &str,
+    occurred_at: DateTime<Utc>,
+    seq: i64,
+) -> Result<()> {
+    let row = transaction
+        .query_row(
+            "SELECT projection_json, provider_session_id, turn_id FROM codex_turns WHERE task_id=?1 AND status IN ('pending','in_progress') ORDER BY last_event_seq DESC LIMIT 1",
+            [task_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(storage_error)?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let mut turn: TurnProjection = serde_json::from_str(&row.0)?;
+    turn.status = TurnStatus::Failed;
+    turn.error = Some(message.to_string());
+    turn.completed_at = Some(occurred_at);
+    transaction
+        .execute(
+            "UPDATE codex_turns SET status='failed',error=?1,completed_at=?2,projection_json=?3,last_event_seq=?4 WHERE provider_session_id=?5 AND turn_id=?6",
+            params![
+                message,
+                occurred_at.to_rfc3339(),
+                serde_json::to_string(&turn)?,
+                seq,
+                row.1,
+                row.2
+            ],
+        )
+        .map_err(storage_error)?;
+    Ok(())
 }
 
 /// Mark the newest unfinished turn for a task as interrupted and log the
@@ -989,10 +1392,21 @@ fn apply_mutation(
             transaction.execute("UPDATE codex_approvals SET state='resolved',updated_at=?1,projection_json=?2,last_event_seq=?3 WHERE id=?4",params![approval.updated_at.to_rfc3339(),serde_json::to_string(&approval)?,seq,approval.id]).map_err(storage_error)?;
             Ok(RuntimeProjection::ApprovalChanged { approval })
         }
-        ProjectionMutation::TurnError { message, retryable } => Ok(RuntimeProjection::TurnError {
-            message: message.clone(),
-            retryable: *retryable,
-        }),
+        ProjectionMutation::TurnError { message, retryable } => {
+            if !*retryable {
+                settle_failed_turn(
+                    transaction,
+                    binding.task_id,
+                    message,
+                    reduced.occurred_at,
+                    seq,
+                )?;
+            }
+            Ok(RuntimeProjection::TurnError {
+                message: message.clone(),
+                retryable: *retryable,
+            })
+        }
         ProjectionMutation::Connection { state, reason } => {
             transaction.execute("UPDATE codex_task_projection SET connection_state=?1,connection_reason=?2,process_id=?3,connection_seq=?4,last_event_seq=?4 WHERE task_id=?5",params![state.as_str(),reason,binding.process_id,seq,binding.task_id.to_string()]).map_err(storage_error)?;
             Ok(RuntimeProjection::ConnectionChanged {
@@ -1591,6 +2005,96 @@ mod tests {
         assert_eq!(snapshot.watermark_seq, event.seq);
         assert_eq!(snapshot.events, vec![event]);
         assert_eq!(snapshot.events[0].provider, "codex");
+    }
+
+    #[test]
+    fn non_retryable_error_settles_the_stored_turn_but_a_retryable_one_does_not() {
+        fn started_turn(occurred_at: DateTime<Utc>) -> ReducedProviderEvent {
+            ReducedProviderEvent {
+                method: "turn/started".into(),
+                thread_id: "thread-fixture".into(),
+                turn_id: Some("turn-1".into()),
+                audit_json: "{}".into(),
+                audit_truncated: false,
+                mutation: ProjectionMutation::Turn(TurnProjection {
+                    id: "turn-1".into(),
+                    status: TurnStatus::InProgress,
+                    stop_requested: false,
+                    error: None,
+                    started_at: Some(occurred_at),
+                    completed_at: None,
+                }),
+                occurred_at,
+            }
+        }
+        fn error_event(
+            occurred_at: DateTime<Utc>,
+            message: &str,
+            retryable: bool,
+        ) -> ReducedProviderEvent {
+            ReducedProviderEvent {
+                method: "error".into(),
+                thread_id: "thread-fixture".into(),
+                turn_id: Some("turn-1".into()),
+                audit_json: "{}".into(),
+                audit_truncated: false,
+                mutation: ProjectionMutation::TurnError {
+                    message: message.into(),
+                    retryable,
+                },
+                occurred_at,
+            }
+        }
+        fn stored_turn_status(store: &LocalStore) -> String {
+            store
+                .connection
+                .lock()
+                .query_row(
+                    "SELECT status FROM codex_turns WHERE turn_id='turn-1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read stored turn")
+        }
+
+        let occurred_at = Utc::now();
+
+        // A provider that is still retrying keeps the turn open.
+        let (retrying, retrying_binding) = bound_store(ProviderKind::Codex);
+        retrying
+            .apply_reduced_event(&retrying_binding, &started_turn(occurred_at))
+            .expect("persist turn");
+        retrying
+            .apply_reduced_event(
+                &retrying_binding,
+                &error_event(occurred_at, "stream disconnected", true),
+            )
+            .expect("persist retryable error");
+        assert_eq!(stored_turn_status(&retrying), "in_progress");
+
+        // A provider that will not retry has abandoned the turn, so the stored
+        // row settles rather than rehydrating as running after a reload.
+        let (limited, limited_binding) = bound_store(ProviderKind::Codex);
+        limited
+            .apply_reduced_event(&limited_binding, &started_turn(occurred_at))
+            .expect("persist turn");
+        limited
+            .apply_reduced_event(
+                &limited_binding,
+                &error_event(occurred_at, "usage limit reached", false),
+            )
+            .expect("persist non-retryable error");
+        assert_eq!(stored_turn_status(&limited), "failed");
+
+        // The settled turn is no longer unfinished work for the stale sweep, so
+        // closing the session cannot relabel it `interrupted` after the fact.
+        let connection = limited.connection.lock();
+        let transaction = connection.unchecked_transaction().expect("transaction");
+        assert!(
+            settle_stale_turn(&transaction, limited_binding.task_id, false)
+                .expect("sweep settled turn")
+                .is_none()
+        );
     }
 
     #[test]

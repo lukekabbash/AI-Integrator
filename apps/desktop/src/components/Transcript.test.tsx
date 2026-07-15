@@ -18,6 +18,103 @@ describe("Transcript", () => {
     vi.unstubAllGlobals();
   });
 
+  it("branches from turn-final replies, not intermediate agent bubbles", () => {
+    const onBranch = vi.fn();
+    render(
+      <Transcript
+        events={[
+          event("user-1", "user", "first question"),
+          event("assistant-1a", "assistant", "partial thought"),
+          event("assistant-1b", "assistant", "first answer"),
+          event("user-2", "user", "follow up"),
+          event("assistant-2", "assistant", "second answer"),
+        ]}
+        onBranch={onBranch}
+      />,
+    );
+
+    const branches = screen.getAllByRole("button", { name: "Branch the chat from this response" });
+    // Cut points are turn ends: last agent reply before the next user, plus
+    // the open trailing reply — not every assistant bubble in a turn.
+    expect(branches).toHaveLength(2);
+    fireEvent.click(branches[0]);
+    expect(onBranch).toHaveBeenCalledWith("assistant-1b");
+    fireEvent.click(branches[1]);
+    expect(onBranch).toHaveBeenCalledWith("assistant-2");
+  });
+
+  it("withholds Branch only on the reply that is still streaming", () => {
+    const onBranch = vi.fn();
+    const { rerender } = render(
+      <Transcript
+        events={[
+          event("user-1", "user", "first question"),
+          event("assistant-1", "assistant", "earlier answer"),
+          event("user-2", "user", "follow up"),
+          event("assistant-2", "assistant", "partial"),
+        ]}
+        onBranch={onBranch}
+        running
+      />,
+    );
+    const whileStreaming = screen.getAllByRole("button", {
+      name: "Branch the chat from this response",
+    });
+    // Prior completed turns stay branchable; only the in-flight reply hides it.
+    expect(whileStreaming).toHaveLength(1);
+    fireEvent.click(whileStreaming[0]);
+    expect(onBranch).toHaveBeenCalledWith("assistant-1");
+
+    rerender(
+      <Transcript
+        events={[
+          event("user-1", "user", "first question"),
+          event("assistant-1", "assistant", "earlier answer"),
+          event("user-2", "user", "follow up"),
+          event("assistant-2", "assistant", "done"),
+        ]}
+        onBranch={onBranch}
+      />,
+    );
+    expect(
+      screen.getAllByRole("button", { name: "Branch the chat from this response" }),
+    ).toHaveLength(2);
+  });
+
+  it("omits Branch entirely when the host wires no handler", () => {
+    render(<Transcript events={[event("assistant-1", "assistant", "answer")]} />);
+    expect(
+      screen.queryByRole("button", { name: "Branch the chat from this response" }),
+    ).toBeNull();
+    expect(screen.getByRole("button", { name: "Copy this response" })).toBeVisible();
+  });
+
+  it("offers Copy and Edit on user messages, including while a turn is streaming", () => {
+    const onEditUserMessage = vi.fn();
+    render(
+      <Transcript
+        events={[
+          event("user-1", "user", "first question"),
+          event("assistant-1", "assistant", "partial"),
+        ]}
+        onEditUserMessage={onEditUserMessage}
+        running
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Copy this message" })).toBeVisible();
+    const edit = screen.getByRole("button", { name: "Edit this message" });
+    expect(edit).toBeVisible();
+    fireEvent.click(edit);
+    expect(onEditUserMessage).toHaveBeenCalledWith("user-1", "first question");
+  });
+
+  it("omits Edit on user messages when the host wires no handler", () => {
+    render(<Transcript events={[event("user-1", "user", "hello")]} />);
+    expect(screen.getByRole("button", { name: "Copy this message" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Edit this message" })).toBeNull();
+  });
+
   it("styles only a verified native skill in a user message", () => {
     const verified = {
       ...event("user-skill", "user", "/skill-creator add release checks"),
@@ -436,9 +533,8 @@ describe("Transcript", () => {
     fireEvent.click(screen.getByRole("button", { name: /Activity.*3 tools/ }));
     const stream = document.querySelector(".task-now-stream");
     expect(stream).not.toBeNull();
-    expect(
-      within(stream as HTMLElement).getByRole("button", { name: /Tool call.*Tool activity/ }),
-    ).toBeInTheDocument();
+    expect(within(stream as HTMLElement).getByText("Tool call")).toBeInTheDocument();
+    expect(within(stream as HTMLElement).getByText("Tool activity")).toBeInTheDocument();
   });
 
   it("expands a grouped activity loop and preserves nested tool details", () => {
@@ -496,6 +592,7 @@ describe("Transcript", () => {
             filePath: "src/App.tsx",
             title: "Edited",
             status: "success",
+            changeStats: { additions: 1, deletions: 1 },
             expandedByDefault: true,
             diff: {
               path: "src/App.tsx",
@@ -515,11 +612,104 @@ describe("Transcript", () => {
       />,
     );
 
+    const row = document.querySelector('[data-event-id="file-1"]') as HTMLElement;
+    expect(within(row).getByText("Edited")).toBeInTheDocument();
+    const fileLink = screen.getByRole("button", { name: "Open src/App.tsx in Files" });
+    expect(fileLink).toHaveTextContent("App.tsx");
+    expect(fileLink).toHaveAttribute("title", "src/App.tsx");
+    expect(within(row).queryByText("src/App.tsx")).toBeNull();
+    expect(screen.getByLabelText("1 lines added, 1 lines removed")).toBeInTheDocument();
+    expect(row.querySelector(".lucide-pencil")).not.toBeNull();
+    expect(row.querySelector(".activity-icon-pencil--writing")).toBeNull();
     expect(screen.getByRole("region", { name: "Diff for src/App.tsx" })).toBeInTheDocument();
     expect(document.querySelectorAll(".diff-line--add")).toHaveLength(1);
     expect(document.querySelectorAll(".diff-line--delete")).toHaveLength(1);
 
-    fireEvent.click(screen.getByRole("button", { name: "Open src/App.tsx in Files" }));
+    fireEvent.click(fileLink);
     expect(onOpenFile).toHaveBeenCalledWith("src/App.tsx");
+  });
+
+  it("shows basename for absolute edit paths and keeps the full path on hover and open", () => {
+    const onOpenFile = vi.fn();
+    const absolute =
+      "/Users/lukekabbash/Documents/Code/integrator-3/apps/desktop/src/components/Transcript.tsx";
+    render(
+      <Transcript
+        events={[
+          {
+            ...event("file-abs", "tool", absolute),
+            activityType: "file",
+            filePath: absolute,
+            title: "Editing",
+            status: "running",
+            changeStats: { additions: 4, deletions: 0 },
+          },
+        ]}
+        onOpenFile={onOpenFile}
+      />,
+    );
+
+    const row = document.querySelector('[data-event-id="file-abs"]') as HTMLElement;
+    expect(within(row).getByText("Editing")).toBeInTheDocument();
+    expect(row.querySelector(".lucide-pencil")).not.toBeNull();
+    expect(row.querySelector(".activity-icon-pencil--writing")).not.toBeNull();
+    const fileLink = screen.getByRole("button", { name: `Open ${absolute} in Files` });
+    expect(fileLink).toHaveTextContent("Transcript.tsx");
+    expect(fileLink).toHaveAttribute("title", absolute);
+    expect(screen.queryByText(absolute)).toBeNull();
+    fireEvent.click(fileLink);
+    expect(onOpenFile).toHaveBeenCalledWith(absolute);
+  });
+
+  it("keeps Worked for collapsed by default and reveals nested activity on expand", () => {
+    render(
+      <Transcript
+        events={[
+          event("user-1", "user", "Please fix it"),
+          {
+            id: "worked-for-assistant-1",
+            kind: "activity",
+            title: "Worked for",
+            body: "1m 35s",
+            timestamp: "2026-07-11T12:00:01.000Z",
+            status: "success",
+            expandedByDefault: false,
+            children: [
+              event("assistant-mid", "assistant", "Looking into the failure."),
+              {
+                ...event("command-1", "tool", "pnpm test"),
+                activityType: "command",
+                title: "Command",
+                status: "success",
+              },
+              {
+                ...event("edit-1", "tool", "src/App.tsx"),
+                activityType: "file",
+                title: "Edited",
+                filePath: "src/App.tsx",
+                status: "success",
+              },
+            ],
+          },
+          event("assistant-1", "assistant", "Fixed."),
+        ]}
+      />,
+    );
+
+    const row = document.querySelector('[data-event-id="worked-for-assistant-1"]') as HTMLElement;
+    expect(row).not.toBeNull();
+    expect(row.classList.contains("activity-event--worked-for")).toBe(true);
+    expect(within(row).getByText("Worked for")).toBeInTheDocument();
+    expect(within(row).getByText("1m 35s")).toBeInTheDocument();
+    expect(screen.queryByText("Looking into the failure.")).not.toBeInTheDocument();
+    expect(screen.queryByText("pnpm test")).not.toBeInTheDocument();
+
+    fireEvent.click(within(row).getByRole("button", { name: /Worked for/ }));
+    expect(screen.getByText("Looking into the failure.")).toBeInTheDocument();
+    expect(screen.getByText("pnpm test")).toBeInTheDocument();
+    expect(screen.getByText("App.tsx")).toBeInTheDocument();
+    expect(
+      row.querySelector('.activity-nested-assistant[data-event-id="assistant-mid"]'),
+    ).not.toBeNull();
   });
 });

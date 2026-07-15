@@ -545,6 +545,28 @@ export interface PushResult {
   summary: string;
 }
 
+export interface ForkTaskInput {
+  taskId: string;
+  /** Full title for the copy; callers derive it with `nextForkTitle`. */
+  title: string;
+  /**
+   * Transcript event id of the assistant reply to branch from. The copy keeps
+   * that reply and everything before it. Omitted for a whole-chat copy.
+   */
+  throughEventId?: string;
+}
+
+export interface TruncateTaskFromInput {
+  taskId: string;
+  /** Transcript event id of the user message being re-sent from. */
+  fromEventId: string;
+  /**
+   * When true, discarded assistant replies below the edit point stay in the
+   * next turn's conversation digest even though the chat view clears them.
+   */
+  saveContext: boolean;
+}
+
 export interface StartTaskInput {
   projectId: string;
   prompt: string;
@@ -805,6 +827,8 @@ export interface AppBridge {
   /** Native file picker for composer context attachments (any file on disk).
    * Images arrive with an inline preview data URL; null means cancelled. */
   pickContextAttachments?(): Promise<ContextAttachment[] | null>;
+  /** Persists a clipboard image and returns a composer-ready attachment. */
+  savePastedImageAttachment?(file: Blob, fileName?: string): Promise<ContextAttachment>;
   /** Loads an inline preview for an image path referenced by a chat message. */
   readAttachmentPreview?(path: string): Promise<string | null>;
   exportLocalData(): Promise<unknown>;
@@ -826,6 +850,18 @@ export interface AppBridge {
   probeRuntimes(): Promise<RuntimeConnection[]>;
   beginRuntimeLogin(runtime: RuntimeId): Promise<RuntimeConnection>;
   startTask(input: StartTaskInput): Promise<TaskSummary>;
+  /**
+   * Copy a chat into a new one. `throughEventId` keeps the transcript up to and
+   * including that assistant reply and drops the rest; omitting it copies the
+   * whole conversation. The copy never resumes the source's provider session,
+   * so its first prompt opens a fresh one seeded from the copied transcript.
+   */
+  forkTask(input: ForkTaskInput): Promise<TaskSummary>;
+  /**
+   * Drop the transcript from a user message onward so that message can be
+   * edited and re-sent as the new tip. Always clears provider resume state.
+   */
+  truncateTaskFrom(input: TruncateTaskFromInput): Promise<void>;
   /** Revisioned local persistence; stale writes are ignored by the native store. */
   saveComposerDraft(draft: ComposerDraft): Promise<void>;
   /** Permanently wipe one chat and its Integrator history. Never touches the project folder. */
@@ -3258,6 +3294,50 @@ export const bridge: AppBridge = {
     });
   },
 
+  savePastedImageAttachment: async (file, fileName) => {
+    const mimeType = file.type || "image/png";
+    const extension = mimeType.split("/")[1]?.split("+")[0] || "png";
+    const name =
+      fileName?.trim() ||
+      (file instanceof File && file.name.trim() ? file.name : `pasted-image.${extension}`);
+    if (isTauri()) {
+      const buffer = new Uint8Array(await file.arrayBuffer());
+      let binary = "";
+      const chunk = 0x8000;
+      for (let index = 0; index < buffer.length; index += chunk) {
+        binary += String.fromCharCode(...buffer.subarray(index, index + chunk));
+      }
+      const saved = await nativeInvoke<{
+        path: string;
+        name: string;
+        kind: "image" | "file";
+        dataUrl: string;
+      }>("attachment_save_paste", {
+        bytesBase64: btoa(binary),
+        mimeType,
+      });
+      return {
+        path: saved.path,
+        name: saved.name,
+        kind: "image",
+        dataUrl: saved.dataUrl,
+      };
+    }
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () =>
+        typeof reader.result === "string"
+          ? resolve(reader.result)
+          : reject(new Error("Could not read clipboard image."));
+      reader.onerror = () => reject(new Error("Could not read clipboard image."));
+      reader.readAsDataURL(file);
+    });
+    // Browser previews have no durable path; keep a unique synthetic path so
+    // repeated pastes of the same clipboard name do not collapse into one chip.
+    const path = `pasted://${crypto.randomUUID()}/${name}`;
+    return { path, name, kind: "image", dataUrl };
+  },
+
   readAttachmentPreview: async (path) => {
     if (!isTauri()) return null;
     if (attachmentKind(path.split(/[\\/]/).filter(Boolean).at(-1) ?? path) !== "image") return null;
@@ -3374,6 +3454,73 @@ export const bridge: AppBridge = {
       unread: false,
       worktree: `ai/${new Date().toISOString().slice(0, 10)}`,
     };
+  },
+
+  forkTask: async (input) => {
+    const snapshot = cachedWorkspace ?? readDemoSnapshot();
+    const source = snapshot.tasks.find((item) => item.id === input.taskId);
+    if (!source) throw new Error(`Unknown chat: ${input.taskId}`);
+    if (isTauri()) {
+      const nativeTaskId = await ensureNativeTask(input.taskId);
+      const task = await nativeInvoke<NativeTask>("task_fork", {
+        taskId: nativeTaskId,
+        throughEventId: input.throughEventId,
+        title: input.title,
+      });
+      nativeTaskIds.set(task.id, task.id);
+      const repository = repositoryByTaskId.get(input.taskId);
+      if (repository) repositoryByTaskId.set(task.id, repository);
+      return {
+        id: task.id,
+        projectId: source.projectId,
+        title: task.title,
+        status: mapTaskStatus(task.state),
+        runtime: mapStoredRuntime(task.runtime) ?? source.runtime,
+        model: task.model?.trim() || source.model,
+        effort: task.effort?.trim() || source.effort,
+        updatedAt: task.updatedAt,
+      };
+    }
+    return {
+      ...source,
+      id: `task-${Date.now()}`,
+      title: input.title,
+      status: "draft",
+      pinned: false,
+      archived: false,
+      unread: false,
+      updatedAt: new Date().toISOString(),
+    };
+  },
+
+  truncateTaskFrom: async (input) => {
+    const snapshot = cachedWorkspace ?? readDemoSnapshot();
+    if (!snapshot.tasks.some((item) => item.id === input.taskId)) {
+      throw new Error(`Unknown chat: ${input.taskId}`);
+    }
+    if (isTauri()) {
+      const nativeTaskId = await ensureNativeTask(input.taskId);
+      await nativeInvoke<void>("task_truncate_from", {
+        taskId: nativeTaskId,
+        fromEventId: input.fromEventId,
+        saveContext: input.saveContext,
+      });
+      return;
+    }
+    // Demo host: drop transcript events at and after the edit point.
+    const context = snapshot.taskContexts[input.taskId];
+    if (!context) return;
+    const cutoff = context.transcript.findIndex((event) => event.id === input.fromEventId);
+    if (cutoff < 0) throw new Error(`Unknown message: ${input.fromEventId}`);
+    snapshot.taskContexts[input.taskId] = {
+      ...context,
+      transcript: context.transcript.slice(0, cutoff),
+    };
+    if (snapshot.activeTaskId === input.taskId) {
+      snapshot.transcript = snapshot.taskContexts[input.taskId].transcript;
+    }
+    cachedWorkspace = snapshot;
+    writeDemoSnapshot(snapshot);
   },
 
   generateTaskTitle: async (input) => {

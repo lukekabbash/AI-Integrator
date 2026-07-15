@@ -5,7 +5,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDemoSnapshot } from "../demoData";
 import { TaskSidebar } from "./TaskSidebar";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 function setup(overrides?: Partial<Parameters<typeof TaskSidebar>[0]>) {
   const snapshot = createDemoSnapshot();
@@ -16,6 +19,7 @@ function setup(overrides?: Partial<Parameters<typeof TaskSidebar>[0]>) {
     onNewTaskInProject: vi.fn(),
     onOpenProject: vi.fn(),
     onUpdateTask: vi.fn(),
+    onCopyTask: vi.fn(),
     onUpdateProject: vi.fn(),
     onDeleteProject: vi.fn(),
     onDeleteTask: vi.fn(),
@@ -186,13 +190,45 @@ describe("TaskSidebar", () => {
       expect(
         screen.getByRole("button", { name: /Mobile intake overnight agent/ }),
       ).toBeInTheDocument();
-      expect(document.querySelector(".project-archived-badge")).toHaveTextContent("Archived");
+      expect(document.querySelector(".project-archived-badge")).toHaveAccessibleName(
+        "Archived project",
+      );
 
       // Fully live projects stay out of the archive.
       expect(screen.queryByRole("button", { name: "EVE OS" })).not.toBeInTheDocument();
 
       fireEvent.click(screen.getByRole("button", { name: /Back to chats/ }));
       expect(screen.getByRole("button", { name: "EVE OS" })).toBeInTheDocument();
+    } finally {
+      delete document.documentElement.dataset.motion;
+    }
+  });
+
+  it("scopes archive-view deletion to archived chats for live projects", () => {
+    document.documentElement.dataset.motion = "none";
+    try {
+      const snapshot = createDemoSnapshot();
+      const projects = snapshot.projects.map((project) =>
+        project.id === "lotmind" ? { ...project, archived: true } : project,
+      );
+      const tasks = snapshot.tasks.map((task) =>
+        task.id === "theme-pass" ? { ...task, archived: true } : task,
+      );
+      const onDeleteArchivedChats = vi.fn();
+      const onDeleteProject = vi.fn();
+      setup({ projects, tasks, onDeleteArchivedChats, onDeleteProject });
+      fireEvent.click(screen.getByRole("button", { name: /^Archived/ }));
+
+      // A live project holding archived chats deletes just those chats.
+      fireEvent.click(screen.getByRole("button", { name: "More actions for AI Integrator" }));
+      fireEvent.click(screen.getByRole("menuitem", { name: /Delete archived chats/ }));
+      expect(onDeleteArchivedChats).toHaveBeenCalledWith("integrator");
+      expect(onDeleteProject).not.toHaveBeenCalled();
+
+      // A fully archived project keeps the full project-delete flow.
+      fireEvent.click(screen.getByRole("button", { name: "More actions for Lotmind AI" }));
+      fireEvent.click(screen.getByRole("menuitem", { name: "Delete…" }));
+      expect(onDeleteProject).toHaveBeenCalledWith("lotmind");
     } finally {
       delete document.documentElement.dataset.motion;
     }
@@ -339,6 +375,86 @@ describe("TaskSidebar", () => {
 
     expect(screen.getByRole("menu")).toBeInTheDocument();
     expect(overflowButtons[0].parentElement).toHaveAttribute("data-menu-open", "true");
+  });
+
+  it("opens the chat overflow menu upward when space below is tight", () => {
+    setup();
+    const overflowButtons = screen.getAllByRole("button", { name: "More chat actions" });
+    const trigger = overflowButtons[overflowButtons.length - 1];
+    const scroll = trigger.closest(".sidebar-scroll") as HTMLElement;
+
+    vi.spyOn(scroll, "getBoundingClientRect").mockReturnValue({
+      top: 100,
+      bottom: 400,
+      left: 0,
+      right: 272,
+      width: 272,
+      height: 300,
+      x: 0,
+      y: 100,
+      toJSON: () => ({}),
+    });
+    vi.spyOn(trigger, "getBoundingClientRect").mockReturnValue({
+      top: 360,
+      bottom: 384,
+      left: 220,
+      right: 244,
+      width: 24,
+      height: 24,
+      x: 220,
+      y: 360,
+      toJSON: () => ({}),
+    });
+
+    fireEvent.click(trigger);
+
+    expect(screen.getByRole("menu")).toHaveClass("chat-action-menu--up");
+  });
+
+  it("copies a chat from the overflow menu and closes it", () => {
+    const snapshot = createDemoSnapshot();
+    const task = { ...snapshot.tasks[0], status: "ready" as const };
+    const { callbacks } = setup({ tasks: [task], activeTaskId: task.id });
+    fireEvent.click(screen.getByRole("button", { name: "More chat actions" }));
+
+    fireEvent.click(within(screen.getByRole("menu")).getByRole("menuitem", { name: /Copy/ }));
+
+    expect(callbacks.onCopyTask).toHaveBeenCalledWith(task.id);
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  it("refuses to copy a chat that is still running", () => {
+    const snapshot = createDemoSnapshot();
+    const task = { ...snapshot.tasks[0], status: "running" as const };
+    const { callbacks } = setup({ tasks: [task], activeTaskId: task.id });
+    fireEvent.click(screen.getByRole("button", { name: "More chat actions" }));
+
+    const copy = within(screen.getByRole("menu")).getByRole("menuitem", { name: /Copy/ });
+    expect(copy).toBeDisabled();
+    fireEvent.click(copy);
+    expect(callbacks.onCopyTask).not.toHaveBeenCalled();
+  });
+
+  it("clips a fork's name rather than the marker that identifies it", () => {
+    const snapshot = createDemoSnapshot();
+    const task = { ...snapshot.tasks[0], title: "Port the parser: Branch 2" };
+    setup({ tasks: [task], activeTaskId: task.id });
+
+    // Separate boxes, so the row's ellipsis trims the name and leaves the
+    // marker whole. One text node would lose the marker first.
+    expect(screen.getByText("Port the parser", { selector: ".chat-row-title-name" })).toBeVisible();
+    expect(screen.getByText(": Branch 2", { selector: ".chat-row-title-suffix" })).toBeVisible();
+    // The full title still reaches the tooltip and the rename field.
+    expect(screen.getByRole("button", { name: /Port the parser: Branch 2/ })).toBeVisible();
+  });
+
+  it("leaves an ordinary chat title as a single node", () => {
+    const snapshot = createDemoSnapshot();
+    const task = { ...snapshot.tasks[0], title: "Port the parser" };
+    setup({ tasks: [task], activeTaskId: task.id });
+
+    expect(screen.getByText("Port the parser", { selector: ".chat-row-title" })).toBeVisible();
+    expect(document.querySelector(".chat-row-title-suffix")).toBeNull();
   });
 
   it("lifts the project that owns an open chat menu above sibling projects", () => {

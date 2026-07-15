@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-attachment-save-paste"
+description = "Enables the attachment_save_paste command without any pre-configured scope."
+commands.allow = ["attachment_save_paste"]
+
+[[permission]]
+identifier = "deny-attachment-save-paste"
+description = "Denies the attachment_save_paste command without any pre-configured scope."
+commands.deny = ["attachment_save_paste"]

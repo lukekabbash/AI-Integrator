@@ -913,23 +913,36 @@ impl GitService {
 
     /// Mark history commits that are not reachable from the branch upstream
     /// so the rail can distinguish shared history from local-only work. With
-    /// no upstream configured, every commit is local-only by definition.
+    /// no upstream configured, fall back to reachability from any
+    /// remote-tracking ref: a branch pushed outside this app (so tracking was
+    /// never set up) must not read as local-only.
     fn annotate_unpushed(
         &self,
         repository: &Path,
         upstream: Option<&str>,
         history: &mut [HistoryCommit],
     ) {
-        let Some(upstream) = upstream.filter(|name| !name.starts_with('-')) else {
-            for commit in history.iter_mut() {
-                commit.unpushed = true;
+        let output = if let Some(upstream) = upstream.filter(|name| !name.starts_with('-')) {
+            let range = format!("{upstream}..HEAD");
+            match self.optional(repository, &["rev-list", "--max-count=256", &range]) {
+                Ok(Some(output)) => output,
+                _ => return,
             }
-            return;
-        };
-        let range = format!("{upstream}..HEAD");
-        let Ok(Some(output)) = self.optional(repository, &["rev-list", "--max-count=256", &range])
-        else {
-            return;
+        } else {
+            match self.optional(
+                repository,
+                &["rev-list", "--max-count=256", "HEAD", "--not", "--remotes"],
+            ) {
+                Ok(Some(output)) => output,
+                // No usable comparison point: treat everything as local-only,
+                // matching a repository that has never been shared.
+                _ => {
+                    for commit in history.iter_mut() {
+                        commit.unpushed = true;
+                    }
+                    return;
+                }
+            }
         };
         let local: Vec<&str> = output
             .lines()

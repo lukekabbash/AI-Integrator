@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-task-truncate-from"
+description = "Enables the task_truncate_from command without any pre-configured scope."
+commands.allow = ["task_truncate_from"]
+
+[[permission]]
+identifier = "deny-task-truncate-from"
+description = "Denies the task_truncate_from command without any pre-configured scope."
+commands.deny = ["task_truncate_from"]

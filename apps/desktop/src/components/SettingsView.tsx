@@ -1,9 +1,12 @@
 import { useCallback, useMemo, useRef, useState, useEffect } from "react";
 import { AnimatePresence, LayoutGroup, m as motion, useReducedMotion } from "motion/react";
 import {
+  Archive,
+  ArchiveRestore,
   ArrowLeft,
   Bot,
   Braces,
+  Folder,
   Check,
   CircleDollarSign,
   Copy,
@@ -34,6 +37,7 @@ import {
   resolveModelEffort,
   type LocalAppInfo,
   type ModelCatalogEntry,
+  type ProjectSummary,
   type ProviderUsageSummary,
   type RuntimeConnection,
   type RuntimeActionKind,
@@ -42,6 +46,7 @@ import {
   type StorageTotals,
   type SubscriptionQuota,
   type SubscriptionWindow,
+  type TaskSummary,
   type UsageSnapshot,
   type UsageSummary,
   type VoiceTypingCredentialStatus,
@@ -69,12 +74,31 @@ import {
 } from "../routingDefaults";
 
 type SettingsSection =
-  "general" | "appearance" | "composer" | "models-runtimes" | "permissions" | "subagents" | "usage";
+  | "general"
+  | "appearance"
+  | "composer"
+  | "models-runtimes"
+  | "permissions"
+  | "subagents"
+  | "usage"
+  | "archive";
 
 interface SettingsViewProps {
   preferences: ThemePreferences;
   runtimes: RuntimeConnection[];
   usage: UsageSnapshot;
+  /** Same workspace data the chat sidebar renders; the Archive section is a
+   * roomier view over it, not a second store. */
+  projects?: ProjectSummary[];
+  tasks?: TaskSummary[];
+  taskActionBusyId?: string;
+  /** Select the chat and return to the workspace screen. */
+  onOpenTask?: (taskId: string) => void;
+  onUpdateTask?: (taskId: string, patch: { archived?: boolean }) => void;
+  onUpdateProject?: (projectId: string, patch: { archived?: boolean }) => void;
+  onDeleteTask?: (taskId: string) => void;
+  onDeleteProject?: (projectId: string) => void;
+  onDeleteArchivedChats?: (projectId: string) => void;
   onChangePreferences: (patch: ThemePreferencePatch) => void;
   onResetPreferences: () => void;
   runtimeActionRequest?: RuntimeActionRequest | null;
@@ -103,6 +127,7 @@ const settingsNav: Array<{ id: SettingsSection; label: string; hint: string; ico
   { id: "permissions", label: "Permissions", hint: "Safe execution defaults", icon: ShieldCheck },
   { id: "subagents", label: "Subagents", hint: "Cross-provider handoff policy", icon: Users },
   { id: "usage", label: "Usage and Budgets", hint: "Local usage evidence", icon: CircleDollarSign },
+  { id: "archive", label: "Archive", hint: "Browse, restore, and clean up", icon: Archive },
 ];
 
 type SettingsMap = Record<string, unknown>;
@@ -152,6 +177,7 @@ const DEFAULT_SETTINGS: SettingsMap = {
   "general.openLastWorkspace": true,
   "general.autoResumeInterruptedTurns": false,
   "general.confirmExternalActions": true,
+  "general.saveContextOnEdit": false,
   "composer.enterToSend": true,
   "transcript.showModel": true,
   "transcript.showTimestamps": true,
@@ -161,6 +187,10 @@ const DEFAULT_SETTINGS: SettingsMap = {
   "models.defaultEffort": "medium",
   [RUNTIME_ROUTE_DEFAULTS_SETTING]: {},
   "permissions.defaultProfile": "project-write",
+  // Enforced by the workspace's retention sweep (App): auto-archive uses the
+  // chat's last activity, auto-delete counts from the moment it was archived.
+  "archive.autoArchiveAfter": "never",
+  "archive.autoDeleteAfter": "never",
   // Consumed by the native delegation broker (peers_list / delegate_start
   // policy) and by the composer's delegation-mode default.
   "delegation.defaultMode": "off",
@@ -2177,6 +2207,16 @@ function PolicySettings({
               label="Automatically resume interrupted responses"
             />
           </SettingRow>
+          <SettingRow
+            label="Save context on edit"
+            description="When you edit a prompt and send again, keep the discarded replies below it as context for the model. The chat view still clears past that message. Off starts the new turn from earlier history only."
+          >
+            <Switch
+              checked={readSetting(settings, "general.saveContextOnEdit", false)}
+              onChange={(value) => setSetting("general.saveContextOnEdit", value)}
+              label="Save context on edit"
+            />
+          </SettingRow>
         </section>
         <VoiceTypingSettings />
         <section className="settings-section">
@@ -2487,6 +2527,265 @@ function VoiceTypingSettings() {
 }
 
 // Same spring as the chat sidebar's traveling selection pill.
+function formatRelativeTime(value: string): string {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return "";
+  const deltaMs = Date.now() - timestamp;
+  if (deltaMs < 60_000) return "just now";
+  const minutes = Math.round(deltaMs / 60_000);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  return new Date(timestamp).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+const AUTO_ARCHIVE_OPTIONS = [
+  { value: "never", label: "Never" },
+  { value: "7d", label: "After 7 days" },
+  { value: "14d", label: "After 14 days" },
+  { value: "30d", label: "After 30 days" },
+  { value: "90d", label: "After 90 days" },
+];
+
+const AUTO_DELETE_OPTIONS = [
+  { value: "never", label: "Never" },
+  { value: "24h", label: "After 24 hours" },
+  { value: "3d", label: "After 3 days" },
+  { value: "7d", label: "After 7 days" },
+  { value: "30d", label: "After 30 days" },
+  { value: "90d", label: "After 90 days" },
+];
+
+interface ArchiveSettingsProps {
+  projects: ProjectSummary[];
+  tasks: TaskSummary[];
+  taskActionBusyId?: string;
+  settings: SettingsMap;
+  setSetting: (key: string, value: unknown) => void;
+  onOpenTask?: (taskId: string) => void;
+  onUpdateTask?: (taskId: string, patch: { archived?: boolean }) => void;
+  onUpdateProject?: (projectId: string, patch: { archived?: boolean }) => void;
+  onDeleteTask?: (taskId: string) => void;
+  onDeleteProject?: (projectId: string) => void;
+  onDeleteArchivedChats?: (projectId: string) => void;
+}
+
+/**
+ * A full-width view over the same archive the sidebar toggle shows, sized for
+ * triage: filter across every project at once, then restore, reopen, or
+ * delete without leaving the page. Destructive actions defer to the shared
+ * confirmation modals owned by the workspace.
+ */
+function ArchiveSettings({
+  projects,
+  tasks,
+  taskActionBusyId,
+  settings,
+  setSetting,
+  onOpenTask,
+  onUpdateTask,
+  onUpdateProject,
+  onDeleteTask,
+  onDeleteProject,
+  onDeleteArchivedChats,
+}: ArchiveSettingsProps) {
+  const [filter, setFilter] = useState("");
+  const projectNames = useMemo(
+    () => new Map(projects.map((project) => [project.id, project.name])),
+    [projects],
+  );
+  const archivedChats = useMemo(
+    () =>
+      tasks
+        .filter((task) => task.archived && !task.parentId)
+        .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)),
+    [tasks],
+  );
+  const archivedProjects = projects.filter((project) => project.archived);
+  const query = filter.trim().toLowerCase();
+  const visibleChats = query
+    ? archivedChats.filter(
+        (task) =>
+          task.title.toLowerCase().includes(query) ||
+          (projectNames.get(task.projectId) ?? "").toLowerCase().includes(query),
+      )
+    : archivedChats;
+  // Group in the sidebar's project order so both archive views read the same.
+  const groups = projects
+    .map((project) => ({
+      project,
+      chats: visibleChats.filter((task) => task.projectId === project.id),
+    }))
+    .filter((group) => group.chats.length > 0);
+  const canMutate = Boolean(onUpdateTask);
+
+  return (
+    <>
+      <div className="settings-page-heading">
+        <span>
+          <Archive />
+        </span>
+        <div>
+          <h1>Archive</h1>
+          <p>
+            Everything you have archived, in one sortable place. The sidebar toggle shows the same
+            data next to your chats.
+          </p>
+        </div>
+      </div>
+      <section className="settings-section">
+        <header>
+          <h2>Retention</h2>
+          <p>Applied locally by this app while it is running; nothing leaves your machine.</p>
+        </header>
+        <SettingRow
+          label="Auto-archive inactive chats"
+          description="Archive chats with no activity for this long. Pinned chats and the open chat are never touched."
+        >
+          <Dropdown
+            aria-label="Auto-archive inactive chats"
+            value={readSetting(settings, "archive.autoArchiveAfter", "never")}
+            onChange={(value) => setSetting("archive.autoArchiveAfter", value)}
+            options={AUTO_ARCHIVE_OPTIONS}
+          />
+        </SettingRow>
+        <SettingRow
+          label="Auto-delete archived chats"
+          description="Permanently delete a chat this long after it was archived. The timer starts at archival, not at last activity."
+        >
+          <Dropdown
+            aria-label="Auto-delete archived chats"
+            value={readSetting(settings, "archive.autoDeleteAfter", "never")}
+            onChange={(value) => setSetting("archive.autoDeleteAfter", value)}
+            options={AUTO_DELETE_OPTIONS}
+          />
+        </SettingRow>
+      </section>
+      <section className="settings-section">
+        <header>
+          <h2>Archived chats{archivedChats.length ? ` · ${archivedChats.length}` : ""}</h2>
+          <p>Restore returns a chat to its project; Open jumps straight back into it.</p>
+        </header>
+        {archivedChats.length > 0 ? (
+          <label className="settings-search archive-filter">
+            <Search />
+            <span className="sr-only">Filter archived chats</span>
+            <input
+              value={filter}
+              onChange={(event) => setFilter(event.target.value)}
+              placeholder="Filter by title or project"
+            />
+          </label>
+        ) : null}
+        {archivedChats.length === 0 ? (
+          <p className="archive-empty" role="status">
+            Nothing archived. Chats you archive from the sidebar will show up here.
+          </p>
+        ) : groups.length === 0 ? (
+          <p className="archive-empty" role="status">
+            No archived chats match “{filter.trim()}”.
+          </p>
+        ) : (
+          groups.map(({ project, chats }) => (
+            <div className="archive-group" key={project.id}>
+              <div className="archive-group-header">
+                <Folder aria-hidden="true" />
+                <strong>{project.name}</strong>
+                <small>{chats.length}</small>
+                {onDeleteArchivedChats && !project.archived ? (
+                  <button
+                    className="archive-action archive-action--danger"
+                    type="button"
+                    onClick={() => onDeleteArchivedChats(project.id)}
+                  >
+                    Delete all…
+                  </button>
+                ) : null}
+              </div>
+              {chats.map((task) => (
+                <div className="archive-row" key={task.id}>
+                  <span className="archive-row-copy">
+                    <strong>{task.title || "Untitled chat"}</strong>
+                    <small>{formatRelativeTime(task.updatedAt)}</small>
+                  </span>
+                  <div className="archive-row-actions">
+                    {onOpenTask ? (
+                      <button
+                        className="archive-action"
+                        type="button"
+                        onClick={() => onOpenTask(task.id)}
+                      >
+                        Open
+                      </button>
+                    ) : null}
+                    {canMutate ? (
+                      <button
+                        className="archive-action"
+                        type="button"
+                        disabled={taskActionBusyId === task.id}
+                        onClick={() => onUpdateTask?.(task.id, { archived: false })}
+                      >
+                        <ArchiveRestore aria-hidden="true" /> Restore
+                      </button>
+                    ) : null}
+                    {onDeleteTask ? (
+                      <button
+                        className="archive-action archive-action--danger"
+                        type="button"
+                        onClick={() => onDeleteTask(task.id)}
+                      >
+                        <Trash2 aria-hidden="true" /> Delete…
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ))
+        )}
+      </section>
+      {archivedProjects.length > 0 ? (
+        <section className="settings-section">
+          <header>
+            <h2>Archived projects · {archivedProjects.length}</h2>
+            <p>Restoring a project brings its chats back to the sidebar unchanged.</p>
+          </header>
+          {archivedProjects.map((project) => (
+            <div className="archive-row" key={project.id}>
+              <span className="archive-row-copy">
+                <strong>{project.name}</strong>
+                <small>{project.path}</small>
+              </span>
+              <div className="archive-row-actions">
+                {onUpdateProject ? (
+                  <button
+                    className="archive-action"
+                    type="button"
+                    onClick={() => onUpdateProject(project.id, { archived: false })}
+                  >
+                    <ArchiveRestore aria-hidden="true" /> Restore
+                  </button>
+                ) : null}
+                {onDeleteProject ? (
+                  <button
+                    className="archive-action archive-action--danger"
+                    type="button"
+                    onClick={() => onDeleteProject(project.id)}
+                  >
+                    <Trash2 aria-hidden="true" /> Delete…
+                  </button>
+                ) : null}
+              </div>
+            </div>
+          ))}
+        </section>
+      ) : null}
+    </>
+  );
+}
+
 const navPillSpring = {
   type: "spring" as const,
   stiffness: 460,
@@ -2666,13 +2965,6 @@ export function SettingsView(props: SettingsViewProps) {
             ))}
           </LayoutGroup>
         </nav>
-        <div className="settings-local-note">
-          <ShieldCheck />
-          <span>
-            <strong>Local-first</strong>
-            <small>No AI Integrator account required</small>
-          </span>
-        </div>
       </aside>
       <div className="settings-content-scroll">
         <div className="settings-content">
@@ -2702,6 +2994,21 @@ export function SettingsView(props: SettingsViewProps) {
           ) : null}
           {section === "usage" ? (
             <UsageSettings usage={props.usage} runtimes={props.runtimes} />
+          ) : null}
+          {section === "archive" ? (
+            <ArchiveSettings
+              projects={props.projects ?? []}
+              tasks={props.tasks ?? []}
+              taskActionBusyId={props.taskActionBusyId}
+              settings={settings}
+              setSetting={setSetting}
+              onOpenTask={props.onOpenTask}
+              onUpdateTask={props.onUpdateTask}
+              onUpdateProject={props.onUpdateProject}
+              onDeleteTask={props.onDeleteTask}
+              onDeleteProject={props.onDeleteProject}
+              onDeleteArchivedChats={props.onDeleteArchivedChats}
+            />
           ) : null}
           {policySections.has(section) ? (
             <PolicySettings

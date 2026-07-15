@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-task-fork"
+description = "Enables the task_fork command without any pre-configured scope."
+commands.allow = ["task_fork"]
+
+[[permission]]
+identifier = "deny-task-fork"
+description = "Denies the task_fork command without any pre-configured scope."
+commands.deny = ["task_fork"]

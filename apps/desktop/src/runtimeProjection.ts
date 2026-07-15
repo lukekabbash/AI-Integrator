@@ -169,9 +169,22 @@ export function applyRuntimeProjection(
     case "modeChanged":
       return { ...next, mode: projection.mode };
     case "turnError":
-      // Only the most recent error is actionable; older ones read as noise.
       return {
         ...next,
+        // A provider that will not retry has abandoned the turn, and some
+        // never follow up with a `turn/completed` saying so. Settling here
+        // keeps the turn from sitting in `inProgress` forever, which pins the
+        // composer to stop instead of send and stalls the queue.
+        turn:
+          !projection.retryable && next.turn?.status === "inProgress"
+            ? {
+                ...next.turn,
+                status: "failed",
+                error: projection.message,
+                completedAt: event.occurredAt,
+              }
+            : next.turn,
+        // Only the most recent error is actionable; older ones read as noise.
         errors: [
           {
             seq: event.seq,
@@ -601,13 +614,34 @@ function formatActivityDuration(children: TranscriptEvent[]): string {
     .filter((value) => Number.isFinite(value));
   if (timestamps.length < 2) return "<1s";
   const elapsed = Math.max(0, Math.max(...timestamps) - Math.min(...timestamps));
-  if (elapsed < 1_000) return "<1s";
-  const seconds = Math.floor(elapsed / 1_000);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  return minutes < 60
-    ? `${minutes}m ${seconds % 60}s`
-    : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  return formatElapsedClock(elapsed);
+}
+
+/** Wall-clock duration for “Worked for …” / activity meta (Codex-style). */
+function formatElapsedClock(elapsedMs: number): string {
+  if (elapsedMs < 1_000) return "<1s";
+  const totalSeconds = Math.floor(elapsedMs / 1_000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
+type ActivityGroupFamily = "edit" | "mixed";
+
+function isEditEvent(event: TranscriptEvent): boolean {
+  if (/^Read/i.test(event.title ?? "")) return false;
+  if (/^(Search|Searching|Searched)/i.test(event.title ?? "")) return false;
+  if (event.activityType === "file") return true;
+  return /^(Edit|Editing|Edited|Creat|Creating|Created|Added|Deleted|Renamed|Changed)/i.test(
+    event.title ?? "",
+  );
+}
+
+function activityGroupFamily(event: TranscriptEvent): ActivityGroupFamily {
+  return isEditEvent(event) ? "edit" : "mixed";
 }
 
 function activityGroupSummary(children: TranscriptEvent[]): string {
@@ -631,6 +665,26 @@ function activityGroupSummary(children: TranscriptEvent[]): string {
       return [`${count} ${count === 1 ? singular : plural}`];
     })
     .join(" · ");
+}
+
+function activityGroupTitle(family: ActivityGroupFamily, status: TranscriptEvent["status"]): string {
+  const running = status === "running";
+  if (family === "edit") return running ? "Editing" : "Edits";
+  return running ? "Working" : "Activity";
+}
+
+function activityGroupBody(family: ActivityGroupFamily, children: TranscriptEvent[]): string {
+  if (family === "edit") {
+    const count = children.length;
+    return `${count} ${count === 1 ? "file" : "files"}`;
+  }
+  return activityGroupSummary(children);
+}
+
+function activityGroupActivityType(
+  family: ActivityGroupFamily,
+): TranscriptEvent["activityType"] {
+  return family === "edit" ? "file" : "other";
 }
 
 function activityGroupStatus(children: TranscriptEvent[]): TranscriptEvent["status"] {
@@ -659,6 +713,7 @@ function groupActivityEvents(
       return;
     }
     const status = activityGroupStatus(batch);
+    const family = activityGroupFamily(batch[0]);
     const additions = batch.reduce(
       (total, child) => total + (child.changeStats?.additions ?? 0),
       0,
@@ -670,9 +725,9 @@ function groupActivityEvents(
     grouped.push({
       id: `activity-group-${batch[0].id}`,
       kind: "activity",
-      activityType: "other",
-      title: status === "running" ? "Working" : "Activity",
-      body: activityGroupSummary(batch),
+      activityType: activityGroupActivityType(family),
+      title: activityGroupTitle(family, status),
+      body: activityGroupBody(family, batch),
       timestamp: batch[0].timestamp,
       status,
       meta: `${formatActivityDuration(batch)} · ${status === "success" ? "complete" : status}`,
@@ -684,25 +739,184 @@ function groupActivityEvents(
   };
 
   for (const event of events) {
+    const family = activityGroupFamily(event);
+    // Pending approvals stay visible as their own rows so turn collapse cannot
+    // bury attention inside a “Worked for” bucket.
     const groupable =
-      (event.kind === "activity" ||
-        event.kind === "tool" ||
-        event.kind === "checkpoint" ||
-        event.kind === "approval") &&
+      (event.kind === "activity" || event.kind === "tool" || event.kind === "checkpoint") &&
       !event.children?.length &&
-      !event.diff &&
-      (event.kind === "approval" || (event.status !== "error" && event.status !== "warning"));
+      (family === "edit" || !event.diff) &&
+      event.status !== "error" &&
+      event.status !== "warning";
     if (groupable) {
+      if (batch.length > 0 && activityGroupFamily(batch[0]) !== family) flush();
       batch.push(event);
       if (batch.length >= ACTIVITY_GROUP_LIMIT) flush();
-    }
-    else {
+    } else {
       flush();
       grouped.push(event);
     }
   }
   flush();
   return grouped;
+}
+
+function isUnresolvedAttention(event: TranscriptEvent): boolean {
+  return (
+    event.kind === "approval" && (event.status === "warning" || event.status === "error")
+  );
+}
+
+function isTurnCollapsible(event: TranscriptEvent): boolean {
+  if (event.kind === "user" || event.kind === "notice") return false;
+  if (isUnresolvedAttention(event)) return false;
+  // Mid-turn assistant replies fold into Worked for in chronological order;
+  // the final assistant is never passed here.
+  if (event.kind === "assistant") return true;
+  return (
+    event.kind === "activity" ||
+    event.kind === "tool" ||
+    event.kind === "checkpoint" ||
+    event.kind === "approval"
+  );
+}
+
+function workedForDuration(
+  children: TranscriptEvent[],
+  turn: TurnProjection | undefined,
+): string {
+  const started = turn?.startedAt ? Date.parse(turn.startedAt) : Number.NaN;
+  const completed = turn?.completedAt ? Date.parse(turn.completedAt) : Number.NaN;
+  if (Number.isFinite(started) && Number.isFinite(completed) && completed >= started) {
+    return formatElapsedClock(completed - started);
+  }
+  return formatActivityDuration(children);
+}
+
+function makeWorkedForEvent(
+  children: TranscriptEvent[],
+  finalAssistantId: string,
+  turn: TurnProjection | undefined,
+  segmentKey: string,
+): TranscriptEvent {
+  const status = activityGroupStatus(children);
+  const additions = children.reduce(
+    (total, child) => total + (child.changeStats?.additions ?? 0),
+    0,
+  );
+  const deletions = children.reduce(
+    (total, child) => total + (child.changeStats?.deletions ?? 0),
+    0,
+  );
+  return {
+    id: `worked-for-${finalAssistantId}${segmentKey}`,
+    kind: "activity",
+    activityType: "other",
+    title: "Worked for",
+    body: workedForDuration(children, turn),
+    timestamp: children[0]?.timestamp ?? turn?.completedAt ?? new Date(0).toISOString(),
+    status,
+    changeStats: additions || deletions ? { additions, deletions } : undefined,
+    children,
+    expandedByDefault: false,
+  };
+}
+
+/**
+ * After a turn settles — and for every earlier completed turn while a new one
+ * is running — fold mid-turn agent activity (including interim assistant
+ * messages) into collapsed “Worked for …” row(s) above each final reply.
+ *
+ * Important: do not gate the entire transcript on the *current* turn's
+ * settled flag. Sending a follow-up must not unwrap prior Worked-for rows.
+ */
+function collapseSettledTurnActivity(
+  events: TranscriptEvent[],
+  options: {
+    turnSettled: boolean;
+    density: TranscriptDensity;
+    turn?: TurnProjection;
+  },
+): TranscriptEvent[] {
+  if (options.density === "verbose" || events.length === 0) {
+    return events;
+  }
+
+  const result: TranscriptEvent[] = [];
+  let index = 0;
+  while (index < events.length) {
+    const event = events[index];
+    if (event.kind !== "user") {
+      result.push(event);
+      index += 1;
+      continue;
+    }
+
+    result.push(event);
+    index += 1;
+    const spanStart = index;
+    let finalAssistantIndex = -1;
+    let nextUserIndex = -1;
+    for (let cursor = spanStart; cursor < events.length; cursor += 1) {
+      if (events[cursor].kind === "user") {
+        nextUserIndex = cursor;
+        break;
+      }
+      if (events[cursor].kind === "assistant") finalAssistantIndex = cursor;
+    }
+    if (finalAssistantIndex < 0) {
+      while (index < events.length && events[index].kind !== "user") {
+        result.push(events[index]);
+        index += 1;
+      }
+      continue;
+    }
+
+    // Collapse completed prior turns always. Collapse the latest turn only once
+    // it has settled — otherwise live activity stays visible while running.
+    const isPriorTurn = nextUserIndex >= 0;
+    const shouldCollapse = isPriorTurn || options.turnSettled;
+    if (!shouldCollapse) {
+      while (index <= finalAssistantIndex) {
+        result.push(events[index]);
+        index += 1;
+      }
+      continue;
+    }
+
+    const finalAssistant = events[finalAssistantIndex];
+    let segment = 0;
+    let pending: TranscriptEvent[] = [];
+    const allowTurnClock = options.turnSettled && !isPriorTurn;
+    const flushPending = () => {
+      if (pending.length === 0) return;
+      const suffix = segment === 0 ? "" : `-${segment}`;
+      const body =
+        segment === 0 && allowTurnClock
+          ? workedForDuration(pending, options.turn)
+          : formatActivityDuration(pending);
+      result.push({
+        ...makeWorkedForEvent(pending, finalAssistant.id, options.turn, suffix),
+        body,
+      });
+      segment += 1;
+      pending = [];
+    };
+
+    for (let cursor = spanStart; cursor < finalAssistantIndex; cursor += 1) {
+      const mid = events[cursor];
+      if (isTurnCollapsible(mid)) {
+        pending.push(mid);
+      } else {
+        flushPending();
+        result.push(mid);
+      }
+    }
+    flushPending();
+    result.push(finalAssistant);
+    index = finalAssistantIndex + 1;
+  }
+  return result;
 }
 
 function deriveItemTranscriptEvents(
@@ -880,13 +1094,15 @@ function buildRuntimeTranscript(
   // Interleave chronologically by FIRST appearance: a streaming item keeps
   // receiving updates, so ordering by last-update time would make growing
   // text hop below tool activity that actually happened after it started.
-  return groupActivityEvents(
-    events
-      .map((event, index) => ({ event, index, time: Date.parse(event.timestamp) || 0 }))
-      .sort((a, b) => a.time - b.time || a.index - b.index)
-      .map(({ event }) => event),
+  const ordered = events
+    .map((event, index) => ({ event, index, time: Date.parse(event.timestamp) || 0 }))
+    .sort((a, b) => a.time - b.time || a.index - b.index)
+    .map(({ event }) => event);
+  return collapseSettledTurnActivity(groupActivityEvents(ordered, density), {
+    turnSettled,
     density,
-  );
+    turn: state.turn,
+  });
 }
 
 export function runtimeTranscript(

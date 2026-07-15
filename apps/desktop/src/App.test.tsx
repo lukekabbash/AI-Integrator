@@ -176,6 +176,9 @@ describe("AI Integrator desktop workspace", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Open Settings" }));
     await screen.findByRole("heading", { name: "Appearance" });
+    // Scope to the settings rail: the workspace screen is still cross-fading
+    // out when these assertions run, so global queries could see its buttons.
+    const navigation = screen.getByRole("complementary", { name: "Settings navigation" });
     const categoryLabels = [
       "General",
       "Appearance",
@@ -183,9 +186,12 @@ describe("AI Integrator desktop workspace", () => {
       "Models and Runtimes",
       "Permissions",
       "Usage and Budgets",
+      "Archive",
     ];
     for (const label of categoryLabels) {
-      expect(screen.getByRole("button", { name: new RegExp(label, "i") })).toBeInTheDocument();
+      expect(
+        within(navigation).getByRole("button", { name: new RegExp(label, "i") }),
+      ).toBeInTheDocument();
     }
     // Placeholder categories with no consuming behavior must not resurface.
     for (const removed of [
@@ -196,7 +202,7 @@ describe("AI Integrator desktop workspace", () => {
       "Advanced",
     ]) {
       expect(
-        screen.queryByRole("button", { name: new RegExp(removed, "i") }),
+        within(navigation).queryByRole("button", { name: new RegExp(removed, "i") }),
       ).not.toBeInTheDocument();
     }
 
@@ -244,6 +250,26 @@ describe("AI Integrator desktop workspace", () => {
     fireEvent.click(screen.getByRole("button", { name: /Usage and Budgets/i }));
     expect(await screen.findByRole("heading", { name: "Per-provider usage" })).toBeInTheDocument();
     expect(screen.getByText("Codex")).toBeInTheDocument();
+  });
+
+  it("manages archived chats from the Archive settings section", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Open Settings" }));
+    await screen.findByRole("heading", { name: "Appearance" });
+    const navigation = screen.getByRole("complementary", { name: "Settings navigation" });
+    fireEvent.click(within(navigation).getByRole("button", { name: "Archive" }));
+    expect(await screen.findByRole("heading", { name: "Archive" })).toBeInTheDocument();
+
+    // Retention controls persist like every other setting.
+    const autoDelete = screen.getByRole("button", { name: "Auto-delete archived chats" });
+    fireEvent.click(autoDelete);
+    fireEvent.click(screen.getByRole("option", { name: "After 7 days" }));
+    expect(window.localStorage.getItem("aiintegrator.settings.v1")).toContain(
+      "archive.autoDeleteAfter",
+    );
+
+    // Demo data starts with nothing archived; the list explains itself.
+    expect(screen.getByText(/Nothing archived/i)).toBeInTheDocument();
   });
 
   it("uses each selected model's advertised effort list in Settings", async () => {

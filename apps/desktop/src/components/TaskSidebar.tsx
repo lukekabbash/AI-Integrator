@@ -1,4 +1,11 @@
-import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactElement,
+} from "react";
 import { createPortal } from "react-dom";
 import { AnimatePresence, LayoutGroup, m as motion, useReducedMotion } from "motion/react";
 import {
@@ -6,6 +13,7 @@ import {
   ArchiveRestore,
   ChevronDown,
   ChevronUp,
+  CopyPlus,
   Folder,
   History,
   MoreHorizontal,
@@ -19,11 +27,29 @@ import {
   X,
 } from "lucide-react";
 import type { ProjectSummary, TaskMessageSearchHit, TaskSummary } from "../bridge";
+import { parseForkTitle } from "../forkTitle";
 import { AnimatedFolderIcon } from "./AnimatedFolderIcon";
 import { BrandMark } from "./BrandMark";
 import { ResizeHandle } from "./ResizeHandle";
 import { Tooltip } from "./Tooltip";
 import { TravelingSelection } from "./TravelingSelection";
+
+/** Themed tooltip for overflow-menu rows. A span shell keeps hover working
+ * when the menuitem itself is disabled (native buttons swallow pointer events). */
+function MenuActionTooltip({
+  label,
+  children,
+}: {
+  label?: string;
+  children: ReactElement;
+}) {
+  if (!label) return children;
+  return (
+    <Tooltip label={label} placement="right">
+      <span className="chat-action-menu-tooltip-target">{children}</span>
+    </Tooltip>
+  );
+}
 
 interface TaskSidebarProps {
   projects: ProjectSummary[];
@@ -43,11 +69,15 @@ interface TaskSidebarProps {
     taskId: string,
     patch: { title?: string; pinned?: boolean; archived?: boolean },
   ) => void;
+  /** Duplicate a chat and its whole transcript into a new one. */
+  onCopyTask?: (taskId: string) => void;
   onUpdateProject?: (
     projectId: string,
     patch: { pinned?: boolean; archived?: boolean },
   ) => void;
   onDeleteProject?: (projectId: string) => void;
+  /** Bulk-delete the archived chats of a live project (archive view only). */
+  onDeleteArchivedChats?: (projectId: string) => void;
   onDeleteTask?: (taskId: string) => void;
   onOpenSettings: () => void;
   onResize?: (delta: number) => void;
@@ -147,6 +177,21 @@ const menuSpring = {
 const INITIAL_PROJECT_CHAT_LIMIT = 5;
 const PROJECT_CHAT_PAGE_SIZE = 10;
 const INITIAL_SEARCH_RESULT_LIMIT = 80;
+/** Rename / Copy / Pin / Archive / Delete — used to decide flip-up vs down. */
+const CHAT_ACTION_MENU_HEIGHT = 168;
+const PROJECT_ACTION_MENU_HEIGHT = 112;
+
+function overflowMenuPlacement(
+  trigger: HTMLElement,
+  container: HTMLElement | null,
+  estimatedHeight: number,
+): "up" | "down" {
+  const triggerRect = trigger.getBoundingClientRect();
+  const bounds = container?.getBoundingClientRect();
+  const roomBelow = (bounds?.bottom ?? window.innerHeight) - triggerRect.bottom - 8;
+  const roomAbove = triggerRect.top - (bounds?.top ?? 0) - 8;
+  return roomBelow < estimatedHeight && roomAbove > roomBelow ? "up" : "down";
+}
 
 /** Keep paging on compositor-friendly properties. The previous height-per-row
  * animation forced layout on every frame and made the sidebar judder. */
@@ -196,8 +241,10 @@ export function TaskSidebar({
   onNewTaskInProject,
   onOpenProject,
   onUpdateTask,
+  onCopyTask,
   onUpdateProject,
   onDeleteProject,
+  onDeleteArchivedChats,
   onDeleteTask,
   onOpenSettings,
   onResize,
@@ -214,10 +261,16 @@ export function TaskSidebar({
     activeProjectId ? { [activeProjectId]: true } : {},
   );
   const [openMenuId, setOpenMenuId] = useState("");
+  const [menuPlacement, setMenuPlacement] = useState<"up" | "down">("down");
   const [openProjectMenuId, setOpenProjectMenuId] = useState("");
+  const [projectMenuPlacement, setProjectMenuPlacement] = useState<"up" | "down">("down");
   const [renamingId, setRenamingId] = useState("");
   const [renameValue, setRenameValue] = useState("");
   const [showArchived, setShowArchived] = useState(false);
+  // Clicking Settings spins the gear past its hover pose while the screens
+  // cross-fade; the sidebar unmounts with the workspace, so this never needs
+  // resetting.
+  const [settingsLaunching, setSettingsLaunching] = useState(false);
   // The archived view keeps its own disclosure state (default open, so the
   // archive is browsable at a glance) without disturbing the normal tree.
   const [archivedExpandedProjects, setArchivedExpandedProjects] = useState<
@@ -481,6 +534,10 @@ export function TaskSidebar({
           showProject: options?.showProject,
           projectName: project?.name,
         });
+    // Split so the row can clip the name and the marker separately; a single
+    // run of text would let the ellipsis eat the marker that tells this chat
+    // apart from the original it was copied from.
+    const forkTitle = options?.searchResult ? null : parseForkTitle(task.title);
     if (renamingId === task.id && !options?.searchResult) {
       return (
         <form
@@ -541,7 +598,7 @@ export function TaskSidebar({
             ) : null}
             <span className="chat-row-copy">
               <motion.span
-                className="chat-row-title"
+                className={forkTitle ? "chat-row-title chat-row-title--fork" : "chat-row-title"}
                 key={task.title}
                 initial={reduceMotion ? false : { opacity: 0, y: 2, filter: "blur(2px)" }}
                 animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
@@ -549,7 +606,14 @@ export function TaskSidebar({
                   reduceMotion ? { duration: 0 } : { duration: 0.2, ease: [0.2, 0, 0, 1] }
                 }
               >
-                {task.title}
+                {forkTitle ? (
+                  <>
+                    <span className="chat-row-title-name">{forkTitle.base}</span>
+                    <span className="chat-row-title-suffix">{`: ${forkTitle.kind} ${forkTitle.index}`}</span>
+                  </>
+                ) : (
+                  task.title
+                )}
               </motion.span>
               {options?.showProject ? <small>{meta}</small> : null}
             </span>
@@ -580,7 +644,21 @@ export function TaskSidebar({
               type="button"
               aria-label="More chat actions"
               aria-expanded={openMenuId === task.id}
-              onClick={() => setOpenMenuId((current) => (current === task.id ? "" : task.id))}
+              onClick={(event) => {
+                setOpenProjectMenuId("");
+                if (openMenuId === task.id) {
+                  setOpenMenuId("");
+                  return;
+                }
+                setMenuPlacement(
+                  overflowMenuPlacement(
+                    event.currentTarget,
+                    chatListRef.current,
+                    CHAT_ACTION_MENU_HEIGHT,
+                  ),
+                );
+                setOpenMenuId(task.id);
+              }}
               disabled={busy}
             >
               <MoreHorizontal />
@@ -590,67 +668,117 @@ export function TaskSidebar({
         <AnimatePresence>
           {openMenuId === task.id && !options?.searchResult ? (
             <motion.div
-              className="chat-action-menu"
+              className={`chat-action-menu${menuPlacement === "up" ? " chat-action-menu--up" : ""}`}
               role="menu"
               ref={menuRef}
-              initial={reduceMotion ? false : { opacity: 0, y: -5, scale: 0.96 }}
+              initial={
+                reduceMotion
+                  ? false
+                  : { opacity: 0, y: menuPlacement === "up" ? 5 : -5, scale: 0.96 }
+              }
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={
                 reduceMotion
                   ? undefined
                   : {
                       opacity: 0,
-                      y: -3,
+                      y: menuPlacement === "up" ? 3 : -3,
                       scale: 0.98,
                       transition: { duration: 0.12, ease: [0.2, 0, 0, 1] },
                     }
               }
               transition={reduceMotion ? { duration: 0 } : menuSpring}
             >
-              <button
-                role="menuitem"
-                type="button"
-                onClick={() => beginRename(task)}
-                disabled={!metadataActionsEnabled}
-                title={metadataActionsEnabled ? undefined : "Native persistence is being added"}
+              <MenuActionTooltip
+                label={
+                  metadataActionsEnabled ? undefined : "Native persistence is being added"
+                }
               >
-                <Pencil /> Rename
-              </button>
-              <button
-                role="menuitem"
-                type="button"
-                onClick={() => {
-                  onUpdateTask(task.id, { pinned: !task.pinned });
-                  setOpenMenuId("");
-                }}
-                disabled={!metadataActionsEnabled}
+                <button
+                  role="menuitem"
+                  type="button"
+                  onClick={() => beginRename(task)}
+                  disabled={!metadataActionsEnabled}
+                >
+                  <Pencil /> Rename
+                </button>
+              </MenuActionTooltip>
+              <MenuActionTooltip
+                label={
+                  task.status === "running"
+                    ? "Wait for this chat to finish before copying it"
+                    : !metadataActionsEnabled || !onCopyTask
+                      ? "Native persistence is being added"
+                      : "Duplicate this chat and its history"
+                }
               >
-                {task.pinned ? <PinOff /> : <Pin />} {task.pinned ? "Unpin" : "Pin"}
-              </button>
-              <button
-                role="menuitem"
-                type="button"
-                onClick={() => {
-                  onUpdateTask(task.id, { archived: !task.archived });
-                  setOpenMenuId("");
-                }}
-                disabled={!metadataActionsEnabled}
+                <button
+                  role="menuitem"
+                  type="button"
+                  onClick={() => {
+                    setOpenMenuId("");
+                    onCopyTask?.(task.id);
+                  }}
+                  disabled={!metadataActionsEnabled || !onCopyTask || task.status === "running"}
+                >
+                  <CopyPlus /> Copy
+                </button>
+              </MenuActionTooltip>
+              <MenuActionTooltip
+                label={
+                  metadataActionsEnabled ? undefined : "Native persistence is being added"
+                }
               >
-                {task.archived ? <ArchiveRestore /> : <Archive />}
-                {task.archived ? "Restore" : "Archive"}
-              </button>
-              <button
-                role="menuitem"
-                type="button"
-                className="chat-action-menu-danger"
-                onClick={() => {
-                  setOpenMenuId("");
-                  onDeleteTask?.(task.id);
-                }}
-                disabled={!metadataActionsEnabled || !onDeleteTask}
+                <button
+                  role="menuitem"
+                  type="button"
+                  onClick={() => {
+                    onUpdateTask(task.id, { pinned: !task.pinned });
+                    setOpenMenuId("");
+                  }}
+                  disabled={!metadataActionsEnabled}
+                >
+                  {task.pinned ? <PinOff /> : <Pin />} {task.pinned ? "Unpin" : "Pin"}
+                </button>
+              </MenuActionTooltip>
+              <MenuActionTooltip
+                label={
+                  metadataActionsEnabled ? undefined : "Native persistence is being added"
+                }
               >
-                <Trash2 /> Delete…
-              </button>
+                <button
+                  role="menuitem"
+                  type="button"
+                  onClick={() => {
+                    onUpdateTask(task.id, { archived: !task.archived });
+                    setOpenMenuId("");
+                  }}
+                  disabled={!metadataActionsEnabled}
+                >
+                  {task.archived ? <ArchiveRestore /> : <Archive />}
+                  {task.archived ? "Restore" : "Archive"}
+                </button>
+              </MenuActionTooltip>
+              <MenuActionTooltip
+                label={
+                  metadataActionsEnabled && onDeleteTask
+                    ? undefined
+                    : "Native persistence is being added"
+                }
+              >
+                <button
+                  role="menuitem"
+                  type="button"
+                  className="chat-action-menu-danger"
+                  onClick={() => {
+                    setOpenMenuId("");
+                    onDeleteTask?.(task.id);
+                  }}
+                  disabled={!metadataActionsEnabled || !onDeleteTask}
+                >
+                  <Trash2 /> Delete…
+                </button>
+              </MenuActionTooltip>
             </motion.div>
           ) : null}
         </AnimatePresence>
@@ -808,7 +936,16 @@ export function TaskSidebar({
                         <AnimatedFolderIcon open={expanded} />
                         <span>{project.name}</span>
                         {showArchived && project.archived ? (
-                          <small className="project-archived-badge">Archived</small>
+                          // Icon-only: a text pill starves the name of space in
+                          // the narrow sidebar.
+                          <small
+                            className="project-archived-badge"
+                            role="img"
+                            aria-label="Archived project"
+                            title="Archived project"
+                          >
+                            <Archive aria-hidden="true" />
+                          </small>
                         ) : null}
                       </button>
                       <span className="project-header-meta" data-has-actions="true">
@@ -844,9 +981,18 @@ export function TaskSidebar({
                               onClick={(event) => {
                                 event.stopPropagation();
                                 setOpenMenuId("");
-                                setOpenProjectMenuId((current) =>
-                                  current === project.id ? "" : project.id,
+                                if (openProjectMenuId === project.id) {
+                                  setOpenProjectMenuId("");
+                                  return;
+                                }
+                                setProjectMenuPlacement(
+                                  overflowMenuPlacement(
+                                    event.currentTarget,
+                                    chatListRef.current,
+                                    PROJECT_ACTION_MENU_HEIGHT,
+                                  ),
                                 );
+                                setOpenProjectMenuId(project.id);
                               }}
                             >
                               <MoreHorizontal aria-hidden="true" />
@@ -868,17 +1014,25 @@ export function TaskSidebar({
                         <AnimatePresence>
                           {openProjectMenuId === project.id ? (
                             <motion.div
-                              className="chat-action-menu project-action-menu"
+                              className={`chat-action-menu project-action-menu${projectMenuPlacement === "up" ? " chat-action-menu--up" : ""}`}
                               role="menu"
                               ref={projectMenuRef}
-                              initial={reduceMotion ? false : { opacity: 0, y: -5, scale: 0.96 }}
+                              initial={
+                                reduceMotion
+                                  ? false
+                                  : {
+                                      opacity: 0,
+                                      y: projectMenuPlacement === "up" ? 5 : -5,
+                                      scale: 0.96,
+                                    }
+                              }
                               animate={{ opacity: 1, y: 0, scale: 1 }}
                               exit={
                                 reduceMotion
                                   ? undefined
                                   : {
                                       opacity: 0,
-                                      y: -3,
+                                      y: projectMenuPlacement === "up" ? 3 : -3,
                                       scale: 0.98,
                                       transition: { duration: 0.12, ease: [0.2, 0, 0, 1] },
                                     }
@@ -907,17 +1061,35 @@ export function TaskSidebar({
                                 {project.archived ? <ArchiveRestore /> : <Archive />}
                                 {project.archived ? "Restore" : "Archive"}
                               </button>
-                              <button
-                                role="menuitem"
-                                type="button"
-                                className="project-action-menu-danger"
-                                onClick={() => {
-                                  setOpenProjectMenuId("");
-                                  onDeleteProject?.(project.id);
-                                }}
-                              >
-                                <Trash2 /> Delete…
-                              </button>
+                              {showArchived && !project.archived ? (
+                                // A live project appears in the archive only for
+                                // its archived chats — delete acts on those, not
+                                // the project.
+                                <button
+                                  role="menuitem"
+                                  type="button"
+                                  className="project-action-menu-danger"
+                                  onClick={() => {
+                                    setOpenProjectMenuId("");
+                                    onDeleteArchivedChats?.(project.id);
+                                  }}
+                                  disabled={!onDeleteArchivedChats}
+                                >
+                                  <Trash2 /> Delete archived chats…
+                                </button>
+                              ) : (
+                                <button
+                                  role="menuitem"
+                                  type="button"
+                                  className="project-action-menu-danger"
+                                  onClick={() => {
+                                    setOpenProjectMenuId("");
+                                    onDeleteProject?.(project.id);
+                                  }}
+                                >
+                                  <Trash2 /> Delete…
+                                </button>
+                              )}
                             </motion.div>
                           ) : null}
                         </AnimatePresence>
@@ -1071,7 +1243,11 @@ export function TaskSidebar({
         <button
           className="sidebar-settings-row"
           type="button"
-          onClick={onOpenSettings}
+          data-launching={settingsLaunching || undefined}
+          onClick={() => {
+            setSettingsLaunching(true);
+            onOpenSettings();
+          }}
           aria-label="Open Settings"
         >
           <Settings />

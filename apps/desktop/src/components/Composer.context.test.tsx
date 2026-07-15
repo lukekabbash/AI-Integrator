@@ -198,6 +198,50 @@ describe("composer attachments", () => {
     fireEvent.click(screen.getByRole("button", { name: "Remove a.txt" }));
     expect(screen.queryByText("a.txt")).toBeNull();
   });
+
+  it("pastes a clipboard image as an attachment chip", async () => {
+    const pasted: ContextAttachment = {
+      path: "/tmp/pasted-attachments/pasted-image.png",
+      name: "pasted-image.png",
+      kind: "image",
+      dataUrl: "data:image/png;base64,aGk=",
+    };
+    const save = vi.fn().mockResolvedValue(pasted);
+    vi.spyOn(bridge, "savePastedImageAttachment").mockImplementation(save);
+    const { textbox } = renderComposer();
+    const file = new File([new Uint8Array([1, 2, 3])], "screenshot.png", { type: "image/png" });
+
+    fireEvent.paste(textbox, {
+      clipboardData: {
+        files: [file],
+        items: [],
+      },
+    });
+
+    expect(await screen.findByText("pasted-image.png")).toBeInTheDocument();
+    expect(screen.getByAltText("pasted-image.png")).toHaveAttribute(
+      "src",
+      "data:image/png;base64,aGk=",
+    );
+    expect(save).toHaveBeenCalledWith(file, "screenshot.png");
+    expect(textbox).toHaveValue("");
+  });
+
+  it("leaves ordinary text pastes alone", async () => {
+    const save = vi.fn();
+    vi.spyOn(bridge, "savePastedImageAttachment").mockImplementation(save);
+    const { textbox } = renderComposer();
+
+    fireEvent.paste(textbox, {
+      clipboardData: {
+        files: [],
+        items: [],
+        getData: () => "hello from clipboard",
+      },
+    });
+
+    expect(save).not.toHaveBeenCalled();
+  });
 });
 
 describe("selection context cards", () => {
