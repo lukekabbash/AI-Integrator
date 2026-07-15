@@ -37,10 +37,146 @@ describe("Transcript", () => {
     // Cut points are turn ends: last agent reply before the next user, plus
     // the open trailing reply — not every assistant bubble in a turn.
     expect(branches).toHaveLength(2);
+    const interim = document.querySelector('[data-event-id="assistant-1a"]');
+    expect(interim?.classList.contains("turn--assistant-interim")).toBe(true);
+    expect(interim).toHaveAttribute("aria-label", "Agent progress");
+    expect(
+      within(interim as HTMLElement).queryByRole("button", { name: "Copy this response" }),
+    ).toBeNull();
     fireEvent.click(branches[0]);
     expect(onBranch).toHaveBeenCalledWith("assistant-1b");
     fireEvent.click(branches[1]);
     expect(onBranch).toHaveBeenCalledWith("assistant-2");
+  });
+
+  it("streams live agent replies in interim italic until the turn settles", () => {
+    const { rerender } = render(
+      <Transcript
+        events={[
+          event("user-1", "user", "fix it"),
+          event("assistant-1", "assistant", "Looking into it…"),
+        ]}
+        running
+      />,
+    );
+
+    const live = document.querySelector('[data-event-id="assistant-1"]');
+    expect(live?.classList.contains("turn--assistant-interim")).toBe(true);
+    expect(live).toHaveAttribute("aria-label", "Agent progress");
+    expect(screen.queryByRole("button", { name: "Copy this response" })).toBeNull();
+
+    rerender(
+      <Transcript
+        events={[
+          event("user-1", "user", "fix it"),
+          event("assistant-1", "assistant", "Looking into it…"),
+          event("assistant-2", "assistant", "All fixed."),
+        ]}
+      />,
+    );
+
+    expect(
+      document.querySelector('[data-event-id="assistant-1"]')?.classList.contains(
+        "turn--assistant-interim",
+      ),
+    ).toBe(true);
+    const finalReply = document.querySelector('[data-event-id="assistant-2"]');
+    expect(finalReply?.classList.contains("turn--assistant-interim")).toBe(false);
+    expect(finalReply).toHaveAttribute("aria-label", "Agent response");
+    expect(screen.getByRole("button", { name: "Copy this response" })).toBeInTheDocument();
+  });
+
+  it("streams final_answer phase replies in normal chrome while the turn is still running", () => {
+    const onBranch = vi.fn();
+    render(
+      <Transcript
+        events={[
+          event("user-1", "user", "fix it"),
+          event("assistant-1", "assistant", "Looking into it…"),
+          {
+            ...event("assistant-2", "assistant", "All fixed."),
+            phase: "final_answer",
+          },
+        ]}
+        running
+        onBranch={onBranch}
+        modelForEvent={() => "Codex"}
+      />,
+    );
+
+    expect(
+      document.querySelector('[data-event-id="assistant-1"]')?.classList.contains(
+        "turn--assistant-interim",
+      ),
+    ).toBe(true);
+    const finalReply = document.querySelector('[data-event-id="assistant-2"]');
+    expect(finalReply?.classList.contains("turn--assistant-interim")).toBe(false);
+    expect(finalReply).toHaveAttribute("aria-label", "Agent response");
+    expect(screen.getByText("Codex")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy this response" })).toBeInTheDocument();
+    // Branch stays withheld until the turn settles, even for final_answer.
+    expect(
+      screen.queryByRole("button", { name: "Branch the chat from this response" }),
+    ).toBeNull();
+  });
+
+  it("keeps prior turn-final replies normal when a follow-up turn starts", () => {
+    const { rerender } = render(
+      <Transcript
+        events={[
+          event("user-1", "user", "first question"),
+          event("assistant-1", "assistant", "first answer"),
+        ]}
+      />,
+    );
+    expect(
+      document.querySelector('[data-event-id="assistant-1"]')?.classList.contains(
+        "turn--assistant-interim",
+      ),
+    ).toBe(false);
+
+    rerender(
+      <Transcript
+        events={[
+          event("user-1", "user", "first question"),
+          event("assistant-1", "assistant", "first answer"),
+          event("user-2", "user", "follow up"),
+        ]}
+        running
+        onBranch={vi.fn()}
+      />,
+    );
+    expect(
+      document.querySelector('[data-event-id="assistant-1"]')?.classList.contains(
+        "turn--assistant-interim",
+      ),
+    ).toBe(false);
+    expect(screen.getByRole("button", { name: "Copy this response" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Branch the chat from this response" }),
+    ).toBeInTheDocument();
+  });
+
+  it("offers Regenerate on every turn-final reply", () => {
+    const onRegenerate = vi.fn();
+    render(
+      <Transcript
+        events={[
+          event("user-1", "user", "first question"),
+          event("assistant-1", "assistant", "first answer"),
+          event("user-2", "user", "follow up"),
+          event("assistant-2", "assistant", "second answer"),
+        ]}
+        onRegenerate={onRegenerate}
+        onBranch={vi.fn()}
+      />,
+    );
+    const regenerates = screen.getAllByRole("button", { name: "Regenerate this response" });
+    expect(regenerates).toHaveLength(2);
+    fireEvent.click(regenerates[0]);
+    expect(onRegenerate).toHaveBeenCalledWith("assistant-1");
+    fireEvent.click(regenerates[1]);
+    expect(onRegenerate).toHaveBeenCalledWith("assistant-2");
   });
 
   it("withholds Branch only on the reply that is still streaming", () => {
@@ -181,7 +317,7 @@ describe("Transcript", () => {
       />,
     );
 
-    let response = screen.getByLabelText("Agent response");
+    let response = screen.getByLabelText("Agent progress");
     expect(response.querySelector("h2")).toBeNull();
     expect(response).toHaveTextContent("Here are the steps:");
 
@@ -192,7 +328,7 @@ describe("Transcript", () => {
       />,
     );
 
-    response = screen.getByLabelText("Agent response");
+    response = screen.getByLabelText("Agent progress");
     expect(response.querySelector("h2")).toBeNull();
     expect(within(response).getByRole("list")).toBeInTheDocument();
     expect(within(response).getByRole("listitem")).toHaveTextContent("First");
@@ -492,7 +628,68 @@ describe("Transcript", () => {
       />,
     );
 
-    expect(screen.getByText("Working on pnpm test")).toBeInTheDocument();
+    expect(screen.getByText("Running pnpm test")).toBeInTheDocument();
+  });
+
+  it("shows Reading with a file basename in the live narration line", () => {
+    render(
+      <Transcript
+        events={[
+          event("user-1", "user", "Inspect the transcript"),
+          {
+            ...event("read-1", "tool", "apps/desktop/src/components/Transcript.tsx"),
+            activityType: "file",
+            title: "Read",
+            filePath: "apps/desktop/src/components/Transcript.tsx",
+            status: "running",
+          },
+        ]}
+        running
+      />,
+    );
+
+    expect(screen.getByText("Reading Transcript.tsx")).toBeInTheDocument();
+    expect(screen.queryByText(/Working on/)).not.toBeInTheDocument();
+  });
+
+  it("shows Editing with a file basename in the live narration line", () => {
+    render(
+      <Transcript
+        events={[
+          event("user-1", "user", "Update the styles"),
+          {
+            ...event("edit-1", "tool", "apps/desktop/src/styles.css"),
+            activityType: "file",
+            title: "Editing",
+            filePath: "apps/desktop/src/styles.css",
+            status: "running",
+          },
+        ]}
+        running
+      />,
+    );
+
+    expect(screen.getByText("Editing styles.css")).toBeInTheDocument();
+  });
+
+  it("omits empty JSON placeholders from the live narration line", () => {
+    render(
+      <Transcript
+        events={[
+          event("user-1", "user", "Inspect something"),
+          {
+            ...event("read-1", "tool", "{}"),
+            activityType: "tool",
+            title: "Read",
+            status: "running",
+          },
+        ]}
+        running
+      />,
+    );
+
+    expect(screen.getByText("Reading a file")).toBeInTheDocument();
+    expect(screen.queryByText(/\{\}/)).not.toBeInTheDocument();
   });
 
   it("moves a trailing activity batch into the single live status row", () => {
@@ -523,14 +720,10 @@ describe("Transcript", () => {
     // The batch renders only inside the live status row, not as its own
     // transcript entry.
     expect(document.querySelectorAll(".activity-event--group")).toHaveLength(0);
-    expect(screen.getByText("Activity")).toBeInTheDocument();
-    expect(screen.getByText("3 tools")).toBeInTheDocument();
-    expect(document.querySelector(".task-now-current")).toHaveTextContent(
-      "Working on Tool call · Tool activity",
-    );
+    expect(screen.getByText("Using a tool")).toBeInTheDocument();
 
     // Opening the live row streams the batch's children as activity rows.
-    fireEvent.click(screen.getByRole("button", { name: /Activity.*3 tools/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Using a tool/ }));
     const stream = document.querySelector(".task-now-stream");
     expect(stream).not.toBeNull();
     expect(within(stream as HTMLElement).getByText("Tool call")).toBeInTheDocument();

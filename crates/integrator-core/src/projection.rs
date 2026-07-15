@@ -112,6 +112,34 @@ pub struct FileChangeProjection {
     pub patch: Option<String>,
 }
 
+/// Codex (and compatible hosts) classify assistant text as mid-turn commentary
+/// or the turn's final answer. Absent when the runtime does not emit a phase.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMessagePhase {
+    Commentary,
+    FinalAnswer,
+}
+
+impl AgentMessagePhase {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Commentary => "commentary",
+            Self::FinalAnswer => "final_answer",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "commentary" => Some(Self::Commentary),
+            "final_answer" => Some(Self::FinalAnswer),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ItemProjection {
@@ -124,6 +152,9 @@ pub struct ItemProjection {
     /// Provider-native skill verified by the trusted host for this user item.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_skill: Option<String>,
+    /// Present for `agentMessage` when the host reports commentary vs final answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<AgentMessagePhase>,
     pub command: Option<String>,
     pub cwd: Option<String>,
     pub output: Option<String>,

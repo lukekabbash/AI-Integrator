@@ -1222,20 +1222,24 @@ function ApprovalControl({
       data-auto={autoApproving || undefined}
       aria-labelledby={`approval-${approval.id}`}
     >
-      <div className="approval-icon" aria-hidden="true">
-        {isPlan ? <ClipboardList /> : isCommand ? <TerminalSquare /> : <FileDiff />}
-      </div>
+      <header className="approval-header">
+        <div className="approval-icon" aria-hidden="true">
+          {isPlan ? <ClipboardList /> : isCommand ? <TerminalSquare /> : <FileDiff />}
+        </div>
+        <div className="approval-heading">
+          <span className="approval-kicker">
+            {autoApproving ? "Auto-approving — full access is on" : "Approval required"}
+          </span>
+          <h3 id={`approval-${approval.id}`}>
+            {isPlan
+              ? "Approve this plan?"
+              : isCommand
+                ? "Run this command?"
+                : "Apply these file changes?"}
+          </h3>
+        </div>
+      </header>
       <div className="approval-body">
-        <span className="approval-kicker">
-          {autoApproving ? "Auto-approving — full access is on" : "Approval required"}
-        </span>
-        <h3 id={`approval-${approval.id}`}>
-          {isPlan
-            ? "Approve this plan?"
-            : isCommand
-              ? "Run this command?"
-              : "Apply these file changes?"}
-        </h3>
         {isPlan ? (
           <>
             {approval.reason ? <p>{approval.reason}</p> : null}
@@ -4530,15 +4534,14 @@ export default function App() {
     });
   }, [projectedTranscript, activeTask?.model, eventModels]);
 
-  /** Re-sends the prompt behind the latest reply using the task's own routing. */
-  const regenerateLatest = async () => {
+  /** Re-sends the prompt behind a turn-final reply using the task's own routing. */
+  const regenerateFrom = async (eventId: string) => {
     if (!activeTask) return;
-    const lastAssistantIndex = projectedTranscript.reduce(
-      (latest, event, index) => (event.kind === "assistant" ? index : latest),
-      -1,
+    const assistantIndex = projectedTranscript.findIndex(
+      (event) => event.id === eventId && event.kind === "assistant",
     );
-    if (lastAssistantIndex < 0) return;
-    const priorUser = [...projectedTranscript.slice(0, lastAssistantIndex)]
+    if (assistantIndex < 0) return;
+    const priorUser = [...projectedTranscript.slice(0, assistantIndex)]
       .reverse()
       .find((event) => event.kind === "user");
     if (!priorUser) return;
@@ -5191,7 +5194,7 @@ export default function App() {
                                 showTimestamps={
                                   localSettings["transcript.showTimestamps"] !== false
                                 }
-                                onRegenerate={() => void regenerateLatest()}
+                                onRegenerate={(eventId) => void regenerateFrom(eventId)}
                                 onBranch={(eventId) => void forkTask(activeTask.id, eventId)}
                                 onEditUserMessage={(eventId, body) =>
                                   void editUserMessage(eventId, body)

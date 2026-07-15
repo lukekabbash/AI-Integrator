@@ -179,6 +179,7 @@ pub fn reduce_provider_event(input: ProviderEventInput) -> Result<Option<Reduced
                 title: Some("File changes".into()),
                 body: None,
                 native_skill: None,
+                phase: None,
                 command: None,
                 cwd: None,
                 output: None,
@@ -342,6 +343,7 @@ fn parse_item(
         title: None,
         body: None,
         native_skill: None,
+        phase: None,
         command: None,
         cwd: None,
         output: None,
@@ -370,6 +372,10 @@ fn parse_item(
             );
             projection.body = Some(body);
             projection.truncated = truncated;
+            projection.phase = value
+                .get("phase")
+                .and_then(Value::as_str)
+                .and_then(integrator_core::AgentMessagePhase::parse);
         }
         "plan" => {
             projection.kind = ItemKind::ReasoningSummary;
@@ -949,6 +955,7 @@ pub fn reduce_acp_update(
                 },
                 body: None,
                 native_skill: None,
+                phase: None,
                 command: None,
                 cwd: None,
                 output,
@@ -1214,6 +1221,87 @@ mod tests {
         assert!(
             matches!(event.mutation, ProjectionMutation::ReplaceItem(ItemProjection { kind: ItemKind::AgentMessage, body: Some(ref body), .. }) if body == "Done")
         );
+    }
+
+    #[test]
+    fn agent_message_phase_is_projected_from_item_events() {
+        let commentary = reduce_provider_event(ProviderEventInput {
+            method: "item/started".into(),
+            params: json!({
+                "threadId": "th1",
+                "turnId": "tu1",
+                "item": {
+                    "type": "agentMessage",
+                    "id": "it-commentary",
+                    "text": "Working on it…",
+                    "phase": "commentary"
+                }
+            }),
+            request_id: None,
+            occurred_at: Utc::now(),
+        })
+        .expect("reduce")
+        .expect("accepted");
+        assert!(matches!(
+            commentary.mutation,
+            ProjectionMutation::ReplaceItem(ItemProjection {
+                kind: ItemKind::AgentMessage,
+                phase: Some(integrator_core::AgentMessagePhase::Commentary),
+                ..
+            })
+        ));
+
+        let final_answer = reduce_provider_event(ProviderEventInput {
+            method: "item/completed".into(),
+            params: json!({
+                "threadId": "th1",
+                "turnId": "tu1",
+                "item": {
+                    "type": "agentMessage",
+                    "id": "it-final",
+                    "text": "Done.",
+                    "phase": "final_answer"
+                }
+            }),
+            request_id: None,
+            occurred_at: Utc::now(),
+        })
+        .expect("reduce")
+        .expect("accepted");
+        assert!(matches!(
+            final_answer.mutation,
+            ProjectionMutation::ReplaceItem(ItemProjection {
+                kind: ItemKind::AgentMessage,
+                phase: Some(integrator_core::AgentMessagePhase::FinalAnswer),
+                ..
+            })
+        ));
+
+        let unknown = reduce_provider_event(ProviderEventInput {
+            method: "item/completed".into(),
+            params: json!({
+                "threadId": "th1",
+                "turnId": "tu1",
+                "item": {
+                    "type": "agentMessage",
+                    "id": "it-legacy",
+                    "text": "Legacy reply",
+                    "phase": "something_else"
+                }
+            }),
+            request_id: None,
+            occurred_at: Utc::now(),
+        })
+        .expect("reduce")
+        .expect("accepted");
+        assert!(matches!(
+            unknown.mutation,
+            ProjectionMutation::ReplaceItem(ItemProjection {
+                kind: ItemKind::AgentMessage,
+                phase: None,
+                ..
+            })
+        ));
     }
 
     #[test]

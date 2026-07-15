@@ -1199,6 +1199,9 @@ fn apply_mutation(
             if update.native_skill.is_some() {
                 item.native_skill = update.native_skill.clone();
             }
+            if update.phase.is_some() {
+                item.phase = update.phase.clone();
+            }
             if update.output.is_some() {
                 item.output = update.output.clone();
             }
@@ -1241,6 +1244,7 @@ fn apply_mutation(
                 title: None,
                 body: None,
                 native_skill: None,
+                phase: None,
                 command: None,
                 cwd: None,
                 output: None,
@@ -1842,6 +1846,7 @@ mod tests {
                 title: None,
                 body: Some(body.into()),
                 native_skill: None,
+                phase: None,
                 command: None,
                 cwd: None,
                 output: None,

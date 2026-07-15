@@ -2043,24 +2043,20 @@ kbd {
   color: var(--color-text-tertiary);
   font-size: 10px;
 }
+/* Sits on the same column as the composer (24px side inset, 780px cap). */
 .approval-control {
-  width: min(100%, 780px);
+  width: min(calc(100% - 48px), 780px);
   box-sizing: border-box;
-  margin: 0 auto 10px;
-  padding: 14px 16px;
-  display: flex;
-  align-items: flex-start;
-  gap: 13px;
-  border: 1px solid color-mix(in srgb, var(--color-warning) 42%, var(--color-border-subtle));
-  border-radius: 14px;
-  background:
-    linear-gradient(
-      180deg,
-      color-mix(in srgb, var(--color-warning) 8%, transparent),
-      transparent 70%
-    ),
-    var(--color-layer-1);
-  box-shadow: 0 12px 30px color-mix(in srgb, black 18%, transparent);
+  margin: 0 auto 8px;
+  padding: 12px 14px;
+  display: grid;
+  gap: 10px;
+  border: 1px solid color-mix(in srgb, var(--color-warning) 28%, var(--color-border-subtle));
+  border-radius: var(--radius-composer, 16px);
+  background: color-mix(in srgb, var(--color-warning) 5%, var(--color-layer-1));
+  box-shadow:
+    0 8px 22px color-mix(in srgb, black 12%, transparent),
+    inset 0 1px color-mix(in srgb, white 3%, transparent);
   animation: approval-enter 180ms ease-out;
 }
 @keyframes approval-enter {
@@ -2093,125 +2089,126 @@ kbd {
   }
 }
 .approval-control[data-auto] {
-  border-color: color-mix(in srgb, var(--color-accent) 42%, var(--color-border-subtle));
-  background:
-    linear-gradient(
-      180deg,
-      color-mix(in srgb, var(--color-accent) 8%, transparent),
-      transparent 70%
-    ),
-    var(--color-layer-1);
+  border-color: color-mix(in srgb, var(--color-accent) 28%, var(--color-border-subtle));
+  background: color-mix(in srgb, var(--color-accent) 5%, var(--color-layer-1));
+}
+.approval-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
 }
 .approval-icon {
   flex: none;
-  width: 32px;
-  height: 32px;
+  width: 28px;
+  height: 28px;
   display: grid;
   place-items: center;
-  border-radius: 9px;
-  border: 1px solid color-mix(in srgb, var(--color-warning) 35%, transparent);
-  background: color-mix(in srgb, var(--color-warning) 12%, transparent);
+  border-radius: var(--radius-control, 9px);
+  border: 1px solid color-mix(in srgb, var(--color-warning) 28%, transparent);
+  background: color-mix(in srgb, var(--color-warning) 10%, transparent);
   color: var(--color-warning);
 }
 .approval-control[data-auto] .approval-icon {
-  border-color: color-mix(in srgb, var(--color-accent) 35%, transparent);
-  background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+  border-color: color-mix(in srgb, var(--color-accent) 28%, transparent);
+  background: color-mix(in srgb, var(--color-accent) 10%, transparent);
   color: var(--color-accent);
 }
 .approval-icon svg {
-  width: 16px;
+  width: 14px;
+  height: 14px;
 }
-.approval-body {
-  flex: 1;
+.approval-heading {
   min-width: 0;
   display: grid;
-  gap: 4px;
+  gap: 1px;
+}
+.approval-kicker {
+  color: var(--color-warning);
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.approval-control[data-auto] .approval-kicker {
+  color: var(--color-accent);
 }
 .approval-control h3 {
   margin: 0;
+  color: var(--color-text-primary);
   font-size: 13px;
+  font-weight: 600;
   letter-spacing: -0.01em;
+  line-height: 1.3;
+}
+.approval-body {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
 }
 .approval-control p {
   margin: 0;
   color: var(--color-text-secondary);
-  font-size: 11px;
+  font-size: 11.5px;
+  line-height: 1.45;
 }
-.approval-command {
-  display: block;
-  max-height: 72px;
-  overflow: auto;
-  padding: 7px 9px;
-  border: 1px solid var(--color-border-subtle);
-  border-radius: 8px;
-  background: color-mix(in srgb, black 22%, transparent);
-  color: var(--color-text-primary);
-  font-family: var(--font-code);
-  font-size: 11px;
-  line-height: 1.55;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
+.approval-command,
 .approval-plan {
   display: block;
   margin: 0;
-  max-height: 240px;
   overflow: auto;
   padding: 8px 10px;
   border: 1px solid var(--color-border-subtle);
-  border-radius: 8px;
-  background: color-mix(in srgb, black 22%, transparent);
+  border-radius: var(--radius-control, 9px);
+  background: color-mix(in srgb, var(--color-canvas) 72%, var(--color-layer-2));
   color: var(--color-text-primary);
   font-family: var(--font-code);
-  font-size: 11px;
-  line-height: 1.55;
+  font-size: 11.5px;
+  line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
+}
+.approval-command {
+  max-height: 88px;
+}
+.approval-plan {
+  max-height: 220px;
 }
 .approval-files {
   margin: 0;
   padding: 0;
   list-style: none;
   display: grid;
-  gap: 2px;
-  max-height: 72px;
+  gap: 3px;
+  max-height: 88px;
   overflow: auto;
 }
 .approval-files code {
   font-family: var(--font-code);
-  font-size: 10.5px;
+  font-size: 11px;
   color: var(--color-text-secondary);
 }
 .approval-cwd {
   color: var(--color-text-tertiary);
   font-family: var(--font-code);
-  font-size: 9.5px;
+  font-size: 10px;
 }
 .approval-failed {
   color: var(--color-danger);
-  font-size: 10.5px;
-}
-.approval-kicker {
-  color: var(--color-warning);
-  font-size: 9px;
-  font-weight: 750;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-.approval-control[data-auto] .approval-kicker {
-  color: var(--color-accent);
+  font-size: 11px;
 }
 .approval-actions {
   display: flex;
-  flex: none;
-  align-self: center;
-  gap: 7px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
 }
 .approval-actions button {
-  height: 30px;
+  height: 28px;
   min-width: auto;
   padding-inline: 11px;
-  font-size: 10.5px;
+  font-size: 11px;
 }
 .approval-decline:hover:not(:disabled) {
   border-color: color-mix(in srgb, var(--color-danger) 50%, var(--color-border-base));
@@ -2314,6 +2311,9 @@ kbd {
 .transcript-virtual-row > .inline-notice {
   margin-top: 0;
   margin-bottom: 0;
+}
+.transcript-row {
+  width: 100%;
 }
 .transcript-search-shell {
   position: sticky;
@@ -2870,6 +2870,15 @@ kbd {
   line-height: 1.6;
   overflow-wrap: anywhere;
 }
+.turn--assistant-interim {
+  color: var(--color-text-secondary);
+  font-style: italic;
+}
+.turn--assistant-interim code,
+.turn--assistant-interim pre,
+.turn--assistant-interim kbd {
+  font-style: normal;
+}
 .turn--assistant p {
   margin: 0 0 9px;
 }
@@ -3104,12 +3113,40 @@ kbd {
   outline-offset: 1px;
 }
 /* The chevron belongs to the row's disclosure control so the label and icon
-   share one hover surface and one click target. */
+   share one hover surface and one click target. Closed rows: meta sits in the
+   caret seat (like chat pins); hover scooches meta left and fades the caret
+   in. Open rows keep both settled. */
 .activity-event-disclosure {
   width: 18px;
   height: 26px;
   display: inline-grid;
   place-items: center;
+  opacity: 0;
+  transition: opacity 0.16s cubic-bezier(0.2, 0, 0, 1);
+}
+.activity-event-meta {
+  display: inline-flex;
+  align-items: center;
+  justify-self: end;
+  gap: 7px;
+  transform: translateX(18px);
+  transition: transform 0.16s cubic-bezier(0.2, 0, 0, 1);
+}
+.activity-event-toggle:hover .activity-event-disclosure,
+.activity-event-toggle:focus-visible .activity-event-disclosure,
+.activity-event-disclosure--open {
+  opacity: 1;
+}
+.activity-event-toggle:hover .activity-event-meta,
+.activity-event-toggle:focus-visible .activity-event-meta,
+.activity-event-toggle[aria-expanded="true"] .activity-event-meta {
+  transform: translateX(0);
+}
+@media (prefers-reduced-motion: reduce) {
+  .activity-event-disclosure,
+  .activity-event-meta {
+    transition: none;
+  }
 }
 .activity-file-name {
   min-width: 0;
@@ -3225,11 +3262,6 @@ kbd {
   color: var(--color-text-tertiary);
   font-size: 10.5px;
   white-space: nowrap;
-}
-.activity-event-meta {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
 }
 .activity-diff-stats,
 .git-line-summary {
@@ -8509,13 +8541,14 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
 .project-new-chat svg {
   width: 14px;
 }
-/* At rest the pin sits just left of the chat count, in the slot `…` will take;
-   on hover it scooches left so `…`/`+` can fade in — same motion as chat pins. */
+/* At rest the pin shares a vertical with the count/`+`; on hover it nudges
+   left just enough for `…`/`+` — 20px scooch, same rhythm as chat pins. */
 .project-pin-button {
   position: absolute;
   z-index: 1;
   top: 50%;
-  right: 48px;
+  /* Hover seat: 4px into the `…` column so the pair stays tight. */
+  right: 44px;
   width: 24px;
   height: 24px;
   padding: 0;
@@ -8909,15 +8942,16 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
 .chat-row[data-status="failed"] .chat-row-copy > small {
   color: var(--color-danger);
 }
-/* At rest the pin sits far right, in the slot the hidden `...` button will
-   occupy; on hover it scooches left to its grid spot so the `...` fades in
-   where the pin just was. Search rows have no `...`, so the pin stays put. */
+/* At rest the pin shares a vertical with project count/`+` (and the chat
+   `…` that replaces it on hover). On hover it nudges 20px left — tight to
+   the `…`, not a full control-width jump. Search rows have no `…`, so the
+   pin stays put. */
 .chat-pin-button {
   position: absolute;
   z-index: 2;
   top: 50%;
-  /* Natural seat just left of the 24px `…` control at right: 4px. */
-  right: 28px;
+  /* Hover seat: 4px into the `…` box (right: 4px, 24px wide) for a tight pair. */
+  right: 24px;
   width: 24px;
   height: 24px;
   padding: 0;
@@ -8928,7 +8962,7 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   color: var(--color-text-tertiary);
   background: transparent;
   cursor: pointer;
-  /* At rest, occupy the `…` seat; on hover scooch left so `…` can fade in. */
+  /* At rest: right 24 − 20 = 4, flush with the trailing control column. */
   transform: translate(20px, -50%);
   transition:
     transform 0.16s cubic-bezier(0.2, 0, 0, 1),
@@ -9582,8 +9616,9 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   .chat-action-menu--up {
     transform-origin: bottom right;
   }
+  .transcript > .transcript-row > .turn,
+  .transcript > .transcript-row > .inline-notice,
   .transcript > .turn,
-  .transcript > .activity-event,
   .transcript > .inline-notice {
     animation: content-enter var(--duration-fast) var(--ease-standard) both;
   }

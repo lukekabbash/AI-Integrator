@@ -2033,6 +2033,7 @@ fn emit_child_turn_started(
             title: None,
             body: Some(redact_and_bound(prompt, 2 * 1024 * 1024).0),
             native_skill: None,
+            phase: None,
             command: None,
             cwd: None,
             output: None,

@@ -53,7 +53,7 @@ describe("sidebar shell corners", () => {
 
   it("scooches the project pin left of the count the same way chat pins yield to …", () => {
     expect(rule(".project-pin")).toContain("width: 11px");
-    expect(rule(".project-pin-button")).toContain("right: 48px");
+    expect(rule(".project-pin-button")).toContain("right: 44px");
     expect(rule(".project-pin-button")).toContain("transform: translate(20px, -50%)");
     expect(
       rule(

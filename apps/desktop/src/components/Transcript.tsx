@@ -11,12 +11,11 @@ import {
 import { useVirtualizer, type Range } from "@tanstack/react-virtual";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { AnimatePresence, m as motion } from "motion/react";
+import { AnimatePresence, m as motion, useReducedMotion } from "motion/react";
 import {
   BookOpen,
   Check,
   ChevronDown,
-  ChevronRight,
   ChevronUp,
   Circle,
   Copy,
@@ -65,8 +64,8 @@ interface TranscriptProps {
   modelForEvent?: (event: TranscriptEvent) => string | undefined;
   /** Per-message clock times in the reply action row. Defaults to on. */
   showTimestamps?: boolean;
-  /** Re-runs the prompt that produced the latest assistant reply. */
-  onRegenerate?: () => void;
+  /** Re-runs the prompt that produced a turn-final assistant reply. */
+  onRegenerate?: (eventId: string) => void;
   /** Copies the chat up to this reply into a new one to follow up in. */
   onBranch?: (eventId: string) => void;
   /**
@@ -289,6 +288,7 @@ const UserMessage = memo(function UserMessage({
         ) : null}
         <div className="message-actions">
           <Tooltip
+            placement="bottom"
             label={
               copyFailed ? "Clipboard unavailable" : copied ? "Copied" : "Copy message"
             }
@@ -303,7 +303,11 @@ const UserMessage = memo(function UserMessage({
             </button>
           </Tooltip>
           {canEdit ? (
-            <Tooltip label="Edit" hint="Return to composer and continue from here">
+            <Tooltip
+              placement="bottom"
+              label="Edit"
+              hint="Return to composer and continue from here"
+            >
               <button
                 type="button"
                 onClick={() => onEdit(id, body)}
@@ -327,8 +331,8 @@ const AssistantMessage = memo(function AssistantMessage({
   showTimestamp,
   copied,
   copyFailed,
-  isLatestAssistant,
   running,
+  interim,
   canRegenerate,
   canBranch,
   canAskAbout,
@@ -344,82 +348,100 @@ const AssistantMessage = memo(function AssistantMessage({
   showTimestamp: boolean;
   copied: boolean;
   copyFailed: boolean;
-  isLatestAssistant: boolean;
   running: boolean;
+  /** Mid-turn narration: no model/actions/timestamp, quieter italic body. */
+  interim?: boolean;
   canRegenerate: boolean;
   canBranch: boolean;
   canAskAbout: boolean;
   onCopy: (id: string, body: string) => void;
-  onRegenerate: () => void;
+  onRegenerate: (id: string) => void;
   onBranch: (id: string) => void;
   onAskAbout: (body: string) => void;
 }) {
-  const clock = showTimestamp ? formatClock(timestamp) : "";
-  const showTurnActions = canBranch && !running;
+  const clock = !interim && showTimestamp ? formatClock(timestamp) : "";
+  const showTurnActions = !interim && canBranch;
+  // One tree for interim + final so flipping quiet→chrome does not remount
+  // the markdown and interrupt streaming.
   return (
-    <section className="turn turn--assistant" data-event-id={id} aria-label="Agent response">
-      {modelLabel ? (
+    <section
+      className={`turn turn--assistant${interim ? " turn--assistant-interim" : ""}`}
+      data-event-id={id}
+      aria-label={interim ? "Agent progress" : "Agent response"}
+    >
+      {!interim && modelLabel ? (
         <header className="turn-attribution">
           <span className="turn-attribution-model">{modelLabel}</span>
         </header>
       ) : null}
       <MarkdownBody body={body} streaming={running} />
-      <div className="message-footer message-footer--assistant">
-        <div className="message-actions">
-          <Tooltip
-            label={
-              copyFailed ? "Clipboard unavailable" : copied ? "Copied" : "Copy response"
-            }
-          >
-            <button
-              type="button"
-              className={copied ? "is-copied" : undefined}
-              onClick={() => onCopy(id, body)}
-              aria-label="Copy this response"
+      {!interim ? (
+        <div className="message-footer message-footer--assistant">
+          <div className="message-actions">
+            <Tooltip
+              placement="bottom"
+              label={
+                copyFailed ? "Clipboard unavailable" : copied ? "Copied" : "Copy response"
+              }
             >
-              {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
-            </button>
-          </Tooltip>
-          {showTurnActions ? (
-            <Tooltip label="Branch" hint="Continue in a copy that ends here">
               <button
                 type="button"
-                onClick={() => onBranch(id)}
-                aria-label="Branch the chat from this response"
+                className={copied ? "is-copied" : undefined}
+                onClick={() => onCopy(id, body)}
+                aria-label="Copy this response"
               >
-                <GitBranch aria-hidden="true" />
+                {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
               </button>
             </Tooltip>
-          ) : null}
-          {showTurnActions && canRegenerate && isLatestAssistant ? (
-            <Tooltip label="Regenerate" hint="Run the same prompt again">
-              <button
-                type="button"
-                onClick={onRegenerate}
-                aria-label="Regenerate this response"
+            {showTurnActions ? (
+              <Tooltip
+                placement="bottom"
+                label="Branch"
+                hint="Continue in a copy that ends here"
               >
-                <RefreshCw aria-hidden="true" />
-              </button>
-            </Tooltip>
-          ) : null}
-          {showTurnActions && canAskAbout ? (
-            <Tooltip label="Ask about this" hint="Draft a follow-up in the composer">
-              <button
-                type="button"
-                onClick={() => onAskAbout(body)}
-                aria-label="Ask a follow-up about this response"
+                <button
+                  type="button"
+                  onClick={() => onBranch(id)}
+                  aria-label="Branch the chat from this response"
+                >
+                  <GitBranch aria-hidden="true" />
+                </button>
+              </Tooltip>
+            ) : null}
+            {showTurnActions && canRegenerate ? (
+              <Tooltip placement="bottom" label="Regenerate" hint="Run the same prompt again">
+                <button
+                  type="button"
+                  onClick={() => onRegenerate(id)}
+                  aria-label="Regenerate this response"
+                >
+                  <RefreshCw aria-hidden="true" />
+                </button>
+              </Tooltip>
+            ) : null}
+            {showTurnActions && canAskAbout ? (
+              <Tooltip
+                placement="bottom"
+                label="Ask about this"
+                hint="Draft a follow-up in the composer"
               >
-                <MessageCircleQuestion aria-hidden="true" />
-              </button>
-            </Tooltip>
+                <button
+                  type="button"
+                  onClick={() => onAskAbout(body)}
+                  aria-label="Ask a follow-up about this response"
+                >
+                  <MessageCircleQuestion aria-hidden="true" />
+                </button>
+              </Tooltip>
+            ) : null}
+          </div>
+          {clock ? (
+            <time className="message-time" dateTime={timestamp}>
+              {clock}
+            </time>
           ) : null}
         </div>
-        {clock ? (
-          <time className="message-time" dateTime={timestamp}>
-            {clock}
-          </time>
-        ) : null}
-      </div>
+      ) : null}
     </section>
   );
 });
@@ -558,14 +580,10 @@ const ActivityEvent = memo(function ActivityEventRow({
     if (expandable) onExpandedChange(event.id, !expanded);
   };
   return (
-    <motion.div
+    <div
       className={`activity-event${hasChildren ? " activity-event--group" : ""}${nested ? " activity-event--nested" : ""}${isWorkedFor ? " activity-event--worked-for" : ""}`}
       data-event-id={event.id}
       data-status={event.status ?? "neutral"}
-      initial={isWorkedFor ? { opacity: 0, y: -6 } : false}
-      animate={{ opacity: 1, y: 0 }}
-      exit={isWorkedFor ? { opacity: 0, height: 0, marginBottom: 0 } : undefined}
-      transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
     >
       <div className="activity-event-summary">
         <div
@@ -607,6 +625,7 @@ const ActivityEvent = memo(function ActivityEventRow({
           </span>
           {event.changeStats || event.meta ? (
             <span className="activity-event-meta">
+              {event.meta ? <span className="activity-meta">{event.meta}</span> : null}
               {event.changeStats ? (
                 <span
                   className="activity-diff-stats"
@@ -616,13 +635,15 @@ const ActivityEvent = memo(function ActivityEventRow({
                   <b>−{event.changeStats.deletions}</b>
                 </span>
               ) : null}
-              {event.meta ? <span className="activity-meta">{event.meta}</span> : null}
             </span>
           ) : null}
-          <span className="activity-event-disclosure" aria-hidden="true">
+          <span
+            className={`activity-event-disclosure${expanded ? " activity-event-disclosure--open" : ""}`}
+            aria-hidden="true"
+          >
             {expandable ? (
-              <ChevronRight
-                className={expanded ? "disclosure disclosure--open-right" : "disclosure"}
+              <ChevronDown
+                className={expanded ? "disclosure disclosure--open" : "disclosure"}
               />
             ) : null}
           </span>
@@ -705,7 +726,7 @@ const ActivityEvent = memo(function ActivityEventRow({
           </motion.div>
         ) : null}
       </AnimatePresence>
-    </motion.div>
+    </div>
   );
 });
 
@@ -835,6 +856,13 @@ export function Transcript({
   const liveActivity = running ? findTrailingActivity(events) : undefined;
   const renderedEventCount = events.length - (liveActivity ? 1 : 0);
   renderedEventCountRef.current = renderedEventCount;
+  const reduceMotion =
+    Boolean(useReducedMotion()) ||
+    (typeof document !== "undefined" && document.documentElement.dataset.motion === "none");
+  const foldTransition = {
+    duration: reduceMotion ? 0.01 : 0.26,
+    ease: [0.22, 1, 0.36, 1] as const,
+  };
   const virtualizationEnabled =
     virtualizationAllowed &&
     renderedEventCount > VIRTUALIZATION_THRESHOLD &&
@@ -953,9 +981,10 @@ export function Transcript({
     if (!container || !content) return undefined;
     const rows = virtualizationEnabled
       ? Array.from(content.querySelectorAll<HTMLElement>(".transcript-virtual-row"))
-      : Array.from(content.children).filter(
-          (child): child is HTMLElement =>
-            child instanceof HTMLElement && Boolean(child.dataset.eventId),
+      : Array.from(
+          content.querySelectorAll<HTMLElement>(
+            ":scope > .transcript-row > [data-event-id], :scope > [data-event-id]",
+          ),
         );
     const viewport = container.getBoundingClientRect();
     const visible = rows
@@ -1277,7 +1306,7 @@ export function Transcript({
   }, []);
 
   const askAbout = useCallback((body: string) => askAboutRef.current?.(body), []);
-  const regenerate = useCallback(() => regenerateRef.current?.(), []);
+  const regenerate = useCallback((eventId: string) => regenerateRef.current?.(eventId), []);
   const branch = useCallback((id: string) => branchRef.current?.(id), []);
   const editUser = useCallback(
     (id: string, body: string) => editUserRef.current?.(id, body),
@@ -1293,7 +1322,6 @@ export function Transcript({
     if (event.kind === "user") {
       return (
         <UserMessage
-          key={event.id}
           id={event.id}
           body={event.body}
           nativeSkill={event.nativeSkill}
@@ -1310,20 +1338,31 @@ export function Transcript({
     }
     if (event.kind === "assistant") {
       const isLatestAssistant = event.id === lastAssistantId;
+      const isTurnFinal = turnFinalAssistantIds.has(event.id);
+      const openTurnIndex = latestUserId
+        ? events.findIndex((candidate) => candidate.id === latestUserId)
+        : -1;
+      const assistantIndex = events.findIndex((candidate) => candidate.id === event.id);
+      const inOpenTurn =
+        openTurnIndex < 0 ? true : assistantIndex > openTurnIndex;
+      // Live tip of the open turn — Branch/Regenerate stay withheld until settle
+      // even when phase marks the text as the final answer (so it can stream
+      // non-italic with chrome while actions wait for the turn to finish).
+      const streamingLiveTip = running && isLatestAssistant && inOpenTurn;
+      const interim = isAssistantInterim(event.phase, isTurnFinal, streamingLiveTip);
       return (
         <AssistantMessage
-          key={event.id}
           id={event.id}
           body={event.body}
           timestamp={event.timestamp}
-          modelLabel={modelForEvent?.(event)}
+          modelLabel={!interim ? modelForEvent?.(event) : undefined}
           showTimestamp={showTimestamps}
           copied={copiedEventId === event.id}
           copyFailed={copyFailureId === event.id}
-          isLatestAssistant={isLatestAssistant}
-          running={isLatestAssistant && running}
+          running={streamingLiveTip}
+          interim={interim}
           canRegenerate={Boolean(onRegenerate)}
-          canBranch={Boolean(onBranch) && turnFinalAssistantIds.has(event.id)}
+          canBranch={Boolean(onBranch) && isTurnFinal && !streamingLiveTip}
           canAskAbout={Boolean(onAskAbout)}
           onCopy={copyMessage}
           onRegenerate={regenerate}
@@ -1333,17 +1372,47 @@ export function Transcript({
       );
     }
     if (event.kind === "notice") {
-      return <NoticeMessage key={event.id} id={event.id} title={event.title} body={event.body} />;
+      return <NoticeMessage id={event.id} title={event.title} body={event.body} />;
     }
     return (
       <ActivityEvent
         event={event}
-        key={event.id}
         isExpanded={isActivityExpanded}
         onExpandedChange={setActivityExpanded}
         onOpenFile={onOpenFile ? openFile : undefined}
         onAddDiffSelection={onAddDiffSelection ? addDiffSelection : undefined}
       />
+    );
+  };
+
+  const renderAnimatedTranscriptRow = (event: TranscriptEvent) => {
+    const isWorkedFor = event.title === "Worked for";
+    const foldsAway = transcriptRowFoldsOnSettle(event, turnFinalAssistantIds);
+    return (
+      <motion.div
+        key={event.id}
+        className={`transcript-row${isWorkedFor ? " transcript-row--worked-for" : ""}`}
+        layout={!reduceMotion && !foldsAway && !isWorkedFor ? "position" : false}
+        initial={reduceMotion ? false : isWorkedFor ? { opacity: 0, height: 0 } : false}
+        animate={
+          reduceMotion
+            ? { opacity: 1 }
+            : isWorkedFor
+              ? { opacity: 1, height: "auto" }
+              : { opacity: 1 }
+        }
+        exit={
+          reduceMotion
+            ? { opacity: 0 }
+            : foldsAway
+              ? { opacity: 0, height: 0, marginTop: 0, marginBottom: 0 }
+              : { opacity: 0 }
+        }
+        transition={foldTransition}
+        style={foldsAway || isWorkedFor ? { overflow: "hidden" } : undefined}
+      >
+        {renderTranscriptEvent(event)}
+      </motion.div>
     );
   };
 
@@ -1447,65 +1516,78 @@ export function Transcript({
           })}
         </div>
       ) : (
-        events.slice(0, renderedEventCount).map(renderTranscriptEvent)
+        <AnimatePresence initial={false}>
+          {events.slice(0, renderedEventCount).map(renderAnimatedTranscriptRow)}
+        </AnimatePresence>
       )}
 
-      {running ? (
-        <div className="task-now">
-          <button
-            className="task-now-toggle"
-            type="button"
-            onClick={() =>
-              liveActivity && setLiveStream((current) => ({ ...current, open: !current.open }))
+      <AnimatePresence initial={false}>
+        {running ? (
+          <motion.div
+            key="task-now"
+            className="task-now"
+            initial={false}
+            exit={
+              reduceMotion
+                ? { opacity: 0 }
+                : { height: 0, opacity: 0, marginTop: 0, marginBottom: 0 }
             }
-            aria-expanded={liveActivity ? liveStreamOpen : undefined}
-            disabled={!liveActivity}
-            title={liveActivity ? "Show the live activity stream" : undefined}
+            transition={foldTransition}
+            style={{ overflow: "hidden" }}
           >
-            <span className="live-indicator" aria-hidden="true" />
-            <span className="task-now-line" role="status" aria-live="polite">
-              <AnimatePresence initial={false}>
-                <motion.span
-                  className="task-now-text"
-                  key={narrationKey}
-                  initial={{ opacity: 0, y: 14, filter: "blur(2px)" }}
-                  animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
-                  exit={{ opacity: 0, y: -14, filter: "blur(2px)" }}
-                  transition={{ duration: 0.32, ease: [0.32, 0.72, 0.24, 1] }}
-                >
-                  {liveActivity ? (
-                    <>
-                      <strong className="task-now-label">Activity</strong>
-                      <span className="task-now-summary">{firstLine(liveActivity.body)}</span>
-                      {currentActivityLabel ? (
-                        <span className="task-now-current">Working on {currentActivityLabel}</span>
-                      ) : null}
-                    </>
-                  ) : (
-                    <span className="task-now-label">
-                      {currentActivityLabel ? (
-                        `Working on ${currentActivityLabel}`
-                      ) : (
-                        <>
-                          Connecting
-                          <span className="task-now-ellipsis" aria-hidden="true">
-                            <span>.</span>
-                            <span>.</span>
-                            <span>.</span>
-                          </span>
-                        </>
-                      )}
-                    </span>
-                  )}
-                </motion.span>
-              </AnimatePresence>
-            </span>
-            {liveActivity ? (
-              <ChevronRight
-                className={liveStreamOpen ? "disclosure disclosure--open-right" : "disclosure"}
-              />
-            ) : null}
-          </button>
+          <Tooltip
+            label={
+              liveStreamOpen ? "Hide the live activity stream" : "Show the live activity stream"
+            }
+            disabled={!liveActivity}
+          >
+            <button
+              className="task-now-toggle"
+              type="button"
+              onClick={() =>
+                liveActivity && setLiveStream((current) => ({ ...current, open: !current.open }))
+              }
+              aria-expanded={liveActivity ? liveStreamOpen : undefined}
+              disabled={!liveActivity}
+            >
+              <span className="live-indicator" aria-hidden="true" />
+              <span className="task-now-line" role="status" aria-live="polite">
+                <AnimatePresence initial={false}>
+                  <motion.span
+                    className="task-now-text"
+                    key={narrationKey}
+                    initial={{ opacity: 0, y: 14, filter: "blur(2px)" }}
+                    animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                    exit={{ opacity: 0, y: -14, filter: "blur(2px)" }}
+                    transition={{ duration: 0.32, ease: [0.32, 0.72, 0.24, 1] }}
+                  >
+                    {currentActivityLabel ? (
+                      <span className="task-now-label">{currentActivityLabel}</span>
+                    ) : liveActivity ? (
+                      <>
+                        <strong className="task-now-label">Activity</strong>
+                        <span className="task-now-summary">{firstLine(liveActivity.body)}</span>
+                      </>
+                    ) : (
+                      <span className="task-now-label">
+                        Connecting
+                        <span className="task-now-ellipsis" aria-hidden="true">
+                          <span>.</span>
+                          <span>.</span>
+                          <span>.</span>
+                        </span>
+                      </span>
+                    )}
+                  </motion.span>
+                </AnimatePresence>
+              </span>
+              {liveActivity ? (
+                <ChevronDown
+                  className={liveStreamOpen ? "disclosure disclosure--open" : "disclosure"}
+                />
+              ) : null}
+            </button>
+          </Tooltip>
           <AnimatePresence initial={false}>
             {liveStreamOpen && liveActivity ? (
               <motion.div
@@ -1513,7 +1595,7 @@ export function Transcript({
                 initial={{ height: 0, opacity: 0 }}
                 animate={{ height: "auto", opacity: 1 }}
                 exit={{ height: 0, opacity: 0 }}
-                transition={{ duration: 0.22 }}
+                transition={{ duration: reduceMotion ? 0.01 : 0.22 }}
               >
                 {(liveActivity.children?.length ? liveActivity.children : [liveActivity]).map(
                   (child) => (
@@ -1537,8 +1619,9 @@ export function Transcript({
               </motion.div>
             ) : null}
           </AnimatePresence>
-        </div>
-      ) : null}
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
     </div>
   );
 }
@@ -1604,6 +1687,31 @@ function findTurnFinalAssistantIds(
   }
   if (pendingAssistantId) ids.add(pendingAssistantId);
   return ids;
+}
+
+/**
+ * Quiet italic for mid-turn narration. When the host reports `final_answer`,
+ * stream that reply with normal chrome even while the turn is still running.
+ * Without phase, the live tip stays interim until the turn settles.
+ */
+function isAssistantInterim(
+  phase: TranscriptEvent["phase"],
+  isTurnFinal: boolean,
+  streamingLiveTip: boolean,
+): boolean {
+  if (phase === "final_answer") return false;
+  if (!isTurnFinal) return true;
+  return streamingLiveTip;
+}
+
+/** Mid-turn rows that collapse into Worked for when a turn settles. */
+function transcriptRowFoldsOnSettle(
+  event: TranscriptEvent,
+  turnFinalAssistantIds: Set<string>,
+): boolean {
+  if (event.kind === "user" || event.kind === "notice") return false;
+  if (event.kind === "assistant") return !turnFinalAssistantIds.has(event.id);
+  return true;
 }
 
 function transcriptTailChanged(
@@ -1717,9 +1825,98 @@ function findActivityLeaf(event: TranscriptEvent): TranscriptEvent {
   return children?.length ? findActivityLeaf(children[children.length - 1]) : event;
 }
 
+const ACTIVITY_PLACEHOLDER_DETAILS = new Set([
+  "tool activity",
+  "tool call",
+  "command activity",
+  "activity",
+  "the task",
+  "file changes",
+  "runtime event",
+]);
+
+function isDisplayableActivityDetail(detail: string): boolean {
+  const trimmed = detail.trim();
+  if (!trimmed) return false;
+  if (trimmed === "{}" || trimmed === "[]" || trimmed === "{" || trimmed === "[") return false;
+  if (/^\{\s*\}$/.test(trimmed) || /^\[\s*\]$/.test(trimmed)) return false;
+  if (ACTIVITY_PLACEHOLDER_DETAILS.has(trimmed.toLowerCase())) return false;
+  return true;
+}
+
+function progressiveActivityVerb(event: TranscriptEvent): string {
+  const title = (event.title ?? "").trim();
+  const lower = title.toLowerCase();
+  const fromTitle: Record<string, string> = {
+    read: "Reading",
+    reads: "Reading",
+    reading: "Reading",
+    edit: "Editing",
+    edits: "Editing",
+    editing: "Editing",
+    edited: "Editing",
+    create: "Creating",
+    creating: "Creating",
+    created: "Creating",
+    added: "Adding",
+    deleted: "Deleting",
+    renamed: "Renaming",
+    changed: "Changing",
+    search: "Searching",
+    searches: "Searching",
+    searching: "Searching",
+    searched: "Searching",
+    command: "Running",
+    commands: "Running",
+    running: "Running",
+    "running a command": "Running",
+    "ran a command": "Running",
+    working: "Working",
+    activity: "Working",
+    "tool call": "Using a tool",
+  };
+  if (fromTitle[lower]) return fromTitle[lower];
+  if (/^(Checking|Starting|Sending|Collecting|Stopping|Using)\b/i.test(title)) return title;
+  if (/ing\b/i.test(title) && title.length < 48) return title;
+
+  const kind = activityGlyphKind(event);
+  if (kind === "read") return "Reading";
+  if (kind === "edit") return "Editing";
+  if (kind === "search") return "Searching";
+  if (kind === "command") return "Running";
+  if (kind === "approval") return "Waiting for approval";
+  if (kind === "reasoning") return "Thinking";
+  if (kind === "tool") return title || "Using a tool";
+  return title || "Working";
+}
+
+/** Live ticker copy: one progressive verb + one concrete target when available. */
 function describeCurrentActivity(event: TranscriptEvent): string {
+  const title = (event.title ?? "").trim();
+  // Integrator / provider sentence titles are already complete live copy.
+  if (
+    /^(Checking|Starting|Sending|Collecting|Stopping)\b/i.test(title) &&
+    title.includes(" ")
+  ) {
+    return title;
+  }
+
   const detail = activityDisplayBody(event);
-  if (event.activityType === "command" && detail) return detail;
-  if (event.title && detail && detail !== event.title) return `${event.title} · ${detail}`;
-  return event.title ?? detail ?? "the task";
+  const usableDetail = isDisplayableActivityDetail(detail) ? detail : undefined;
+  const verb = progressiveActivityVerb(event);
+
+  if (usableDetail) {
+    if (usableDetail.toLowerCase() === verb.toLowerCase()) return verb;
+    if (usableDetail.toLowerCase().startsWith(`${verb.toLowerCase()} `)) return usableDetail;
+    if (event.activityType === "command" || verb === "Running") return `Running ${usableDetail}`;
+    return `${verb} ${usableDetail}`;
+  }
+
+  if (verb === "Reading") return "Reading a file";
+  if (verb === "Editing" || verb === "Creating" || verb === "Adding") return `${verb} a file`;
+  if (verb === "Searching") return "Searching";
+  if (verb === "Running") return "Running a command";
+  if (verb === "Using a tool") return verb;
+  if (verb === "Waiting for approval" || verb === "Thinking") return verb;
+  return verb === "Working" ? "Working" : verb;
 }

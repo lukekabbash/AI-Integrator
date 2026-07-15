@@ -136,6 +136,11 @@ export interface TranscriptEvent {
   body: string;
   /** Present only when the native host verified that this user message invoked a real skill. */
   nativeSkill?: string;
+  /**
+   * Codex (and compatible hosts) classify assistant text as mid-turn commentary
+   * or the turn's final answer. Absent when the runtime does not emit a phase.
+   */
+  phase?: "commentary" | "final_answer";
   timestamp: string;
   status?: "running" | "success" | "warning" | "error" | "neutral";
   meta?: string;
@@ -649,6 +654,8 @@ export interface ItemProjection {
   body?: string;
   /** Verified provider-native skill invoked by this user item. */
   nativeSkill?: string;
+  /** Present for agentMessage when the host reports commentary vs final answer. */
+  phase?: "commentary" | "final_answer";
   command?: string;
   cwd?: string;
   output?: string;

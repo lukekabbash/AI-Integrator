@@ -430,27 +430,40 @@ function toolSummary(
         (action === "write" && typeof input.content === "string"
           ? { additions: lineCount(input.content), deletions: 0 }
           : undefined));
-  const fallback = item.body || item.toolInput?.split("\n", 1)[0] || "Tool activity";
+  const fallback = item.body || toolInputPreview(item.toolInput);
   const semanticTitle = semanticToolTitle(item);
-  if (semanticTitle) return { title: semanticTitle, body: path ?? fallback, changeStats };
+  if (semanticTitle) return { title: semanticTitle, body: path ?? fallback ?? "", changeStats };
   const running = item.status === "pending" || item.status === "inProgress";
-  if (action === "read") return { title: running ? "Reading" : "Read", body: path ?? fallback };
+  if (action === "read") return { title: running ? "Reading" : "Read", body: path ?? fallback ?? "" };
   if (action === "write")
-    return { title: running ? "Creating" : "Created", body: path ?? fallback, changeStats };
+    return { title: running ? "Creating" : "Created", body: path ?? fallback ?? "", changeStats };
   if (action === "edit")
-    return { title: running ? "Editing" : "Edited", body: path ?? fallback, changeStats };
+    return { title: running ? "Editing" : "Edited", body: path ?? fallback ?? "", changeStats };
   if (action === "search")
     return {
       title: running ? "Searching" : "Searched",
-      body: toolQuery(input) ?? path ?? fallback,
+      body: toolQuery(input) ?? path ?? fallback ?? "",
     };
   if (action === "execute")
-    return { title: running ? "Running a command" : "Ran a command", body: fallback };
+    return {
+      title: running ? "Running a command" : "Ran a command",
+      body: fallback ?? "",
+    };
   return {
     title: "Runtime event",
-    body: path ?? fallback,
+    body: path ?? fallback ?? "",
     changeStats,
   };
+}
+
+/** First line of tool input when it is human-meaningful; skip empty JSON shells. */
+function toolInputPreview(toolInput?: string): string | undefined {
+  if (!toolInput) return undefined;
+  const first = toolInput.split("\n", 1)[0]?.trim();
+  if (!first) return undefined;
+  if (first === "{}" || first === "[]" || first === "{" || first === "[") return undefined;
+  if (/^\{\s*\}$/.test(first) || /^\[\s*\]$/.test(first)) return undefined;
+  return first;
 }
 
 function itemBody(item: ItemProjection): string {
@@ -466,7 +479,7 @@ function itemBody(item: ItemProjection): string {
     return (
       item.body ||
       [item.mcpServer, item.mcpTool].filter(Boolean).join(" · ") ||
-      item.toolInput?.split("\n", 1)[0] ||
+      toolInputPreview(item.toolInput) ||
       "Tool call"
     );
   }
@@ -939,7 +952,9 @@ function deriveItemTranscriptEvents(
   };
 
   if (item.kind === "userMessage") return [{ ...common, kind: "user" }];
-  if (item.kind === "agentMessage") return [{ ...common, kind: "assistant" }];
+  if (item.kind === "agentMessage") {
+    return [{ ...common, kind: "assistant", phase: item.phase }];
+  }
   if (item.kind === "reasoningSummary") {
     const summary = item.body?.trim();
     if (!summary) return [];
