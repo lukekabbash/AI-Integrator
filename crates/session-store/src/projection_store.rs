@@ -32,6 +32,27 @@ pub struct PersistedStopRequest {
 }
 
 impl LocalStore {
+    /// Locate the durable turn that owns one provider tool-call identity.
+    /// ACP session/load replays old notifications without a turn id, so the
+    /// pump binds only already-known tool calls back to their original turn
+    /// instead of duplicating transcript text into the current turn.
+    pub fn turn_for_provider_item(
+        &self,
+        task_id: TaskId,
+        provider: ProviderKind,
+        provider_item_id: &str,
+    ) -> Result<Option<String>> {
+        self.connection
+            .lock()
+            .query_row(
+                "SELECT i.turn_id FROM codex_items i JOIN provider_sessions p ON p.id=i.provider_session_id WHERE i.task_id=?1 AND p.provider=?2 AND i.item_id=?3 ORDER BY i.last_event_seq DESC LIMIT 1",
+                params![task_id.to_string(), provider.as_str(), provider_item_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage_error)
+    }
+
     pub fn create_runtime_binding(
         &self,
         task_id: TaskId,
@@ -342,7 +363,7 @@ impl LocalStore {
             // No current turn is bound to this task: the session is dead or
             // was never fully attached. Settle any unfinished turn so the
             // stop button always lands instead of erroring with not-found.
-            let event = settle_stale_turn(&transaction, task_id)?;
+            let event = settle_stale_turn(&transaction, task_id, true)?;
             transaction.commit().map_err(storage_error)?;
             let turn_id = event
                 .as_ref()
@@ -366,7 +387,7 @@ impl LocalStore {
         if inserted != 1 {
             // Same dead-session path: no live runtime session can carry the
             // stop, so settle the turn locally instead of failing.
-            let event = settle_stale_turn(&transaction, task_id)?;
+            let event = settle_stale_turn(&transaction, task_id, true)?;
             transaction.commit().map_err(storage_error)?;
             return Ok(PersistedStopRequest {
                 result: StopRequestResult {
@@ -409,7 +430,21 @@ impl LocalStore {
     pub fn settle_stopped_turn(&self, task_id: TaskId) -> Result<Option<RuntimeProjectionEvent>> {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction().map_err(storage_error)?;
-        let event = settle_stale_turn(&transaction, task_id)?;
+        let event = settle_stale_turn(&transaction, task_id, true)?;
+        transaction.commit().map_err(storage_error)?;
+        Ok(event)
+    }
+
+    /// Mark a turn interrupted by transport/process loss without pretending
+    /// the user pressed Stop. The distinction keeps opt-in auto-resume from
+    /// undoing an intentional cancellation.
+    pub fn settle_interrupted_turn(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<RuntimeProjectionEvent>> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(storage_error)?;
+        let event = settle_stale_turn(&transaction, task_id, false)?;
         transaction.commit().map_err(storage_error)?;
         Ok(event)
     }
@@ -478,6 +513,43 @@ impl LocalStore {
         }
         lines.reverse();
         Ok(Some(lines.join("\n\n")))
+    }
+
+    /// Newest persisted transcript item seq for a task, or 0 when the task
+    /// has no items yet.
+    pub fn latest_item_seq(&self, task_id: TaskId) -> Result<i64> {
+        let connection = self.connection.lock();
+        connection
+            .query_row(
+                "SELECT COALESCE(MAX(last_event_seq), 0) FROM codex_items WHERE task_id = ?1",
+                [task_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(storage_error)
+    }
+
+    /// Assistant message bodies persisted after `after_seq`, oldest first.
+    /// The delegation sentinel scanner uses this to route `<integrator:…>`
+    /// blocks from children whose provider has no MCP injection surface.
+    pub fn assistant_messages_since(
+        &self,
+        task_id: TaskId,
+        after_seq: i64,
+    ) -> Result<Vec<(i64, String)>> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT last_event_seq, body FROM codex_items WHERE task_id = ?1 AND kind = 'agent_message' AND body IS NOT NULL AND last_event_seq > ?2 ORDER BY last_event_seq ASC LIMIT 100",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(params![task_id.to_string(), after_seq], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(storage_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        Ok(rows)
     }
 
     /// Search locally materialized user/assistant messages without loading
@@ -632,6 +704,7 @@ impl LocalStore {
 fn settle_stale_turn(
     transaction: &Transaction<'_>,
     task_id: TaskId,
+    stop_requested: bool,
 ) -> Result<Option<RuntimeProjectionEvent>> {
     let row = transaction.query_row(
         "SELECT projection_json, provider_session_id, thread_id, turn_id FROM codex_turns WHERE task_id=?1 AND status IN ('pending','in_progress') ORDER BY last_event_seq DESC LIMIT 1",
@@ -644,19 +717,24 @@ fn settle_stale_turn(
     let mut turn: TurnProjection = serde_json::from_str(&row.0)?;
     let occurred_at = Utc::now();
     turn.status = TurnStatus::Interrupted;
-    turn.stop_requested = true;
+    turn.stop_requested = stop_requested;
     turn.completed_at = Some(occurred_at);
+    let method = if stop_requested {
+        "client/turn/stopSettled"
+    } else {
+        "client/turn/interruptedSettled"
+    };
     let inserted = transaction.execute(
-        "INSERT INTO codex_event_log(task_id,provider_session_id,runtime_session_id,process_id,thread_id,turn_id,method,audit_json,audit_truncated,occurred_at) SELECT ?1,?2,id,COALESCE(process_id,'expired'),?3,?4,'client/turn/stopSettled','{}',0,?5 FROM runtime_sessions WHERE task_id=?1 AND provider_session_id=?2 ORDER BY started_at DESC LIMIT 1",
-        params![task_id.to_string(), row.1, row.2, row.3, occurred_at.to_rfc3339()],
+        "INSERT INTO codex_event_log(task_id,provider_session_id,runtime_session_id,process_id,thread_id,turn_id,method,audit_json,audit_truncated,occurred_at) SELECT ?1,?2,id,COALESCE(process_id,'expired'),?3,?4,?5,'{}',0,?6 FROM runtime_sessions WHERE task_id=?1 AND provider_session_id=?2 ORDER BY started_at DESC LIMIT 1",
+        params![task_id.to_string(), row.1, row.2, row.3, method, occurred_at.to_rfc3339()],
     ).map_err(storage_error)?;
     if inserted != 1 {
         return Ok(None);
     }
     let seq = transaction.last_insert_rowid();
     transaction.execute(
-        "UPDATE codex_turns SET status='interrupted',stop_requested=1,completed_at=?1,projection_json=?2,last_event_seq=?3 WHERE provider_session_id=?4 AND turn_id=?5",
-        params![occurred_at.to_rfc3339(), serde_json::to_string(&turn)?, seq, row.1, row.3],
+        "UPDATE codex_turns SET status='interrupted',stop_requested=?1,completed_at=?2,projection_json=?3,last_event_seq=?4 WHERE provider_session_id=?5 AND turn_id=?6",
+        params![stop_requested, occurred_at.to_rfc3339(), serde_json::to_string(&turn)?, seq, row.1, row.3],
     ).map_err(storage_error)?;
     let event = RuntimeProjectionEvent {
         seq,
@@ -1883,7 +1961,7 @@ mod tests {
             )
             .expect("persist running turn");
         let settled = store
-            .settle_stopped_turn(task.id)
+            .settle_interrupted_turn(task.id)
             .expect("settle stale turn")
             .expect("settlement event");
         drop(store);
@@ -1897,7 +1975,7 @@ mod tests {
             RuntimeProjection::TurnChanged {
                 turn: TurnProjection {
                     status: TurnStatus::Interrupted,
-                    stop_requested: true,
+                    stop_requested: false,
                     ..
                 }
             }

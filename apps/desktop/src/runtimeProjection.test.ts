@@ -174,6 +174,51 @@ describe("runtime projection reducer", () => {
     });
   });
 
+  it("shows real reasoning summaries as content and drops empty placeholders", () => {
+    let state = createRuntimeProjectionState("task-1");
+    state = applyRuntimeProjection(
+      state,
+      event(13, {
+        kind: "itemChanged",
+        item: {
+          id: "codex:thread-1:turn-1:reasoning-empty",
+          providerItemId: "reasoning-empty",
+          kind: "reasoningSummary",
+          status: "completed",
+          title: "Reasoning summary",
+          body: "",
+          truncated: false,
+          updatedAt: "2026-07-10T16:00:00Z",
+        },
+      }),
+    );
+    state = applyRuntimeProjection(
+      state,
+      event(14, {
+        kind: "itemChanged",
+        item: {
+          id: "codex:thread-1:turn-1:reasoning-real",
+          providerItemId: "reasoning-real",
+          kind: "reasoningSummary",
+          status: "completed",
+          title: "Reasoning summary",
+          body: "Comparing the reducer with the captured event stream.",
+          truncated: false,
+          updatedAt: "2026-07-10T16:00:01Z",
+        },
+      }),
+    );
+
+    expect(runtimeTranscript(state)).toEqual([
+      expect.objectContaining({
+        id: "codex:thread-1:turn-1:reasoning-real",
+        body: "Comparing the reducer with the captured event stream.",
+        meta: "Reasoning summary",
+      }),
+    ]);
+    expect(runtimeTranscript(state)[0].title).toBeUndefined();
+  });
+
   it("projects connection gaps and pending approvals without losing tagged request IDs", () => {
     let state = createRuntimeProjectionState("task-1");
     state = applyRuntimeProjection(
@@ -313,6 +358,50 @@ describe("runtime projection reducer", () => {
         expect.objectContaining({ activityType: "tool" }),
       ],
     });
+    expect(runtimeTranscript(state, "verbose").map((entry) => entry.id)).toEqual([
+      "msg-1",
+      "command-1",
+      "tool-1",
+      "msg-2",
+    ]);
+
+    let single = createRuntimeProjectionState("task-summary");
+    single = applyRuntimeProjection(single, {
+      ...event(70, { kind: "itemChanged", item: items[1] }),
+      taskId: "task-summary",
+      occurredAt: items[1].updatedAt,
+    });
+    expect(runtimeTranscript(single, "summary")[0]).toMatchObject({
+      id: "activity-group-command-1",
+      body: "1 command",
+      children: [expect.objectContaining({ id: "command-1" })],
+    });
+  });
+
+  it("caps collapsed activity groups so expanding one cannot mount an unbounded history", () => {
+    let state = createRuntimeProjectionState("task-1");
+    for (let index = 0; index < 125; index += 1) {
+      const timestamp = new Date(Date.UTC(2026, 6, 10, 16, 0, index)).toISOString();
+      state = applyRuntimeProjection(state, {
+        ...event(200 + index, {
+          kind: "itemChanged",
+          item: {
+            id: `command-${index}`,
+            providerItemId: `command-${index}`,
+            kind: "commandExecution",
+            status: "completed",
+            command: `echo ${index}`,
+            truncated: false,
+            updatedAt: timestamp,
+          },
+        }),
+        occurredAt: timestamp,
+      });
+    }
+
+    const grouped = runtimeTranscript(state);
+    expect(grouped).toHaveLength(3);
+    expect(grouped.map((entry) => entry.children?.length)).toEqual([50, 50, 25]);
   });
 
   it("keeps pending approvals inside the activity stack between text segments", () => {
@@ -427,6 +516,51 @@ describe("runtime projection reducer", () => {
       { label: "Input", body: '{\n  "query": "flaky tests"\n}' },
       { label: "Output", body: "3 results" },
     ]);
+  });
+
+  it("uses typed subagent copy and fails unknown tools closed", () => {
+    let state = createRuntimeProjectionState("task-1");
+    const peers = {
+      id: "codex:thread-1:turn-1:peers",
+      providerItemId: "peers",
+      kind: "mcpTool" as const,
+      status: "inProgress" as const,
+      mcpServer: "integrator",
+      mcpTool: "peers_list",
+      toolInput: "{}",
+      truncated: false,
+      updatedAt: "2026-07-10T16:00:00Z",
+    };
+    state = applyRuntimeProjection(state, event(51, { kind: "itemChanged", item: peers }));
+    expect(runtimeTranscript(state)[0].title).toBe("Checking subagent configuration");
+
+    state = applyRuntimeProjection(
+      state,
+      event(52, {
+        kind: "itemChanged",
+        item: { ...peers, status: "completed", updatedAt: "2026-07-10T16:00:01Z" },
+      }),
+    );
+    expect(runtimeTranscript(state)[0].title).toBe("Checked subagent configuration");
+
+    const unknown = applyRuntimeProjection(
+      createRuntimeProjectionState("task-1"),
+      event(53, {
+        kind: "itemChanged",
+        item: {
+          id: "codex:thread-1:turn-1:unknown",
+          providerItemId: "unknown",
+          kind: "mcpTool",
+          status: "completed",
+          mcpServer: "future-provider",
+          mcpTool: "invented_tool",
+          toolInput: "{}",
+          truncated: false,
+          updatedAt: "2026-07-10T16:00:00Z",
+        },
+      }),
+    );
+    expect(runtimeTranscript(unknown)[0].title).toBe("Runtime event");
   });
 
   it("turns file tools into readable paths with diff-style line counts", () => {
@@ -599,7 +733,7 @@ describe("runtime projection reducer", () => {
     );
   });
 
-  it("settles an interrupted turn: no live spinners, one interruption notice", () => {
+  it("settles an interrupted turn without putting recovery state in the transcript", () => {
     let state = createRuntimeProjectionState("task-1");
     state = applyRuntimeProjection(
       state,
@@ -632,12 +766,7 @@ describe("runtime projection reducer", () => {
 
     const transcript = runtimeTranscript(state);
     expect(transcript).not.toContainEqual(expect.objectContaining({ status: "running" }));
-    expect(transcript.at(-1)).toMatchObject({
-      id: "runtime-turn-interrupted-turn-1",
-      kind: "notice",
-      title: "Response interrupted",
-      timestamp: "2026-07-10T19:30:00Z",
-    });
+    expect(transcript).not.toContainEqual(expect.objectContaining({ kind: "notice" }));
   });
 
   it("keeps unfinished items spinning while the turn is still in progress", () => {

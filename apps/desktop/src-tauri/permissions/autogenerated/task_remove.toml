@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-task-remove"
+description = "Enables the task_remove command without any pre-configured scope."
+commands.allow = ["task_remove"]
+
+[[permission]]
+identifier = "deny-task-remove"
+description = "Denies the task_remove command without any pre-configured scope."
+commands.deny = ["task_remove"]

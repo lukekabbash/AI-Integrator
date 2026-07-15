@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use integrator_core::{AuthenticationState, ProviderKind, ProviderStatus, ProviderTransport};
+use integrator_core::{
+    AuthenticationState, ProviderCapabilities, ProviderCertification, ProviderKind, ProviderStatus,
+    ProviderTransport,
+};
 
 use crate::safe_process::{redact_text, run_bounded};
 
@@ -75,6 +78,8 @@ fn discover_one(definition: ProbeDefinition) -> ProviderStatus {
             authentication: AuthenticationState::Unavailable,
             transport: None,
             diagnostic_code: Some("not-installed".into()),
+            capabilities: ProviderCapabilities::default(),
+            certification: ProviderCertification::Uncertified,
         };
     };
 
@@ -87,6 +92,11 @@ fn discover_one(definition: ProbeDefinition) -> ProviderStatus {
         Err(_) => (None, Some("version-probe-unavailable".into())),
     };
     let compatibility_code = runtime_compatibility_code(&definition.provider, version.as_deref());
+    let (capabilities, certification, capability_code) = probe_capabilities(
+        &definition.provider,
+        &executable,
+        compatibility_code.is_none(),
+    );
     let (authentication, auth_code) = authentication_status(&definition.provider, &executable);
 
     ProviderStatus {
@@ -96,8 +106,133 @@ fn discover_one(definition: ProbeDefinition) -> ProviderStatus {
         version,
         authentication,
         transport: Some(definition.transport),
-        diagnostic_code: auth_code.or(compatibility_code).or(probe_code),
+        diagnostic_code: auth_code
+            .or(compatibility_code)
+            .or(capability_code)
+            .or(probe_code),
+        capabilities,
+        certification,
     }
+}
+
+fn probe_capabilities(
+    provider: &ProviderKind,
+    executable: &Path,
+    version_compatible: bool,
+) -> (ProviderCapabilities, ProviderCertification, Option<String>) {
+    let help = run_bounded(executable, &["--help"], None)
+        .ok()
+        .filter(|output| output.success)
+        .map(|output| format!("{}\n{}", output.stdout, output.stderr));
+    let Some(help) = help else {
+        return (
+            ProviderCapabilities::default(),
+            ProviderCertification::Uncertified,
+            Some("capability-probe-failed".into()),
+        );
+    };
+    classify_help_capabilities(provider, &help, version_compatible)
+}
+
+fn classify_help_capabilities(
+    provider: &ProviderKind,
+    help: &str,
+    version_compatible: bool,
+) -> (ProviderCapabilities, ProviderCertification, Option<String>) {
+    let has = |marker: &str| help.contains(marker);
+    let capabilities = match provider {
+        ProviderKind::Codex => ProviderCapabilities {
+            session_resume: has("resume"),
+            authoritative_history: has("app-server"),
+            structured_tool_events: has("app-server"),
+            hooks: false,
+            sandboxed_workspace: has("--sandbox"),
+            subscription_auth: true,
+            skills: has("plugin"),
+        },
+        ProviderKind::Claude => ProviderCapabilities {
+            session_resume: has("--resume"),
+            authoritative_history: false,
+            structured_tool_events: has("--output-format") && has("--input-format"),
+            hooks: has("--include-hook-events"),
+            sandboxed_workspace: has("--permission-mode"),
+            subscription_auth: true,
+            skills: has("--disable-slash-commands"),
+        },
+        ProviderKind::Antigravity => ProviderCapabilities {
+            session_resume: has("--conversation"),
+            authoritative_history: false,
+            structured_tool_events: has("--print"),
+            hooks: true,
+            sandboxed_workspace: has("--sandbox") && has("--new-project") && has("--add-dir"),
+            subscription_auth: true,
+            skills: has("plugin"),
+        },
+        ProviderKind::Cursor => ProviderCapabilities {
+            session_resume: has("--resume"),
+            authoritative_history: false,
+            structured_tool_events: has("--output-format"),
+            hooks: false,
+            sandboxed_workspace: has("--sandbox") && has("--workspace"),
+            subscription_auth: true,
+            skills: has("--plugin-dir"),
+        },
+        ProviderKind::Grok => ProviderCapabilities {
+            session_resume: false,
+            authoritative_history: false,
+            structured_tool_events: has("agent"),
+            hooks: false,
+            sandboxed_workspace: false,
+            subscription_auth: true,
+            skills: true,
+        },
+        ProviderKind::CustomAcp => ProviderCapabilities::default(),
+    };
+    let all_required = match provider {
+        ProviderKind::Codex => {
+            version_compatible
+                && capabilities.session_resume
+                && capabilities.authoritative_history
+                && capabilities.structured_tool_events
+                && capabilities.sandboxed_workspace
+                && capabilities.subscription_auth
+                && capabilities.skills
+        }
+        ProviderKind::Claude => {
+            capabilities.session_resume
+                && capabilities.structured_tool_events
+                && capabilities.hooks
+                && capabilities.sandboxed_workspace
+                && capabilities.subscription_auth
+                && capabilities.skills
+        }
+        ProviderKind::Antigravity => {
+            capabilities.session_resume
+                && capabilities.structured_tool_events
+                && capabilities.sandboxed_workspace
+                && capabilities.hooks
+                && capabilities.subscription_auth
+                && capabilities.skills
+        }
+        ProviderKind::Cursor => {
+            capabilities.session_resume
+                && capabilities.structured_tool_events
+                && capabilities.sandboxed_workspace
+                && capabilities.subscription_auth
+                && capabilities.skills
+        }
+        ProviderKind::Grok => capabilities.structured_tool_events && capabilities.subscription_auth,
+        ProviderKind::CustomAcp => false,
+    };
+    let certification = if !all_required {
+        ProviderCertification::Uncertified
+    } else if matches!(provider, ProviderKind::Cursor | ProviderKind::Grok) {
+        ProviderCertification::SessionProbeRequired
+    } else {
+        ProviderCertification::Certified
+    };
+    let diagnostic = (!all_required).then(|| "capability-mismatch".into());
+    (capabilities, certification, diagnostic)
 }
 
 /// Fallback for processes launched with a stale `PATH` (e.g. a dev shell or
@@ -334,6 +469,52 @@ mod tests {
             .find(|definition| definition.provider == ProviderKind::Grok)
             .expect("Grok Build definition");
         assert_eq!(grok.version_args, &["version"]);
+    }
+
+    #[test]
+    fn installed_help_is_classified_provider_by_provider_and_fails_closed() {
+        let (codex, certification, diagnostic) = classify_help_capabilities(
+            &ProviderKind::Codex,
+            "resume app-server --sandbox plugin",
+            true,
+        );
+        assert!(codex.session_resume && codex.authoritative_history && codex.skills);
+        assert_eq!(certification, ProviderCertification::Certified);
+        assert_eq!(diagnostic, None);
+
+        let (claude, certification, _) = classify_help_capabilities(
+            &ProviderKind::Claude,
+            "--resume --output-format --input-format --include-hook-events --permission-mode --disable-slash-commands",
+            true,
+        );
+        assert!(claude.hooks && claude.structured_tool_events && claude.skills);
+        assert_eq!(certification, ProviderCertification::Certified);
+
+        let (agy, certification, _) = classify_help_capabilities(
+            &ProviderKind::Antigravity,
+            "--conversation --print --sandbox --new-project --add-dir plugin",
+            true,
+        );
+        assert!(agy.session_resume && agy.subscription_auth && agy.skills);
+        assert_eq!(certification, ProviderCertification::Certified);
+
+        let (_, cursor_certification, _) = classify_help_capabilities(
+            &ProviderKind::Cursor,
+            "--resume --output-format --sandbox --workspace --plugin-dir",
+            true,
+        );
+        assert_eq!(
+            cursor_certification,
+            ProviderCertification::SessionProbeRequired
+        );
+
+        let (_, incomplete_certification, diagnostic) = classify_help_capabilities(
+            &ProviderKind::Claude,
+            "--resume --output-format --input-format --permission-mode",
+            true,
+        );
+        assert_eq!(incomplete_certification, ProviderCertification::Uncertified);
+        assert_eq!(diagnostic.as_deref(), Some("capability-mismatch"));
     }
 
     #[test]

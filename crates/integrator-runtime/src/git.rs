@@ -861,6 +861,25 @@ impl GitService {
         self.history_page(repository, 0, 32)
     }
 
+    /// Recent commit subjects only (newest first). Empty when the repository
+    /// has no commits yet. Used as style context for commit-message drafts.
+    pub fn recent_subjects(&self, repository: &Path, limit: u32) -> Result<Vec<String>> {
+        let limit = limit.clamp(1, 32);
+        let count_arg = format!("-{limit}");
+        Ok(self
+            .optional(repository, &["log", &count_arg, "--format=%s"])?
+            .map(|output| {
+                output
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .take(limit as usize)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// One page of history for the rail's "Show older commits" control.
     /// `current` is only meaningful on the first page; later pages clear it.
     pub fn history_page(

@@ -71,7 +71,12 @@ const motifs = [
 ] as const;
 
 function morphingState(state: AgentGlyphState): boolean {
-  return state === "starting" || state === "running" || state === "waiting";
+  return (
+    state === "starting" ||
+    state === "running" ||
+    state === "waiting" ||
+    state === "interrupted"
+  );
 }
 
 function pathSequence(variant: number, state: AgentGlyphState): string[] {
@@ -82,6 +87,7 @@ function pathSequence(variant: number, state: AgentGlyphState): string[] {
     case "running":
       return [at(0), at(1), at(4), at(7), at(0)];
     case "waiting":
+    case "interrupted":
       return [at(0), at(1), at(0)];
     default:
       return [at(0)];
@@ -123,6 +129,7 @@ function motifMotion(state: AgentGlyphState, still: boolean) {
         },
       };
     case "waiting":
+    case "interrupted":
     case "pending-approval":
       return {
         animate: { rotate: [0, 30, 0], scale: [0.86, 1, 0.86], opacity: [0.5, 1, 0.5] },

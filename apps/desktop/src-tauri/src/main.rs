@@ -6,5 +6,8 @@ fn main() {
     if std::env::args().any(|argument| argument == "--broker-mcp") {
         std::process::exit(ai_integrator_desktop_lib::run_broker_mcp());
     }
+    if std::env::args().any(|argument| argument == "--antigravity-hook") {
+        std::process::exit(ai_integrator_desktop_lib::run_antigravity_hook());
+    }
     ai_integrator_desktop_lib::run();
 }

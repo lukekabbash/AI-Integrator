@@ -76,6 +76,68 @@ describe("Transcript", () => {
     expect(open).not.toHaveBeenCalled();
   });
 
+  it("does not promote a streaming bullet start into a setext heading", () => {
+    const { rerender } = render(
+      <Transcript
+        events={[event("assistant-1", "assistant", "Here are the steps:\n-")]}
+        running
+      />,
+    );
+
+    let response = screen.getByLabelText("Agent response");
+    expect(response.querySelector("h2")).toBeNull();
+    expect(response).toHaveTextContent("Here are the steps:");
+
+    rerender(
+      <Transcript
+        events={[event("assistant-1", "assistant", "Here are the steps:\n- First")]}
+        running
+      />,
+    );
+
+    response = screen.getByLabelText("Agent response");
+    expect(response.querySelector("h2")).toBeNull();
+    expect(within(response).getByRole("list")).toBeInTheDocument();
+    expect(within(response).getByRole("listitem")).toHaveTextContent("First");
+  });
+
+  it("keeps a finished thematic break but still suppresses aborted setext underlines", () => {
+    const { rerender } = render(
+      <Transcript events={[event("assistant-1", "assistant", "Done.\n\n---")]} />,
+    );
+    expect(screen.getByLabelText("Agent response").querySelector("hr")).not.toBeNull();
+
+    rerender(
+      <Transcript events={[event("assistant-1", "assistant", "Here are the steps:\n-")]} />,
+    );
+    const response = screen.getByLabelText("Agent response");
+    expect(response.querySelector("h2")).toBeNull();
+    expect(response).toHaveTextContent("Here are the steps:");
+  });
+
+  it("renders finished bulleted lists as real list items", () => {
+    render(
+      <Transcript
+        events={[
+          event(
+            "assistant-1",
+            "assistant",
+            "Here are the steps:\n- First\n- Second\n\nAnd a nested list:\n- Parent\n  - Child",
+          ),
+        ]}
+      />,
+    );
+
+    const response = screen.getByLabelText("Agent response");
+    expect(response.querySelector("h2")).toBeNull();
+    const items = within(response).getAllByRole("listitem");
+    expect(items).toHaveLength(4);
+    expect(items[0]).toHaveTextContent("First");
+    expect(items[1]).toHaveTextContent("Second");
+    expect(items[2]).toHaveTextContent(/Parent/);
+    expect(items[3]).toHaveTextContent("Child");
+  });
+
   it("shows jump-to-latest when new content arrives after scrolling away", () => {
     const scrollContainerRef = { current: null as HTMLDivElement | null };
     let contentHeight = 220;
@@ -291,7 +353,7 @@ describe("Transcript", () => {
       <Transcript events={[event("user-1", "user", "Start the task")]} running />,
     );
 
-    expect(screen.getByText("Thinking…")).toBeInTheDocument();
+    expect(screen.getByText(/Connecting/)).toBeInTheDocument();
     rerender(
       <Transcript
         events={[
@@ -305,7 +367,16 @@ describe("Transcript", () => {
       />,
     );
 
-    expect(screen.getByText("Thinking…")).toBeInTheDocument();
+    expect(screen.getByText(/Connecting/)).toBeInTheDocument();
+  });
+
+  it("shows Connecting without inventing reasoning activity", () => {
+    render(
+      <Transcript events={[event("user-1", "user", "Start the task")]} running />,
+    );
+
+    expect(screen.getByText(/Connecting/)).toBeInTheDocument();
+    expect(screen.queryByText("Thinking…")).not.toBeInTheDocument();
   });
 
   it("shows the current command in the live narration line", () => {

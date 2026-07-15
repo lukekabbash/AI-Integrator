@@ -18,9 +18,9 @@ use futures_util::{SinkExt, StreamExt};
 use integrator_core::{
     ApprovalDecision, ApprovalKind, ApprovalProjection, ComposerDraft, ConnectionState,
     IntegratorError, LocalExport, ModeOption, ModeProjection, NewQueuedMessage, NewTask, ProjectId,
-    ProviderKind, QueuedMessage, QueuedMessageId, QueuedMessageState, RuntimeBinding,
-    RuntimeProjection, RuntimeSession, Setting, StopRequestResult, Task, TaskId, TaskSnapshot,
-    TaskState, TransportRequestId, TrustedProject, TurnStatus, Versioned,
+    ProviderKind, ProviderResumeState, QueuedMessage, QueuedMessageId, QueuedMessageState,
+    RuntimeBinding, RuntimeProjection, RuntimeSession, Setting, StopRequestResult, Task, TaskId,
+    TaskSnapshot, TaskState, TransportRequestId, TrustedProject, TurnStatus, Versioned,
 };
 use integrator_runtime::{
     CommitResult, CreateWorktree, DiffResult, DiffScope, FileStatus, GitOverview, GitRemote,
@@ -48,9 +48,9 @@ use crate::native_actions::{
     discover_file_actions, parse_acp_actions,
 };
 use crate::state::{
-    AcpPermissionOption, AcpRuntime, AppState, CodexRuntime, PendingStructuredPermission,
-    PendingUserPrompt, StructuredRuntime, VoiceTypingCommand, VoiceTypingSession,
-    remove_task_runtime, replace_task_runtime,
+    AcpPermissionOption, AcpRuntime, AcpSessionSpec, AppState, CodexRuntime,
+    PendingStructuredPermission, PendingUserPrompt, StructuredResumeContext, StructuredRuntime,
+    VoiceTypingCommand, VoiceTypingSession, remove_task_runtime, replace_task_runtime,
 };
 
 pub(crate) type CommandResult<T> = std::result::Result<T, CommandError>;
@@ -736,6 +736,27 @@ pub async fn task_update_routing(
     .await
     .map_err(|_| worker_error())?
     .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn task_remove(state: State<'_, AppState>, task_id: TaskId) -> CommandResult<Task> {
+    {
+        let mut runtimes = state.codex.lock().await;
+        remove_task_runtime(&mut *runtimes, task_id);
+    }
+    {
+        let mut runtimes = state.acp.lock().await;
+        remove_task_runtime(&mut *runtimes, task_id);
+    }
+    {
+        let mut runtimes = state.structured.lock().await;
+        remove_task_runtime(&mut *runtimes, task_id);
+    }
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || store.remove_task(task_id))
+        .await
+        .map_err(|_| worker_error())?
+        .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -1589,13 +1610,37 @@ pub async fn project_list(state: State<'_, AppState>) -> CommandResult<Vec<Trust
 pub async fn project_remove(
     state: State<'_, AppState>,
     project_id: ProjectId,
+    delete_files: Option<bool>,
 ) -> CommandResult<()> {
     let store = Arc::clone(&state.store);
     let authorizations = Arc::clone(&state.git_authorizations);
+    let delete_files = delete_files.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
         let mut authorizations = authorizations.lock().expect("git authorization cache lock");
-        store.remove_trusted_project(project_id)?;
+        let project = store.remove_trusted_project(project_id)?;
         authorizations.clear();
+        if delete_files {
+            let root = &project.repository_root;
+            // Only the exact registered project folder may be removed, and only
+            // when it is still a directory. Never follow this into a file path.
+            if root.as_os_str().is_empty()
+                || root
+                    .components()
+                    .all(|component| matches!(component, Component::RootDir | Component::Prefix(_)))
+            {
+                return Err(IntegratorError::InvalidInput(
+                    "refusing to delete an empty or filesystem-root project path".into(),
+                ));
+            }
+            if root.is_dir() {
+                fs::remove_dir_all(root).map_err(IntegratorError::Io)?;
+            } else if root.exists() {
+                return Err(IntegratorError::InvalidInput(format!(
+                    "project path is not a directory: {}",
+                    root.display()
+                )));
+            }
+        }
         Ok::<(), IntegratorError>(())
     })
     .await
@@ -2477,6 +2522,7 @@ pub async fn codex_connect(
         client,
         process_id: uuid::Uuid::new_v4().to_string(),
         alive: Arc::new(AtomicBool::new(true)),
+        reconciling: Arc::new(AtomicBool::new(false)),
         binding: Arc::new(std::sync::Mutex::new(None)),
         context_primer: Arc::new(std::sync::Mutex::new(None)),
         pending_user_prompt: Arc::new(std::sync::Mutex::new(None)),
@@ -2532,13 +2578,12 @@ pub(crate) fn spawn_projection_pump(
             let event = match receiver.recv().await {
                 Ok(event) => event,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    pump_connection_event(
-                        &app,
-                        &store,
-                        &runtime,
+                    begin_codex_reconciliation(
+                        app.clone(),
+                        Arc::clone(&store),
+                        runtime.clone(),
                         "client/receiverLagged",
-                        ConnectionState::Gap,
-                        Some("event stream lagged; recovery required"),
+                        "event stream lagged",
                     );
                     continue;
                 }
@@ -2583,13 +2628,12 @@ pub(crate) fn spawn_projection_pump(
                     );
                 }
                 CodexEvent::ProtocolViolation { code } => {
-                    pump_connection_event(
-                        &app,
-                        &store,
-                        &runtime,
+                    begin_codex_reconciliation(
+                        app.clone(),
+                        Arc::clone(&store),
+                        runtime.clone(),
                         "client/protocolViolation",
-                        ConnectionState::Gap,
-                        Some(&code),
+                        &code,
                     );
                 }
                 CodexEvent::StderrActivity => {}
@@ -2609,6 +2653,91 @@ pub(crate) fn spawn_projection_pump(
         }
         runtime.alive.store(false, Ordering::Release);
     });
+}
+
+fn begin_codex_reconciliation(
+    app: AppHandle<tauri::Wry>,
+    store: Arc<LocalStore>,
+    runtime: CodexRuntime,
+    method: &'static str,
+    reason: &str,
+) {
+    if runtime.reconciling.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    pump_connection_event(
+        &app,
+        &store,
+        &runtime,
+        method,
+        ConnectionState::Reconciling,
+        Some(reason),
+    );
+    tauri::async_runtime::spawn(async move {
+        let thread_id = runtime
+            .binding
+            .lock()
+            .expect("binding lock")
+            .as_ref()
+            .and_then(|binding| binding.thread_id.clone());
+        let result = match thread_id {
+            Some(thread_id) => timeout(
+                Duration::from_secs(15),
+                runtime.client.read_thread(&thread_id, true),
+            )
+            .await
+            .map_err(|_| IntegratorError::Unavailable("Codex recovery timed out".into()))
+            .and_then(std::convert::identity),
+            None => Err(IntegratorError::Unavailable(
+                "Codex thread identity is unavailable".into(),
+            )),
+        };
+        match result {
+            Ok(response) => {
+                reconcile_thread_response(&app, &store, &runtime, &response);
+                pump_connection_event(
+                    &app,
+                    &store,
+                    &runtime,
+                    "client/threadReconciled",
+                    ConnectionState::Connected,
+                    Some("provider thread state restored"),
+                );
+            }
+            Err(error) => {
+                pump_connection_event(
+                    &app,
+                    &store,
+                    &runtime,
+                    "client/threadReconcileFailed",
+                    ConnectionState::Disconnected,
+                    Some(&error.to_string()),
+                );
+                settle_interrupted_turn(
+                    &app,
+                    &store,
+                    runtime
+                        .binding
+                        .lock()
+                        .expect("binding lock")
+                        .as_ref()
+                        .map(|binding| binding.task_id),
+                );
+            }
+        }
+        runtime.reconciling.store(false, Ordering::Release);
+    });
+}
+
+fn settle_interrupted_turn(
+    app: &AppHandle<tauri::Wry>,
+    store: &LocalStore,
+    task_id: Option<TaskId>,
+) {
+    let Some(task_id) = task_id else { return };
+    if let Ok(Some(event)) = store.settle_interrupted_turn(task_id) {
+        let _ = app.emit("runtime://projection", &event);
+    }
 }
 
 fn pump_provider_event(
@@ -2789,7 +2918,7 @@ pub async fn codex_start_thread(
     permission: Option<String>,
     delegation: Option<String>,
 ) -> CommandResult<Value> {
-    state.store.get_task(task_id).map_err(CommandError::from)?;
+    let cwd = authorized_task_directory(&state, task_id, cwd).await?;
     // Map the UI permission profile onto Codex's approval-policy/sandbox
     // pair. Codex prompts through its own approval requests, so "ask" means
     // prompt for everything and "full access" means never prompt, unsandboxed.
@@ -2842,6 +2971,16 @@ pub async fn codex_start_thread(
         .map_err(CommandError::from)?;
     if let Some(thread_id) = extract_thread_id(&response) {
         bind_thread(&state, &runtime, task_id, &thread_id).await?;
+        persist_provider_resume_state(
+            &state.store,
+            task_id,
+            ProviderKind::Codex,
+            &thread_id,
+            &cwd,
+            permission.as_deref().unwrap_or("project-write"),
+            delegation.as_deref().unwrap_or("off"),
+        )
+        .map_err(CommandError::from)?;
         queue_context_primer(&state, task_id, &runtime.context_primer).await;
         pump_connection_event(
             &app,
@@ -2944,6 +3083,49 @@ async fn bind_thread(
     Ok(())
 }
 
+fn persist_provider_resume_state(
+    store: &LocalStore,
+    task_id: TaskId,
+    provider: ProviderKind,
+    session_ref: &str,
+    repository_root: &Path,
+    permission: &str,
+    delegation: &str,
+) -> integrator_core::Result<()> {
+    store.upsert_provider_resume_state(&ProviderResumeState {
+        task_id,
+        provider,
+        session_ref: session_ref.to_owned(),
+        repository_root: repository_root.to_path_buf(),
+        permission: permission.to_owned(),
+        delegation: delegation.to_owned(),
+        updated_at: Utc::now(),
+    })
+}
+
+const INTERRUPTED_RESUME_WIRE_PROMPT: &str = "The prior turn was interrupted. Continue from its last safe boundary. First inspect the current workspace and provider conversation state. Do not repeat completed actions. If any external or mutating outcome is uncertain, stop and explain before retrying it.";
+
+fn provider_wire_prompt(prompt: &str, resume_interrupted: Option<bool>) -> String {
+    if resume_interrupted == Some(true) {
+        INTERRUPTED_RESUME_WIRE_PROMPT.into()
+    } else {
+        prompt.into()
+    }
+}
+
+fn validate_interrupted_resume_action(
+    native_action_id: Option<&str>,
+    resume_interrupted: Option<bool>,
+) -> CommandResult<()> {
+    if resume_interrupted == Some(true) && native_action_id.is_some() {
+        return Err(CommandError {
+            code: "invalid-input",
+            message: "An interrupted response cannot resume through a new native action".into(),
+        });
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn codex_start_turn(
     app: AppHandle<tauri::Wry>,
@@ -2954,7 +3136,9 @@ pub async fn codex_start_turn(
     repository: PathBuf,
     native_action_id: Option<String>,
     delegation: Option<String>,
+    resume_interrupted: Option<bool>,
 ) -> CommandResult<Value> {
+    validate_interrupted_resume_action(native_action_id.as_deref(), resume_interrupted)?;
     let repository = authorized_task_directory(&state, task_id, repository).await?;
     let runtime = codex_runtime(&state, Some(task_id)).await?;
     let mut goal_objective = None;
@@ -3020,15 +3204,15 @@ pub async fn codex_start_turn(
             .map(|(_, text)| text.as_str())
             .unwrap_or(prompt.as_str())
     });
+    let provider_prompt = provider_wire_prompt(visible_wire, resume_interrupted);
     let mut wire_prompt = if native_action_id.is_some() {
         // Preserve Codex's recommended `$name` text at byte zero alongside
         // a typed skill item, or the exact goal objective after setting goal
         // state. Native actions must not be silently converted back into a
         // generic prompt by hidden context.
-        visible_wire.to_owned()
+        provider_prompt
     } else {
-        apply_context_primer(&runtime.context_primer, visible_wire)
-            .unwrap_or_else(|| visible_wire.to_owned())
+        apply_context_primer(&runtime.context_primer, &provider_prompt).unwrap_or(provider_prompt)
     };
     if let Some(mode) = delegation.as_deref().filter(|mode| *mode != "off")
         && native_action_id.is_none()
@@ -3158,6 +3342,7 @@ async fn task_has_live_runtime(state: &State<'_, AppState>, task_id: TaskId) -> 
 
 #[tauri::command]
 pub async fn task_snapshot(
+    app: AppHandle<tauri::Wry>,
     state: State<'_, AppState>,
     task_id: TaskId,
 ) -> CommandResult<TaskSnapshot> {
@@ -3168,8 +3353,29 @@ pub async fn task_snapshot(
     let runtime_live = task_has_live_runtime(&state, task_id).await;
     if !runtime_live {
         let store = Arc::clone(&state.store);
-        let _ =
-            tauri::async_runtime::spawn_blocking(move || store.settle_stopped_turn(task_id)).await;
+        let settled =
+            tauri::async_runtime::spawn_blocking(move || store.settle_interrupted_turn(task_id))
+                .await
+                .map_err(|_| worker_error())?
+                .map_err(CommandError::from)?;
+        if settled.is_some() {
+            let store = Arc::clone(&state.store);
+            let interrupted = tauri::async_runtime::spawn_blocking(move || {
+                let Some(delegation) = store.delegation_for_child_task(task_id)? else {
+                    return Ok(None);
+                };
+                store.interrupt_process_owned_delegation(
+                    delegation.id,
+                    "Interrupted because the subagent process is no longer running. Resume from the Agents panel or ask me to continue from the last safe boundary.",
+                )
+            })
+            .await
+            .map_err(|_| worker_error())?
+            .map_err(CommandError::from)?;
+            if let Some(delegation) = interrupted {
+                crate::delegation::emit_update(&app, delegation.parent_task_id);
+            }
+        }
     }
     let store = Arc::clone(&state.store);
     let mut snapshot = tauri::async_runtime::spawn_blocking(move || store.task_snapshot(task_id))
@@ -3410,6 +3616,8 @@ pub async fn acp_connect(
         delegation_preamble: Arc::new(std::sync::Mutex::new(None)),
         unattended: false,
         read_only: false,
+        session_spec: Arc::new(std::sync::Mutex::new(None)),
+        replaying_history: Arc::new(AtomicBool::new(false)),
     };
     spawn_acp_pump(app, Arc::clone(&state.store), runtime.clone());
     let previous = if let Some(task_id) = task_id {
@@ -3451,38 +3659,34 @@ pub async fn acp_start_session(
     task_id: TaskId,
     cwd: PathBuf,
     delegation: Option<String>,
+    permission: Option<String>,
 ) -> CommandResult<Value> {
     let cwd = authorized_task_directory(&state, task_id, cwd).await?;
+    let permission = match permission.as_deref() {
+        None | Some("project-write") => "project-write",
+        Some("read-only") => "read-only",
+        Some("ask") => "ask",
+        Some("full-access") => "full-access",
+        Some(_) => {
+            return Err(CommandError {
+                code: "invalid-input",
+                message: "unknown permission profile".into(),
+            });
+        }
+    };
     let runtime = acp_runtime(&state, Some(task_id), None).await?;
     let provider = runtime.provider;
     let provider_name = provider.as_str().to_owned();
     // Delegation broker injection: ACP's `session/new` carries MCP servers
     // natively. The tool preamble is queued one-shot for the first turn.
-    let mut mcp_servers = Vec::new();
+    let mcp_servers = acp_session_mcp_servers(&state, task_id, delegation.as_deref())?;
     if let Some(mode) = delegation.as_deref().filter(|mode| *mode != "off") {
-        let broker = state
-            .broker
-            .lock()
-            .expect("broker lock")
-            .clone()
-            .ok_or_else(|| CommandError {
-                code: "provider-unavailable",
-                message: "the delegation broker is not ready; retry this turn".into(),
-            })?;
-        let entry = crate::delegation::acp_mcp_server_entry(
-            &broker,
-            "orchestrator",
-            &task_id.to_string(),
-            mode,
-        )
-        .map_err(CommandError::from)?;
-        mcp_servers.push(entry);
         *runtime.delegation_preamble.lock().expect("preamble lock") =
             Some(crate::delegation::orchestrator_preamble(&state.store, mode));
     }
     let response = runtime
         .client
-        .new_session(&cwd, mcp_servers)
+        .new_session(&cwd, mcp_servers.clone())
         .await
         .map_err(CommandError::from)?;
     let session_id = response
@@ -3493,26 +3697,21 @@ pub async fn acp_start_session(
             message: format!("{provider_name} did not return a session identifier"),
         })?
         .to_owned();
-    let store = Arc::clone(&state.store);
-    let process_id = runtime.process_id.clone();
-    let session = session_id.clone();
-    let current = runtime.binding.lock().expect("binding lock").clone();
-    let binding = tauri::async_runtime::spawn_blocking(move || {
-        let binding = match current {
-            Some(binding) if binding.task_id == task_id => binding,
-            Some(_) => {
-                return Err(IntegratorError::Unauthorized(format!(
-                    "{provider_name} runtime is already bound to another task"
-                )));
-            }
-            None => store.create_runtime_binding(task_id, &process_id, provider)?,
-        };
-        store.attach_provider_thread(&binding, &session)
-    })
-    .await
-    .map_err(|_| worker_error())?
+    let binding = bind_acp_session(&state, &runtime, task_id, &session_id).await?;
+    *runtime.session_spec.lock().expect("session spec lock") = Some(AcpSessionSpec {
+        cwd: cwd.clone(),
+        mcp_servers,
+    });
+    persist_provider_resume_state(
+        &state.store,
+        task_id,
+        provider,
+        &session_id,
+        &cwd,
+        permission,
+        delegation.as_deref().unwrap_or("off"),
+    )
     .map_err(CommandError::from)?;
-    *runtime.binding.lock().expect("binding lock") = Some(binding.clone());
     let connected = reduce_connection_event(
         "client/acp/connected",
         &session_id,
@@ -3533,6 +3732,154 @@ pub async fn acp_start_session(
     Ok(response)
 }
 
+fn acp_session_mcp_servers(
+    state: &AppState,
+    task_id: TaskId,
+    delegation: Option<&str>,
+) -> CommandResult<Vec<Value>> {
+    let Some(mode) = delegation.filter(|mode| *mode != "off") else {
+        return Ok(Vec::new());
+    };
+    let broker = state
+        .broker
+        .lock()
+        .expect("broker lock")
+        .clone()
+        .ok_or_else(|| CommandError {
+            code: "provider-unavailable",
+            message: "the delegation broker is not ready; retry this turn".into(),
+        })?;
+    Ok(vec![
+        crate::delegation::acp_mcp_server_entry(
+            &broker,
+            "orchestrator",
+            &task_id.to_string(),
+            mode,
+        )
+        .map_err(CommandError::from)?,
+    ])
+}
+
+async fn bind_acp_session(
+    state: &State<'_, AppState>,
+    runtime: &AcpRuntime,
+    task_id: TaskId,
+    session_id: &str,
+) -> CommandResult<RuntimeBinding> {
+    let store = Arc::clone(&state.store);
+    let process_id = runtime.process_id.clone();
+    let provider = runtime.provider;
+    let provider_name = provider.as_str().to_owned();
+    let session = session_id.to_owned();
+    let current = runtime.binding.lock().expect("binding lock").clone();
+    let binding = tauri::async_runtime::spawn_blocking(move || {
+        let binding = match current {
+            Some(binding) if binding.task_id == task_id => binding,
+            Some(_) => {
+                return Err(IntegratorError::Unauthorized(format!(
+                    "{provider_name} runtime is already bound to another task"
+                )));
+            }
+            None => store.create_runtime_binding(task_id, &process_id, provider)?,
+        };
+        store.attach_provider_thread(&binding, &session)
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(CommandError::from)?;
+    *runtime.binding.lock().expect("binding lock") = Some(binding.clone());
+    Ok(binding)
+}
+
+#[tauri::command]
+pub async fn acp_resume_session(
+    app: AppHandle<tauri::Wry>,
+    state: State<'_, AppState>,
+    task_id: TaskId,
+    cwd: PathBuf,
+) -> CommandResult<Value> {
+    let cwd = authorized_task_directory(&state, task_id, cwd).await?;
+    let saved = state
+        .store
+        .provider_resume_state(task_id)
+        .map_err(CommandError::from)?
+        .ok_or_else(|| CommandError {
+            code: "not-found",
+            message: "This task has no saved provider session to resume".into(),
+        })?;
+    let runtime = acp_runtime(&state, Some(task_id), None).await?;
+    if saved.provider != runtime.provider || saved.repository_root != cwd {
+        return Err(CommandError {
+            code: "unauthorized",
+            message: "The saved provider session does not match this task and workspace".into(),
+        });
+    }
+    let mcp_servers = acp_session_mcp_servers(&state, task_id, Some(&saved.delegation))?;
+    let binding = bind_acp_session(&state, &runtime, task_id, &saved.session_ref).await?;
+    *runtime.session_spec.lock().expect("session spec lock") = Some(AcpSessionSpec {
+        cwd: cwd.clone(),
+        mcp_servers: mcp_servers.clone(),
+    });
+    acp_connection_event(
+        &app,
+        &state.store,
+        &runtime,
+        "client/sessionRecovering",
+        ConnectionState::Reconciling,
+        Some("restoring provider session"),
+    );
+    let capabilities = runtime.client.session_capabilities().await;
+    let result = if capabilities.resume {
+        runtime.replaying_history.store(true, Ordering::Release);
+        runtime
+            .client
+            .resume_session(&saved.session_ref, &cwd, mcp_servers)
+            .await
+    } else if capabilities.load {
+        runtime.replaying_history.store(true, Ordering::Release);
+        runtime
+            .client
+            .load_session(&saved.session_ref, &cwd, mcp_servers)
+            .await
+    } else {
+        Err(IntegratorError::Unavailable(format!(
+            "{} did not advertise ACP session recovery",
+            runtime.provider.as_str()
+        )))
+    };
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => {
+            runtime.replaying_history.store(false, Ordering::Release);
+            acp_connection_event(
+                &app,
+                &state.store,
+                &runtime,
+                "client/sessionRecoveryFailed",
+                ConnectionState::Disconnected,
+                Some(&error.to_string()),
+            );
+            return Err(CommandError::from(error));
+        }
+    };
+    if let Some(mode) = parse_acp_mode_state(&response) {
+        *runtime.session_modes.lock().expect("modes lock") = Some(mode.clone());
+        let event = acp_mode_event(&saved.session_ref, None, mode, Utc::now());
+        apply_and_emit(&app, &state.store, &binding, &event);
+    }
+    persist_provider_resume_state(
+        &state.store,
+        task_id,
+        saved.provider,
+        &saved.session_ref,
+        &cwd,
+        &saved.permission,
+        &saved.delegation,
+    )
+    .map_err(CommandError::from)?;
+    Ok(response)
+}
+
 #[tauri::command]
 pub async fn acp_send_turn(
     app: AppHandle<tauri::Wry>,
@@ -3541,8 +3888,28 @@ pub async fn acp_send_turn(
     prompt: String,
     delegation: Option<String>,
     native_action_id: Option<String>,
+    resume_interrupted: Option<bool>,
 ) -> CommandResult<Value> {
+    validate_interrupted_resume_action(native_action_id.as_deref(), resume_interrupted)?;
     let runtime = acp_runtime(&state, Some(task_id), None).await?;
+    timeout(Duration::from_secs(15), async {
+        while runtime.replaying_history.load(Ordering::Acquire)
+            && runtime.alive.load(Ordering::Acquire)
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .map_err(|_| CommandError {
+        code: "provider-unavailable",
+        message: "Provider session recovery is still in progress; try Resume again shortly".into(),
+    })?;
+    if !runtime.alive.load(Ordering::Acquire) {
+        return Err(CommandError {
+            code: "provider-disconnected",
+            message: "Provider session recovery failed; reconnect before resuming".into(),
+        });
+    }
     let provider_name = runtime.provider.as_str();
     if let Some(action_id) = native_action_id.as_deref() {
         let task = state.store.get_task(task_id).map_err(CommandError::from)?;
@@ -3652,8 +4019,9 @@ pub async fn acp_send_turn(
     // from a background task so this command returns immediately. The primer
     // rides only on the wire prompt — the persisted user item above keeps the
     // prompt exactly as the user typed it.
+    let provider_prompt = provider_wire_prompt(&prompt, resume_interrupted);
     let mut wire_prompt =
-        apply_context_primer(&runtime.context_primer, &prompt).unwrap_or_else(|| prompt.clone());
+        apply_context_primer(&runtime.context_primer, &provider_prompt).unwrap_or(provider_prompt);
     if delegation.as_deref().is_some_and(|mode| mode != "off") {
         let mut preface = runtime
             .delegation_preamble
@@ -3817,6 +4185,15 @@ pub async fn acp_list_cursor_models(
         .map_err(Into::into)
 }
 
+#[tauri::command]
+pub async fn acp_session_capabilities(
+    state: State<'_, AppState>,
+    task_id: TaskId,
+) -> CommandResult<adapter_acp::AcpSessionCapabilities> {
+    let runtime = acp_runtime(&state, Some(task_id), None).await?;
+    Ok(runtime.client.session_capabilities().await)
+}
+
 // The argument list is the typed renderer-to-Tauri command protocol.
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
@@ -3832,7 +4209,9 @@ pub async fn structured_cli_start_turn(
     prompt: String,
     delegation: Option<String>,
     native_action_id: Option<String>,
+    resume_interrupted: Option<bool>,
 ) -> CommandResult<Value> {
+    validate_interrupted_resume_action(native_action_id.as_deref(), resume_interrupted)?;
     let repository = authorized_task_directory(&state, task_id, cwd.clone()).await?;
     let native_action = native_action_id
         .as_deref()
@@ -3908,20 +4287,21 @@ pub async fn structured_cli_start_turn(
     // running independently in the background. Replacing a process is scoped
     // to this task only (for a retry, provider change, or resumed next turn).
     let mut resume_session_id = None;
+    let mut control_overlay = None;
     let previous = {
         let mut runtimes = state.structured.lock().await;
         remove_task_runtime(&mut *runtimes, task_id)
     };
     if let Some(previous) = previous {
-        if matches!(structured_provider, StructuredCliProvider::Claude)
-            && previous
-                .binding
-                .lock()
-                .expect("binding lock")
-                .as_ref()
-                .is_some_and(|binding| binding.task_id == task_id && binding.provider == provider)
-        {
+        let same_provider = previous
+            .binding
+            .lock()
+            .expect("binding lock")
+            .as_ref()
+            .is_some_and(|binding| binding.task_id == task_id && binding.provider == provider);
+        if same_provider {
             resume_session_id = previous.session_ref.lock().expect("session lock").clone();
+            control_overlay = previous.control_overlay.clone();
         }
         let turn = { previous.current_turn.lock().expect("turn lock").clone() };
         if let Some(turn) = turn {
@@ -3929,6 +4309,16 @@ pub async fn structured_cli_start_turn(
         }
         previous.alive.store(false, Ordering::Release);
         let _ = state.store.expire_process_approvals(&previous.process_id);
+    }
+    if resume_session_id.is_none()
+        && let Some(saved) = state
+            .store
+            .provider_resume_state(task_id)
+            .map_err(CommandError::from)?
+        && saved.provider == provider
+        && saved.repository_root == repository
+    {
+        resume_session_id = Some(saved.session_ref);
     }
 
     let digest_store = Arc::clone(&state.store);
@@ -3938,26 +4328,28 @@ pub async fn structured_cli_start_turn(
     .await
     .map_err(|_| worker_error())?
     .map_err(CommandError::from)?;
+    let provider_prompt = provider_wire_prompt(&prompt, resume_interrupted);
     let mut wire_prompt = if native_action.is_some() {
         // Native slash parsing requires `/name` at byte zero. A resumed
         // Claude session already owns its history; on a first native turn we
         // prefer exact provider semantics over silently de-nativizing it.
-        prompt.clone()
+        provider_prompt
     } else {
-        match digest {
-            Some(digest) => format!(
-                "<conversation-context>\nEarlier conversation in this task (possibly from another assistant session). Treat it as prior chat history, not as part of the new request:\n\n{digest}\n</conversation-context>\n\n{prompt}"
+        match (resume_session_id.as_ref(), digest) {
+            (Some(_), _) => provider_prompt,
+            (None, Some(digest)) => format!(
+                "<conversation-context>\nEarlier conversation in this task (possibly from another assistant session). Treat it as prior chat history, not as part of the new request:\n\n{digest}\n</conversation-context>\n\n{provider_prompt}"
             ),
-            None => prompt.clone(),
+            (None, None) => provider_prompt,
         }
     };
 
     // Delegation broker injection: each structured turn is a fresh provider
     // session, so the tool preamble and any pending subagent updates ride on
     // every wire prompt while delegation is active.
-    let delegation_mode = delegation.filter(|mode| mode != "off");
+    let delegation_mode = delegation.as_deref().filter(|mode| *mode != "off");
     let mut mcp_config_path = None;
-    if let Some(mode) = delegation_mode.as_deref() {
+    if let Some(mode) = delegation_mode {
         let store = Arc::clone(&state.store);
         let mut preface = crate::delegation::orchestrator_preamble(&store, mode);
         if let Some(updates) = crate::delegation::pending_updates_block(&store, task_id) {
@@ -3991,6 +4383,27 @@ pub async fn structured_cli_start_turn(
 
     let client = integrator_runtime::StructuredCliClient::new();
     let process_id = uuid::Uuid::new_v4().to_string();
+    let mut hook_event_log = None;
+    if matches!(structured_provider, StructuredCliProvider::Antigravity) {
+        let scope = control_overlay
+            .as_deref()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .unwrap_or(&process_id);
+        let overlay = crate::antigravity_hooks::create_overlay(
+            &state.data_directory,
+            &repository,
+            scope,
+            permission_mode,
+        )
+        .map_err(CommandError::from)?;
+        control_overlay = Some(overlay.root);
+        hook_event_log = Some(overlay.event_log);
+    }
+    let hook_offset = hook_event_log
+        .as_deref()
+        .map(crate::antigravity_hooks::event_log_offset)
+        .unwrap_or(0);
     // Thread ids must pass the projection store's identity charset
     // (alphanumeric plus `-`, `_`, `.`), so no `:` separators here.
     let thread_id = format!("structured.{}.{}", provider.as_str(), uuid::Uuid::new_v4());
@@ -4014,6 +4427,13 @@ pub async fn structured_cli_start_turn(
         last_diagnostic: Arc::new(std::sync::Mutex::new(None)),
         permission_requests: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_ref: Arc::new(std::sync::Mutex::new(resume_session_id.clone())),
+        control_overlay: control_overlay.clone(),
+        hook_event_log: hook_event_log.clone(),
+        resume_context: Some(StructuredResumeContext {
+            repository: repository.clone(),
+            permission: permission.clone(),
+            delegation: delegation.clone().unwrap_or_else(|| "off".into()),
+        }),
     };
     spawn_structured_cli_pump(app.clone(), Arc::clone(&state.store), runtime.clone());
     let turn_id = client
@@ -4021,18 +4441,28 @@ pub async fn structured_cli_start_turn(
             StructuredCliLaunchOptions {
                 provider: structured_provider,
                 executable,
-                working_directory: cwd,
+                working_directory: repository,
                 model: model.filter(|value| value != "Provider default"),
                 effort: effort.filter(|value| !value.is_empty()),
                 resume_session_id,
                 permission_mode,
                 mcp_config_path,
+                control_overlay,
             },
             wire_prompt,
         )
         .await
         .map_err(CommandError::from)?;
     *runtime.current_turn.lock().expect("turn lock") = Some(turn_id.clone());
+    if let Some(event_log) = hook_event_log {
+        crate::antigravity_hooks::watch_events(
+            event_log,
+            hook_offset,
+            client.clone(),
+            turn_id.clone(),
+            Arc::clone(&runtime.alive),
+        );
+    }
     let now = Utc::now();
     apply_and_emit(
         &app,
@@ -4140,8 +4570,51 @@ pub(crate) fn spawn_structured_cli_pump(
         // can place one activity stack between the two text blocks.
         let mut agent_segment: u32 = 0;
         let mut segment_has_text = false;
+        let mut had_denied_tool = false;
         let mut segment_turn = String::new();
-        while let Ok(event) = receiver.recv().await {
+        loop {
+            let event = match receiver.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    structured_connection_event(
+                        &app,
+                        &store,
+                        &runtime,
+                        "client/receiverLagged",
+                        ConnectionState::Gap,
+                        Some(&format!(
+                            "activity stream dropped {skipped} events; the turn outcome requires recovery"
+                        )),
+                    );
+                    let turn = runtime.current_turn.lock().expect("turn lock").take();
+                    if let Some(turn) = turn {
+                        let _ = runtime.client.cancel(&turn).await;
+                    }
+                    runtime.alive.store(false, Ordering::Release);
+                    settle_interrupted_turn(
+                        &app,
+                        &store,
+                        runtime
+                            .binding
+                            .lock()
+                            .expect("binding lock")
+                            .as_ref()
+                            .map(|binding| binding.task_id),
+                    );
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    structured_connection_event(
+                        &app,
+                        &store,
+                        &runtime,
+                        "client/receiverClosed",
+                        ConnectionState::Disconnected,
+                        Some("activity stream closed"),
+                    );
+                    break;
+                }
+            };
             let Some(binding) = runtime.binding.lock().expect("binding lock").clone() else {
                 continue;
             };
@@ -4149,18 +4622,48 @@ pub(crate) fn spawn_structured_cli_pump(
                 continue;
             };
             if let Some(session_id) = event.session_id.as_ref() {
-                *runtime.session_ref.lock().expect("session lock") = Some(session_id.clone());
+                let changed = {
+                    let mut current = runtime.session_ref.lock().expect("session lock");
+                    let changed = current.as_deref() != Some(session_id);
+                    *current = Some(session_id.clone());
+                    changed
+                };
+                if changed
+                    && let Some(context) = runtime.resume_context.as_ref()
+                    && let Err(error) = persist_provider_resume_state(
+                        &store,
+                        binding.task_id,
+                        binding.provider,
+                        session_id,
+                        &context.repository,
+                        &context.permission,
+                        &context.delegation,
+                    )
+                {
+                    structured_connection_event(
+                        &app,
+                        &store,
+                        &runtime,
+                        "client/resumeStatePersistFailed",
+                        ConnectionState::Gap,
+                        Some(&format!(
+                            "session recovery state could not be saved: {error}"
+                        )),
+                    );
+                }
             }
             let now = Utc::now();
             if segment_turn != event.turn_id {
                 segment_turn = event.turn_id.clone();
                 agent_segment = 0;
                 segment_has_text = false;
+                had_denied_tool = false;
             }
             if matches!(
                 &event.event,
                 StructuredCliEventKind::ToolUse { .. }
                     | StructuredCliEventKind::ToolResult { .. }
+                    | StructuredCliEventKind::ToolDenied { .. }
                     | StructuredCliEventKind::PermissionRequest { .. }
             ) && segment_has_text
             {
@@ -4226,6 +4729,21 @@ pub(crate) fn spawn_structured_cli_pump(
                     },
                     now,
                 ))),
+                StructuredCliEventKind::ToolDenied { id, content } => {
+                    had_denied_tool = true;
+                    Some(ProjectionMutation::MergeItem(structured_item(
+                        &thread_id,
+                        &event.turn_id,
+                        &id,
+                        integrator_core::ItemKind::McpTool,
+                        None,
+                        None,
+                        Some(content),
+                        None,
+                        integrator_core::ItemStatus::Declined,
+                        now,
+                    )))
+                }
                 StructuredCliEventKind::Result {
                     success,
                     message,
@@ -4250,14 +4768,17 @@ pub(crate) fn spawn_structured_cli_pump(
                             },
                         );
                     }
+                    let status = structured_result_status(
+                        binding.provider,
+                        success,
+                        had_denied_tool,
+                        segment_has_text,
+                    );
+                    let recovered_denial = status == TurnStatus::Completed && !success;
                     Some(ProjectionMutation::Turn(acp_turn_projection(
                         &event.turn_id,
-                        if success {
-                            TurnStatus::Completed
-                        } else {
-                            TurnStatus::Failed
-                        },
-                        message,
+                        status,
+                        if recovered_denial { None } else { message },
                         now,
                         now,
                     )))
@@ -4387,6 +4908,37 @@ pub(crate) fn spawn_structured_cli_pump(
         }
         runtime.alive.store(false, Ordering::Release);
     });
+}
+
+fn structured_result_status(
+    provider: ProviderKind,
+    success: bool,
+    had_denied_tool: bool,
+    has_answer_text: bool,
+) -> TurnStatus {
+    if success || (provider == ProviderKind::Antigravity && had_denied_tool && has_answer_text) {
+        TurnStatus::Completed
+    } else {
+        TurnStatus::Failed
+    }
+}
+
+fn structured_connection_event(
+    app: &AppHandle<tauri::Wry>,
+    store: &LocalStore,
+    runtime: &StructuredRuntime,
+    method: &str,
+    connection: ConnectionState,
+    reason: Option<&str>,
+) {
+    let Some(binding) = runtime.binding.lock().expect("binding lock").clone() else {
+        return;
+    };
+    let Some(thread_id) = binding.thread_id.clone() else {
+        return;
+    };
+    let reduced = reduce_connection_event(method, &thread_id, connection, reason, Utc::now());
+    apply_and_emit(app, store, &binding, &reduced);
 }
 
 /// Claude's permission modes as a canonical mode projection. The vocabulary
@@ -4534,14 +5086,35 @@ pub(crate) fn spawn_acp_pump(
             let event = match receiver.recv().await {
                 Ok(event) => event,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    acp_connection_event(
-                        &app,
-                        &store,
-                        &runtime,
-                        "client/receiverLagged",
-                        ConnectionState::Gap,
-                        Some("event stream lagged; recovery required"),
-                    );
+                    if runtime.replaying_history.swap(true, Ordering::AcqRel) {
+                        runtime.replaying_history.store(false, Ordering::Release);
+                        runtime.alive.store(false, Ordering::Release);
+                        acp_connection_event(
+                            &app,
+                            &store,
+                            &runtime,
+                            "client/recoveryLagged",
+                            ConnectionState::Disconnected,
+                            Some("provider history replay also overflowed"),
+                        );
+                        settle_interrupted_turn(
+                            &app,
+                            &store,
+                            runtime
+                                .binding
+                                .lock()
+                                .expect("binding lock")
+                                .as_ref()
+                                .map(|binding| binding.task_id),
+                        );
+                    } else {
+                        begin_acp_reconciliation(
+                            app.clone(),
+                            Arc::clone(&store),
+                            runtime.clone(),
+                            "event stream lagged",
+                        );
+                    }
                     continue;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -4573,6 +5146,26 @@ pub(crate) fn spawn_acp_pump(
                     let Some(update) = params.get("update") else {
                         continue;
                     };
+                    if runtime.replaying_history.load(Ordering::Acquire) {
+                        let kind = update
+                            .get("sessionUpdate")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if matches!(kind, "tool_call" | "tool_call_update")
+                            && let Some(tool_call_id) =
+                                update.get("toolCallId").and_then(Value::as_str)
+                            && let Ok(Some(original_turn)) = store.turn_for_provider_item(
+                                binding.task_id,
+                                binding.provider,
+                                tool_call_id,
+                            )
+                            && let Ok(Some(reduced)) =
+                                reduce_acp_update(session_id, &original_turn, 0, update, Utc::now())
+                        {
+                            apply_and_emit(&app, &store, binding, &reduced);
+                        }
+                        continue;
+                    }
                     // Mode changes are session metadata and can land between
                     // turns (e.g. a set_mode echo), so they are handled before
                     // the in-flight-turn guard below.
@@ -4734,13 +5327,30 @@ pub(crate) fn spawn_acp_pump(
                     apply_and_emit(&app, &store, binding, &reduced);
                 }
                 adapter_acp::AcpEvent::ProtocolViolation { code } => {
+                    if !runtime.replaying_history.swap(true, Ordering::AcqRel) {
+                        begin_acp_reconciliation(
+                            app.clone(),
+                            Arc::clone(&store),
+                            runtime.clone(),
+                            &code,
+                        );
+                    }
+                }
+                adapter_acp::AcpEvent::RecoveryBoundary { replayed_history } => {
+                    if !runtime.replaying_history.swap(false, Ordering::AcqRel) {
+                        continue;
+                    }
                     acp_connection_event(
                         &app,
                         &store,
                         &runtime,
-                        "client/protocolViolation",
-                        ConnectionState::Gap,
-                        Some(&code),
+                        "client/sessionRecovered",
+                        ConnectionState::Connected,
+                        Some(if replayed_history {
+                            "provider history restored"
+                        } else {
+                            "provider session resumed"
+                        }),
                     );
                 }
                 adapter_acp::AcpEvent::StderrActivity => {}
@@ -4759,6 +5369,76 @@ pub(crate) fn spawn_acp_pump(
             }
         }
         runtime.alive.store(false, Ordering::Release);
+    });
+}
+
+fn begin_acp_reconciliation(
+    app: AppHandle<tauri::Wry>,
+    store: Arc<LocalStore>,
+    runtime: AcpRuntime,
+    reason: &str,
+) {
+    acp_connection_event(
+        &app,
+        &store,
+        &runtime,
+        "client/sessionReconciling",
+        ConnectionState::Reconciling,
+        Some(reason),
+    );
+    tauri::async_runtime::spawn(async move {
+        let binding = runtime.binding.lock().expect("binding lock").clone();
+        let spec = runtime
+            .session_spec
+            .lock()
+            .expect("session spec lock")
+            .clone();
+        let can_load = runtime.client.session_capabilities().await.load;
+        let result = match (binding.as_ref(), spec) {
+            (Some(binding), Some(spec)) => match binding.thread_id.as_deref() {
+                Some(session_id) if can_load => {
+                    let _ = runtime.client.cancel(session_id).await;
+                    timeout(
+                        Duration::from_secs(15),
+                        runtime
+                            .client
+                            .load_session(session_id, &spec.cwd, spec.mcp_servers),
+                    )
+                    .await
+                    .map_err(|_| {
+                        IntegratorError::Unavailable("ACP history recovery timed out".into())
+                    })
+                    .and_then(std::convert::identity)
+                }
+                Some(_) => Err(IntegratorError::Unavailable(format!(
+                    "{} did not advertise session/load for authoritative recovery",
+                    runtime.provider.as_str()
+                ))),
+                None => Err(IntegratorError::Unavailable(
+                    "ACP session identity is unavailable".into(),
+                )),
+            },
+            _ => Err(IntegratorError::Unavailable(
+                "ACP session recovery parameters are unavailable".into(),
+            )),
+        };
+        if let Err(error) = result {
+            runtime.replaying_history.store(false, Ordering::Release);
+            runtime.alive.store(false, Ordering::Release);
+            acp_connection_event(
+                &app,
+                &store,
+                &runtime,
+                "client/sessionReconcileFailed",
+                ConnectionState::Disconnected,
+                Some(&error.to_string()),
+            );
+            settle_interrupted_turn(
+                &app,
+                &store,
+                binding.as_ref().map(|binding| binding.task_id),
+            );
+        }
     });
 }
 
@@ -5089,12 +5769,16 @@ fn reconcile_thread_response(
             .into_iter()
             .flatten()
         {
+            let method = match item.get("status").and_then(Value::as_str) {
+                Some("completed" | "failed" | "declined") => "item/completed",
+                _ => "item/started",
+            };
             pump_provider_event(
                 app,
                 store,
                 runtime,
                 binding.as_ref(),
-                "item/completed".into(),
+                method.into(),
                 serde_json::json!({
                     "threadId": thread_id,
                     "turnId": turn_id,
@@ -5790,6 +6474,22 @@ fn worker_error() -> CommandError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn interrupted_resume_uses_an_idempotence_guard_without_rewriting_visible_copy() {
+        assert_eq!(
+            provider_wire_prompt("Resume from here", None),
+            "Resume from here"
+        );
+        let wire = provider_wire_prompt("Resume from here", Some(true));
+        assert!(wire.contains("Do not repeat completed actions"));
+        assert!(wire.contains("stop and explain before retrying"));
+        assert!(!wire.contains("Resume from here"));
+        assert!(validate_interrupted_resume_action(None, Some(true)).is_ok());
+        let error = validate_interrupted_resume_action(Some("skill"), Some(true))
+            .expect_err("resume must not run a second native action");
+        assert_eq!(error.code, "invalid-input");
+    }
+
     fn codex_user_item(provider_item_id: &str, body: &str) -> integrator_core::ItemProjection {
         integrator_core::ItemProjection {
             id: format!("codex:{provider_item_id}"),
@@ -5994,6 +6694,22 @@ mod tests {
             &serde_json::json!({ "authMethods": [{ "id": "xai.api_key" }] }),
             "cached_token"
         ));
+    }
+
+    #[test]
+    fn antigravity_denial_with_a_useful_answer_is_not_a_failed_turn() {
+        assert_eq!(
+            structured_result_status(ProviderKind::Antigravity, false, true, true),
+            TurnStatus::Completed
+        );
+        assert_eq!(
+            structured_result_status(ProviderKind::Antigravity, false, true, false),
+            TurnStatus::Failed
+        );
+        assert_eq!(
+            structured_result_status(ProviderKind::Claude, false, true, true),
+            TurnStatus::Failed
+        );
     }
 
     #[test]

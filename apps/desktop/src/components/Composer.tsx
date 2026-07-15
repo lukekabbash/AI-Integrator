@@ -883,7 +883,7 @@ export function Composer({
   }, [restoreRequest]);
 
   // Grow the textarea with its content (up to the CSS max-height) instead of
-  // scrolling a fixed three-row box.
+  // scrolling a fixed two-row box.
   useEffect(() => {
     const textarea = textareaRef.current;
     if (!textarea) return;
@@ -1592,7 +1592,7 @@ export function Composer({
                 void submit();
               }
             }}
-            rows={3}
+            rows={2}
             placeholder="Ask, build, review… use / for skills and @ for context"
             aria-label={messageLabel}
             autoFocus
@@ -1995,12 +1995,7 @@ export function Composer({
           </div>
         </div>
       </div>
-      <p className="composer-footnote">
-        {enterToSend
-          ? "Enter to send · Shift Enter for a new line"
-          : "Ctrl Enter to send · Enter for a new line"}{" "}
-        · agents can make mistakes; review changes
-      </p>
+      <p className="composer-footnote">Agents can make mistakes; review changes</p>
       {voiceActive || voiceNotice || voiceError ? (
         // Absolutely positioned so transient status lines never change the
         // composer's height or push it up while typing.

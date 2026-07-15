@@ -15,6 +15,7 @@ import {
   Plus,
   Search,
   Settings,
+  Trash2,
   X,
 } from "lucide-react";
 import type { ProjectSummary, TaskMessageSearchHit, TaskSummary } from "../bridge";
@@ -42,6 +43,12 @@ interface TaskSidebarProps {
     taskId: string,
     patch: { title?: string; pinned?: boolean; archived?: boolean },
   ) => void;
+  onUpdateProject?: (
+    projectId: string,
+    patch: { pinned?: boolean; archived?: boolean },
+  ) => void;
+  onDeleteProject?: (projectId: string) => void;
+  onDeleteTask?: (taskId: string) => void;
   onOpenSettings: () => void;
   onResize?: (delta: number) => void;
 }
@@ -189,6 +196,9 @@ export function TaskSidebar({
   onNewTaskInProject,
   onOpenProject,
   onUpdateTask,
+  onUpdateProject,
+  onDeleteProject,
+  onDeleteTask,
   onOpenSettings,
   onResize,
 }: TaskSidebarProps) {
@@ -204,9 +214,15 @@ export function TaskSidebar({
     activeProjectId ? { [activeProjectId]: true } : {},
   );
   const [openMenuId, setOpenMenuId] = useState("");
+  const [openProjectMenuId, setOpenProjectMenuId] = useState("");
   const [renamingId, setRenamingId] = useState("");
   const [renameValue, setRenameValue] = useState("");
   const [showArchived, setShowArchived] = useState(false);
+  // The archived view keeps its own disclosure state (default open, so the
+  // archive is browsable at a glance) without disturbing the normal tree.
+  const [archivedExpandedProjects, setArchivedExpandedProjects] = useState<
+    Record<string, boolean>
+  >({});
   const [projectChatLimits, setProjectChatLimits] = useState<Record<string, number>>({});
   // Index each project's newest reveal started at, so only freshly exposed
   // rows pick up a cascade delay — settled rows never re-stagger.
@@ -220,6 +236,7 @@ export function TaskSidebar({
   const searchInputRef = useRef<HTMLInputElement>(null);
   const searchButtonRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const projectMenuRef = useRef<HTMLDivElement>(null);
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const searchGenerationRef = useRef(0);
   const mod = modKeyLabel();
@@ -235,12 +252,22 @@ export function TaskSidebar({
   }
 
   useEffect(() => {
-    if (!openMenuId) return;
+    if (!openMenuId && !openProjectMenuId) return;
     const onPointerDown = (event: PointerEvent) => {
-      if (!menuRef.current?.contains(event.target as Node)) setOpenMenuId("");
+      const target = event.target as Node;
+      if (openMenuId && !menuRef.current?.contains(target)) setOpenMenuId("");
+      if (openProjectMenuId && !projectMenuRef.current?.contains(target)) {
+        const button = (event.target as HTMLElement | null)?.closest?.(
+          `[data-project-menu="${openProjectMenuId}"]`,
+        );
+        if (!button) setOpenProjectMenuId("");
+      }
     };
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setOpenMenuId("");
+      if (event.key === "Escape") {
+        setOpenMenuId("");
+        setOpenProjectMenuId("");
+      }
     };
     document.addEventListener("pointerdown", onPointerDown);
     document.addEventListener("keydown", onKeyDown);
@@ -248,7 +275,7 @@ export function TaskSidebar({
       document.removeEventListener("pointerdown", onPointerDown);
       document.removeEventListener("keydown", onKeyDown);
     };
-  }, [openMenuId]);
+  }, [openMenuId, openProjectMenuId]);
 
   useEffect(
     () => () => {
@@ -337,7 +364,34 @@ export function TaskSidebar({
     return map;
   }, [projects, tasks]);
 
-  const archivedCount = useMemo(() => tasks.filter((task) => task.archived).length, [tasks]);
+  const archivedCount = useMemo(() => {
+    // Archived projects count once each; chats inside them ride along
+    // implicitly, so only individually archived chats elsewhere add up.
+    const archivedProjectIds = new Set(
+      projects.filter((project) => project.archived).map((project) => project.id),
+    );
+    const archivedTasks = tasks.filter(
+      (task) => task.archived && !archivedProjectIds.has(task.projectId),
+    ).length;
+    return archivedTasks + archivedProjectIds.size;
+  }, [projects, tasks]);
+
+  const visibleProjects = useMemo(() => {
+    // The archive lists archived projects plus any live project holding
+    // archived chats — otherwise those chats would be unreachable.
+    const filtered = showArchived
+      ? projects.filter(
+          (project) =>
+            project.archived ||
+            (tasksByProject.get(project.id) ?? []).some((task) => task.archived),
+        )
+      : projects.filter((project) => !project.archived);
+    return [...filtered].sort((a, b) => {
+      const pinDelta = Number(Boolean(b.pinned)) - Number(Boolean(a.pinned));
+      if (pinDelta !== 0) return pinDelta;
+      return projects.indexOf(a) - projects.indexOf(b);
+    });
+  }, [projects, showArchived, tasksByProject]);
 
   const selectionFadingForProject =
     Boolean(projectHidingSelection) &&
@@ -376,10 +430,36 @@ export function TaskSidebar({
 
   const chatsForProject = (projectId: string): TaskSummary[] => {
     const all = tasksByProject.get(projectId) ?? [];
-    if (showArchived) return all.filter((task) => task.archived);
+    if (showArchived) {
+      // An archived project takes all of its chats with it; a live project
+      // only surfaces the chats that were archived individually.
+      if (projectById.get(projectId)?.archived) return all;
+      return all.filter((task) => task.archived);
+    }
     const pinned = all.filter((task) => task.pinned && !task.archived);
     const recent = all.filter((task) => !task.pinned && !task.archived);
     return [...pinned, ...recent];
+  };
+
+  const isProjectExpanded = (projectId: string): boolean =>
+    showArchived
+      ? (archivedExpandedProjects[projectId] ?? true)
+      : (expandedProjects[projectId] ?? false);
+
+  const toggleProjectExpanded = (projectId: string, expanded: boolean) => {
+    if (showArchived) {
+      setArchivedExpandedProjects((current) => ({ ...current, [projectId]: !expanded }));
+      return;
+    }
+    if (expanded) {
+      const containsActiveChat = (tasksByProject.get(projectId) ?? []).some(
+        (task) => task.id === activeTaskId,
+      );
+      if (containsActiveChat) setProjectHidingSelection(projectId);
+    } else if (projectHidingSelection === projectId) {
+      setProjectHidingSelection("");
+    }
+    setExpandedProjects((current) => ({ ...current, [projectId]: !expanded }));
   };
 
   const renderChat = (
@@ -473,9 +553,26 @@ export function TaskSidebar({
               </motion.span>
               {options?.showProject ? <small>{meta}</small> : null}
             </span>
-            {task.pinned ? <Pin className="chat-pin" aria-label="Pinned" /> : null}
           </button>
         </Tooltip>
+        {task.pinned && !options?.searchResult ? (
+          <Tooltip label="Unpin">
+            <button
+              className="chat-pin-button"
+              type="button"
+              aria-label="Unpin chat"
+              disabled={busy || !metadataActionsEnabled}
+              onClick={(event) => {
+                event.stopPropagation();
+                onUpdateTask(task.id, { pinned: false });
+              }}
+            >
+              <Pin className="chat-pin" aria-hidden="true" />
+            </button>
+          </Tooltip>
+        ) : task.pinned ? (
+          <Pin className="chat-pin" aria-label="Pinned" />
+        ) : null}
         {!options?.searchResult ? (
           <Tooltip label="More actions">
             <button
@@ -542,6 +639,18 @@ export function TaskSidebar({
                 {task.archived ? <ArchiveRestore /> : <Archive />}
                 {task.archived ? "Restore" : "Archive"}
               </button>
+              <button
+                role="menuitem"
+                type="button"
+                className="chat-action-menu-danger"
+                onClick={() => {
+                  setOpenMenuId("");
+                  onDeleteTask?.(task.id);
+                }}
+                disabled={!metadataActionsEnabled || !onDeleteTask}
+              >
+                <Trash2 /> Delete…
+              </button>
             </motion.div>
           ) : null}
         </AnimatePresence>
@@ -596,19 +705,21 @@ export function TaskSidebar({
           }}
         >
           <div className="rail-section-heading">
-            <span>Projects</span>
-            <Tooltip label={openingProject ? "Opening project…" : "Open another project"}>
-              <button
-                type="button"
-                className="icon-button tiny"
-                aria-label={openingProject ? "Opening project" : "Open another project"}
-                onClick={onOpenProject}
-                disabled={openingProject}
-                aria-busy={openingProject}
-              >
-                <Plus />
-              </button>
-            </Tooltip>
+            <span>{showArchived ? "Archived" : "Projects"}</span>
+            {!showArchived ? (
+              <Tooltip label={openingProject ? "Opening project…" : "Open another project"}>
+                <button
+                  type="button"
+                  className="icon-button tiny"
+                  aria-label={openingProject ? "Opening project" : "Open another project"}
+                  onClick={onOpenProject}
+                  disabled={openingProject}
+                  aria-busy={openingProject}
+                >
+                  <Plus />
+                </button>
+              </Tooltip>
+            ) : null}
           </div>
 
           <LayoutGroup id="sidebar-chats">
@@ -617,17 +728,17 @@ export function TaskSidebar({
                 activeKey={activeTaskId}
                 className="chat-row-active"
                 visible={!selectionFadingForProject}
-                layoutKey={`${showArchived}:${projects
+                layoutKey={`${showArchived}:${visibleProjects
                   .map(
                     (project) =>
-                      `${project.id}:${expandedProjects[project.id] ?? false}:${projectChatLimits[project.id] ?? INITIAL_PROJECT_CHAT_LIMIT}`,
+                      `${project.id}:${isProjectExpanded(project.id)}:${projectChatLimits[project.id] ?? INITIAL_PROJECT_CHAT_LIMIT}:${project.pinned ? 1 : 0}:${project.archived ? 1 : 0}`,
                   )
                   .join("|")}:${tasks
                   .map((task) => `${task.id}:${task.projectId}:${task.updatedAt}:${task.archived}`)
                   .join("|")}`}
               />
-              {projects.map((project) => {
-                const expanded = expandedProjects[project.id] ?? false;
+              {visibleProjects.map((project) => {
+                const expanded = isProjectExpanded(project.id);
                 const allProjectTasks = tasksByProject.get(project.id) ?? [];
                 const projectChats = expanded ? chatsForProject(project.id) : [];
                 const chatLimit = projectChatLimits[project.id] ?? INITIAL_PROJECT_CHAT_LIMIT;
@@ -641,12 +752,25 @@ export function TaskSidebar({
                 }
                 const hiddenChatCount = Math.max(0, projectChats.length - chatLimit);
                 const visibleCount = showArchived
-                  ? allProjectTasks.filter((task) => task.archived).length
+                  ? project.archived
+                    ? allProjectTasks.length
+                    : allProjectTasks.filter((task) => task.archived).length
                   : allProjectTasks.filter((task) => !task.archived).length;
+                const projectMenuOpen = openProjectMenuId === project.id;
+                // Chat menus still need the group lifted (z-index) so the
+                // popover clears the next project header — but that must not
+                // fake a project-header hover (pin scooch / … / +).
+                const menuOpenInProject = Boolean(
+                  projectMenuOpen ||
+                    (openMenuId && projectChats.some((task) => task.id === openMenuId)),
+                );
                 return (
                   <motion.div
                     className="project-group"
                     data-active={project.id === activeProjectId}
+                    data-archived={showArchived && project.archived ? "true" : undefined}
+                    data-menu-open={menuOpenInProject ? "true" : undefined}
+                    data-project-menu-open={projectMenuOpen ? "true" : undefined}
                     key={project.id}
                     layout={reduceMotion ? false : "position"}
                     layoutDependency={`${expanded}:${showArchived}:${visibleProjectChats
@@ -660,20 +784,7 @@ export function TaskSidebar({
                         type="button"
                         aria-label={`${expanded ? "Collapse" : "Expand"} ${project.name}`}
                         aria-expanded={expanded}
-                        onClick={() => {
-                          if (expanded) {
-                            const containsActiveChat = (tasksByProject.get(project.id) ?? []).some(
-                              (task) => task.id === activeTaskId,
-                            );
-                            if (containsActiveChat) setProjectHidingSelection(project.id);
-                          } else if (projectHidingSelection === project.id) {
-                            setProjectHidingSelection("");
-                          }
-                          setExpandedProjects((current) => ({
-                            ...current,
-                            [project.id]: !expanded,
-                          }));
-                        }}
+                        onClick={() => toggleProjectExpanded(project.id, expanded)}
                       >
                         <ChevronDown
                           className={expanded ? "disclosure disclosure--open" : "disclosure"}
@@ -682,39 +793,141 @@ export function TaskSidebar({
                       <button
                         className="project-select-button"
                         type="button"
-                        onClick={() => onSelectProject(project.id)}
-                        aria-label={`Open project ${project.name}`}
+                        onClick={() => {
+                          // Inactive → select (auto-expands). Active → toggle
+                          // expand/collapse so close is as easy as open.
+                          if (project.id !== activeProjectId) {
+                            onSelectProject(project.id);
+                            return;
+                          }
+                          toggleProjectExpanded(project.id, expanded);
+                        }}
+                        aria-expanded={expanded}
                         aria-current={project.id === activeProjectId ? "true" : undefined}
                       >
                         <AnimatedFolderIcon open={expanded} />
                         <span>{project.name}</span>
+                        {showArchived && project.archived ? (
+                          <small className="project-archived-badge">Archived</small>
+                        ) : null}
                       </button>
-                      <span className="project-header-meta">
+                      <span className="project-header-meta" data-has-actions="true">
+                        {project.pinned ? (
+                          <Tooltip label="Unpin">
+                            <button
+                              className="project-pin-button"
+                              type="button"
+                              aria-label="Unpin project"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                onUpdateProject?.(project.id, { pinned: false });
+                              }}
+                            >
+                              <Pin className="project-pin" aria-hidden="true" />
+                            </button>
+                          </Tooltip>
+                        ) : null}
                         <small
                           className="project-count"
                           aria-label={`${visibleCount} chat${visibleCount === 1 ? "" : "s"}`}
                         >
                           {visibleCount}
                         </small>
-                        {onNewTaskInProject ? (
-                          <Tooltip label={`New chat in ${project.name}`}>
+                        <span className="project-header-actions">
+                          <Tooltip label="More project actions">
                             <button
-                              className="project-new-chat"
+                              className="project-more-button"
                               type="button"
-                              aria-label={`New chat in ${project.name}`}
-                              onClick={() => onNewTaskInProject(project.id)}
+                              data-project-menu={project.id}
+                              aria-label={`More actions for ${project.name}`}
+                              aria-expanded={openProjectMenuId === project.id}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                setOpenMenuId("");
+                                setOpenProjectMenuId((current) =>
+                                  current === project.id ? "" : project.id,
+                                );
+                              }}
                             >
-                              <Plus aria-hidden="true" />
+                              <MoreHorizontal aria-hidden="true" />
                             </button>
                           </Tooltip>
-                        ) : null}
+                          {onNewTaskInProject && !showArchived ? (
+                            <Tooltip label={`New chat in ${project.name}`}>
+                              <button
+                                className="project-new-chat"
+                                type="button"
+                                aria-label={`New chat in ${project.name}`}
+                                onClick={() => onNewTaskInProject(project.id)}
+                              >
+                                <Plus aria-hidden="true" />
+                              </button>
+                            </Tooltip>
+                          ) : null}
+                        </span>
+                        <AnimatePresence>
+                          {openProjectMenuId === project.id ? (
+                            <motion.div
+                              className="chat-action-menu project-action-menu"
+                              role="menu"
+                              ref={projectMenuRef}
+                              initial={reduceMotion ? false : { opacity: 0, y: -5, scale: 0.96 }}
+                              animate={{ opacity: 1, y: 0, scale: 1 }}
+                              exit={
+                                reduceMotion
+                                  ? undefined
+                                  : {
+                                      opacity: 0,
+                                      y: -3,
+                                      scale: 0.98,
+                                      transition: { duration: 0.12, ease: [0.2, 0, 0, 1] },
+                                    }
+                              }
+                              transition={reduceMotion ? { duration: 0 } : menuSpring}
+                            >
+                              <button
+                                role="menuitem"
+                                type="button"
+                                onClick={() => {
+                                  onUpdateProject?.(project.id, { pinned: !project.pinned });
+                                  setOpenProjectMenuId("");
+                                }}
+                              >
+                                {project.pinned ? <PinOff /> : <Pin />}
+                                {project.pinned ? "Unpin" : "Pin"}
+                              </button>
+                              <button
+                                role="menuitem"
+                                type="button"
+                                onClick={() => {
+                                  onUpdateProject?.(project.id, { archived: !project.archived });
+                                  setOpenProjectMenuId("");
+                                }}
+                              >
+                                {project.archived ? <ArchiveRestore /> : <Archive />}
+                                {project.archived ? "Restore" : "Archive"}
+                              </button>
+                              <button
+                                role="menuitem"
+                                type="button"
+                                className="project-action-menu-danger"
+                                onClick={() => {
+                                  setOpenProjectMenuId("");
+                                  onDeleteProject?.(project.id);
+                                }}
+                              >
+                                <Trash2 /> Delete…
+                              </button>
+                            </motion.div>
+                          ) : null}
+                        </AnimatePresence>
                       </span>
                     </div>
                     <AnimatePresence initial={false}>
                       {expanded ? (
                         <motion.div
                           className="project-chat-list"
-                          data-menu-open={openMenuId ? "true" : "false"}
+                          data-menu-open={menuOpenInProject ? "true" : "false"}
                           initial={reduceMotion ? false : { height: 0, opacity: 0 }}
                           animate={{ height: "auto", opacity: 1 }}
                           exit={reduceMotion ? undefined : { height: 0, opacity: 0 }}
@@ -807,7 +1020,9 @@ export function TaskSidebar({
                             </>
                           ) : (
                             <p className="project-chat-empty" role="status">
-                              {showArchived ? "No archived chats" : "No chats yet"}
+                              {showArchived && !project.archived
+                                ? "No archived chats"
+                                : "No chats yet"}
                             </p>
                           )}
                         </motion.div>
@@ -816,6 +1031,19 @@ export function TaskSidebar({
                   </motion.div>
                 );
               })}
+              {visibleProjects.length === 0 && projects.length > 0 ? (
+                showArchived ? (
+                  <div className="sidebar-chat-empty" role="status">
+                    <Archive aria-hidden="true" />
+                    <strong>Nothing archived</strong>
+                    <span>Archived chats and projects will show up here.</span>
+                  </div>
+                ) : (
+                  <p className="project-chat-empty" role="status">
+                    All projects are archived
+                  </p>
+                )
+              ) : null}
               {projects.length === 0 ? (
                 <button className="sidebar-empty-project" type="button" onClick={onOpenProject}>
                   <Folder />

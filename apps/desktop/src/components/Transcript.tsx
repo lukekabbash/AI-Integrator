@@ -1,10 +1,22 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useVirtualizer, type Range } from "@tanstack/react-virtual";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { AnimatePresence, m as motion } from "motion/react";
 import {
   Check,
+  ChevronDown,
   ChevronRight,
+  ChevronUp,
   Circle,
   Copy,
   FileSearch,
@@ -14,16 +26,31 @@ import {
   RefreshCw,
   Search,
   TerminalSquare,
+  X,
 } from "lucide-react";
 import { bridge, openExternalLink, attachmentKind, type TranscriptEvent } from "../bridge";
 import { DiffView, type DiffSelectionPayload } from "./DiffView";
 import { FileIcon } from "./FileIcon";
 import { splitAttachmentBlock } from "./conversationFormatting";
+import { stabilizeStreamingMarkdown } from "./streamStableMarkdown";
+import {
+  readTranscriptViewportState,
+  writeTranscriptViewportState,
+  type TranscriptAnchor,
+  type TranscriptViewportState,
+} from "./transcriptViewportState";
 
 const FOLLOW_THRESHOLD_PX = 96;
+const VIRTUALIZATION_THRESHOLD = 250;
+const MINIMUM_ROW_HEIGHT_PX = 26;
+const OVERSCAN_VIEWPORTS = 1.5;
 
 interface TranscriptProps {
   events: TranscriptEvent[];
+  /** Stable task/delegation identity used for local viewport restoration. */
+  ownerKey?: string;
+  /** Emergency fallback for platform-specific rendering issues. */
+  virtualizationEnabled?: boolean;
   running?: boolean;
   /** The scroll viewport owned by the workspace shell. */
   scrollContainerRef?: React.RefObject<HTMLDivElement | null>;
@@ -39,6 +66,36 @@ interface TranscriptProps {
   onOpenFile?: (path: string) => void;
   /** Selection-to-chat from transcript-embedded diffs. */
   onAddDiffSelection?: (payload: DiffSelectionPayload) => void;
+}
+
+interface AttachmentPreviewCache {
+  values: Map<string, string | null>;
+  requests: Map<string, Promise<string | null>>;
+}
+
+function loadAttachmentPreview(
+  cache: AttachmentPreviewCache,
+  path: string,
+): Promise<string | null> {
+  if (cache.values.has(path)) return Promise.resolve(cache.values.get(path) ?? null);
+  const pending = cache.requests.get(path);
+  if (pending) return pending;
+  if (!bridge.readAttachmentPreview) return Promise.resolve(null);
+
+  const request = bridge
+    .readAttachmentPreview(path)
+    .then((preview) => {
+      cache.values.set(path, preview);
+      cache.requests.delete(path);
+      return preview;
+    })
+    .catch(() => {
+      cache.values.set(path, null);
+      cache.requests.delete(path);
+      return null;
+    });
+  cache.requests.set(path, request);
+  return request;
 }
 
 function formatClock(timestamp: string): string {
@@ -79,10 +136,18 @@ function MarkdownLink({
 const MARKDOWN_REMARK_PLUGINS = [remarkGfm];
 const MARKDOWN_COMPONENTS = { a: MarkdownLink };
 
-const MarkdownBody = memo(function MarkdownBody({ body }: { body: string }) {
+const MarkdownBody = memo(function MarkdownBody({
+  body,
+  streaming = false,
+}: {
+  body: string;
+  /** When true, also hold thematic-break candidates until the stream settles. */
+  streaming?: boolean;
+}) {
+  const source = stabilizeStreamingMarkdown(body, streaming);
   return (
     <ReactMarkdown remarkPlugins={MARKDOWN_REMARK_PLUGINS} components={MARKDOWN_COMPONENTS}>
-      {body}
+      {source}
     </ReactMarkdown>
   );
 });
@@ -104,23 +169,28 @@ function mentionSegments(text: string): Array<string | { mention: string }> {
   return segments;
 }
 
-function AttachmentThumb({ path }: { path: string }) {
+function AttachmentThumb({
+  path,
+  previewCache,
+}: {
+  path: string;
+  previewCache: AttachmentPreviewCache;
+}) {
   const name = path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
   const isImage = attachmentKind(name) === "image";
-  const [preview, setPreview] = useState<string | null>(null);
+  const [preview, setPreview] = useState<string | null>(
+    () => previewCache.values.get(path) ?? null,
+  );
   useEffect(() => {
-    if (!isImage || !bridge.readAttachmentPreview) return;
+    if (!isImage) return;
     let active = true;
-    void bridge
-      .readAttachmentPreview(path)
-      .then((dataUrl) => {
-        if (active) setPreview(dataUrl);
-      })
-      .catch(() => undefined);
+    void loadAttachmentPreview(previewCache, path).then((dataUrl) => {
+      if (active) setPreview(dataUrl);
+    });
     return () => {
       active = false;
     };
-  }, [isImage, path]);
+  }, [isImage, path, previewCache]);
   return (
     <span
       className={`user-attachment${preview ? " user-attachment--image" : ""}`}
@@ -134,15 +204,19 @@ function AttachmentThumb({ path }: { path: string }) {
 }
 
 const UserMessage = memo(function UserMessage({
+  id,
   body,
   nativeSkill,
   timestamp,
   showTimestamp,
+  previewCache,
 }: {
+  id: string;
   body: string;
   nativeSkill?: string;
   timestamp: string;
   showTimestamp: boolean;
+  previewCache: AttachmentPreviewCache;
 }) {
   const skillPrefix = nativeSkill ? `/${nativeSkill}` : "";
   const hasVerifiedSkill =
@@ -152,6 +226,7 @@ const UserMessage = memo(function UserMessage({
   return (
     <section
       className="turn turn--user"
+      data-event-id={id}
       aria-label="Your message"
       title={showTimestamp ? formatClock(timestamp) : undefined}
     >
@@ -182,7 +257,7 @@ const UserMessage = memo(function UserMessage({
       {attachments.length > 0 ? (
         <span className="user-attachments" aria-label="Attached files">
           {attachments.map((path) => (
-            <AttachmentThumb key={path} path={path} />
+            <AttachmentThumb key={path} path={path} previewCache={previewCache} />
           ))}
         </span>
       ) : null}
@@ -223,13 +298,13 @@ const AssistantMessage = memo(function AssistantMessage({
 }) {
   const clock = showTimestamp ? formatClock(timestamp) : "";
   return (
-    <section className="turn turn--assistant" aria-label="Agent response">
+    <section className="turn turn--assistant" data-event-id={id} aria-label="Agent response">
       {modelLabel ? (
         <header className="turn-attribution">
           <span className="turn-attribution-model">{modelLabel}</span>
         </header>
       ) : null}
-      <MarkdownBody body={body} />
+      <MarkdownBody body={body} streaming={running} />
       <div className="message-actions">
         <button
           type="button"
@@ -274,14 +349,16 @@ const AssistantMessage = memo(function AssistantMessage({
 });
 
 const NoticeMessage = memo(function NoticeMessage({
+  id,
   title,
   body,
 }: {
+  id: string;
   title?: string;
   body: string;
 }) {
   return (
-    <aside className="inline-notice">
+    <aside className="inline-notice" data-event-id={id}>
       <Info />
       <span>
         <strong>{title}</strong>
@@ -303,6 +380,8 @@ function EventIcon({ event }: { event: TranscriptEvent }) {
 interface ActivityEventProps {
   event: TranscriptEvent;
   nested?: boolean;
+  isExpanded: (event: TranscriptEvent) => boolean;
+  onExpandedChange: (eventId: string, expanded: boolean) => void;
   onOpenFile?: (path: string) => void;
   onAddDiffSelection?: (payload: DiffSelectionPayload) => void;
 }
@@ -310,10 +389,12 @@ interface ActivityEventProps {
 const ActivityEvent = memo(function ActivityEventRow({
   event,
   nested = false,
+  isExpanded,
+  onExpandedChange,
   onOpenFile,
   onAddDiffSelection,
 }: ActivityEventProps): React.ReactElement {
-  const [expanded, setExpanded] = useState(event.expandedByDefault ?? false);
+  const expanded = isExpanded(event);
   const hasChildren = Boolean(event.children?.length);
   const hasDetails = Boolean(event.details?.length);
   const hasDiff = Boolean(event.diff?.lines.length);
@@ -325,13 +406,14 @@ const ActivityEvent = memo(function ActivityEventRow({
   return (
     <div
       className={`activity-event${hasChildren ? " activity-event--group" : ""}${nested ? " activity-event--nested" : ""}`}
+      data-event-id={event.id}
       data-status={event.status ?? "neutral"}
     >
       <div className="activity-event-summary">
         <button
           className="activity-event-toggle"
           type="button"
-          onClick={() => expandable && setExpanded((value) => !value)}
+          onClick={() => expandable && onExpandedChange(event.id, !expanded)}
           aria-expanded={expandable ? expanded : undefined}
           disabled={!expandable}
         >
@@ -417,6 +499,8 @@ const ActivityEvent = memo(function ActivityEventRow({
                 event={child}
                 key={child.id}
                 nested
+                isExpanded={isExpanded}
+                onExpandedChange={onExpandedChange}
                 onOpenFile={onOpenFile}
                 onAddDiffSelection={onAddDiffSelection}
               />
@@ -444,8 +528,67 @@ const ActivityEvent = memo(function ActivityEventRow({
   );
 });
 
+interface RowMargins {
+  top: number;
+  bottom: number;
+}
+
+function transcriptRowMargins(event: TranscriptEvent): RowMargins {
+  if (event.kind === "assistant") return { top: 10, bottom: 18 };
+  if (event.kind === "user") return { top: 0, bottom: 16 };
+  if (event.kind === "notice") return { top: 10, bottom: 10 };
+  return { top: 0, bottom: 2 };
+}
+
+function transcriptRowSpacing(events: TranscriptEvent[], index: number, count: number) {
+  const current = transcriptRowMargins(events[index]);
+  const previous = index > 0 ? transcriptRowMargins(events[index - 1]) : undefined;
+  return {
+    paddingTop: previous ? Math.max(previous.bottom, current.top) : current.top,
+    paddingBottom: index === count - 1 ? current.bottom : 0,
+  };
+}
+
+function estimateTranscriptRowSize(event: TranscriptEvent): number {
+  const explicitLines = event.body.split("\n").length;
+  const wrappedLines = Math.ceil(event.body.length / 82);
+  const lines = Math.max(explicitLines, wrappedLines);
+  if (event.kind === "assistant") return Math.min(520, 54 + lines * 21);
+  if (event.kind === "user") return Math.min(320, 34 + lines * 20);
+  if (event.kind === "notice") return Math.min(220, 38 + lines * 18);
+  return event.expandedByDefault ? 96 : 28;
+}
+
+const TRANSCRIPT_SEARCH_TEXT = new WeakMap<TranscriptEvent, string>();
+
+function transcriptSearchText(event: TranscriptEvent): string {
+  const cached = TRANSCRIPT_SEARCH_TEXT.get(event);
+  if (cached !== undefined) return cached;
+  const text = [
+    event.title,
+    event.body,
+    event.meta,
+    event.filePath,
+    event.diff?.path,
+    event.diff?.lines.map((line) => line.content).join("\n"),
+    event.details?.map((detail) => `${detail.label}\n${detail.body}`).join("\n"),
+    event.children?.map((child) => transcriptSearchText(child)).join("\n"),
+  ]
+    .filter(Boolean)
+    .join("\n")
+    .toLowerCase();
+  TRANSCRIPT_SEARCH_TEXT.set(event, text);
+  return text;
+}
+
+function sameNumbers(left: number[], right: number[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
 export function Transcript({
   events,
+  ownerKey,
+  virtualizationEnabled: virtualizationAllowed = true,
   running = false,
   scrollContainerRef,
   onAskAbout,
@@ -455,9 +598,19 @@ export function Transcript({
   onOpenFile,
   onAddDiffSelection,
 }: TranscriptProps) {
+  const [initialViewportState] = useState(() => readTranscriptViewportState(ownerKey));
   const [copiedEventId, setCopiedEventId] = useState<string | null>(null);
   const [copyFailureId, setCopyFailureId] = useState<string | null>(null);
   const [hasNewContent, setHasNewContent] = useState(false);
+  const [expandedEvents, setExpandedEvents] = useState<Record<string, boolean>>(
+    () => initialViewportState?.expanded ?? {},
+  );
+  const [pinnedIndices, setPinnedIndices] = useState<number[]>([]);
+  const [scrollMargin, setScrollMargin] = useState(0);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [activeSearchMatch, setActiveSearchMatch] = useState(0);
+  const [scrollElement, setScrollElement] = useState<HTMLDivElement | null>(null);
   const [liveStream, setLiveStream] = useState({ running, open: false });
   if (liveStream.running !== running) {
     setLiveStream({ running, open: false });
@@ -465,15 +618,124 @@ export function Transcript({
   const liveStreamOpen = liveStream.open;
   const clearCopyStatus = useRef<number | undefined>(undefined);
   const contentRef = useRef<HTMLDivElement>(null);
-  const shouldFollowLatestRef = useRef(true);
+  const virtualListRef = useRef<HTMLDivElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const searchReturnAnchorRef = useRef<TranscriptAnchor | undefined>(undefined);
+  const previewCacheRef = useRef<AttachmentPreviewCache>({
+    values: new Map(),
+    requests: new Map(),
+  });
+  const eventsRef = useRef(events);
+  eventsRef.current = events;
+  const renderedEventCountRef = useRef(events.length);
+  const shouldFollowLatestRef = useRef(initialViewportState?.following ?? true);
   const previousEventsRef = useRef<TranscriptEvent[] | null>(null);
   const previousRunningRef = useRef(running);
   const previousLatestUserIdRef = useRef<string | undefined>(undefined);
   const scheduledFrameRef = useRef<number | undefined>(undefined);
+  const restoreFrameRef = useRef<number | undefined>(undefined);
+  const saveViewportTimerRef = useRef<number | undefined>(undefined);
+  const viewportStateRef = useRef<TranscriptViewportState>(
+    initialViewportState ?? {
+      following: true,
+      expanded: {},
+      updatedAt: Date.now(),
+    },
+  );
   const askAboutRef = useRef(onAskAbout);
   const regenerateRef = useRef(onRegenerate);
   const openFileRef = useRef(onOpenFile);
   const addDiffSelectionRef = useRef(onAddDiffSelection);
+
+  const liveActivity = running ? findTrailingActivity(events) : undefined;
+  const renderedEventCount = events.length - (liveActivity ? 1 : 0);
+  renderedEventCountRef.current = renderedEventCount;
+  const virtualizationEnabled =
+    virtualizationAllowed &&
+    renderedEventCount > VIRTUALIZATION_THRESHOLD &&
+    Boolean(scrollContainerRef);
+  const setContentNode = useCallback(
+    (node: HTMLDivElement | null) => {
+      contentRef.current = node;
+      if (virtualizationEnabled) {
+        const container = scrollContainerRef?.current ?? node?.parentElement;
+        setScrollElement(container instanceof HTMLDivElement ? container : null);
+      }
+    },
+    [scrollContainerRef, virtualizationEnabled],
+  );
+  const { lastAssistantId, latestUserId } = findRecentMessageIds(events, renderedEventCount);
+  const currentActivity = liveActivity
+    ? findActivityLeaf(liveActivity)
+    : running
+      ? findCurrentActivity(events)
+      : undefined;
+  const currentActivityLabel = currentActivity
+    ? describeCurrentActivity(currentActivity)
+    : undefined;
+  // Connection wait stays generic — the live indicator already signals an
+  // active run, and naming the runtime here raced the connection banner.
+  const waitingLabel = "Connecting";
+  // Keying the narration on its visible text is what drives the ticker
+  // transition: any wording change swaps the node through AnimatePresence.
+  const narrationKey = liveActivity
+    ? `${firstLine(liveActivity.body)}|${currentActivityLabel ?? ""}`
+    : (currentActivityLabel ?? waitingLabel);
+  const deferredSearchQuery = useDeferredValue(searchQuery.trim().toLocaleLowerCase());
+  const searchMatches = useMemo(() => {
+    if (!searchOpen || !deferredSearchQuery) return [];
+    const matches: number[] = [];
+    for (let index = 0; index < renderedEventCount; index += 1) {
+      if (transcriptSearchText(events[index]).includes(deferredSearchQuery)) matches.push(index);
+    }
+    return matches;
+  }, [deferredSearchQuery, events, renderedEventCount, searchOpen]);
+  const normalizedActiveSearchMatch =
+    searchMatches.length > 0 ? activeSearchMatch % searchMatches.length : 0;
+  const activeSearchIndex = searchMatches[normalizedActiveSearchMatch];
+  const searchMatchSet = useMemo(() => new Set(searchMatches), [searchMatches]);
+
+  const getItemKey = useCallback((index: number) => eventsRef.current[index]?.id ?? index, []);
+  const estimateSize = useCallback((index: number) => {
+    const source = eventsRef.current;
+    const event = source[index];
+    if (!event) return MINIMUM_ROW_HEIGHT_PX;
+    const spacing = transcriptRowSpacing(source, index, renderedEventCountRef.current);
+    return estimateTranscriptRowSize(event) + spacing.paddingTop + spacing.paddingBottom;
+  }, []);
+  const rangeExtractor = useCallback(
+    (range: Range) => {
+      const viewportHeight = scrollContainerRef?.current?.clientHeight ?? 0;
+      const extraRows = Math.ceil((viewportHeight * OVERSCAN_VIEWPORTS) / MINIMUM_ROW_HEIGHT_PX);
+      const first = Math.max(0, range.startIndex - extraRows);
+      const last = Math.min(range.count - 1, range.endIndex + extraRows);
+      const indexes = new Set(pinnedIndices);
+      if (activeSearchIndex !== undefined) indexes.add(activeSearchIndex);
+      for (let index = first; index <= last; index += 1) indexes.add(index);
+      return [...indexes]
+        .filter((index) => index >= 0 && index < range.count)
+        .sort((a, b) => a - b);
+    },
+    [activeSearchIndex, pinnedIndices, scrollContainerRef],
+  );
+
+  // TanStack Virtual is intentionally imperative; React Compiler skips this
+  // component while the rest of the renderer remains compiler-compatible.
+  // eslint-disable-next-line react-hooks/incompatible-library
+  const rowVirtualizer = useVirtualizer({
+    count: renderedEventCount,
+    getScrollElement: () => scrollElement,
+    estimateSize,
+    getItemKey,
+    rangeExtractor,
+    scrollMargin,
+    overscan: 0,
+    enabled: virtualizationEnabled,
+    anchorTo: "end",
+    followOnAppend: true,
+    scrollEndThreshold: FOLLOW_THRESHOLD_PX,
+    useFlushSync: false,
+  });
 
   useEffect(() => {
     askAboutRef.current = onAskAbout;
@@ -481,6 +743,152 @@ export function Transcript({
     openFileRef.current = onOpenFile;
     addDiffSelectionRef.current = onAddDiffSelection;
   }, [onAddDiffSelection, onAskAbout, onOpenFile, onRegenerate]);
+
+  const queueViewportSave = useCallback(() => {
+    if (!ownerKey) return;
+    viewportStateRef.current.updatedAt = Date.now();
+    if (saveViewportTimerRef.current !== undefined) {
+      window.clearTimeout(saveViewportTimerRef.current);
+    }
+    saveViewportTimerRef.current = window.setTimeout(() => {
+      saveViewportTimerRef.current = undefined;
+      writeTranscriptViewportState(ownerKey, viewportStateRef.current);
+    }, 180);
+  }, [ownerKey]);
+
+  const captureVisibleAnchor = useCallback((): TranscriptAnchor | undefined => {
+    const container = scrollContainerRef?.current;
+    const content = contentRef.current;
+    if (!container || !content) return undefined;
+    const rows = virtualizationEnabled
+      ? Array.from(content.querySelectorAll<HTMLElement>(".transcript-virtual-row"))
+      : Array.from(content.children).filter(
+          (child): child is HTMLElement =>
+            child instanceof HTMLElement && Boolean(child.dataset.eventId),
+        );
+    const viewport = container.getBoundingClientRect();
+    const visible = rows
+      .map((row) => ({ row, rect: row.getBoundingClientRect() }))
+      .filter(({ rect }) => rect.bottom > viewport.top && rect.top < viewport.bottom)
+      .sort((left, right) => left.rect.top - right.rect.top)[0];
+    const eventId = visible?.row.dataset.eventId;
+    return eventId ? { eventId, offsetPx: visible.rect.top - viewport.top } : undefined;
+  }, [scrollContainerRef, virtualizationEnabled]);
+
+  const restoreAnchor = useCallback(
+    (anchor: TranscriptAnchor): boolean => {
+      if (!(scrollContainerRef?.current ?? scrollElement)) return false;
+      const index = eventsRef.current.findIndex((event) => event.id === anchor.eventId);
+      if (index < 0) return false;
+      if (virtualizationEnabled) rowVirtualizer.scrollToIndex(index, { align: "start" });
+
+      const alignMeasuredRow = () => {
+        const container = scrollContainerRef?.current;
+        const content = contentRef.current;
+        if (!container || !content) return;
+        const row = Array.from(content.querySelectorAll<HTMLElement>("[data-event-id]")).find(
+          (candidate) => candidate.dataset.eventId === anchor.eventId,
+        );
+        if (!row) return;
+        const currentOffset =
+          row.getBoundingClientRect().top - container.getBoundingClientRect().top;
+        container.scrollTop += currentOffset - anchor.offsetPx;
+      };
+
+      restoreFrameRef.current = window.requestAnimationFrame(() => {
+        if (virtualizationEnabled) {
+          restoreFrameRef.current = window.requestAnimationFrame(() => {
+            restoreFrameRef.current = undefined;
+            alignMeasuredRow();
+          });
+        } else {
+          restoreFrameRef.current = undefined;
+          alignMeasuredRow();
+        }
+      });
+      return true;
+    },
+    [rowVirtualizer, scrollContainerRef, scrollElement, virtualizationEnabled],
+  );
+
+  const openTranscriptSearch = useCallback(() => {
+    if (!searchOpen) searchReturnAnchorRef.current = captureVisibleAnchor();
+    setSearchOpen(true);
+    window.requestAnimationFrame(() => searchInputRef.current?.focus());
+  }, [captureVisibleAnchor, searchOpen]);
+
+  const closeTranscriptSearch = useCallback(() => {
+    setSearchOpen(false);
+    setSearchQuery("");
+    setActiveSearchMatch(0);
+    const anchor = searchReturnAnchorRef.current;
+    searchReturnAnchorRef.current = undefined;
+    if (anchor) restoreAnchor(anchor);
+  }, [restoreAnchor]);
+
+  const moveSearchMatch = useCallback(
+    (direction: 1 | -1) => {
+      if (searchMatches.length === 0) return;
+      setActiveSearchMatch(
+        (current) => (current + direction + searchMatches.length) % searchMatches.length,
+      );
+    },
+    [searchMatches.length],
+  );
+
+  const updateScrollMargin = useCallback(() => {
+    if (!virtualizationEnabled) return;
+    const container = scrollContainerRef?.current;
+    const list = virtualListRef.current;
+    if (!container || !list) return;
+    const next =
+      list.getBoundingClientRect().top -
+      container.getBoundingClientRect().top +
+      container.scrollTop;
+    setScrollMargin((current) => (Math.abs(current - next) > 0.5 ? next : current));
+  }, [scrollContainerRef, virtualizationEnabled]);
+
+  const isActivityExpanded = useCallback(
+    (event: TranscriptEvent) => expandedEvents[event.id] ?? event.expandedByDefault ?? false,
+    [expandedEvents],
+  );
+  const setActivityExpanded = useCallback(
+    (eventId: string, expanded: boolean) => {
+      setExpandedEvents((current) => {
+        if (current[eventId] === expanded) return current;
+        const next = { ...current, [eventId]: expanded };
+        viewportStateRef.current.expanded = next;
+        queueViewportSave();
+        return next;
+      });
+    },
+    [queueViewportSave],
+  );
+
+  useEffect(() => {
+    const container = scrollContainerRef?.current;
+    if (!virtualizationEnabled || !container) return;
+    const handleFindShortcut = (event: KeyboardEvent) => {
+      if (
+        event.key.toLocaleLowerCase() !== "f" ||
+        (!event.metaKey && !event.ctrlKey) ||
+        event.altKey
+      ) {
+        return;
+      }
+      event.preventDefault();
+      openTranscriptSearch();
+    };
+    container.addEventListener("keydown", handleFindShortcut);
+    return () => container.removeEventListener("keydown", handleFindShortcut);
+  }, [openTranscriptSearch, scrollContainerRef, virtualizationEnabled]);
+
+  useEffect(() => {
+    if (!searchOpen || activeSearchIndex === undefined) return;
+    shouldFollowLatestRef.current = false;
+    viewportStateRef.current.following = false;
+    rowVirtualizer.scrollToIndex(activeSearchIndex, { align: "center" });
+  }, [activeSearchIndex, rowVirtualizer, searchOpen]);
 
   const scheduleFollow = useCallback(() => {
     if (!shouldFollowLatestRef.current) return;
@@ -509,6 +917,11 @@ export function Transcript({
       const shouldFollow = distanceFromLatest <= FOLLOW_THRESHOLD_PX;
       shouldFollowLatestRef.current = shouldFollow;
       if (shouldFollow) setHasNewContent(false);
+      viewportStateRef.current.following = shouldFollow;
+      if (!shouldFollow) {
+        viewportStateRef.current.anchor = captureVisibleAnchor() ?? viewportStateRef.current.anchor;
+      }
+      queueViewportSave();
     };
 
     // Follow state changes only on real scroll events. Probing the position
@@ -516,28 +929,63 @@ export function Transcript({
     // chat and misfile "just opened" as "scrolled away from the latest".
     container.addEventListener("scroll", handleScroll, { passive: true });
     return () => container.removeEventListener("scroll", handleScroll);
-  }, [scrollContainerRef]);
+  }, [captureVisibleAnchor, queueViewportSave, scrollContainerRef]);
 
-  const liveActivity = running ? findTrailingActivity(events) : undefined;
-  const renderedEventCount = events.length - (liveActivity ? 1 : 0);
-  const { lastAssistantId, latestUserId } = findRecentMessageIds(events, renderedEventCount);
-  const currentActivity = liveActivity
-    ? findActivityLeaf(liveActivity)
-    : running
-      ? findCurrentActivity(events)
-      : undefined;
-  const currentActivityLabel = currentActivity
-    ? describeCurrentActivity(currentActivity)
-    : undefined;
-  // Keying the narration on its visible text is what drives the ticker
-  // transition: any wording change swaps the node through AnimatePresence.
-  const narrationKey = liveActivity
-    ? `${firstLine(liveActivity.body)}|${currentActivityLabel ?? ""}`
-    : (currentActivityLabel ?? "thinking");
+  useEffect(() => {
+    const content = contentRef.current;
+    if (!virtualizationEnabled || !content) return;
+
+    const indexForNode = (node: Node | null): number | undefined => {
+      const element = node instanceof Element ? node : node?.parentElement;
+      const row = element?.closest<HTMLElement>(".transcript-virtual-row");
+      if (!row || !content.contains(row)) return undefined;
+      const index = Number(row.dataset.index);
+      return Number.isInteger(index) ? index : undefined;
+    };
+    const updatePinnedRows = () => {
+      const selection = window.getSelection();
+      const next = new Set<number>();
+      const activeIndex = indexForNode(document.activeElement);
+      if (activeIndex !== undefined) next.add(activeIndex);
+      if (selection && !selection.isCollapsed) {
+        const anchorIndex = indexForNode(selection.anchorNode);
+        const focusIndex = indexForNode(selection.focusNode);
+        if (anchorIndex !== undefined) next.add(anchorIndex);
+        if (focusIndex !== undefined) next.add(focusIndex);
+        if (next.size > 0) {
+          shouldFollowLatestRef.current = false;
+          viewportStateRef.current.following = false;
+          viewportStateRef.current.anchor =
+            captureVisibleAnchor() ?? viewportStateRef.current.anchor;
+          queueViewportSave();
+        }
+      }
+      const sorted = [...next].sort((a, b) => a - b);
+      setPinnedIndices((current) => (sameNumbers(current, sorted) ? current : sorted));
+    };
+
+    document.addEventListener("selectionchange", updatePinnedRows);
+    content.addEventListener("focusin", updatePinnedRows);
+    content.addEventListener("focusout", updatePinnedRows);
+    return () => {
+      document.removeEventListener("selectionchange", updatePinnedRows);
+      content.removeEventListener("focusin", updatePinnedRows);
+      content.removeEventListener("focusout", updatePinnedRows);
+    };
+  }, [captureVisibleAnchor, queueViewportSave, virtualizationEnabled]);
 
   useLayoutEffect(() => {
     const previousEvents = previousEventsRef.current;
     const isInitialLayout = previousEvents === null;
+    if (
+      isInitialLayout &&
+      !shouldFollowLatestRef.current &&
+      initialViewportState?.anchor &&
+      virtualizationEnabled &&
+      !scrollElement
+    ) {
+      return;
+    }
     const hasNewUserMessage =
       !isInitialLayout &&
       latestUserId !== undefined &&
@@ -550,40 +998,74 @@ export function Transcript({
     previousRunningRef.current = running;
     previousLatestUserIdRef.current = latestUserId;
 
-    if (isInitialLayout || hasNewUserMessage || shouldFollowLatestRef.current) {
+    if (
+      isInitialLayout &&
+      !shouldFollowLatestRef.current &&
+      initialViewportState?.anchor &&
+      restoreAnchor(initialViewportState.anchor)
+    ) {
+      setHasNewContent(false);
+    } else if (isInitialLayout || hasNewUserMessage || shouldFollowLatestRef.current) {
       shouldFollowLatestRef.current = true;
+      viewportStateRef.current.following = true;
       setHasNewContent(false);
       scheduleFollow();
     } else if (hasTranscriptChanged) {
       setHasNewContent(true);
     }
-  }, [events, latestUserId, running, scheduleFollow]);
+  }, [
+    events,
+    initialViewportState,
+    latestUserId,
+    restoreAnchor,
+    running,
+    scheduleFollow,
+    scrollElement,
+    virtualizationEnabled,
+  ]);
+
+  useLayoutEffect(() => {
+    updateScrollMargin();
+  }, [events, hasNewContent, updateScrollMargin]);
 
   useEffect(() => {
     const container = scrollContainerRef?.current;
     const content = contentRef.current;
     if (!container || !content || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => scheduleFollow());
+    const observer = new ResizeObserver(() => {
+      updateScrollMargin();
+      scheduleFollow();
+    });
     observer.observe(container);
     observer.observe(content);
     return () => {
       observer.disconnect();
     };
-  }, [scheduleFollow, scrollContainerRef]);
+  }, [scheduleFollow, scrollContainerRef, updateScrollMargin]);
 
   useEffect(
     () => () => {
       if (clearCopyStatus.current) window.clearTimeout(clearCopyStatus.current);
+      if (saveViewportTimerRef.current !== undefined) {
+        window.clearTimeout(saveViewportTimerRef.current);
+        saveViewportTimerRef.current = undefined;
+      }
       if (scheduledFrameRef.current !== undefined) {
         window.cancelAnimationFrame(scheduledFrameRef.current);
       }
+      if (restoreFrameRef.current !== undefined) {
+        window.cancelAnimationFrame(restoreFrameRef.current);
+      }
+      if (ownerKey) writeTranscriptViewportState(ownerKey, viewportStateRef.current);
     },
-    [],
+    [ownerKey],
   );
 
   const jumpToLatest = () => {
     shouldFollowLatestRef.current = true;
+    viewportStateRef.current.following = true;
     setHasNewContent(false);
+    queueViewportSave();
     if (scrollContainerRef?.current) scrollToLatest(scrollContainerRef.current, "smooth");
   };
 
@@ -611,61 +1093,159 @@ export function Transcript({
     [],
   );
 
+  const renderTranscriptEvent = (event: TranscriptEvent) => {
+    if (event.kind === "user") {
+      return (
+        <UserMessage
+          key={event.id}
+          id={event.id}
+          body={event.body}
+          nativeSkill={event.nativeSkill}
+          timestamp={event.timestamp}
+          showTimestamp={showTimestamps}
+          previewCache={previewCacheRef.current}
+        />
+      );
+    }
+    if (event.kind === "assistant") {
+      const isLatestAssistant = event.id === lastAssistantId;
+      return (
+        <AssistantMessage
+          key={event.id}
+          id={event.id}
+          body={event.body}
+          timestamp={event.timestamp}
+          modelLabel={modelForEvent?.(event)}
+          showTimestamp={showTimestamps}
+          copied={copiedEventId === event.id}
+          copyFailed={copyFailureId === event.id}
+          isLatestAssistant={isLatestAssistant}
+          running={isLatestAssistant && running}
+          canRegenerate={Boolean(onRegenerate)}
+          canAskAbout={Boolean(onAskAbout)}
+          onCopy={copyMessage}
+          onRegenerate={regenerate}
+          onAskAbout={askAbout}
+        />
+      );
+    }
+    if (event.kind === "notice") {
+      return <NoticeMessage key={event.id} id={event.id} title={event.title} body={event.body} />;
+    }
+    return (
+      <ActivityEvent
+        event={event}
+        key={event.id}
+        isExpanded={isActivityExpanded}
+        onExpandedChange={setActivityExpanded}
+        onOpenFile={onOpenFile ? openFile : undefined}
+        onAddDiffSelection={onAddDiffSelection ? addDiffSelection : undefined}
+      />
+    );
+  };
+
+  const virtualItems = virtualizationEnabled ? rowVirtualizer.getVirtualItems() : [];
+
   return (
-    <div className="transcript" ref={contentRef} aria-label="Task transcript">
+    <div
+      className={`transcript${virtualizationEnabled ? " transcript--virtualized" : ""}`}
+      ref={setContentNode}
+      aria-label="Task transcript"
+    >
+      {searchOpen ? (
+        <div className="transcript-search-shell">
+          <div className="transcript-search" role="search" aria-label="Find in transcript">
+            <Search aria-hidden="true" />
+            <input
+              ref={searchInputRef}
+              type="search"
+              value={searchQuery}
+              onChange={(event) => {
+                setSearchQuery(event.target.value);
+                setActiveSearchMatch(0);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Escape") closeTranscriptSearch();
+                if (event.key === "Enter") moveSearchMatch(event.shiftKey ? -1 : 1);
+              }}
+              placeholder="Find in transcript"
+              aria-label="Find in transcript"
+            />
+            <span className="transcript-search-count" aria-live="polite">
+              {searchQuery
+                ? searchMatches.length > 0
+                  ? `${normalizedActiveSearchMatch + 1} of ${searchMatches.length}`
+                  : "No results"
+                : ""}
+            </span>
+            <button
+              type="button"
+              onClick={() => moveSearchMatch(-1)}
+              disabled={searchMatches.length === 0}
+              aria-label="Previous transcript result"
+            >
+              <ChevronUp aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              onClick={() => moveSearchMatch(1)}
+              disabled={searchMatches.length === 0}
+              aria-label="Next transcript result"
+            >
+              <ChevronDown aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              onClick={closeTranscriptSearch}
+              aria-label="Close transcript search"
+            >
+              <X aria-hidden="true" />
+            </button>
+          </div>
+        </div>
+      ) : null}
       {hasNewContent ? (
         <button className="transcript-jump-latest" type="button" onClick={jumpToLatest}>
           <span aria-hidden="true">↓</span> New activity · Jump to latest
         </button>
       ) : null}
-      {events.map((event, index) => {
-        if (index >= renderedEventCount) return null;
-        if (event.kind === "user") {
-          return (
-            <UserMessage
-              key={event.id}
-              body={event.body}
-              nativeSkill={event.nativeSkill}
-              timestamp={event.timestamp}
-              showTimestamp={showTimestamps}
-            />
-          );
-        }
-        if (event.kind === "assistant") {
-          const isLatestAssistant = event.id === lastAssistantId;
-          const modelLabel = modelForEvent?.(event);
-          return (
-            <AssistantMessage
-              key={event.id}
-              id={event.id}
-              body={event.body}
-              timestamp={event.timestamp}
-              modelLabel={modelLabel}
-              showTimestamp={showTimestamps}
-              copied={copiedEventId === event.id}
-              copyFailed={copyFailureId === event.id}
-              isLatestAssistant={isLatestAssistant}
-              running={isLatestAssistant && running}
-              canRegenerate={Boolean(onRegenerate)}
-              canAskAbout={Boolean(onAskAbout)}
-              onCopy={copyMessage}
-              onRegenerate={regenerate}
-              onAskAbout={askAbout}
-            />
-          );
-        }
-        if (event.kind === "notice") {
-          return <NoticeMessage key={event.id} title={event.title} body={event.body} />;
-        }
-        return (
-          <ActivityEvent
-            event={event}
-            key={event.id}
-            onOpenFile={onOpenFile ? openFile : undefined}
-            onAddDiffSelection={onAddDiffSelection ? addDiffSelection : undefined}
-          />
-        );
-      })}
+      {virtualizationEnabled ? (
+        <div
+          className="transcript-virtual-list"
+          ref={virtualListRef}
+          role="list"
+          style={{ height: rowVirtualizer.getTotalSize() }}
+        >
+          {virtualItems.map((virtualRow) => {
+            const event = events[virtualRow.index];
+            if (!event) return null;
+            const spacing = transcriptRowSpacing(events, virtualRow.index, renderedEventCount);
+            return (
+              <div
+                className="transcript-virtual-row"
+                key={virtualRow.key}
+                ref={rowVirtualizer.measureElement}
+                role="listitem"
+                aria-posinset={virtualRow.index + 1}
+                aria-setsize={renderedEventCount}
+                data-index={virtualRow.index}
+                data-event-id={event.id}
+                data-search-match={searchMatchSet.has(virtualRow.index) ? "true" : undefined}
+                data-search-current={virtualRow.index === activeSearchIndex ? "true" : undefined}
+                style={{
+                  paddingTop: spacing.paddingTop,
+                  paddingBottom: spacing.paddingBottom,
+                  transform: `translateY(${virtualRow.start - scrollMargin}px)`,
+                }}
+              >
+                {renderTranscriptEvent(event)}
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        events.slice(0, renderedEventCount).map(renderTranscriptEvent)
+      )}
 
       {running ? (
         <div className="task-now">
@@ -700,7 +1280,18 @@ export function Transcript({
                     </>
                   ) : (
                     <span className="task-now-label">
-                      {currentActivityLabel ? `Working on ${currentActivityLabel}` : "Thinking…"}
+                      {currentActivityLabel ? (
+                        `Working on ${currentActivityLabel}`
+                      ) : (
+                        <>
+                          Connecting
+                          <span className="task-now-ellipsis" aria-hidden="true">
+                            <span>.</span>
+                            <span>.</span>
+                            <span>.</span>
+                          </span>
+                        </>
+                      )}
                     </span>
                   )}
                 </motion.span>
@@ -732,6 +1323,8 @@ export function Transcript({
                       <ActivityEvent
                         event={child}
                         nested
+                        isExpanded={isActivityExpanded}
+                        onExpandedChange={setActivityExpanded}
                         onOpenFile={onOpenFile ? openFile : undefined}
                         onAddDiffSelection={onAddDiffSelection ? addDiffSelection : undefined}
                       />

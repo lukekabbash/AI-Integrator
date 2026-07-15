@@ -345,7 +345,13 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
       version: "1.1.1",
       status: "login_required",
       fidelity: "structured",
-      models: ["Gemini 3.1 Pro", "Gemini 3.5 Flash"],
+      models: [
+        "Gemini 3.1 Pro",
+        "Gemini 3.5 Flash",
+        "Claude Sonnet 4.6 (Thinking)",
+        "Claude Opus 4.6 (Thinking)",
+        "GPT-OSS 120B",
+      ],
       detail: "Installed. Finish the vendor-owned browser login to enable it.",
     },
   ];

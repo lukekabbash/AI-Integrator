@@ -87,6 +87,12 @@ pub enum AcpEvent {
     ProtocolViolation {
         code: String,
     },
+    /// Ordered after every notification emitted by session/load or
+    /// session/resume. Consumers use this to leave replay/recovery mode only
+    /// after the transport has delivered the provider's full response.
+    RecoveryBoundary {
+        replayed_history: bool,
+    },
     StderrActivity,
     Exited,
 }
@@ -127,6 +133,13 @@ impl StopReason {
 #[derive(Clone)]
 pub struct AcpClient {
     inner: Arc<Inner>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpSessionCapabilities {
+    pub load: bool,
+    pub resume: bool,
 }
 
 struct Inner {
@@ -208,6 +221,10 @@ impl AcpClient {
         self.inner.initialization.lock().await.clone()
     }
 
+    pub async fn session_capabilities(&self) -> AcpSessionCapabilities {
+        session_capabilities(&self.initialization().await)
+    }
+
     /// Runs ACP's provider-owned authentication handshake. Integrator passes
     /// only a method id the agent advertised (for Grok, `cached_token`) and
     /// never transports API keys or token contents.
@@ -229,6 +246,66 @@ impl AcpClient {
             json!({ "cwd": cwd.to_string_lossy(), "mcpServers": mcp_servers }),
         )
         .await
+    }
+
+    /// Restore an ACP session and replay its history. The capability gate is
+    /// mandatory: agents may reject unknown methods or implement only resume.
+    pub async fn load_session(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        mcp_servers: Vec<Value>,
+    ) -> Result<Value> {
+        validate_session_id(session_id)?;
+        if !self.session_capabilities().await.load {
+            return Err(IntegratorError::Unavailable(
+                "ACP agent did not advertise session/load".into(),
+            ));
+        }
+        let response = self
+            .request(
+                "session/load",
+                json!({
+                    "sessionId": session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "mcpServers": mcp_servers
+                }),
+            )
+            .await?;
+        let _ = self.inner.events.send(AcpEvent::RecoveryBoundary {
+            replayed_history: true,
+        });
+        Ok(response)
+    }
+
+    /// Reconnect to an ACP session without replaying history. Stable ACP
+    /// requires `agentCapabilities.sessionCapabilities.resume`.
+    pub async fn resume_session(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        mcp_servers: Vec<Value>,
+    ) -> Result<Value> {
+        validate_session_id(session_id)?;
+        if !self.session_capabilities().await.resume {
+            return Err(IntegratorError::Unavailable(
+                "ACP agent did not advertise session/resume".into(),
+            ));
+        }
+        let response = self
+            .request(
+                "session/resume",
+                json!({
+                    "sessionId": session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "mcpServers": mcp_servers
+                }),
+            )
+            .await?;
+        let _ = self.inner.events.send(AcpEvent::RecoveryBoundary {
+            replayed_history: false,
+        });
+        Ok(response)
     }
 
     /// Long-running: the response resolves when the turn finishes. Callers
@@ -383,6 +460,19 @@ impl AcpClient {
         stdin.write_all(&encoded).await?;
         stdin.flush().await?;
         Ok(())
+    }
+}
+
+fn session_capabilities(initialization: &Value) -> AcpSessionCapabilities {
+    let agent = initialization
+        .get("agentCapabilities")
+        .unwrap_or(&Value::Null);
+    AcpSessionCapabilities {
+        load: agent
+            .get("loadSession")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        resume: agent.pointer("/sessionCapabilities/resume").is_some(),
     }
 }
 
@@ -733,6 +823,26 @@ mod tests {
         assert!(validate_session_id(&"s".repeat(513)).is_err());
         assert!(validate_short_token("", "config option id").is_err());
         assert!(validate_short_token(&"m".repeat(257), "config option value").is_err());
+    }
+
+    #[test]
+    fn session_recovery_capabilities_are_feature_detected_exactly() {
+        assert_eq!(
+            session_capabilities(&json!({
+                "agentCapabilities": {
+                    "loadSession": true,
+                    "sessionCapabilities": { "resume": {} }
+                }
+            })),
+            AcpSessionCapabilities {
+                load: true,
+                resume: true,
+            }
+        );
+        assert_eq!(
+            session_capabilities(&json!({ "agentCapabilities": {} })),
+            AcpSessionCapabilities::default()
+        );
     }
 
     #[tokio::test]

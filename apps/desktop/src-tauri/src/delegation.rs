@@ -17,6 +17,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
+    time::Duration,
 };
 
 #[cfg(unix)]
@@ -45,13 +46,14 @@ use tokio::{
 use crate::{
     chat_title::{format_subagent_title, generate_subagent_title},
     state::{
-        AcpRuntime, AppState, CodexRuntime, DelegationChild, DelegationChildDriver,
+        AcpRuntime, AcpSessionSpec, AppState, CodexRuntime, DelegationChild, DelegationChildDriver,
         StructuredRuntime,
     },
 };
 
 pub const DELEGATION_UPDATE_EVENT: &str = "delegation://update";
 const CHILD_DIGEST_BYTES: usize = 6 * 1024;
+const INTERRUPTED_RESUME_WIRE_PROMPT: &str = "The prior turn was interrupted. Continue from its last safe boundary. First inspect the current workspace and provider conversation state. Do not repeat completed actions. If any external or mutating outcome is uncertain, stop and explain before retrying it.";
 const MAX_LINE_BYTES: usize = 256 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -213,11 +215,12 @@ fn custom_instruction(store: &LocalStore) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Instruction block prepended to the orchestrator's wire prompt when
-/// delegation is active. Kept short: the authoritative tool contracts live in
-/// the MCP tool descriptions.
+/// delegation is active. Spells out the full workflow inline: agents that
+/// only saw tool names have gone hunting through the repository for how
+/// "Integrator delegation" works instead of just calling the tools.
 pub fn orchestrator_preamble(store: &LocalStore, mode: &str) -> String {
     let mut block = String::from(
-        "<delegation>\nYou can delegate subtasks to subagents on other providers using the `integrator` MCP tools (peers_list, delegate_start, delegation_status, delegation_message, delegation_result, delegation_stop). Delegation is asynchronous: delegate_start returns immediately and the subagent works in the background while you continue. Check in with delegation_status when convenient; nudge or answer a subagent with delegation_message; collect deliverables with delegation_result. Subagents may queue questions for you — they appear in delegation_status results and in <delegation-update> blocks.\n",
+        "<delegation>\nYou can delegate subtasks to subagents running on other AI providers. The tools for this are already connected on the `integrator` MCP server: peers_list, delegate_start, delegation_status, delegation_message, delegation_result, delegation_stop. Call them directly — do not search this repository, read Integrator source code, or shell out to provider CLIs to figure out how delegation works. This block plus the tool descriptions are the complete contract.\n\nWorkflow:\n1. peers_list — see which delegation profiles the user has enabled (provider, cost tier, concurrency headroom). Only these profiles exist; there is no other peer discovery.\n2. delegate_start(profileId, title, brief, permission) — launch a subagent. It works in this same repository but sees only a short digest of recent conversation plus your brief, so the brief must stand alone: goal, constraints, relevant files, and the exact deliverable you expect back. Use permission \"read-only\" for research, audits, and repo orientation; \"project-write\" only when it must edit files.\n3. delegate_start returns a delegationId immediately and the subagent runs in the background. Do not block waiting on it — continue your own work, and launch several delegations in parallel when subtasks are independent.\n4. delegation_status — check progress when convenient and whenever a <delegation-update> block appears in your prompt. Subagents may queue questions or progress reports for you there; answer with delegation_message(delegationId, message).\n5. delegation_result(delegationId) — collect the finished deliverable (the subagent's summary plus a transcript digest) and integrate it. Verify delegated work before relying on it; your task is not done while delegations you still need are running.\n6. delegation_stop(delegationId) — stop a subagent you no longer need.\n",
     );
     match mode {
         "manual" => block.push_str(
@@ -296,11 +299,11 @@ fn child_preamble(
     }
     if has_tools {
         block.push_str(
-            "Use the `integrator` MCP tools: task_complete(summary) when your assignment is done (always call it — the summary is your deliverable), orchestrator_ask(message) to queue a question (asynchronous — finish what you can while waiting), orchestrator_report(message) for progress notes on long work.\n",
+            "\nReporting back: your orchestrator cannot see this transcript. The `integrator` MCP tools below are your only channel to it — use them instead of just printing text and stopping.\n- task_complete(summary): call this exactly once when your assignment is done. The summary is your entire deliverable — state what you did, files touched, key decisions, and caveats. Ending your final turn without calling task_complete leaves the orchestrator waiting on you.\n- orchestrator_ask(message): queue a question when you are blocked or the brief is ambiguous. Include enough context to answer without seeing your transcript. Delivery is asynchronous — keep making progress on anything that does not depend on the answer.\n- orchestrator_report(message): send short progress notes during long-running work; fire and forget.\n",
         );
     } else {
         block.push_str(
-            "When your assignment is done, end your reply with a concise summary of what you did and any caveats — it is captured as your deliverable.\n",
+            "\nReporting back: your orchestrator cannot see this transcript and you have no messaging tools. Instead, Integrator scans your replies for the following blocks and routes them to the orchestrator. Write each block as plain text on its own lines — never inside a code fence, and never as an example you do not mean.\n- <integrator:complete>…</integrator:complete> — emit exactly once, when your assignment is done. Its contents are recorded as your entire deliverable: what you did, files touched, key decisions, caveats.\n- <integrator:ask>…</integrator:ask> — when you are blocked or the brief is ambiguous. Include enough context to answer without seeing this transcript; the answer arrives in a later turn, so keep making progress on anything that does not depend on it.\n- <integrator:report>…</integrator:report> — short progress notes during long-running work; fire and forget.\nIf you finish without emitting <integrator:complete>, your final reply is captured as your deliverable instead — but prefer the block.\n",
         );
     }
     block.push_str("</subagent-brief>\n\n");
@@ -828,6 +831,12 @@ fn delegation_status(
             "result": delegation.result,
             "messagesFromSubagent": bodies,
             "updatedAt": delegation.updated_at.to_rfc3339(),
+            "note": match delegation.status {
+                DelegationStatus::Interrupted => Some(
+                    "Subagent was interrupted (restart or process loss). Resume it from the Agents panel or send guidance to continue.",
+                ),
+                _ => None,
+            },
         }));
     }
     if !rows.is_empty() {
@@ -852,6 +861,132 @@ fn delegation_result(app: &AppHandle<tauri::Wry>, delegation: &Delegation) -> Re
         "result": delegation.result,
         "transcriptDigest": digest,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Sentinel fallback (children without an MCP injection surface)
+// ---------------------------------------------------------------------------
+
+/// One child->orchestrator verb parsed from `<integrator:…>` blocks in a
+/// child's reply. Semantically identical to the broker's child tools;
+/// providers that cannot load the broker MCP server use this text transport
+/// instead.
+#[derive(Debug, PartialEq, Eq)]
+enum SentinelAction {
+    Complete(String),
+    Ask(String),
+    Report(String),
+}
+
+/// Extract `<integrator:complete|ask|report>…</integrator:…>` blocks in
+/// document order. Unclosed or empty blocks are ignored; unknown kinds are
+/// skipped without consuming the text after them.
+fn parse_sentinel_actions(text: &str) -> Vec<SentinelAction> {
+    const OPEN: &str = "<integrator:";
+    let mut actions = Vec::new();
+    let mut cursor = 0;
+    while let Some(found) = text[cursor..].find(OPEN) {
+        let start = cursor + found;
+        let rest = &text[start + OPEN.len()..];
+        let Some(kind) = ["complete", "ask", "report"]
+            .into_iter()
+            .find(|kind| rest.starts_with(&format!("{kind}>")))
+        else {
+            cursor = start + OPEN.len();
+            continue;
+        };
+        let body_start = start + OPEN.len() + kind.len() + 1;
+        let close = format!("</integrator:{kind}>");
+        let Some(close_at) = text[body_start..].find(&close) else {
+            cursor = start + OPEN.len();
+            continue;
+        };
+        let body = text[body_start..body_start + close_at].trim().to_owned();
+        cursor = body_start + close_at + close.len();
+        if body.is_empty() {
+            continue;
+        }
+        actions.push(match kind {
+            "complete" => SentinelAction::Complete(body),
+            "ask" => SentinelAction::Ask(body),
+            _ => SentinelAction::Report(body),
+        });
+    }
+    actions
+}
+
+/// Sentinel scan state for a freshly spawned child: enabled only when the
+/// child has no broker tools, starting past any transcript that already
+/// exists (a respawned child must not replay old blocks).
+fn sentinel_watermark_for(
+    store: &LocalStore,
+    child_task_id: TaskId,
+    has_tools: bool,
+) -> Option<Arc<std::sync::Mutex<i64>>> {
+    (!has_tools).then(|| {
+        Arc::new(std::sync::Mutex::new(
+            store.latest_item_seq(child_task_id).unwrap_or(0),
+        ))
+    })
+}
+
+/// Route any new sentinel blocks from a settled child turn into the same
+/// store paths the broker's child tools use. The settle watcher races the
+/// persistence pump on the same event channel, so poll briefly until the
+/// turn's assistant messages have landed.
+async fn process_child_sentinels(app: &AppHandle<tauri::Wry>, child: &Arc<DelegationChild>) {
+    let Some(watermark) = child.sentinel_watermark.as_ref() else {
+        return;
+    };
+    let state = app.state::<AppState>();
+    let mut seen_rows = false;
+    let mut acted = false;
+    for attempt in 0..5 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let since = *watermark.lock().expect("sentinel watermark lock");
+        let Ok(rows) = state
+            .store
+            .assistant_messages_since(child.child_task_id, since)
+        else {
+            break;
+        };
+        if rows.is_empty() {
+            if seen_rows {
+                break;
+            }
+            continue;
+        }
+        seen_rows = true;
+        for (seq, body) in rows {
+            for action in parse_sentinel_actions(&body) {
+                acted = true;
+                match action {
+                    SentinelAction::Complete(summary) => {
+                        if state
+                            .store
+                            .complete_delegation(child.delegation_id, &summary)
+                            .is_ok()
+                        {
+                            *child.completed.lock().expect("completed lock") = true;
+                        }
+                    }
+                    SentinelAction::Ask(message) | SentinelAction::Report(message) => {
+                        let _ = state.store.add_delegation_message(
+                            child.delegation_id,
+                            DelegationSender::Child,
+                            &message,
+                        );
+                    }
+                }
+            }
+            *watermark.lock().expect("sentinel watermark lock") = seq;
+        }
+    }
+    if acted {
+        emit_update_for_delegation(app, child.delegation_id);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -986,18 +1121,22 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
         .task_conversation_digest(delegation.parent_task_id, CHILD_DIGEST_BYTES)
         .ok()
         .flatten();
-    let mut first_prompt = String::new();
+    // Wire-only prefix: the digest rides to the provider but must never be
+    // persisted as the child's visible user message, or later continuation
+    // digests re-ingest it and the nesting compounds on every restart.
+    let mut context_prefix = String::new();
     if let Some(digest) = parent_digest {
-        first_prompt.push_str(&format!(
+        context_prefix.push_str(&format!(
             "<orchestrator-context>\nRecent conversation from the delegating task, for background only:\n\n{digest}\n</orchestrator-context>\n\n"
         ));
     }
+    let mut preamble = String::new();
 
     let broker = state.broker.lock().expect("broker lock").clone();
     let child = match provider {
         ProviderKind::Claude | ProviderKind::Antigravity => {
             let has_tools = matches!(provider, ProviderKind::Claude) && broker.is_some();
-            first_prompt.push_str(&child_preamble(
+            preamble.push_str(&child_preamble(
                 &delegation,
                 has_tools,
                 profile,
@@ -1025,13 +1164,32 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
             .await?
         }
         ProviderKind::Codex => {
-            first_prompt.push_str(&child_preamble(
+            // Codex accepts the broker through `thread/start`'s ephemeral
+            // config layer, the same injection the orchestrator path uses.
+            let mcp_config = match &broker {
+                Some(info) => Some(codex_mcp_config(
+                    info,
+                    "child",
+                    &delegation_id.to_string(),
+                    "off",
+                )?),
+                None => None,
+            };
+            preamble.push_str(&child_preamble(
                 &delegation,
-                false,
+                mcp_config.is_some(),
                 profile,
                 &preferred_children,
             ));
-            spawn_codex_child(&app, &delegation, child_task.id, executable, cwd).await?
+            spawn_codex_child(
+                &app,
+                &delegation,
+                child_task.id,
+                executable,
+                cwd,
+                mcp_config,
+            )
+            .await?
         }
         ProviderKind::Cursor | ProviderKind::Grok => {
             // Cursor accepts broker tools through ACP `session/new`
@@ -1046,7 +1204,7 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
                 )?),
                 _ => None,
             };
-            first_prompt.push_str(&child_preamble(
+            preamble.push_str(&child_preamble(
                 &delegation,
                 mcp_server.is_some(),
                 profile,
@@ -1084,7 +1242,16 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
         .store
         .update_delegation_status(delegation_id, DelegationStatus::Running)?;
     emit_update(&app, delegation.parent_task_id);
-    start_child_turn(&app, &child, first_prompt).await?;
+    let wire = format!("{context_prefix}{preamble}");
+    start_child_turn(
+        &app,
+        &child,
+        ChildPrompt {
+            wire,
+            visible: preamble,
+        },
+    )
+    .await?;
     let project = parent
         .repository_path
         .as_deref()
@@ -1157,7 +1324,16 @@ async fn respawn_existing_child(
             .await?
         }
         ProviderKind::Codex => {
-            spawn_codex_child(app, delegation, child_task_id, executable, cwd).await?
+            let mcp_config = match &broker {
+                Some(info) => Some(codex_mcp_config(
+                    info,
+                    "child",
+                    &delegation.id.to_string(),
+                    "off",
+                )?),
+                None => None,
+            };
+            spawn_codex_child(app, delegation, child_task_id, executable, cwd, mcp_config).await?
         }
         ProviderKind::Cursor | ProviderKind::Grok => {
             let mcp_server = match (&broker, provider) {
@@ -1202,12 +1378,28 @@ async fn spawn_structured_child(
     let state = app.state::<AppState>();
     let client = integrator_runtime::StructuredCliClient::new();
     let process_id = uuid::Uuid::new_v4().to_string();
+    let permission_mode = if delegation.permission.is_read_only() {
+        StructuredPermissionMode::ReadOnly
+    } else {
+        StructuredPermissionMode::AcceptEdits
+    };
+    let (control_overlay, hook_event_log) = if provider == ProviderKind::Antigravity {
+        let overlay = crate::antigravity_hooks::create_overlay(
+            &state.data_directory,
+            &cwd,
+            &process_id,
+            permission_mode,
+        )?;
+        (Some(overlay.root), Some(overlay.event_log))
+    } else {
+        (None, None)
+    };
     let thread_id = format!("structured.{}.{}", provider.as_str(), uuid::Uuid::new_v4());
     let binding = state
         .store
         .create_runtime_binding(child_task_id, &process_id, provider)?;
     let binding = state.store.attach_provider_thread(&binding, &thread_id)?;
-    let session_ref = Arc::new(std::sync::Mutex::new(None));
+    let session_ref = Arc::new(std::sync::Mutex::new(delegation.child_session_ref.clone()));
     let runtime = StructuredRuntime {
         client: client.clone(),
         process_id,
@@ -1217,6 +1409,9 @@ async fn spawn_structured_child(
         last_diagnostic: Arc::new(std::sync::Mutex::new(None)),
         permission_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
         session_ref: Arc::clone(&session_ref),
+        control_overlay,
+        hook_event_log,
+        resume_context: None,
     };
     crate::commands::spawn_structured_cli_pump(
         app.clone(),
@@ -1229,6 +1424,11 @@ async fn spawn_structured_child(
         parent_task_id: delegation.parent_task_id,
         busy: Arc::new(std::sync::Mutex::new(false)),
         completed: Arc::new(std::sync::Mutex::new(false)),
+        sentinel_watermark: sentinel_watermark_for(
+            &state.store,
+            child_task_id,
+            mcp_config.is_some(),
+        ),
         driver: DelegationChildDriver::Structured {
             runtime,
             provider,
@@ -1251,6 +1451,7 @@ async fn spawn_codex_child(
     child_task_id: TaskId,
     executable: PathBuf,
     cwd: PathBuf,
+    mcp_config: Option<Value>,
 ) -> Result<DelegationChild> {
     let state = app.state::<AppState>();
     let client = adapter_codex::CodexClient::spawn(adapter_codex::CodexLaunchOptions {
@@ -1264,17 +1465,38 @@ async fn spawn_codex_child(
     } else {
         "workspace-write"
     };
+    let has_tools = mcp_config.is_some();
     // Children run unattended: never block on approvals; their persisted
     // delegation permission selects the actual Codex sandbox boundary.
-    let response = client
-        .start_thread_with_policies(
-            &cwd,
-            delegation.model.as_deref(),
-            delegation.effort.as_deref(),
-            "never",
-            sandbox,
-        )
-        .await?;
+    let response = match delegation.child_session_ref.as_deref() {
+        Some(thread_id) => match client.resume_thread(thread_id).await {
+            Ok(response) => response,
+            Err(_) => {
+                client
+                    .start_thread_with_policies_and_config(
+                        &cwd,
+                        delegation.model.as_deref(),
+                        delegation.effort.as_deref(),
+                        "never",
+                        sandbox,
+                        mcp_config.clone(),
+                    )
+                    .await?
+            }
+        },
+        None => {
+            client
+                .start_thread_with_policies_and_config(
+                    &cwd,
+                    delegation.model.as_deref(),
+                    delegation.effort.as_deref(),
+                    "never",
+                    sandbox,
+                    mcp_config,
+                )
+                .await?
+        }
+    };
     let thread_id = response
         .get("threadId")
         .and_then(Value::as_str)
@@ -1284,6 +1506,7 @@ async fn spawn_codex_child(
                 .and_then(|thread| thread.get("id"))
                 .and_then(Value::as_str)
         })
+        .or(delegation.child_session_ref.as_deref())
         .ok_or_else(|| {
             IntegratorError::Unavailable("Codex did not return a thread identifier".into())
         })?
@@ -1301,6 +1524,7 @@ async fn spawn_codex_child(
         client: client.clone(),
         process_id,
         alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        reconciling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         binding: Arc::new(std::sync::Mutex::new(Some(binding))),
         context_primer: Arc::new(std::sync::Mutex::new(None)),
         pending_user_prompt: Arc::new(std::sync::Mutex::new(None)),
@@ -1312,6 +1536,7 @@ async fn spawn_codex_child(
         parent_task_id: delegation.parent_task_id,
         busy: Arc::new(std::sync::Mutex::new(false)),
         completed: Arc::new(std::sync::Mutex::new(false)),
+        sentinel_watermark: sentinel_watermark_for(&state.store, child_task_id, has_tools),
         driver: DelegationChildDriver::Codex { runtime, thread_id },
     };
     watch_codex_child(app.clone(), &child, client);
@@ -1496,20 +1721,68 @@ async fn spawn_acp_child(
         let _ = client.shutdown().await;
         return Err(IntegratorError::Unavailable(error.message));
     }
-    let response = match client
-        .new_session(&cwd, mcp_server.into_iter().collect())
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            let _ = client.shutdown().await;
-            return Err(error);
+    let mcp_servers: Vec<Value> = mcp_server.into_iter().collect();
+    let has_tools = !mcp_servers.is_empty();
+    let capabilities = client.session_capabilities().await;
+    let response = match delegation.child_session_ref.as_deref() {
+        Some(session_id) if capabilities.resume => {
+            match client
+                .resume_session(session_id, &cwd, mcp_servers.clone())
+                .await
+            {
+                Ok(response) => response,
+                Err(_) if capabilities.load => {
+                    match client
+                        .load_session(session_id, &cwd, mcp_servers.clone())
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(_) => match client.new_session(&cwd, mcp_servers.clone()).await {
+                            Ok(response) => response,
+                            Err(error) => {
+                                let _ = client.shutdown().await;
+                                return Err(error);
+                            }
+                        },
+                    }
+                }
+                Err(_) => match client.new_session(&cwd, mcp_servers.clone()).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let _ = client.shutdown().await;
+                        return Err(error);
+                    }
+                },
+            }
         }
+        Some(session_id) if capabilities.load => {
+            match client
+                .load_session(session_id, &cwd, mcp_servers.clone())
+                .await
+            {
+                Ok(response) => response,
+                Err(_) => match client.new_session(&cwd, mcp_servers.clone()).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let _ = client.shutdown().await;
+                        return Err(error);
+                    }
+                },
+            }
+        }
+        _ => match client.new_session(&cwd, mcp_servers.clone()).await {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = client.shutdown().await;
+                return Err(error);
+            }
+        },
     };
     let Some(session_id) = response
         .get("sessionId")
         .and_then(Value::as_str)
         .map(str::to_owned)
+        .or_else(|| delegation.child_session_ref.clone())
     else {
         let _ = client.shutdown().await;
         return Err(IntegratorError::Unavailable(format!(
@@ -1552,6 +1825,11 @@ async fn spawn_acp_child(
         delegation_preamble: Arc::new(std::sync::Mutex::new(None)),
         unattended: true,
         read_only: delegation.permission.is_read_only(),
+        session_spec: Arc::new(std::sync::Mutex::new(Some(AcpSessionSpec {
+            cwd,
+            mcp_servers,
+        }))),
+        replaying_history: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     crate::commands::spawn_acp_pump(app.clone(), Arc::clone(&state.store), runtime.clone());
     Ok(DelegationChild {
@@ -1560,6 +1838,7 @@ async fn spawn_acp_child(
         parent_task_id: delegation.parent_task_id,
         busy: Arc::new(std::sync::Mutex::new(false)),
         completed: Arc::new(std::sync::Mutex::new(false)),
+        sentinel_watermark: sentinel_watermark_for(&state.store, child_task_id, has_tools),
         driver: DelegationChildDriver::Acp {
             runtime,
             session_id,
@@ -1567,13 +1846,22 @@ async fn spawn_acp_child(
     })
 }
 
-/// Starts (or resumes) one child turn with the given wire prompt, recording
-/// synthetic user/turn projections for structured providers so the child's
-/// transcript shows what was injected.
+/// Wire vs. visible child prompt. Providers receive `wire` (injected digests
+/// and control blocks included); the persisted transcript records only
+/// `visible`, so injected context never re-enters later digests or clutters
+/// the subagent chat.
+struct ChildPrompt {
+    wire: String,
+    visible: String,
+}
+
+/// Starts (or resumes) one child turn, recording synthetic user/turn
+/// projections (with the visible prompt only) for structured and ACP
+/// providers; Codex substitutes via its pending-user-prompt annotation.
 async fn start_child_turn(
     app: &AppHandle<tauri::Wry>,
     child: &Arc<DelegationChild>,
-    prompt: String,
+    prompt: ChildPrompt,
 ) -> Result<()> {
     *child.busy.lock().expect("busy lock") = true;
     let result: Result<()> = async {
@@ -1606,15 +1894,45 @@ async fn start_child_turn(
                         StructuredPermissionMode::AcceptEdits
                     },
                     mcp_config_path: mcp_config.clone(),
+                    control_overlay: runtime.control_overlay.clone(),
                 };
-                let turn_id = runtime.client.start_turn(options, prompt.clone()).await?;
+                let hook_offset = runtime
+                    .hook_event_log
+                    .as_deref()
+                    .map(crate::antigravity_hooks::event_log_offset)
+                    .unwrap_or(0);
+                let turn_id = runtime
+                    .client
+                    .start_turn(options, prompt.wire.clone())
+                    .await?;
                 *runtime.current_turn.lock().expect("turn lock") = Some(turn_id.clone());
+                if let Some(event_log) = runtime.hook_event_log.clone() {
+                    crate::antigravity_hooks::watch_events(
+                        event_log,
+                        hook_offset,
+                        runtime.client.clone(),
+                        turn_id.clone(),
+                        Arc::clone(&runtime.alive),
+                    );
+                }
                 if let Some(binding) = runtime.binding.lock().expect("binding lock").clone() {
-                    emit_child_turn_started(app, &binding, &turn_id, &prompt);
+                    emit_child_turn_started(app, &binding, &turn_id, &prompt.visible);
                 }
             }
             DelegationChildDriver::Codex { runtime, thread_id } => {
-                runtime.client.start_turn(thread_id, &prompt).await?;
+                // Codex echoes the submitted prompt back as the user item;
+                // the pump's annotation swaps it for the visible form.
+                *runtime
+                    .pending_user_prompt
+                    .lock()
+                    .expect("user prompt lock") =
+                    (prompt.wire != prompt.visible).then(|| crate::state::PendingUserPrompt {
+                        wire_prompt: prompt.wire.clone(),
+                        visible_prompt: prompt.visible.clone(),
+                        native_skill: None,
+                        provider_item_id: None,
+                    });
+                runtime.client.start_turn(thread_id, &prompt.wire).await?;
             }
             DelegationChildDriver::Acp {
                 runtime,
@@ -1627,15 +1945,16 @@ async fn start_child_turn(
                 *runtime.current_turn.lock().expect("turn lock") = Some(turn_id.clone());
                 let started_at = Utc::now();
                 if let Some(binding) = runtime.binding.lock().expect("binding lock").clone() {
-                    emit_child_turn_started(app, &binding, &turn_id, &prompt);
+                    emit_child_turn_started(app, &binding, &turn_id, &prompt.visible);
                 }
                 let app = app.clone();
                 let runtime = runtime.clone();
                 let session_id = session_id.clone();
+                let wire = prompt.wire.clone();
                 let delegation_id = child.delegation_id;
                 let child_identity = Arc::clone(&child.busy);
                 tauri::async_runtime::spawn(async move {
-                    let outcome = runtime.client.prompt(&session_id, &prompt).await;
+                    let outcome = runtime.client.prompt(&session_id, &wire).await;
                     let now = Utc::now();
                     let (status, error, failed) = match &outcome {
                         Ok(response) => match adapter_acp::StopReason::from_protocol(response) {
@@ -1864,6 +2183,10 @@ async fn child_turn_settled_inner(
         return;
     }
     *child.busy.lock().expect("busy lock") = false;
+    // Children without broker tools report back through `<integrator:…>`
+    // blocks in their replies; route any new ones before reading the
+    // completion flag so a sentinel-completed turn settles as completed.
+    process_child_sentinels(&app, &child).await;
     let completed = *child.completed.lock().expect("completed lock");
     let Ok(delegation) = state.store.get_delegation(delegation_id) else {
         return;
@@ -1907,13 +2230,14 @@ async fn deliver_queued_messages(
     app: &AppHandle<tauri::Wry>,
     child: &Arc<DelegationChild>,
 ) -> Result<bool> {
-    deliver_queued_messages_with_context(app, child, false).await
+    deliver_queued_messages_with_context(app, child, false, false).await
 }
 
 async fn deliver_queued_messages_with_context(
     app: &AppHandle<tauri::Wry>,
     child: &Arc<DelegationChild>,
     include_continuation_context: bool,
+    resume_interrupted: bool,
 ) -> Result<bool> {
     let state = app.state::<AppState>();
     if *child.busy.lock().expect("busy lock") {
@@ -1925,7 +2249,26 @@ async fn deliver_queued_messages_with_context(
     if messages.is_empty() {
         return Ok(false);
     }
-    let mut prompt = String::new();
+    // The visible transcript shows only the guidance itself; the
+    // continuation digest and control tags ride wire-only so they never
+    // re-enter later digests (which previously nested them recursively).
+    let mut note = String::from("New guidance from your orchestrator:\n");
+    for message in &messages {
+        note.push_str(&format!("- {}\n", message.body));
+    }
+    let visible = if resume_interrupted
+        && messages.len() == 1
+        && messages[0].body.trim() == "Resume from here"
+    {
+        "Resume from here".to_owned()
+    } else {
+        note.clone()
+    };
+    let mut wire = String::new();
+    if resume_interrupted {
+        wire.push_str(INTERRUPTED_RESUME_WIRE_PROMPT);
+        wire.push_str("\n\n");
+    }
     if include_continuation_context
         && let Some(digest) = state
             .store
@@ -1933,15 +2276,13 @@ async fn deliver_queued_messages_with_context(
             .ok()
             .flatten()
     {
-        prompt.push_str(&format!(
+        wire.push_str(&format!(
             "<continuation-context>\nYou are continuing the same delegated conversation through a fresh provider session. Recent locally persisted transcript:\n\n{digest}\n</continuation-context>\n\n"
         ));
     }
-    prompt.push_str("<orchestrator-message>\nNew guidance from your orchestrator:\n");
-    for message in &messages {
-        prompt.push_str(&format!("- {}\n", message.body));
-    }
-    prompt.push_str("</orchestrator-message>\nContinue your assignment accordingly.");
+    wire.push_str(&format!(
+        "<orchestrator-message>\n{note}</orchestrator-message>\nContinue your assignment accordingly."
+    ));
     let message_ids = messages
         .iter()
         .map(|message| message.id.clone())
@@ -1949,7 +2290,7 @@ async fn deliver_queued_messages_with_context(
     let _ = state
         .store
         .update_delegation_status(child.delegation_id, DelegationStatus::Running);
-    start_child_turn(app, child, prompt).await?;
+    start_child_turn(app, child, ChildPrompt { wire, visible }).await?;
     state
         .store
         .mark_delegation_messages_delivered(&message_ids)?;
@@ -2040,8 +2381,13 @@ pub async fn queue_message_to_child(
         .store
         .add_delegation_message(delegation_id, sender, message)?;
 
-    let rebuild =
-        route_changed || existing_child.is_none() || delegation.status == DelegationStatus::Failed;
+    let rebuild = route_changed
+        || existing_child.is_none()
+        || matches!(
+            delegation.status,
+            DelegationStatus::Failed | DelegationStatus::Interrupted
+        );
+    let resume_interrupted = delegation.status == DelegationStatus::Interrupted;
     let child = if rebuild {
         let previous = state
             .delegation_children
@@ -2087,7 +2433,7 @@ pub async fn queue_message_to_child(
     } else {
         *child.completed.lock().expect("completed lock") = false;
         state.store.reopen_delegation(delegation_id)?;
-        match deliver_queued_messages_with_context(app, &child, rebuild).await {
+        match deliver_queued_messages_with_context(app, &child, rebuild, resume_interrupted).await {
             Ok(delivered) => delivered,
             Err(error) => {
                 let _ = state
@@ -2163,6 +2509,24 @@ pub fn emit_update(app: &AppHandle<tauri::Wry>, parent_task_id: TaskId) {
         DELEGATION_UPDATE_EVENT,
         json!({ "parentTaskId": parent_task_id.to_string() }),
     );
+}
+
+/// Notify the UI after boot recovery rewrote process-owned delegations to
+/// `interrupted` and queued orchestrator-visible notes.
+pub fn emit_recovered_delegation_updates(app: &AppHandle<tauri::Wry>) {
+    let state = app.state::<AppState>();
+    let Ok(delegations) = state.store.list_interrupted_delegations() else {
+        return;
+    };
+    let mut parents = Vec::new();
+    for delegation in delegations {
+        if !parents.iter().any(|id| *id == delegation.parent_task_id) {
+            parents.push(delegation.parent_task_id);
+        }
+    }
+    for parent in parents {
+        emit_update(app, parent);
+    }
 }
 
 fn emit_update_for_delegation(app: &AppHandle<tauri::Wry>, delegation_id: DelegationId) {
@@ -2526,6 +2890,8 @@ mod tests {
         assert!(preamble.contains("budget-first"));
         assert!(preamble.contains("Prefer Codex for mechanical work."));
         assert!(preamble.contains("delegate_start"));
+        assert!(preamble.contains("peers_list"));
+        assert!(preamble.contains("do not search this repository"));
     }
 
     #[test]
@@ -2564,5 +2930,47 @@ mod tests {
         assert!(prompt.contains("Luna explorer"));
         assert!(prompt.contains("task_complete"));
         assert!(prompt.contains("Workspace permission: read-only"));
+        assert!(prompt.contains("cannot see this transcript"));
+
+        let untooled = child_preamble(&delegation, false, None, &[]);
+        assert!(!untooled.contains("task_complete"));
+        assert!(untooled.contains("<integrator:complete>"));
+        assert!(untooled.contains("<integrator:ask>"));
+        assert!(untooled.contains("<integrator:report>"));
+    }
+
+    #[test]
+    fn sentinel_parser_extracts_blocks_in_document_order() {
+        let text = "Working on it.\n<integrator:report>halfway there</integrator:report>\nSome text.\n<integrator:ask>which branch?</integrator:ask>\n<integrator:complete>done: edited a.rs, b.rs</integrator:complete>";
+        assert_eq!(
+            parse_sentinel_actions(text),
+            vec![
+                SentinelAction::Report("halfway there".into()),
+                SentinelAction::Ask("which branch?".into()),
+                SentinelAction::Complete("done: edited a.rs, b.rs".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn sentinel_parser_ignores_malformed_empty_and_unknown_blocks() {
+        assert!(parse_sentinel_actions("no blocks here").is_empty());
+        assert!(parse_sentinel_actions("<integrator:complete>never closed").is_empty());
+        assert!(parse_sentinel_actions("<integrator:complete>  </integrator:complete>").is_empty());
+        assert!(parse_sentinel_actions("<integrator:launch>x</integrator:launch>").is_empty());
+        // An unknown kind must not swallow a valid block after it.
+        assert_eq!(
+            parse_sentinel_actions(
+                "<integrator:launch>x</integrator:launch><integrator:report>ok</integrator:report>"
+            ),
+            vec![SentinelAction::Report("ok".into())]
+        );
+        // Multiline bodies survive with outer whitespace trimmed.
+        assert_eq!(
+            parse_sentinel_actions(
+                "<integrator:complete>\nline one\nline two\n</integrator:complete>"
+            ),
+            vec![SentinelAction::Complete("line one\nline two".into())]
+        );
     }
 }

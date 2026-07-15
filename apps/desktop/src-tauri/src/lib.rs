@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod antigravity_hooks;
 mod broker_mcp;
 mod chat_title;
 mod code_explain;
@@ -31,6 +32,12 @@ pub fn run_broker_mcp() -> i32 {
     broker_mcp::run()
 }
 
+/// `--antigravity-hook` mode: observe one official Agy lifecycle event and
+/// return a narrow permission decision without starting Tauri.
+pub fn run_antigravity_hook() -> i32 {
+    antigravity_hooks::run_hook()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // rustls 0.23 panics on the first TLS connection (voice typing's
@@ -56,6 +63,7 @@ pub fn run() {
                 eprintln!("delegation broker config cleanup failed: {error}");
             }
             delegation::start_broker_host(app.handle().clone());
+            delegation::emit_recovered_delegation_updates(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -76,6 +84,7 @@ pub fn run() {
             task_update_metadata,
             task_generate_title,
             task_update_routing,
+            task_remove,
             setting_list,
             setting_set,
             session_list,
@@ -150,10 +159,12 @@ pub fn run() {
             codex_stop_turn,
             acp_connect,
             acp_start_session,
+            acp_resume_session,
             acp_send_turn,
             acp_set_config_option,
             acp_set_mode,
             acp_list_cursor_models,
+            acp_session_capabilities,
             structured_cli_start_turn,
             delegation_list,
             delegation_approve,

@@ -10,6 +10,7 @@ const { bridgeMock } = vi.hoisted(() => ({
     listRuntimeActionPlans: vi.fn(),
     listModelCatalog: vi.fn(),
     setSetting: vi.fn(),
+    getStorageTotals: vi.fn(),
   },
 }));
 
@@ -95,6 +96,53 @@ describe("Runtime Settings command disclosure", () => {
     bridgeMock.listRuntimeActionPlans.mockResolvedValue([updatePlan]);
     bridgeMock.listModelCatalog.mockResolvedValue([]);
     bridgeMock.setSetting.mockResolvedValue(undefined);
+    bridgeMock.getStorageTotals.mockResolvedValue({
+      totalBytes: 0,
+      databaseBytes: 0,
+      walBytes: 0,
+      sharedMemoryBytes: 0,
+      measuredAt: "2026-07-15T00:00:00Z",
+      kind: "sqlite",
+    });
+  });
+
+  it("persists interruption recovery and transcript density as local settings", async () => {
+    render(
+      <SettingsView
+        preferences={DEFAULT_THEME_PREFERENCES}
+        runtimes={[claudeRuntime, runtime]}
+        usage={createEmptySnapshot().usage}
+        onChangePreferences={vi.fn()}
+        onResetPreferences={vi.fn()}
+        onBack={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("General").closest("button") as HTMLButtonElement);
+    await screen.findByRole("heading", { name: "General" });
+    const autoResume = screen.getByRole("switch", {
+      name: "Automatically resume interrupted responses",
+    });
+    expect(autoResume).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(autoResume);
+    await waitFor(() =>
+      expect(bridgeMock.setSetting).toHaveBeenCalledWith(
+        "settings.general.autoResumeInterruptedTurns",
+        true,
+      ),
+    );
+
+    fireEvent.click(screen.getByText("Composer").closest("button") as HTMLButtonElement);
+    const density = await screen.findByRole("button", { name: "Activity detail" });
+    expect(density).toHaveTextContent("Normal");
+    fireEvent.click(density);
+    fireEvent.click(await screen.findByRole("option", { name: "Verbose" }));
+    await waitFor(() =>
+      expect(bridgeMock.setSetting).toHaveBeenCalledWith(
+        "settings.transcript.activityDensity",
+        "verbose",
+      ),
+    );
   });
 
   it("opens an error-routed update as review-only, then re-probes after terminal exit", async () => {

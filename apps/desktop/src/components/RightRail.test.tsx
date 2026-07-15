@@ -83,6 +83,21 @@ describe("RightRail", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("keeps the Git panel painted while a known repository refreshes", () => {
+    const snapshot = createDemoSnapshot();
+    setup({
+      gitLoading: true,
+      git: snapshot.git,
+      activeFile: snapshot.git.files[0],
+    });
+
+    expect(screen.queryByRole("status", { name: "Checking repository" })).not.toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Commit message")).toBeInTheDocument();
+    expect(document.querySelector(".git-panel")).toHaveAttribute("aria-busy", "true");
+    expect(document.querySelector(".git-panel")).toHaveAttribute("data-refreshing", "true");
+    expect(document.querySelectorAll(".git-file-row").length).toBeGreaterThan(0);
+  });
+
   it("treats an ordinary folder as an intentional Git setup state", async () => {
     const onInitializeGit = vi.fn().mockResolvedValue(undefined);
     setup({

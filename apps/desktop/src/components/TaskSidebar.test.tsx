@@ -16,8 +16,12 @@ function setup(overrides?: Partial<Parameters<typeof TaskSidebar>[0]>) {
     onNewTaskInProject: vi.fn(),
     onOpenProject: vi.fn(),
     onUpdateTask: vi.fn(),
+    onUpdateProject: vi.fn(),
+    onDeleteProject: vi.fn(),
+    onDeleteTask: vi.fn(),
     onOpenSettings: vi.fn(),
     onResize: vi.fn(),
+    ...pickFnOverrides(overrides),
   };
   const props = {
     projects: snapshot.projects,
@@ -37,6 +41,15 @@ function setup(overrides?: Partial<Parameters<typeof TaskSidebar>[0]>) {
     rerenderSidebar: (next: Partial<Parameters<typeof TaskSidebar>[0]>) =>
       view.rerender(<TaskSidebar {...props} {...next} />),
   };
+}
+
+function pickFnOverrides(overrides?: Partial<Parameters<typeof TaskSidebar>[0]>) {
+  if (!overrides) return {};
+  const next: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(overrides)) {
+    if (typeof value === "function") next[key] = value;
+  }
+  return next;
 }
 
 describe("TaskSidebar", () => {
@@ -79,16 +92,38 @@ describe("TaskSidebar", () => {
   });
 
   it("reveals nested chats when expanding another project", () => {
-    const { snapshot, callbacks } = setup();
+    const { snapshot } = setup();
     const lotmind = snapshot.projects.find((project) => project.id === "lotmind")!;
     fireEvent.click(screen.getByRole("button", { name: `Expand ${lotmind.name}` }));
     expect(screen.getByRole("button", { name: `Collapse ${lotmind.name}` })).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: /Mobile intake overnight agent/i }),
     ).toBeInTheDocument();
+  });
 
-    fireEvent.click(screen.getByRole("button", { name: `Open project ${lotmind.name}` }));
+  it("toggles expand and collapse from the project name", () => {
+    const { snapshot, callbacks } = setup();
+    const lotmind = snapshot.projects.find((project) => project.id === "lotmind")!;
+    const name = screen.getByRole("button", { name: lotmind.name });
+
+    // Inactive → select (and auto-expand).
+    fireEvent.click(name);
     expect(callbacks.onSelectProject).toHaveBeenCalledWith("lotmind");
+  });
+
+  it("collapses the active project from its name without requiring the chevron", () => {
+    const { snapshot } = setup();
+    const active = snapshot.projects.find((project) => project.id === snapshot.activeProjectId)!;
+    const name = screen.getByRole("button", { name: active.name });
+    expect(name).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.click(name);
+    expect(screen.getByRole("button", { name: `Expand ${active.name}` })).toBeInTheDocument();
+    expect(name).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(name);
+    expect(screen.getByRole("button", { name: `Collapse ${active.name}` })).toBeInTheDocument();
+    expect(name).toHaveAttribute("aria-expanded", "true");
   });
 
   it("shows five chats per project, pages ten at a time, and collapses back", () => {
@@ -117,6 +152,58 @@ describe("TaskSidebar", () => {
       expect(screen.queryByRole("button", { name: /^Bulk chat 14$/ })).not.toBeInTheDocument();
       expect(screen.getByRole("button", { name: /^Bulk chat 4$/ })).toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "Show less" })).not.toBeInTheDocument();
+    } finally {
+      delete document.documentElement.dataset.motion;
+    }
+  });
+
+  it("surfaces archived chats from live projects and whole archived projects", () => {
+    document.documentElement.dataset.motion = "none";
+    try {
+      const snapshot = createDemoSnapshot();
+      const projects = snapshot.projects.map((project) =>
+        project.id === "lotmind" ? { ...project, archived: true } : project,
+      );
+      const tasks = snapshot.tasks.map((task) =>
+        task.id === "theme-pass" ? { ...task, archived: true } : task,
+      );
+      setup({ projects, tasks });
+
+      const toggle = screen.getByRole("button", { name: /^Archived/ });
+      expect(within(toggle).getByText("2")).toBeInTheDocument();
+      fireEvent.click(toggle);
+
+      // A live project holding an archived chat appears with only that chat.
+      expect(
+        screen.getByRole("button", { name: /Tune coordinated theme presets/ }),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: /Construct the native v1 workspace/ }),
+      ).not.toBeInTheDocument();
+
+      // An archived project brings all of its chats, expanded by default,
+      // and wears an Archived badge.
+      expect(
+        screen.getByRole("button", { name: /Mobile intake overnight agent/ }),
+      ).toBeInTheDocument();
+      expect(document.querySelector(".project-archived-badge")).toHaveTextContent("Archived");
+
+      // Fully live projects stay out of the archive.
+      expect(screen.queryByRole("button", { name: "EVE OS" })).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: /Back to chats/ }));
+      expect(screen.getByRole("button", { name: "EVE OS" })).toBeInTheDocument();
+    } finally {
+      delete document.documentElement.dataset.motion;
+    }
+  });
+
+  it("shows an empty state when nothing is archived", () => {
+    document.documentElement.dataset.motion = "none";
+    try {
+      setup();
+      fireEvent.click(screen.getByRole("button", { name: "Archived" }));
+      expect(screen.getByText("Nothing archived")).toBeInTheDocument();
     } finally {
       delete document.documentElement.dataset.motion;
     }
@@ -166,7 +253,9 @@ describe("TaskSidebar", () => {
     setup();
     const sidebar = screen.getByRole("complementary", { name: "Chat navigation" });
     const searchButton = within(sidebar).getByRole("button", { name: "Search chats" });
-    const brand = within(sidebar).getByLabelText("AI Integrator");
+    const brand = within(sidebar).getByLabelText("AI Integrator", {
+      selector: ".brand-lockup",
+    });
     expect(brand.closest(".sidebar-brand-row")).toContainElement(searchButton);
     expect(
       within(sidebar).queryByRole("textbox", { name: "Search chats" }),
@@ -250,5 +339,125 @@ describe("TaskSidebar", () => {
 
     expect(screen.getByRole("menu")).toBeInTheDocument();
     expect(overflowButtons[0].parentElement).toHaveAttribute("data-menu-open", "true");
+  });
+
+  it("lifts the project that owns an open chat menu above sibling projects", () => {
+    const { snapshot } = setup();
+    const active = snapshot.projects.find((project) => project.id === snapshot.activeProjectId)!;
+    const other = snapshot.projects.find((project) => project.id !== active.id)!;
+    fireEvent.click(screen.getByRole("button", { name: `Expand ${other.name}` }));
+
+    const activeGroup = screen
+      .getByRole("button", { name: `Collapse ${active.name}` })
+      .closest(".project-group");
+    const otherGroup = screen
+      .getByRole("button", { name: `Collapse ${other.name}` })
+      .closest(".project-group");
+    expect(activeGroup).toBeTruthy();
+    expect(otherGroup).toBeTruthy();
+
+    const overflowInActive = within(activeGroup as HTMLElement).getAllByRole("button", {
+      name: "More chat actions",
+    })[0];
+    fireEvent.click(overflowInActive);
+
+    expect(activeGroup).toHaveAttribute("data-menu-open", "true");
+    expect(activeGroup).not.toHaveAttribute("data-project-menu-open");
+    expect(otherGroup).not.toHaveAttribute("data-menu-open");
+    expect(
+      within(activeGroup as HTMLElement).getByRole("menu"),
+    ).toBeInTheDocument();
+  });
+
+  it("marks project-menu-open only for the project overflow menu", () => {
+    const { snapshot } = setup();
+    const active = snapshot.projects.find((project) => project.id === snapshot.activeProjectId)!;
+    const group = screen
+      .getByRole("button", { name: `Collapse ${active.name}` })
+      .closest(".project-group") as HTMLElement;
+
+    fireEvent.click(
+      within(group).getByRole("button", { name: `More actions for ${active.name}` }),
+    );
+
+    expect(group).toHaveAttribute("data-menu-open", "true");
+    expect(group).toHaveAttribute("data-project-menu-open", "true");
+  });
+
+  it("opens a project menu with pin, archive, and delete to the left of new chat", () => {
+    const { snapshot, callbacks } = setup();
+    const active = snapshot.projects.find((project) => project.id === snapshot.activeProjectId)!;
+    const group = screen
+      .getByRole("button", { name: `Collapse ${active.name}` })
+      .closest(".project-group") as HTMLElement;
+
+    const more = within(group).getByRole("button", {
+      name: `More actions for ${active.name}`,
+    });
+    const newChat = within(group).getByRole("button", {
+      name: `New chat in ${active.name}`,
+    });
+    expect(more.compareDocumentPosition(newChat) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    fireEvent.click(more);
+    const menu = within(group).getByRole("menu");
+    expect(within(menu).getByRole("menuitem", { name: /Pin/i })).toBeInTheDocument();
+    expect(within(menu).getByRole("menuitem", { name: /Archive/i })).toBeInTheDocument();
+    fireEvent.click(within(menu).getByRole("menuitem", { name: /Delete/i }));
+    expect(callbacks.onDeleteProject).toHaveBeenCalledWith(active.id);
+  });
+
+  it("pins a project from the project overflow menu", () => {
+    const { snapshot, callbacks } = setup();
+    const active = snapshot.projects.find((project) => project.id === snapshot.activeProjectId)!;
+    const group = screen
+      .getByRole("button", { name: `Collapse ${active.name}` })
+      .closest(".project-group") as HTMLElement;
+
+    fireEvent.click(
+      within(group).getByRole("button", { name: `More actions for ${active.name}` }),
+    );
+    fireEvent.click(within(group).getByRole("menuitem", { name: /^Pin$/i }));
+    expect(callbacks.onUpdateProject).toHaveBeenCalledWith(active.id, { pinned: true });
+  });
+
+  it("unpins a project when its pin glyph is clicked", () => {
+    const snapshot = createDemoSnapshot();
+    const active = snapshot.projects.find((project) => project.id === snapshot.activeProjectId)!;
+    const { callbacks } = setup({
+      projects: snapshot.projects.map((project) =>
+        project.id === active.id ? { ...project, pinned: true } : project,
+      ),
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Unpin project" }));
+    expect(callbacks.onUpdateProject).toHaveBeenCalledWith(active.id, { pinned: false });
+  });
+
+  it("unpins a chat when its pin glyph is clicked", () => {
+    const snapshot = createDemoSnapshot();
+    const pinned = {
+      ...snapshot.tasks[0],
+      pinned: true,
+    };
+    const { callbacks } = setup({
+      tasks: [pinned, ...snapshot.tasks.slice(1)],
+      activeTaskId: pinned.id,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Unpin chat" }));
+    expect(callbacks.onUpdateTask).toHaveBeenCalledWith(pinned.id, { pinned: false });
+  });
+
+  it("offers delete from the chat overflow menu", () => {
+    const { snapshot, callbacks } = setup();
+    const active = snapshot.tasks.find((task) => task.id === snapshot.activeTaskId)!;
+    const row = screen
+      .getByRole("button", { name: new RegExp(active.title) })
+      .closest(".chat-row-shell") as HTMLElement;
+
+    fireEvent.click(within(row).getByRole("button", { name: "More chat actions" }));
+    fireEvent.click(within(row).getByRole("menuitem", { name: /Delete/i }));
+    expect(callbacks.onDeleteTask).toHaveBeenCalledWith(active.id);
   });
 });

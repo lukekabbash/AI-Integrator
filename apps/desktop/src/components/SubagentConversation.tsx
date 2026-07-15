@@ -38,6 +38,8 @@ interface SubagentConversationProps {
   /** Requests the bounded project scan the first time an @-token is typed. */
   onRequestContextFiles?: () => void;
   enterToSend?: boolean;
+  /** When true, automatically resume a transport-interrupted child once. */
+  autoResumeInterrupted?: boolean;
   rightRailOpen?: boolean;
   terminalOpen?: boolean;
   onClose: () => void;
@@ -53,6 +55,7 @@ function activeStatus(status: DelegationView["status"]): boolean {
 }
 
 function statusLabel(status: DelegationView["status"]): string {
+  if (status === "interrupted") return "Interrupted";
   return status
     .split("-")
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
@@ -66,6 +69,7 @@ export function SubagentConversation({
   contextFiles,
   onRequestContextFiles,
   enterToSend,
+  autoResumeInterrupted = false,
   rightRailOpen = true,
   terminalOpen = false,
   onClose,
@@ -79,6 +83,8 @@ export function SubagentConversation({
   const [loading, setLoading] = useState(Boolean(delegation.childTaskId));
   const [loadError, setLoadError] = useState("");
   const [stopping, setStopping] = useState(false);
+  const [resuming, setResuming] = useState(false);
+  const [recoveryError, setRecoveryError] = useState("");
   const [actionError, setActionError] = useState("");
   const [centerView, setCenterView] = useState<"task" | "review">("task");
   const [git, setGit] = useState<GitSnapshot | null>(null);
@@ -95,6 +101,7 @@ export function SubagentConversation({
     effort: delegation.effort ?? undefined,
   });
   const scrollRef = useRef<HTMLDivElement>(null);
+  const autoResumeAttemptedRef = useRef(new Set<string>());
   const childTaskId = delegation.childTaskId ?? undefined;
 
   useEffect(() => {
@@ -234,6 +241,17 @@ export function SubagentConversation({
     [projectedEvents, visibleOptimisticMessages],
   );
   const turnRunning = projection?.turn?.status === "inProgress" && activeStatus(delegation.status);
+  const recoverableTurn =
+    projection?.turn?.status === "interrupted" && !projection.turn.stopRequested
+      ? projection.turn
+      : undefined;
+  const showResume =
+    Boolean(onSend) &&
+    (delegation.status === "interrupted" || Boolean(recoverableTurn)) &&
+    !turnRunning;
+  const recoveryKey = showResume
+    ? `${delegation.id}:${recoverableTurn?.id ?? "status"}`
+    : "";
   const canMessage = Boolean(
     onSend &&
     childTaskId &&
@@ -328,6 +346,31 @@ export function SubagentConversation({
       return false;
     }
   };
+
+  const resumeInterrupted = async (): Promise<boolean> => {
+    if (!showResume || resuming) return false;
+    setResuming(true);
+    setRecoveryError("");
+    const accepted = await send({
+      prompt: "Resume from here",
+      runtime: selectedRouting.runtime,
+      model: selectedRouting.model || "Provider default",
+      effort: selectedRouting.effort,
+    });
+    setResuming(false);
+    if (!accepted) {
+      setRecoveryError("Couldn’t restore this subagent. You can retry or send a new message.");
+    }
+    return accepted;
+  };
+
+  useEffect(() => {
+    if (!showResume || !autoResumeInterrupted || resuming) return;
+    if (autoResumeAttemptedRef.current.has(recoveryKey)) return;
+    autoResumeAttemptedRef.current.add(recoveryKey);
+    void resumeInterrupted();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one attempt per interrupted child boundary
+  }, [autoResumeInterrupted, recoveryKey, resuming, showResume]);
 
   const stop = async () => {
     if (!onStop || stopping) return;
@@ -452,6 +495,7 @@ export function SubagentConversation({
                 fallback={<div className="subagent-conversation-empty">Rendering transcript…</div>}
               >
                 <Transcript
+                  ownerKey={`task:${childTaskId}`}
                   events={events}
                   running={turnRunning}
                   scrollContainerRef={scrollRef}
@@ -463,11 +507,31 @@ export function SubagentConversation({
             )}
           </div>
           <AnimatePresence initial={false}>
-            {turnRunning ? (
+            {turnRunning || showResume ? (
               <TaskStatusPill
                 key="subagent-status-pill"
-                runningSince={projection?.turn?.startedAt}
+                runningSince={turnRunning ? projection?.turn?.startedAt : undefined}
                 usage={projection?.usage}
+                recovery={
+                  showResume ? (
+                    <div className="turn-recovery-control" role="status">
+                      <span>
+                        <strong>Subagent interrupted</strong>
+                        <small>
+                          {recoveryError ||
+                            "The provider can continue from its last safe boundary."}
+                        </small>
+                      </span>
+                      <button
+                        type="button"
+                        disabled={resuming}
+                        onClick={() => void resumeInterrupted()}
+                      >
+                        {resuming ? "Resuming…" : "Resume"}
+                      </button>
+                    </div>
+                  ) : undefined
+                }
               />
             ) : null}
           </AnimatePresence>

@@ -9,6 +9,8 @@ interface TaskStatusPillProps {
   activeAgentCount?: number;
   /** Pending follow-ups render in the shelf attached behind the composer. */
   queue?: ReactNode;
+  /** Recovery stays beside queued follow-ups instead of entering the transcript. */
+  recovery?: ReactNode;
 }
 
 function formatTokens(tokens: number): string {
@@ -60,6 +62,7 @@ export const TaskStatusPill = memo(function TaskStatusPill({
   usage,
   activeAgentCount,
   queue,
+  recovery,
 }: TaskStatusPillProps) {
   const [nowMs, setNowMs] = useState(() => Date.now());
 
@@ -78,7 +81,7 @@ export const TaskStatusPill = memo(function TaskStatusPill({
     return () => window.clearTimeout(timeout);
   }, [runningSince]);
 
-  if (!runningSince && !queue) return null;
+  if (!runningSince && !queue && !recovery) return null;
 
   const elapsed = runningSince ? formatElapsed(runningSince, nowMs) : "";
   // Crossfade only when the unit rolls over (s → m → h m); within a unit the
@@ -87,7 +90,10 @@ export const TaskStatusPill = memo(function TaskStatusPill({
 
   return (
     <div className="task-status-anchor">
-      <div className="task-status-float-row" data-has-queue={queue ? true : undefined}>
+      <div
+        className="task-status-float-row"
+        data-has-queue={queue || recovery ? true : undefined}
+      >
         <AnimatePresence initial={false}>
           {runningSince ? (
             <motion.div
@@ -122,6 +128,22 @@ export const TaskStatusPill = memo(function TaskStatusPill({
                   {activeAgentCount} {activeAgentCount === 1 ? "agent" : "agents"}
                 </span>
               ) : null}
+            </motion.div>
+          ) : null}
+          {recovery ? (
+            <motion.div
+              key="turn-recovery"
+              className="turn-recovery-surface"
+              layout
+              initial={{ opacity: 0, x: 8, scale: 0.96 }}
+              animate={{ opacity: 1, x: 0, scale: 1 }}
+              exit={{ opacity: 0, x: 8, scale: 0.96 }}
+              transition={{
+                opacity: { duration: 0.18, ease: "easeOut" },
+                layout: { type: "spring", stiffness: 430, damping: 34, mass: 0.72 },
+              }}
+            >
+              {recovery}
             </motion.div>
           ) : null}
           {queue ? (

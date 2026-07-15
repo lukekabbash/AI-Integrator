@@ -91,6 +91,8 @@ import {
   type ThemePreferences,
 } from "./theme";
 import { Composer } from "./components/Composer";
+import { DeleteChatModal } from "./components/DeleteChatModal";
+import { DeleteProjectModal, type DeleteProjectScope } from "./components/DeleteProjectModal";
 import { FileWorkspace, type FileSelectionPayload } from "./components/FileView";
 import { TitlebarFileTabs } from "./components/TitlebarFileTabs";
 import { resolveRequestedFile } from "./components/fileViewSupport";
@@ -108,6 +110,7 @@ import {
   isFrameBatchableRuntimeProjection,
   taskActivityUpdate,
   type RuntimeProjectionState,
+  type TranscriptDensity,
 } from "./runtimeProjection";
 import {
   normalizeRuntimeRouteDefaults,
@@ -278,7 +281,48 @@ interface ComposerErrorState {
 const SIDEBAR_WIDTH_STORAGE_KEY = "aiintegrator.sidebar-width.v1";
 const RIGHT_RAIL_WIDTH_STORAGE_KEY = "aiintegrator.right-rail-width.v1";
 const SUBAGENT_PANE_RATIO_STORAGE_KEY = "aiintegrator.subagent-pane-ratio.v1";
+const PROJECT_SIDEBAR_META_KEY = "projects.sidebarMeta";
 const GIT_CACHE_TTL_MS = 5_000;
+
+type ProjectSidebarMeta = Record<string, { pinned?: boolean; archived?: boolean }>;
+
+function readProjectSidebarMeta(value: unknown): ProjectSidebarMeta {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const meta: ProjectSidebarMeta = {};
+  for (const [projectId, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const record = entry as Record<string, unknown>;
+    meta[projectId] = {
+      pinned: record.pinned === true,
+      archived: record.archived === true,
+    };
+  }
+  return meta;
+}
+
+function applyProjectSidebarMeta(
+  projects: ProjectSummary[],
+  meta: ProjectSidebarMeta,
+): ProjectSummary[] {
+  return projects.map((project) => ({
+    ...project,
+    pinned: meta[project.id]?.pinned ?? project.pinned ?? false,
+    archived: meta[project.id]?.archived ?? project.archived ?? false,
+  }));
+}
+
+function projectSidebarMetaFromProjects(projects: ProjectSummary[]): ProjectSidebarMeta {
+  const meta: ProjectSidebarMeta = {};
+  for (const project of projects) {
+    if (project.pinned || project.archived) {
+      meta[project.id] = {
+        pinned: Boolean(project.pinned),
+        archived: Boolean(project.archived),
+      };
+    }
+  }
+  return meta;
+}
 
 /** Names a provider rate-limit window by its reported duration; common plan
  * windows get friendly names, anything else falls back to the raw span. */
@@ -1017,24 +1061,71 @@ function EmptyTaskState({ project }: { project: ProjectSummary }) {
   );
 }
 
-function ConnectionNotice({ state }: { state: RuntimeProjectionState["connection"] }) {
-  if (state.state === "connected") return null;
+/**
+ * Grace period before a non-connected notice becomes visible. New tasks pass
+ * through reconciling/connecting for a few hundred milliseconds while the
+ * provider spawns; flashing a banner for that is noise.
+ */
+const CONNECTION_NOTICE_DELAY_MS = 800;
+const CONNECTION_NOTICE_EXIT_MS = 220;
+
+function ConnectionNotice({
+  state,
+  runtime,
+}: {
+  state: RuntimeProjectionState["connection"];
+  runtime: string;
+}) {
+  const active = state.state !== "connected";
+  const [notice, setNotice] = useState<{
+    connection: RuntimeProjectionState["connection"];
+    exiting: boolean;
+  } | null>(null);
+
+  useEffect(() => {
+    if (active) {
+      if (
+        notice &&
+        !notice.exiting &&
+        notice.connection.state === state.state &&
+        notice.connection.reason === state.reason
+      )
+        return;
+      const timer = window.setTimeout(
+        () => setNotice({ connection: state, exiting: false }),
+        notice ? 0 : CONNECTION_NOTICE_DELAY_MS,
+      );
+      return () => window.clearTimeout(timer);
+    }
+    if (!notice) return;
+    const timer = window.setTimeout(
+      () => setNotice(notice.exiting ? null : { ...notice, exiting: true }),
+      notice.exiting ? CONNECTION_NOTICE_EXIT_MS : 0,
+    );
+    return () => window.clearTimeout(timer);
+  }, [active, notice, state]);
+
+  if (!notice) return null;
+  const shown = notice.connection;
+  if (shown.state === "connected") return null;
   const labels = {
-    connecting: "Connecting to Codex…",
-    disconnected: "Codex is disconnected",
+    connecting: `Connecting to ${runtime}…`,
+    disconnected: `${runtime} is disconnected`,
     reconciling: "Reconciling persisted task state…",
-    gap: "Event gap detected; recovering authoritative history…",
+    gap: "Some runtime events were missed",
   } as const;
   return (
     <div
-      className={`runtime-connection runtime-connection--${state.state}`}
-      role={state.state === "disconnected" ? "alert" : "status"}
+      className={`runtime-connection runtime-connection--${shown.state}${
+        notice.exiting ? " runtime-connection--exiting" : ""
+      }`}
+      role={shown.state === "disconnected" ? "alert" : "status"}
       aria-live="polite"
     >
       <span className="runtime-connection-dot" aria-hidden="true" />
       <span>
-        <strong>{labels[state.state]}</strong>
-        {state.reason ? <small>{state.reason}</small> : null}
+        <strong>{labels[shown.state]}</strong>
+        {shown.reason ? <small>{shown.reason}</small> : null}
       </span>
     </div>
   );
@@ -1217,6 +1308,12 @@ export default function App() {
   const [openingProject, setOpeningProject] = useState(false);
   const [addProjectOpen, setAddProjectOpen] = useState(false);
   const [createProjectError, setCreateProjectError] = useState("");
+  const [deleteProjectId, setDeleteProjectId] = useState("");
+  const [deleteProjectBusy, setDeleteProjectBusy] = useState(false);
+  const [deleteProjectError, setDeleteProjectError] = useState("");
+  const [deleteTaskId, setDeleteTaskId] = useState("");
+  const [deleteTaskBusy, setDeleteTaskBusy] = useState(false);
+  const [deleteTaskError, setDeleteTaskError] = useState("");
   const [creatingTask, setCreatingTask] = useState(false);
   const [switchingTaskId, setSwitchingTaskId] = useState("");
   const [taskActionBusyId, setTaskActionBusyId] = useState("");
@@ -1255,6 +1352,12 @@ export default function App() {
   // settles. Cleared if the user sends their own message first.
   const pendingPlanBuildRef = useRef("");
   const [stoppingTurn, setStoppingTurn] = useState(false);
+  const [resumingTaskId, setResumingTaskId] = useState("");
+  const [recoveryFailure, setRecoveryFailure] = useState<{
+    key: string;
+    message: string;
+  } | null>(null);
+  const autoResumeAttemptedRef = useRef(new Set<string>());
   const [queueBusyId, setQueueBusyId] = useState("");
   const queueBusyIdRef = useRef("");
   const priorityQueueIdRef = useRef("");
@@ -1771,7 +1874,11 @@ export default function App() {
           }
         }
         composerDraftStore.hydrate(loaded.composerDrafts);
-        setSnapshot(loaded);
+        const sidebarMeta = readProjectSidebarMeta(settingsMap[PROJECT_SIDEBAR_META_KEY]);
+        setSnapshot({
+          ...loaded,
+          projects: applyProjectSidebarMeta(loaded.projects, sidebarMeta),
+        });
         taskRuntimeByIdRef.current = new Map(
           loaded.tasks.map((task) => [task.id, task.runtime] as const),
         );
@@ -1941,6 +2048,12 @@ export default function App() {
     snapshot.projects.find((project) => project.id === snapshot.activeProjectId) ??
     snapshot.projects.find((project) => project.id === activeTask?.projectId) ??
     snapshot.projects[0];
+  const deleteProjectTarget = deleteProjectId
+    ? snapshot.projects.find((project) => project.id === deleteProjectId)
+    : undefined;
+  const deleteTaskTarget = deleteTaskId
+    ? snapshot.tasks.find((task) => task.id === deleteTaskId)
+    : undefined;
   const configuredDefaultRuntime = localSettings["models.defaultRuntime"];
   const favoriteRuntime =
     typeof configuredDefaultRuntime === "string" &&
@@ -2363,23 +2476,32 @@ export default function App() {
   };
 
   const mergeProject = (project: ProjectSummary) => {
-    setGitLoading(nativeHost);
+    const sameProject = snapshot.activeProjectId === project.id;
+    // Opening a different project needs a cold Git check. Same-project merges
+    // (re-open / metadata refresh) must not blank the panel into a skeleton.
+    if (!sameProject) setGitLoading(nativeHost);
     activeTaskIdRef.current = snapshot.tasks.find((task) => task.projectId === project.id)?.id;
     setSnapshot((current) => {
+      const existing = current.projects.find((item) => item.id === project.id);
+      const mergedProject: ProjectSummary = {
+        ...project,
+        pinned: existing?.pinned ?? project.pinned ?? false,
+        archived: existing?.archived ?? project.archived ?? false,
+      };
       const existingTasks = current.tasks.filter((task) => task.projectId === project.id);
-      const sameProject = current.activeProjectId === project.id;
+      const stayingOnProject = current.activeProjectId === project.id;
       return {
         ...current,
-        projects: [project, ...current.projects.filter((item) => item.id !== project.id)],
+        projects: [mergedProject, ...current.projects.filter((item) => item.id !== project.id)],
         activeProjectId: project.id,
         activeTaskId: existingTasks[0]?.id ?? "",
         lastTaskByProject: existingTasks[0]
           ? { ...current.lastTaskByProject, [project.id]: existingTasks[0].id }
           : current.lastTaskByProject,
-        transcript: sameProject ? current.transcript : [],
-        git: sameProject ? current.git : createEmptySnapshot().git,
-        usage: sameProject ? current.usage : createEmptySnapshot().usage,
-        children: sameProject ? current.children : [],
+        transcript: stayingOnProject ? current.transcript : [],
+        git: stayingOnProject ? current.git : createEmptySnapshot().git,
+        usage: stayingOnProject ? current.usage : createEmptySnapshot().usage,
+        children: stayingOnProject ? current.children : [],
       };
     });
   };
@@ -2598,7 +2720,10 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProject?.id, nativeHost]);
 
-  const sendTurn = async (input: ComposerTurnInput): Promise<boolean> => {
+  const sendTurn = async (
+    input: ComposerTurnInput,
+    options?: { resumeInterrupted?: boolean },
+  ): Promise<boolean> => {
     const project = activeProject;
     if (!project) {
       setOperationError("Open a project before starting a task.");
@@ -2684,6 +2809,7 @@ export default function App() {
         permission: input.permission,
         delegation: input.delegation,
         nativeActionId: input.nativeActionId,
+        resumeInterrupted: options?.resumeInterrupted,
       };
       event = await bridge.sendTurn({ ...turnInput, taskId: targetTask.id });
       if (!nativeHost && nativeAction?.kind === "skill") {
@@ -2797,6 +2923,49 @@ export default function App() {
       };
     });
     return true;
+  };
+
+  const resumeInterruptedTurn = async (): Promise<boolean> => {
+    if (!activeTask || resumingTaskId) return false;
+    const attemptedRecoveryKey =
+      runtimeState?.taskId === activeTask.id && runtimeState.turn?.status === "interrupted"
+        ? `${activeTask.id}:${runtimeState.turn.id}`
+        : activeTask.id;
+    const defaultPermission =
+      localSettings["permissions.defaultProfile"] === "read-only" ||
+      localSettings["permissions.defaultProfile"] === "ask" ||
+      localSettings["permissions.defaultProfile"] === "full-access"
+        ? localSettings["permissions.defaultProfile"]
+        : "project-write";
+    const defaultDelegation =
+      localSettings["delegation.defaultMode"] === "manual" ||
+      localSettings["delegation.defaultMode"] === "balanced" ||
+      localSettings["delegation.defaultMode"] === "budget-first"
+        ? localSettings["delegation.defaultMode"]
+        : "off";
+    setResumingTaskId(activeTask.id);
+    setRecoveryFailure(null);
+    const accepted = await sendTurn(
+      {
+        prompt: "Resume from here",
+        runtime: activeTask.runtime,
+        model: activeTask.model ?? "Provider default",
+        effort: activeTask.effort,
+        permission:
+          (taskPermissions[activeTask.id] as StartTaskInput["permission"] | undefined) ??
+          defaultPermission,
+        delegation: defaultDelegation,
+      },
+      { resumeInterrupted: true },
+    );
+    setResumingTaskId("");
+    if (!accepted) {
+      setRecoveryFailure({
+        key: attemptedRecoveryKey,
+        message: "Couldn’t restore this response. You can retry or send a new message.",
+      });
+    }
+    return accepted;
   };
 
   const replaceTaskQueue = (taskId: string, messages: QueuedMessage[]) => {
@@ -3017,6 +3186,133 @@ export default function App() {
       setOperationError(error instanceof Error ? error.message : "Could not update that chat");
     } finally {
       setTaskActionBusyId("");
+    }
+  };
+
+  const updateProjectMetadata = async (
+    projectId: string,
+    patch: { pinned?: boolean; archived?: boolean },
+  ) => {
+    setOperationError("");
+    let nextProjects: WorkspaceSnapshot["projects"] = [];
+    setSnapshot((current) => {
+      nextProjects = current.projects.map((project) =>
+        project.id === projectId
+          ? {
+              ...project,
+              pinned: patch.pinned ?? project.pinned ?? false,
+              archived: patch.archived ?? project.archived ?? false,
+            }
+          : project,
+      );
+      return { ...current, projects: nextProjects };
+    });
+    const meta = projectSidebarMetaFromProjects(nextProjects);
+    setLocalSettings((current) => ({ ...current, [PROJECT_SIDEBAR_META_KEY]: meta }));
+    try {
+      await bridge.setSetting(PROJECT_SIDEBAR_META_KEY, meta);
+    } catch (error) {
+      setOperationError(
+        error instanceof Error ? error.message : "Could not update that project",
+      );
+    }
+    if (patch.archived && snapshot.activeProjectId === projectId) {
+      const replacement = nextProjects.find((project) => !project.archived);
+      if (replacement) selectProject(replacement.id);
+    }
+  };
+
+  const confirmDeleteProject = async (scope: DeleteProjectScope) => {
+    if (!deleteProjectId || deleteProjectBusy) return;
+    setDeleteProjectBusy(true);
+    setDeleteProjectError("");
+    setOperationError("");
+    const removedId = deleteProjectId;
+    const wasActiveTask =
+      Boolean(snapshot.activeTaskId) &&
+      snapshot.tasks.some(
+        (task) => task.id === snapshot.activeTaskId && task.projectId === removedId,
+      );
+    try {
+      await bridge.removeProject(removedId, { deleteFiles: scope === "disk" });
+      const remainingProjects = snapshot.projects.filter((project) => project.id !== removedId);
+      const remainingTasks = snapshot.tasks.filter((task) => task.projectId !== removedId);
+      const nextActiveProjectId =
+        snapshot.activeProjectId === removedId
+          ? (remainingProjects.find((project) => !project.archived)?.id ??
+            remainingProjects[0]?.id ??
+            "")
+          : snapshot.activeProjectId;
+      const nextActiveTaskId = remainingTasks.some((task) => task.id === snapshot.activeTaskId)
+        ? snapshot.activeTaskId
+        : (remainingTasks.find(
+            (task) => task.projectId === nextActiveProjectId && !task.archived,
+          )?.id ?? "");
+      const meta = projectSidebarMetaFromProjects(remainingProjects);
+      setLocalSettings((settings) => ({ ...settings, [PROJECT_SIDEBAR_META_KEY]: meta }));
+      void bridge.setSetting(PROJECT_SIDEBAR_META_KEY, meta).catch(() => undefined);
+      const empty = createEmptySnapshot();
+      setSnapshot((current) => ({
+        ...current,
+        projects: remainingProjects,
+        tasks: remainingTasks,
+        activeProjectId: nextActiveProjectId,
+        activeTaskId: nextActiveTaskId,
+        transcript: nextActiveTaskId === current.activeTaskId ? current.transcript : [],
+        git: nextActiveTaskId === current.activeTaskId ? current.git : empty.git,
+        usage: nextActiveTaskId === current.activeTaskId ? current.usage : empty.usage,
+        children: nextActiveTaskId === current.activeTaskId ? current.children : [],
+      }));
+      setDeleteProjectId("");
+      if (wasActiveTask) setRuntimeState(null);
+    } catch (error) {
+      setDeleteProjectError(formatBridgeError(error, "Could not remove that project"));
+    } finally {
+      setDeleteProjectBusy(false);
+    }
+  };
+
+  const confirmDeleteTask = async () => {
+    if (!deleteTaskId || deleteTaskBusy) return;
+    setDeleteTaskBusy(true);
+    setDeleteTaskError("");
+    setOperationError("");
+    const removedId = deleteTaskId;
+    const removed = snapshot.tasks.find((task) => task.id === removedId);
+    const wasActive = snapshot.activeTaskId === removedId;
+    try {
+      await bridge.removeTask(removedId);
+      const remainingTasks = snapshot.tasks.filter((task) => task.id !== removedId);
+      const nextActiveTaskId = wasActive
+        ? (remainingTasks.find(
+            (task) =>
+              task.projectId === (removed?.projectId ?? snapshot.activeProjectId) &&
+              !task.archived &&
+              !task.parentId,
+          )?.id ??
+          remainingTasks.find((task) => !task.archived && !task.parentId)?.id ??
+          "")
+        : snapshot.activeTaskId;
+      const empty = createEmptySnapshot();
+      setSnapshot((current) => ({
+        ...current,
+        tasks: remainingTasks,
+        activeTaskId: nextActiveTaskId,
+        transcript: nextActiveTaskId === current.activeTaskId ? current.transcript : [],
+        git: nextActiveTaskId === current.activeTaskId ? current.git : empty.git,
+        usage: nextActiveTaskId === current.activeTaskId ? current.usage : empty.usage,
+        children: nextActiveTaskId === current.activeTaskId ? current.children : [],
+        composerDrafts: current.composerDrafts.filter(
+          (draft) => draft.owner.kind !== "task" || draft.owner.taskId !== removedId,
+        ),
+        queuedMessages: current.queuedMessages.filter((message) => message.taskId !== removedId),
+      }));
+      setDeleteTaskId("");
+      if (wasActive) setRuntimeState(null);
+    } catch (error) {
+      setDeleteTaskError(formatBridgeError(error, "Could not delete that chat"));
+    } finally {
+      setDeleteTaskBusy(false);
     }
   };
 
@@ -3567,7 +3863,15 @@ export default function App() {
   const pendingApproval = runtimeState?.approvals.find(
     (approval) => approval.state === "pending" || approval.state === "responseFailed",
   );
-  const deriveNativeRuntimeTranscript = useMemo(() => createRuntimeTranscriptDeriver(), []);
+  const transcriptDensity: TranscriptDensity =
+    localSettings["transcript.activityDensity"] === "summary" ||
+    localSettings["transcript.activityDensity"] === "verbose"
+      ? localSettings["transcript.activityDensity"]
+      : "normal";
+  const deriveNativeRuntimeTranscript = useMemo(
+    () => createRuntimeTranscriptDeriver(transcriptDensity),
+    [transcriptDensity],
+  );
   const nativeRuntimeEvents = useMemo(
     () =>
       nativeHost && runtimeState && runtimeState.taskId === activeTask?.id
@@ -3618,6 +3922,21 @@ export default function App() {
             .sort((left, right) => left.position - right.position)
         : [],
     [activeTask, snapshot.queuedMessages],
+  );
+  // A dispatching message whose optimistic bubble is already in the transcript
+  // would render twice — as a sent user message and as a queued chip — for as
+  // long as bridge.sendTurn takes (the whole connection wait on a fresh turn).
+  // Hide the chip for that window; a failed send flips the durable state back
+  // to "queued", which makes the chip reappear.
+  const visibleQueuedMessages = useMemo(
+    () =>
+      activeQueuedMessages.filter(
+        (message) =>
+          message.state !== "dispatching" ||
+          !optimisticForActiveTask ||
+          optimisticForActiveTask.event.body !== queuedMessagePrompt(message),
+      ),
+    [activeQueuedMessages, optimisticForActiveTask],
   );
   const runtimeUsage = runtimeState?.usage;
   const tokenBreakdown = runtimeUsage
@@ -3687,6 +4006,11 @@ export default function App() {
         } · ${usagePillTokens}`
       : `Plan usage not exposed to AI Integrator · ${usagePillTokens}`;
   const activeRuntimeState = runtimeState?.taskId === activeTask?.id ? runtimeState : undefined;
+  const recoverableTurn =
+    activeRuntimeState?.turn?.status === "interrupted" &&
+    !activeRuntimeState.turn.stopRequested
+      ? activeRuntimeState.turn
+      : undefined;
   const activeAgentCount = nativeTurnRunning
     ? 1 +
       (nativeHost
@@ -3811,6 +4135,31 @@ export default function App() {
   // send is deferred a tick so the follow-up turn never starts inside the
   // render that delivered the turn-completed projection.
   const activeTurnStatus = activeRuntimeState?.turn?.status;
+  const recoveryKey = activeTask && recoverableTurn ? `${activeTask.id}:${recoverableTurn.id}` : "";
+  const recoveryError = recoveryFailure?.key === recoveryKey ? recoveryFailure.message : "";
+  const autoResumeEnabled = localSettings["general.autoResumeInterruptedTurns"] === true;
+  const recoverableTurnId = recoverableTurn?.id;
+  const recoverableStopRequested = recoverableTurn?.stopRequested;
+
+  useEffect(() => {
+    if (!activeTask || !recoverableTurn || recoverableTurn.stopRequested) return;
+    if (!autoResumeEnabled) return;
+    if (activeQueuedMessages.length > 0 || optimisticTurnStarting || resumingTaskId) return;
+    if (autoResumeAttemptedRef.current.has(recoveryKey)) return;
+    autoResumeAttemptedRef.current.add(recoveryKey);
+    void resumeInterruptedTurn();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one attempt per durable interrupted turn
+  }, [
+    activeQueuedMessages.length,
+    activeTask?.id,
+    autoResumeEnabled,
+    optimisticTurnStarting,
+    recoverableStopRequested,
+    recoverableTurnId,
+    recoveryKey,
+    resumingTaskId,
+  ]);
+
   useEffect(() => {
     if (!activeTask || pendingPlanBuildRef.current !== activeTask.id) return;
     if (activeTurnStatus !== "completed") return;
@@ -4334,6 +4683,15 @@ export default function App() {
                       onOpenProject={() => setAddProjectOpen(true)}
                       openingProject={openingProject}
                       onUpdateTask={(taskId, patch) => void updateTaskMetadata(taskId, patch)}
+                      onUpdateProject={(projectId, patch) => void updateProjectMetadata(projectId, patch)}
+                      onDeleteProject={(projectId) => {
+                        setDeleteProjectError("");
+                        setDeleteProjectId(projectId);
+                      }}
+                      onDeleteTask={(taskId) => {
+                        setDeleteTaskError("");
+                        setDeleteTaskId(taskId);
+                      }}
                       onOpenSettings={() => setScreen("settings")}
                       onResize={(delta) =>
                         setSidebarWidth((current) => clampDimension(current + delta, 220, 420))
@@ -4401,7 +4759,10 @@ export default function App() {
                       <>
                         <div className="transcript-scroll" ref={transcriptScrollRef}>
                           {nativeHost && runtimeState ? (
-                            <ConnectionNotice state={runtimeState.connection} />
+                            <ConnectionNotice
+                              state={runtimeState.connection}
+                              runtime={runtimeLabel(activeTask?.runtime ?? settingsDefaultRuntime)}
+                            />
                           ) : null}
                           {activeTask ? (
                             <Suspense
@@ -4413,6 +4774,7 @@ export default function App() {
                             >
                               <Transcript
                                 key={activeTask?.id ?? "draft"}
+                                ownerKey={`task:${activeTask.id}`}
                                 events={projectedTranscript}
                                 scrollContainerRef={transcriptScrollRef}
                                 running={nativeTurnRunning || optimisticTurnStarting}
@@ -4455,7 +4817,8 @@ export default function App() {
                           {activeTask &&
                           (nativeTurnRunning ||
                             optimisticTurnStarting ||
-                            activeQueuedMessages.length > 0) ? (
+                            visibleQueuedMessages.length > 0 ||
+                            Boolean(recoverableTurn)) ? (
                             <TaskStatusPill
                               key="task-status-pill"
                               runningSince={
@@ -4466,14 +4829,34 @@ export default function App() {
                               }
                               usage={runtimeUsage}
                               activeAgentCount={activeAgentCount}
+                              recovery={
+                                recoverableTurn ? (
+                                  <div className="turn-recovery-control" role="status">
+                                    <span>
+                                      <strong>Response interrupted</strong>
+                                      <small>
+                                        {recoveryError ||
+                                          "The provider can continue from its last safe boundary."}
+                                      </small>
+                                    </span>
+                                    <button
+                                      type="button"
+                                      disabled={resumingTaskId === activeTask.id}
+                                      onClick={() => void resumeInterruptedTurn()}
+                                    >
+                                      {resumingTaskId === activeTask.id ? "Resuming…" : "Resume"}
+                                    </button>
+                                  </div>
+                                ) : undefined
+                              }
                               queue={
-                                activeQueuedMessages.length > 0 ? (
+                                visibleQueuedMessages.length > 0 ? (
                                   <QueuedMessages
-                                    messages={activeQueuedMessages}
+                                    messages={visibleQueuedMessages}
                                     busyId={queueBusyId || undefined}
                                     disabled={Boolean(queueBusyId)}
                                     onSendNow={(messageId) => {
-                                      const message = activeQueuedMessages.find(
+                                      const message = visibleQueuedMessages.find(
                                         (candidate) => candidate.id === messageId,
                                       );
                                       if (message) void dispatchQueuedMessage(message, true);
@@ -4711,6 +5094,9 @@ export default function App() {
                           contextFiles={contextFilePaths}
                           onRequestContextFiles={requestProjectFiles}
                           enterToSend={localSettings["composer.enterToSend"] !== false}
+                          autoResumeInterrupted={
+                            localSettings["general.autoResumeInterruptedTurns"] === true
+                          }
                           rightRailOpen={rightRailOpen}
                           terminalOpen={terminalOwner === selectedDelegation.id}
                           onClose={() => {
@@ -4881,6 +5267,28 @@ export default function App() {
             onClone={(input) => void cloneProject(input)}
           />
         ) : null}
+        <DeleteProjectModal
+          project={deleteProjectTarget ?? null}
+          busy={deleteProjectBusy}
+          error={deleteProjectError}
+          onClose={() => {
+            if (deleteProjectBusy) return;
+            setDeleteProjectId("");
+            setDeleteProjectError("");
+          }}
+          onConfirm={(scope) => void confirmDeleteProject(scope)}
+        />
+        <DeleteChatModal
+          task={deleteTaskTarget ?? null}
+          busy={deleteTaskBusy}
+          error={deleteTaskError}
+          onClose={() => {
+            if (deleteTaskBusy) return;
+            setDeleteTaskId("");
+            setDeleteTaskError("");
+          }}
+          onConfirm={() => void confirmDeleteTask()}
+        />
       </div>
     </LazyMotion>
   );

@@ -38,4 +38,41 @@ describe("sidebar shell corners", () => {
       "width: calc(var(--sidebar-width, 272px) - 18px)",
     );
   });
+
+  it("lifts a project group above siblings while its chat menu is open", () => {
+    expect(rule(".project-group")).toContain("z-index: 1");
+    expect(rule('.project-group[data-menu-open="true"]')).toContain("z-index: 20");
+  });
+
+  it("keeps the project chat count on the trailing edge with ellipsis left of +", () => {
+    expect(rule(".project-count")).toContain("right: 0");
+    expect(rule(".project-count")).toContain("width: 24px");
+    expect(styles).toContain(".project-more-button {\n  grid-column: 1;");
+    expect(styles).toContain(".project-new-chat {\n  grid-column: 2;");
+  });
+
+  it("scooches the project pin left of the count the same way chat pins yield to …", () => {
+    expect(rule(".project-pin")).toContain("width: 11px");
+    expect(rule(".project-pin-button")).toContain("right: 48px");
+    expect(rule(".project-pin-button")).toContain("transform: translate(20px, -50%)");
+    expect(
+      rule(
+        ".project-group-header:hover .project-pin-button,\n" +
+          ".project-header-meta:focus-within .project-pin-button,\n" +
+          '.project-group[data-project-menu-open="true"] .project-pin-button',
+      ),
+    ).toContain("transform: translate(0, -50%)");
+  });
+
+  it("keeps project header action chrome off chat-menu stacking", () => {
+    // data-menu-open still lifts z-index for chat menus; only
+    // data-project-menu-open may reveal …/+ / pin scooch.
+    expect(rule('.project-group[data-menu-open="true"]')).toContain("z-index: 20");
+    expect(styles).not.toContain(
+      '.project-group[data-menu-open="true"] .project-header-actions',
+    );
+    expect(styles).toContain(
+      '.project-group[data-project-menu-open="true"] .project-header-actions',
+    );
+  });
 });

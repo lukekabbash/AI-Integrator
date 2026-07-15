@@ -10,7 +10,7 @@ import {
   type FormEvent,
   type KeyboardEvent,
 } from "react";
-import { AnimatePresence, m as motion, useReducedMotion } from "motion/react";
+import { AnimatePresence, LayoutGroup, m as motion, useReducedMotion } from "motion/react";
 import {
   Activity,
   ArrowDown,
@@ -75,6 +75,28 @@ const INITIAL_FILE_TREE_ENTRIES = 300;
 const FILE_TREE_CHUNK = 300;
 const INITIAL_GIT_FILE_ROWS = 200;
 const GIT_FILE_CHUNK = 200;
+
+/** Worktree refreshes should settle rows in place — not remount the whole panel. */
+const gitFileRowVariants = {
+  hidden: { opacity: 0, y: -4 },
+  visible: {
+    opacity: 1,
+    y: 0,
+    transition: { duration: 0.16, ease: [0.2, 0, 0, 1] as const },
+  },
+  exit: {
+    opacity: 0,
+    y: -3,
+    transition: { duration: 0.12, ease: [0.4, 0, 1, 1] as const },
+  },
+};
+
+const gitFileLayoutSpring = {
+  type: "spring" as const,
+  stiffness: 560,
+  damping: 44,
+  mass: 0.6,
+};
 
 const GRAPH_LANE_WIDTH = 9;
 const GRAPH_ROW_HEIGHT = 35;
@@ -294,7 +316,8 @@ function collapseCommitRefs(refs: string[], upstream: string, branch: string): C
 
 interface RightRailProps {
   git: GitSnapshot;
-  /** True while the selected folder is being checked for an existing repository. */
+  /** True while the selected folder is being checked for an existing repository.
+   * When a repository snapshot is already painted, the panel stays visible. */
   gitLoading?: boolean;
   children: ChildAgent[];
   /** Live delegated subagents from the native broker; overrides `children`. */
@@ -730,11 +753,17 @@ function GitPanel({
   const fileRow = (file: DiffFile, isStaged: boolean) => {
     const key = diffFileKey(file);
     return (
-      <div
+      <motion.div
         className="git-file-row"
         data-active={activeFile ? diffFileKey(activeFile) === diffFileKey(file) : false}
         data-traveling-selection={key}
         key={key}
+        layout={reduceMotion ? false : "position"}
+        variants={reduceMotion ? undefined : gitFileRowVariants}
+        initial={reduceMotion ? false : "hidden"}
+        animate="visible"
+        exit={reduceMotion ? undefined : "exit"}
+        transition={reduceMotion ? { duration: 0 } : { layout: gitFileLayoutSpring }}
         onContextMenu={(event) => {
           event.preventDefault();
           openFileContextMenu(
@@ -792,11 +821,14 @@ function GitPanel({
           )}
         </span>
         <span className="file-state">{file.status.at(0)?.toUpperCase()}</span>
-      </div>
+      </motion.div>
     );
   };
 
-  if (gitLoading) {
+  // Keep an already-known repository painted during background worktree
+  // refreshes. Skeleton is only for cold detection before we have content.
+  const coldLoading = Boolean(gitLoading && git.kind !== "repository");
+  if (coldLoading) {
     return (
       <div
         className="rail-panel git-panel git-panel--skeleton"
@@ -882,7 +914,11 @@ function GitPanel({
   }
 
   return (
-    <div className="rail-panel git-panel">
+    <div
+      className="rail-panel git-panel"
+      aria-busy={gitLoading || busy === "refresh" ? true : undefined}
+      data-refreshing={gitLoading || busy === "refresh" ? "true" : undefined}
+    >
       {git.remotes.length === 0 ? (
         <div className="git-local-only">
           <span>
@@ -1225,7 +1261,11 @@ function GitPanel({
             />
             {staged.length ? (
               <>
-                {staged.slice(0, stagedLimit).map((file) => fileRow(file, true))}
+                <LayoutGroup id="git-staged-files">
+                  <AnimatePresence initial={false} mode="popLayout">
+                    {staged.slice(0, stagedLimit).map((file) => fileRow(file, true))}
+                  </AnimatePresence>
+                </LayoutGroup>
                 <ProgressiveSurfaceControls
                   shown={Math.min(stagedLimit, staged.length)}
                   total={staged.length}
@@ -1270,7 +1310,11 @@ function GitPanel({
             />
             {unstaged.length ? (
               <>
-                {unstaged.slice(0, unstagedLimit).map((file) => fileRow(file, false))}
+                <LayoutGroup id="git-unstaged-files">
+                  <AnimatePresence initial={false} mode="popLayout">
+                    {unstaged.slice(0, unstagedLimit).map((file) => fileRow(file, false))}
+                  </AnimatePresence>
+                </LayoutGroup>
                 <ProgressiveSurfaceControls
                   shown={Math.min(unstagedLimit, unstaged.length)}
                   total={unstaged.length}
@@ -1516,6 +1560,8 @@ function delegationStatusLabel(status: DelegationView["status"]): string {
       return "Approval needed";
     case "running":
       return "Working";
+    case "interrupted":
+      return "Interrupted";
     case "completed":
       return "Complete";
     default:

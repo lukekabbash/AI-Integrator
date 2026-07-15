@@ -907,6 +907,29 @@ describe("native trusted-project bridge", () => {
         ];
       }
       if (command === "acp_connect") return connectGate;
+      if (command === "acp_list_cursor_models") {
+        return {
+          models: [
+            { value: "grok-4.5", name: "grok-4.5", configOptions: [] },
+            {
+              value: "gpt-5.6-sol",
+              name: "gpt-5.6-sol",
+              configOptions: [
+                {
+                  id: "reasoning",
+                  category: "thought_level",
+                  currentValue: "medium",
+                  options: [
+                    { value: "low", name: "Low" },
+                    { value: "medium", name: "Medium" },
+                    { value: "high", name: "High" },
+                  ],
+                },
+              ],
+            },
+          ],
+        };
+      }
       if (command === "acp_start_session") {
         return {
           sessionId: "cursor-session",

@@ -102,7 +102,7 @@ const settingsNav: Array<{ id: SettingsSection; label: string; hint: string; ico
   },
   { id: "permissions", label: "Permissions", hint: "Safe execution defaults", icon: ShieldCheck },
   { id: "subagents", label: "Subagents", hint: "Cross-provider handoff policy", icon: Users },
-  { id: "usage", label: "Usage & budgets", hint: "Local usage evidence", icon: CircleDollarSign },
+  { id: "usage", label: "Usage and Budgets", hint: "Local usage evidence", icon: CircleDollarSign },
 ];
 
 type SettingsMap = Record<string, unknown>;
@@ -150,10 +150,12 @@ const DEFAULT_DELEGATION_PROFILES: DelegationProfileSetting[] = [
  */
 const DEFAULT_SETTINGS: SettingsMap = {
   "general.openLastWorkspace": true,
+  "general.autoResumeInterruptedTurns": false,
   "general.confirmExternalActions": true,
   "composer.enterToSend": true,
   "transcript.showModel": true,
   "transcript.showTimestamps": true,
+  "transcript.activityDensity": "normal",
   "models.defaultRuntime": "",
   "models.defaultModel": "",
   "models.defaultEffort": "medium",
@@ -1006,6 +1008,28 @@ function runtimeConnectionForRequest(
   );
 }
 
+function runtimeCertificationSummary(runtime: RuntimeConnection): string | undefined {
+  if (runtime.status === "not_installed") return undefined;
+  const certification =
+    runtime.certification === "certified"
+      ? "Certified installed route"
+      : runtime.certification === "session_probe_required"
+        ? "ACP session probe pending"
+        : "Installed route not certified";
+  const capabilities = runtime.capabilities;
+  if (!capabilities) return certification;
+  const observed = [
+    capabilities.sessionResume && "session recovery",
+    capabilities.authoritativeHistory && "history replay",
+    capabilities.structuredToolEvents && "structured tools",
+    capabilities.sandboxedWorkspace && "workspace sandbox",
+    capabilities.subscriptionAuth && "subscription auth",
+    capabilities.hooks && "hooks",
+    capabilities.skills && "skills",
+  ].filter(Boolean);
+  return observed.length > 0 ? `${certification} · ${observed.join(" · ")}` : certification;
+}
+
 interface RuntimePlannerState {
   runtime: RuntimeConnection;
   kind: RuntimeActionKind;
@@ -1458,6 +1482,14 @@ function ModelsAndRuntimesSettings({
                       ) : null}
                     </span>
                     <p>{runtime.detail}</p>
+                    {runtimeCertificationSummary(runtime) ? (
+                      <small
+                        className="runtime-certification"
+                        data-certification={runtime.certification}
+                      >
+                        {runtimeCertificationSummary(runtime)}
+                      </small>
+                    ) : null}
                     <code className="runtime-executable">{runtime.command}</code>
                   </span>
                   <span className="runtime-row-actions">
@@ -1965,7 +1997,7 @@ function UsageSettings({
           <CircleDollarSign />
         </span>
         <div>
-          <h1>Usage & budgets</h1>
+          <h1>Usage and Budgets</h1>
           <p>Plan limits, processed tokens, cost estimates, and actual charges stay separate.</p>
         </div>
       </div>
@@ -2135,6 +2167,16 @@ function PolicySettings({
               label="Confirm external actions"
             />
           </SettingRow>
+          <SettingRow
+            label="Automatically resume interrupted responses"
+            description="After a crash or lost connection, reconnect the provider and continue from its last safe boundary. Off leaves a Resume control above the composer."
+          >
+            <Switch
+              checked={readSetting(settings, "general.autoResumeInterruptedTurns", false)}
+              onChange={(value) => setSetting("general.autoResumeInterruptedTurns", value)}
+              label="Automatically resume interrupted responses"
+            />
+          </SettingRow>
         </section>
         <VoiceTypingSettings />
         <section className="settings-section">
@@ -2255,6 +2297,21 @@ function PolicySettings({
               options={[
                 { value: "show", label: "Show" },
                 { value: "hide", label: "Hide" },
+              ]}
+            />
+          </SettingRow>
+          <SettingRow
+            label="Activity detail"
+            description="Summary collapses every tool step, Normal groups runs of activity, and Verbose shows each event."
+          >
+            <Dropdown
+              aria-label="Activity detail"
+              value={readSetting(settings, "transcript.activityDensity", "normal")}
+              onChange={(value) => setSetting("transcript.activityDensity", value)}
+              options={[
+                { value: "summary", label: "Summary" },
+                { value: "normal", label: "Normal" },
+                { value: "verbose", label: "Verbose" },
               ]}
             />
           </SettingRow>

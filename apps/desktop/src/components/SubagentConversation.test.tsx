@@ -54,6 +54,7 @@ const stoppedDelegation: DelegationView = {
   runtime: "codex",
   model: "gpt-5.6-luna",
   effort: "high",
+  permission: "project-write",
   title: "Polish the interaction",
   brief: "Review and improve the interaction.",
   status: "stopped",
@@ -385,6 +386,56 @@ describe("SubagentConversation", () => {
     expect(loadTaskGitFile).toHaveBeenCalledWith(
       "task-child",
       expect.objectContaining({ path: "src/interaction.ts", diffLoaded: false }),
+    );
+  });
+
+  it("offers a noninterruptive Resume control for an interrupted subagent", async () => {
+    vi.spyOn(bridge, "loadTaskProjection").mockResolvedValue({
+      events: [
+        {
+          taskId: "task-child",
+          seq: 1,
+          providerSessionId: "session-child",
+          provider: "codex",
+          threadId: "thread-child",
+          turnId: "turn-interrupted",
+          occurredAt: "2026-07-12T10:06:01Z",
+          projection: {
+            kind: "turnChanged",
+            turn: {
+              id: "turn-interrupted",
+              status: "interrupted",
+              stopRequested: false,
+              startedAt: "2026-07-12T10:05:00Z",
+              completedAt: "2026-07-12T10:06:00Z",
+            },
+          },
+        },
+      ],
+      watermarkSeq: 1,
+      runtimeLive: false,
+    });
+    vi.spyOn(bridge, "subscribeRuntimeProjections").mockResolvedValue(() => undefined);
+    vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
+      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
+    ]);
+    const onSend = vi.fn().mockResolvedValue(undefined);
+
+    renderSubagent({
+      delegation: { ...stoppedDelegation, status: "interrupted" },
+      runtimes,
+      onClose: vi.fn(),
+      onSend,
+    });
+
+    expect(await screen.findByText("Subagent interrupted")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+    await waitFor(() =>
+      expect(onSend).toHaveBeenCalledWith(
+        "delegation-1",
+        "Resume from here",
+        expect.objectContaining({ runtime: "codex", model: "gpt-5.6-luna" }),
+      ),
     );
   });
 });

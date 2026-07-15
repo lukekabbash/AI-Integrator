@@ -182,7 +182,7 @@ describe("AI Integrator desktop workspace", () => {
       "Composer",
       "Models and Runtimes",
       "Permissions",
-      "Usage & budgets",
+      "Usage and Budgets",
     ];
     for (const label of categoryLabels) {
       expect(screen.getByRole("button", { name: new RegExp(label, "i") })).toBeInTheDocument();
@@ -215,6 +215,12 @@ describe("AI Integrator desktop workspace", () => {
     expect(window.localStorage.getItem("aiintegrator.settings.v1")).toContain(
       "general.openLastWorkspace",
     );
+    const autoResume = screen.getByRole("switch", {
+      name: "Automatically resume interrupted responses",
+    });
+    expect(autoResume).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(autoResume);
+    expect(autoResume).toHaveAttribute("aria-checked", "true");
 
     fireEvent.click(screen.getByRole("button", { name: /Appearance/i }));
     expect(
@@ -235,7 +241,7 @@ describe("AI Integrator desktop workspace", () => {
     fireEvent.click(screen.getByRole("button", { name: "Back" }));
     expect(screen.getByRole("button", { name: "Favorite runtime" })).toHaveTextContent("Last used");
 
-    fireEvent.click(screen.getByRole("button", { name: /Usage & budgets/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Usage and Budgets/i }));
     expect(await screen.findByRole("heading", { name: "Per-provider usage" })).toBeInTheDocument();
     expect(screen.getByText("Codex")).toBeInTheDocument();
   });
@@ -403,7 +409,6 @@ describe("AI Integrator desktop workspace", () => {
     render(<App />);
 
     const composer = await screen.findByRole("textbox", { name: "Task message" });
-    expect(await screen.findByText(/Ctrl Enter to send/)).toBeInTheDocument();
     fireEvent.change(composer, { target: { value: "draft stays put" } });
     fireEvent.keyDown(composer, { key: "Enter" });
     expect(composer).toHaveValue("draft stays put");
@@ -743,7 +748,7 @@ describe("AI Integrator desktop workspace", () => {
       await screen.findByRole("region", { name: /Diff for src\/runtime\/router\.ts/i }),
     ).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Open project Lotmind AI" }));
+    fireEvent.click(screen.getByRole("button", { name: "Lotmind AI" }));
     expect(
       await screen.findByRole("heading", { name: "Mobile intake overnight agent" }),
     ).toBeInTheDocument();
@@ -751,7 +756,7 @@ describe("AI Integrator desktop workspace", () => {
     expect(screen.queryByText("Integrator transcript")).not.toBeInTheDocument();
     expect(screen.getByTitle(/222,000 tokens on this task/)).toHaveTextContent("222k tokens");
 
-    fireEvent.click(screen.getByRole("button", { name: "Open project AI Integrator" }));
+    fireEvent.click(screen.getByRole("button", { name: "AI Integrator" }));
     expect(
       await screen.findByRole("region", { name: /Diff for src\/runtime\/router\.ts/i }),
     ).toBeInTheDocument();
@@ -784,7 +789,7 @@ describe("AI Integrator desktop workspace", () => {
       await screen.findByRole("heading", { name: "Certify Codex and ACP adapters" }),
     ).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Open project Lotmind AI" }));
+    fireEvent.click(screen.getByRole("button", { name: "Lotmind AI" }));
     expect(
       await screen.findByRole("heading", { name: "Mobile intake overnight agent" }),
     ).toBeInTheDocument();

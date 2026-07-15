@@ -9,9 +9,9 @@ use std::{
 use chrono::{DateTime, Utc};
 use integrator_core::{
     ComposerDraft, ComposerDraftAttachment, ComposerDraftOwner, IntegratorError, LocalExport,
-    NewQueuedMessage, NewTask, ProjectId, ProviderKind, ProviderSession, ProviderSessionId,
-    QueuedMessage, QueuedMessageId, QueuedMessageState, Result, RuntimeSession, RuntimeSessionId,
-    Setting, Task, TaskId, TaskState, TrustedProject, UsageProjection,
+    NewQueuedMessage, NewTask, ProjectId, ProviderKind, ProviderResumeState, ProviderSession,
+    ProviderSessionId, QueuedMessage, QueuedMessageId, QueuedMessageState, Result, RuntimeSession,
+    RuntimeSessionId, Setting, Task, TaskId, TaskState, TrustedProject, UsageProjection,
 };
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -28,6 +28,11 @@ pub enum CommitMessageGenerationClaim {
     Cached(String),
     InProgress,
 }
+
+/// Unfinished commit-message claims older than this are treated as orphaned
+/// (e.g. the app crashed mid-generation) and re-claimable. Generation callers
+/// enforce a 30-second provider timeout, so a live claim never reaches it.
+const COMMIT_MESSAGE_CLAIM_TTL_SECONDS: i64 = 120;
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (
@@ -675,6 +680,20 @@ const MIGRATIONS: &[(i64, &str)] = &[
             CHECK (permission IN ('read-only', 'project-write'));
         "#,
     ),
+    (
+        16,
+        r#"
+        CREATE TABLE provider_resume_states (
+            task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+            provider TEXT NOT NULL,
+            session_ref TEXT NOT NULL,
+            repository_root TEXT NOT NULL,
+            permission TEXT NOT NULL,
+            delegation TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    ),
 ];
 
 pub struct LocalStore {
@@ -1099,10 +1118,52 @@ impl LocalStore {
         .collect()
     }
 
-    pub fn remove_trusted_project(&self, project_id: ProjectId) -> Result<()> {
-        let changed = self
-            .connection
-            .lock()
+    /// Detaches a trusted project and deletes Integrator-owned history for it
+    /// (tasks and cascaded session/projection rows). Never touches the folder
+    /// on disk — filesystem deletion is an explicit host-layer choice.
+    pub fn remove_trusted_project(&self, project_id: ProjectId) -> Result<TrustedProject> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(storage_error)?;
+        let project = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT p.id, p.display_name, p.repository_root, g.repository_root, g.git_common_directory, p.created_at, p.last_opened_at FROM trusted_projects p LEFT JOIN project_git_repositories g ON g.project_id = p.id WHERE p.id = ?1",
+                )
+                .map_err(storage_error)?;
+            statement
+                .query_row([project_id.to_string()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                })
+                .optional()
+                .map_err(storage_error)?
+                .ok_or_else(|| IntegratorError::NotFound(format!("project {project_id}")))
+                .and_then(|(id, display_name, root, git_root, common, created, opened)| {
+                    Ok(TrustedProject {
+                        id: ProjectId::from_str(&id).map_err(invalid_stored)?,
+                        display_name,
+                        repository_root: PathBuf::from(root),
+                        git_repository_root: git_root.map(PathBuf::from),
+                        git_common_directory: common.map(PathBuf::from),
+                        created_at: parse_time(&created)?,
+                        last_opened_at: parse_time(&opened)?,
+                    })
+                })?
+        };
+        let project_root = project.repository_root.to_string_lossy().into_owned();
+        // Tasks are path-linked rather than FK-linked; wipe them explicitly so
+        // chat history leaves with the project instead of becoming orphaned.
+        transaction
+            .execute("DELETE FROM tasks WHERE repository_path = ?1", [&project_root])
+            .map_err(storage_error)?;
+        let changed = transaction
             .execute(
                 "DELETE FROM trusted_projects WHERE id = ?1",
                 [project_id.to_string()],
@@ -1111,7 +1172,8 @@ impl LocalStore {
         if changed == 0 {
             return Err(IntegratorError::NotFound(format!("project {project_id}")));
         }
-        Ok(())
+        transaction.commit().map_err(storage_error)?;
+        Ok(project)
     }
 
     pub fn list_tasks(&self) -> Result<Vec<Task>> {
@@ -1373,6 +1435,21 @@ impl LocalStore {
         self.get_task(task_id)
     }
 
+    /// Permanently deletes one chat and cascaded Integrator-owned rows
+    /// (sessions, projections, queue, drafts). Never touches the project folder.
+    pub fn remove_task(&self, task_id: TaskId) -> Result<Task> {
+        let task = self.get_task(task_id)?;
+        let changed = self
+            .connection
+            .lock()
+            .execute("DELETE FROM tasks WHERE id = ?1", [task_id.to_string()])
+            .map_err(storage_error)?;
+        if changed == 0 {
+            return Err(IntegratorError::NotFound(format!("task {task_id}")));
+        }
+        Ok(task)
+    }
+
     /// Replace a temporary title only while it still has the expected value.
     /// A concurrent manual rename therefore always wins over background naming.
     pub fn compare_and_set_task_title(
@@ -1464,18 +1541,42 @@ impl LocalStore {
         let transaction = connection.transaction().map_err(storage_error)?;
         let existing = transaction
             .query_row(
-                "SELECT message FROM commit_message_jobs WHERE task_id = ?1 AND provider = ?2 AND diff_fingerprint = ?3",
+                "SELECT message, started_at FROM commit_message_jobs WHERE task_id = ?1 AND provider = ?2 AND diff_fingerprint = ?3",
                 params![task_id.to_string(), provider, diff_fingerprint],
-                |row| row.get::<_, Option<String>>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                    ))
+                },
             )
             .optional()
             .map_err(storage_error)?;
-        if let Some(message) = existing {
-            transaction.commit().map_err(storage_error)?;
-            return Ok(match message {
-                Some(message) => CommitMessageGenerationClaim::Cached(message),
-                None => CommitMessageGenerationClaim::InProgress,
-            });
+        if let Some((message, started_at)) = existing {
+            if let Some(message) = message {
+                transaction.commit().map_err(storage_error)?;
+                return Ok(CommitMessageGenerationClaim::Cached(message));
+            }
+            // Failed generations release their claim explicitly, but a crash
+            // mid-generation would otherwise pin InProgress forever. Callers
+            // time out well within this window, so an old unfinished claim is
+            // orphaned, not racing.
+            let stale = DateTime::parse_from_rfc3339(&started_at)
+                .map(|started| {
+                    Utc::now().signed_duration_since(started.with_timezone(&Utc))
+                        > chrono::Duration::seconds(COMMIT_MESSAGE_CLAIM_TTL_SECONDS)
+                })
+                .unwrap_or(true);
+            if !stale {
+                transaction.commit().map_err(storage_error)?;
+                return Ok(CommitMessageGenerationClaim::InProgress);
+            }
+            transaction
+                .execute(
+                    "DELETE FROM commit_message_jobs WHERE task_id = ?1 AND provider = ?2 AND diff_fingerprint = ?3 AND message IS NULL",
+                    params![task_id.to_string(), provider, diff_fingerprint],
+                )
+                .map_err(storage_error)?;
         }
         let changed = transaction
             .execute(
@@ -1520,6 +1621,25 @@ impl LocalStore {
                 "commit-message generation was not claimed".into(),
             ));
         }
+        Ok(())
+    }
+
+    /// Release an unfinished claim so a failed generation can be retried
+    /// immediately instead of waiting out the stale-claim window. Completed
+    /// (cached) results are never removed.
+    pub fn abandon_commit_message_generation(
+        &self,
+        task_id: TaskId,
+        provider: &str,
+        diff_fingerprint: &str,
+    ) -> Result<()> {
+        self.connection
+            .lock()
+            .execute(
+                "DELETE FROM commit_message_jobs WHERE task_id = ?1 AND provider = ?2 AND diff_fingerprint = ?3 AND message IS NULL",
+                params![task_id.to_string(), provider, diff_fingerprint],
+            )
+            .map_err(storage_error)?;
         Ok(())
     }
 
@@ -1713,9 +1833,85 @@ impl LocalStore {
             settings: self.list_settings()?,
             provider_sessions: self.list_provider_sessions()?,
             runtime_sessions: self.list_runtime_sessions()?,
+            provider_resume_states: self.list_provider_resume_states()?,
             composer_drafts: self.list_composer_drafts()?,
             queued_messages: self.list_all_queued_messages()?,
         })
+    }
+
+    pub fn upsert_provider_resume_state(&self, state: &ProviderResumeState) -> Result<()> {
+        if state.session_ref.trim().is_empty() || state.session_ref.len() > 512 {
+            return Err(IntegratorError::InvalidInput(
+                "provider resume identity is invalid".into(),
+            ));
+        }
+        if !state.repository_root.is_absolute() {
+            return Err(IntegratorError::InvalidInput(
+                "provider resume repository must be absolute".into(),
+            ));
+        }
+        self.connection
+            .lock()
+            .execute(
+                "INSERT INTO provider_resume_states(task_id,provider,session_ref,repository_root,permission,delegation,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(task_id) DO UPDATE SET provider=excluded.provider,session_ref=excluded.session_ref,repository_root=excluded.repository_root,permission=excluded.permission,delegation=excluded.delegation,updated_at=excluded.updated_at",
+                params![
+                    state.task_id.to_string(),
+                    state.provider.as_str(),
+                    state.session_ref,
+                    state.repository_root.to_string_lossy(),
+                    state.permission,
+                    state.delegation,
+                    state.updated_at.to_rfc3339(),
+                ],
+            )
+            .map_err(storage_error)?;
+        Ok(())
+    }
+
+    pub fn provider_resume_state(&self, task_id: TaskId) -> Result<Option<ProviderResumeState>> {
+        let row = self
+            .connection
+            .lock()
+            .query_row(
+                "SELECT provider,session_ref,repository_root,permission,delegation,updated_at FROM provider_resume_states WHERE task_id=?1",
+                [task_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?;
+        row.map(
+            |(provider, session_ref, repository_root, permission, delegation, updated_at)| {
+                Ok(ProviderResumeState {
+                    task_id,
+                    provider: ProviderKind::from_str(&provider)?,
+                    session_ref,
+                    repository_root: PathBuf::from(repository_root),
+                    permission,
+                    delegation,
+                    updated_at: parse_time(&updated_at)?,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    pub fn list_provider_resume_states(&self) -> Result<Vec<ProviderResumeState>> {
+        let mut states = Vec::new();
+        for task in self.list_tasks()? {
+            if let Some(state) = self.provider_resume_state(task.id)? {
+                states.push(state);
+            }
+        }
+        Ok(states)
     }
 
     fn list_all_queued_messages(&self) -> Result<Vec<QueuedMessage>> {
@@ -2426,6 +2622,69 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_commit_message_claims_are_retryable_but_cached_results_stay() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let task = create_naming_task(&store);
+        assert_eq!(
+            store
+                .claim_commit_message_generation(task.id, "antigravity", "diff-a")
+                .expect("claim"),
+            CommitMessageGenerationClaim::Claimed
+        );
+        store
+            .abandon_commit_message_generation(task.id, "antigravity", "diff-a")
+            .expect("release failed generation");
+        assert_eq!(
+            store
+                .claim_commit_message_generation(task.id, "antigravity", "diff-a")
+                .expect("re-claim"),
+            CommitMessageGenerationClaim::Claimed
+        );
+        store
+            .complete_commit_message_generation(task.id, "antigravity", "diff-a", "fix: retry")
+            .expect("complete");
+        store
+            .abandon_commit_message_generation(task.id, "antigravity", "diff-a")
+            .expect("abandon is a no-op once cached");
+        assert_eq!(
+            store
+                .claim_commit_message_generation(task.id, "antigravity", "diff-a")
+                .expect("cached claim"),
+            CommitMessageGenerationClaim::Cached("fix: retry".into())
+        );
+    }
+
+    #[test]
+    fn stale_unfinished_commit_message_claims_expire() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let task = create_naming_task(&store);
+        assert_eq!(
+            store
+                .claim_commit_message_generation(task.id, "antigravity", "diff-a")
+                .expect("claim"),
+            CommitMessageGenerationClaim::Claimed
+        );
+        // Age the claim past the TTL as if the app crashed mid-generation.
+        let started = (Utc::now()
+            - chrono::Duration::seconds(COMMIT_MESSAGE_CLAIM_TTL_SECONDS + 5))
+        .to_rfc3339();
+        store
+            .connection
+            .lock()
+            .execute(
+                "UPDATE commit_message_jobs SET started_at = ?1 WHERE task_id = ?2",
+                params![started, task.id.to_string()],
+            )
+            .expect("age claim");
+        assert_eq!(
+            store
+                .claim_commit_message_generation(task.id, "antigravity", "diff-a")
+                .expect("expired claim is re-claimable"),
+            CommitMessageGenerationClaim::Claimed
+        );
+    }
+
+    #[test]
     fn commit_message_generation_cache_survives_restart() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let database = directory.path().join("commit-message-cache.sqlite3");
@@ -2502,6 +2761,37 @@ mod tests {
         assert_eq!(usage_rows[0].1, 1);
         assert_eq!(usage_rows[0].2, 0);
         assert_eq!(usage_rows[0].3.total_tokens, 0);
+    }
+
+    #[test]
+    fn provider_resume_state_round_trips_without_provider_credentials() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let task = create_naming_task(&store);
+        let repository = std::env::temp_dir().join("integrator-resume-fixture");
+        let state = ProviderResumeState {
+            task_id: task.id,
+            provider: ProviderKind::Antigravity,
+            session_ref: "conversation-fixture".into(),
+            repository_root: repository.clone(),
+            permission: "project-write".into(),
+            delegation: "off".into(),
+            updated_at: Utc::now(),
+        };
+        store
+            .upsert_provider_resume_state(&state)
+            .expect("persist resume state");
+
+        let restored = store
+            .provider_resume_state(task.id)
+            .expect("read resume state")
+            .expect("resume state");
+        assert_eq!(restored.provider, ProviderKind::Antigravity);
+        assert_eq!(restored.session_ref, "conversation-fixture");
+        assert_eq!(restored.repository_root, repository);
+        assert_eq!(
+            store.export().expect("export").provider_resume_states,
+            vec![restored]
+        );
     }
 
     #[test]
@@ -3340,9 +3630,23 @@ mod tests {
         assert_eq!(projects[0].id, registered.id);
         assert_eq!(projects[0].repository_root, repository);
         assert_eq!(reopened.export().expect("export").projects, projects);
-        reopened
+        let _ = reopened
+            .create_task(NewTask {
+                title: "Project chat".into(),
+                repository_path: Some(repository.clone()),
+                worktree_path: None,
+                runtime: None,
+                model: None,
+                effort: None,
+                parent_task_id: None,
+            })
+            .expect("create project task");
+        assert_eq!(reopened.list_tasks().expect("list tasks").len(), 1);
+
+        let removed = reopened
             .remove_trusted_project(registered.id)
             .expect("remove trust record");
+        assert_eq!(removed.id, registered.id);
         assert!(
             reopened
                 .list_trusted_projects()
@@ -3350,9 +3654,61 @@ mod tests {
                 .is_empty()
         );
         assert!(
+            reopened.list_tasks().expect("list tasks after removal").is_empty(),
+            "removing a project must delete its Integrator chat history"
+        );
+        assert!(
             repository.exists(),
             "removal must never delete repository data"
         );
+    }
+
+    #[test]
+    fn remove_task_wipes_chat_history_and_preserves_project_folder() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let database = directory.path().join("integrator.sqlite3");
+        let repository = directory.path().join("repository");
+        std::fs::create_dir_all(&repository).expect("fixture directories");
+        let store = LocalStore::open(&database).expect("open store");
+        let _project = store
+            .upsert_trusted_project("Repository", &repository, None)
+            .expect("register project");
+        let keep = store
+            .create_task(NewTask {
+                title: "Keep me".into(),
+                repository_path: Some(repository.clone()),
+                worktree_path: None,
+                runtime: None,
+                model: None,
+                effort: None,
+                parent_task_id: None,
+            })
+            .expect("create kept task");
+        let remove = store
+            .create_task(NewTask {
+                title: "Delete me".into(),
+                repository_path: Some(repository.clone()),
+                worktree_path: None,
+                runtime: None,
+                model: None,
+                effort: None,
+                parent_task_id: None,
+            })
+            .expect("create removed task");
+
+        let removed = store.remove_task(remove.id).expect("remove task");
+        assert_eq!(removed.id, remove.id);
+        let tasks = store.list_tasks().expect("list tasks");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, keep.id);
+        assert!(
+            repository.exists(),
+            "removing a chat must never delete the project folder"
+        );
+        assert!(matches!(
+            store.remove_task(remove.id),
+            Err(IntegratorError::NotFound(_))
+        ));
     }
 
     #[test]

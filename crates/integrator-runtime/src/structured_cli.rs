@@ -47,6 +47,10 @@ pub struct StructuredCliLaunchOptions {
     /// surface. Claude-only in v1: the flag pair is not portable, so other
     /// providers ignore it.
     pub mcp_config_path: Option<PathBuf>,
+    /// Integrator-owned Antigravity customization root. The directory may
+    /// contain `.agents/hooks.json`, but is never written into the user's
+    /// repository. Other structured providers ignore it.
+    pub control_overlay: Option<PathBuf>,
 }
 
 /// Effort levels `claude --effort` accepts. Unknown values are dropped rather
@@ -102,6 +106,11 @@ pub enum StructuredCliEventKind {
     ToolResult {
         id: String,
         is_error: bool,
+        content: String,
+    },
+    /// An official provider hook blocked the action before execution.
+    ToolDenied {
+        id: String,
         content: String,
     },
     Result {
@@ -177,6 +186,22 @@ impl StructuredCliClient {
 
     pub fn subscribe(&self) -> broadcast::Receiver<StructuredCliEvent> {
         self.events.subscribe()
+    }
+
+    /// Publishes a typed event observed through a provider-owned lifecycle
+    /// hook. The desktop host uses this for Agy because its print JSON is
+    /// final-only; arbitrary hook payloads never cross this boundary.
+    pub fn emit_host_event(
+        &self,
+        turn_id: &str,
+        session_id: Option<String>,
+        event: StructuredCliEventKind,
+    ) {
+        let _ = self.events.send(StructuredCliEvent {
+            turn_id: turn_id.to_owned(),
+            session_id,
+            event,
+        });
     }
 
     /// Starts one structured CLI turn. Prompt content is written over stdin and
@@ -325,6 +350,16 @@ fn provider_args(options: &StructuredCliLaunchOptions) -> Vec<String> {
         // request-review mode is agy's own prompt-for-approval behavior.
         StructuredCliProvider::Antigravity => {
             let mut args = vec!["--output-format".into(), "json".into()];
+            // Every first turn receives an exact project instead of falling
+            // into agy's empty default project. Resumed turns use
+            // `--conversation` below and retain the original project.
+            if options.resume_session_id.is_none() {
+                args.push("--new-project".into());
+            }
+            args.push("--sandbox".into());
+            if let Some(overlay) = options.control_overlay.as_deref() {
+                args.extend(["--add-dir".into(), overlay.to_string_lossy().into_owned()]);
+            }
             match options.permission_mode {
                 // agy print mode has no control channel to answer its default
                 // request-review prompts; callers must not route "ask" here.
@@ -405,6 +440,23 @@ fn spawn_structured_child(options: &StructuredCliLaunchOptions) -> Result<Child>
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if matches!(options.provider, StructuredCliProvider::Antigravity) {
+        // Agy must stay on its subscription/keyring path. Remove selector
+        // names without reading or logging their values.
+        for name in [
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "GOOGLE_GENAI_USE_VERTEXAI",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+        ] {
+            command.env_remove(name);
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().process_group(0);
+    }
     command.spawn().map_err(IntegratorError::from)
 }
 
@@ -587,6 +639,27 @@ async fn terminate_process_tree(child: &mut Child) {
             .status()
             .await;
     }
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let process_group = format!("-{pid}");
+        let _ = Command::new("/bin/kill")
+            .args(["-TERM", "--", &process_group])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", "--", &process_group])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+        }
+    }
     let _ = child.start_kill();
 }
 
@@ -601,14 +674,17 @@ fn parse_provider_line(provider: StructuredCliProvider, line: &str) -> Vec<Parse
         return Vec::new();
     };
     match provider {
-        StructuredCliProvider::Claude => parse_claude_event(&value).into_iter().collect(),
+        StructuredCliProvider::Claude => parse_claude_event(&value),
         StructuredCliProvider::Antigravity => parse_antigravity_result(&value),
     }
 }
 
-fn parse_claude_event(value: &Value) -> Option<ParsedEvent> {
+fn parse_claude_event(value: &Value) -> Vec<ParsedEvent> {
     let session_id = string_at(value, "session_id");
-    match value.get("type")?.as_str()? {
+    let Some(event_type) = value.get("type").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let event = match event_type {
         "system" if value.get("subtype").and_then(Value::as_str) == Some("init") => {
             Some(ParsedEvent {
                 session_id,
@@ -620,17 +696,27 @@ fn parse_claude_event(value: &Value) -> Option<ParsedEvent> {
         // Claude reports permission-mode transitions (e.g. leaving plan mode
         // after an approved ExitPlanMode) as status messages.
         "system" if value.get("subtype").and_then(Value::as_str) == Some("status") => {
-            let mode = string_at(value, "permissionMode")?;
+            let Some(mode) = string_at(value, "permissionMode") else {
+                return Vec::new();
+            };
             Some(ParsedEvent {
                 session_id,
                 event: StructuredCliEventKind::PermissionModeChanged { mode },
             })
         }
         "stream_event" => {
-            let event = value.get("event")?;
-            (event.get("type")?.as_str()? == "content_block_delta").then_some(())?;
-            let delta = event.get("delta")?;
-            (delta.get("type")?.as_str()? == "text_delta").then_some(())?;
+            let Some(event) = value.get("event") else {
+                return Vec::new();
+            };
+            if event.get("type").and_then(Value::as_str) != Some("content_block_delta") {
+                return Vec::new();
+            }
+            let Some(delta) = event.get("delta") else {
+                return Vec::new();
+            };
+            if delta.get("type").and_then(Value::as_str) != Some("text_delta") {
+                return Vec::new();
+            }
             Some(ParsedEvent {
                 session_id,
                 event: StructuredCliEventKind::Text {
@@ -639,7 +725,8 @@ fn parse_claude_event(value: &Value) -> Option<ParsedEvent> {
                 },
             })
         }
-        "assistant" => parse_claude_assistant(value, session_id),
+        "assistant" => return parse_claude_assistant(value, session_id),
+        "user" => return parse_claude_tool_results(value, session_id),
         "control_request" => parse_claude_control_request(value, session_id),
         "result" => Some(ParsedEvent {
             session_id,
@@ -657,7 +744,8 @@ fn parse_claude_event(value: &Value) -> Option<ParsedEvent> {
             },
         }),
         _ => None,
-    }
+    };
+    event.into_iter().collect()
 }
 
 /// Maps a stream-json `control_request` line onto a permission event. Only
@@ -682,33 +770,78 @@ fn parse_claude_control_request(value: &Value, session_id: Option<String>) -> Op
     })
 }
 
-fn parse_claude_assistant(value: &Value, session_id: Option<String>) -> Option<ParsedEvent> {
-    let content = value.pointer("/message/content")?.as_array()?;
-    for block in content {
-        match block.get("type").and_then(Value::as_str) {
-            Some("text") => {
-                return Some(ParsedEvent {
-                    session_id,
-                    event: StructuredCliEventKind::Text {
-                        text: string_at(block, "text").unwrap_or_default(),
-                        delta: false,
-                    },
-                });
-            }
-            Some("tool_use") => {
-                return Some(ParsedEvent {
-                    session_id,
-                    event: StructuredCliEventKind::ToolUse {
-                        id: string_at(block, "id").unwrap_or_default(),
-                        name: string_at(block, "name").unwrap_or_default(),
-                        input: block.get("input").cloned().unwrap_or(Value::Null),
-                    },
-                });
-            }
-            _ => {}
-        }
+fn parse_claude_assistant(value: &Value, session_id: Option<String>) -> Vec<ParsedEvent> {
+    let Some(content) = value.pointer("/message/content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    content
+        .iter()
+        .filter_map(|block| match block.get("type").and_then(Value::as_str) {
+            Some("text") => Some(ParsedEvent {
+                session_id: session_id.clone(),
+                event: StructuredCliEventKind::Text {
+                    text: string_at(block, "text").unwrap_or_default(),
+                    delta: false,
+                },
+            }),
+            Some("tool_use") => Some(ParsedEvent {
+                session_id: session_id.clone(),
+                event: StructuredCliEventKind::ToolUse {
+                    id: string_at(block, "id").unwrap_or_default(),
+                    name: string_at(block, "name").unwrap_or_default(),
+                    input: block.get("input").cloned().unwrap_or(Value::Null),
+                },
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn parse_claude_tool_results(value: &Value, session_id: Option<String>) -> Vec<ParsedEvent> {
+    let Some(content) = value.pointer("/message/content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    content
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+        .map(|block| ParsedEvent {
+            session_id: session_id.clone(),
+            event: StructuredCliEventKind::ToolResult {
+                id: string_at(block, "tool_use_id").unwrap_or_default(),
+                is_error: block
+                    .get("is_error")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                content: claude_tool_result_content(block.get("content")),
+            },
+        })
+        .collect()
+}
+
+fn claude_tool_result_content(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| match block {
+                Value::String(text) => Some(text.clone()),
+                Value::Object(_) => block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| serde_json::to_string(block).ok()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(Value::Object(_)) => content
+            .and_then(|value| value.get("text"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| content.and_then(|value| serde_json::to_string(value).ok()))
+            .unwrap_or_default(),
+        _ => String::new(),
     }
-    None
 }
 
 /// `agy --output-format json` prints exactly one object per turn:
@@ -793,6 +926,7 @@ mod tests {
                 resume_session_id: Some("session-1".into()),
                 permission_mode: StructuredPermissionMode::ReadOnly,
                 mcp_config_path: None,
+                control_overlay: None,
             });
             assert!(!args.iter().any(|arg| arg.contains("secret prompt")));
             let has_effort = args
@@ -839,6 +973,7 @@ mod tests {
             resume_session_id: None,
             permission_mode: mode,
             mcp_config_path: None,
+            control_overlay: None,
         };
         for mode in [
             StructuredPermissionMode::Prompt,
@@ -873,6 +1008,7 @@ mod tests {
             resume_session_id: None,
             permission_mode: StructuredPermissionMode::AcceptEdits,
             mcp_config_path: Some("C:/data/broker-mcp/orchestrator-task.json".into()),
+            control_overlay: None,
         };
         let claude = provider_args(&options(StructuredCliProvider::Claude));
         assert!(claude.windows(2).any(|w| w[0] == "--mcp-config"));
@@ -896,6 +1032,7 @@ mod tests {
             resume_session_id: None,
             permission_mode: StructuredPermissionMode::BypassPermissions,
             mcp_config_path: None,
+            control_overlay: None,
         };
         let claude = provider_args(&options(StructuredCliProvider::Claude));
         assert!(
@@ -1015,6 +1152,41 @@ mod tests {
     }
 
     #[test]
+    fn parses_every_claude_tool_result_block() {
+        let line = r#"{"type":"user","session_id":"sess-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":"read output"},{"type":"tool_result","tool_use_id":"tool-2","content":[{"type":"text","text":"exit 7"}],"is_error":true}]}}"#;
+        let events = parse_provider_line(StructuredCliProvider::Claude, line);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            ParsedEvent {
+                session_id: Some(session_id),
+                event: StructuredCliEventKind::ToolResult { id, is_error: false, content }
+            } if session_id == "sess-1" && id == "tool-1" && content == "read output"
+        ));
+        assert!(matches!(
+            &events[1].event,
+            StructuredCliEventKind::ToolResult { id, is_error: true, content }
+                if id == "tool-2" && content == "exit 7"
+        ));
+    }
+
+    #[test]
+    fn parses_all_displayable_claude_assistant_blocks_and_ignores_thinking() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hidden"},{"type":"text","text":"Checking."},{"type":"tool_use","id":"tool-1","name":"Read","input":{"file_path":"alpha.txt"}}]}}"#;
+        let events = parse_provider_line(StructuredCliProvider::Claude, line);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0].event,
+            StructuredCliEventKind::Text { text, delta: false } if text == "Checking."
+        ));
+        assert!(matches!(
+            &events[1].event,
+            StructuredCliEventKind::ToolUse { id, name, .. }
+                if id == "tool-1" && name == "Read"
+        ));
+    }
+
+    #[test]
     fn antigravity_effort_composes_into_the_model_name() {
         let options = |model: Option<&str>, effort: Option<&str>| StructuredCliLaunchOptions {
             provider: StructuredCliProvider::Antigravity,
@@ -1025,6 +1197,7 @@ mod tests {
             resume_session_id: None,
             permission_mode: StructuredPermissionMode::Prompt,
             mcp_config_path: None,
+            control_overlay: None,
         };
         let model_arg = |args: Vec<String>| {
             args.windows(2)
@@ -1042,6 +1215,14 @@ mod tests {
             model_arg(provider_args(&options(Some("Gemini 3.1 Pro"), None))),
             Some("Gemini 3.1 Pro".into())
         );
+        // The isolated helper path (chat titles, commit messages) pins "low".
+        assert_eq!(
+            model_arg(provider_args(&options(
+                Some("Gemini 3.5 Flash"),
+                Some("low")
+            ))),
+            Some("Gemini 3.5 Flash (Low)".into())
+        );
         // Unknown effort ids must not mutate the model string.
         assert_eq!(
             model_arg(provider_args(&options(
@@ -1052,6 +1233,41 @@ mod tests {
         );
         // No model selected: nothing to compose, no --model at all.
         assert_eq!(model_arg(provider_args(&options(None, Some("high")))), None);
+    }
+
+    #[test]
+    fn antigravity_launches_an_exact_sandboxed_project_and_preserves_it_on_resume() {
+        let options = |resume_session_id: Option<&str>| StructuredCliLaunchOptions {
+            provider: StructuredCliProvider::Antigravity,
+            executable: "agy".into(),
+            working_directory: "/workspace/project".into(),
+            model: None,
+            effort: None,
+            resume_session_id: resume_session_id.map(str::to_owned),
+            permission_mode: StructuredPermissionMode::ReadOnly,
+            mcp_config_path: None,
+            control_overlay: Some("/private/tmp/integrator-overlay".into()),
+        };
+
+        let first = provider_args(&options(None));
+        assert!(first.iter().any(|arg| arg == "--new-project"));
+        assert!(first.iter().any(|arg| arg == "--sandbox"));
+        assert!(first.windows(2).any(|args| {
+            args[0] == "--add-dir" && args[1] == "/private/tmp/integrator-overlay"
+        }));
+        assert!(!first.iter().any(|arg| arg == "--conversation"));
+
+        let resumed = provider_args(&options(Some("conversation-1")));
+        assert!(!resumed.iter().any(|arg| arg == "--new-project"));
+        assert!(resumed.iter().any(|arg| arg == "--sandbox"));
+        assert!(
+            resumed
+                .windows(2)
+                .any(|args| { args[0] == "--conversation" && args[1] == "conversation-1" })
+        );
+        assert!(resumed.windows(2).any(|args| {
+            args[0] == "--add-dir" && args[1] == "/private/tmp/integrator-overlay"
+        }));
     }
 
     #[test]
@@ -1093,5 +1309,84 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_terminates_structured_provider_descendants() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("provider fixture");
+        let executable = directory.path().join("fixture-agent.sh");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nsleep 30 &\necho $! > child.pid\nwait\n",
+        )
+        .expect("write provider fixture");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("make provider fixture executable");
+
+        let client = StructuredCliClient::new();
+        let mut receiver = client.subscribe();
+        let turn_id = client
+            .start_turn(
+                StructuredCliLaunchOptions {
+                    provider: StructuredCliProvider::Claude,
+                    executable,
+                    working_directory: directory.path().into(),
+                    model: None,
+                    effort: None,
+                    resume_session_id: None,
+                    permission_mode: StructuredPermissionMode::ReadOnly,
+                    mcp_config_path: None,
+                    control_overlay: None,
+                },
+                "start fixture".into(),
+            )
+            .await
+            .expect("start provider fixture");
+        let pid_path = directory.path().join("child.pid");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !pid_path.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("descendant pid");
+        let descendant = std::fs::read_to_string(&pid_path)
+            .expect("read descendant pid")
+            .trim()
+            .to_owned();
+
+        assert!(client.cancel(&turn_id).await.expect("cancel provider"));
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                let event = receiver.recv().await.expect("provider event");
+                if matches!(
+                    event.event,
+                    StructuredCliEventKind::Exited {
+                        cancelled: true,
+                        ..
+                    }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("cancelled exit");
+
+        let still_alive = Command::new("/bin/kill")
+            .args(["-0", &descendant])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|status| status.success());
+        assert!(
+            !still_alive,
+            "structured provider descendant survived cancellation"
+        );
     }
 }

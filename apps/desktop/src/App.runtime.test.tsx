@@ -16,6 +16,7 @@ const { bridgeMock } = vi.hoisted(() => ({
     beginRuntimeLogin: vi.fn(),
     listRuntimeActionPlans: vi.fn(),
     listSettings: vi.fn(),
+    setSetting: vi.fn(),
     getAppInfo: vi.fn(),
     openProject: vi.fn(),
     registerProject: vi.fn(),
@@ -140,6 +141,7 @@ describe("native runtime recovery UI", () => {
     bridgeMock.listDelegations.mockResolvedValue([]);
     bridgeMock.listModelCatalog.mockResolvedValue([]);
     bridgeMock.listSettings.mockResolvedValue([]);
+    bridgeMock.setSetting.mockResolvedValue(undefined);
     bridgeMock.generateTaskTitle.mockResolvedValue(null);
     bridgeMock.listQueuedMessages.mockResolvedValue([]);
     bridgeMock.steerTurn.mockResolvedValue(false);
@@ -287,8 +289,10 @@ describe("native runtime recovery UI", () => {
     expect(bridgeMock.probeRuntimes).toHaveBeenCalledTimes(1);
     expect(bridgeMock.loadTaskGit).toHaveBeenCalledWith("task-1");
     expect(bridgeMock.listProjectFiles).not.toHaveBeenCalled();
+    // Connection notices render after a grace delay to avoid flashing on
+    // fast transitions, so wait for them instead of querying synchronously.
     expect(
-      screen.getByText("Event gap detected; recovering authoritative history…"),
+      await screen.findByText("Some runtime events were missed", {}, { timeout: 3000 }),
     ).toBeInTheDocument();
     expect(bridgeMock.subscribeRuntimeProjections.mock.invocationCallOrder[0]).toBeLessThan(
       bridgeMock.loadWorkspace.mock.invocationCallOrder[0],
@@ -307,6 +311,107 @@ describe("native runtime recovery UI", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Stop turn" }));
     await waitFor(() => expect(bridgeMock.stopTurn).toHaveBeenCalledWith("task-1"));
+  });
+
+  it("offers a noninterruptive resume control for a transport-interrupted turn", async () => {
+    bridgeMock.loadTaskProjection.mockResolvedValue({
+      watermarkSeq: 1,
+      runtimeLive: false,
+      events: [
+        projection(1, {
+          kind: "turnChanged",
+          turn: {
+            id: "turn-interrupted",
+            status: "interrupted",
+            stopRequested: false,
+            startedAt: "2026-07-10T16:00:00Z",
+            completedAt: "2026-07-10T16:00:03Z",
+          },
+        }),
+      ],
+    });
+    bridgeMock.sendTurn.mockResolvedValue({
+      id: "resume-user",
+      kind: "user",
+      body: "Resume from here",
+      timestamp: "2026-07-10T16:01:00Z",
+      status: "neutral",
+    });
+
+    render(<App />);
+    expect(await screen.findByText("Response interrupted")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+
+    await waitFor(() =>
+      expect(bridgeMock.sendTurn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          taskId: "task-1",
+          prompt: "Resume from here",
+          runtime: "codex",
+          resumeInterrupted: true,
+        }),
+      ),
+    );
+  });
+
+  it("hides resume recovery when the user stopped the turn", async () => {
+    bridgeMock.loadTaskProjection.mockResolvedValue({
+      watermarkSeq: 1,
+      runtimeLive: false,
+      events: [
+        projection(1, {
+          kind: "turnChanged",
+          turn: {
+            id: "turn-stopped",
+            status: "interrupted",
+            stopRequested: true,
+            startedAt: "2026-07-10T16:00:00Z",
+            completedAt: "2026-07-10T16:00:03Z",
+          },
+        }),
+      ],
+    });
+
+    render(<App />);
+    await waitFor(() => expect(bridgeMock.loadTaskProjection).toHaveBeenCalled());
+    expect(screen.queryByText("Response interrupted")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Resume" })).not.toBeInTheDocument();
+  });
+
+  it("auto-resumes only provider interruptions when the local setting is enabled", async () => {
+    bridgeMock.listSettings.mockResolvedValue([
+      { key: "settings.general.autoResumeInterruptedTurns", value: true },
+    ]);
+    bridgeMock.loadTaskProjection.mockResolvedValue({
+      watermarkSeq: 1,
+      runtimeLive: false,
+      events: [
+        projection(1, {
+          kind: "turnChanged",
+          turn: {
+            id: "turn-interrupted",
+            status: "interrupted",
+            stopRequested: false,
+            startedAt: "2026-07-10T16:00:00Z",
+            completedAt: "2026-07-10T16:00:03Z",
+          },
+        }),
+      ],
+    });
+    bridgeMock.sendTurn.mockResolvedValue({
+      id: "resume-user",
+      kind: "user",
+      body: "Resume from here",
+      timestamp: "2026-07-10T16:01:00Z",
+      status: "neutral",
+    });
+
+    render(<App />);
+    await waitFor(() =>
+      expect(bridgeMock.sendTurn).toHaveBeenCalledWith(
+        expect.objectContaining({ resumeInterrupted: true }),
+      ),
+    );
   });
 
   it("publishes main text once per frame and flushes an urgent event in order", async () => {
@@ -392,7 +497,9 @@ describe("native runtime recovery UI", () => {
       expect(
         await screen.findByText("Buffered immediately before urgent state"),
       ).toBeInTheDocument();
-      expect(screen.getByText("urgent receiver gap")).toBeInTheDocument();
+      expect(
+        await screen.findByText("urgent receiver gap", {}, { timeout: 3000 }),
+      ).toBeInTheDocument();
     } finally {
       requestFrame.mockRestore();
       cancelFrame.mockRestore();
@@ -427,7 +534,7 @@ describe("native runtime recovery UI", () => {
       );
     });
 
-    expect(await screen.findByText("Codex is disconnected")).toBeVisible();
+    expect(await screen.findByText("Codex is disconnected", {}, { timeout: 3000 })).toBeVisible();
     expect(screen.getByText("Provider process exited after verification")).toBeVisible();
     expect(screen.queryByText("Provider connection lost")).not.toBeInTheDocument();
   });
@@ -1241,7 +1348,7 @@ describe("native runtime recovery UI", () => {
       );
     });
 
-    expect(await screen.findByText("Codex is disconnected")).toBeVisible();
+    expect(await screen.findByText("Codex is disconnected", {}, { timeout: 3000 })).toBeVisible();
     fireEvent.click(await screen.findByRole("button", { name: "Update Codex" }));
     await screen.findByRole("dialog", { name: "Update Codex" });
     fireEvent.click(screen.getByRole("button", { name: "Cancel runtime command" }));
@@ -1262,7 +1369,10 @@ describe("native runtime recovery UI", () => {
     await screen.findByText("Runtime status refreshed.");
     fireEvent.click(screen.getByRole("button", { name: /Back to workspace/i }));
 
-    expect(screen.queryByText("Codex is disconnected")).not.toBeInTheDocument();
+    // The notice lingers briefly for its exit animation before unmounting.
+    await waitFor(() =>
+      expect(screen.queryByText("Codex is disconnected")).not.toBeInTheDocument(),
+    );
     expect(screen.queryByText(/requires a newer version of Codex/i)).not.toBeInTheDocument();
 
     act(() => {
@@ -1274,7 +1384,7 @@ describe("native runtime recovery UI", () => {
         }),
       );
     });
-    expect(await screen.findByText("Codex is disconnected")).toBeVisible();
+    expect(await screen.findByText("Codex is disconnected", {}, { timeout: 3000 })).toBeVisible();
   });
 
   it("allows stale approval operation errors to be dismissed", async () => {

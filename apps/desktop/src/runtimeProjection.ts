@@ -326,24 +326,61 @@ function toolPath(input: Record<string, unknown>): string | undefined {
   return candidate?.trim();
 }
 
-function toolAction(item: ItemProjection): "read" | "write" | "edit" | "search" | "other" {
-  const name = [item.mcpTool, item.title].filter(Boolean).join(" ").toLowerCase();
-  if (/\b(read|cat|open|view)\b/.test(name)) return "read";
-  if (/\b(write|create|save)\b/.test(name)) return "write";
-  if (/\b(edit|patch|replace|update)\b/.test(name)) return "edit";
-  if (/\b(search|grep|glob|find|list)\b/.test(name)) return "search";
-  return "other";
+type ToolAction = "read" | "write" | "edit" | "search" | "execute" | "other";
+
+const TOOL_ACTIONS: Readonly<Record<string, ToolAction>> = {
+  read: "read",
+  read_file: "read",
+  view_file: "read",
+  write: "write",
+  write_file: "write",
+  write_to_file: "write",
+  edit: "edit",
+  apply_patch: "edit",
+  replace_file_content: "edit",
+  multi_replace_file_content: "edit",
+  search: "search",
+  grep: "search",
+  glob: "search",
+  find: "search",
+  list_dir: "search",
+  list_files: "search",
+  bash: "execute",
+  shell: "execute",
+  execute: "execute",
+  run_command: "execute",
+};
+
+const INTEGRATOR_TOOL_COPY: Readonly<Record<string, readonly [string, string]>> = {
+  peers_list: ["Checking subagent configuration", "Checked subagent configuration"],
+  delegate_start: ["Starting a subagent", "Started a subagent"],
+  delegation_status: ["Checking subagent progress", "Checked subagent progress"],
+  delegation_message: ["Sending guidance to a subagent", "Sent guidance to a subagent"],
+  delegation_result: ["Collecting the subagent result", "Collected the subagent result"],
+  delegation_stop: ["Stopping a subagent", "Stopped a subagent"],
+};
+
+const PROVIDER_TOOL_COPY: Readonly<Record<string, readonly [string, string]>> = {
+  list_permissions: ["Checking tool permissions", "Checked tool permissions"],
+};
+
+function normalizedToolName(item: ItemProjection): string {
+  return (item.mcpTool ?? item.title ?? "").trim().toLowerCase();
 }
 
-/** "web_search" / "fetchUrl" / "apply-patch" → "Web search" / "Fetch url" / "Apply patch". */
-function humanizeToolName(name?: string): string | undefined {
-  if (!name) return undefined;
-  const words = name
-    .replace(/[_-]+/g, " ")
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .trim();
-  if (!words) return undefined;
-  return words.charAt(0).toUpperCase() + words.slice(1).toLowerCase();
+function toolAction(item: ItemProjection): ToolAction {
+  return TOOL_ACTIONS[normalizedToolName(item)] ?? "other";
+}
+
+function semanticToolTitle(item: ItemProjection): string | undefined {
+  const name = normalizedToolName(item);
+  const copy =
+    item.mcpServer?.toLowerCase() === "integrator"
+      ? INTEGRATOR_TOOL_COPY[name]
+      : PROVIDER_TOOL_COPY[name];
+  if (!copy) return undefined;
+  const running = item.status === "pending" || item.status === "inProgress";
+  return copy[running ? 0 : 1];
 }
 
 function toolQuery(input: Record<string, unknown>): string | undefined {
@@ -381,16 +418,23 @@ function toolSummary(
           ? { additions: lineCount(input.content), deletions: 0 }
           : undefined));
   const fallback = item.body || item.toolInput?.split("\n", 1)[0] || "Tool activity";
-  if (action === "read") return { title: "Read", body: path ?? fallback };
-  if (action === "write") return { title: "Wrote", body: path ?? fallback, changeStats };
-  if (action === "edit") return { title: "Edited", body: path ?? fallback, changeStats };
-  if (action === "search") return { title: "Searched", body: toolQuery(input) ?? path ?? fallback };
-  const toolName = humanizeToolName(item.mcpTool);
+  const semanticTitle = semanticToolTitle(item);
+  if (semanticTitle) return { title: semanticTitle, body: path ?? fallback, changeStats };
+  const running = item.status === "pending" || item.status === "inProgress";
+  if (action === "read") return { title: running ? "Reading" : "Read", body: path ?? fallback };
+  if (action === "write")
+    return { title: running ? "Creating" : "Created", body: path ?? fallback, changeStats };
+  if (action === "edit")
+    return { title: running ? "Editing" : "Edited", body: path ?? fallback, changeStats };
+  if (action === "search")
+    return {
+      title: running ? "Searching" : "Searched",
+      body: toolQuery(input) ?? path ?? fallback,
+    };
+  if (action === "execute")
+    return { title: running ? "Running a command" : "Ran a command", body: fallback };
   return {
-    title:
-      (toolName && item.mcpServer ? `${toolName} · ${item.mcpServer}` : toolName) ||
-      item.title ||
-      "Tool call",
+    title: "Runtime event",
     body: path ?? fallback,
     changeStats,
   };
@@ -596,13 +640,20 @@ function activityGroupStatus(children: TranscriptEvent[]): TranscriptEvent["stat
   return "success";
 }
 
-function groupActivityEvents(events: TranscriptEvent[]): TranscriptEvent[] {
+export type TranscriptDensity = "summary" | "normal" | "verbose";
+const ACTIVITY_GROUP_LIMIT = 50;
+
+function groupActivityEvents(
+  events: TranscriptEvent[],
+  density: TranscriptDensity,
+): TranscriptEvent[] {
+  if (density === "verbose") return events;
   const grouped: TranscriptEvent[] = [];
   let batch: TranscriptEvent[] = [];
 
   const flush = () => {
     if (batch.length === 0) return;
-    if (batch.length === 1) {
+    if (batch.length === 1 && density !== "summary") {
       grouped.push(batch[0]);
       batch = [];
       return;
@@ -641,7 +692,10 @@ function groupActivityEvents(events: TranscriptEvent[]): TranscriptEvent[] {
       !event.children?.length &&
       !event.diff &&
       (event.kind === "approval" || (event.status !== "error" && event.status !== "warning"));
-    if (groupable) batch.push(event);
+    if (groupable) {
+      batch.push(event);
+      if (batch.length >= ACTIVITY_GROUP_LIMIT) flush();
+    }
     else {
       flush();
       grouped.push(event);
@@ -673,12 +727,19 @@ function deriveItemTranscriptEvents(
   if (item.kind === "userMessage") return [{ ...common, kind: "user" }];
   if (item.kind === "agentMessage") return [{ ...common, kind: "assistant" }];
   if (item.kind === "reasoningSummary") {
+    const summary = item.body?.trim();
+    if (!summary) return [];
+    const providerLabel = item.title === "Reasoning summary";
     return [
       {
         ...common,
         kind: "activity",
         activityType: "reasoning",
-        title: item.title ?? "Reasoning summary",
+        body: summary,
+        title: providerLabel ? undefined : item.title,
+        meta: providerLabel
+          ? [common.meta, "Reasoning summary"].filter(Boolean).join(" · ")
+          : common.meta,
       },
     ];
   }
@@ -738,6 +799,7 @@ type ItemTranscriptDeriver = (
 function buildRuntimeTranscript(
   state: RuntimeProjectionState,
   deriveItem: ItemTranscriptDeriver,
+  density: TranscriptDensity,
 ): TranscriptEvent[] {
   const events: TranscriptEvent[] = [];
   const turnSettled =
@@ -815,20 +877,6 @@ function buildRuntimeTranscript(
     });
   }
 
-  if (state.turn?.status === "interrupted") {
-    events.push({
-      id: `runtime-turn-interrupted-${state.turn.id}`,
-      kind: "notice",
-      title: "Response interrupted",
-      body: "The agent was stopped before it finished this response. Send a new message to continue.",
-      timestamp:
-        state.turn.completedAt ??
-        state.items[state.items.length - 1]?.updatedAt ??
-        new Date().toISOString(),
-      status: "warning",
-    });
-  }
-
   // Interleave chronologically by FIRST appearance: a streaming item keeps
   // receiving updates, so ordering by last-update time would make growing
   // text hop below tool activity that actually happened after it started.
@@ -837,14 +885,20 @@ function buildRuntimeTranscript(
       .map((event, index) => ({ event, index, time: Date.parse(event.timestamp) || 0 }))
       .sort((a, b) => a.time - b.time || a.index - b.index)
       .map(({ event }) => event),
+    density,
   );
 }
 
-export function runtimeTranscript(state: RuntimeProjectionState): TranscriptEvent[] {
-  return buildRuntimeTranscript(state, deriveItemTranscriptEvents);
+export function runtimeTranscript(
+  state: RuntimeProjectionState,
+  density: TranscriptDensity = "normal",
+): TranscriptEvent[] {
+  return buildRuntimeTranscript(state, deriveItemTranscriptEvents, density);
 }
 
-export function createRuntimeTranscriptDeriver(): (
+export function createRuntimeTranscriptDeriver(
+  density: TranscriptDensity = "normal",
+): (
   state: RuntimeProjectionState,
 ) => TranscriptEvent[] {
   let cachedTaskId: string | undefined;
@@ -862,12 +916,16 @@ export function createRuntimeTranscriptDeriver(): (
       cachedTaskId = state.taskId;
       itemCache = new WeakMap();
     }
-    return buildRuntimeTranscript(state, (item, timestamp, status) => {
-      const cached = itemCache.get(item);
-      if (cached?.timestamp === timestamp && cached.status === status) return cached.events;
-      const events = deriveItemTranscriptEvents(item, timestamp, status);
-      itemCache.set(item, { timestamp, status, events });
-      return events;
-    });
+    return buildRuntimeTranscript(
+      state,
+      (item, timestamp, status) => {
+        const cached = itemCache.get(item);
+        if (cached?.timestamp === timestamp && cached.status === status) return cached.events;
+        const events = deriveItemTranscriptEvents(item, timestamp, status);
+        itemCache.set(item, { timestamp, status, events });
+        return events;
+      },
+      density,
+    );
   };
 }

@@ -383,10 +383,14 @@ async fn generate_structured_title(
                 executable,
                 working_directory: cwd.to_path_buf(),
                 model: Some(model.into()),
-                effort: (provider == ProviderKind::Claude).then(|| "low".into()),
+                // Claude forwards this as `--effort low`; agy composes it into
+                // the model name ("Gemini 3.5 Flash (Low)") — agy's registry
+                // only accepts suffixed names, so omitting it fails the turn.
+                effort: Some("low".into()),
                 resume_session_id: None,
                 permission_mode: StructuredPermissionMode::ReadOnly,
                 mcp_config_path: None,
+                control_overlay: None,
             },
             prompt.to_owned(),
         )

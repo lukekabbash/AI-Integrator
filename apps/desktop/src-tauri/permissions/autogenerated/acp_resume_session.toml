@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-acp-resume-session"
+description = "Enables the acp_resume_session command without any pre-configured scope."
+commands.allow = ["acp_resume_session"]
+
+[[permission]]
+identifier = "deny-acp-resume-session"
+description = "Denies the acp_resume_session command without any pre-configured scope."
+commands.deny = ["acp_resume_session"]

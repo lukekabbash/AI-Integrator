@@ -33,6 +33,7 @@ pub struct CodexRuntime {
     /// registry intentionally keeps the task slot until reconnect so stale
     /// handles can never make a crashed turn look live.
     pub alive: Arc<AtomicBool>,
+    pub reconciling: Arc<AtomicBool>,
     pub binding: Arc<std::sync::Mutex<Option<RuntimeBinding>>>,
     /// Conversation digest queued for injection into the first turn of a
     /// freshly created provider thread, so a new session inherits the task's
@@ -51,6 +52,12 @@ pub struct CodexRuntime {
 pub struct AcpPermissionOption {
     pub option_id: String,
     pub kind: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AcpSessionSpec {
+    pub cwd: PathBuf,
+    pub mcp_servers: Vec<serde_json::Value>,
 }
 
 /// One connected ACP agent process (e.g. `cursor-agent acp`).
@@ -91,6 +98,19 @@ pub struct AcpRuntime {
     /// Read-only delegated children reject ACP permission requests instead of
     /// inheriting the unattended auto-allow behavior used by writing workers.
     pub read_only: bool,
+    /// Exact lifecycle parameters required by ACP session/load or
+    /// session/resume. Kept in memory only; the durable resume record stores
+    /// no MCP secrets.
+    pub session_spec: Arc<std::sync::Mutex<Option<AcpSessionSpec>>>,
+    /// True while session/load replay notifications are being reconciled.
+    pub replaying_history: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StructuredResumeContext {
+    pub repository: PathBuf,
+    pub permission: String,
+    pub delegation: String,
 }
 
 /// One provider-neutral structured CLI route. The vendor CLI owns auth and
@@ -111,6 +131,12 @@ pub struct StructuredRuntime {
     /// Vendor session id captured from structured events and reused on the
     /// next turn so native Claude skill context stays provider-owned.
     pub session_ref: Arc<std::sync::Mutex<Option<String>>>,
+    /// Integrator-owned Agy customization root. It remains outside the user
+    /// repository and is reused with the provider conversation.
+    pub control_overlay: Option<PathBuf>,
+    /// Redacted official-hook event stream inside `control_overlay`.
+    pub hook_event_log: Option<PathBuf>,
+    pub resume_context: Option<StructuredResumeContext>,
 }
 
 /// See [`StructuredRuntime::permission_requests`].
@@ -132,6 +158,11 @@ pub struct DelegationChild {
     /// Set by the `task_complete` broker tool so turn settlement does not
     /// misfile a finished delegation as `waiting`.
     pub completed: Arc<std::sync::Mutex<bool>>,
+    /// Newest transcript item seq already scanned for `<integrator:…>`
+    /// sentinel blocks. `Some` only for children without broker tools; `None`
+    /// disables sentinel routing so tooled children can quote the syntax
+    /// safely (e.g. while working on Integrator's own source).
+    pub sentinel_watermark: Option<Arc<std::sync::Mutex<i64>>>,
     pub driver: DelegationChildDriver,
 }
 
@@ -253,6 +284,7 @@ impl AppState {
         let store = LocalStore::open(data_directory.join("integrator.sqlite3"))?;
         store.interrupt_unfinished_runtime_sessions()?;
         store.recover_dispatching_queued_messages()?;
+        store.recover_orphaned_delegations()?;
         Ok(Self {
             store: Arc::new(store),
             data_directory,

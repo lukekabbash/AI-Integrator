@@ -21,6 +21,16 @@ export interface RuntimeConnection {
   fidelity: "native" | "structured" | "acp" | "pty";
   models: string[];
   detail: string;
+  certification?: "certified" | "session_probe_required" | "uncertified";
+  capabilities?: {
+    sessionResume: boolean;
+    authoritativeHistory: boolean;
+    structuredToolEvents: boolean;
+    hooks: boolean;
+    sandboxedWorkspace: boolean;
+    subscriptionAuth: boolean;
+    skills: boolean;
+  };
 }
 
 export interface NativeProviderAction {
@@ -78,6 +88,8 @@ export interface ProjectSummary {
   branch: string;
   dirtyFiles: number;
   expanded: boolean;
+  pinned?: boolean;
+  archived?: boolean;
 }
 
 export interface TaskSummary {
@@ -156,6 +168,7 @@ export type DelegationStatus =
   | "starting"
   | "running"
   | "waiting"
+  | "interrupted"
   | "completed"
   | "failed"
   | "stopped"
@@ -585,6 +598,8 @@ export interface SendTurnInput extends Omit<StartTaskInput, "projectId"> {
   taskId: string;
   /** Opaque selection returned by listNativeProviderActions. */
   nativeActionId?: string;
+  /** Continue a transport-interrupted turn from its provider-owned session. */
+  resumeInterrupted?: boolean;
 }
 
 export interface TurnProjection {
@@ -806,11 +821,15 @@ export interface AppBridge {
   cloneProject(input: CloneProjectInput): Promise<ProjectSummary>;
   registerProject(path: string): Promise<ProjectSummary>;
   listProjects(): Promise<ProjectSummary[]>;
+  /** Detach a project and wipe Integrator history; optionally delete the folder. */
+  removeProject(projectId: string, options?: { deleteFiles?: boolean }): Promise<void>;
   probeRuntimes(): Promise<RuntimeConnection[]>;
   beginRuntimeLogin(runtime: RuntimeId): Promise<RuntimeConnection>;
   startTask(input: StartTaskInput): Promise<TaskSummary>;
   /** Revisioned local persistence; stale writes are ignored by the native store. */
   saveComposerDraft(draft: ComposerDraft): Promise<void>;
+  /** Permanently wipe one chat and its Integrator history. Never touches the project folder. */
+  removeTask(taskId: string): Promise<void>;
   enqueueMessage(input: QueueMessageInput): Promise<QueuedMessage>;
   listQueuedMessages(taskId: string): Promise<QueuedMessage[]>;
   reorderQueuedMessages(taskId: string, orderedIds: string[]): Promise<QueuedMessage[]>;
@@ -1005,6 +1024,13 @@ interface NativeProviderStatus {
   authentication: "authenticated" | "loggedOut" | "unavailable" | "unknown" | "needsAttention";
   transport?: "jsonlStdio" | "acpStdio" | "externalApplication";
   diagnosticCode?: string;
+  certification?: "certified" | "sessionProbeRequired" | "uncertified";
+  capabilities?: RuntimeConnection["capabilities"];
+}
+
+interface NativeAcpSessionCapabilities {
+  load: boolean;
+  resume: boolean;
 }
 
 interface NativeExport {
@@ -1018,8 +1044,19 @@ interface NativeExport {
     provider: NativeProviderStatus["provider"];
     providerThreadId: string;
   }>;
+  providerResumeStates?: NativeProviderResumeState[];
   composerDrafts?: ComposerDraft[];
   queuedMessages?: QueuedMessage[];
+}
+
+interface NativeProviderResumeState {
+  taskId: string;
+  provider: NativeProviderStatus["provider"];
+  sessionRef: string;
+  repositoryRoot: string;
+  permission: StartTaskInput["permission"];
+  delegation: StartTaskInput["delegation"];
+  updatedAt: string;
 }
 
 interface NativeBootstrap {
@@ -1086,6 +1123,12 @@ const codexThreadByTask = new Map<string, string>();
 const activeCodexThreads = new Set<string>();
 const codexConnectedTasks = new Set<string>();
 const codexDelegationByTask = new Map<string, StartTaskInput["delegation"]>();
+const providerResumeByTask = new Map<string, NativeProviderResumeState>();
+const providerRouteByTask = new Map<
+  string,
+  Pick<NativeProviderResumeState, "provider" | "permission" | "delegation">
+>();
+const acpSessionCertification = new Map<RuntimeId, NativeAcpSessionCapabilities>();
 let cachedWorkspace: WorkspaceSnapshot | undefined;
 let cachedNativeSettings: LocalSetting[] | undefined;
 let codexCatalogConnected = false;
@@ -1100,7 +1143,13 @@ const cursorEffortConfigByModel = new Map<string, string>();
 let cursorModelConfigId: string | undefined;
 const FALLBACK_MODELS: Partial<Record<RuntimeId, string[]>> = {
   claude: ["claude-opus-4-8", "claude-fable-5", "claude-sonnet-5", "claude-haiku-4-5"],
-  antigravity: ["Gemini 3.1 Pro", "Gemini 3.5 Flash"],
+  antigravity: [
+    "Gemini 3.1 Pro",
+    "Gemini 3.5 Flash",
+    "Claude Sonnet 4.6 (Thinking)",
+    "Claude Opus 4.6 (Thinking)",
+    "GPT-OSS 120B",
+  ],
   // These are a degraded fallback only. A successfully negotiated Cursor ACP
   // catalog replaces them with the models available to the signed-in account.
   cursor: ["composer-2.5", "cursor-small", "deepseek-v3.1", "deepseek-r1", "auto"],
@@ -1369,6 +1418,25 @@ export function extractCursorModelParams(response: unknown): Map<string, CursorM
     });
   }
   return params;
+}
+
+function extractCursorExtensionCatalog(response: unknown): ModelCatalogEntry[] {
+  if (!response || typeof response !== "object") return [];
+  const models = (response as { models?: unknown }).models;
+  if (!Array.isArray(models)) return [];
+  const catalog: ModelCatalogEntry[] = [];
+  const seen = new Set<string>();
+  for (const model of models) {
+    if (!model || typeof model !== "object") continue;
+    const entry = model as { value?: unknown; name?: unknown };
+    if (typeof entry.value !== "string" || !entry.value || seen.has(entry.value)) continue;
+    seen.add(entry.value);
+    catalog.push({
+      id: entry.value,
+      label: typeof entry.name === "string" && entry.name ? entry.name : entry.value,
+    });
+  }
+  return catalog;
 }
 
 /**
@@ -1682,6 +1750,8 @@ function runtimeId(provider: NativeProviderStatus["provider"]): RuntimeId {
 
 function mapRuntime(status: NativeProviderStatus): RuntimeConnection {
   const id = runtimeId(status.provider);
+  const acpSession = acpSessionCertification.get(id);
+  const acpProbeEligible = status.certification === "sessionProbeRequired";
   const names: Record<RuntimeId, string> = {
     codex: "Codex",
     cursor: "Cursor",
@@ -1716,9 +1786,36 @@ function mapRuntime(status: NativeProviderStatus): RuntimeConnection {
             ? "structured"
             : "pty",
     models: [],
+    certification: acpSession && acpProbeEligible
+      ? acpSession.load
+        ? "certified"
+        : "uncertified"
+      : status.certification === "sessionProbeRequired"
+        ? "session_probe_required"
+        : (status.certification ?? "uncertified"),
+    capabilities: status.capabilities
+      ? {
+          ...status.capabilities,
+          sessionResume: acpSession
+            ? acpSession.load || acpSession.resume
+            : status.capabilities.sessionResume,
+          authoritativeHistory: acpSession?.load ?? status.capabilities.authoritativeHistory,
+        }
+      : undefined,
     detail: updateRequired
       ? "This CLI is authenticated but older than Integrator's certified protocol floor."
-      : (status.diagnosticCode ?? (connected ? "Authenticated local CLI" : "Status unavailable")),
+      : status.diagnosticCode === "capability-mismatch"
+        ? "This installed CLI is missing a capability required by Integrator's certified route."
+        : status.diagnosticCode === "capability-probe-failed"
+          ? "Integrator could not verify this CLI's installed capabilities."
+          : acpSession?.load && acpProbeEligible
+            ? "Installed CLI and ACP session recovery verified."
+            : acpSession && acpProbeEligible
+              ? "ACP connected, but session/load is unavailable; interrupted history cannot be reconciled authoritatively."
+          : status.certification === "sessionProbeRequired" && connected
+            ? "Installed CLI verified; session capabilities are checked during the ACP handshake."
+            : (status.diagnosticCode ??
+              (connected ? "Authenticated local CLI" : "Status unavailable")),
   };
 }
 
@@ -1793,6 +1890,15 @@ async function loadNativeWorkspace(): Promise<WorkspaceSnapshot> {
   const projects: ProjectSummary[] = (local.projects ?? []).map(mapProject);
   const projectByPath = new Map(projects.map((project) => [project.path, project]));
   const runtimeByTask = new Map<string, RuntimeId>();
+  providerResumeByTask.clear();
+  providerRouteByTask.clear();
+  for (const resume of local.providerResumeStates ?? []) {
+    providerResumeByTask.set(resume.taskId, resume);
+    providerRouteByTask.set(resume.taskId, resume);
+    if (resume.provider === "codex") {
+      codexDelegationByTask.set(resume.taskId, resume.delegation);
+    }
+  }
   for (const session of local.providerSessions) {
     const mapped = mapStoredRuntime(session.provider);
     if (mapped) runtimeByTask.set(session.taskId, mapped);
@@ -1941,6 +2047,12 @@ function extractThreadId(response: unknown): string | undefined {
   return typeof id === "string" ? id : undefined;
 }
 
+function extractSessionId(response: unknown): string | undefined {
+  if (!response || typeof response !== "object") return undefined;
+  const id = (response as { sessionId?: unknown }).sessionId;
+  return typeof id === "string" ? id : undefined;
+}
+
 const cursorSessionByTask = new Set<string>();
 const cursorDelegationByTask = new Map<string, StartTaskInput["delegation"]>();
 /** The model and effort last applied to each Cursor session, to skip redundant protocol calls. */
@@ -2024,42 +2136,68 @@ async function refreshCursorModelParams(taskId?: string): Promise<void> {
     const response = await nativeInvoke<unknown>("acp_list_cursor_models", { taskId });
     const params = extractCursorModelParams(response);
     if (params.size > 0) cursorModelParams = params;
+    const catalog = extractCursorExtensionCatalog(response);
+    mergeCursorModelParams(catalog, params);
+    if (catalog.length > 0) modelCatalogCache.set("cursor", catalog);
   } catch {
     // Older cursor-agent builds without the extension RPC.
+  }
+}
+
+async function certifyAcpSession(taskId: string, runtime: "cursor" | "grok"): Promise<void> {
+  try {
+    const capabilities = await nativeInvoke<NativeAcpSessionCapabilities>(
+      "acp_session_capabilities",
+      { taskId },
+    );
+    acpSessionCertification.set(runtime, capabilities);
+  } catch {
+    acpSessionCertification.delete(runtime);
   }
 }
 
 async function ensureCursorSessionForTaskUnlocked(
   taskId: string,
   delegation?: StartTaskInput["delegation"],
+  permission?: StartTaskInput["permission"],
 ): Promise<string> {
   const nativeTaskId = await ensureNativeTask(taskId);
   const cwd = repositoryForTask(taskId);
   const delegationMode = delegation ?? "off";
   try {
-    if (
-      !cursorConnectedTasks.has(nativeTaskId) ||
-      activeAcpProviderByTask.get(nativeTaskId) !== "cursor"
-    ) {
-      await nativeInvoke("acp_connect", {
-        provider: "cursor",
-        workingDirectory: cwd,
-        taskId: nativeTaskId,
-      });
-      resetGrokConnectionState(nativeTaskId);
-      cursorConnectedTasks.add(nativeTaskId);
-      activeAcpProviderByTask.set(nativeTaskId, "cursor");
-      clearCursorSessionCaches(nativeTaskId);
-    }
+    await ensureCursorConnectionUnlocked(nativeTaskId, cwd);
     if (
       !cursorSessionByTask.has(nativeTaskId) ||
       cursorDelegationByTask.get(nativeTaskId) !== delegationMode
     ) {
-      const session = await nativeInvoke<unknown>("acp_start_session", {
-        taskId: nativeTaskId,
-        cwd,
-        delegation: delegationMode,
-      });
+      const saved = providerResumeByTask.get(nativeTaskId);
+      const resumable =
+        saved?.provider === "cursor" &&
+        saved.repositoryRoot === cwd &&
+        saved.delegation === delegationMode;
+      const session = resumable
+        ? await nativeInvoke<unknown>("acp_resume_session", {
+            taskId: nativeTaskId,
+            cwd,
+          })
+        : await nativeInvoke<unknown>("acp_start_session", {
+            taskId: nativeTaskId,
+            cwd,
+            delegation: delegationMode,
+            permission,
+          });
+      const sessionId = extractSessionId(session);
+      if (sessionId) {
+        providerResumeByTask.set(nativeTaskId, {
+          taskId: nativeTaskId,
+          provider: "cursor",
+          sessionRef: sessionId,
+          repositoryRoot: cwd,
+          permission: permission ?? "project-write",
+          delegation: delegationMode,
+          updatedAt: new Date().toISOString(),
+        });
+      }
       cursorSessionByTask.add(nativeTaskId);
       cursorDelegationByTask.set(nativeTaskId, delegationMode);
       cursorAppliedSelection.delete(nativeTaskId);
@@ -2075,12 +2213,32 @@ async function ensureCursorSessionForTaskUnlocked(
   }
 }
 
+async function ensureCursorConnectionUnlocked(nativeTaskId: string, cwd: string): Promise<void> {
+  if (
+    cursorConnectedTasks.has(nativeTaskId) &&
+    activeAcpProviderByTask.get(nativeTaskId) === "cursor"
+  ) {
+    return;
+  }
+  await nativeInvoke("acp_connect", {
+    provider: "cursor",
+    workingDirectory: cwd,
+    taskId: nativeTaskId,
+  });
+  await certifyAcpSession(nativeTaskId, "cursor");
+  resetGrokConnectionState(nativeTaskId);
+  cursorConnectedTasks.add(nativeTaskId);
+  activeAcpProviderByTask.set(nativeTaskId, "cursor");
+  clearCursorSessionCaches(nativeTaskId);
+}
+
 async function ensureCursorSessionForTask(
   taskId: string,
   delegation?: StartTaskInput["delegation"],
+  permission?: StartTaskInput["permission"],
 ): Promise<string> {
   const operation = cursorSessionQueue.then(() =>
-    ensureCursorSessionForTaskUnlocked(taskId, delegation),
+    ensureCursorSessionForTaskUnlocked(taskId, delegation, permission),
   );
   cursorSessionQueue = operation.then(
     () => undefined,
@@ -2090,7 +2248,7 @@ async function ensureCursorSessionForTask(
 }
 
 async function ensureCursorSession(input: SendTurnInput): Promise<string> {
-  return ensureCursorSessionForTask(input.taskId, input.delegation);
+  return ensureCursorSessionForTask(input.taskId, input.delegation, input.permission);
 }
 
 async function ensureGrokSession(input: SendTurnInput): Promise<string> {
@@ -2105,6 +2263,7 @@ async function ensureGrokSession(input: SendTurnInput): Promise<string> {
       workingDirectory: cwd,
       taskId: nativeTaskId,
     });
+    await certifyAcpSession(nativeTaskId, "grok");
     resetCursorConnectionState(nativeTaskId);
     grokConnectedTasks.add(nativeTaskId);
     activeAcpProviderByTask.set(nativeTaskId, "grok");
@@ -2114,11 +2273,34 @@ async function ensureGrokSession(input: SendTurnInput): Promise<string> {
     !grokSessionByTask.has(nativeTaskId) ||
     grokDelegationByTask.get(nativeTaskId) !== input.delegation
   ) {
-    await nativeInvoke("acp_start_session", {
-      taskId: nativeTaskId,
-      cwd,
-      delegation: input.delegation,
-    });
+    const saved = providerResumeByTask.get(nativeTaskId);
+    const resumable =
+      saved?.provider === "grok" &&
+      saved.repositoryRoot === cwd &&
+      saved.delegation === input.delegation;
+    const session = resumable
+      ? await nativeInvoke<unknown>("acp_resume_session", {
+          taskId: nativeTaskId,
+          cwd,
+        })
+      : await nativeInvoke<unknown>("acp_start_session", {
+          taskId: nativeTaskId,
+          cwd,
+          delegation: input.delegation,
+          permission: input.permission,
+        });
+    const sessionId = extractSessionId(session);
+    if (sessionId) {
+      providerResumeByTask.set(nativeTaskId, {
+        taskId: nativeTaskId,
+        provider: "grok",
+        sessionRef: sessionId,
+        repositoryRoot: cwd,
+        permission: input.permission,
+        delegation: input.delegation,
+        updatedAt: new Date().toISOString(),
+      });
+    }
     grokSessionByTask.add(nativeTaskId);
     grokDelegationByTask.set(nativeTaskId, input.delegation);
   }
@@ -2212,9 +2394,27 @@ const ANTIGRAVITY_CATALOG: ModelCatalogEntry[] = [
     id: "Gemini 3.5 Flash",
     label: "Gemini 3.5 Flash",
     efforts: [
+      { id: "low", label: "Low" },
       { id: "medium", label: "Medium" },
       { id: "high", label: "High" },
     ],
+    defaultEffort: "medium",
+  },
+  // Third-party models agy proxies. "(Thinking)" is part of the literal model
+  // name in agy's registry, not a reasoning level, so those ids carry the
+  // suffix verbatim and expose no effort picker.
+  {
+    id: "Claude Sonnet 4.6 (Thinking)",
+    label: "Claude Sonnet 4.6 (Thinking)",
+  },
+  {
+    id: "Claude Opus 4.6 (Thinking)",
+    label: "Claude Opus 4.6 (Thinking)",
+  },
+  {
+    id: "GPT-OSS 120B",
+    label: "GPT-OSS 120B",
+    efforts: [{ id: "medium", label: "Medium" }],
     defaultEffort: "medium",
   },
 ];
@@ -2254,7 +2454,17 @@ async function loadModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]
     try {
       const snapshot = cachedWorkspace ?? readDemoSnapshot();
       if (snapshot.activeTaskId) {
-        await ensureCursorSessionForTask(snapshot.activeTaskId);
+        const nativeTaskId = await ensureNativeTask(snapshot.activeTaskId);
+        const cwd = repositoryForTask(snapshot.activeTaskId);
+        const operation = cursorSessionQueue.then(async () => {
+          await ensureCursorConnectionUnlocked(nativeTaskId, cwd);
+          await refreshCursorModelParams(nativeTaskId);
+        });
+        cursorSessionQueue = operation.then(
+          () => undefined,
+          () => undefined,
+        );
+        await operation;
         const catalog = modelCatalogCache.get("cursor");
         if (catalog?.length) return catalog;
       } else if (!cursorCatalogConnected) {
@@ -2373,6 +2583,17 @@ async function startNewCodexThread(
   codexDelegationByTask.set(nativeTaskId, input.delegation);
   codexDelegationByTask.set(input.taskId, input.delegation);
   activeCodexThreads.add(threadId);
+  const resumeState: NativeProviderResumeState = {
+    taskId: nativeTaskId,
+    provider: "codex",
+    sessionRef: threadId,
+    repositoryRoot: cwd,
+    permission: input.permission,
+    delegation: input.delegation,
+    updatedAt: new Date().toISOString(),
+  };
+  providerResumeByTask.set(nativeTaskId, resumeState);
+  providerRouteByTask.set(nativeTaskId, resumeState);
   return threadId;
 }
 
@@ -2939,6 +3160,45 @@ export const bridge: AppBridge = {
     return readDemoSnapshot().projects;
   },
 
+  removeProject: async (projectId, options) => {
+    const deleteFiles = Boolean(options?.deleteFiles);
+    if (isTauri()) {
+      await nativeInvoke("project_remove", { projectId, deleteFiles });
+      nativeProjectById.delete(projectId);
+      repositoryByProjectId.delete(projectId);
+      if (cachedWorkspace) {
+        cachedWorkspace = {
+          ...cachedWorkspace,
+          projects: cachedWorkspace.projects.filter((item) => item.id !== projectId),
+          tasks: cachedWorkspace.tasks.filter((task) => task.projectId !== projectId),
+        };
+      }
+      return;
+    }
+    const snapshot = cachedWorkspace ?? readDemoSnapshot();
+    const project = snapshot.projects.find((item) => item.id === projectId);
+    if (!project) throw new Error(`Project ${projectId} was not found.`);
+    const remainingProjects = snapshot.projects.filter((item) => item.id !== projectId);
+    const remainingTasks = snapshot.tasks.filter((task) => task.projectId !== projectId);
+    const next: WorkspaceSnapshot = {
+      ...snapshot,
+      projects: remainingProjects,
+      tasks: remainingTasks,
+      activeProjectId:
+        snapshot.activeProjectId === projectId
+          ? (remainingProjects[0]?.id ?? "")
+          : snapshot.activeProjectId,
+      activeTaskId: snapshot.tasks.some(
+        (task) => task.id === snapshot.activeTaskId && task.projectId === projectId,
+      )
+        ? (remainingTasks.find((task) => task.projectId === remainingProjects[0]?.id)?.id ?? "")
+        : snapshot.activeTaskId,
+    };
+    writeDemoSnapshot(next);
+    cachedWorkspace = next;
+    void deleteFiles;
+  },
+
   pickContextAttachments: async () => {
     if (isTauri()) {
       const { open } = await import("@tauri-apps/plugin-dialog");
@@ -3174,6 +3434,49 @@ export const bridge: AppBridge = {
     };
     cachedWorkspace = next;
     writeDemoSnapshot(next);
+  },
+
+  removeTask: async (taskId) => {
+    if (isTauri()) {
+      const nativeTaskId = await ensureNativeTask(taskId);
+      await nativeInvoke("task_remove", { taskId: nativeTaskId });
+      if (cachedWorkspace) {
+        cachedWorkspace = {
+          ...cachedWorkspace,
+          tasks: cachedWorkspace.tasks.filter((task) => task.id !== taskId),
+          composerDrafts: cachedWorkspace.composerDrafts.filter(
+            (draft) => draft.owner.kind !== "task" || draft.owner.taskId !== taskId,
+          ),
+          queuedMessages: cachedWorkspace.queuedMessages.filter(
+            (message) => message.taskId !== taskId,
+          ),
+        };
+      }
+      return;
+    }
+    const snapshot = cachedWorkspace ?? readDemoSnapshot();
+    const remainingTasks = snapshot.tasks.filter((task) => task.id !== taskId);
+    const next: WorkspaceSnapshot = {
+      ...snapshot,
+      tasks: remainingTasks,
+      activeTaskId:
+        snapshot.activeTaskId === taskId
+          ? (remainingTasks.find(
+              (task) =>
+                task.projectId ===
+                  (snapshot.tasks.find((item) => item.id === taskId)?.projectId ??
+                    snapshot.activeProjectId) && !task.archived,
+            )?.id ??
+            remainingTasks[0]?.id ??
+            "")
+          : snapshot.activeTaskId,
+      composerDrafts: snapshot.composerDrafts.filter(
+        (draft) => draft.owner.kind !== "task" || draft.owner.taskId !== taskId,
+      ),
+      queuedMessages: snapshot.queuedMessages.filter((message) => message.taskId !== taskId),
+    };
+    writeDemoSnapshot(next);
+    cachedWorkspace = next;
   },
 
   enqueueMessage: async (input) => {
@@ -3764,26 +4067,42 @@ export const bridge: AppBridge = {
 
   sendTurn: async (input) => {
     if (isTauri()) {
-      if (input.runtime === "codex") {
-        const nativeTaskId = await ensureNativeTask(input.taskId);
+      const resumeTaskId = nativeTaskIds.get(input.taskId) ?? input.taskId;
+      const savedResume = input.resumeInterrupted
+        ? providerResumeByTask.get(resumeTaskId)
+        : undefined;
+      const savedRoute = input.resumeInterrupted
+        ? (savedResume ?? providerRouteByTask.get(resumeTaskId))
+        : undefined;
+      const routedInput: SendTurnInput =
+        savedRoute && mapStoredRuntime(savedRoute.provider) === input.runtime
+        ? {
+            ...input,
+            permission: savedRoute.permission,
+            delegation: savedRoute.delegation,
+          }
+        : input;
+      if (routedInput.runtime === "codex") {
+        const nativeTaskId = await ensureNativeTask(routedInput.taskId);
         let threadId: string | undefined;
         const startTurn = async (targetThreadId: string) =>
           nativeInvoke("codex_start_turn", {
             taskId: nativeTaskId,
             threadId: targetThreadId,
-            prompt: input.prompt,
-            repository: repositoryForTask(input.taskId),
-            nativeActionId: input.nativeActionId,
-            delegation: input.delegation,
+            prompt: routedInput.prompt,
+            repository: repositoryForTask(routedInput.taskId),
+            nativeActionId: routedInput.nativeActionId,
+            delegation: routedInput.delegation,
+            resumeInterrupted: routedInput.resumeInterrupted,
           });
         try {
-          threadId = await ensureCodexThread(input);
+          threadId = await ensureCodexThread(routedInput);
           try {
             await startTurn(threadId);
           } catch (error) {
             if (!isMissingCodexThreadError(error)) throw error;
-            forgetCodexThread(input.taskId, nativeTaskId, threadId);
-            threadId = await ensureCodexThread(input);
+            forgetCodexThread(routedInput.taskId, nativeTaskId, threadId);
+            threadId = await ensureCodexThread(routedInput);
             await startTurn(threadId);
           }
         } catch (error) {
@@ -3793,49 +4112,60 @@ export const bridge: AppBridge = {
           }
           throw error;
         }
-      } else if (input.runtime === "cursor") {
+      } else if (routedInput.runtime === "cursor") {
         try {
-          const taskId = await ensureCursorSession(input);
-          await applyCursorSelection(taskId, input);
+          const taskId = await ensureCursorSession(routedInput);
+          await applyCursorSelection(taskId, routedInput);
           await nativeInvoke("acp_send_turn", {
             taskId,
-            prompt: input.prompt,
-            delegation: input.delegation,
-            nativeActionId: input.nativeActionId,
+            prompt: routedInput.prompt,
+            delegation: routedInput.delegation,
+            nativeActionId: routedInput.nativeActionId,
+            resumeInterrupted: routedInput.resumeInterrupted,
           });
         } catch (error) {
-          resetCursorConnectionState(input.taskId);
+          resetCursorConnectionState(routedInput.taskId);
           throw error;
         }
-      } else if (input.runtime === "grok") {
+      } else if (routedInput.runtime === "grok") {
         try {
-          const taskId = await ensureGrokSession(input);
+          const taskId = await ensureGrokSession(routedInput);
           await nativeInvoke("acp_send_turn", {
             taskId,
-            prompt: input.prompt,
-            delegation: input.delegation,
-            nativeActionId: input.nativeActionId,
+            prompt: routedInput.prompt,
+            delegation: routedInput.delegation,
+            nativeActionId: routedInput.nativeActionId,
+            resumeInterrupted: routedInput.resumeInterrupted,
           });
         } catch (error) {
-          resetGrokConnectionState(input.taskId);
+          resetGrokConnectionState(routedInput.taskId);
           throw error;
         }
-      } else if (input.runtime === "claude" || input.runtime === "antigravity") {
-        const taskId = await ensureNativeTask(input.taskId);
+      } else if (routedInput.runtime === "claude" || routedInput.runtime === "antigravity") {
+        const taskId = await ensureNativeTask(routedInput.taskId);
         await nativeInvoke("structured_cli_start_turn", {
           taskId,
-          provider: input.runtime,
-          cwd: repositoryForTask(input.taskId),
-          model: realModelId(input.model),
-          effort: input.effort,
-          permission: input.permission,
-          prompt: input.prompt,
-          delegation: input.delegation,
-          nativeActionId: input.nativeActionId,
+          provider: routedInput.runtime,
+          cwd: repositoryForTask(routedInput.taskId),
+          model: realModelId(routedInput.model),
+          effort: routedInput.effort,
+          permission: routedInput.permission,
+          prompt: routedInput.prompt,
+          delegation: routedInput.delegation,
+          nativeActionId: routedInput.nativeActionId,
+          resumeInterrupted: routedInput.resumeInterrupted,
         });
       } else {
-        throw new Error(`${input.runtime} turn execution is not implemented by the native backend`);
+        throw new Error(
+          `${routedInput.runtime} turn execution is not implemented by the native backend`,
+        );
       }
+      const routedTaskId = nativeTaskIds.get(routedInput.taskId) ?? routedInput.taskId;
+      providerRouteByTask.set(routedTaskId, {
+        provider: routedInput.runtime,
+        permission: routedInput.permission,
+        delegation: routedInput.delegation,
+      });
     }
     const event: TranscriptEvent = {
       id: `event-${Date.now()}`,

@@ -134,6 +134,27 @@ pub enum ProviderTransport {
     ExternalApplication,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCapabilities {
+    pub session_resume: bool,
+    pub authoritative_history: bool,
+    pub structured_tool_events: bool,
+    pub hooks: bool,
+    pub sandboxed_workspace: bool,
+    pub subscription_auth: bool,
+    pub skills: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProviderCertification {
+    Certified,
+    SessionProbeRequired,
+    #[default]
+    Uncertified,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderStatus {
@@ -144,6 +165,10 @@ pub struct ProviderStatus {
     pub authentication: AuthenticationState,
     pub transport: Option<ProviderTransport>,
     pub diagnostic_code: Option<String>,
+    #[serde(default)]
+    pub capabilities: ProviderCapabilities,
+    #[serde(default)]
+    pub certification: ProviderCertification,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -285,6 +310,20 @@ pub struct RuntimeSession {
     pub ended_at: Option<DateTime<Utc>>,
 }
 
+/// Durable provider-owned conversation identity plus the exact local scope
+/// required to reconnect it after an app or provider-process restart.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderResumeState {
+    pub task_id: TaskId,
+    pub provider: ProviderKind,
+    pub session_ref: String,
+    pub repository_root: PathBuf,
+    pub permission: String,
+    pub delegation: String,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalExport {
@@ -295,6 +334,8 @@ pub struct LocalExport {
     pub settings: Vec<Setting>,
     pub provider_sessions: Vec<ProviderSession>,
     pub runtime_sessions: Vec<RuntimeSession>,
+    #[serde(default)]
+    pub provider_resume_states: Vec<ProviderResumeState>,
     pub composer_drafts: Vec<ComposerDraft>,
     pub queued_messages: Vec<QueuedMessage>,
 }
@@ -460,6 +501,9 @@ pub enum DelegationStatus {
     /// Idle: the child settled a turn without completing and has no queued
     /// work. Nudges wake it back to `Running`.
     Waiting,
+    /// The child process/session was lost (app restart, crash, or transport
+    /// drop) before the assignment finished. Resume restores provider state.
+    Interrupted,
     Completed,
     Failed,
     Stopped,
@@ -475,6 +519,7 @@ impl DelegationStatus {
             Self::Starting => "starting",
             Self::Running => "running",
             Self::Waiting => "waiting",
+            Self::Interrupted => "interrupted",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Stopped => "stopped",
@@ -487,6 +532,12 @@ impl DelegationStatus {
     pub const fn is_active(&self) -> bool {
         matches!(self, Self::Starting | Self::Running | Self::Waiting)
     }
+
+    /// Process-owned work that cannot survive an Integrator restart.
+    #[must_use]
+    pub const fn is_process_owned(&self) -> bool {
+        matches!(self, Self::Starting | Self::Running)
+    }
 }
 
 impl FromStr for DelegationStatus {
@@ -498,6 +549,7 @@ impl FromStr for DelegationStatus {
             "starting" => Ok(Self::Starting),
             "running" => Ok(Self::Running),
             "waiting" => Ok(Self::Waiting),
+            "interrupted" => Ok(Self::Interrupted),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
             "stopped" => Ok(Self::Stopped),

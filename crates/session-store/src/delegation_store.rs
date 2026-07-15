@@ -530,6 +530,90 @@ impl LocalStore {
         result.sort_by_key(|entry| entry.1.created_at);
         Ok(result)
     }
+
+    pub fn delegation_for_child_task(&self, child_task_id: TaskId) -> Result<Option<Delegation>> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT {DELEGATION_COLUMNS} FROM delegations WHERE child_task_id = ?1 LIMIT 1"
+            ))
+            .map_err(storage_error)?;
+        statement
+            .query_row([child_task_id.to_string()], parse_delegation_row)
+            .optional()
+            .map_err(storage_error)?
+            .transpose()
+    }
+
+    /// Process-owned delegations left alive in SQLite after an app exit.
+    pub fn list_process_owned_delegations(&self) -> Result<Vec<Delegation>> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT {DELEGATION_COLUMNS} FROM delegations WHERE status IN ('starting', 'running') ORDER BY updated_at, id"
+            ))
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([], parse_delegation_row)
+            .map_err(storage_error)?;
+        rows.map(|row| row.map_err(storage_error)?).collect()
+    }
+
+    pub fn list_interrupted_delegations(&self) -> Result<Vec<Delegation>> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT {DELEGATION_COLUMNS} FROM delegations WHERE status = 'interrupted' ORDER BY updated_at, id"
+            ))
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([], parse_delegation_row)
+            .map_err(storage_error)?;
+        rows.map(|row| row.map_err(storage_error)?).collect()
+    }
+
+    /// After Integrator restarts, no child provider process is alive. Settle
+    /// unfinished child turns, mark process-owned delegations interrupted, and
+    /// queue an orchestrator-visible recovery note. Returns affected parents.
+    pub fn recover_orphaned_delegations(&self) -> Result<Vec<TaskId>> {
+        let orphans = self.list_process_owned_delegations()?;
+        let mut parents = Vec::new();
+        for delegation in orphans {
+            if let Some(child_task_id) = delegation.child_task_id {
+                let _ = self.settle_interrupted_turn(child_task_id)?;
+                self.interrupt_process_owned_delegation(
+                    delegation.id,
+                    "Interrupted when Integrator restarted. Resume from the Agents panel or ask me to continue from the last safe boundary.",
+                )?;
+            } else {
+                // Never attached a child task: treat as failed setup, not resumeable.
+                let _ = self.set_delegation_result(
+                    delegation.id,
+                    DelegationStatus::Failed,
+                    "Subagent never started before Integrator exited.",
+                )?;
+            }
+            if !parents.iter().any(|id| *id == delegation.parent_task_id) {
+                parents.push(delegation.parent_task_id);
+            }
+        }
+        Ok(parents)
+    }
+
+    /// Mark a live/starting delegation interrupted and notify the orchestrator.
+    pub fn interrupt_process_owned_delegation(
+        &self,
+        id: DelegationId,
+        note: &str,
+    ) -> Result<Option<Delegation>> {
+        let delegation = self.get_delegation(id)?;
+        if !delegation.status.is_process_owned() {
+            return Ok(None);
+        }
+        let updated = self.update_delegation_status(id, DelegationStatus::Interrupted)?;
+        let _ = self.add_delegation_message(id, DelegationSender::Child, note)?;
+        Ok(Some(updated))
+    }
 }
 
 type DelegationRow = (
@@ -838,5 +922,82 @@ mod tests {
         let reopened = store.reopen_delegation(delegation.id).expect("reopen");
         assert_eq!(reopened.status, DelegationStatus::Running);
         assert_eq!(reopened.result, None);
+    }
+
+    #[test]
+    fn recover_orphaned_delegations_settles_process_owned_children() {
+        let (store, parent) = store_with_task();
+        let child = store
+            .create_task(NewTask {
+                title: "Child".into(),
+                repository_path: None,
+                worktree_path: None,
+                runtime: Some("codex".into()),
+                model: None,
+                effort: None,
+                parent_task_id: Some(parent),
+            })
+            .expect("create child");
+        let delegation = store
+            .create_delegation(new_delegation(parent))
+            .expect("create delegation");
+        store
+            .attach_delegation_child(delegation.id, child.id)
+            .expect("attach");
+        store
+            .update_delegation_status(delegation.id, DelegationStatus::Running)
+            .expect("running");
+        let binding = store
+            .create_runtime_binding(
+                child.id,
+                "child-process",
+                integrator_core::ProviderKind::Codex,
+            )
+            .and_then(|binding| store.attach_provider_thread(&binding, "child-thread"))
+            .expect("binding");
+        let at = Utc::now();
+        store
+            .apply_reduced_event(
+                &binding,
+                &integrator_runtime::ReducedProviderEvent {
+                    method: "turn/started".into(),
+                    thread_id: "child-thread".into(),
+                    turn_id: Some("child-turn".into()),
+                    audit_json: "{}".into(),
+                    audit_truncated: false,
+                    mutation: integrator_runtime::ProjectionMutation::Turn(
+                        integrator_core::TurnProjection {
+                            id: "child-turn".into(),
+                            status: integrator_core::TurnStatus::InProgress,
+                            stop_requested: false,
+                            error: None,
+                            started_at: Some(at),
+                            completed_at: None,
+                        },
+                    ),
+                    occurred_at: at,
+                },
+            )
+            .expect("start turn");
+
+        let parents = store
+            .recover_orphaned_delegations()
+            .expect("recover orphans");
+        assert_eq!(parents, vec![parent]);
+        let recovered = store.get_delegation(delegation.id).expect("delegation");
+        assert_eq!(recovered.status, DelegationStatus::Interrupted);
+        let notes = store
+            .undelivered_delegation_messages(delegation.id, false)
+            .expect("recovery notes");
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0]
+                .body
+                .contains("Interrupted when Integrator restarted")
+        );
+        let settled = store
+            .settle_interrupted_turn(child.id)
+            .expect("idempotent settle");
+        assert!(settled.is_none(), "turn already settled during recovery");
     }
 }

@@ -118,7 +118,7 @@ pub fn reduce_provider_event(input: ProviderEventInput) -> Result<Option<Reduced
         "item/started" | "item/completed" => {
             let item = input.params.get("item").unwrap_or(&input.params);
             let completed = method == "item/completed";
-            ProjectionMutation::ReplaceItem(parse_item(
+            let projection = parse_item(
                 &thread_id,
                 turn_id.as_deref().ok_or_else(|| {
                     integrator_core::IntegratorError::Protocol("item event missing turn id".into())
@@ -126,7 +126,16 @@ pub fn reduce_provider_event(input: ProviderEventInput) -> Result<Option<Reduced
                 item,
                 completed,
                 input.occurred_at,
-            )?)
+            )?;
+            if projection.kind == ItemKind::ReasoningSummary
+                && projection
+                    .body
+                    .as_deref()
+                    .is_none_or(|body| body.trim().is_empty())
+            {
+                return Ok(None);
+            }
+            ProjectionMutation::ReplaceItem(projection)
         }
         "item/agentMessage/delta" => ProjectionMutation::AppendItem {
             provider_item_id: required_string(&input.params, "itemId")?,
@@ -1270,6 +1279,29 @@ mod tests {
         .expect("accepted");
         assert!(event.audit_json.contains("Safe provider summary"));
         assert!(!event.audit_json.contains("Raw hidden chain of thought"));
+    }
+
+    #[test]
+    fn empty_codex_reasoning_items_do_not_create_transcript_rows() {
+        for method in ["item/started", "item/completed"] {
+            let event = reduce_provider_event(ProviderEventInput {
+                method: method.into(),
+                params: json!({
+                    "threadId": "th1",
+                    "turnId": "tu1",
+                    "item": {
+                        "type": "reasoning",
+                        "id": "reasoning-empty",
+                        "summary": [],
+                        "content": []
+                    }
+                }),
+                request_id: None,
+                occurred_at: Utc::now(),
+            })
+            .expect("reduce");
+            assert!(event.is_none(), "{method} should be ignored");
+        }
     }
 
     #[test]
