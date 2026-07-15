@@ -30,7 +30,7 @@ describe("AI Integrator desktop workspace", () => {
     );
     // No provider reports quota in the demo snapshot: the pill shows tokens
     // only instead of a dead "—%".
-    const usagePill = screen.getByTitle(/Subscription usage unavailable/);
+    const usagePill = screen.getByTitle(/Plan usage not exposed/);
     expect(usagePill).not.toHaveTextContent("%");
     expect(usagePill).toHaveTextContent("tokens");
     expect(screen.getByPlaceholderText("Commit message")).toBeInTheDocument();
@@ -65,8 +65,12 @@ describe("AI Integrator desktop workspace", () => {
     expect(appRoot).toHaveAttribute("data-sidebar-visible", "true");
     expect(appRoot).toHaveAttribute("data-rail-visible", "true");
 
+    const viewMenu = screen.getByRole("button", { name: "View" }).closest(".titlebar-menu-group");
+    const sidebarToggle = screen.getByRole("button", { name: "Close chat navigation" });
+    expect(viewMenu?.nextElementSibling).toBe(sidebarToggle);
+
     // Collapse fully unmounts each panel once the slide-out animation ends.
-    fireEvent.click(screen.getByRole("button", { name: "Close chat navigation" }));
+    fireEvent.click(sidebarToggle);
     await waitFor(() =>
       expect(
         screen.queryByRole("complementary", { name: "Chat navigation" }),
@@ -81,7 +85,8 @@ describe("AI Integrator desktop workspace", () => {
     expect(appRoot).toHaveAttribute("data-rail-visible", "false");
 
     // The corner buttons stay put and bring each panel back.
-    fireEvent.click(screen.getByRole("button", { name: "Open chat navigation" }));
+    expect(screen.getByRole("button", { name: "Open chat navigation" })).toBe(sidebarToggle);
+    fireEvent.click(sidebarToggle);
     expect(
       await screen.findByRole("complementary", { name: "Chat navigation" }),
     ).toBeInTheDocument();
@@ -504,7 +509,8 @@ describe("AI Integrator desktop workspace", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Usage" }));
     expect(await screen.findByText("Local turns")).toBeInTheDocument();
     expect(screen.getByText("Input tokens (estimate)")).toBeInTheDocument();
-    expect(screen.getByText("Subscription usage")).toBeInTheDocument();
+    expect(screen.queryByText("API equivalent (estimate)")).not.toBeInTheDocument();
+    expect(screen.getByText("Plan telemetry not exposed")).toBeInTheDocument();
   });
 
   it("turns the top File, Edit, and View labels into workspace actions", async () => {

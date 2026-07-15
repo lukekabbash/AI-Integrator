@@ -105,12 +105,21 @@ fn text_schema(properties: Value, required: &[&str]) -> Value {
     json!({ "type": "object", "properties": properties, "required": required })
 }
 
+fn tool_annotations(read_only: bool, destructive: bool) -> Value {
+    json!({
+        "readOnlyHint": read_only,
+        "destructiveHint": destructive,
+        "openWorldHint": false,
+    })
+}
+
 fn tool_definitions(role: &str) -> Vec<Value> {
     match role {
         "child" => vec![
             json!({
                 "name": "task_complete",
                 "description": "Report that your delegated assignment is finished. The summary is your deliverable — include what you did, files touched, and caveats. Always call this exactly once when done.",
+                "annotations": tool_annotations(false, false),
                 "inputSchema": text_schema(json!({
                     "summary": { "type": "string", "description": "Concise deliverable summary for the orchestrator." }
                 }), &["summary"]),
@@ -118,6 +127,7 @@ fn tool_definitions(role: &str) -> Vec<Value> {
             json!({
                 "name": "orchestrator_ask",
                 "description": "Queue a question for the orchestrator that delegated this work. Asynchronous: the answer arrives in a later turn, so keep making progress on whatever does not depend on it.",
+                "annotations": tool_annotations(false, false),
                 "inputSchema": text_schema(json!({
                     "message": { "type": "string", "description": "Your question, with enough context to answer without seeing your transcript." }
                 }), &["message"]),
@@ -125,6 +135,7 @@ fn tool_definitions(role: &str) -> Vec<Value> {
             json!({
                 "name": "orchestrator_report",
                 "description": "Queue a progress note for the orchestrator on long-running work. Fire and forget.",
+                "annotations": tool_annotations(false, false),
                 "inputSchema": text_schema(json!({
                     "message": { "type": "string", "description": "Short progress update." }
                 }), &["message"]),
@@ -134,20 +145,23 @@ fn tool_definitions(role: &str) -> Vec<Value> {
             json!({
                 "name": "peers_list",
                 "description": "List the delegation profiles the user has enabled (other AI coding agents you may delegate subtasks to), with cost tiers and current concurrency headroom.",
+                "annotations": tool_annotations(true, false),
                 "inputSchema": text_schema(json!({}), &[]),
             }),
             json!({
                 "name": "delegate_start",
                 "description": "Delegate a self-contained subtask to a subagent on another provider. Fully asynchronous: returns a delegationId immediately while the subagent works in the background — continue your own work and check in later. The brief must stand alone: the subagent sees only recent conversation context plus your brief.",
+                "annotations": tool_annotations(false, false),
                 "inputSchema": text_schema(json!({
                     "profileId": { "type": "string", "description": "A profileId from peers_list." },
-                    "title": { "type": "string", "description": "Short label for the subtask (shown to the user)." },
+                    "title": { "type": "string", "description": "Short provisional label for the subtask. The app applies its subagent-number convention and may replace this with an automatically generated chat name." },
                     "brief": { "type": "string", "description": "Complete standalone instructions: goal, constraints, files, and the deliverable you expect back." }
                 }), &["profileId", "title", "brief"]),
             }),
             json!({
                 "name": "delegation_status",
                 "description": "Check on your delegated subagents: status, results, and any queued questions or reports from them. Omit delegationId to list all. Answer subagent questions with delegation_message.",
+                "annotations": tool_annotations(false, false),
                 "inputSchema": text_schema(json!({
                     "delegationId": { "type": "string", "description": "Optional: one delegation to inspect." }
                 }), &[]),
@@ -155,6 +169,7 @@ fn tool_definitions(role: &str) -> Vec<Value> {
             json!({
                 "name": "delegation_message",
                 "description": "Send guidance, corrections, or answers to a running subagent. Delivered when the subagent is idle — it never interrupts a turn in progress.",
+                "annotations": tool_annotations(false, false),
                 "inputSchema": text_schema(json!({
                     "delegationId": { "type": "string" },
                     "message": { "type": "string", "description": "Guidance or an answer to the subagent's question." }
@@ -163,6 +178,7 @@ fn tool_definitions(role: &str) -> Vec<Value> {
             json!({
                 "name": "delegation_result",
                 "description": "Fetch a delegation's deliverable: the subagent's reported summary plus a digest of its transcript.",
+                "annotations": tool_annotations(true, false),
                 "inputSchema": text_schema(json!({
                     "delegationId": { "type": "string" }
                 }), &["delegationId"]),
@@ -170,6 +186,7 @@ fn tool_definitions(role: &str) -> Vec<Value> {
             json!({
                 "name": "delegation_stop",
                 "description": "Stop a delegated subagent that is no longer needed.",
+                "annotations": tool_annotations(false, true),
                 "inputSchema": text_schema(json!({
                     "delegationId": { "type": "string" }
                 }), &["delegationId"]),
@@ -320,5 +337,27 @@ mod tests {
             .collect();
         assert!(child.contains(&"task_complete".to_owned()));
         assert!(!child.contains(&"delegate_start".to_owned()));
+    }
+
+    #[test]
+    fn tool_annotations_match_broker_side_effects() {
+        let orchestrator = tool_definitions("orchestrator");
+        let annotation = |name: &str, key: &str| {
+            orchestrator
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .and_then(|tool| tool["annotations"][key].as_bool())
+        };
+
+        assert_eq!(annotation("peers_list", "readOnlyHint"), Some(true));
+        assert_eq!(annotation("delegation_result", "readOnlyHint"), Some(true));
+        assert_eq!(annotation("delegation_status", "readOnlyHint"), Some(false));
+        assert_eq!(annotation("delegate_start", "readOnlyHint"), Some(false));
+        assert_eq!(annotation("delegation_stop", "destructiveHint"), Some(true));
+        assert!(
+            orchestrator
+                .iter()
+                .all(|tool| { tool["annotations"]["openWorldHint"].as_bool() == Some(false) })
+        );
     }
 }

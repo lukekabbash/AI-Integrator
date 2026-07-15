@@ -291,6 +291,11 @@ function describeQuotaWindow(window?: SubscriptionWindow): string {
   return `${Math.round(mins / 1440)}-day window`;
 }
 
+function formatCostEstimate(usd: number): string {
+  if (usd > 0 && usd < 0.0001) return "<$0.0001";
+  return `$${usd.toFixed(usd < 0.01 ? 4 : 2)}`;
+}
+
 function storedDimension(key: string, fallback: number, minimum: number, maximum: number): number {
   if (typeof window === "undefined") return fallback;
   const parsed = Number(window.localStorage.getItem(key));
@@ -533,6 +538,7 @@ function NativeTitlebar({
               </div>
             ) : null}
           </div>
+          {leading}
         </div>
         {title ? (
           <motion.div
@@ -546,7 +552,6 @@ function NativeTitlebar({
               },
             }}
           >
-            {leading}
             <div className="titlebar-heading">
               <h1>
                 {onTitleSelect ? (
@@ -3541,38 +3546,57 @@ export default function App() {
     [activeTask, snapshot.queuedMessages],
   );
   const runtimeUsage = runtimeState?.usage;
+  const tokenBreakdown = runtimeUsage
+    ? [
+        ["Input", runtimeUsage.inputTokens],
+        ["Cache read", runtimeUsage.cachedInputTokens],
+        ["Output", runtimeUsage.outputTokens],
+        ["Reasoning", runtimeUsage.reasoningOutputTokens],
+      ]
+        .filter(([, value]) => Number(value) > 0)
+        .map(([label, value]) => `${label} ${Number(value).toLocaleString()}`)
+        .join(" · ")
+    : "";
+  const nonCostUsageMetrics = snapshot.usage.metrics.filter(
+    (metric) =>
+      metric.label !== "API equivalent (vendor)" &&
+      metric.label !== "API equivalent (estimate)" &&
+      metric.label !== "API cost estimate",
+  );
   const displayedUsage = runtimeUsage
     ? {
         ...snapshot.usage,
         tokens: runtimeUsage.totalTokens,
         metrics: [
-          {
-            label: "Tokens",
-            value: runtimeUsage.totalTokens.toLocaleString(),
-            numeric: runtimeUsage.totalTokens,
-            provenance: "vendor_exact" as const,
-            detail: "Persisted provider turn usage",
-          },
-          ...(runtimeUsage.vendorCostMicroUsd !== undefined
+          ...(runtimeUsage.totalTokens > 0
             ? [
                 {
-                  label: "API equivalent (vendor)",
-                  value: `$${(runtimeUsage.vendorCostMicroUsd / 1_000_000).toFixed(4)}`,
-                  numeric: runtimeUsage.vendorCostMicroUsd / 1_000_000,
-                  provenance: "estimated" as const,
-                  detail: "Provider-reported API-equivalent cost estimate; not a vendor bill.",
+                  label: "Processed tokens",
+                  value: runtimeUsage.totalTokens.toLocaleString(),
+                  numeric: runtimeUsage.totalTokens,
+                  provenance: "vendor_exact" as const,
+                  detail: `${activeTask ? runtimeLabel(activeTask.runtime) : "Provider"} reported this cumulative task total.${tokenBreakdown ? ` ${tokenBreakdown}.` : ""} It is not plan usage or a bill.`,
                 },
               ]
             : []),
-          ...snapshot.usage.metrics.filter(
-            (metric) =>
-              metric.label !== "Tokens" &&
-              (runtimeUsage.vendorCostMicroUsd === undefined ||
-                metric.label !== "API equivalent (estimate)"),
+          ...(runtimeUsage.vendorCostMicroUsd !== undefined && runtimeUsage.vendorCostMicroUsd > 0
+            ? [
+                {
+                  label: "API cost estimate",
+                  value: formatCostEstimate(runtimeUsage.vendorCostMicroUsd / 1_000_000),
+                  numeric: runtimeUsage.vendorCostMicroUsd / 1_000_000,
+                  provenance: "estimated" as const,
+                  detail:
+                    "The Claude CLI computes this locally from token counts. It is not a bill or subscription usage.",
+                },
+              ]
+            : []),
+          ...nonCostUsageMetrics.filter(
+            (metric) => metric.label !== "Tokens" && metric.label !== "Processed tokens",
           ),
         ],
       }
-    : snapshot.usage;
+    : { ...snapshot.usage, metrics: nonCostUsageMetrics };
   // The header pill prefers per-task vendor telemetry, then the provider's
   // account-level quota windows. When neither exists the percent is omitted
   // entirely — a dead "—%" reads as broken rather than unavailable.
@@ -3587,7 +3611,7 @@ export default function App() {
             ? `, resets ${new Date(quotaWindow.resetsAt * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
             : ""
         } · ${usagePillTokens}`
-      : `Subscription usage unavailable — this provider does not report it · ${usagePillTokens}`;
+      : `Plan usage not exposed to AI Integrator · ${usagePillTokens}`;
   const activeRuntimeState = runtimeState?.taskId === activeTask?.id ? runtimeState : undefined;
   const activeAgentCount = nativeTurnRunning
     ? 1 +
@@ -4167,7 +4191,7 @@ export default function App() {
               <SettingsView
                 preferences={preferences}
                 runtimes={snapshot.runtimes}
-                usage={snapshot.usage}
+                usage={displayedUsage}
                 onChangePreferences={setTheme}
                 onResetPreferences={resetTheme}
                 runtimeActionRequest={runtimeActionRequest}
@@ -4708,6 +4732,8 @@ export default function App() {
                           await refreshDelegations(activeTaskIdRef.current);
                         }}
                         usage={displayedUsage}
+                        runtime={activeTask?.runtime}
+                        subscription={activeQuota}
                         activeFile={activeFile}
                         projectId={activeProject?.id}
                         projectFiles={projectFiles}

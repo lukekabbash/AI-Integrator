@@ -176,8 +176,10 @@ describe("RightRail", () => {
         runtime: "claude",
         model: "claude-fable-5",
         title: "Audit the interaction",
-        brief: "Review the flow.",
-        status: "running",
+        brief:
+          "Review the complete interaction flow and report only the highest-impact selection issues.",
+        status: "completed",
+        result: "A very long completed audit that belongs in the conversation pane, not the rail.",
         createdAt: "2026-07-12T10:00:00Z",
         updatedAt: "2026-07-12T10:01:00Z",
         unreadFromChild: 0,
@@ -205,6 +207,7 @@ describe("RightRail", () => {
     setup({ delegations, onNudgeDelegation, onSelectDelegation });
 
     fireEvent.click(screen.getByRole("tab", { name: /Agents/ }));
+    expect(screen.getByRole("tab", { name: /Agents\s*2/ })).toBeInTheDocument();
     const lineage = screen.getByRole("tree", { name: "Subagent lineage" });
     expect(lineage).toBeInTheDocument();
     expect(screen.getByRole("treeitem", { name: /Audit the interaction/ })).toHaveAttribute(
@@ -220,6 +223,16 @@ describe("RightRail", () => {
     expect(onSelectDelegation).toHaveBeenCalledWith("delegation-root");
     expect(screen.queryByRole("button", { name: /View transcript/i })).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Audit the interaction transcript")).not.toBeInTheDocument();
+    expect(
+      screen.getByTitle(
+        "Review the complete interaction flow and report only the highest-impact selection issues.",
+      ),
+    ).toHaveClass("agent-activity");
+    expect(
+      screen.queryByText(
+        "A very long completed audit that belongs in the conversation pane, not the rail.",
+      ),
+    ).not.toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /^Git/ })).toBeInTheDocument();
   });
 
@@ -251,6 +264,7 @@ describe("RightRail", () => {
     const onSelectDelegation = vi.fn();
     setup({ delegations, onSelectDelegation });
 
+    expect(screen.getByRole("tab", { name: /Agents\s*12/ })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("tab", { name: /Agents/ }));
     const tree = screen.getByRole("tree", { name: "Subagent lineage" });
     const glyphs = Array.from(tree.querySelectorAll<HTMLElement>(".agent-glyph"));
@@ -260,6 +274,11 @@ describe("RightRail", () => {
     expect(glyphs[10]).toHaveAttribute("data-agent-icon", glyphs[0]!.dataset.agentIcon);
     expect(glyphs[0]).toHaveAttribute("data-shade", "0");
     expect(glyphs[10]).toHaveAttribute("data-shade", "1");
+    expect(glyphs[0]).toHaveAttribute("data-morphing", "true");
+    expect(glyphs[0]).toHaveAttribute("data-morph-frames", "4");
+    expect(glyphs[1]).toHaveAttribute("data-morph-frames", "5");
+    expect(glyphs[3]).toHaveAttribute("data-morphing", "false");
+    expect(glyphs[3]).toHaveAttribute("data-morph-frames", "1");
     expect(tree.querySelectorAll(".agent-route .provider-icon")).toHaveLength(12);
     expect(screen.getAllByText("gpt-5.6-codex")).toHaveLength(12);
 
@@ -352,15 +371,36 @@ describe("RightRail", () => {
   });
 
   it("marks unavailable vendor plan data instead of inventing a plan percentage", () => {
-    setup();
+    setup({ runtime: "claude" });
     fireEvent.click(screen.getByRole("tab", { name: "Usage" }));
 
-    expect(screen.getByText("Vendor plan unavailable")).toBeInTheDocument();
-    expect(screen.getByText("Subscription usage").parentElement).toHaveTextContent("Unavailable");
+    expect(screen.getByText("Plan telemetry not exposed")).toBeInTheDocument();
+    expect(screen.getByText(/run \/usage/i)).toBeInTheDocument();
+    expect(screen.queryByText("Subscription usage")).not.toBeInTheDocument();
     expect(screen.getByText("Local turns").parentElement).toHaveTextContent("local observed");
     expect(screen.getByText("Input tokens (estimate)").parentElement).toHaveTextContent(
       "estimated",
     );
+  });
+
+  it("shows every provider-reported Codex plan window without collapsing them", () => {
+    setup({
+      runtime: "codex",
+      subscription: {
+        planType: "pro",
+        primary: { usedPercent: 34, windowDurationMins: 300, resetsAt: 1_900_000_000 },
+        secondary: { usedPercent: 8, windowDurationMins: 10_080, resetsAt: 1_900_500_000 },
+        updatedAt: "2026-07-14T12:00:00Z",
+      },
+    });
+    fireEvent.click(screen.getByRole("tab", { name: "Usage" }));
+
+    expect(screen.getByText("5-hour limit")).toBeInTheDocument();
+    expect(screen.getByText("Weekly limit")).toBeInTheDocument();
+    expect(screen.getByText("34% used")).toBeInTheDocument();
+    expect(screen.getByText("8% used")).toBeInTheDocument();
+    expect(screen.getAllByRole("progressbar")).toHaveLength(2);
+    expect(screen.queryByText("Plan telemetry not exposed")).not.toBeInTheDocument();
   });
 
   it("commits with Ctrl+Enter and exposes failures instead of reporting fake success", async () => {
@@ -591,8 +631,9 @@ describe("RightRail", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("keeps live delegation actions compact and leaves messaging to the transcript pane", async () => {
+  it("keeps live delegation actions compact and nudges the selected subagent from the rail", async () => {
     const onApproveDelegation = vi.fn().mockResolvedValue(undefined);
+    const onNudgeDelegation = vi.fn().mockResolvedValue(undefined);
     setup({
       delegations: [
         {
@@ -630,16 +671,28 @@ describe("RightRail", () => {
           pendingQuestions: ["Should I include style nits?"],
         },
       ],
+      selectedDelegationId: "delegation-2",
       onApproveDelegation,
+      onNudgeDelegation,
     });
 
     fireEvent.click(screen.getByRole("tab", { name: /^Agents/ }));
     expect(screen.getByText("Write reducer tests")).toBeInTheDocument();
-    expect(screen.getByText("Should I include style nits?", { exact: false })).toBeInTheDocument();
+    expect(screen.getByText("Should I include style nits?")).toBeInTheDocument();
+    expect(screen.queryByText(/❓/)).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
     await waitFor(() => expect(onApproveDelegation).toHaveBeenCalledWith("delegation-1"));
-    expect(screen.queryByPlaceholderText("Nudge this subagent…")).not.toBeInTheDocument();
+    const nudge = screen.getByPlaceholderText("Nudge this subagent…");
+    fireEvent.change(nudge, { target: { value: "Focus on behavior, not style nits." } });
+    fireEvent.click(screen.getByRole("button", { name: "Send nudge to Review the diff" }));
+    await waitFor(() =>
+      expect(onNudgeDelegation).toHaveBeenCalledWith(
+        "delegation-2",
+        "Focus on behavior, not style nits.",
+      ),
+    );
+    expect(nudge).toHaveValue("");
   });
 
   it("supports arrow-key navigation across rail tabs", () => {

@@ -1814,8 +1814,8 @@ function providerUsageLabel(provider: ProviderUsageSummary["provider"]): string 
 }
 
 function formatEstimatedCost(usd: number): string {
-  if (usd > 0 && usd < 0.01) return "<$0.01";
-  return `$${usd.toFixed(2)}`;
+  if (usd > 0 && usd < 0.0001) return "<$0.0001";
+  return `$${usd.toFixed(usd < 0.01 ? 4 : 2)}`;
 }
 
 /** Labels a rate-limit window by its provider-reported duration; the labels
@@ -1966,9 +1966,7 @@ function UsageSettings({
         </span>
         <div>
           <h1>Usage & budgets</h1>
-          <p>
-            Subscription pressure, tokens, equivalent API value, and actual charges stay separate.
-          </p>
+          <p>Plan limits, processed tokens, cost estimates, and actual charges stay separate.</p>
         </div>
       </div>
       <section className="settings-section">
@@ -2012,13 +2010,15 @@ function UsageSettings({
                   </strong>
                 </div>
                 <div className="settings-provider-stat">
-                  <span>Total tokens</span>
+                  <span>Processed tokens</span>
                   <strong>{formatTokens(row.totalTokens)}</strong>
                 </div>
                 <div className="settings-provider-stat">
-                  <span>API equivalent</span>
+                  <span>API cost estimate</span>
                   <strong>
-                    {row.estimatedCostUsd != null ? formatEstimatedCost(row.estimatedCostUsd) : "—"}
+                    {row.estimatedCostUsd != null && row.estimatedCostUsd > 0
+                      ? formatEstimatedCost(row.estimatedCostUsd)
+                      : "—"}
                   </strong>
                 </div>
                 <div className="settings-provider-stat">
@@ -2044,7 +2044,7 @@ function UsageSettings({
         )}
         {summary ? (
           <p className="settings-measured-note">
-            Measured {new Date(summary.measuredAt).toLocaleString()} · Output and subscription
+            Measured {new Date(summary.measuredAt).toLocaleString()} · Processed-token and plan
             totals are never inferred.
           </p>
         ) : message ? (

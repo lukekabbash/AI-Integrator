@@ -7,12 +7,14 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type FormEvent,
   type KeyboardEvent,
 } from "react";
 import { AnimatePresence, m as motion, useReducedMotion } from "motion/react";
 import {
   Activity,
   ArrowDown,
+  ArrowUp,
   AtSign,
   ChevronDown,
   ChevronRight,
@@ -50,6 +52,9 @@ import {
   type GitSnapshot,
   type ProjectFileEntry,
   type ProjectFileOpener,
+  type RuntimeId,
+  type SubscriptionQuota,
+  type SubscriptionWindow,
   type UsageSnapshot,
 } from "../bridge";
 import { ResizeHandle } from "./ResizeHandle";
@@ -301,6 +306,9 @@ interface RightRailProps {
   selectedDelegationId?: string;
   onSelectDelegation?: (delegationId: string) => void;
   usage: UsageSnapshot;
+  /** Active runtime and its provider-reported plan windows, when exposed. */
+  runtime?: RuntimeId;
+  subscription?: SubscriptionQuota;
   activeFile?: DiffFile;
   /** Clears in-rail open file tabs when the selected project changes. */
   projectId?: string;
@@ -1644,11 +1652,67 @@ function childAgentLineage(agents: ChildAgent[]): Array<{ agent: ChildAgent; dep
   return ordered;
 }
 
+function DelegationNudge({
+  delegation,
+  onNudge,
+}: {
+  delegation: DelegationView;
+  onNudge: (delegationId: string, message: string) => Promise<void>;
+}) {
+  const [message, setMessage] = useState("");
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState("");
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const nudge = message.trim();
+    if (!nudge || sending) return;
+    setSending(true);
+    setError("");
+    try {
+      await onNudge(delegation.id, nudge);
+      setMessage("");
+    } catch (submitError) {
+      setError(
+        submitError instanceof Error ? submitError.message : "Could not nudge this subagent.",
+      );
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <form className="agent-nudge" aria-label={`Nudge ${delegation.title}`} onSubmit={submit}>
+      <input
+        type="text"
+        value={message}
+        maxLength={32_768}
+        placeholder="Nudge this subagent…"
+        aria-label={`Nudge ${delegation.title}`}
+        disabled={sending}
+        onChange={(event) => setMessage(event.target.value)}
+      />
+      <button
+        type="submit"
+        aria-label={`Send nudge to ${delegation.title}`}
+        disabled={sending || !message.trim()}
+      >
+        <ArrowUp aria-hidden="true" />
+      </button>
+      {error ? (
+        <small role="alert" title={error}>
+          {error}
+        </small>
+      ) : null}
+    </form>
+  );
+}
+
 function AgentPanel({
   agents,
   delegations,
   onApprove,
   onDeny,
+  onNudge,
   onStop,
   selectedDelegationId,
   onSelectDelegation,
@@ -1657,6 +1721,7 @@ function AgentPanel({
   delegations?: DelegationView[];
   onApprove?: (delegationId: string) => Promise<void>;
   onDeny?: (delegationId: string) => Promise<void>;
+  onNudge?: (delegationId: string, message: string) => Promise<void>;
   onStop?: (delegationId: string) => Promise<void>;
   selectedDelegationId?: string;
   onSelectDelegation: (delegationId: string) => void;
@@ -1671,7 +1736,7 @@ function AgentPanel({
       ),
     );
     return (
-      <div className="rail-panel agent-panel">
+      <div className="rail-panel agent-panel agent-panel--delegations">
         <div className="subagent-lineage-pane">
           <div className="delegation-tree" role="tree" aria-label="Subagent lineage">
             <AnimatePresence initial={false}>
@@ -1694,6 +1759,16 @@ function AgentPanel({
             </AnimatePresence>
           </div>
         </div>
+        {selectedDelegation &&
+        selectedDelegation.childTaskId &&
+        !["pending-approval", "denied", "starting"].includes(selectedDelegation.status) &&
+        onNudge ? (
+          <DelegationNudge
+            key={selectedDelegation.id}
+            delegation={selectedDelegation}
+            onNudge={onNudge}
+          />
+        ) : null}
       </div>
     );
   }
@@ -1817,14 +1892,16 @@ function DelegationRow({
       <span className="agent-copy">
         <span className="agent-heading">
           <strong>
-            {delegation.title}
+            <span className="agent-title">{delegation.title}</span>
             <i>{delegation.profileLabel}</i>
           </strong>
           <span className="agent-state" data-status={delegation.status}>
             {delegationStatusLabel(delegation.status)}
           </span>
         </span>
-        <span className="agent-activity">{delegation.brief}</span>
+        <span className="agent-activity" title={delegation.brief}>
+          {delegation.brief}
+        </span>
         <AgentRoute runtime={delegation.runtime} model={delegation.model} />
         {delegation.unreadFromChild > 0 ? (
           <span className="agent-unread">
@@ -1834,12 +1911,9 @@ function DelegationRow({
         ) : null}
         {delegation.pendingQuestions.map((question, index) => (
           <small className="delegation-question" key={index}>
-            ❓ {question}
+            {question}
           </small>
         ))}
-        {delegation.result ? (
-          <small className="delegation-result">{delegation.result}</small>
-        ) : null}
         {canApprove || canDeny || canStop ? (
           <span className="delegation-actions">
             {canApprove && onApprove ? (
@@ -1909,7 +1983,7 @@ function AgentRow({
       <span className="agent-copy">
         <span className="agent-heading">
           <strong>
-            {agent.name}
+            <span className="agent-title">{agent.name}</span>
             <i>{agent.role}</i>
           </strong>
           <span className="agent-state" data-status={agent.status}>
@@ -1920,7 +1994,9 @@ function AgentRow({
                 : agent.status.charAt(0).toUpperCase() + agent.status.slice(1)}
           </span>
         </span>
-        <span className="agent-activity">{agent.activity}</span>
+        <span className="agent-activity" title={agent.activity}>
+          {agent.activity}
+        </span>
         <AgentRoute runtime={agent.runtime} model={agent.model} elapsed={agent.elapsed} />
       </span>
     </motion.div>
@@ -2581,8 +2657,82 @@ function formatFileSize(size: number): string {
   return `${(size / 1_000_000).toFixed(1)} MB`;
 }
 
-function UsagePanel({ usage }: { usage: UsageSnapshot }) {
-  const hasVendorPlan = usage.subscriptionPercent !== undefined;
+const PLAN_USAGE_GUIDANCE: Record<RuntimeId, string> = {
+  codex:
+    "No subscription window was returned for this sign-in. API-key usage is billed separately.",
+  claude: "Open Claude Code and run /usage to see its plan limits.",
+  cursor: "Open the Cursor dashboard to see included usage and token breakdowns.",
+  grok: "Run /usage in Grok Build or open Settings → Usage on grok.com.",
+  antigravity: "Open Antigravity Settings to see baseline quota by model.",
+  custom: "This ACP agent has not supplied a plan limit.",
+};
+
+const PLAN_TYPE_LABELS: Record<string, string> = {
+  free: "Free",
+  go: "Go",
+  plus: "Plus",
+  pro: "Pro",
+  prolite: "Pro Lite",
+  team: "Team",
+  self_serve_business_usage_based: "Business",
+  business: "Business",
+  enterprise_cbp_usage_based: "Enterprise",
+  enterprise: "Enterprise",
+  edu: "Edu",
+};
+
+function usageRuntimeLabel(runtime?: RuntimeId): string {
+  if (!runtime) return "Provider";
+  return {
+    codex: "Codex",
+    cursor: "Cursor",
+    claude: "Claude Code",
+    grok: "Grok Build",
+    antigravity: "Antigravity",
+    custom: "Custom ACP",
+  }[runtime];
+}
+
+function quotaWindowLabel(window: SubscriptionWindow, index: number): string {
+  const mins = window.windowDurationMins;
+  if (!mins) return index === 0 ? "Primary limit" : "Secondary limit";
+  if (Math.abs(mins - 300) <= 15) return "5-hour limit";
+  if (Math.abs(mins - 1440) <= 72) return "Daily limit";
+  if (Math.abs(mins - 10_080) <= 504) return "Weekly limit";
+  if (mins < 60) return `${mins}-minute limit`;
+  if (mins < 1440) return `${Math.round(mins / 60)}-hour limit`;
+  return `${Math.round(mins / 1440)}-day limit`;
+}
+
+function quotaResetLabel(resetsAt?: number): string {
+  if (!resetsAt) return "Reset time not reported";
+  const date = new Date(resetsAt * 1000);
+  const today = new Date();
+  const sameDay = date.toDateString() === today.toDateString();
+  return `Resets ${date.toLocaleString([], {
+    weekday: sameDay ? undefined : "short",
+    hour: "numeric",
+    minute: "2-digit",
+  })}`;
+}
+
+function UsagePanel({
+  usage,
+  runtime,
+  subscription,
+}: {
+  usage: UsageSnapshot;
+  runtime?: RuntimeId;
+  subscription?: SubscriptionQuota;
+}) {
+  const windows = [subscription?.primary, subscription?.secondary].filter(
+    (window): window is SubscriptionWindow => window != null,
+  );
+  const metrics = usage.metrics.filter((metric) => metric.label !== "Subscription usage");
+  const runtimeName = usageRuntimeLabel(runtime);
+  const planName = subscription?.planType
+    ? (PLAN_TYPE_LABELS[subscription.planType] ?? subscription.planType)
+    : undefined;
   return (
     <div className="rail-panel usage-panel">
       <header className="rail-panel-header">
@@ -2590,47 +2740,72 @@ function UsagePanel({ usage }: { usage: UsageSnapshot }) {
           <CircleDollarSign /> Usage evidence
         </span>
       </header>
-      <div className="usage-hero">
-        <div
-          className="usage-ring"
-          style={
-            {
-              "--usage": `${usage.subscriptionPercent ?? 0}%`,
-            } as React.CSSProperties
-          }
-        >
-          <strong>
-            {usage.subscriptionPercent === undefined ? "—" : `${usage.subscriptionPercent}%`}
-          </strong>
-          <span>plan window</span>
+      <section className="usage-plan" aria-label={`${runtimeName} plan limits`}>
+        <div className="usage-plan-heading">
+          <span>Plan limits</span>
+          <small>{planName ? `${runtimeName} ${planName}` : runtimeName}</small>
         </div>
-        <div>
-          <strong>
-            {hasVendorPlan
-              ? `Resets ${usage.resetAt ?? "when reported"}`
-              : "Vendor plan unavailable"}
-          </strong>
-          <span>
-            {hasVendorPlan
-              ? "Subscription and API usage stay separate."
-              : "Local turn evidence is tracked separately; no plan percentage is inferred."}
-          </span>
-        </div>
-      </div>
-      <div className="usage-metrics">
-        {usage.metrics.map((metric) => (
-          <div key={metric.label}>
-            <span>
-              {metric.label}
-              <small data-provenance={metric.provenance}>
-                {metric.provenance.replace("_", " ")}
-              </small>
-            </span>
-            <strong>{metric.value}</strong>
-            <p>{metric.detail}</p>
+        {windows.length ? (
+          <>
+            <div className="usage-windows">
+              {windows.map((window, index) => {
+                const percent = Math.max(0, Math.min(100, Math.round(window.usedPercent)));
+                return (
+                  <div
+                    className="usage-window"
+                    key={`${index}-${window.windowDurationMins ?? "unknown"}`}
+                  >
+                    <div>
+                      <span>{quotaWindowLabel(window, index)}</span>
+                      <strong>{percent}% used</strong>
+                    </div>
+                    <div
+                      className="usage-window-track"
+                      role="progressbar"
+                      aria-label={`${quotaWindowLabel(window, index)} used`}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={percent}
+                    >
+                      <span style={{ width: `${percent}%` }} />
+                    </div>
+                    <small>{quotaResetLabel(window.resetsAt)}</small>
+                  </div>
+                );
+              })}
+            </div>
+            <p>
+              Reported by {runtimeName}
+              {subscription?.updatedAt
+                ? ` · updated ${new Date(subscription.updatedAt).toLocaleString()}`
+                : ""}
+              . Task tokens are separate.
+            </p>
+          </>
+        ) : (
+          <div className="usage-plan-empty">
+            <strong>Plan telemetry not exposed</strong>
+            <span>{runtime ? PLAN_USAGE_GUIDANCE[runtime] : "No plan limit was reported."}</span>
+            <small>AI Integrator never estimates plan usage.</small>
           </div>
-        ))}
-      </div>
+        )}
+      </section>
+      {metrics.length ? (
+        <div className="usage-metrics">
+          {metrics.map((metric) => (
+            <div key={metric.label}>
+              <span>
+                {metric.label}
+                <small data-provenance={metric.provenance}>
+                  {metric.provenance.replace("_", " ")}
+                </small>
+              </span>
+              <strong>{metric.value}</strong>
+              <p>{metric.detail}</p>
+            </div>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -2664,11 +2839,7 @@ export function RightRail(props: RightRailProps) {
       id: "agents",
       label: "Agents",
       icon: Users,
-      count: props.delegations?.length
-        ? props.delegations.filter((delegation) =>
-            ["starting", "running", "waiting", "pending-approval"].includes(delegation.status),
-          ).length
-        : props.children.filter((agent) => agent.status === "running").length,
+      count: props.delegations ? props.delegations.length : props.children.length,
     },
     { id: "files", label: "Files", icon: FileText },
     { id: "usage", label: "Usage", icon: Radio },
@@ -2730,6 +2901,7 @@ export function RightRail(props: RightRailProps) {
             delegations={props.delegations}
             onApprove={props.onApproveDelegation}
             onDeny={props.onDenyDelegation}
+            onNudge={props.onNudgeDelegation}
             onStop={props.onStopDelegation}
             selectedDelegationId={props.selectedDelegationId}
             onSelectDelegation={props.onSelectDelegation ?? (() => undefined)}
@@ -2753,7 +2925,13 @@ export function RightRail(props: RightRailProps) {
             onRevealProjectFile={props.onRevealProjectFile}
           />
         ) : null}
-        {tab === "usage" ? <UsagePanel usage={props.usage} /> : null}
+        {tab === "usage" ? (
+          <UsagePanel
+            usage={props.usage}
+            runtime={props.runtime}
+            subscription={props.subscription}
+          />
+        ) : null}
       </div>
     </aside>
   );

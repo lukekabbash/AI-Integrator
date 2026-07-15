@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { AnimatePresence } from "motion/react";
 import { createPortal } from "react-dom";
-import { CircleStop, PanelRightClose, PanelRightOpen, TerminalSquare, X } from "lucide-react";
+import { PanelRightClose, PanelRightOpen, TerminalSquare, X } from "lucide-react";
 import {
   bridge,
   diffFileKey,
@@ -353,18 +353,6 @@ export function SubagentConversation({
                 >
                   {formatCompactTokenCount(totalTokens)}
                 </span>
-                {activeStatus(delegation.status) && onStop ? (
-                  <button
-                    className="stop-turn-button subagent-stop-button"
-                    type="button"
-                    onClick={() => void stop()}
-                    disabled={stopping}
-                    aria-label={stopping ? "Stopping subagent" : "Stop subagent"}
-                  >
-                    <CircleStop aria-hidden="true" />
-                    <span>{stopping ? "Stopping…" : "Stop"}</span>
-                  </button>
-                ) : null}
                 {onToggleTerminal ? (
                   <button
                     className="icon-button subtle"

@@ -109,6 +109,30 @@ afterEach(() => {
 });
 
 describe("SubagentConversation", () => {
+  it("keeps Stop out of the open subagent header", async () => {
+    vi.spyOn(bridge, "loadTaskProjection").mockResolvedValue({
+      events: [],
+      watermarkSeq: 0,
+      runtimeLive: true,
+    });
+    vi.spyOn(bridge, "subscribeRuntimeProjections").mockResolvedValue(() => undefined);
+    vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
+      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
+    ]);
+    const headerTarget = renderSubagent({
+      delegation: { ...stoppedDelegation, status: "running" },
+      runtimes,
+      onClose: vi.fn(),
+      onSend: vi.fn().mockResolvedValue(undefined),
+      onStop: vi.fn().mockResolvedValue(undefined),
+    });
+
+    expect(await screen.findByText("No transcript events yet.")).toBeInTheDocument();
+    expect(
+      within(headerTarget).queryByRole("button", { name: "Stop subagent" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("reopens a stopped child and sends the provider/model selected in the shared composer", async () => {
     vi.spyOn(bridge, "loadTaskProjection").mockResolvedValue({
       events: [],

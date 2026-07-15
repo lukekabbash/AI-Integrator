@@ -124,30 +124,6 @@ select:focus-visible,
   color: var(--color-text-tertiary);
   user-select: none;
 }
-.native-titlebar::before,
-.native-titlebar::after {
-  content: "";
-  position: absolute;
-  z-index: 2;
-  bottom: 0;
-  height: 1px;
-  background: var(--color-border-subtle);
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity var(--duration-moderate) var(--ease-standard);
-}
-.native-titlebar::before {
-  left: 0;
-  width: var(--sidebar-width, 272px);
-}
-.native-titlebar::after {
-  right: 0;
-  width: var(--right-rail-width, 356px);
-}
-[data-sidebar-visible="true"] .native-titlebar::before,
-[data-rail-visible="true"] .native-titlebar::after {
-  opacity: 1;
-}
 .titlebar-workspace-divider {
   position: absolute;
   z-index: 2;
@@ -227,7 +203,6 @@ select:focus-visible,
 .titlebar-subagent-actions .usage-compact {
   height: 24px;
 }
-.titlebar-subagent-actions .stop-turn-button,
 .titlebar-subagent-actions .icon-button {
   height: 26px;
 }
@@ -254,9 +229,8 @@ select:focus-visible,
   gap: 8px;
   font-size: 12px;
 }
-/* The open chat sidebar gives the title group a real alignment edge. Motion's
-   layout animation carries the group between this edge and its natural,
-   left-aligned position when the sidebar closes. */
+/* Keep the menu controls anchored at the left while reserving the open
+   sidebar's width, so the chat title retains its canvas alignment edge. */
 [data-sidebar-visible="true"] .titlebar-brand-mini {
   width: calc(var(--sidebar-width, 272px) - 18px);
 }
@@ -282,21 +256,6 @@ select:focus-visible,
   display: grid;
   align-content: center;
   gap: 1px;
-}
-.titlebar-title::before {
-  content: "";
-  position: absolute;
-  top: 7px;
-  bottom: 7px;
-  left: 0;
-  width: 1px;
-  background: var(--color-border-subtle);
-  opacity: 0;
-  transition: opacity var(--duration-fast) var(--ease-standard);
-}
-[data-sidebar-visible="true"] .titlebar-title::before {
-  opacity: 1;
-  transition-delay: var(--duration-instant);
 }
 .titlebar-title h1 {
   overflow: hidden;
@@ -640,6 +599,7 @@ select:focus-visible,
     var(--color-rail) 150px
   );
   border-right: 1px solid var(--color-border-subtle);
+  border-top-right-radius: var(--radius-panel);
   box-shadow: inset 0 1px 0 color-mix(in srgb, var(--color-text-primary) 4%, transparent);
   overflow: hidden;
   transition:
@@ -3557,6 +3517,7 @@ kbd {
   display: flex;
   flex-direction: column;
   border-left: 1px solid var(--color-border-subtle);
+  border-top-left-radius: var(--radius-panel);
   /* Same vertical falloff texture as the chat sidebar rail. */
   background: linear-gradient(
     180deg,
@@ -4977,12 +4938,19 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
 }
 .agent-copy strong {
   min-width: 0;
+  flex: 1;
   display: flex;
   gap: 6px;
   align-items: baseline;
   overflow: hidden;
   font-size: 11px;
   line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-title {
+  min-width: 0;
+  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -5564,46 +5532,78 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   color: inherit;
 }
 
-.usage-hero {
-  padding: 18px 14px;
-  display: grid;
-  grid-template-columns: 72px 1fr;
-  align-items: center;
-  gap: 14px;
+.usage-plan {
+  padding: 14px 13px 13px;
   border-bottom: 1px solid var(--color-border-subtle);
 }
-.usage-ring {
-  width: 70px;
-  height: 70px;
+.usage-plan-heading {
   display: flex;
-  flex-direction: column;
   align-items: center;
-  justify-content: center;
-  border-radius: 99px;
-  background:
-    radial-gradient(circle at center, var(--color-rail) 59%, transparent 60%),
-    conic-gradient(var(--color-accent) var(--usage), var(--color-layer-2) 0);
+  justify-content: space-between;
+  gap: 12px;
 }
-.usage-ring strong {
-  font-size: 16px;
-  font-variant-numeric: tabular-nums;
+.usage-plan-heading > span {
+  color: var(--color-text-secondary);
+  font-size: 10.5px;
 }
-.usage-ring span {
+.usage-plan-heading > small,
+.usage-window > small,
+.usage-plan-empty small {
   color: var(--color-text-tertiary);
   font-size: 9px;
 }
-.usage-hero > div:last-child {
+.usage-windows {
+  margin-top: 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+}
+.usage-window > div:first-child {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.usage-window > div:first-child span {
+  color: var(--color-text-secondary);
+  font-size: 10px;
+}
+.usage-window > div:first-child strong {
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+.usage-window-track {
+  height: 3px;
+  margin: 6px 0 5px;
+  overflow: hidden;
+  border-radius: 99px;
+  background: var(--color-layer-2);
+}
+.usage-window-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--color-accent);
+}
+.usage-plan > p {
+  margin: 12px 0 0;
+  color: var(--color-text-tertiary);
+  font-size: 9px;
+  line-height: 1.4;
+}
+.usage-plan-empty {
+  margin-top: 11px;
   display: flex;
   flex-direction: column;
   gap: 4px;
 }
-.usage-hero > div:last-child strong {
+.usage-plan-empty strong {
   font-size: 11px;
 }
-.usage-hero > div:last-child span {
-  color: var(--color-text-tertiary);
-  font-size: 9px;
-  line-height: 1.4;
+.usage-plan-empty > span {
+  color: var(--color-text-secondary);
+  font-size: 9.5px;
+  line-height: 1.45;
 }
 .usage-metrics > div {
   padding: 12px 13px;
@@ -5699,6 +5699,11 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   gap: 6px;
   border-bottom: 1px solid var(--color-border-subtle);
   background: var(--color-layer-1);
+}
+.workspace-content > .diff-workspace > .diff-header,
+.workspace-content > .file-workspace > .file-workspace-header {
+  border-top-left-radius: var(--radius-panel);
+  border-top-right-radius: var(--radius-panel);
 }
 .diff-file-title {
   min-width: 0;
@@ -6309,6 +6314,7 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   display: flex;
   flex-direction: column;
   border-right: 1px solid var(--color-border-subtle);
+  border-top-right-radius: var(--radius-panel);
   /* Same vertical falloff texture as the chat sidebar rail. */
   background: linear-gradient(
     180deg,
@@ -8765,6 +8771,81 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   overflow-y: auto;
 }
 
+.agent-panel--delegations {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.agent-panel--delegations .subagent-lineage-pane {
+  flex: 1;
+}
+
+.agent-nudge {
+  flex: none;
+  padding: 8px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 6px;
+  border-top: 1px solid var(--color-border-subtle);
+  background: color-mix(in srgb, var(--color-rail) 96%, transparent);
+}
+
+.agent-nudge input {
+  min-width: 0;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--color-border-base);
+  border-radius: var(--radius-control);
+  outline: none;
+  color: var(--color-text-primary);
+  background: var(--color-layer-1);
+  font: 10px var(--font-ui);
+}
+
+.agent-nudge input::placeholder {
+  color: var(--color-text-tertiary);
+}
+
+.agent-nudge input:focus {
+  border-color: var(--color-focus);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-focus) 32%, transparent);
+}
+
+.agent-nudge button {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: var(--radius-control);
+  color: var(--color-accent-text);
+  background: var(--color-accent-primary);
+  cursor: pointer;
+}
+
+.agent-nudge button svg {
+  width: 13px;
+  height: 13px;
+}
+
+.agent-nudge button:disabled,
+.agent-nudge input:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.agent-nudge small {
+  grid-column: 1 / -1;
+  overflow: hidden;
+  color: var(--color-danger);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .delegation-tree {
   padding: 8px 6px 12px;
 }
@@ -8789,13 +8870,6 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
 .delegation-question {
   color: var(--color-warning);
   font: 9.5px var(--font-ui);
-  white-space: normal;
-}
-
-.delegation-result {
-  color: var(--color-text-tertiary);
-  font: 9.5px var(--font-ui);
-  line-height: 1.4;
   white-space: normal;
 }
 
@@ -8898,13 +8972,8 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
 }
 
 @container subagent-titlebar (max-width: 560px) {
-  .titlebar-subagent-copy span,
-  .subagent-stop-button span {
+  .titlebar-subagent-copy span {
     display: none;
-  }
-  .titlebar-subagent-actions .subagent-stop-button {
-    width: 27px;
-    padding: 0;
   }
 }
 

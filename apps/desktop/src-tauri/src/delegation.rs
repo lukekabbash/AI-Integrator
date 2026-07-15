@@ -41,8 +41,12 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
-use crate::state::{
-    AcpRuntime, AppState, CodexRuntime, DelegationChild, DelegationChildDriver, StructuredRuntime,
+use crate::{
+    chat_title::{format_subagent_title, generate_subagent_title},
+    state::{
+        AcpRuntime, AppState, CodexRuntime, DelegationChild, DelegationChildDriver,
+        StructuredRuntime,
+    },
 };
 
 pub const DELEGATION_UPDATE_EVENT: &str = "delegation://update";
@@ -334,6 +338,17 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
         .into_iter()
         .map(|(key, value)| (key.to_owned(), Value::String(value)))
         .collect();
+    let enabled_tools = match role {
+        "child" => json!(["task_complete", "orchestrator_ask", "orchestrator_report"]),
+        _ => json!([
+            "peers_list",
+            "delegate_start",
+            "delegation_status",
+            "delegation_message",
+            "delegation_result",
+            "delegation_stop",
+        ]),
+    };
     Ok(json!({
         "mcp_servers": {
             "integrator": {
@@ -341,6 +356,13 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
                 "args": ["--broker-mcp"],
                 "env": env,
                 "required": true,
+                "enabled_tools": enabled_tools,
+                // Delegation already has a narrower, task-scoped approval
+                // boundary: broker mode, enabled profiles, concurrency caps,
+                // and the Agents-rail gate in manual mode. A second Codex MCP
+                // prompt cannot be surfaced by Integrator and deadlocks the
+                // turn before the loopback broker receives the call.
+                "default_tools_approval_mode": "approve",
             }
         }
     }))
@@ -696,7 +718,7 @@ async fn delegate_start(
 ) -> Result<Value> {
     let profile_id = text_param(params, "profileId")
         .ok_or_else(|| IntegratorError::InvalidInput("profileId is required".into()))?;
-    let title = text_param(params, "title")
+    let requested_title = text_param(params, "title")
         .ok_or_else(|| IntegratorError::InvalidInput("title is required".into()))?;
     let brief = text_param(params, "brief")
         .ok_or_else(|| IntegratorError::InvalidInput("brief is required".into()))?;
@@ -718,7 +740,7 @@ async fn delegate_start(
         runtime: profile.runtime.clone(),
         model: profile.model.clone(),
         effort: profile.effort.clone(),
-        title,
+        title: requested_title.clone(),
         brief,
         status: if manual {
             DelegationStatus::PendingApproval
@@ -726,6 +748,14 @@ async fn delegate_start(
             DelegationStatus::Starting
         },
     })?;
+    // Compute the sibling number after insertion. Even concurrent starts then
+    // receive distinct ordinals from the store's deterministic creation order.
+    let ordinal = delegation_ordinal(&state.store, &delegation)?;
+    let title = format_subagent_title(ordinal, &requested_title);
+    let delegation = state
+        .store
+        .compare_and_set_delegation_title(delegation.id, &requested_title, &title)?
+        .unwrap_or(delegation);
     emit_update(app, parent_task_id);
     if manual {
         return Ok(json!({
@@ -820,6 +850,69 @@ fn delegation_result(app: &AppHandle<tauri::Wry>, delegation: &Delegation) -> Re
 // Child lifecycle
 // ---------------------------------------------------------------------------
 
+fn delegation_ordinal(store: &LocalStore, delegation: &Delegation) -> Result<usize> {
+    Ok(store
+        .list_delegations(delegation.parent_task_id)?
+        .iter()
+        .position(|candidate| candidate.id == delegation.id)
+        .map_or(1, |index| index + 1))
+}
+
+/// Name a child chat through the same isolated, cheapest-model helper used by
+/// ordinary new chats. The provider turn and sidebar remain responsive: a
+/// deterministic ordinal title is already persisted before this runs.
+fn schedule_subagent_title_generation(
+    app: &AppHandle<tauri::Wry>,
+    delegation: &Delegation,
+    child_task_id: TaskId,
+    expected_task_title: String,
+    provider: ProviderKind,
+    project: String,
+    ordinal: usize,
+) {
+    let state = app.state::<AppState>();
+    let store = Arc::clone(&state.store);
+    let data_directory = state.data_directory.clone();
+    let expected_delegation_title = delegation.title.clone();
+    let source = delegation.brief.clone();
+    let parent_task_id = delegation.parent_task_id;
+    let delegation_id = delegation.id;
+    let app = app.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let claim_store = Arc::clone(&store);
+        let claim_title = expected_task_title.clone();
+        let claimed = tauri::async_runtime::spawn_blocking(move || {
+            claim_store.claim_task_title_generation(child_task_id, &claim_title)
+        })
+        .await;
+        if !matches!(claimed, Ok(Ok(true))) {
+            return;
+        }
+
+        let Ok(Some(stem)) =
+            generate_subagent_title(&data_directory, provider, &project, &source).await
+        else {
+            return;
+        };
+        let title = format_subagent_title(ordinal, &stem);
+        let update_store = Arc::clone(&store);
+        let updated = tauri::async_runtime::spawn_blocking(move || {
+            update_store.compare_and_set_delegation_child_title(
+                delegation_id,
+                child_task_id,
+                &expected_delegation_title,
+                &expected_task_title,
+                &title,
+            )
+        })
+        .await;
+        if matches!(updated, Ok(Ok(true))) {
+            emit_update(&app, parent_task_id);
+        }
+    });
+}
+
 /// Launches the child runtime for an approved delegation. Fully async: the
 /// child's first turn starts in the background and this returns once the
 /// process is up and the delegation is `running`.
@@ -856,8 +949,10 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let ordinal = delegation_ordinal(&state.store, &delegation)?;
+    let initial_title = format_subagent_title(ordinal, &delegation.title);
     let child_task = state.store.create_task(integrator_core::NewTask {
-        title: format!("Subagent · {}", delegation.title),
+        title: initial_title.clone(),
         repository_path: parent.repository_path.clone(),
         worktree_path: parent.worktree_path.clone(),
         runtime: Some(delegation.runtime.clone()),
@@ -982,6 +1077,22 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
         .update_delegation_status(delegation_id, DelegationStatus::Running)?;
     emit_update(&app, delegation.parent_task_id);
     start_child_turn(&app, &child, first_prompt).await?;
+    let project = parent
+        .repository_path
+        .as_deref()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .unwrap_or("software project")
+        .to_owned();
+    schedule_subagent_title_generation(
+        &app,
+        &delegation,
+        child_task.id,
+        initial_title,
+        provider,
+        project,
+        ordinal,
+    );
     Ok(())
 }
 
@@ -2210,6 +2321,18 @@ mod tests {
         let server = &config["mcp_servers"]["integrator"];
         assert_eq!(server["args"], json!(["--broker-mcp"]));
         assert_eq!(server["required"], json!(true));
+        assert_eq!(server["default_tools_approval_mode"], json!("approve"));
+        assert_eq!(
+            server["enabled_tools"],
+            json!([
+                "peers_list",
+                "delegate_start",
+                "delegation_status",
+                "delegation_message",
+                "delegation_result",
+                "delegation_stop",
+            ])
+        );
         assert_eq!(
             server["env"]["INTEGRATOR_BROKER_ADDR"],
             json!("127.0.0.1:43123")

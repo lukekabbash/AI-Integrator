@@ -110,13 +110,52 @@ impl LocalStore {
         let connection = self.connection.lock();
         let mut statement = connection
             .prepare(&format!(
-                "SELECT {DELEGATION_COLUMNS} FROM delegations WHERE parent_task_id = ?1 ORDER BY created_at"
+                "SELECT {DELEGATION_COLUMNS} FROM delegations WHERE parent_task_id = ?1 ORDER BY created_at, id"
             ))
             .map_err(storage_error)?;
         let rows = statement
             .query_map([parent_task_id.to_string()], parse_delegation_row)
             .map_err(storage_error)?;
         rows.map(|row| row.map_err(storage_error)?).collect()
+    }
+
+    /// Replace a newly-created provisional delegation title while it still
+    /// has the exact value supplied by the caller.
+    pub fn compare_and_set_delegation_title(
+        &self,
+        id: DelegationId,
+        expected_title: &str,
+        title: &str,
+    ) -> Result<Option<Delegation>> {
+        let expected_title = expected_title.trim();
+        let title = title.trim();
+        if expected_title.is_empty()
+            || expected_title.chars().count() > 240
+            || title.is_empty()
+            || title.chars().count() > 240
+        {
+            return Err(IntegratorError::InvalidInput(
+                "delegation titles must contain 1 to 240 characters".into(),
+            ));
+        }
+        let changed = self
+            .connection
+            .lock()
+            .execute(
+                "UPDATE delegations SET title = ?1, updated_at = ?2 WHERE id = ?3 AND title = ?4",
+                params![
+                    title,
+                    Utc::now().to_rfc3339(),
+                    id.to_string(),
+                    expected_title
+                ],
+            )
+            .map_err(storage_error)?;
+        if changed == 0 {
+            self.get_delegation(id)?;
+            return Ok(None);
+        }
+        self.get_delegation(id).map(Some)
     }
 
     /// Count of delegations holding a concurrency slot for this parent.
@@ -171,6 +210,67 @@ impl LocalStore {
             return Err(IntegratorError::NotFound(format!("delegation {id}")));
         }
         self.get_delegation(id)
+    }
+
+    /// Atomically replace the broker-assigned fallback title on both sides of
+    /// a delegation. Stale background naming can never overwrite a later
+    /// title or leave the hidden child task and its rail row out of sync.
+    pub fn compare_and_set_delegation_child_title(
+        &self,
+        id: DelegationId,
+        child_task_id: TaskId,
+        expected_delegation_title: &str,
+        expected_task_title: &str,
+        title: &str,
+    ) -> Result<bool> {
+        let expected_delegation_title = expected_delegation_title.trim();
+        let expected_task_title = expected_task_title.trim();
+        let title = title.trim();
+        if expected_delegation_title.is_empty()
+            || expected_delegation_title.chars().count() > 240
+            || expected_task_title.is_empty()
+            || expected_task_title.chars().count() > 240
+            || title.is_empty()
+            || title.chars().count() > 240
+        {
+            return Err(IntegratorError::InvalidInput(
+                "delegation and task titles must contain 1 to 240 characters".into(),
+            ));
+        }
+        self.get_delegation(id)?;
+        self.get_task(child_task_id)?;
+
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(storage_error)?;
+        let delegation_changed = transaction
+            .execute(
+                "UPDATE delegations SET title = ?1, updated_at = ?2 WHERE id = ?3 AND child_task_id = ?4 AND title = ?5",
+                params![
+                    title,
+                    now,
+                    id.to_string(),
+                    child_task_id.to_string(),
+                    expected_delegation_title
+                ],
+            )
+            .map_err(storage_error)?;
+        if delegation_changed != 1 {
+            transaction.rollback().map_err(storage_error)?;
+            return Ok(false);
+        }
+        let task_changed = transaction
+            .execute(
+                "UPDATE tasks SET title = ?1, updated_at = ?2 WHERE id = ?3 AND title = ?4",
+                params![title, now, child_task_id.to_string(), expected_task_title],
+            )
+            .map_err(storage_error)?;
+        if task_changed != 1 {
+            transaction.rollback().map_err(storage_error)?;
+            return Ok(false);
+        }
+        transaction.commit().map_err(storage_error)?;
+        Ok(true)
     }
 
     pub fn set_delegation_session_ref(&self, id: DelegationId, session_ref: &str) -> Result<()> {
@@ -517,6 +617,14 @@ mod tests {
             .expect("create delegation");
         assert_eq!(delegation.status, DelegationStatus::Starting);
         assert_eq!(store.active_delegation_count(parent).expect("count"), 1);
+        let delegation = store
+            .compare_and_set_delegation_title(
+                delegation.id,
+                "Refactor tests",
+                "Subagent 1 · Refactor tests",
+            )
+            .expect("apply ordinal title")
+            .expect("provisional title still current");
 
         let child = store
             .create_task(NewTask {
@@ -534,6 +642,39 @@ mod tests {
         store
             .attach_delegation_child(delegation.id, child.id)
             .expect("attach child");
+        assert!(
+            store
+                .compare_and_set_delegation_child_title(
+                    delegation.id,
+                    child.id,
+                    "Subagent 1 · Refactor tests",
+                    "Subagent: Refactor tests",
+                    "Subagent 1 · Shared Test Helpers",
+                )
+                .expect("replace fallback title")
+        );
+        assert_eq!(
+            store
+                .get_delegation(delegation.id)
+                .expect("renamed delegation")
+                .title,
+            "Subagent 1 · Shared Test Helpers"
+        );
+        assert_eq!(
+            store.get_task(child.id).expect("renamed child task").title,
+            "Subagent 1 · Shared Test Helpers"
+        );
+        assert!(
+            !store
+                .compare_and_set_delegation_child_title(
+                    delegation.id,
+                    child.id,
+                    "Subagent 1 · Refactor tests",
+                    "Subagent: Refactor tests",
+                    "Subagent 1 · Stale Rename",
+                )
+                .expect("reject stale title")
+        );
         let updated = store
             .set_delegation_result(delegation.id, DelegationStatus::Completed, "done")
             .expect("set result");
