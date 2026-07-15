@@ -15,7 +15,8 @@ import {
 import {
   applyRuntimeProjection,
   createRuntimeProjectionState,
-  runtimeTranscript,
+  createRuntimeTranscriptDeriver,
+  isFrameBatchableRuntimeProjection,
   type RuntimeProjectionState,
 } from "../runtimeProjection";
 import { Composer } from "./Composer";
@@ -102,7 +103,21 @@ export function SubagentConversation({
     let disposed = false;
     let ready = false;
     let unlisten: (() => void) | undefined;
+    let projectionFrame: number | undefined;
     const buffered: RuntimeProjectionEvent[] = [];
+    const frameEvents: RuntimeProjectionEvent[] = [];
+    const applyEvents = (events: RuntimeProjectionEvent[]) => {
+      if (events.length === 0) return;
+      setProjection((current) => {
+        let next = current ?? createRuntimeProjectionState(childTaskId);
+        for (const event of events) next = applyRuntimeProjection(next, event);
+        return next;
+      });
+    };
+    const flushFrameEvents = () => {
+      projectionFrame = undefined;
+      applyEvents(frameEvents.splice(0));
+    };
     void (async () => {
       try {
         unlisten = await bridge.subscribeRuntimeProjections((event) => {
@@ -111,9 +126,16 @@ export function SubagentConversation({
             buffered.push(event);
             return;
           }
-          setProjection((current) =>
-            applyRuntimeProjection(current ?? createRuntimeProjectionState(childTaskId), event),
-          );
+          if (isFrameBatchableRuntimeProjection(event)) {
+            frameEvents.push(event);
+            projectionFrame ??= window.requestAnimationFrame(flushFrameEvents);
+            return;
+          }
+          if (projectionFrame !== undefined) {
+            window.cancelAnimationFrame(projectionFrame);
+            projectionFrame = undefined;
+          }
+          applyEvents([...frameEvents.splice(0), event]);
         });
         if (disposed) {
           unlisten();
@@ -145,6 +167,7 @@ export function SubagentConversation({
 
     return () => {
       disposed = true;
+      if (projectionFrame !== undefined) window.cancelAnimationFrame(projectionFrame);
       unlisten?.();
     };
   }, [childTaskId]);
@@ -181,21 +204,32 @@ export function SubagentConversation({
     };
   }, [childTaskId, centerView, delegation.status, reviewRefreshVersion]);
 
+  const deriveProjectedEvents = useMemo(() => createRuntimeTranscriptDeriver(), []);
   const projectedEvents = useMemo(
-    () => (projection ? runtimeTranscript(projection) : []),
-    [projection],
+    () => (projection ? deriveProjectedEvents(projection) : []),
+    [deriveProjectedEvents, projection],
   );
-  const visibleOptimisticMessages = optimisticMessages.filter(
-    (optimistic) =>
-      !projectedEvents.some(
-        (event) =>
-          event.kind === "user" &&
-          event.body === optimistic.body &&
-          Date.parse(event.timestamp) >= Date.parse(optimistic.timestamp) - 1_000,
+  const visibleOptimisticMessages = useMemo(
+    () =>
+      optimisticMessages.filter(
+        (optimistic) =>
+          !projectedEvents.some(
+            (event) =>
+              event.kind === "user" &&
+              event.body === optimistic.body &&
+              Date.parse(event.timestamp) >= Date.parse(optimistic.timestamp) - 1_000,
+          ),
       ),
+    [optimisticMessages, projectedEvents],
   );
-  const events = [...projectedEvents, ...visibleOptimisticMessages].sort(
-    (a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp),
+  const events = useMemo(
+    () =>
+      visibleOptimisticMessages.length === 0
+        ? projectedEvents
+        : [...projectedEvents, ...visibleOptimisticMessages].sort(
+            (a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp),
+          ),
+    [projectedEvents, visibleOptimisticMessages],
   );
   const turnRunning = projection?.turn?.status === "inProgress" && activeStatus(delegation.status);
   const canMessage = Boolean(
@@ -205,8 +239,12 @@ export function SubagentConversation({
     delegation.status !== "denied" &&
     delegation.status !== "starting",
   );
-  const supportedRuntimes = runtimes.filter((runtime) =>
-    ["codex", "claude", "antigravity", "cursor", "grok"].includes(runtime.id),
+  const supportedRuntimes = useMemo(
+    () =>
+      runtimes.filter((runtime) =>
+        ["codex", "claude", "antigravity", "cursor", "grok"].includes(runtime.id),
+      ),
+    [runtimes],
   );
   const reviewFile =
     git?.files.find((file) => diffFileKey(file) === reviewFileKey) ?? git?.files[0];

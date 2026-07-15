@@ -1,8 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { RuntimeProjectionEvent } from "./bridge";
 import {
   applyRuntimeProjection,
   createRuntimeProjectionState,
+  createRuntimeTranscriptDeriver,
+  isFrameBatchableRuntimeProjection,
   runtimeTranscript,
   taskActivityUpdate,
 } from "./runtimeProjection";
@@ -688,5 +690,171 @@ describe("runtime projection reducer", () => {
     expect(runtimeTranscript(state)).not.toContainEqual(
       expect.objectContaining({ id: "runtime-error-30" }),
     );
+  });
+
+  it("reuses unchanged item derivations without changing canonical transcript output", () => {
+    let state = createRuntimeProjectionState("task-1");
+    state = applyRuntimeProjection(
+      state,
+      event(90, {
+        kind: "itemChanged",
+        item: {
+          id: "tool-cached",
+          providerItemId: "tool-cached",
+          kind: "mcpTool",
+          status: "completed",
+          mcpTool: "edit",
+          toolInput: JSON.stringify({
+            path: "src/App.tsx",
+            old_string: "const value = 1;",
+            new_string: "const value = 2;",
+          }),
+          truncated: false,
+          updatedAt: "2026-07-10T16:00:00Z",
+        },
+      }),
+    );
+    state = applyRuntimeProjection(
+      state,
+      event(91, {
+        kind: "itemChanged",
+        item: {
+          id: "message-streaming",
+          providerItemId: "message-streaming",
+          kind: "agentMessage",
+          status: "inProgress",
+          body: "First chunk",
+          truncated: false,
+          updatedAt: "2026-07-10T16:00:01Z",
+        },
+      }),
+    );
+
+    const deriveTranscript = createRuntimeTranscriptDeriver();
+    const first = deriveTranscript(state);
+    expect(first).toEqual(runtimeTranscript(state));
+    const firstTool = first.find((entry) => entry.id === "tool-cached");
+    const firstMessage = first.find((entry) => entry.id === "message-streaming");
+
+    state = applyRuntimeProjection(
+      state,
+      event(92, {
+        kind: "itemChanged",
+        item: {
+          ...state.items.find((item) => item.id === "message-streaming")!,
+          body: "First chunk and second chunk",
+          updatedAt: "2026-07-10T16:00:02Z",
+        },
+      }),
+    );
+    const second = deriveTranscript(state);
+
+    expect(second).toEqual(runtimeTranscript(state));
+    expect(second.find((entry) => entry.id === "tool-cached")).toBe(firstTool);
+    expect(second.find((entry) => entry.id === "message-streaming")).not.toBe(firstMessage);
+  });
+
+  it("invalidates cached item surfaces when first-seen time or settled status changes", () => {
+    let state = applyRuntimeProjection(
+      createRuntimeProjectionState("task-1"),
+      event(100, {
+        kind: "itemChanged",
+        item: {
+          id: "command-cached",
+          providerItemId: "command-cached",
+          kind: "commandExecution",
+          status: "inProgress",
+          command: "npm test",
+          truncated: false,
+          updatedAt: "2026-07-10T16:00:00Z",
+        },
+      }),
+    );
+    const deriveTranscript = createRuntimeTranscriptDeriver();
+    const initial = deriveTranscript(state)[0];
+
+    state = {
+      ...state,
+      firstSeen: { ...state.firstSeen, "command-cached": "2026-07-10T15:59:59Z" },
+    };
+    const retimed = deriveTranscript(state)[0];
+    expect(retimed).not.toBe(initial);
+    expect(retimed.timestamp).toBe("2026-07-10T15:59:59Z");
+
+    state = applyRuntimeProjection(
+      state,
+      event(101, {
+        kind: "turnChanged",
+        turn: { id: "turn-1", status: "completed", stopRequested: false },
+      }),
+    );
+    const settled = deriveTranscript(state)[0];
+    expect(settled).not.toBe(retimed);
+    expect(settled.status).toBe("neutral");
+    expect(settled).toEqual(runtimeTranscript(state)[0]);
+  });
+
+  it("parses a cached MCP item once per scoped transcript deriver", () => {
+    const state = applyRuntimeProjection(
+      createRuntimeProjectionState("task-1"),
+      event(110, {
+        kind: "itemChanged",
+        item: {
+          id: "tool-parse-once",
+          providerItemId: "tool-parse-once",
+          kind: "mcpTool",
+          status: "completed",
+          mcpTool: "edit",
+          toolInput: '{"path":"src/App.tsx","old_string":"a","new_string":"b"}',
+          truncated: false,
+          updatedAt: "2026-07-10T16:00:00Z",
+        },
+      }),
+    );
+    const parse = vi.spyOn(JSON, "parse");
+    const deriveTranscript = createRuntimeTranscriptDeriver();
+
+    deriveTranscript(state);
+    expect(parse).toHaveBeenCalledTimes(1);
+    deriveTranscript(state);
+    expect(parse).toHaveBeenCalledTimes(1);
+    createRuntimeTranscriptDeriver()(state);
+    expect(parse).toHaveBeenCalledTimes(2);
+    parse.mockRestore();
+  });
+
+  it("frame-batches only in-progress assistant and reasoning projections", () => {
+    expect(
+      isFrameBatchableRuntimeProjection(
+        event(120, {
+          kind: "itemChanged",
+          item: {
+            id: "message-frame",
+            providerItemId: "message-frame",
+            kind: "agentMessage",
+            status: "inProgress",
+            body: "streaming",
+            truncated: false,
+            updatedAt: "2026-07-10T16:00:00Z",
+          },
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      isFrameBatchableRuntimeProjection(
+        event(121, {
+          kind: "itemChanged",
+          item: {
+            id: "command-frame",
+            providerItemId: "command-frame",
+            kind: "commandExecution",
+            status: "inProgress",
+            command: "npm test",
+            truncated: false,
+            updatedAt: "2026-07-10T16:00:00Z",
+          },
+        }),
+      ),
+    ).toBe(false);
   });
 });

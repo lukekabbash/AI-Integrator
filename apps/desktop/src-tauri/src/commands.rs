@@ -3409,6 +3409,7 @@ pub async fn acp_connect(
         context_primer: Arc::new(std::sync::Mutex::new(None)),
         delegation_preamble: Arc::new(std::sync::Mutex::new(None)),
         unattended: false,
+        read_only: false,
     };
     spawn_acp_pump(app, Arc::clone(&state.store), runtime.clone());
     let previous = if let Some(task_id) = task_id {
@@ -4625,9 +4626,17 @@ pub(crate) fn spawn_acp_pump(
                     // the ACP analog of Codex children's approval "never".
                     if runtime.unattended {
                         let result = if method == "session/request_permission" {
-                            acp_auto_allow_outcome(&params)
+                            if runtime.read_only {
+                                serde_json::json!({ "outcome": { "outcome": "cancelled" } })
+                            } else {
+                                acp_auto_allow_outcome(&params)
+                            }
                         } else if method == "cursor/create_plan" {
-                            serde_json::json!({ "result": { "success": {} } })
+                            if runtime.read_only {
+                                serde_json::json!({ "result": { "error": { "error": "This delegated child is read-only." } } })
+                            } else {
+                                serde_json::json!({ "result": { "success": {} } })
+                            }
                         } else {
                             serde_json::json!({ "error": "unsupported" })
                         };

@@ -171,6 +171,7 @@ export interface DelegationView {
   runtime: string;
   model?: string | null;
   effort?: string | null;
+  permission: "read-only" | "project-write";
   title: string;
   brief: string;
   status: DelegationStatus;

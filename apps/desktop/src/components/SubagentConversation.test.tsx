@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
 import type { ComponentProps } from "react";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bridge, type DelegationView, type GitSnapshot, type RuntimeConnection } from "../bridge";
 import { SubagentConversation } from "./SubagentConversation";
@@ -94,6 +94,34 @@ const childGit: GitSnapshot = {
   ],
 };
 
+function childProjectionEvent(
+  seq: number,
+  body: string,
+  status: "inProgress" | "completed" = "inProgress",
+): Parameters<Parameters<typeof bridge.subscribeRuntimeProjections>[0]>[0] {
+  return {
+    taskId: "task-child",
+    seq,
+    providerSessionId: "session-child",
+    provider: "codex",
+    threadId: "thread-child",
+    turnId: "turn-child",
+    occurredAt: `2026-07-12T10:06:0${seq}Z`,
+    projection: {
+      kind: "itemChanged",
+      item: {
+        id: "message-child",
+        providerItemId: "message-child",
+        kind: "agentMessage",
+        status,
+        body,
+        truncated: false,
+        updatedAt: `2026-07-12T10:06:0${seq}Z`,
+      },
+    },
+  };
+}
+
 function renderSubagent(props: Omit<ComponentProps<typeof SubagentConversation>, "headerTarget">) {
   const headerTarget = document.createElement("div");
   headerTarget.className = "test-subagent-header-target";
@@ -109,6 +137,58 @@ afterEach(() => {
 });
 
 describe("SubagentConversation", () => {
+  it("publishes child text once per frame and flushes completion immediately in order", async () => {
+    vi.spyOn(bridge, "loadTaskProjection").mockResolvedValue({
+      events: [],
+      watermarkSeq: 0,
+      runtimeLive: true,
+    });
+    let projectionListener: Parameters<typeof bridge.subscribeRuntimeProjections>[0] | undefined;
+    vi.spyOn(bridge, "subscribeRuntimeProjections").mockImplementation(async (listener) => {
+      projectionListener = listener;
+      return () => undefined;
+    });
+    vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
+      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
+    ]);
+    const frameCallbacks = new Map<number, FrameRequestCallback>();
+    let nextFrameId = 0;
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      nextFrameId += 1;
+      frameCallbacks.set(nextFrameId, callback);
+      return nextFrameId;
+    });
+    const cancelFrame = vi
+      .spyOn(window, "cancelAnimationFrame")
+      .mockImplementation((id) => void frameCallbacks.delete(id));
+
+    renderSubagent({
+      delegation: { ...stoppedDelegation, status: "running" },
+      runtimes,
+      onClose: vi.fn(),
+      onSend: vi.fn().mockResolvedValue(undefined),
+    });
+
+    expect(await screen.findByText("No transcript events yet.")).toBeInTheDocument();
+    expect(projectionListener).toBeDefined();
+    act(() => {
+      projectionListener?.(childProjectionEvent(1, "First"));
+      projectionListener?.(childProjectionEvent(2, "First second"));
+    });
+
+    expect(screen.getByText("No transcript events yet.")).toBeInTheDocument();
+    expect(window.requestAnimationFrame).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      projectionListener?.(childProjectionEvent(3, "First second complete", "completed"));
+    });
+
+    expect(await screen.findByText("First second complete")).toBeInTheDocument();
+    expect(screen.queryByText("No transcript events yet.")).not.toBeInTheDocument();
+    expect(cancelFrame).toHaveBeenCalledTimes(1);
+    expect(frameCallbacks.has(1)).toBe(false);
+  });
+
   it("keeps Stop out of the open subagent header", async () => {
     vi.spyOn(bridge, "loadTaskProjection").mockResolvedValue({
       events: [],

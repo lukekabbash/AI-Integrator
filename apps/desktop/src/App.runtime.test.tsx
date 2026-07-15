@@ -74,6 +74,7 @@ import type { RuntimeProjectionEvent } from "./bridge";
 import { createEmptySnapshot } from "./demoData";
 
 let runtimeListener: ((event: RuntimeProjectionEvent) => void) | undefined;
+let delegationListener: ((parentTaskId: string) => void) | undefined;
 
 function projection(
   seq: number,
@@ -128,6 +129,7 @@ describe("native runtime recovery UI", () => {
     for (const value of Object.values(bridgeMock)) value.mockReset();
     bridgeMock.listProjectFileOpeners.mockResolvedValue([]);
     runtimeListener = undefined;
+    delegationListener = undefined;
     bridgeMock.subscribeRuntimeProjections.mockImplementation(async (listener) => {
       runtimeListener = listener;
       return vi.fn();
@@ -172,7 +174,10 @@ describe("native runtime recovery UI", () => {
       dataDirectory: "H:\\AppData\\Integrator",
       localOnly: true,
     });
-    bridgeMock.subscribeDelegationUpdates.mockResolvedValue(vi.fn());
+    bridgeMock.subscribeDelegationUpdates.mockImplementation(async (listener) => {
+      delegationListener = listener;
+      return vi.fn();
+    });
     const workspace = createEmptySnapshot();
     workspace.projects = [
       {
@@ -1166,7 +1171,23 @@ describe("native runtime recovery UI", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("projects background turn activity into real sidebar dots and unread state", async () => {
+  it("ignores delegation notifications outside the active task lineage", async () => {
+    render(<App />);
+    await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
+    await waitFor(() => expect(bridgeMock.listDelegations).toHaveBeenCalledWith("task-1"));
+    const readsAfterHydration = bridgeMock.listDelegations.mock.calls.length;
+
+    act(() => delegationListener?.("unrelated-task"));
+    await Promise.resolve();
+    expect(bridgeMock.listDelegations).toHaveBeenCalledTimes(readsAfterHydration);
+
+    act(() => delegationListener?.("task-1"));
+    await waitFor(() =>
+      expect(bridgeMock.listDelegations).toHaveBeenCalledTimes(readsAfterHydration + 1),
+    );
+  });
+
+  it("projects background activity immediately but defers its Git scan until selection", async () => {
     const workspace = createEmptySnapshot();
     workspace.projects = [
       {
@@ -1235,12 +1256,59 @@ describe("native runtime recovery UI", () => {
     await waitFor(() =>
       expect(bridgeMock.setTaskStatus).toHaveBeenCalledWith("task-2", "completed"),
     );
-    await waitFor(() => expect(bridgeMock.loadTaskGit).toHaveBeenCalledWith("task-2"));
+    expect(bridgeMock.loadTaskGit).not.toHaveBeenCalledWith("task-2");
 
     fireEvent.click(screen.getByRole("button", { name: /Background task/i }));
-    const selectedBackground = await screen.findByRole("button", { name: /Background task/i });
-    await waitFor(() => expect(selectedBackground).toHaveAttribute("aria-current", "page"));
-    expect(within(selectedBackground).queryByRole("img")).not.toBeInTheDocument();
+    await waitFor(() => expect(bridgeMock.loadTaskGit).toHaveBeenCalledWith("task-2"));
+    await waitFor(() => expect(background).toHaveAttribute("aria-current", "page"));
+    expect(within(background).queryByRole("img")).not.toBeInTheDocument();
+  });
+
+  it("fully invalidates loaded diffs when settlement has no reported file paths", async () => {
+    const workspace = await bridgeMock.loadWorkspace();
+    const loadedFile = {
+      path: "src/settled.ts",
+      status: "modified" as const,
+      additions: 1,
+      deletions: 0,
+      staged: false,
+      lines: [{ kind: "add" as const, newNumber: 1, content: "before" }],
+      diffLoaded: true,
+    };
+    workspace.git = {
+      ...createEmptySnapshot().git,
+      kind: "repository",
+      branch: "main",
+      worktree: "H:\\Code\\sample",
+      files: [loadedFile],
+    };
+    const refreshedFile = { ...loadedFile, lines: [], diffLoaded: false };
+    bridgeMock.loadWorkspace.mockResolvedValue(workspace);
+    bridgeMock.loadTaskGit
+      .mockReset()
+      .mockResolvedValueOnce(workspace.git)
+      .mockResolvedValueOnce({ ...workspace.git, files: [refreshedFile] });
+
+    render(<App />);
+    await waitFor(() => expect(bridgeMock.loadTaskGit).toHaveBeenCalledTimes(1));
+
+    act(() => {
+      runtimeListener?.(
+        projection(29, {
+          kind: "turnChanged",
+          turn: { id: "turn-settled", status: "completed", stopRequested: false },
+        }),
+      );
+    });
+    await waitFor(() => expect(bridgeMock.loadTaskGit).toHaveBeenCalledTimes(2));
+
+    fireEvent.click(screen.getByRole("tab", { name: "Review" }));
+    await waitFor(() =>
+      expect(bridgeMock.loadTaskGitFile).toHaveBeenCalledWith(
+        "task-1",
+        expect.objectContaining({ path: "src/settled.ts", diffLoaded: false }),
+      ),
+    );
   });
 
   it("ignores an older Git refresh that resolves after a newer one", async () => {
@@ -1273,10 +1341,10 @@ describe("native runtime recovery UI", () => {
     });
     await waitFor(() => expect(bridgeMock.loadTaskGit).toHaveBeenCalledTimes(3));
 
-    const gitSnapshot = (path: string) => ({
+    const gitSnapshot = (branch: string, path: string) => ({
       ...createEmptySnapshot().git,
       kind: "repository" as const,
-      branch: "main",
+      branch,
       worktree: "H:\\Code\\sample",
       files: [
         {
@@ -1290,11 +1358,12 @@ describe("native runtime recovery UI", () => {
       ],
     });
 
-    await act(async () => resolveNewer(gitSnapshot("src/newer.ts")));
-    expect(await screen.findByText("newer.ts")).toBeInTheDocument();
-    await act(async () => resolveOlder(gitSnapshot("src/older.ts")));
-    expect(screen.getByText("newer.ts")).toBeInTheDocument();
-    expect(screen.queryByText("older.ts")).not.toBeInTheDocument();
+    const titleDetail = document.querySelector(".titlebar-title-detail");
+    await act(async () => resolveNewer(gitSnapshot("newer", "src/newer.ts")));
+    await waitFor(() => expect(titleDetail).toHaveTextContent("newer"));
+    await act(async () => resolveOlder(gitSnapshot("older", "src/older.ts")));
+    expect(titleDetail).toHaveTextContent("newer");
+    expect(titleDetail).not.toHaveTextContent("older");
   });
 
   it("debounces provider file changes into a live Git refresh", async () => {

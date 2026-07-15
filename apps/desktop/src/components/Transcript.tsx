@@ -637,7 +637,7 @@ export function Transcript({
               copied={copiedEventId === event.id}
               copyFailed={copyFailureId === event.id}
               isLatestAssistant={isLatestAssistant}
-              running={running}
+              running={isLatestAssistant && running}
               canRegenerate={Boolean(onRegenerate)}
               canAskAbout={Boolean(onAskAbout)}
               onCopy={copyMessage}

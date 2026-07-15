@@ -370,6 +370,34 @@ describe("RightRail", () => {
     expect(screen.getByTitle("Open src/runtime/router.ts")).toHaveAttribute("data-tree-depth", "2");
   });
 
+  it("fades the selection pill before its active folder collapses and restores it in place", async () => {
+    setup({
+      activeFilePath: "src/runtime/router.ts",
+      projectFiles: [
+        { path: "src/runtime/router.ts", size: 1200 },
+        { path: "src/runtime/index.ts", size: 900 },
+      ],
+    });
+    fireEvent.click(screen.getByRole("tab", { name: "Files" }));
+
+    await waitFor(() => expect(document.querySelector(".file-tree-active")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Collapse folder src/runtime" }));
+    expect(screen.getByRole("button", { name: "Collapse folder src/runtime" })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(document.querySelector(".file-tree-active")).toHaveStyle({ opacity: "0" }),
+    );
+    expect(screen.getByTitle("Open src/runtime/router.ts")).toHaveStyle({ opacity: "0" });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Expand folder src/runtime" })).toBeInTheDocument(),
+    );
+    await waitFor(() =>
+      expect(document.querySelector(".file-tree-active")).not.toBeInTheDocument(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand folder src/runtime" }));
+    await waitFor(() => expect(document.querySelector(".file-tree-active")).toBeInTheDocument());
+  });
+
   it("marks unavailable vendor plan data instead of inventing a plan percentage", () => {
     setup({ runtime: "claude" });
     fireEvent.click(screen.getByRole("tab", { name: "Usage" }));

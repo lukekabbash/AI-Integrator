@@ -19,6 +19,15 @@ export interface TaskActivityUpdate {
   unread?: boolean;
 }
 
+export function isFrameBatchableRuntimeProjection(event: RuntimeProjectionEvent): boolean {
+  return (
+    event.projection.kind === "itemChanged" &&
+    event.projection.item.status === "inProgress" &&
+    (event.projection.item.kind === "agentMessage" ||
+      event.projection.item.kind === "reasoningSummary")
+  );
+}
+
 /**
  * Projects provider activity into the compact task state used by the sidebar.
  * This deliberately reacts only to lifecycle and attention events: streaming
@@ -190,6 +199,86 @@ export function applyRuntimeProjection(
   }
 }
 
+function applyItemProjectionRun(
+  state: RuntimeProjectionState,
+  events: readonly RuntimeProjectionEvent[],
+  start: number,
+  end: number,
+): RuntimeProjectionState {
+  let lastSeq = state.lastSeq;
+  let items: ItemProjection[] | undefined;
+  let itemIndexes: Map<string, number> | undefined;
+  let firstSeen = state.firstSeen;
+  let firstSeenChanged = false;
+
+  for (let index = start; index < end; index += 1) {
+    const event = events[index];
+    if (event.taskId !== state.taskId || event.seq <= lastSeq) continue;
+
+    const projection = event.projection;
+    if (projection.kind !== "itemChanged") continue;
+    lastSeq = event.seq;
+
+    if (!items || !itemIndexes) {
+      items = [...state.items];
+      itemIndexes = new Map<string, number>();
+      for (const [itemIndex, item] of items.entries()) {
+        if (!itemIndexes.has(item.id)) itemIndexes.set(item.id, itemIndex);
+      }
+    }
+
+    const itemIndex = itemIndexes.get(projection.item.id);
+    if (itemIndex === undefined) {
+      itemIndexes.set(projection.item.id, items.length);
+      items.push(projection.item);
+    } else {
+      items[itemIndex] = projection.item;
+    }
+
+    if (!firstSeen[projection.item.id]) {
+      if (!firstSeenChanged) {
+        firstSeen = { ...firstSeen };
+        firstSeenChanged = true;
+      }
+      firstSeen[projection.item.id] = event.occurredAt;
+    }
+  }
+
+  if (!items) return state;
+  return { ...state, lastSeq, items, firstSeen };
+}
+
+/**
+ * Reduces an ordered publication without repeatedly copying the full item
+ * collection for a streaming burst. Every non-item transition remains on the
+ * canonical single-event reducer, so lifecycle and reset semantics stay in
+ * one place.
+ */
+export function applyRuntimeProjectionBatch(
+  state: RuntimeProjectionState,
+  events: readonly RuntimeProjectionEvent[],
+): RuntimeProjectionState {
+  let next = state;
+  let index = 0;
+
+  while (index < events.length) {
+    if (events[index].projection.kind !== "itemChanged") {
+      next = applyRuntimeProjection(next, events[index]);
+      index += 1;
+      continue;
+    }
+
+    const start = index;
+    while (index < events.length && events[index].projection.kind === "itemChanged") index += 1;
+    next =
+      index - start === 1
+        ? applyRuntimeProjection(next, events[start])
+        : applyItemProjectionRun(next, events, start, index);
+  }
+
+  return next;
+}
+
 function itemStatus(item: ItemProjection, turnSettled: boolean): TranscriptEvent["status"] {
   if (item.status === "failed") return "error";
   if (item.status === "declined") return "warning";
@@ -264,14 +353,16 @@ function toolQuery(input: Record<string, unknown>): string | undefined {
   return candidate?.trim();
 }
 
-function toolSummary(item: ItemProjection): {
+function toolSummary(
+  item: ItemProjection,
+  input: Record<string, unknown>,
+  path: string | undefined,
+  action: ReturnType<typeof toolAction>,
+): {
   title: string;
   body: string;
   changeStats?: { additions: number; deletions: number };
 } {
-  const input = parseToolInput(item.toolInput);
-  const path = toolPath(input);
-  const action = toolAction(item);
   const patchStats = countChangedLines(item.output);
   const oldText = typeof input.oldString === "string" ? input.oldString : input.old_string;
   const newText = typeof input.newString === "string" ? input.newString : input.new_string;
@@ -327,6 +418,7 @@ function itemBody(item: ItemProjection): string {
 
 function itemChangeStats(
   item: ItemProjection,
+  toolChangeStats?: { additions: number; deletions: number },
 ): { additions: number; deletions: number } | undefined {
   if (item.fileChanges?.length) {
     const stats = item.fileChanges.reduce(
@@ -341,7 +433,7 @@ function itemChangeStats(
     );
     return stats.additions || stats.deletions ? stats : undefined;
   }
-  return item.kind === "mcpTool" ? toolSummary(item).changeStats : undefined;
+  return toolChangeStats;
 }
 
 function itemDetails(item: ItemProjection): TranscriptEvent["details"] {
@@ -407,11 +499,11 @@ function syntheticEditPatch(
 
 function toolDiff(
   item: ItemProjection,
+  input: Record<string, unknown>,
   path: string | undefined,
   action: ReturnType<typeof toolAction>,
 ): DiffFile | undefined {
   if (!path || (action !== "edit" && action !== "write")) return undefined;
-  const input = parseToolInput(item.toolInput);
   const oldText =
     typeof input.oldString === "string"
       ? input.oldString
@@ -432,6 +524,21 @@ function toolDiff(
     patch,
     action === "write" && oldText === undefined ? "added" : "modified",
   );
+}
+
+function deriveToolPresentation(item: ItemProjection): {
+  summary: ReturnType<typeof toolSummary>;
+  path: string | undefined;
+  diff: DiffFile | undefined;
+} {
+  const input = parseToolInput(item.toolInput);
+  const path = toolPath(input);
+  const action = toolAction(item);
+  return {
+    summary: toolSummary(item, input, path, action),
+    path,
+    diff: toolDiff(item, input, path, action),
+  };
 }
 
 function fileChangeVerb(
@@ -544,7 +651,94 @@ function groupActivityEvents(events: TranscriptEvent[]): TranscriptEvent[] {
   return grouped;
 }
 
-export function runtimeTranscript(state: RuntimeProjectionState): TranscriptEvent[] {
+function deriveItemTranscriptEvents(
+  item: ItemProjection,
+  timestamp: string,
+  status: TranscriptEvent["status"],
+): TranscriptEvent[] {
+  const hasFileChanges =
+    (item.kind === "fileChange" || item.kind === "mcpTool") && Boolean(item.fileChanges?.length);
+  const toolPresentation =
+    item.kind === "mcpTool" && !hasFileChanges ? deriveToolPresentation(item) : undefined;
+  const common = {
+    id: item.id,
+    body: itemBody(item),
+    nativeSkill: item.nativeSkill,
+    timestamp,
+    status,
+    meta: item.truncated ? "Output truncated" : undefined,
+    changeStats: itemChangeStats(item, toolPresentation?.summary.changeStats),
+  };
+
+  if (item.kind === "userMessage") return [{ ...common, kind: "user" }];
+  if (item.kind === "agentMessage") return [{ ...common, kind: "assistant" }];
+  if (item.kind === "reasoningSummary") {
+    return [
+      {
+        ...common,
+        kind: "activity",
+        activityType: "reasoning",
+        title: item.title ?? "Reasoning summary",
+      },
+    ];
+  }
+  if (hasFileChanges) {
+    return (item.fileChanges ?? []).map((change, index) => ({
+      ...common,
+      id: `${item.id}:file:${index}`,
+      kind: "tool",
+      activityType: "file",
+      filePath: change.path,
+      diff: diffFileFromPatch(change.path, change.patch, diffStatusForChange(change.changeKind)),
+      title: fileChangeVerb(change.changeKind),
+      body: change.path,
+      expandedByDefault: false,
+    }));
+  }
+
+  const summary = toolPresentation?.summary;
+  const diff = toolPresentation?.diff;
+  return [
+    {
+      ...common,
+      kind: "tool",
+      activityType:
+        item.kind === "commandExecution"
+          ? "command"
+          : item.kind === "fileChange"
+            ? "file"
+            : item.kind === "mcpTool"
+              ? "tool"
+              : "other",
+      title:
+        summary?.title ??
+        item.title ??
+        (item.kind === "commandExecution"
+          ? "Command"
+          : item.kind === "fileChange"
+            ? "File changes"
+            : item.kind === "mcpTool"
+              ? [item.mcpServer, item.mcpTool].filter(Boolean).join(" · ") || "Tool call"
+              : "Activity"),
+      body: summary?.body ?? common.body,
+      filePath: toolPresentation?.path,
+      diff,
+      details: diff ? undefined : itemDetails(item),
+      expandedByDefault: false,
+    },
+  ];
+}
+
+type ItemTranscriptDeriver = (
+  item: ItemProjection,
+  timestamp: string,
+  status: TranscriptEvent["status"],
+) => readonly TranscriptEvent[];
+
+function buildRuntimeTranscript(
+  state: RuntimeProjectionState,
+  deriveItem: ItemTranscriptDeriver,
+): TranscriptEvent[] {
   const events: TranscriptEvent[] = [];
   const turnSettled =
     state.turn !== undefined &&
@@ -576,83 +770,13 @@ export function runtimeTranscript(state: RuntimeProjectionState): TranscriptEven
   }
 
   for (const item of state.items) {
-    const common = {
-      id: item.id,
-      body: itemBody(item),
-      nativeSkill: item.nativeSkill,
-      timestamp: state.firstSeen[item.id] ?? item.updatedAt,
-      status: itemStatus(item, turnSettled),
-      meta: item.truncated ? "Output truncated" : undefined,
-      changeStats: itemChangeStats(item),
-    };
-    if (item.kind === "userMessage") events.push({ ...common, kind: "user" });
-    else if (item.kind === "agentMessage") events.push({ ...common, kind: "assistant" });
-    else if (item.kind === "reasoningSummary") {
-      events.push({
-        ...common,
-        kind: "activity",
-        activityType: "reasoning",
-        title: item.title ?? "Reasoning summary",
-      });
-    } else if (
-      // ACP providers (Cursor) report edits as tool calls carrying diff
-      // content blocks, so a tool item with file changes renders the same
-      // per-file diff events as a Codex fileChange item.
-      (item.kind === "fileChange" || item.kind === "mcpTool") &&
-      item.fileChanges?.length
-    ) {
-      item.fileChanges.forEach((change, index) => {
-        const diff = diffFileFromPatch(
-          change.path,
-          change.patch,
-          diffStatusForChange(change.changeKind),
-        );
-        events.push({
-          ...common,
-          id: `${item.id}:file:${index}`,
-          kind: "tool",
-          activityType: "file",
-          filePath: change.path,
-          diff,
-          title: fileChangeVerb(change.changeKind),
-          body: change.path,
-          expandedByDefault: false,
-        });
-      });
-    } else {
-      const summary = item.kind === "mcpTool" ? toolSummary(item) : undefined;
-      const input = item.kind === "mcpTool" ? parseToolInput(item.toolInput) : {};
-      const path = item.kind === "mcpTool" ? toolPath(input) : undefined;
-      const action = item.kind === "mcpTool" ? toolAction(item) : "other";
-      const diff = item.kind === "mcpTool" ? toolDiff(item, path, action) : undefined;
-      events.push({
-        ...common,
-        kind: "tool",
-        activityType:
-          item.kind === "commandExecution"
-            ? "command"
-            : item.kind === "fileChange"
-              ? "file"
-              : item.kind === "mcpTool"
-                ? "tool"
-                : "other",
-        title:
-          summary?.title ??
-          item.title ??
-          (item.kind === "commandExecution"
-            ? "Command"
-            : item.kind === "fileChange"
-              ? "File changes"
-              : item.kind === "mcpTool"
-                ? [item.mcpServer, item.mcpTool].filter(Boolean).join(" · ") || "Tool call"
-                : "Activity"),
-        body: summary?.body ?? common.body,
-        filePath: path,
-        diff,
-        details: diff ? undefined : itemDetails(item),
-        expandedByDefault: false,
-      });
-    }
+    events.push(
+      ...deriveItem(
+        item,
+        state.firstSeen[item.id] ?? item.updatedAt,
+        itemStatus(item, turnSettled),
+      ),
+    );
   }
 
   for (const approval of state.approvals) {
@@ -714,4 +838,36 @@ export function runtimeTranscript(state: RuntimeProjectionState): TranscriptEven
       .sort((a, b) => a.time - b.time || a.index - b.index)
       .map(({ event }) => event),
   );
+}
+
+export function runtimeTranscript(state: RuntimeProjectionState): TranscriptEvent[] {
+  return buildRuntimeTranscript(state, deriveItemTranscriptEvents);
+}
+
+export function createRuntimeTranscriptDeriver(): (
+  state: RuntimeProjectionState,
+) => TranscriptEvent[] {
+  let cachedTaskId: string | undefined;
+  let itemCache = new WeakMap<
+    ItemProjection,
+    {
+      timestamp: string;
+      status: TranscriptEvent["status"];
+      events: readonly TranscriptEvent[];
+    }
+  >();
+
+  return (state) => {
+    if (cachedTaskId !== state.taskId) {
+      cachedTaskId = state.taskId;
+      itemCache = new WeakMap();
+    }
+    return buildRuntimeTranscript(state, (item, timestamp, status) => {
+      const cached = itemCache.get(item);
+      if (cached?.timestamp === timestamp && cached.status === status) return cached.events;
+      const events = deriveItemTranscriptEvents(item, timestamp, status);
+      itemCache.set(item, { timestamp, status, events });
+      return events;
+    });
+  };
 }

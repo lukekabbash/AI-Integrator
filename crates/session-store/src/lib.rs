@@ -668,6 +668,13 @@ const MIGRATIONS: &[(i64, &str)] = &[
             ON queued_messages(task_id, state, position);
         "#,
     ),
+    (
+        15,
+        r#"
+        ALTER TABLE delegations ADD COLUMN permission TEXT NOT NULL DEFAULT 'project-write'
+            CHECK (permission IN ('read-only', 'project-write'));
+        "#,
+    ),
 ];
 
 pub struct LocalStore {

@@ -7878,7 +7878,7 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   display: block;
   pointer-events: none;
   z-index: 0;
-  will-change: transform, width, height;
+  will-change: transform, width, height, opacity;
 }
 .chat-row-active,
 .file-tree-active,

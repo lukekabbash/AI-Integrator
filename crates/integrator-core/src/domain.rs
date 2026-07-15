@@ -410,6 +410,43 @@ pub struct QueuedMessage {
 
 uuid_id!(DelegationId);
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DelegationPermission {
+    ReadOnly,
+    #[default]
+    ProjectWrite,
+}
+
+impl DelegationPermission {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::ProjectWrite => "project-write",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_read_only(&self) -> bool {
+        matches!(self, Self::ReadOnly)
+    }
+}
+
+impl FromStr for DelegationPermission {
+    type Err = crate::IntegratorError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "read-only" => Ok(Self::ReadOnly),
+            "project-write" => Ok(Self::ProjectWrite),
+            _ => Err(crate::IntegratorError::InvalidInput(format!(
+                "unknown delegation permission: {value}"
+            ))),
+        }
+    }
+}
+
 /// Lifecycle of one delegated subagent. Delegation is fully asynchronous:
 /// state changes never interrupt the orchestrator's conversation; they are
 /// pulled via broker tools or surfaced in the UI lineage panel.
@@ -529,6 +566,8 @@ pub struct Delegation {
     pub runtime: String,
     pub model: Option<String>,
     pub effort: Option<String>,
+    #[serde(default)]
+    pub permission: DelegationPermission,
     pub title: String,
     /// The work brief the orchestrator handed over.
     pub brief: String,

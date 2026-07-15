@@ -103,7 +103,8 @@ import { TaskSidebar } from "./components/TaskSidebar";
 import {
   applyRuntimeProjection,
   createRuntimeProjectionState,
-  runtimeTranscript,
+  createRuntimeTranscriptDeriver,
+  isFrameBatchableRuntimeProjection,
   taskActivityUpdate,
   type RuntimeProjectionState,
 } from "./runtimeProjection";
@@ -1349,8 +1350,12 @@ export default function App() {
   const taskGitCache = useRef(new Map<string, GitSnapshot>());
   const taskGitRefreshedAt = useRef(new Map<string, number>());
   const taskGitGeneration = useRef(new Map<string, number>());
+  const taskGitAppliedGeneration = useRef(new Map<string, number>());
   const scheduledTaskGitRefresh = useRef(new Map<string, number>());
-  const taskGitInvalidatedPaths = useRef(new Map<string, Set<string>>());
+  const taskGitInvalidatedPaths = useRef(new Map<string, Set<string> | null>());
+  const delegationLineageTaskIdsRef = useRef(
+    new Set(snapshot.activeTaskId ? [snapshot.activeTaskId] : []),
+  );
   const projectFilesCache = useRef(new Map<string, ProjectFileEntry[]>());
   const activeProjectForFilesRef = useRef<string | undefined>(undefined);
   const composerNoticeSequence = useRef(0);
@@ -1398,9 +1403,11 @@ export default function App() {
       if (expectedGeneration !== undefined && expectedGeneration !== currentGeneration) {
         return false;
       }
+      const appliedGeneration = expectedGeneration ?? currentGeneration + 1;
       if (expectedGeneration === undefined) {
-        taskGitGeneration.current.set(taskId, currentGeneration + 1);
+        taskGitGeneration.current.set(taskId, appliedGeneration);
       }
+      taskGitAppliedGeneration.current.set(taskId, appliedGeneration);
       taskGitCache.current.set(taskId, git);
       taskGitRefreshedAt.current.set(taskId, Date.now());
       if (activeTaskIdRef.current !== taskId) return true;
@@ -1435,24 +1442,58 @@ export default function App() {
     [applyTaskGitSnapshot],
   );
 
+  const invalidateTaskGit = useCallback((taskId: string, paths?: Iterable<string>) => {
+    const current = taskGitInvalidatedPaths.current.get(taskId);
+    if (paths === undefined || current === null) {
+      taskGitInvalidatedPaths.current.set(taskId, null);
+    } else {
+      const invalidated = current ?? new Set<string>();
+      for (const path of paths) invalidated.add(path);
+      taskGitInvalidatedPaths.current.set(taskId, invalidated);
+    }
+    taskGitGeneration.current.set(taskId, (taskGitGeneration.current.get(taskId) ?? 0) + 1);
+  }, []);
+
+  const markTaskGitDirty = useCallback((taskId: string) => {
+    if (!taskGitInvalidatedPaths.current.has(taskId)) {
+      taskGitInvalidatedPaths.current.set(taskId, null);
+    }
+    taskGitGeneration.current.set(taskId, (taskGitGeneration.current.get(taskId) ?? 0) + 1);
+  }, []);
+
+  const refreshInvalidatedTaskGit = useCallback(
+    async (taskId: string): Promise<GitSnapshot | undefined> => {
+      const invalidated = taskGitInvalidatedPaths.current.get(taskId);
+      taskGitInvalidatedPaths.current.delete(taskId);
+      try {
+        const pending = refreshTaskGitSnapshot(taskId, invalidated ?? undefined);
+        const refreshGeneration = taskGitGeneration.current.get(taskId) ?? 0;
+        const git = await pending;
+        if (!git && (taskGitAppliedGeneration.current.get(taskId) ?? 0) < refreshGeneration) {
+          invalidateTaskGit(taskId, invalidated === null ? undefined : (invalidated ?? []));
+        }
+        return git;
+      } catch (error) {
+        invalidateTaskGit(taskId, invalidated === null ? undefined : (invalidated ?? []));
+        throw error;
+      }
+    },
+    [invalidateTaskGit, refreshTaskGitSnapshot],
+  );
+
   const scheduleTaskGitRefresh = useCallback(
     (taskId: string, paths: string[]) => {
-      if (paths.length) {
-        const invalidated = taskGitInvalidatedPaths.current.get(taskId) ?? new Set<string>();
-        for (const path of paths) invalidated.add(path);
-        taskGitInvalidatedPaths.current.set(taskId, invalidated);
-      }
+      invalidateTaskGit(taskId, paths.length > 0 ? paths : undefined);
       const pending = scheduledTaskGitRefresh.current.get(taskId);
       if (pending !== undefined) window.clearTimeout(pending);
       const timer = window.setTimeout(() => {
         scheduledTaskGitRefresh.current.delete(taskId);
-        const invalidated = taskGitInvalidatedPaths.current.get(taskId);
-        taskGitInvalidatedPaths.current.delete(taskId);
-        void refreshTaskGitSnapshot(taskId, invalidated).catch(() => undefined);
+        if (activeTaskIdRef.current !== taskId) return;
+        void refreshInvalidatedTaskGit(taskId).catch(() => undefined);
       }, 250);
       scheduledTaskGitRefresh.current.set(taskId, timer);
     },
-    [refreshTaskGitSnapshot],
+    [invalidateTaskGit, refreshInvalidatedTaskGit],
   );
 
   useEffect(() => {
@@ -1616,10 +1657,12 @@ export default function App() {
               event.projection.kind === "itemChanged" &&
               event.projection.item.kind === "fileChange"
             ) {
-              scheduleTaskGitRefresh(
-                event.taskId,
-                event.projection.item.fileChanges?.map((change) => change.path) ?? [],
-              );
+              const paths = event.projection.item.fileChanges?.map((change) => change.path) ?? [];
+              if (event.taskId === activeTaskIdRef.current) {
+                scheduleTaskGitRefresh(event.taskId, paths);
+              } else {
+                invalidateTaskGit(event.taskId, paths.length > 0 ? paths : undefined);
+              }
             }
             if (!projectionReady.current) {
               recordRuntimeVerificationEvent(event, verifiedRuntimesRef.current);
@@ -1643,15 +1686,16 @@ export default function App() {
                 persistedActivity.status === "failed" ||
                 persistedActivity.status === "stopped"
               ) {
+                markTaskGitDirty(event.taskId);
                 const pendingRefresh = scheduledTaskGitRefresh.current.get(event.taskId);
                 if (pendingRefresh !== undefined) window.clearTimeout(pendingRefresh);
                 scheduledTaskGitRefresh.current.delete(event.taskId);
-                const invalidated = taskGitInvalidatedPaths.current.get(event.taskId);
-                taskGitInvalidatedPaths.current.delete(event.taskId);
                 void bridge
                   .setTaskStatus?.(event.taskId, persistedActivity.status)
                   .catch(() => undefined);
-                void refreshTaskGitSnapshot(event.taskId, invalidated).catch(() => undefined);
+                if (event.taskId === activeTaskIdRef.current) {
+                  void refreshInvalidatedTaskGit(event.taskId).catch(() => undefined);
+                }
               }
             }
             if (!projectionReady.current) {
@@ -1659,12 +1703,7 @@ export default function App() {
               return;
             }
             if (event.taskId !== projectionTaskId.current) return;
-            const isStreamingText =
-              event.projection.kind === "itemChanged" &&
-              event.projection.item.status === "inProgress" &&
-              (event.projection.item.kind === "agentMessage" ||
-                event.projection.item.kind === "reasoningSummary");
-            if (isStreamingText) {
+            if (isFrameBatchableRuntimeProjection(event)) {
               // Preserve and apply every normalized projection in sequence,
               // but commit text-only presentation updates once per frame.
               // Tool state, approvals, errors, stop/completion and connection
@@ -1687,8 +1726,11 @@ export default function App() {
             return;
           }
         }
-        const loaded = await bridge.loadWorkspace();
-        const persisted = (await Promise.resolve(bridge.listSettings?.()).catch(() => [])) ?? [];
+        const [loaded, persistedSettings] = await Promise.all([
+          bridge.loadWorkspace(),
+          Promise.resolve(bridge.listSettings?.()).catch(() => []),
+        ]);
+        const persisted = persistedSettings ?? [];
         if (!active) return;
         // Composer defaults (runtime, effort, permission, Enter behavior) are
         // committed before the workspace renders so its pickers mount with
@@ -1737,7 +1779,7 @@ export default function App() {
           void reconcileTaskProjection(loaded.activeTaskId, true);
           const taskId = loaded.activeTaskId;
           activeTaskIdRef.current = taskId;
-          void refreshTaskGitSnapshot(taskId)
+          void refreshInvalidatedTaskGit(taskId)
             .catch(() => undefined)
             .finally(() => {
               if (active) setGitLoading(false);
@@ -1770,7 +1812,9 @@ export default function App() {
     composerDraftStore,
     nativeHost,
     reconcileTaskProjection,
-    refreshTaskGitSnapshot,
+    invalidateTaskGit,
+    markTaskGitDirty,
+    refreshInvalidatedTaskGit,
     scheduleTaskGitRefresh,
   ]);
 
@@ -1784,6 +1828,9 @@ export default function App() {
   // are cheap notifications, so a full re-list keeps the panel authoritative.
   useEffect(() => {
     activeTaskIdRef.current = snapshot.activeTaskId;
+    delegationLineageTaskIdsRef.current = new Set(
+      snapshot.activeTaskId ? [snapshot.activeTaskId] : [],
+    );
   }, [snapshot.activeTaskId]);
   const refreshDelegations = useCallback(
     async (taskId: string | undefined) => {
@@ -1798,6 +1845,9 @@ export default function App() {
         const rows: DelegationView[] = [];
         const pending = [taskId];
         const visitedTasks = new Set<string>();
+        if (activeTaskIdRef.current === taskId) {
+          delegationLineageTaskIdsRef.current = visitedTasks;
+        }
         while (pending.length > 0 && visitedTasks.size < 64) {
           const parentTaskId = pending.shift();
           if (!parentTaskId || visitedTasks.has(parentTaskId)) continue;
@@ -1813,7 +1863,7 @@ export default function App() {
         }
         if (activeTaskIdRef.current === taskId) setDelegations(rows);
       } catch {
-        setDelegations([]);
+        if (activeTaskIdRef.current === taskId) setDelegations([]);
       }
     },
     [nativeHost],
@@ -1853,8 +1903,10 @@ export default function App() {
     let active = true;
     let unlisten: (() => void) | undefined;
     void (async () => {
-      unlisten = await bridge.subscribeDelegationUpdates?.(() => {
-        if (active) void refreshDelegations(activeTaskIdRef.current);
+      unlisten = await bridge.subscribeDelegationUpdates?.((parentTaskId) => {
+        if (active && delegationLineageTaskIdsRef.current.has(parentTaskId)) {
+          void refreshDelegations(activeTaskIdRef.current);
+        }
       });
       if (!active) unlisten?.();
     })();
@@ -2158,10 +2210,12 @@ export default function App() {
     const cachedGit =
       taskCachedGit ?? (nativeHost && sharesActiveRepository ? snapshot.git : undefined);
     const gitRefreshedAt = taskGitRefreshedAt.current.get(taskId) ?? 0;
+    const taskGitIsDirty = taskGitInvalidatedPaths.current.has(taskId);
     const refreshTaskGit =
       nativeHost &&
-      !sharesActiveRepository &&
-      (!taskCachedGit || Date.now() - gitRefreshedAt >= GIT_CACHE_TTL_MS);
+      (taskGitIsDirty ||
+        (!sharesActiveRepository &&
+          (!taskCachedGit || Date.now() - gitRefreshedAt >= GIT_CACHE_TTL_MS)));
     // Cached conversations commit in the same frame. Authoritative transcript
     // storage still reconciles below; Git only refreshes when checkout identity
     // changes, and a stale cached checkout never gives way to a loading flash.
@@ -2226,7 +2280,10 @@ export default function App() {
         if (generation === navigationGeneration.current) setSwitchingTaskId("");
       });
       if (refreshTaskGit) {
-        void refreshTaskGitSnapshot(taskId)
+        const pendingRefresh = scheduledTaskGitRefresh.current.get(taskId);
+        if (pendingRefresh !== undefined) window.clearTimeout(pendingRefresh);
+        scheduledTaskGitRefresh.current.delete(taskId);
+        void refreshInvalidatedTaskGit(taskId)
           .catch((error: unknown) => {
             if (generation !== navigationGeneration.current) return;
             setOperationError(error instanceof Error ? error.message : "Could not load Git state");
@@ -3494,12 +3551,13 @@ export default function App() {
   const pendingApproval = runtimeState?.approvals.find(
     (approval) => approval.state === "pending" || approval.state === "responseFailed",
   );
+  const deriveNativeRuntimeTranscript = useMemo(() => createRuntimeTranscriptDeriver(), []);
   const nativeRuntimeEvents = useMemo(
     () =>
       nativeHost && runtimeState && runtimeState.taskId === activeTask?.id
-        ? runtimeTranscript(runtimeState)
+        ? deriveNativeRuntimeTranscript(runtimeState)
         : [],
-    [activeTask?.id, nativeHost, runtimeState],
+    [activeTask?.id, deriveNativeRuntimeTranscript, nativeHost, runtimeState],
   );
   const optimisticForActiveTask =
     nativeHost && optimisticUserMessage?.taskId === activeTask?.id ? optimisticUserMessage : null;

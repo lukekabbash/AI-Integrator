@@ -24,8 +24,9 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use chrono::Utc;
 use integrator_core::{
-    Delegation, DelegationId, DelegationSender, DelegationStatus, IntegratorError, ItemKind,
-    ItemProjection, ItemStatus, ProviderKind, Result, RuntimeBinding, TaskId, TurnStatus,
+    Delegation, DelegationId, DelegationPermission, DelegationSender, DelegationStatus,
+    IntegratorError, ItemKind, ItemProjection, ItemStatus, ProviderKind, Result, RuntimeBinding,
+    TaskId, TurnStatus,
 };
 use integrator_runtime::{
     ProjectionMutation, ReducedProviderEvent, StructuredCliEventKind, StructuredCliLaunchOptions,
@@ -272,8 +273,10 @@ fn child_preamble(
     preferred_children: &[String],
 ) -> String {
     let mut block = format!(
-        "<subagent-brief>\nYou are a delegated subagent working on behalf of an orchestrator agent in this repository. Your assignment: {}\n\n{}\n",
-        delegation.title, delegation.brief
+        "<subagent-brief>\nYou are a delegated subagent working on behalf of an orchestrator agent in this repository. Your assignment: {}\nWorkspace permission: {}. This boundary is enforced by the host; do not ask to widen it.\n\n{}\n",
+        delegation.title,
+        delegation.permission.as_str(),
+        delegation.brief
     );
     if let Some(instruction) = profile
         .and_then(|profile| profile.instruction.as_deref())
@@ -718,6 +721,10 @@ async fn delegate_start(
         .ok_or_else(|| IntegratorError::InvalidInput("title is required".into()))?;
     let brief = text_param(params, "brief")
         .ok_or_else(|| IntegratorError::InvalidInput("brief is required".into()))?;
+    let permission = text_param(params, "permission")
+        .map(|value| DelegationPermission::from_str(&value))
+        .transpose()?
+        .unwrap_or_default();
 
     let state = app.state::<AppState>();
     let profile = enabled_profile(&state.store, &profile_id)?;
@@ -736,6 +743,7 @@ async fn delegate_start(
         runtime: profile.runtime.clone(),
         model: profile.model.clone(),
         effort: profile.effort.clone(),
+        permission,
         title: requested_title.clone(),
         brief,
         status: if manual {
@@ -757,6 +765,7 @@ async fn delegate_start(
         return Ok(json!({
             "delegationId": delegation.id.to_string(),
             "status": delegation.status.as_str(),
+            "permission": delegation.permission.as_str(),
             "note": "Waiting for the user to approve this delegation in the task's Agents rail (right panel). Chat-level tool-call approval does not launch it — if it stays pending, ask the user to press Approve in the Agents rail. Continue other work; check delegation_status later.",
         }));
     }
@@ -776,6 +785,7 @@ async fn delegate_start(
     Ok(json!({
         "delegationId": delegation.id.to_string(),
         "status": delegation.status.as_str(),
+        "permission": delegation.permission.as_str(),
         "note": "Subagent launched asynchronously. Continue your own work; poll delegation_status when convenient.",
     }))
 }
@@ -813,6 +823,7 @@ fn delegation_status(
             "title": delegation.title,
             "profile": delegation.profile_label,
             "runtime": delegation.runtime,
+            "permission": delegation.permission.as_str(),
             "status": delegation.status.as_str(),
             "result": delegation.result,
             "messagesFromSubagent": bodies,
@@ -836,6 +847,7 @@ fn delegation_result(app: &AppHandle<tauri::Wry>, delegation: &Delegation) -> Re
     });
     Ok(json!({
         "delegationId": delegation.id.to_string(),
+        "permission": delegation.permission.as_str(),
         "status": delegation.status.as_str(),
         "result": delegation.result,
         "transcriptDigest": digest,
@@ -1224,6 +1236,7 @@ async fn spawn_structured_child(
             cwd,
             model: delegation.model.clone(),
             effort: delegation.effort.clone(),
+            permission: delegation.permission,
             mcp_config,
             session_ref,
         },
@@ -1246,14 +1259,20 @@ async fn spawn_codex_child(
         client_version: env!("CARGO_PKG_VERSION").into(),
     })
     .await?;
-    // Children run unattended: never block on approvals; the workspace-write
-    // sandbox is the enforcement boundary instead.
+    let sandbox = if delegation.permission.is_read_only() {
+        "read-only"
+    } else {
+        "workspace-write"
+    };
+    // Children run unattended: never block on approvals; their persisted
+    // delegation permission selects the actual Codex sandbox boundary.
     let response = client
-        .start_thread_with_approval(
+        .start_thread_with_policies(
             &cwd,
             delegation.model.as_deref(),
             delegation.effort.as_deref(),
             "never",
+            sandbox,
         )
         .await?;
     let thread_id = response
@@ -1299,14 +1318,18 @@ async fn spawn_codex_child(
     Ok(child)
 }
 
-/// The mode a delegated ACP child must run in: agents that advertise session
-/// modes (Cursor: Agent/Plan/Ask) could otherwise start in whatever mode the
-/// user's CLI last used, leaving a brief planned or answered read-only
-/// instead of executed. Returns `None` when no switch is needed.
-fn acp_agent_mode_target(response: &Value) -> Option<String> {
+/// Select the ACP mode matching the persisted child permission. Cursor's Ask
+/// mode is its read-only surface; writing children use Agent. Providers that
+/// do not advertise modes keep their provider default.
+fn acp_agent_mode_target(response: &Value, permission: DelegationPermission) -> Option<String> {
     let modes = parse_acp_mode_state(response)?;
+    let requested = if permission.is_read_only() {
+        "ask"
+    } else {
+        "agent"
+    };
     let target = modes.available_modes.iter().find(|mode| {
-        mode.id.eq_ignore_ascii_case("agent") || mode.name.eq_ignore_ascii_case("agent")
+        mode.id.eq_ignore_ascii_case(requested) || mode.name.eq_ignore_ascii_case(requested)
     })?;
     (target.id != modes.current_mode_id).then(|| target.id.clone())
 }
@@ -1494,7 +1517,7 @@ async fn spawn_acp_child(
             provider.as_str()
         )));
     };
-    if let Some(mode_id) = acp_agent_mode_target(&response) {
+    if let Some(mode_id) = acp_agent_mode_target(&response, delegation.permission) {
         let _ = client.set_mode(&session_id, &mode_id).await;
     }
     apply_acp_child_routing(
@@ -1528,6 +1551,7 @@ async fn spawn_acp_child(
         context_primer: Arc::new(std::sync::Mutex::new(None)),
         delegation_preamble: Arc::new(std::sync::Mutex::new(None)),
         unattended: true,
+        read_only: delegation.permission.is_read_only(),
     };
     crate::commands::spawn_acp_pump(app.clone(), Arc::clone(&state.store), runtime.clone());
     Ok(DelegationChild {
@@ -1561,6 +1585,7 @@ async fn start_child_turn(
                 cwd,
                 model,
                 effort,
+                permission,
                 mcp_config,
                 session_ref,
             } => {
@@ -1575,7 +1600,11 @@ async fn start_child_turn(
                     model: model.clone(),
                     effort: effort.clone(),
                     resume_session_id: session_ref.lock().expect("session lock").clone(),
-                    permission_mode: StructuredPermissionMode::AcceptEdits,
+                    permission_mode: if permission.is_read_only() {
+                        StructuredPermissionMode::ReadOnly
+                    } else {
+                        StructuredPermissionMode::AcceptEdits
+                    },
                     mcp_config_path: mcp_config.clone(),
                 };
                 let turn_id = runtime.client.start_turn(options, prompt.clone()).await?;
@@ -2395,7 +2424,14 @@ mod tests {
                 ]
             }
         });
-        assert_eq!(acp_agent_mode_target(&planning), Some("agent".into()));
+        assert_eq!(
+            acp_agent_mode_target(&planning, DelegationPermission::ProjectWrite),
+            Some("agent".into())
+        );
+        assert_eq!(
+            acp_agent_mode_target(&planning, DelegationPermission::ReadOnly),
+            Some("ask".into())
+        );
 
         let already_agent = json!({
             "modes": {
@@ -2403,10 +2439,16 @@ mod tests {
                 "availableModes": [{ "id": "agent", "name": "Agent" }]
             }
         });
-        assert_eq!(acp_agent_mode_target(&already_agent), None);
+        assert_eq!(
+            acp_agent_mode_target(&already_agent, DelegationPermission::ProjectWrite),
+            None
+        );
         // Agents without session modes (Grok) skip the pin entirely.
         assert_eq!(
-            acp_agent_mode_target(&json!({ "sessionId": "session-1" })),
+            acp_agent_mode_target(
+                &json!({ "sessionId": "session-1" }),
+                DelegationPermission::ReadOnly
+            ),
             None
         );
     }
@@ -2497,6 +2539,7 @@ mod tests {
             runtime: "claude".into(),
             model: Some("claude-fable-5".into()),
             effort: Some("high".into()),
+            permission: DelegationPermission::ReadOnly,
             title: "Interaction audit".into(),
             brief: "Review the flow".into(),
             status: DelegationStatus::Starting,
@@ -2520,5 +2563,6 @@ mod tests {
         assert!(prompt.contains("Test keyboard and reduced-motion behavior."));
         assert!(prompt.contains("Luna explorer"));
         assert!(prompt.contains("task_complete"));
+        assert!(prompt.contains("Workspace permission: read-only"));
     }
 }

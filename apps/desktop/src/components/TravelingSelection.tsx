@@ -12,6 +12,8 @@ interface TravelingSelectionProps {
   activeKey: string;
   className: string;
   layoutKey: string;
+  visible?: boolean;
+  onHidden?: () => void;
 }
 
 const selectionSpring = {
@@ -59,7 +61,13 @@ function measureTarget(target: HTMLElement, container: HTMLElement): SelectionBo
   };
 }
 
-export function TravelingSelection({ activeKey, className, layoutKey }: TravelingSelectionProps) {
+export function TravelingSelection({
+  activeKey,
+  className,
+  layoutKey,
+  visible = true,
+  onHidden,
+}: TravelingSelectionProps) {
   const reduceMotion =
     Boolean(useReducedMotion()) ||
     (typeof document !== "undefined" && document.documentElement.dataset.motion === "none");
@@ -83,6 +91,10 @@ export function TravelingSelection({ activeKey, className, layoutKey }: Travelin
 
     let measureFrame = 0;
     const measure = () => {
+      if (!target.isConnected || !container.contains(target)) {
+        setBounds(null);
+        return;
+      }
       const next = measureTarget(target, container);
       setBounds((current) => (sameBounds(current, next) ? current : next));
     };
@@ -120,8 +132,22 @@ export function TravelingSelection({ activeKey, className, layoutKey }: Travelin
         y: bounds.y,
         width: bounds.width,
         height: bounds.height,
+        opacity: visible ? 1 : 0,
       }}
-      transition={reduceMotion ? { duration: 0 } : selectionSpring}
+      transition={
+        reduceMotion
+          ? { duration: 0 }
+          : {
+              x: selectionSpring,
+              y: selectionSpring,
+              width: selectionSpring,
+              height: selectionSpring,
+              opacity: { duration: visible ? 0.08 : 0.07, ease: "easeOut" },
+            }
+      }
+      onAnimationComplete={() => {
+        if (!visible) onHidden?.();
+      }}
       aria-hidden="true"
     />
   );

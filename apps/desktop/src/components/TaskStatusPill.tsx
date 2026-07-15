@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { memo, useEffect, useState, type ReactNode } from "react";
 import { AnimatePresence, m as motion } from "motion/react";
 import type { RuntimeUsageProjection } from "../bridge";
 
@@ -55,7 +55,7 @@ function ClockFace() {
 }
 
 /** Floating run vitals centered above the composer-attached queue shelf. */
-export function TaskStatusPill({
+export const TaskStatusPill = memo(function TaskStatusPill({
   runningSince,
   usage,
   activeAgentCount,
@@ -144,4 +144,4 @@ export function TaskStatusPill({
       </div>
     </div>
   );
-}
+});

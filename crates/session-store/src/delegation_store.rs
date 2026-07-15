@@ -2,8 +2,8 @@ use std::str::FromStr;
 
 use chrono::Utc;
 use integrator_core::{
-    Delegation, DelegationId, DelegationMessage, DelegationSender, DelegationStatus,
-    IntegratorError, Result, TaskId,
+    Delegation, DelegationId, DelegationMessage, DelegationPermission, DelegationSender,
+    DelegationStatus, IntegratorError, Result, TaskId,
 };
 use rusqlite::{OptionalExtension, params};
 
@@ -20,6 +20,7 @@ pub struct NewDelegation {
     pub runtime: String,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub permission: DelegationPermission,
     pub title: String,
     pub brief: String,
     pub status: DelegationStatus,
@@ -36,7 +37,7 @@ fn bounded(value: &str, limit: usize) -> String {
     format!("{}…[truncated]", &value[..end])
 }
 
-const DELEGATION_COLUMNS: &str = "id, parent_task_id, child_task_id, profile_id, profile_label, runtime, model, effort, title, brief, status, result, child_session_ref, created_at, updated_at";
+const DELEGATION_COLUMNS: &str = "id, parent_task_id, child_task_id, profile_id, profile_label, runtime, model, effort, permission, title, brief, status, result, child_session_ref, created_at, updated_at";
 
 impl LocalStore {
     pub fn create_delegation(&self, input: NewDelegation) -> Result<Delegation> {
@@ -57,6 +58,7 @@ impl LocalStore {
             runtime: input.runtime,
             model: input.model,
             effort: input.effort,
+            permission: input.permission,
             title: title.to_owned(),
             brief: bounded(input.brief.trim(), BRIEF_LIMIT),
             status: input.status,
@@ -68,7 +70,7 @@ impl LocalStore {
         self.connection
             .lock()
             .execute(
-                "INSERT INTO delegations(id, parent_task_id, child_task_id, profile_id, profile_label, runtime, model, effort, title, brief, status, result, child_session_ref, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                "INSERT INTO delegations(id, parent_task_id, child_task_id, profile_id, profile_label, runtime, model, effort, permission, title, brief, status, result, child_session_ref, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     delegation.id.to_string(),
                     delegation.parent_task_id.to_string(),
@@ -78,6 +80,7 @@ impl LocalStore {
                     delegation.runtime,
                     delegation.model,
                     delegation.effort,
+                    delegation.permission.as_str(),
                     delegation.title,
                     delegation.brief,
                     delegation.status.as_str(),
@@ -541,6 +544,7 @@ type DelegationRow = (
     String,
     String,
     String,
+    String,
     Option<String>,
     Option<String>,
     String,
@@ -564,6 +568,7 @@ fn parse_delegation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Dele
         row.get(12)?,
         row.get(13)?,
         row.get(14)?,
+        row.get(15)?,
     );
     Ok(build_delegation(raw))
 }
@@ -578,6 +583,7 @@ fn build_delegation(raw: DelegationRow) -> Result<Delegation> {
         runtime,
         model,
         effort,
+        permission,
         title,
         brief,
         status,
@@ -599,6 +605,7 @@ fn build_delegation(raw: DelegationRow) -> Result<Delegation> {
         runtime,
         model,
         effort,
+        permission: DelegationPermission::from_str(&permission)?,
         title,
         brief,
         status: DelegationStatus::from_str(&status)?,
@@ -657,6 +664,7 @@ mod tests {
             runtime: "codex".into(),
             model: Some("gpt-5.6-codex".into()),
             effort: Some("low".into()),
+            permission: DelegationPermission::ReadOnly,
             title: "Refactor tests".into(),
             brief: "Move helpers into a shared module".into(),
             status: DelegationStatus::Starting,
@@ -670,6 +678,7 @@ mod tests {
             .create_delegation(new_delegation(parent))
             .expect("create delegation");
         assert_eq!(delegation.status, DelegationStatus::Starting);
+        assert_eq!(delegation.permission, DelegationPermission::ReadOnly);
         assert_eq!(store.active_delegation_count(parent).expect("count"), 1);
         let delegation = store
             .compare_and_set_delegation_title(

@@ -8,7 +8,9 @@ use std::{
 use adapter_acp::AcpClient;
 use adapter_codex::CodexClient;
 use directories::ProjectDirs;
-use integrator_core::{IntegratorError, ProviderKind, Result, RuntimeBinding, TaskId};
+use integrator_core::{
+    DelegationPermission, IntegratorError, ProviderKind, Result, RuntimeBinding, TaskId,
+};
 use integrator_runtime::{AuthorizedRepositoryCache, GitService, StructuredCliClient};
 use session_store::LocalStore;
 use tokio::sync::Mutex;
@@ -86,6 +88,9 @@ pub struct AcpRuntime {
     /// immediately (the ACP analog of Codex's approval-policy "never")
     /// instead of parking an approval card no one will answer.
     pub unattended: bool,
+    /// Read-only delegated children reject ACP permission requests instead of
+    /// inheriting the unattended auto-allow behavior used by writing workers.
+    pub read_only: bool,
 }
 
 /// One provider-neutral structured CLI route. The vendor CLI owns auth and
@@ -140,6 +145,7 @@ pub enum DelegationChildDriver {
         cwd: PathBuf,
         model: Option<String>,
         effort: Option<String>,
+        permission: DelegationPermission,
         mcp_config: Option<PathBuf>,
         session_ref: Arc<std::sync::Mutex<Option<String>>>,
     },

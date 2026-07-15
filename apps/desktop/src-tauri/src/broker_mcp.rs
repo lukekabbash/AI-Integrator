@@ -150,12 +150,13 @@ fn tool_definitions(role: &str) -> Vec<Value> {
             }),
             json!({
                 "name": "delegate_start",
-                "description": "Delegate a self-contained subtask to a subagent on another provider. Fully asynchronous: returns a delegationId immediately while the subagent works in the background — continue your own work and check in later. The brief must stand alone: the subagent sees only recent conversation context plus your brief.",
+                "description": "Delegate a self-contained subtask to a subagent on another provider. Fully asynchronous: returns a delegationId immediately while the subagent works in the background — continue your own work and check in later. The brief must stand alone: the subagent sees only recent conversation context plus your brief. Set permission to read-only for research, audits, and repo orientation; use project-write only when the child must modify the workspace.",
                 "annotations": tool_annotations(false, false),
                 "inputSchema": text_schema(json!({
                     "profileId": { "type": "string", "description": "A profileId from peers_list." },
                     "title": { "type": "string", "description": "Short provisional label for the subtask. The app applies its subagent-number convention and may replace this with an automatically generated chat name." },
-                    "brief": { "type": "string", "description": "Complete standalone instructions: goal, constraints, files, and the deliverable you expect back." }
+                    "brief": { "type": "string", "description": "Complete standalone instructions: goal, constraints, files, and the deliverable you expect back." },
+                    "permission": { "type": "string", "enum": ["read-only", "project-write"], "default": "project-write", "description": "Enforced child workspace permission. Use read-only whenever edits are not required." }
                 }), &["profileId", "title", "brief"]),
             }),
             json!({
