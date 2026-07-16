@@ -6,10 +6,18 @@ import {
   useState,
   type KeyboardEvent,
   type MouseEvent,
+  type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
-import { AtSign, FileCode2, LoaderCircle, MessageCircleQuestion, X } from "lucide-react";
+import {
+  AtSign,
+  CornerDownLeft,
+  FileCode2,
+  LoaderCircle,
+  MessageCircleQuestion,
+  X,
+} from "lucide-react";
 import { AnimatePresence, m as motion, useReducedMotion } from "motion/react";
 import { FileIcon } from "./FileIcon";
 import { type SelectionContext, type SelectionPayload } from "./SelectionActionPopover";
@@ -84,6 +92,11 @@ export interface FileExplainPayload extends FileSelectionPayload {
   /** The live editor buffer. Sent rather than read from disk so an explanation
    * describes what is on screen, including unsaved edits. */
   fileText: string;
+  /** Follow-up question; absent on the first ask. */
+  question?: string;
+  /** Prior completed exchanges, oldest first. The helper keeps no session, so
+   * a follow-up's context is whatever rides along here. */
+  history?: Array<{ question: string; answer: string }>;
 }
 
 export interface FileExplainResult {
@@ -92,6 +105,15 @@ export interface FileExplainResult {
    * this is not necessarily the agent the request was addressed to. */
   agentLabel: string;
   usedFallback: boolean;
+}
+
+/** One packet of the ask panel's live answer stream. `attempt` names the
+ * provider about to answer and resets the buffer — a fallback must not append
+ * to a failed primary's partial output. `delta` appends one chunk. */
+export interface FileExplainDelta {
+  kind: "attempt" | "delta";
+  text: string;
+  agentLabel: string;
 }
 
 const INITIAL_FILE_LINES = 400;
@@ -173,53 +195,134 @@ function selectionRangeLabel(payload: SelectionContext): string {
   return `${payload.startLine}`;
 }
 
-type ExplainPanelState =
-  | {
-      payload: FileSelectionPayload;
-      status: "loading";
-    }
-  | {
-      payload: FileSelectionPayload;
-      status: "ready";
-      explanation: string;
-      /** Carried on the result rather than read from the prop: a failed-over
-       * answer must not be attributed to the agent that could not give it. */
-      answeredBy: string;
-      usedFallback: boolean;
-    }
-  | {
-      payload: FileSelectionPayload;
-      status: "error";
-      message: string;
-    };
+/** One completed question/answer pair shown in the ask panel. The first
+ * exchange has no question of its own — it is the initial analysis. */
+interface AskExchange {
+  question?: string;
+  answer: string;
+  /** Carried on the result rather than read from the prop: a failed-over
+   * answer must not be attributed to the agent that could not give it. */
+  answeredBy: string;
+  usedFallback: boolean;
+}
 
-/** Docked explain surface for "Ask about this": stays on the file canvas and
- * shows the selected agent's prose reply in a quiet reading panel. It is
- * intentionally separate from Add to chat / the task transcript. */
-function SelectionExplainPanel({
+interface AskPanelState {
+  payload: FileSelectionPayload;
+  /** Fixed-position anchor, seeded from the context menu and moved by drag. */
+  position: { x: number; y: number };
+  exchanges: AskExchange[];
+  /** The in-flight answer; null when idle. `question` is what is being asked,
+   * `text` grows with the stream, `agentLabel` follows the attempt events so a
+   * fallback is credited live, not only at the end. */
+  live: { text: string; agentLabel: string; question?: string } | null;
+  error: string | null;
+}
+
+const ASK_PANEL_WIDTH = 440;
+
+/** Keep the panel on screen without pinning it: enough must remain visible to
+ * grab the header again. */
+function clampAskPosition(x: number, y: number): { x: number; y: number } {
+  if (typeof window === "undefined") return { x, y };
+  return {
+    x: Math.min(Math.max(8, x), Math.max(8, window.innerWidth - ASK_PANEL_WIDTH - 8)),
+    y: Math.min(Math.max(8, y), Math.max(8, window.innerHeight - 120)),
+  };
+}
+
+/** Floating conversation surface for "Ask about this": opens where the
+ * selection menu was, streams the answer in place, and takes follow-up
+ * questions about the same selection. Draggable by its header, scrollable in
+ * its body, and intentionally separate from Add to chat / the task
+ * transcript. */
+function SelectionAskPanel({
   state,
   agentLabel,
   onClose,
   onAddToChat,
+  onFollowUp,
+  onDrag,
 }: {
-  state: ExplainPanelState;
+  state: AskPanelState;
   agentLabel: string;
   onClose: () => void;
   onAddToChat?: (payload: FileSelectionPayload) => void;
+  onFollowUp: (question: string) => void;
+  onDrag: (position: { x: number; y: number }) => void;
 }) {
   const reduceMotion = useReducedMotion();
   const still =
     Boolean(reduceMotion) ||
     (typeof document !== "undefined" && document.documentElement.dataset.motion === "none");
+  const [question, setQuestion] = useState("");
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const pinnedToBottom = useRef(true);
   const range = selectionRangeLabel(state.payload);
   const title = `${fileName(state.payload.path)}${range ? ` (${range})` : ""}`;
+  const busy = state.live !== null;
+  const latest = state.exchanges.at(-1);
+
+  useEffect(() => {
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  // Follow the stream only while the reader is already at the bottom; a user
+  // who scrolled up to reread is never yanked back down by a delta.
+  useEffect(() => {
+    const body = bodyRef.current;
+    if (body && pinnedToBottom.current) body.scrollTop = body.scrollHeight;
+  }, [state.live?.text, state.exchanges.length, state.error]);
+
+  const startDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    if ((event.target as HTMLElement).closest("button, input")) return;
+    event.preventDefault();
+    const from = { x: event.clientX, y: event.clientY };
+    const origin = state.position;
+    // preventDefault on pointerdown does not stop the browser from growing a
+    // text selection as the pointer crosses the page, so selection is switched
+    // off document-wide for the duration of the drag.
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.userSelect = "none";
+    const onMove = (move: globalThis.PointerEvent) => {
+      onDrag(clampAskPosition(origin.x + move.clientX - from.x, origin.y + move.clientY - from.y));
+    };
+    const stop = () => {
+      window.removeEventListener("pointermove", onMove);
+      document.body.style.userSelect = previousUserSelect;
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", stop, { once: true });
+  };
+
+  const submitFollowUp = () => {
+    const trimmed = question.trim();
+    if (!trimmed || busy) return;
+    setQuestion("");
+    pinnedToBottom.current = true;
+    onFollowUp(trimmed);
+  };
+
+  const status = busy
+    ? `Explaining with ${state.live?.agentLabel ?? agentLabel}…`
+    : state.error
+      ? `${agentLabel} could not explain this selection`
+      : latest?.usedFallback
+        ? `${agentLabel} could not answer, so ${latest.answeredBy} did`
+        : latest
+          ? `Explained by ${latest.answeredBy}`
+          : "";
 
   return (
-    <motion.aside
-      className="selection-explain-panel"
-      role="complementary"
-      aria-label={`Explanation of ${title}`}
-      aria-busy={state.status === "loading"}
+    <motion.section
+      className="selection-ask-panel"
+      role="dialog"
+      aria-label={`Ask about ${title}`}
+      aria-busy={busy}
+      style={{ left: state.position.x, top: state.position.y, width: ASK_PANEL_WIDTH }}
       initial={still ? false : { opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
       exit={
@@ -229,57 +332,101 @@ function SelectionExplainPanel({
       }
       transition={still ? { duration: 0 } : MENU_ENTER}
     >
-      <header className="selection-explain-header">
-        <div className="selection-explain-title">
+      <header
+        className="selection-ask-header"
+        onPointerDown={startDrag}
+        // The header doubles as the drag handle; announce it as one.
+        title="Drag to move"
+      >
+        <div className="selection-ask-title">
           <MessageCircleQuestion aria-hidden="true" />
           <div>
             <strong>Ask about this</strong>
             <small title={state.payload.path}>{title}</small>
           </div>
         </div>
-        <button
-          className="selection-explain-close"
-          type="button"
-          aria-label="Close explanation"
-          title="Close"
-          onClick={onClose}
-        >
-          <X aria-hidden="true" />
-        </button>
-      </header>
-      <p className="selection-explain-agent" role="status" aria-live="polite">
-        {state.status === "loading"
-          ? `Explaining with ${agentLabel}…`
-          : state.status === "error"
-            ? `${agentLabel} could not explain this selection`
-            : state.usedFallback
-              ? `${agentLabel} could not answer, so ${state.answeredBy} did`
-              : `Explained by ${state.answeredBy}`}
-      </p>
-      {state.status === "loading" ? (
-        <div className="selection-explain-loading">
-          <LoaderCircle aria-hidden="true" className="selection-explain-spinner" />
-          <span>Reading the selection…</span>
-        </div>
-      ) : state.status === "error" ? (
-        <p className="selection-explain-error" role="alert">
-          {state.message}
-        </p>
-      ) : (
-        <div className="selection-explain-body">{state.explanation}</div>
-      )}
-      {state.status === "ready" && onAddToChat ? (
-        <footer className="selection-explain-footer">
-          <button
-            className="secondary-button"
-            type="button"
-            onClick={() => onAddToChat(state.payload)}
-          >
-            <AtSign aria-hidden="true" /> Add selection to chat
+        <div className="selection-ask-header-actions">
+          {onAddToChat ? (
+            <button
+              type="button"
+              aria-label="Add selection to chat"
+              title="Add selection to chat"
+              onClick={() => onAddToChat(state.payload)}
+            >
+              <AtSign aria-hidden="true" />
+            </button>
+          ) : null}
+          <button type="button" aria-label="Close explanation" title="Close" onClick={onClose}>
+            <X aria-hidden="true" />
           </button>
-        </footer>
-      ) : null}
-    </motion.aside>
+        </div>
+      </header>
+      <p className="selection-ask-agent" role="status" aria-live="polite">
+        {status}
+      </p>
+      <div
+        className="selection-ask-body"
+        ref={bodyRef}
+        onScroll={(event) => {
+          const body = event.currentTarget;
+          pinnedToBottom.current =
+            body.scrollHeight - body.scrollTop - body.clientHeight < 48;
+        }}
+      >
+        {state.exchanges.map((exchange, index) => (
+          <div className="selection-ask-exchange" key={index}>
+            {exchange.question ? (
+              <p className="selection-ask-question">{exchange.question}</p>
+            ) : null}
+            <div className="selection-ask-answer">{exchange.answer}</div>
+          </div>
+        ))}
+        {state.live ? (
+          <div className="selection-ask-exchange" data-live="true">
+            {state.live.question ? (
+              <p className="selection-ask-question">{state.live.question}</p>
+            ) : null}
+            {state.live.text ? (
+              <div className="selection-ask-answer">{state.live.text}</div>
+            ) : (
+              <div className="selection-ask-loading">
+                <LoaderCircle aria-hidden="true" className="selection-ask-spinner" />
+                <span>Reading the selection…</span>
+              </div>
+            )}
+          </div>
+        ) : null}
+        {state.error ? (
+          <p className="selection-ask-error" role="alert">
+            {state.error}
+          </p>
+        ) : null}
+      </div>
+      <footer className="selection-ask-footer">
+        <input
+          value={question}
+          aria-label="Follow-up question"
+          placeholder={busy ? "Answering…" : "Ask a follow-up…"}
+          disabled={busy || (state.exchanges.length === 0 && !state.error)}
+          onChange={(event) => setQuestion(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              submitFollowUp();
+            }
+          }}
+        />
+        <button
+          type="button"
+          aria-label="Send follow-up"
+          title="Send follow-up"
+          disabled={busy || !question.trim()}
+          onClick={submitFollowUp}
+        >
+          <CornerDownLeft aria-hidden="true" />
+        </button>
+      </footer>
+    </motion.section>
   );
 }
 
@@ -295,7 +442,9 @@ function SelectionContextMenu({
 }: {
   menu: SelectionMenuState | null;
   path: string;
-  onAskAbout?: (payload: FileSelectionPayload) => void;
+  /** The ask panel opens where the menu was, so the gesture hands over its
+   * own coordinates. */
+  onAskAbout?: (payload: FileSelectionPayload, at: { x: number; y: number }) => void;
   onAddComposerContext?: (payload: FileSelectionPayload) => void;
   onClose: () => void;
 }) {
@@ -326,7 +475,7 @@ function SelectionContextMenu({
 
   const askAbout = () => {
     if (!menu) return;
-    onAskAbout?.({ ...menu.context, intent: "ask", path });
+    onAskAbout?.({ ...menu.context, intent: "ask", path }, { x: menu.x, y: menu.y });
     onClose();
   };
 
@@ -409,8 +558,13 @@ export function FileWorkspace({
   /** True when the native host can write edits back to this file. */
   editable?: boolean;
   onSave?: (content: string) => Promise<void>;
-  /** Context menu: open the in-file explain panel for the current agent. */
-  onExplainSelection?: (payload: FileExplainPayload) => Promise<FileExplainResult>;
+  /** Context menu: open the floating ask panel for the current agent. Deltas
+   * stream through the callback while the promise runs; the resolved result
+   * remains the authoritative final text. */
+  onExplainSelection?: (
+    payload: FileExplainPayload,
+    onDelta: (delta: FileExplainDelta) => void,
+  ) => Promise<FileExplainResult>;
   /** Context menu: the selection becomes a removable composer context card. */
   onAddComposerContext?: (payload: FileSelectionPayload) => void;
   /** Label for the active runtime shown in the explain panel. */
@@ -422,7 +576,7 @@ export function FileWorkspace({
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
   const [menu, setMenu] = useState<SelectionMenuState | null>(null);
-  const [explain, setExplain] = useState<ExplainPanelState | null>(null);
+  const [explain, setExplain] = useState<AskPanelState | null>(null);
   const explainRequestId = useRef(0);
   const linesRef = useRef<HTMLOListElement>(null);
   const editorRef = useRef<HTMLTextAreaElement>(null);
@@ -477,33 +631,112 @@ export function FileWorkspace({
     return { text: range.toString(), startLine, endLine };
   }, []);
 
-  const askAboutSelection = useCallback(
-    (payload: FileSelectionPayload) => {
+  /** Run one ask — the initial analysis or a follow-up — streaming deltas
+   * into the panel as they arrive. The request id fences everything: a panel
+   * closed or re-asked mid-stream drops the stale request's packets, result,
+   * and error alike. */
+  const runAsk = useCallback(
+    (
+      payload: FileSelectionPayload,
+      options: {
+        question?: string;
+        history: Array<{ question: string; answer: string }>;
+      },
+    ) => {
       if (!onExplainSelection) return;
       const requestId = ++explainRequestId.current;
-      setExplain({ payload, status: "loading" });
-      void onExplainSelection({ ...payload, fileText: draft })
+      setExplain((current) =>
+        current
+          ? {
+              ...current,
+              error: null,
+              live: { text: "", agentLabel: explainAgentLabel, question: options.question },
+            }
+          : current,
+      );
+      void onExplainSelection(
+        { ...payload, fileText: draft, question: options.question, history: options.history },
+        (delta) => {
+          if (requestId !== explainRequestId.current) return;
+          setExplain((current) => {
+            if (!current?.live) return current;
+            return {
+              ...current,
+              live:
+                delta.kind === "attempt"
+                  ? { ...current.live, text: "", agentLabel: delta.agentLabel }
+                  : { ...current.live, text: current.live.text + delta.text },
+            };
+          });
+        },
+      )
         .then((result) => {
           if (requestId !== explainRequestId.current) return;
-          setExplain({
-            payload,
-            status: "ready",
-            explanation: result.text,
-            answeredBy: result.agentLabel,
-            usedFallback: result.usedFallback,
-          });
+          setExplain((current) =>
+            current
+              ? {
+                  ...current,
+                  live: null,
+                  error: null,
+                  exchanges: [
+                    ...current.exchanges,
+                    {
+                      question: options.question,
+                      answer: result.text,
+                      answeredBy: result.agentLabel,
+                      usedFallback: result.usedFallback,
+                    },
+                  ],
+                }
+              : current,
+          );
         })
         .catch((error: unknown) => {
           if (requestId !== explainRequestId.current) return;
-          setExplain({
-            payload,
-            status: "error",
-            message:
-              error instanceof Error ? error.message : "The selection could not be explained.",
-          });
+          setExplain((current) =>
+            current
+              ? {
+                  ...current,
+                  live: null,
+                  error:
+                    error instanceof Error
+                      ? error.message
+                      : "The selection could not be explained.",
+                }
+              : current,
+          );
         });
     },
-    [onExplainSelection, draft],
+    [onExplainSelection, draft, explainAgentLabel],
+  );
+
+  const askAboutSelection = useCallback(
+    (payload: FileSelectionPayload, at: { x: number; y: number }) => {
+      if (!onExplainSelection) return;
+      setExplain({
+        payload,
+        position: clampAskPosition(at.x, at.y),
+        exchanges: [],
+        live: null,
+        error: null,
+      });
+      runAsk(payload, { history: [] });
+    },
+    [onExplainSelection, runAsk],
+  );
+
+  const askFollowUp = useCallback(
+    (question: string) => {
+      if (!explain) return;
+      runAsk(explain.payload, {
+        question,
+        history: explain.exchanges.map((exchange) => ({
+          question: exchange.question ?? "",
+          answer: exchange.answer,
+        })),
+      });
+    },
+    [explain, runAsk],
   );
 
   const closeExplain = useCallback(() => {
@@ -735,24 +968,28 @@ export function FileWorkspace({
         onAddComposerContext={onAddComposerContext}
         onClose={() => setMenu(null)}
       />
-      <AnimatePresence>
-        {explain ? (
-          <SelectionExplainPanel
-            key="selection-explain"
-            state={explain}
-            agentLabel={explainAgentLabel}
-            onClose={closeExplain}
-            onAddToChat={
-              onAddComposerContext
-                ? (payload) => {
-                    onAddComposerContext({ ...payload, intent: "add" });
-                    closeExplain();
-                  }
-                : undefined
-            }
-          />
-        ) : null}
-      </AnimatePresence>
+      {createPortal(
+        <AnimatePresence>
+          {explain ? (
+            <SelectionAskPanel
+              key="selection-ask"
+              state={explain}
+              agentLabel={explainAgentLabel}
+              onClose={closeExplain}
+              onFollowUp={askFollowUp}
+              onDrag={(position) =>
+                setExplain((current) => (current ? { ...current, position } : current))
+              }
+              onAddToChat={
+                onAddComposerContext
+                  ? (payload) => onAddComposerContext({ ...payload, intent: "add" })
+                  : undefined
+              }
+            />
+          ) : null}
+        </AnimatePresence>,
+        document.body,
+      )}
     </section>
   );
 }

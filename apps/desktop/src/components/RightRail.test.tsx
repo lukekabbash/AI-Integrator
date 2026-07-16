@@ -291,11 +291,25 @@ describe("RightRail", () => {
     expect(glyphs[10]).toHaveAttribute("data-shade", "1");
     expect(glyphs[0]).toHaveAttribute("data-morphing", "true");
     expect(glyphs[0]).toHaveAttribute("data-morph-frames", "4");
+    expect(glyphs[0]).toHaveAttribute("data-motion-family", "forming");
     expect(glyphs[1]).toHaveAttribute("data-morph-frames", "5");
+    expect(glyphs[1]).toHaveAttribute("data-motion-family", "working");
+    expect(glyphs[2]).toHaveAttribute("data-motion-family", "watching");
     expect(glyphs[3]).toHaveAttribute("data-morphing", "false");
     expect(glyphs[3]).toHaveAttribute("data-morph-frames", "1");
+    expect(glyphs[3]).toHaveAttribute("data-motion-family", "resting");
+    expect(glyphs[4]).toHaveAttribute("data-motion-family", "failed");
+    expect(glyphs[5]).toHaveAttribute("data-motion-family", "dormant");
+    expect(glyphs[1]!.querySelector(".agent-glyph-orbit")).toBeInTheDocument();
+    expect(glyphs[3]!.querySelector(".agent-glyph-state-mark")).toBeInTheDocument();
+
+    const workingRow = screen.getByRole("treeitem", { name: /Agent 2/ });
+    fireEvent.pointerEnter(workingRow);
+    expect(glyphs[1]).toHaveAttribute("data-hovered", "true");
+    fireEvent.pointerLeave(workingRow);
+    expect(glyphs[1]).toHaveAttribute("data-hovered", "false");
     expect(tree.querySelectorAll(".agent-route .provider-icon")).toHaveLength(12);
-    expect(screen.getAllByText("gpt-5.6-codex")).toHaveLength(12);
+    expect(screen.getAllByText("GPT-5.6 Codex")).toHaveLength(12);
 
     fireEvent.click(screen.getByRole("treeitem", { name: /Agent 11/ }));
     expect(onSelectDelegation).toHaveBeenCalledWith("delegation-11");

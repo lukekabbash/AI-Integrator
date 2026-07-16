@@ -30,6 +30,7 @@ import {
   type RuntimeId,
 } from "../bridge";
 import type { ComposerNotice } from "../composerNotices";
+import { prettyModelLabel, resolveModelLabel } from "../modelLabel";
 import type { RuntimeRouteDefaults } from "../routingDefaults";
 import { Dropdown, ProviderIcon } from "./Dropdown";
 import { appendVoiceSegment, insertVoiceText, type VoiceInsertAnchor } from "./voiceTyping";
@@ -444,6 +445,47 @@ function encodePcm16(samples: Float32Array, sourceRate: number): number[] {
   return bytes;
 }
 
+/** Session-persistent slash-menu cache so enabled skills render instantly
+ * while the authoritative provider list refreshes in the background. A
+ * cached action whose handle went stale fails loudly at send with the
+ * existing "choose it again" flow. */
+const NATIVE_ACTION_CACHE_KEY = "aiintegrator.native-actions.v1";
+const NATIVE_ACTION_CACHE_LIMIT = 24;
+
+function readNativeActionCache(): Record<string, NativeProviderAction[]> {
+  try {
+    const raw = window.localStorage?.getItem(NATIVE_ACTION_CACHE_KEY);
+    if (!raw) return {};
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const cache: Record<string, NativeProviderAction[]> = {};
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!Array.isArray(value)) continue;
+      cache[key] = value.filter(
+        (action): action is NativeProviderAction =>
+          Boolean(action) &&
+          typeof action === "object" &&
+          typeof (action as { name?: unknown }).name === "string" &&
+          typeof (action as { id?: unknown }).id === "string",
+      );
+    }
+    return cache;
+  } catch {
+    return {};
+  }
+}
+
+function writeNativeActionCache(cache: Record<string, NativeProviderAction[]>) {
+  try {
+    const bounded = Object.fromEntries(
+      Object.entries(cache).slice(-NATIVE_ACTION_CACHE_LIMIT),
+    );
+    window.localStorage?.setItem(NATIVE_ACTION_CACHE_KEY, JSON.stringify(bounded));
+  } catch {
+    // The cache is a warm-start optimization only.
+  }
+}
+
 export function Composer({
   runtimes,
   defaultRuntime,
@@ -520,11 +562,12 @@ export function Composer({
   const providerCatalogLoads = useRef(new Set<RuntimeId>());
   const [nativeActionsByKey, setNativeActionsByKey] = useState<
     Record<string, NativeProviderAction[]>
-  >({});
+  >(() => readNativeActionCache());
   const [nativeActionsError, setNativeActionsError] = useState("");
   const [nativeActionsLoadingKey, setNativeActionsLoadingKey] = useState("");
   const [nativeActionRetry, setNativeActionRetry] = useState(0);
   const nativeActionLoads = useRef(new Set<string>());
+  const nativeActionRefreshes = useRef(new Set<string>());
   const composerTextMirrorRef = useRef<HTMLDivElement>(null);
   const [voiceConfigured, setVoiceConfigured] = useState<boolean | null>(null);
   const [voicePhase, setVoicePhase] = useState<VoicePhase>("idle");
@@ -560,7 +603,7 @@ export function Composer({
   const runtimeCatalog =
     selectedRuntime?.models
       .filter((id) => id !== PROVIDER_DEFAULT_MODEL)
-      .map((id) => ({ id, label: id })) ?? [];
+      .map((id) => ({ id, label: resolveModelLabel(id) })) ?? [];
   const catalog = (providerCatalogs[runtime] ?? runtimeCatalog).filter(
     (entry) => entry.id !== PROVIDER_DEFAULT_MODEL,
   );
@@ -568,11 +611,16 @@ export function Composer({
   const activeModel = activeEntry?.id ?? (model || PROVIDER_DEFAULT_MODEL);
   const modelOptions =
     catalog.length > 0
-      ? catalog.map((entry) => ({ value: entry.id, label: entry.label }))
+      ? catalog.map((entry) => ({
+          value: entry.id,
+          label: entry.label || resolveModelLabel(entry.id),
+        }))
       : [
           {
             value: activeModel,
-            label: catalogLoaded ? activeModel : "Checking model…",
+            label: catalogLoaded
+              ? prettyModelLabel(activeModel) || activeModel
+              : "Checking model…",
             disabled: true,
           },
         ];
@@ -681,10 +729,12 @@ export function Composer({
   const mirrorActive = mirrorSegments.some((segment) => segment.token);
   useEffect(() => {
     if (!workingDirectory || !nativeActionKey) return;
-    if (nativeActionsByKey[nativeActionKey] || nativeActionLoads.current.has(nativeActionKey)) {
-      return;
-    }
+    // Cached actions render immediately; the authoritative list still
+    // refreshes once per key (or again on explicit retry) in the background.
+    const refreshKey = `${nativeActionKey}#${nativeActionRetry}`;
+    if (nativeActionRefreshes.current.has(refreshKey)) return;
     let cancelled = false;
+    nativeActionRefreshes.current.add(refreshKey);
     nativeActionLoads.current.add(nativeActionKey);
     setNativeActionsLoadingKey(nativeActionKey);
     setNativeActionsError("");
@@ -692,7 +742,11 @@ export function Composer({
       .listNativeProviderActions(runtime, workingDirectory)
       .then((actions) => {
         if (!cancelled) {
-          setNativeActionsByKey((current) => ({ ...current, [nativeActionKey]: actions }));
+          setNativeActionsByKey((current) => {
+            const next = { ...current, [nativeActionKey]: actions };
+            writeNativeActionCache(next);
+            return next;
+          });
         }
       })
       .catch((error) => {
@@ -709,7 +763,7 @@ export function Composer({
     return () => {
       cancelled = true;
     };
-  }, [nativeActionKey, nativeActionRetry, nativeActionsByKey, runtime, workingDirectory]);
+  }, [nativeActionKey, nativeActionRetry, runtime, workingDirectory]);
   const autocompleteMatches = useMemo(
     () =>
       !autocompleteToken

@@ -9,6 +9,8 @@ const { bridgeMock } = vi.hoisted(() => ({
     getAppInfo: vi.fn(),
     listRuntimeActionPlans: vi.fn(),
     listModelCatalog: vi.fn(),
+    listIntegratorSkills: vi.fn(),
+    installIntegratorPlugin: vi.fn(),
     setSetting: vi.fn(),
     getStorageTotals: vi.fn(),
   },
@@ -95,6 +97,13 @@ describe("Runtime Settings command disclosure", () => {
     });
     bridgeMock.listRuntimeActionPlans.mockResolvedValue([updatePlan]);
     bridgeMock.listModelCatalog.mockResolvedValue([]);
+    bridgeMock.listIntegratorSkills.mockResolvedValue({
+      skillsRoot: "/tmp/AI Integrator/Skills",
+      pluginsRoot: "/tmp/AI Integrator/Plugins",
+      bundledAvailable: true,
+      skills: [],
+    });
+    bridgeMock.installIntegratorPlugin.mockRejectedValue(new Error("not used"));
     bridgeMock.setSetting.mockResolvedValue(undefined);
     bridgeMock.getStorageTotals.mockResolvedValue({
       totalBytes: 0,
@@ -124,7 +133,10 @@ describe("Runtime Settings command disclosure", () => {
     expect(saveContext).toHaveAttribute("aria-checked", "false");
     fireEvent.click(saveContext);
     await waitFor(() =>
-      expect(bridgeMock.setSetting).toHaveBeenCalledWith("settings.general.saveContextOnEdit", true),
+      expect(bridgeMock.setSetting).toHaveBeenCalledWith(
+        "settings.general.saveContextOnEdit",
+        true,
+      ),
     );
 
     fireEvent.click(screen.getByText("Composer").closest("button") as HTMLButtonElement);
@@ -137,6 +149,66 @@ describe("Runtime Settings command disclosure", () => {
         "settings.transcript.activityDensity",
         "verbose",
       ),
+    );
+  });
+
+  it("toggles an entire skill plugin while preserving per-skill controls", async () => {
+    bridgeMock.listIntegratorSkills.mockResolvedValueOnce({
+      skillsRoot: "/tmp/AI Integrator/Skills",
+      pluginsRoot: "/tmp/AI Integrator/Plugins",
+      bundledAvailable: true,
+      skills: [
+        {
+          name: "gov-data:fred",
+          description: "Fetch FRED series",
+          source: "first-party",
+          enabled: false,
+          defaultEnabled: false,
+        },
+        {
+          name: "gov-data:bls",
+          description: "Fetch BLS series",
+          source: "first-party",
+          enabled: true,
+          defaultEnabled: false,
+        },
+      ],
+    });
+
+    render(
+      <SettingsView
+        preferences={DEFAULT_THEME_PREFERENCES}
+        runtimes={[claudeRuntime, runtime]}
+        usage={createEmptySnapshot().usage}
+        onChangePreferences={vi.fn()}
+        onResetPreferences={vi.fn()}
+        onBack={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Skills").closest("button") as HTMLButtonElement);
+    const heading = await screen.findByRole("heading", { name: "gov-data" });
+    const plugin = heading.closest("section") as HTMLElement;
+    expect(plugin.querySelector("img")).toHaveAttribute("src", "/brand/skills/data-gov.ico");
+
+    const pluginSwitch = within(plugin).getByRole("switch", {
+      name: "Enable all skills in gov-data",
+    });
+    expect(pluginSwitch).toHaveAttribute("data-mixed", "true");
+    fireEvent.click(pluginSwitch);
+    await waitFor(() =>
+      expect(bridgeMock.setSetting).toHaveBeenCalledWith("settings.skills.integrator.enabled", {
+        "gov-data:fred": true,
+        "gov-data:bls": true,
+      }),
+    );
+
+    fireEvent.click(within(plugin).getByRole("switch", { name: "Enable gov-data:fred" }));
+    await waitFor(() =>
+      expect(bridgeMock.setSetting).toHaveBeenCalledWith("settings.skills.integrator.enabled", {
+        "gov-data:fred": false,
+        "gov-data:bls": true,
+      }),
     );
   });
 

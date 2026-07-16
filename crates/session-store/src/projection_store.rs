@@ -344,10 +344,7 @@ impl LocalStore {
             });
         }
 
-        let limit = query
-            .limit
-            .unwrap_or(TASK_PROJECTION_HYDRATE_TAIL)
-            .max(1);
+        let limit = query.limit.unwrap_or(TASK_PROJECTION_HYDRATE_TAIL).max(1);
         let before_seq = query.before_seq.unwrap_or(i64::MAX);
 
         let mut statement = connection
@@ -388,9 +385,10 @@ impl LocalStore {
 
         let oldest_loaded = window_rows.first().map(|(seq, _)| *seq);
         let has_more_older = match oldest_loaded {
-            Some(oldest) if fetched >= limit => connection
-                .query_row(
-                    "SELECT EXISTS(
+            Some(oldest) if fetched >= limit => {
+                connection
+                    .query_row(
+                        "SELECT EXISTS(
                         SELECT 1 FROM codex_items
                             WHERE task_id = ?1 AND last_event_seq > ?2 AND last_event_seq < ?3
                               AND last_event_seq <= ?4 AND snapshot_event_json IS NOT NULL
@@ -399,11 +397,12 @@ impl LocalStore {
                             WHERE task_id = ?1 AND last_event_seq > ?2 AND last_event_seq < ?3
                               AND last_event_seq <= ?4 AND snapshot_event_json IS NOT NULL
                     )",
-                    params![task_key, reset_seq, oldest, watermark],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map_err(storage_error)?
-                > 0,
+                        params![task_key, reset_seq, oldest, watermark],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(storage_error)?
+                    > 0
+            }
             _ => false,
         };
 
@@ -522,10 +521,7 @@ impl LocalStore {
                 }
                 RuntimeProjection::UsageChanged { usage } => hydrate.usage = Some(usage),
                 RuntimeProjection::ModeChanged { mode } => hydrate.mode = Some(mode),
-                RuntimeProjection::TurnError {
-                    message,
-                    retryable,
-                } => {
+                RuntimeProjection::TurnError { message, retryable } => {
                     hydrate.error = Some(TaskProjectionErrorHydrate {
                         message,
                         retryable,
@@ -690,9 +686,10 @@ impl LocalStore {
                 .map_err(storage_error)?;
             transaction
                 .execute(
-                    "INSERT INTO codex_items(provider_session_id, task_id, thread_id, turn_id, item_id, stable_id, kind, status, title, body, command_text, cwd, output, exit_code, file_changes_json, mcp_server, mcp_tool, truncated, updated_at, projection_json, last_event_seq, first_event_seq, first_occurred_at, snapshot_event_json)
+                    "INSERT INTO codex_items(provider_session_id, task_id, thread_id, turn_id, item_id, stable_id, kind, status, title, body, command_text, cwd, output, exit_code, file_changes_json, mcp_server, mcp_tool, truncated, updated_at, projection_json, last_event_seq, first_event_seq, first_occurred_at, snapshot_event_json, native_skill)
                      SELECT ?1, ?2, thread_id, turn_id, item_id, stable_id, kind, status, title, body, command_text, cwd, output, exit_code, file_changes_json, mcp_server, mcp_tool, truncated, updated_at, projection_json, last_event_seq, first_event_seq, first_occurred_at,
                             json_set(snapshot_event_json, '$.taskId', ?2, '$.providerSessionId', ?1)
+                            , native_skill
                      FROM codex_items WHERE provider_session_id = ?3 AND last_event_seq <= ?4",
                     params![new_session_id, fork.id.to_string(), old_session_id, cutoff],
                 )
@@ -929,6 +926,48 @@ impl LocalStore {
         Ok(event)
     }
 
+    pub fn task_has_unfinished_turn(&self, task_id: TaskId) -> Result<bool> {
+        let connection = self.connection.lock();
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM codex_turns WHERE task_id=?1 AND status IN ('pending','in_progress'))",
+                [task_id.to_string()],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(storage_error)
+    }
+
+    /// Provider processes belong to this app process and cannot survive a
+    /// restart. Reconcile every unfinished task once during startup so merely
+    /// opening a chat remains a read-only operation.
+    pub fn settle_unfinished_turns_after_restart(&self) -> Result<usize> {
+        let task_ids = {
+            let connection = self.connection.lock();
+            let mut statement = connection
+                .prepare(
+                    "SELECT DISTINCT task_id FROM codex_turns WHERE status IN ('pending','in_progress')",
+                )
+                .map_err(storage_error)?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(storage_error)?;
+            let mut task_ids = Vec::new();
+            for row in rows {
+                task_ids.push(
+                    TaskId::from_str(&row.map_err(storage_error)?).map_err(invalid_stored)?,
+                );
+            }
+            task_ids
+        };
+        let mut settled = 0;
+        for task_id in task_ids {
+            while self.settle_interrupted_turn(task_id)?.is_some() {
+                settled += 1;
+            }
+        }
+        Ok(settled)
+    }
+
     /// Render the task's shared SQLite projections (any provider) as a bounded
     /// handoff package for a freshly created native session.
     pub fn task_handoff_digest(
@@ -1003,7 +1042,11 @@ impl LocalStore {
         drop(item_statement);
         drop(connection);
 
-        if item_rows.is_empty() && edit_context.as_ref().is_none_or(|body| body.trim().is_empty()) {
+        if item_rows.is_empty()
+            && edit_context
+                .as_ref()
+                .is_none_or(|body| body.trim().is_empty())
+        {
             return Ok(None);
         }
 
@@ -2110,7 +2153,7 @@ fn upsert_item(
         .thread_id
         .as_deref()
         .ok_or_else(|| IntegratorError::Storage("runtime thread identity is missing".into()))?;
-    transaction.execute("INSERT INTO codex_items(provider_session_id,task_id,thread_id,turn_id,item_id,stable_id,kind,status,title,body,command_text,cwd,output,exit_code,file_changes_json,mcp_server,mcp_tool,truncated,updated_at,projection_json,last_event_seq,first_event_seq,first_occurred_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?21,?22) ON CONFLICT(provider_session_id,turn_id,item_id) DO UPDATE SET stable_id=excluded.stable_id,kind=excluded.kind,status=excluded.status,title=excluded.title,body=excluded.body,command_text=excluded.command_text,cwd=excluded.cwd,output=excluded.output,exit_code=excluded.exit_code,file_changes_json=excluded.file_changes_json,mcp_server=excluded.mcp_server,mcp_tool=excluded.mcp_tool,truncated=excluded.truncated,updated_at=excluded.updated_at,projection_json=excluded.projection_json,last_event_seq=excluded.last_event_seq",params![provider_session_id.to_string(),binding.task_id.to_string(),thread_id,reduced.turn_id,item.provider_item_id,item.id,item.kind.as_str(),item.status.as_str(),item.title,item.body,item.command,item.cwd,item.output,item.exit_code,item.file_changes.as_ref().map(serde_json::to_string).transpose()?,item.mcp_server,item.mcp_tool,item.truncated,item.updated_at.to_rfc3339(),serde_json::to_string(item)?,seq,reduced.occurred_at.to_rfc3339()]).map_err(storage_error)?;
+    transaction.execute("INSERT INTO codex_items(provider_session_id,task_id,thread_id,turn_id,item_id,stable_id,kind,status,title,body,command_text,cwd,output,exit_code,file_changes_json,mcp_server,mcp_tool,truncated,updated_at,projection_json,last_event_seq,first_event_seq,first_occurred_at,native_skill) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?21,?22,?23) ON CONFLICT(provider_session_id,turn_id,item_id) DO UPDATE SET stable_id=excluded.stable_id,kind=excluded.kind,status=excluded.status,title=excluded.title,body=excluded.body,command_text=excluded.command_text,cwd=excluded.cwd,output=excluded.output,exit_code=excluded.exit_code,file_changes_json=excluded.file_changes_json,mcp_server=excluded.mcp_server,mcp_tool=excluded.mcp_tool,truncated=excluded.truncated,updated_at=excluded.updated_at,projection_json=excluded.projection_json,last_event_seq=excluded.last_event_seq,native_skill=excluded.native_skill",params![provider_session_id.to_string(),binding.task_id.to_string(),thread_id,reduced.turn_id,item.provider_item_id,item.id,item.kind.as_str(),item.status.as_str(),item.title,item.body,item.command,item.cwd,item.output,item.exit_code,item.file_changes.as_ref().map(serde_json::to_string).transpose()?,item.mcp_server,item.mcp_tool,item.truncated,item.updated_at.to_rfc3339(),serde_json::to_string(item)?,seq,reduced.occurred_at.to_rfc3339(),item.native_skill]).map_err(storage_error)?;
     Ok(())
 }
 fn load_item(
@@ -2208,7 +2251,9 @@ fn clip_head_tail(value: &str, max: usize) -> String {
     format!(
         "{}\n…[truncated {} chars]…\n{}",
         &value[..head_end],
-        value.len().saturating_sub(head_end + (value.len() - tail_start)),
+        value
+            .len()
+            .saturating_sub(head_end + (value.len() - tail_start)),
         &value[tail_start..]
     )
 }
@@ -2297,10 +2342,7 @@ fn format_file_changes(json: &str) -> Option<String> {
     }
     let mut parts = Vec::new();
     for change in changes.iter().take(24) {
-        let path = change
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
+        let path = change.get("path").and_then(|v| v.as_str()).unwrap_or("?");
         let kind = change
             .get("changeKind")
             .or_else(|| change.get("change_kind"))
@@ -2412,10 +2454,7 @@ fn format_digest_line(row: &DigestItemRow) -> Option<String> {
             }
 
             if output.len() > HANDOFF_NOISY_OUTPUT_THRESHOLD {
-                return Some(format!(
-                    "Tool ({label}): {} chars truncated",
-                    output.len()
-                ));
+                return Some(format!("Tool ({label}): {} chars truncated", output.len()));
             }
             if output.is_empty() {
                 let input_clip = clip_chars(input.trim(), 200);
@@ -2907,6 +2946,13 @@ mod tests {
         let item = &snapshot.hydrate.expect("hydrate").items[0];
         assert_eq!(item.body.as_deref(), Some("/skill-creator build one"));
         assert_eq!(item.native_skill.as_deref(), Some("skill-creator"));
+        assert_eq!(
+            store
+                .skill_invocation_counts()
+                .expect("count verified skill")
+                .get("skill-creator"),
+            Some(&1)
+        );
     }
 
     #[test]
@@ -3012,7 +3058,10 @@ mod tests {
             Some(connection) if connection.state == ConnectionState::Connected
         ));
         assert_eq!(
-            hydrate.mode.as_ref().map(|mode| mode.current_mode_id.as_str()),
+            hydrate
+                .mode
+                .as_ref()
+                .map(|mode| mode.current_mode_id.as_str()),
             Some("agent")
         );
         assert_eq!(hydrate.approvals.len(), 1);
@@ -3272,6 +3321,95 @@ mod tests {
     }
 
     #[test]
+    fn startup_settlement_reconciles_every_unfinished_chat_once() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let mut task_ids = Vec::new();
+        for index in 0..2 {
+            let task = store
+                .create_task(NewTask {
+                    title: format!("Restart fixture {index}"),
+                    repository_path: None,
+                    worktree_path: None,
+                    runtime: None,
+                    model: None,
+                    effort: None,
+                    parent_task_id: None,
+                })
+                .expect("create task");
+            let thread_id = format!("restart-thread-{index}");
+            let turn_id = format!("restart-turn-{index}");
+            let binding = store
+                .create_runtime_binding(
+                    task.id,
+                    &format!("restart-process-{index}"),
+                    ProviderKind::Codex,
+                )
+                .and_then(|binding| store.attach_provider_thread(&binding, &thread_id))
+                .expect("attach runtime");
+            let at = Utc::now();
+            store
+                .apply_reduced_event(
+                    &binding,
+                    &ReducedProviderEvent {
+                        method: "turn/started".into(),
+                        thread_id,
+                        turn_id: Some(turn_id.clone()),
+                        audit_json: "{}".into(),
+                        audit_truncated: false,
+                        mutation: ProjectionMutation::Turn(TurnProjection {
+                            id: turn_id,
+                            status: TurnStatus::InProgress,
+                            stop_requested: false,
+                            error: None,
+                            started_at: Some(at),
+                            completed_at: None,
+                        }),
+                        occurred_at: at,
+                    },
+                )
+                .expect("persist running turn");
+            task_ids.push(task.id);
+        }
+
+        for task_id in &task_ids {
+            assert!(
+                store
+                    .task_has_unfinished_turn(*task_id)
+                    .expect("unfinished turn before startup settlement")
+            );
+        }
+
+        assert_eq!(
+            store
+                .settle_unfinished_turns_after_restart()
+                .expect("settle startup turns"),
+            2
+        );
+        assert_eq!(
+            store
+                .settle_unfinished_turns_after_restart()
+                .expect("idempotent startup settlement"),
+            0
+        );
+        for task_id in task_ids {
+            assert!(
+                !store
+                    .task_has_unfinished_turn(task_id)
+                    .expect("no unfinished turn after startup settlement")
+            );
+            let snapshot = store.task_snapshot(task_id).expect("load settled task");
+            assert!(matches!(
+                snapshot.hydrate.expect("hydrate").turn.as_ref(),
+                Some(TurnProjection {
+                    status: TurnStatus::Interrupted,
+                    stop_requested: false,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
     fn task_tip_stop_requested_tracks_stop_latch() {
         let (store, binding) = bound_store(ProviderKind::Codex);
         let at = Utc::now();
@@ -3296,13 +3434,17 @@ mod tests {
                 },
             )
             .expect("persist running turn");
-        assert!(!store
-            .task_tip_stop_requested(binding.task_id)
-            .expect("query before stop"));
+        assert!(
+            !store
+                .task_tip_stop_requested(binding.task_id)
+                .expect("query before stop")
+        );
         store.request_stop(binding.task_id).expect("request stop");
-        assert!(store
-            .task_tip_stop_requested(binding.task_id)
-            .expect("query after stop"));
+        assert!(
+            store
+                .task_tip_stop_requested(binding.task_id)
+                .expect("query after stop")
+        );
     }
 
     #[test]
@@ -3655,11 +3797,7 @@ mod tests {
             .expect("persist handoff fixture item");
     }
 
-    fn base_item(
-        id: &str,
-        kind: ItemKind,
-        turn_offset_secs: i64,
-    ) -> ItemProjection {
+    fn base_item(id: &str, kind: ItemKind, turn_offset_secs: i64) -> ItemProjection {
         let updated_at = Utc::now() + chrono::Duration::seconds(turn_offset_secs);
         ItemProjection {
             id: format!("fixture:{id}"),
@@ -3716,30 +3854,19 @@ mod tests {
     fn handoff_digest_degraded_drops_oldest_turns_and_stubs_web_search() {
         let (store, binding) = bound_store(ProviderKind::Codex);
         for index in 0..12 {
-            let mut user = base_item(
-                &format!("u{index}"),
-                ItemKind::UserMessage,
-                index * 3,
-            );
+            let mut user = base_item(&format!("u{index}"), ItemKind::UserMessage, index * 3);
             user.body = Some(format!("turn-{index}-user-marker"));
             persist_item(&store, &binding, &format!("turn-{index}"), user);
 
-            let mut search = base_item(
-                &format!("s{index}"),
-                ItemKind::McpTool,
-                index * 3 + 1,
-            );
+            let mut search = base_item(&format!("s{index}"), ItemKind::McpTool, index * 3 + 1);
             search.mcp_tool = Some("WebSearch".into());
             search.title = Some("WebSearch".into());
             search.tool_input = Some(r#"{"query":"overflow menus"}"#.into());
             search.output = Some("x".repeat(20_000));
             persist_item(&store, &binding, &format!("turn-{index}"), search);
 
-            let mut assistant = base_item(
-                &format!("a{index}"),
-                ItemKind::AgentMessage,
-                index * 3 + 2,
-            );
+            let mut assistant =
+                base_item(&format!("a{index}"), ItemKind::AgentMessage, index * 3 + 2);
             assistant.body = Some(format!("turn-{index}-assistant"));
             persist_item(&store, &binding, &format!("turn-{index}"), assistant);
         }

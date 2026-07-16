@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-git-tracked-paths"
+description = "Enables the git_tracked_paths command without any pre-configured scope."
+commands.allow = ["git_tracked_paths"]
+
+[[permission]]
+identifier = "deny-git-tracked-paths"
+description = "Denies the git_tracked_paths command without any pre-configured scope."
+commands.deny = ["git_tracked_paths"]

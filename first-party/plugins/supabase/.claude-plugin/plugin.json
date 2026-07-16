@@ -1,0 +1,7 @@
+{
+  "name": "supabase",
+  "description": "Supabase expertise: Postgres, Row Level Security, auth, realtime, storage, and local development with links to canonical docs.",
+  "version": "0.1.0",
+  "author": { "name": "AI Integrator" },
+  "license": "Apache-2.0"
+}

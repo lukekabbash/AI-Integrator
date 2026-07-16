@@ -59,6 +59,7 @@ import {
   type SubscriptionWindow,
   type UsageSnapshot,
 } from "../bridge";
+import { prettyModelLabel } from "../modelLabel";
 import { ResizeHandle } from "./ResizeHandle";
 import { SlidingTabIndicator } from "./SlidingTabIndicator";
 import { Tooltip } from "./Tooltip";
@@ -1869,14 +1870,15 @@ function AgentRoute({
   elapsed?: string;
 }) {
   const label = providerLabel(runtime);
+  const modelLabel = model ? prettyModelLabel(model) || model : null;
   return (
     <small className="agent-route">
       <ProviderIcon provider={runtime} label={label} />
       <span>{label}</span>
-      {model ? (
+      {modelLabel ? (
         <>
           <span aria-hidden="true">·</span>
-          <span>{model}</span>
+          <span>{modelLabel}</span>
         </>
       ) : null}
       {elapsed ? (
@@ -2119,6 +2121,7 @@ function DelegationRow({
 }) {
   const reduceMotion = useReducedMotion();
   const [busy, setBusy] = useState(false);
+  const [hovered, setHovered] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const active = ["starting", "running", "waiting"].includes(delegation.status);
   const canApprove = delegation.status === "pending-approval" && Boolean(onApprove);
@@ -2151,6 +2154,12 @@ function DelegationRow({
       animate={{ opacity: 1, x: 0 }}
       exit={reduceMotion ? { opacity: 0 } : { opacity: 0, x: -4 }}
       transition={reduceMotion ? { duration: 0 } : { type: "spring", stiffness: 460, damping: 36 }}
+      onHoverStart={() => setHovered(true)}
+      onHoverEnd={() => setHovered(false)}
+      onFocus={() => setHovered(true)}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setHovered(false);
+      }}
       onClick={(event) => {
         if (!delegation.childTaskId) return;
         if ((event.target as HTMLElement).closest("button, input")) return;
@@ -2187,6 +2196,7 @@ function DelegationRow({
         provider={delegation.runtime}
         state={delegation.status}
         label={delegation.title}
+        hovered={hovered}
       />
       <span className="agent-copy">
         <span className="agent-heading">
@@ -2260,6 +2270,7 @@ function AgentRow({
   identity: AgentVisualIdentity;
 }) {
   const reduceMotion = useReducedMotion();
+  const [hovered, setHovered] = useState(false);
   return (
     <motion.div
       layout="position"
@@ -2271,6 +2282,8 @@ function AgentRow({
       initial={reduceMotion ? false : { opacity: 0, x: -5 }}
       animate={{ opacity: 1, x: 0 }}
       transition={reduceMotion ? { duration: 0 } : { type: "spring", stiffness: 460, damping: 36 }}
+      onHoverStart={() => setHovered(true)}
+      onHoverEnd={() => setHovered(false)}
     >
       <AgentGlyph
         variant={identity.variant}
@@ -2278,6 +2291,7 @@ function AgentRow({
         provider={agent.runtime}
         state={agent.status}
         label={agent.name}
+        hovered={hovered}
       />
       <span className="agent-copy">
         <span className="agent-heading">

@@ -5,7 +5,8 @@
   "description": "Local-first native control plane for coding agents",
   "packageManager": "npm@10.9.2",
   "scripts": {
-    "dev": "npm --prefix apps/desktop run tauri -- dev",
+    "dev": "npm --prefix apps/desktop run tauri -- dev --no-watch",
+    "dev:watch": "npm --prefix apps/desktop run tauri -- dev",
     "dev:web": "npm --prefix apps/desktop run dev",
     "build": "npm --prefix apps/desktop run tauri -- build",
     "build:web": "npm --prefix apps/desktop run build",

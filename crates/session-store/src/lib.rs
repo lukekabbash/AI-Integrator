@@ -9,10 +9,10 @@ use std::{
 use chrono::{DateTime, Utc};
 use integrator_core::{
     ArchivedTaskPage, ComposerDraft, ComposerDraftAttachment, ComposerDraftOwner, IntegratorError,
-    LocalExport,
-    NewQueuedMessage, NewTask, ProjectId, ProviderKind, ProviderResumeState, ProviderSession,
-    ProviderSessionId, QueuedMessage, QueuedMessageId, QueuedMessageState, Result, RuntimeSession,
-    RuntimeSessionId, Setting, Task, TaskId, TaskState, TrustedProject, UsageProjection,
+    LocalExport, NewQueuedMessage, NewTask, ProjectId, ProviderKind, ProviderResumeState,
+    ProviderSession, ProviderSessionId, QueuedMessage, QueuedMessageId, QueuedMessageState, Result,
+    RuntimeSession, RuntimeSessionId, Setting, Task, TaskId, TaskState, TrustedProject,
+    UsageProjection,
 };
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -709,6 +709,19 @@ const MIGRATIONS: &[(i64, &str)] = &[
         );
         "#,
     ),
+    (
+        18,
+        r#"
+        ALTER TABLE codex_items ADD COLUMN native_skill TEXT;
+        UPDATE codex_items
+        SET native_skill = json_extract(projection_json, '$.nativeSkill')
+        WHERE kind = 'user_message'
+          AND json_extract(projection_json, '$.nativeSkill') IS NOT NULL;
+        CREATE INDEX codex_items_native_skill_idx
+            ON codex_items(native_skill)
+            WHERE native_skill IS NOT NULL;
+        "#,
+    ),
 ];
 
 pub struct LocalStore {
@@ -869,6 +882,29 @@ impl LocalStore {
                 (provider, task_count, turn_count, usage)
             })
             .collect())
+    }
+
+    /// Verified skill invocations are persisted on the provider-backed user
+    /// item itself, so retries and snapshot updates cannot inflate the count.
+    pub fn skill_invocation_counts(&self) -> Result<BTreeMap<String, u64>> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT native_skill, COUNT(*) FROM codex_items \
+                 WHERE native_skill IS NOT NULL GROUP BY native_skill",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+            })
+            .map_err(storage_error)?;
+        let mut counts = BTreeMap::new();
+        for row in rows {
+            let (skill, count) = row.map_err(storage_error)?;
+            counts.insert(skill, count);
+        }
+        Ok(counts)
     }
 
     pub fn create_task(&self, input: NewTask) -> Result<Task> {
@@ -1160,23 +1196,28 @@ impl LocalStore {
                 .optional()
                 .map_err(storage_error)?
                 .ok_or_else(|| IntegratorError::NotFound(format!("project {project_id}")))
-                .and_then(|(id, display_name, root, git_root, common, created, opened)| {
-                    Ok(TrustedProject {
-                        id: ProjectId::from_str(&id).map_err(invalid_stored)?,
-                        display_name,
-                        repository_root: PathBuf::from(root),
-                        git_repository_root: git_root.map(PathBuf::from),
-                        git_common_directory: common.map(PathBuf::from),
-                        created_at: parse_time(&created)?,
-                        last_opened_at: parse_time(&opened)?,
-                    })
-                })?
+                .and_then(
+                    |(id, display_name, root, git_root, common, created, opened)| {
+                        Ok(TrustedProject {
+                            id: ProjectId::from_str(&id).map_err(invalid_stored)?,
+                            display_name,
+                            repository_root: PathBuf::from(root),
+                            git_repository_root: git_root.map(PathBuf::from),
+                            git_common_directory: common.map(PathBuf::from),
+                            created_at: parse_time(&created)?,
+                            last_opened_at: parse_time(&opened)?,
+                        })
+                    },
+                )?
         };
         let project_root = project.repository_root.to_string_lossy().into_owned();
         // Tasks are path-linked rather than FK-linked; wipe them explicitly so
         // chat history leaves with the project instead of becoming orphaned.
         transaction
-            .execute("DELETE FROM tasks WHERE repository_path = ?1", [&project_root])
+            .execute(
+                "DELETE FROM tasks WHERE repository_path = ?1",
+                [&project_root],
+            )
             .map_err(storage_error)?;
         let changed = transaction
             .execute(
@@ -1297,11 +1338,7 @@ impl LocalStore {
         })
     }
 
-    fn query_tasks(
-        &self,
-        sql: &str,
-        params: impl rusqlite::Params,
-    ) -> Result<Vec<Task>> {
+    fn query_tasks(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<Task>> {
         let connection = self.connection.lock();
         let mut statement = connection.prepare(sql).map_err(storage_error)?;
         let rows = statement
@@ -2059,8 +2096,15 @@ impl LocalStore {
             })
             .map_err(storage_error)?;
         rows.map(|row| {
-            let (task_id, provider, session_ref, repository_root, permission, delegation, updated_at) =
-                row.map_err(storage_error)?;
+            let (
+                task_id,
+                provider,
+                session_ref,
+                repository_root,
+                permission,
+                delegation,
+                updated_at,
+            ) = row.map_err(storage_error)?;
             Ok(ProviderResumeState {
                 task_id: TaskId::from_str(&task_id).map_err(invalid_stored)?,
                 provider: ProviderKind::from_str(&provider)?,
@@ -2162,9 +2206,9 @@ fn format_archived_cursor(updated_at: &str, id: &str) -> String {
 }
 
 fn parse_archived_cursor(cursor: &str) -> Result<(String, String)> {
-    let (updated_at, id) = cursor.split_once('\t').ok_or_else(|| {
-        IntegratorError::InvalidInput("archived task cursor is invalid".into())
-    })?;
+    let (updated_at, id) = cursor
+        .split_once('\t')
+        .ok_or_else(|| IntegratorError::InvalidInput("archived task cursor is invalid".into()))?;
     if updated_at.is_empty() || id.is_empty() {
         return Err(IntegratorError::InvalidInput(
             "archived task cursor is invalid".into(),
@@ -2825,7 +2869,10 @@ mod tests {
         store
             .update_task_metadata(fork.id, Some("Renamed fork".into()), None, None)
             .expect("rename fork");
-        assert_eq!(store.get_task(source.id).expect("reread source").title, "Port the parser");
+        assert_eq!(
+            store.get_task(source.id).expect("reread source").title,
+            "Port the parser"
+        );
         store.remove_task(fork.id).expect("remove fork");
         assert_eq!(item_bodies(&store, source.id).len(), 4);
     }
@@ -2952,7 +2999,11 @@ mod tests {
         seed_conversation(&store, source.id);
 
         assert!(matches!(
-            store.fork_task(source.id, Some("codex:fork-thread:turn-1:item-99"), "x".into()),
+            store.fork_task(
+                source.id,
+                Some("codex:fork-thread:turn-1:item-99"),
+                "x".into()
+            ),
             Err(IntegratorError::NotFound(_))
         ));
 
@@ -3565,13 +3616,18 @@ mod tests {
         assert_eq!(snapshot.watermark_seq, appended.seq);
         let hydrate = snapshot.hydrate.expect("compact hydrate");
         assert_eq!(hydrate.items.len(), 2);
-        assert!(hydrate.items.iter().any(|item| {
-            item.body.as_deref() == Some("legacy materialized message")
-        }));
-        assert!(hydrate
-            .items
-            .iter()
-            .any(|item| item.body.as_deref() == Some("post-migration message")));
+        assert!(
+            hydrate
+                .items
+                .iter()
+                .any(|item| { item.body.as_deref() == Some("legacy materialized message") })
+        );
+        assert!(
+            hydrate
+                .items
+                .iter()
+                .any(|item| item.body.as_deref() == Some("post-migration message"))
+        );
     }
 
     #[test]
@@ -4134,7 +4190,10 @@ mod tests {
                 .is_empty()
         );
         assert!(
-            reopened.list_tasks().expect("list tasks after removal").is_empty(),
+            reopened
+                .list_tasks()
+                .expect("list tasks after removal")
+                .is_empty(),
             "removing a project must delete its Integrator chat history"
         );
         assert!(
@@ -4177,9 +4236,7 @@ mod tests {
         assert_eq!(hot[0].id, live.id);
         assert!(!hot[0].archived);
 
-        let page = store
-            .list_archived_tasks(None, 50)
-            .expect("list archived");
+        let page = store.list_archived_tasks(None, 50).expect("list archived");
         assert_eq!(page.total, 1);
         assert_eq!(page.tasks.len(), 1);
         assert_eq!(page.tasks[0].id, archived.id);

@@ -1922,6 +1922,7 @@ async fn start_child_turn(
                     },
                     mcp_config_path: mcp_config.clone(),
                     control_overlay: runtime.control_overlay.clone(),
+                    plugin_dirs: Vec::new(),
                 };
                 let hook_offset = runtime
                     .hook_event_log
@@ -1930,7 +1931,11 @@ async fn start_child_turn(
                     .unwrap_or(0);
                 let turn_id = runtime
                     .client
-                    .start_turn_with_images(options, prompt.wire.clone(), prompt.image_paths.clone())
+                    .start_turn_with_images(
+                        options,
+                        prompt.wire.clone(),
+                        prompt.image_paths.clone(),
+                    )
                     .await?;
                 *runtime.current_turn.lock().expect("turn lock") = Some(turn_id.clone());
                 if let Some(event_log) = runtime.hook_event_log.clone() {
@@ -2573,8 +2578,9 @@ pub async fn stop_delegation(
     // cannot treat the cancelled turn as crash recovery and auto-resume it.
     if let Some(child_task_id) = delegation.child_task_id {
         let store = Arc::clone(&state.store);
-        let _ = tauri::async_runtime::spawn_blocking(move || store.settle_stopped_turn(child_task_id))
-            .await;
+        let _ =
+            tauri::async_runtime::spawn_blocking(move || store.settle_stopped_turn(child_task_id))
+                .await;
     }
     let updated = state
         .store

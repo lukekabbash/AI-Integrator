@@ -2140,7 +2140,10 @@ mod tests {
         assert_eq!((preview.ahead, preview.behind), (1, 1));
         // The ordinary confirmation carries no force mode, so a diverged push
         // is refused rather than quietly rewriting the remote.
-        assert!(git.push_confirmed(root, &confirmation_for(&preview)).is_err());
+        assert!(
+            git.push_confirmed(root, &confirmation_for(&preview))
+                .is_err()
+        );
 
         let result = git
             .push_confirmed(root, &forced_confirmation_for(&preview, PushForce::Lease))

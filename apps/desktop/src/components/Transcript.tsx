@@ -277,6 +277,12 @@ const UserMessage = memo(function UserMessage({
   return (
     <div className="turn-user-wrap">
       <section className="turn turn--user" data-event-id={id} aria-label="Your message">
+        {nativeSkill ? (
+          <span className="skill-invocation-marker" aria-label={`Skill invoked: ${nativeSkill}`}>
+            <Wrench aria-hidden />
+            Skill invoked <strong>{nativeSkill}</strong>
+          </span>
+        ) : null}
         <p>
           {hasVerifiedSkill ? (
             <strong

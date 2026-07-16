@@ -5,6 +5,7 @@ import {
   DEMO_GIT_RECENT_COMMITS,
   demoGitHistoryArchive,
 } from "./demoData";
+import { resolveModelLabel } from "./modelLabel";
 
 export type RuntimeId = "codex" | "cursor" | "claude" | "grok" | "antigravity" | "custom";
 export type TaskStatus =
@@ -48,6 +49,37 @@ export interface NativeProviderAction {
 export interface NativeActionReference {
   name: string;
   kind: NativeProviderAction["kind"];
+}
+
+/** One Integrator-plane skill: bounded display metadata plus enablement.
+ * Individual skill paths never cross into the renderer. */
+export interface IntegratorSkillInfo {
+  name: string;
+  description: string;
+  /** "integrator" (user Skills root), "plugin" (user Plugins root), or
+   * "first-party" (bundled with the app). */
+  source: string;
+  enabled: boolean;
+  defaultEnabled: boolean;
+  invocationCount: number;
+  credential?: IntegratorSkillCredentialInfo;
+}
+
+export interface IntegratorSkillCredentialInfo {
+  id: string;
+  label: string;
+  required: boolean;
+  configured: boolean;
+  available: boolean;
+  helpUrl: string;
+}
+
+export interface IntegratorSkillsOverview {
+  /** Display paths of the user-visible Documents roots. */
+  skillsRoot: string;
+  pluginsRoot: string;
+  bundledAvailable: boolean;
+  skills: IntegratorSkillInfo[];
 }
 
 /**
@@ -608,6 +640,8 @@ export interface GenerateTaskTitleInput {
   taskId: string;
   prompt: string;
   runtime: RuntimeId;
+  /** Optional override used by native naming; normally mirrors Git's commit-message route. */
+  route?: ExplainRoute;
 }
 
 export interface ModelEffortOption {
@@ -898,11 +932,12 @@ export interface ExplainConfig {
 
 export interface ExplainRoute {
   runtime: RuntimeId;
-  /** Catalog model id; omitted keeps the provider's economy default. */
+  /** Catalog model id. Required for commit-message generation; for explain,
+   * omitted only when the route inherits the chat's already-chosen model. */
   model?: string;
   effort?: string;
   /** Runtimes to try in order once the primary cannot answer. Each runs on its
-   * own economy model — a model id means nothing to a different provider. */
+   * own default model — a model id is not portable to another provider. */
   fallbacks: RuntimeId[];
 }
 
@@ -912,6 +947,23 @@ export interface ExplainOutcome {
    * the route fails over, so the panel must label the answer with this. */
   runtime: RuntimeId;
   usedFallback: boolean;
+}
+
+/** One completed ask-panel question/answer pair, re-sent with a follow-up so
+ * the sessionless helper can answer in context. An empty `question` marks the
+ * initial analysis request. */
+export interface ExplainExchange {
+  question: string;
+  answer: string;
+}
+
+/** One packet of the ask panel's live stream. `attempt` announces the provider
+ * about to answer — the panel must clear its buffer on it, since a fallback
+ * must not append to a failed primary's partial output. `delta` appends text. */
+export interface ExplainStreamEvent {
+  kind: "attempt" | "delta";
+  text: string;
+  runtime: RuntimeId;
 }
 
 export interface AppBridge {
@@ -1026,7 +1078,11 @@ export interface AppBridge {
   /** Write manually edited text back to one trusted project file (native builds only). */
   writeProjectFile(projectId: string, path: string, content: string): Promise<ProjectFileContent>;
   /** Explain a highlighted selection through the isolated, tool-denied helper
-   * boundary shared with chat naming. Returns plain prose. */
+   * boundary shared with chat naming. Returns plain prose; when `onDelta` is
+   * given, answer text also streams through it while the call runs, and the
+   * resolved outcome remains the authoritative final text. Follow-ups pass
+   * `question` plus the prior `history` — the helper keeps no session, so
+   * continuity lives in the prompt. */
   explainSelection(
     projectId: string,
     route: ExplainRoute,
@@ -1040,7 +1096,10 @@ export interface AppBridge {
        * own file is sent rather than read from disk: reading it back would
        * explain a stale version whenever there are unsaved edits. */
       fileText?: string;
+      question?: string;
+      history?: ExplainExchange[];
     },
+    onDelta?: (event: ExplainStreamEvent) => void,
   ): Promise<ExplainOutcome>;
   /** The exact prompt the given settings would send. Composed natively by the
    * same function a real explanation uses, so the settings preview cannot drift
@@ -1123,8 +1182,9 @@ export interface AppBridge {
   stageProjectFiles(projectId: string, paths: string[], staged: boolean): Promise<GitSnapshot>;
   commit(taskId: string, message: string): Promise<GitSnapshot>;
   commitProject(projectId: string, message: string): Promise<GitSnapshot>;
-  /** Draft one bounded staged-diff subject with the task's selected provider. */
-  generateCommitMessage(taskId: string, runtime: RuntimeId): Promise<string>;
+  /** Draft one bounded staged-diff subject through the configured commit-message
+   * route (primary model plus ordered fallbacks). */
+  generateCommitMessage(taskId: string, route: ExplainRoute): Promise<string>;
   /** Read-only push data used to render an explicit confirmation surface. */
   previewPush(taskId: string): Promise<PushPreview>;
   previewProjectPush(projectId: string): Promise<PushPreview>;
@@ -1140,6 +1200,17 @@ export interface AppBridge {
     runtime: RuntimeId,
     repository: string,
   ): Promise<NativeProviderAction[]>;
+  /** The Integrator-plane skill inventory: user Documents roots plus bundled
+   * first-party plugins, with enablement state. */
+  listIntegratorSkills(): Promise<IntegratorSkillsOverview>;
+  /** Clone one GitHub plugin repository (owner/name) into the user's Plugins
+   * root via the GitHub CLI. Installed skills start disabled. */
+  installIntegratorPlugin(repository: string): Promise<IntegratorSkillsOverview>;
+  /** Remove one exact top-level plugin returned by discovery. */
+  uninstallIntegratorPlugin(pluginId: string): Promise<IntegratorSkillsOverview>;
+  /** Save or clear a bundled-skill secret in the native OS credential store. */
+  setIntegratorSkillCredential(credentialId: string, secret: string): Promise<void>;
+  clearIntegratorSkillCredential(credentialId: string): Promise<void>;
 }
 
 /**
@@ -1362,7 +1433,7 @@ export function deriveChatTitle(prompt: string, maxLength = CHAT_TITLE_MAX_LENGT
 }
 
 function toCatalogEntries(ids: string[]): ModelCatalogEntry[] {
-  return ids.map((id) => ({ id, label: id }));
+  return ids.map((id) => ({ id, label: resolveModelLabel(id) }));
 }
 
 function effortLabel(id: string): string {
@@ -1392,7 +1463,7 @@ export function extractCodexCatalog(response: unknown): ModelCatalogEntry[] {
     if (typeof entry === "string") {
       if (!seen.has(entry)) {
         seen.add(entry);
-        catalog.push({ id: entry, label: entry });
+        catalog.push({ id: entry, label: resolveModelLabel(entry) });
       }
       continue;
     }
@@ -1412,9 +1483,15 @@ export function extractCodexCatalog(response: unknown): ModelCatalogEntry[] {
     );
     if (!id || seen.has(id)) continue;
     seen.add(id);
+    const providerLabel =
+      typeof value.displayName === "string" && value.displayName
+        ? value.displayName
+        : typeof value.name === "string" && value.name
+          ? value.name
+          : undefined;
     const item: ModelCatalogEntry = {
       id,
-      label: typeof value.displayName === "string" && value.displayName ? value.displayName : id,
+      label: resolveModelLabel(id, providerLabel),
     };
     if (Array.isArray(value.supportedReasoningEfforts)) {
       const efforts = value.supportedReasoningEfforts
@@ -1519,7 +1596,7 @@ export function extractAcpCatalog(response: unknown): ModelCatalogEntry[] {
     seen.add(model.value);
     const item: ModelCatalogEntry = {
       id: model.value,
-      label: model.name ?? model.value,
+      label: resolveModelLabel(model.value, model.name),
     };
     if (thoughtOption && typeof thoughtOption.id === "string") {
       cursorEffortConfigByModel.set(item.id, thoughtOption.id);
@@ -1606,7 +1683,10 @@ function extractCursorExtensionCatalog(response: unknown): ModelCatalogEntry[] {
     seen.add(entry.value);
     catalog.push({
       id: entry.value,
-      label: typeof entry.name === "string" && entry.name ? entry.name : entry.value,
+      label: resolveModelLabel(
+        entry.value,
+        typeof entry.name === "string" && entry.name ? entry.name : undefined,
+      ),
     });
   }
   return catalog;
@@ -2681,19 +2761,20 @@ async function loadModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]
     const demoModels = readDemoSnapshot().runtimes.find((item) => item.id === runtime)?.models;
     if (demoModels?.length) {
       return demoModels.map((id) => {
+        const label = resolveModelLabel(id);
         if (runtime === "claude") {
-          return { id, label: id, efforts: CLAUDE_EFFORTS, defaultEffort: CLAUDE_DEFAULT_EFFORT };
+          return { id, label, efforts: CLAUDE_EFFORTS, defaultEffort: CLAUDE_DEFAULT_EFFORT };
         }
         return DEMO_EFFORT_RUNTIMES.has(runtime)
-          ? { id, label: id, efforts: DEMO_EFFORTS, defaultEffort: "medium" }
-          : { id, label: id };
+          ? { id, label, efforts: DEMO_EFFORTS, defaultEffort: "medium" }
+          : { id, label };
       });
     }
   }
   if (runtime === "claude") {
     return (FALLBACK_MODELS.claude ?? []).map((id) => ({
       id,
-      label: id,
+      label: resolveModelLabel(id),
       efforts: CLAUDE_EFFORTS,
       defaultEffort: CLAUDE_DEFAULT_EFFORT,
     }));
@@ -3609,6 +3690,69 @@ export const bridge: AppBridge = {
 
   listModelCatalog: loadModelCatalog,
 
+  listIntegratorSkills: async () => {
+    if (isTauri()) {
+      return nativeInvoke<IntegratorSkillsOverview>("integrator_skills_overview");
+    }
+    return {
+      skillsRoot: "Documents/AI Integrator/Skills",
+      pluginsRoot: "Documents/AI Integrator/Plugins",
+      bundledAvailable: true,
+      skills: [
+        {
+          name: "integrator-authoring:skill-creator",
+          description: "Create a new portable agent skill from a description of a repeated task",
+          source: "first-party",
+          enabled: true,
+          defaultEnabled: true,
+          invocationCount: 3,
+        },
+        {
+          name: "gov-data:fred",
+          description: "Fetch US economic time series from FRED",
+          source: "first-party",
+          enabled: false,
+          defaultEnabled: false,
+          invocationCount: 1,
+          credential: {
+            id: "fred-api-key",
+            label: "FRED API key",
+            required: true,
+            configured: false,
+            available: false,
+            helpUrl: "https://fred.stlouisfed.org/docs/api/api_key.html",
+          },
+        },
+      ],
+    };
+  },
+
+  installIntegratorPlugin: async (repository) => {
+    if (isTauri()) {
+      return nativeInvoke<IntegratorSkillsOverview>("integrator_skills_install", { repository });
+    }
+    throw new Error("Plugin installs need the desktop app; the browser preview is read-only.");
+  },
+
+  uninstallIntegratorPlugin: async (pluginId) => {
+    if (isTauri()) {
+      return nativeInvoke<IntegratorSkillsOverview>("integrator_skills_uninstall", { pluginId });
+    }
+    throw new Error("Plugin uninstall needs the desktop app; the browser preview is read-only.");
+  },
+
+  setIntegratorSkillCredential: async (credentialId, secret) => {
+    if (!isTauri()) {
+      throw new Error("Secure skill credentials are available in the native app only.");
+    }
+    await nativeInvoke("integrator_skill_credential_set", { credentialId, secret });
+  },
+
+  clearIntegratorSkillCredential: async (credentialId) => {
+    if (!isTauri()) return;
+    await nativeInvoke("integrator_skill_credential_clear", { credentialId });
+  },
+
   listNativeProviderActions: async (runtime, repository) => {
     if (isTauri()) {
       return nativeInvoke<NativeProviderAction[]>("provider_action_list", {
@@ -3782,9 +3926,17 @@ export const bridge: AppBridge = {
   generateTaskTitle: async (input) => {
     if (isTauri()) {
       const nativeTaskId = await ensureNativeTask(input.taskId);
+      const route = input.route ?? { runtime: input.runtime, fallbacks: [] };
       const task = await nativeInvoke<NativeTask | null>("task_generate_title", {
         taskId: nativeTaskId,
-        provider: input.runtime === "custom" ? "custom-acp" : input.runtime,
+        route: {
+          provider: route.runtime === "custom" ? "custom-acp" : route.runtime,
+          model: route.model,
+          effort: route.effort,
+          fallbacks: route.fallbacks.map((runtime) =>
+            runtime === "custom" ? "custom-acp" : runtime,
+          ),
+        },
         prompt: input.prompt,
       });
       if (!task) return null;
@@ -4219,49 +4371,86 @@ export const bridge: AppBridge = {
     return paths;
   },
 
-  explainSelection: async (projectId, route, config, payload) => {
+  explainSelection: async (projectId, route, config, payload, onDelta) => {
     if (isTauri()) {
-      const outcome = await nativeInvoke<{
-        text: string;
-        provider: NativeProviderStatus["provider"];
-        usedFallback: boolean;
-      }>("selection_explain", {
-        repository: repositoryForProject(projectId),
-        route: {
-          provider: wireProvider(route.runtime),
-          model: route.model ?? null,
-          effort: route.effort ?? null,
-          fallbacks: route.fallbacks.map(wireProvider),
-        },
-        config: {
-          archetype: config.archetype,
-          customMission: config.customMission ?? null,
-          verbosity: config.verbosity,
-          technicality: config.technicality,
-        },
-        path: payload.path,
-        startLine: payload.startLine ?? null,
-        endLine: payload.endLine ?? null,
-        selection: payload.text,
-        fileText: payload.fileText ?? null,
-      });
-      return {
-        text: outcome.text,
-        runtime: runtimeId(outcome.provider),
-        usedFallback: outcome.usedFallback,
-      };
+      // The listener attaches before the invoke so the first delta cannot
+      // race past it, and the request id keeps packets from an abandoned
+      // earlier ask out of this panel.
+      const requestId = onDelta ? crypto.randomUUID() : null;
+      let unlisten: (() => void) | undefined;
+      if (requestId && onDelta) {
+        const { listen } = await import("@tauri-apps/api/event");
+        unlisten = await listen<{
+          requestId: string;
+          kind: "attempt" | "delta";
+          text: string;
+          provider: NativeProviderStatus["provider"];
+        }>("selection-explain://event", (event) => {
+          if (event.payload.requestId !== requestId) return;
+          onDelta({
+            kind: event.payload.kind,
+            text: event.payload.text,
+            runtime: runtimeId(event.payload.provider),
+          });
+        });
+      }
+      try {
+        const outcome = await nativeInvoke<{
+          text: string;
+          provider: NativeProviderStatus["provider"];
+          usedFallback: boolean;
+        }>("selection_explain", {
+          repository: repositoryForProject(projectId),
+          route: {
+            provider: wireProvider(route.runtime),
+            model: route.model ?? null,
+            effort: route.effort ?? null,
+            fallbacks: route.fallbacks.map(wireProvider),
+          },
+          config: {
+            archetype: config.archetype,
+            customMission: config.customMission ?? null,
+            verbosity: config.verbosity,
+            technicality: config.technicality,
+          },
+          path: payload.path,
+          startLine: payload.startLine ?? null,
+          endLine: payload.endLine ?? null,
+          selection: payload.text,
+          fileText: payload.fileText ?? null,
+          requestId,
+          question: payload.question ?? null,
+          history: payload.history ?? [],
+        });
+        return {
+          text: outcome.text,
+          runtime: runtimeId(outcome.provider),
+          usedFallback: outcome.usedFallback,
+        };
+      } finally {
+        unlisten?.();
+      }
     }
     // Browser preview: a canned explanation keeps the flow demonstrable
-    // without a provider CLI.
-    await new Promise((resolve) => window.setTimeout(resolve, 600));
+    // without a provider CLI — streamed in chunks so the panel's live path
+    // stays demonstrable too.
     const lines = payload.text.split("\n").length;
-    return {
-      text: `This selection spans ${lines} line${lines === 1 ? "" : "s"} of ${
-        payload.path.split("/").at(-1) ?? payload.path
-      }. In the desktop app, your ${config.archetype} agent analyzes the highlighted code here in read-only mode.`,
-      runtime: route.runtime,
-      usedFallback: false,
-    };
+    const answer = payload.question
+      ? `On “${payload.question.slice(0, 80)}”: in the desktop app the ${config.archetype} agent answers follow-ups with the full conversation in context.`
+      : `This selection spans ${lines} line${lines === 1 ? "" : "s"} of ${
+          payload.path.split("/").at(-1) ?? payload.path
+        }. In the desktop app, your ${config.archetype} agent analyzes the highlighted code here in read-only mode.`;
+    if (onDelta) {
+      onDelta({ kind: "attempt", text: "", runtime: route.runtime });
+      const middle = Math.ceil(answer.length / 2);
+      for (const chunk of [answer.slice(0, middle), answer.slice(middle)]) {
+        await new Promise((resolve) => window.setTimeout(resolve, 250));
+        onDelta({ kind: "delta", text: chunk, runtime: route.runtime });
+      }
+    } else {
+      await new Promise((resolve) => window.setTimeout(resolve, 600));
+    }
+    return { text: answer, runtime: route.runtime, usedFallback: false };
   },
 
   explainPromptPreview: async (config, project) =>
@@ -4944,14 +5133,22 @@ export const bridge: AppBridge = {
     };
   },
 
-  generateCommitMessage: async (taskId, runtime) => {
+  generateCommitMessage: async (taskId, route) => {
     if (!isTauri()) {
       throw new Error("Commit-message generation is available only in the native desktop app");
+    }
+    if (!route.model?.trim()) {
+      throw new Error("Choose a commit-message model in Git settings.");
     }
     const nativeTaskId = await ensureNativeTask(taskId);
     return nativeInvoke<string>("git_generate_commit_message", {
       taskId: nativeTaskId,
-      provider: runtime === "custom" ? "custom-acp" : runtime,
+      route: {
+        provider: wireProvider(route.runtime),
+        model: route.model,
+        effort: route.effort ?? null,
+        fallbacks: route.fallbacks.map(wireProvider),
+      },
     });
   },
 

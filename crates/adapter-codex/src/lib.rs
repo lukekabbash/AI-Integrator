@@ -133,6 +133,7 @@ impl CodexClient {
         }
 
         let mut command = Command::new(&options.executable);
+        suppress_windows_console(&mut command);
         command
             .args(["app-server", "--stdio"])
             .stdin(Stdio::piped())
@@ -550,6 +551,19 @@ fn encode_message(value: &Value) -> Result<Vec<u8>> {
     }
     encoded.push(b'\n');
     Ok(encoded)
+}
+
+fn suppress_windows_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    }
+
+    #[cfg(not(windows))]
+    let _ = command;
 }
 
 fn spawn_stdout_reader(

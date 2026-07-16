@@ -167,6 +167,7 @@ impl AcpClient {
         }
 
         let mut command = launch_command(&options.executable, &options.arguments);
+        suppress_windows_console(&mut command);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -478,6 +479,19 @@ impl AcpClient {
         stdin.flush().await?;
         Ok(())
     }
+}
+
+fn suppress_windows_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    }
+
+    #[cfg(not(windows))]
+    let _ = command;
 }
 
 fn session_capabilities(initialization: &Value) -> AcpSessionCapabilities {

@@ -1,0 +1,7 @@
+{
+  "name": "stripe",
+  "description": "Stripe integration expertise: payment intents, webhooks, subscriptions, test mode, and CLI workflows with links to canonical docs.",
+  "version": "0.1.0",
+  "author": { "name": "AI Integrator" },
+  "license": "Apache-2.0"
+}

@@ -278,7 +278,7 @@ describe("FileWorkspace", () => {
     expect(screen.queryByRole("button", { name: /Add to chat/ })).not.toBeInTheDocument();
   });
 
-  it("opens the in-file explain panel instead of sending the selection to chat", async () => {
+  it("expands the menu into the floating ask panel instead of sending the selection to chat", async () => {
     const onExplainSelection = vi.fn().mockResolvedValue({
       text: "This line declares a string constant used by the surrounding module.",
       agentLabel: "Codex",
@@ -307,13 +307,15 @@ describe("FileWorkspace", () => {
         // The live buffer travels with the selection: context is gathered from
         // what is on screen, not from what is on disk.
         fileText: expect.stringContaining("const value"),
+        history: [],
       }),
+      expect.any(Function),
     );
     expect(onAddComposerContext).not.toHaveBeenCalled();
 
-    expect(
-      screen.getByRole("complementary", { name: /Explanation of App.tsx/ }),
-    ).toBeInTheDocument();
+    // The panel opens where the menu was, as a floating dialog.
+    const panel = screen.getByRole("dialog", { name: /Ask about App.tsx/ });
+    expect(panel).toBeInTheDocument();
     expect(screen.getByText("Explaining with Codex…")).toBeInTheDocument();
 
     await waitFor(() =>
@@ -327,6 +329,108 @@ describe("FileWorkspace", () => {
         screen.queryByRole("menu", { name: "Selection actions for src/App.tsx" }),
       ).not.toBeInTheDocument(),
     );
+  });
+
+  it("streams the answer into the panel as deltas arrive", async () => {
+    let sendDelta!: (delta: { kind: "attempt" | "delta"; text: string; agentLabel: string }) => void;
+    let finish!: (result: { text: string; agentLabel: string; usedFallback: boolean }) => void;
+    const onExplainSelection = vi.fn().mockImplementation((_payload, onDelta) => {
+      sendDelta = onDelta;
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    });
+    renderWorkspace({ onExplainSelection, explainAgentLabel: "Codex" });
+
+    fireEvent.contextMenu(selectFirstLine(), { clientX: 60, clientY: 60 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Ask about this" }));
+
+    // Before any delta: spinner, not text.
+    expect(screen.getByText("Reading the selection…")).toBeInTheDocument();
+
+    await act(async () => {
+      sendDelta({ kind: "attempt", text: "", agentLabel: "Codex" });
+      sendDelta({ kind: "delta", text: "It declares", agentLabel: "Codex" });
+    });
+    expect(screen.getByText("It declares")).toBeInTheDocument();
+
+    await act(async () => {
+      sendDelta({ kind: "delta", text: " a constant.", agentLabel: "Codex" });
+    });
+    expect(screen.getByText("It declares a constant.")).toBeInTheDocument();
+
+    // A fallback attempt resets the buffer instead of appending to the
+    // failed primary's partial output.
+    await act(async () => {
+      sendDelta({ kind: "attempt", text: "", agentLabel: "Claude" });
+    });
+    expect(screen.queryByText("It declares a constant.")).not.toBeInTheDocument();
+    expect(screen.getByText("Explaining with Claude…")).toBeInTheDocument();
+
+    await act(async () => {
+      finish({ text: "Final answer.", agentLabel: "Claude", usedFallback: true });
+    });
+    expect(screen.getByText("Final answer.")).toBeInTheDocument();
+  });
+
+  it("sends a follow-up with the prior exchanges as history", async () => {
+    const onExplainSelection = vi
+      .fn()
+      .mockResolvedValueOnce({
+        text: "It memoizes the visible rows.",
+        agentLabel: "Codex",
+        usedFallback: false,
+      })
+      .mockResolvedValueOnce({
+        text: "No, the memo is dropped on unmount.",
+        agentLabel: "Codex",
+        usedFallback: false,
+      });
+    renderWorkspace({ onExplainSelection, explainAgentLabel: "Codex" });
+
+    fireEvent.contextMenu(selectFirstLine(), { clientX: 60, clientY: 60 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Ask about this" }));
+    await screen.findByText("It memoizes the visible rows.");
+
+    const input = screen.getByRole("textbox", { name: "Follow-up question" });
+    fireEvent.change(input, { target: { value: "Could this leak on unmount?" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(onExplainSelection).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        question: "Could this leak on unmount?",
+        history: [{ question: "", answer: "It memoizes the visible rows." }],
+      }),
+      expect.any(Function),
+    );
+
+    // Both the question and its answer join the conversation.
+    await screen.findByText("No, the memo is dropped on unmount.");
+    expect(screen.getByText("Could this leak on unmount?")).toBeInTheDocument();
+    expect(screen.getByText("It memoizes the visible rows.")).toBeInTheDocument();
+    expect(input).toHaveValue("");
+  });
+
+  it("drags the panel by its header", async () => {
+    const onExplainSelection = vi.fn().mockResolvedValue({
+      text: "Answer.",
+      agentLabel: "Codex",
+      usedFallback: false,
+    });
+    renderWorkspace({ onExplainSelection });
+
+    fireEvent.contextMenu(selectFirstLine(), { clientX: 60, clientY: 60 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Ask about this" }));
+    const panel = await screen.findByRole("dialog", { name: /Ask about App.tsx/ });
+    const before = { left: panel.style.left, top: panel.style.top };
+
+    const header = panel.querySelector(".selection-ask-header") as HTMLElement;
+    fireEvent.pointerDown(header, { clientX: 100, clientY: 100 });
+    fireEvent.pointerMove(window, { clientX: 160, clientY: 140 });
+    fireEvent.pointerUp(window, { clientX: 160, clientY: 140 });
+
+    expect(panel.style.left).not.toBe(before.left);
+    expect(panel.style.top).not.toBe(before.top);
   });
 
   it("credits the provider that answered rather than the one that was asked", async () => {

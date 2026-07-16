@@ -275,6 +275,190 @@ fn discover_antigravity(repository: &Path) -> Vec<DiscoveredAction> {
     actions
 }
 
+/// One Integrator-plane skill: the bounded display metadata plus the host-side
+/// path used for projection. The path never crosses into the renderer.
+#[derive(Clone, Debug)]
+pub struct IntegratorSkillEntry {
+    pub name: String,
+    pub description: String,
+    /// "integrator" (user Skills root), "plugin" (user Plugins root), or
+    /// "first-party" (bundled with the app).
+    pub source: String,
+    /// The skill directory (containing SKILL.md) or a bare `<name>.md` file.
+    pub path: PathBuf,
+}
+
+/// Scan the Integrator-owned skill roots. Standalone skills are namespaced
+/// `integrator:<name>`; plugin skills are `<plugin>:<name>` so explicit slash
+/// invocation matches the projected plugin's own naming. First match by name
+/// wins: user skills shadow plugins, plugins shadow bundled first-party.
+pub fn discover_integrator_skills(
+    skills_root: &Path,
+    plugins_root: &Path,
+    bundled_root: Option<&Path>,
+) -> Vec<IntegratorSkillEntry> {
+    let mut entries = Vec::new();
+    scan_integrator_skill_root(skills_root, Some("integrator"), "integrator", &mut entries);
+    scan_integrator_plugin_tree(plugins_root, "plugin", &mut entries);
+    if let Some(bundled) = bundled_root {
+        scan_integrator_plugin_tree(bundled, "first-party", &mut entries);
+    }
+    let mut seen = HashSet::new();
+    entries
+        .into_iter()
+        .filter(|entry| seen.insert(entry.name.clone()))
+        .take(MAX_ACTIONS)
+        .collect()
+}
+
+fn scan_integrator_skill_root(
+    root: &Path,
+    namespace: Option<&str>,
+    source: &str,
+    output: &mut Vec<IntegratorSkillEntry>,
+) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten().take(MAX_ACTIONS) {
+        if output.len() >= MAX_ACTIONS {
+            break;
+        }
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
+        let (metadata_path, skill_path) = if kind.is_dir() {
+            (entry.path().join("SKILL.md"), entry.path())
+        } else if entry.path().extension().and_then(|value| value.to_str()) == Some("md") {
+            (entry.path(), entry.path())
+        } else {
+            continue;
+        };
+        let fallback = if kind.is_dir() {
+            entry.file_name().to_string_lossy().into_owned()
+        } else {
+            entry
+                .path()
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        };
+        let Some(action) = read_action_file(
+            &metadata_path,
+            &fallback,
+            source,
+            NativeActionKind::Skill,
+            NativeActionInvocation::Direct,
+        ) else {
+            continue;
+        };
+        let name = match namespace {
+            Some(namespace) => format!("{namespace}:{}", action.name),
+            None => action.name,
+        };
+        output.push(IntegratorSkillEntry {
+            name,
+            description: action.description,
+            source: source.into(),
+            path: skill_path,
+        });
+    }
+}
+
+/// Each top-level directory in the plugins root is one plugin; its name is
+/// the namespace. Inside a plugin, skills are found wherever the ecosystem
+/// puts them: `skills/` collections (Claude-plugin layout) or any descendant
+/// directory holding a SKILL.md (bare catalog repos like `anthropics/skills`
+/// or `openai/skills`, whose skill folders sit at the repository root).
+fn scan_integrator_plugin_tree(root: &Path, source: &str, output: &mut Vec<IntegratorSkillEntry>) {
+    let Ok(plugins) = fs::read_dir(root) else {
+        return;
+    };
+    for plugin in plugins.flatten().take(256) {
+        let Ok(kind) = plugin.file_type() else {
+            continue;
+        };
+        if !kind.is_dir()
+            || kind.is_symlink()
+            || plugin.file_name().to_string_lossy().starts_with('.')
+        {
+            continue;
+        }
+        let plugin_name = plugin.file_name().to_string_lossy().into_owned();
+        scan_plugin_dir(&plugin.path(), &plugin_name, source, output);
+    }
+}
+
+fn scan_plugin_dir(
+    root: &Path,
+    namespace: &str,
+    source: &str,
+    output: &mut Vec<IntegratorSkillEntry>,
+) {
+    let mut queue = VecDeque::from([(root.to_path_buf(), 0usize)]);
+    let mut visited = 0usize;
+    while let Some((directory, depth)) = queue.pop_front() {
+        if depth > 6 || visited >= 2_048 || output.len() >= MAX_ACTIONS {
+            break;
+        }
+        visited += 1;
+        // A directory owning a SKILL.md is one skill; its bundled resources
+        // are not walked further. This includes a plugin whose repository
+        // root is itself a single skill.
+        if directory.join("SKILL.md").is_file() {
+            let fallback = directory
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            if let Some(action) = read_action_file(
+                &directory.join("SKILL.md"),
+                &fallback,
+                source,
+                NativeActionKind::Skill,
+                NativeActionInvocation::Direct,
+            ) {
+                output.push(IntegratorSkillEntry {
+                    name: format!("{namespace}:{}", action.name),
+                    description: action.description,
+                    source: source.into(),
+                    path: directory,
+                });
+            }
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten().take(256) {
+            let name = entry.file_name();
+            if matches!(
+                name.to_str(),
+                Some(".git" | "node_modules" | "target" | ".next")
+            ) {
+                continue;
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if !kind.is_dir() || kind.is_symlink() {
+                continue;
+            }
+            if name.to_string_lossy().eq_ignore_ascii_case("skills") {
+                // Claude-plugin layout: `skills/` also hosts bare `.md`
+                // skills that the SKILL.md walk above cannot represent.
+                scan_integrator_skill_root(&entry.path(), Some(namespace), source, output);
+            } else {
+                queue.push_back((entry.path(), depth + 1));
+            }
+        }
+    }
+}
+
 fn scan_repo_skill_dirs(
     repository: &Path,
     marker: &str,
@@ -649,6 +833,90 @@ mod tests {
         );
         assert!(!actions.iter().any(|action| action.name == "too-large"));
         fs::remove_dir_all(root).expect("clean up native action fixtures");
+    }
+
+    #[test]
+    fn integrator_discovery_namespaces_shadows_and_rejects_symlinks() {
+        let root = std::env::temp_dir().join(format!("integrator-skills-{}", uuid::Uuid::new_v4()));
+        let skills = root.join("Skills");
+        let plugins = root.join("Plugins");
+        let bundled = root.join("bundled");
+        fs::create_dir_all(skills.join("fred")).expect("skills fixture");
+        fs::write(
+            skills.join("fred").join("SKILL.md"),
+            "---\nname: fred\ndescription: User copy\n---\nBODY",
+        )
+        .expect("user skill");
+        fs::create_dir_all(plugins.join("gov-data").join("skills").join("fred"))
+            .expect("plugin fixture");
+        fs::write(
+            plugins
+                .join("gov-data")
+                .join("skills")
+                .join("fred")
+                .join("SKILL.md"),
+            "---\nname: fred\ndescription: FRED data\n---\nBODY",
+        )
+        .expect("plugin skill");
+        fs::create_dir_all(bundled.join("gov-data").join("skills").join("fred"))
+            .expect("bundled fixture");
+        fs::write(
+            bundled
+                .join("gov-data")
+                .join("skills")
+                .join("fred")
+                .join("SKILL.md"),
+            "---\nname: fred\ndescription: Bundled copy\n---\nBODY",
+        )
+        .expect("bundled skill");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&skills, skills.join("escape")).expect("symlink fixture");
+
+        let entries = discover_integrator_skills(&skills, &plugins, Some(&bundled));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.name == "integrator:fred" && entry.source == "integrator")
+        );
+        // Same plugin name across Plugins and bundled: the user's install wins.
+        let plugin_copies = entries
+            .iter()
+            .filter(|entry| entry.name == "gov-data:fred")
+            .collect::<Vec<_>>();
+        assert_eq!(plugin_copies.len(), 1);
+        assert_eq!(plugin_copies[0].source, "plugin");
+        assert_eq!(plugin_copies[0].description, "FRED data");
+        assert!(!entries.iter().any(|entry| entry.name.contains("escape")));
+        fs::remove_dir_all(root).expect("clean up integrator fixtures");
+    }
+
+    #[test]
+    fn integrator_plugin_scan_handles_bare_catalog_repos() {
+        let root =
+            std::env::temp_dir().join(format!("integrator-catalog-{}", uuid::Uuid::new_v4()));
+        let plugins = root.join("Plugins");
+        // anthropics/skills style: skill dirs at the repository root.
+        let pdf = plugins.join("anthropics-skills").join("pdf");
+        fs::create_dir_all(pdf.join("scripts")).expect("catalog fixture");
+        fs::write(
+            pdf.join("SKILL.md"),
+            "---\nname: pdf\ndescription: Work with PDFs\n---\nBODY",
+        )
+        .expect("catalog skill");
+        // Nested resources under a skill are not themselves skills.
+        fs::write(
+            pdf.join("scripts").join("SKILL.md"),
+            "---\nname: fake\n---\n",
+        )
+        .expect("nested fixture");
+        let entries = discover_integrator_skills(&root.join("Skills"), &plugins, None);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.name == "anthropics-skills:pdf")
+        );
+        assert!(!entries.iter().any(|entry| entry.name.contains("fake")));
+        fs::remove_dir_all(root).expect("clean up catalog fixtures");
     }
 
     #[test]

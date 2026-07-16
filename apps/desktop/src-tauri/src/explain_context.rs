@@ -391,9 +391,40 @@ fn is_ident_continue(byte: u8) -> bool {
 /// byte walk never slices a multi-byte character.
 fn identifiers(text: &str) -> HashSet<&str> {
     const NOISE: &[&str] = &[
-        "if", "else", "for", "while", "return", "let", "const", "var", "fn", "pub", "use", "mod",
-        "self", "this", "true", "false", "null", "undefined", "new", "await", "async", "import",
-        "export", "from", "as", "type", "match", "impl", "in", "of", "not", "and", "or", "is",
+        "if",
+        "else",
+        "for",
+        "while",
+        "return",
+        "let",
+        "const",
+        "var",
+        "fn",
+        "pub",
+        "use",
+        "mod",
+        "self",
+        "this",
+        "true",
+        "false",
+        "null",
+        "undefined",
+        "new",
+        "await",
+        "async",
+        "import",
+        "export",
+        "from",
+        "as",
+        "type",
+        "match",
+        "impl",
+        "in",
+        "of",
+        "not",
+        "and",
+        "or",
+        "is",
     ];
     let bytes = text.as_bytes();
     let mut names = HashSet::new();
@@ -478,7 +509,9 @@ fn statements(head: &str, starts: fn(&str) -> bool, complete: fn(&str) -> bool) 
 fn typescript_imports(head: &str) -> Vec<Import> {
     statements(
         head,
-        |line| line.starts_with("import ") || line.starts_with("import{") || line.contains("require("),
+        |line| {
+            line.starts_with("import ") || line.starts_with("import{") || line.contains("require(")
+        },
         |statement| quoted_specifier(statement).is_some(),
     )
     .into_iter()
@@ -489,7 +522,9 @@ fn typescript_imports(head: &str) -> Vec<Import> {
         // statement is a side-effect import that binds nothing — scanning it
         // whole would mine the specifier itself for names ("./styles.css"
         // would "import" `styles` and `css`).
-        let clause = &statement[..statement.find(" from ").or_else(|| statement.find("require("))?];
+        let clause = &statement[..statement
+            .find(" from ")
+            .or_else(|| statement.find("require("))?];
         let names = clause_names(clause);
         (!names.is_empty()).then_some(Import { specifier, names })
     })
@@ -586,10 +621,7 @@ fn resolve_typescript(current: &Path, specifier: &str) -> Option<PathBuf> {
         return Some(base);
     }
     for extension in EXTENSIONS {
-        let candidate = base.with_file_name(format!(
-            "{}.{extension}",
-            base.file_name()?.to_str()?
-        ));
+        let candidate = base.with_file_name(format!("{}.{extension}", base.file_name()?.to_str()?));
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -614,7 +646,10 @@ fn resolve_typescript(current: &Path, specifier: &str) -> Option<PathBuf> {
 /// ancestor holding a Cargo.toml; `self`/`super` walk from the current module.
 /// External crates resolve to nothing and are skipped by the root check.
 fn resolve_rust(_root: &Path, current: &Path, specifier: &str) -> Option<PathBuf> {
-    let mut segments: Vec<&str> = specifier.split("::").filter(|part| !part.is_empty()).collect();
+    let mut segments: Vec<&str> = specifier
+        .split("::")
+        .filter(|part| !part.is_empty())
+        .collect();
     if segments.is_empty() {
         return None;
     }
@@ -752,7 +787,11 @@ mod tests {
         assert!(imports[1].names.contains(&"LocalSetting".to_owned()));
         assert!(imports[1].names.contains(&"Setting".to_owned()));
         // A side-effect import binds nothing and is dropped.
-        assert!(!imports.iter().any(|import| import.specifier.ends_with(".css")));
+        assert!(
+            !imports
+                .iter()
+                .any(|import| import.specifier.ends_with(".css"))
+        );
     }
 
     #[test]
@@ -769,12 +808,21 @@ mod tests {
 
     #[test]
     fn definitions_are_found_by_keyword_not_by_mention() {
-        assert!(defines("export function resolveModelEffort(entry) {", "resolveModelEffort"));
+        assert!(defines(
+            "export function resolveModelEffort(entry) {",
+            "resolveModelEffort"
+        ));
         assert!(defines("pub struct Setting {", "Setting"));
         assert!(defines("  const bridge = createBridge();", "bridge"));
-        assert!(defines("async fn generate_codex_title(", "generate_codex_title"));
+        assert!(defines(
+            "async fn generate_codex_title(",
+            "generate_codex_title"
+        ));
         // A call site is not a definition, and a substring is not a word.
-        assert!(!defines("  resolveModelEffort(entry, preferred);", "resolveModelEffort"));
+        assert!(!defines(
+            "  resolveModelEffort(entry, preferred);",
+            "resolveModelEffort"
+        ));
         assert!(!defines("pub struct SettingRow {", "Setting"));
     }
 

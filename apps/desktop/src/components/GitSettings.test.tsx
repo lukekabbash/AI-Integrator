@@ -11,7 +11,6 @@ const { bridgeMock } = vi.hoisted(() => ({
     listModelCatalog: vi.fn(),
     setSetting: vi.fn(),
     getStorageTotals: vi.fn(),
-    explainPromptPreview: vi.fn(),
   },
 }));
 
@@ -74,11 +73,11 @@ function renderSettings() {
 
 async function openSection() {
   renderSettings();
-  fireEvent.click(screen.getByText("Files and Git").closest("button") as HTMLButtonElement);
-  await screen.findByRole("heading", { name: "Files and Git" });
+  fireEvent.click(screen.getByText("Git").closest("button") as HTMLButtonElement);
+  await screen.findByRole("heading", { name: "Git" });
 }
 
-describe("Files and Git settings", () => {
+describe("Git settings", () => {
   beforeEach(() => {
     for (const mock of Object.values(bridgeMock)) mock.mockReset();
     bridgeMock.listSettings.mockResolvedValue([]);
@@ -91,7 +90,6 @@ describe("Files and Git settings", () => {
     bridgeMock.listRuntimeActionPlans.mockResolvedValue([]);
     bridgeMock.listModelCatalog.mockResolvedValue([]);
     bridgeMock.setSetting.mockResolvedValue(undefined);
-    bridgeMock.explainPromptPreview.mockResolvedValue("PROMPT PREVIEW");
     bridgeMock.getStorageTotals.mockResolvedValue({
       totalBytes: 0,
       databaseBytes: 0,
@@ -102,83 +100,36 @@ describe("Files and Git settings", () => {
     });
   });
 
-  it("persists the archetype and both sliders", async () => {
+  it("puts what AI Integrator writes into a commit above who drafts it", async () => {
     await openSection();
-
-    fireEvent.click(screen.getByRole("button", { name: "Explain archetype" }));
-    fireEvent.click(await screen.findByRole("option", { name: "Socratic" }));
-    await waitFor(() =>
-      expect(bridgeMock.setSetting).toHaveBeenCalledWith("settings.explain.archetype", "socratic"),
-    );
-
-    fireEvent.change(screen.getByRole("slider", { name: "Verbosity" }), {
-      target: { value: "95" },
-    });
-    await waitFor(() =>
-      expect(bridgeMock.setSetting).toHaveBeenCalledWith("settings.explain.verbosity", 95),
-    );
-
-    fireEvent.change(screen.getByRole("slider", { name: "Audience" }), { target: { value: "0" } });
-    await waitFor(() =>
-      expect(bridgeMock.setSetting).toHaveBeenCalledWith("settings.explain.technicality", 0),
-    );
+    const headings = screen.getAllByRole("heading", { level: 2 }).map((node) => node.textContent);
+    const commitsIndex = headings.indexOf("Commits");
+    const commitMessagesIndex = headings.indexOf("Commit messages");
+    expect(commitsIndex).toBeGreaterThanOrEqual(0);
+    expect(commitMessagesIndex).toBeGreaterThan(commitsIndex);
   });
 
-  it("announces each slider's meaning rather than its raw index", async () => {
+  it("requires an explicit commit-message runtime and auto-picks its first catalog model", async () => {
+    bridgeMock.listModelCatalog.mockResolvedValue([
+      { id: "gpt-5-mini", label: "GPT-5 mini" },
+      { id: "gpt-5", label: "GPT-5" },
+    ]);
     await openSection();
-    // "2" tells a screen-reader user nothing about who the answer is written for.
-    expect(screen.getByRole("slider", { name: "Audience" })).toHaveAttribute(
-      "aria-valuetext",
-      "Technical",
-    );
-    expect(screen.getByRole("slider", { name: "Verbosity" })).toHaveAttribute(
-      "aria-valuetext",
-      "Brief · 40",
-    );
-  });
 
-  it("creates a custom archetype from the dropdown's New row and selects it", async () => {
-    await openSection();
-    fireEvent.click(screen.getByRole("button", { name: "Explain archetype" }));
-    fireEvent.click(await screen.findByRole("option", { name: "New archetype…" }));
+    fireEvent.click(screen.getByRole("button", { name: "Commit message runtime" }));
+    fireEvent.click(await screen.findByRole("option", { name: "Codex" }));
 
-    await waitFor(() => expect(bridgeMock.setSetting).toHaveBeenCalled());
-    const written = bridgeMock.setSetting.mock.calls.find(
-      ([key]) => key === "settings.explain.customArchetypes",
-    );
-    expect(written?.[1]).toHaveLength(1);
-    // The sentinel is an action, not a value: it must never be stored.
-    expect(bridgeMock.setSetting).not.toHaveBeenCalledWith(
-      "settings.explain.archetype",
-      "__new__",
-    );
-
-    // The new archetype opens its editor with a starter mission to edit.
-    const mission = await screen.findByRole("textbox", { name: "Archetype mission" });
-    expect(mission).toHaveValue("Explain what this code does and why it matters.");
-  });
-
-  it("shows the natively composed prompt rather than a local imitation", async () => {
-    await openSection();
-    await waitFor(() => expect(bridgeMock.explainPromptPreview).toHaveBeenCalled());
-    expect(await screen.findByLabelText("Composed explain prompt")).toHaveTextContent(
-      "PROMPT PREVIEW",
-    );
-    expect(bridgeMock.explainPromptPreview.mock.calls.at(-1)?.[0]).toMatchObject({
-      archetype: "explanation",
-      verbosity: 40,
-      technicality: 2,
-    });
-  });
-
-  it("orders the fallback chain by click and offers only installed runtimes", async () => {
-    await openSection();
-    // Cursor is not installed, so it can never answer and is not offered.
-    expect(screen.queryByRole("button", { name: /Cursor/ })).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: /Claude/ }));
     await waitFor(() =>
-      expect(bridgeMock.setSetting).toHaveBeenCalledWith("settings.explain.fallbacks", ["claude"]),
+      expect(bridgeMock.setSetting).toHaveBeenCalledWith(
+        "settings.git.commitMessage.runtime",
+        "codex",
+      ),
+    );
+    await waitFor(() =>
+      expect(bridgeMock.setSetting).toHaveBeenCalledWith(
+        "settings.git.commitMessage.model",
+        "gpt-5-mini",
+      ),
     );
   });
 

@@ -180,7 +180,6 @@ describe("Composer compact controls", () => {
     fireEvent.click(screen.getByRole("button", { name: "Runtime" }));
     fireEvent.click(screen.getByRole("option", { name: "Claude" }));
 
-    expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("claude-sonnet");
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("Claude Sonnet"),
     );

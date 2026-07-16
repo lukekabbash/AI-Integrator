@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-integrator-skills-uninstall"
+description = "Enables the integrator_skills_uninstall command without any pre-configured scope."
+commands.allow = ["integrator_skills_uninstall"]
+
+[[permission]]
+identifier = "deny-integrator-skills-uninstall"
+description = "Denies the integrator_skills_uninstall command without any pre-configured scope."
+commands.deny = ["integrator_skills_uninstall"]

@@ -8,7 +8,9 @@ mod commands;
 mod commit_message;
 mod delegation;
 mod explain_context;
+mod integrator_skills;
 mod native_actions;
+mod provider_routing;
 mod runtime_setup;
 mod state;
 
@@ -19,6 +21,10 @@ use commit_message::git_generate_commit_message;
 use delegation::{
     delegation_approve, delegation_deny, delegation_list, delegation_send_message,
     delegation_stop_cmd,
+};
+use integrator_skills::{
+    integrator_skill_credential_clear, integrator_skill_credential_set,
+    integrator_skills_install, integrator_skills_overview, integrator_skills_uninstall,
 };
 use runtime_setup::{
     runtime_action_plan_list, runtime_terminal_close, runtime_terminal_open,
@@ -59,7 +65,11 @@ pub fn run() {
                 let boxed: Box<dyn std::error::Error> = Box::new(error);
                 boxed
             })?;
+            integrator_skills::prune_projections(&state.data_directory);
             app.manage(state);
+            if let Err(error) = integrator_skills::ensure_roots(app.handle()) {
+                eprintln!("skills root creation failed: {error}");
+            }
             if let Err(error) = delegation::prune_stale_mcp_configs(app.handle()) {
                 eprintln!("delegation broker config cleanup failed: {error}");
             }
@@ -92,6 +102,11 @@ pub fn run() {
             task_remove,
             setting_list,
             setting_set,
+            integrator_skills_overview,
+            integrator_skills_install,
+            integrator_skills_uninstall,
+            integrator_skill_credential_set,
+            integrator_skill_credential_clear,
             session_list,
             local_export,
             local_clear,

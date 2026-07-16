@@ -1006,8 +1006,8 @@ describe("native trusted-project bridge", () => {
 
     await expect(catalogPromise).resolves.toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ label: "grok-4.5" }),
-        expect.objectContaining({ label: "gpt-5.6-sol" }),
+        expect.objectContaining({ label: "Grok 4.5" }),
+        expect.objectContaining({ label: "GPT-5.6 Sol" }),
       ]),
     );
     await expect(sendPromise).resolves.toMatchObject({ kind: "user" });

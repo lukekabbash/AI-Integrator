@@ -624,6 +624,53 @@ describe("native runtime recovery UI", () => {
     expect(screen.queryByText("Provider connection lost")).not.toBeInTheDocument();
   });
 
+  it("replaces stale disconnect copy while connecting and disappears when connected", async () => {
+    const workspace = await bridgeMock.loadWorkspace();
+    workspace.tasks = workspace.tasks.map((task) => ({
+      ...task,
+      runtime: "cursor",
+    }));
+    bridgeMock.loadWorkspace.mockResolvedValue(workspace);
+
+    render(<App />);
+    await screen.findByText("Some runtime events were missed", {}, { timeout: 3000 });
+
+    act(() => {
+      runtimeListener?.(
+        projection(10, {
+          kind: "connectionChanged",
+          state: "disconnected",
+          reason: "Cursor is not connected",
+        }),
+      );
+    });
+    expect(await screen.findByText("Cursor is disconnected")).toBeVisible();
+
+    act(() => {
+      runtimeListener?.(
+        projection(11, {
+          kind: "connectionChanged",
+          state: "connecting",
+        }),
+      );
+    });
+    expect(screen.getByText("Connecting to Cursor…")).toBeVisible();
+    expect(screen.queryByText("Cursor is disconnected")).not.toBeInTheDocument();
+    expect(screen.queryByText("Cursor is not connected")).not.toBeInTheDocument();
+
+    act(() => {
+      runtimeListener?.(
+        projection(12, {
+          kind: "connectionChanged",
+          state: "connected",
+          processId: "cursor-process",
+        }),
+      );
+    });
+    expect(screen.queryByText("Connecting to Cursor…")).not.toBeInTheDocument();
+    expect(document.querySelector(".runtime-connection")).toBeNull();
+  }, 10_000);
+
   it("queues a typed follow-up instead of starting a competing turn", async () => {
     render(<App />);
     await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
@@ -645,6 +692,63 @@ describe("native runtime recovery UI", () => {
     );
     expect(bridgeMock.sendTurn).not.toHaveBeenCalled();
     expect(screen.getByText("Follow up")).toBeInTheDocument();
+  });
+
+  it("waits for authoritative chat state before dispatching a newly queued turn", async () => {
+    const workspace = await bridgeMock.loadWorkspace();
+    workspace.tasks.push({
+      id: "task-2",
+      projectId: "project-1",
+      title: "Reconnecting chat",
+      status: "completed",
+      runtime: "codex",
+      model: "Provider default",
+      updatedAt: "2026-07-10T15:00:00Z",
+    });
+    bridgeMock.loadWorkspace.mockResolvedValue(workspace);
+    let releaseTaskTwo: ((value: TaskProjectionSnapshot) => void) | undefined;
+    const taskTwoProjection = new Promise<TaskProjectionSnapshot>((resolve) => {
+      releaseTaskTwo = resolve;
+    });
+    bridgeMock.loadTaskProjection.mockImplementation(async (taskId: string) => {
+      if (taskId === "task-2") return taskTwoProjection;
+      return projectionSnapshot({ watermarkSeq: 0, runtimeLive: false, events: [] });
+    });
+    bridgeMock.setQueuedMessageDispatching.mockImplementation(
+      async (taskId, _messageId, dispatching) => ({
+        ...queuedMessage("Wait for state"),
+        taskId,
+        state: dispatching ? "dispatching" : "queued",
+      }),
+    );
+    bridgeMock.takeQueuedMessage.mockResolvedValue(queuedMessage("Wait for state"));
+    bridgeMock.sendTurn.mockResolvedValue(undefined);
+
+    render(<App />);
+    await waitFor(() =>
+      expect(bridgeMock.loadTaskProjection).toHaveBeenCalledWith("task-1", expect.any(Object)),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /Reconnecting chat/i }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Task message" }), {
+      target: { value: "Wait for state" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(bridgeMock.enqueueMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ taskId: "task-2", prompt: "Wait for state" }),
+      ),
+    );
+    expect(bridgeMock.sendTurn).not.toHaveBeenCalled();
+
+    releaseTaskTwo?.(
+      projectionSnapshot({ watermarkSeq: 0, runtimeLive: false, events: [], taskId: "task-2" }),
+    );
+    await waitFor(() =>
+      expect(bridgeMock.sendTurn).toHaveBeenCalledWith(
+        expect.objectContaining({ taskId: "task-2", prompt: "Wait for state" }),
+      ),
+    );
   });
 
   it("steers a supported active turn when Send now is selected", async () => {
@@ -897,6 +1001,113 @@ describe("native runtime recovery UI", () => {
     expect(screen.queryByText("Response interrupted")).not.toBeInTheDocument();
     expect(screen.getByText("2h 5m")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Stop turn" })).toBeInTheDocument();
+  });
+
+  it("keeps a background chat projection current while another chat is selected", async () => {
+    const workspace = createEmptySnapshot();
+    workspace.projects = [
+      {
+        id: "project-1",
+        name: "sample",
+        path: "H:\\Code\\sample",
+        branch: "main",
+        dirtyFiles: 0,
+        expanded: true,
+      },
+    ];
+    workspace.tasks = [
+      {
+        id: "task-1",
+        projectId: "project-1",
+        title: "Foreground task",
+        status: "completed",
+        runtime: "codex",
+        model: "Provider default",
+        updatedAt: "2026-07-10T16:00:00Z",
+      },
+      {
+        id: "task-2",
+        projectId: "project-1",
+        title: "Background live task",
+        status: "running",
+        runtime: "codex",
+        model: "Provider default",
+        updatedAt: "2026-07-10T15:00:00Z",
+      },
+    ];
+    workspace.activeProjectId = "project-1";
+    workspace.activeTaskId = "task-2";
+    bridgeMock.loadWorkspace.mockResolvedValue(workspace);
+
+    let taskTwoLoads = 0;
+    let releaseSecondTaskTwoLoad: ((value: TaskProjectionSnapshot) => void) | undefined;
+    const secondTaskTwoLoad = new Promise<TaskProjectionSnapshot>((resolve) => {
+      releaseSecondTaskTwoLoad = resolve;
+    });
+    bridgeMock.loadTaskProjection.mockImplementation(async (taskId: string) => {
+      if (taskId === "task-1") {
+        return projectionSnapshot({ watermarkSeq: 0, runtimeLive: false, events: [] });
+      }
+      taskTwoLoads += 1;
+      if (taskTwoLoads > 1) return secondTaskTwoLoad;
+      return projectionSnapshot({
+        watermarkSeq: 2,
+        runtimeLive: true,
+        events: [
+          {
+            ...projection(1, {
+              kind: "connectionChanged",
+              state: "connected",
+              processId: "process-2",
+            }),
+            taskId: "task-2",
+          },
+          {
+            ...projection(2, {
+              kind: "turnChanged",
+              turn: {
+                id: "turn-background",
+                status: "inProgress",
+                stopRequested: false,
+              },
+            }),
+            taskId: "task-2",
+          },
+        ],
+      });
+    });
+
+    render(<App />);
+    expect(await screen.findByRole("button", { name: "Stop turn" })).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: /Foreground task/i }));
+    await waitFor(() =>
+      expect(bridgeMock.loadTaskProjection).toHaveBeenCalledWith("task-1", expect.any(Object)),
+    );
+
+    act(() => {
+      runtimeListener?.({
+        ...projection(3, {
+          kind: "turnChanged",
+          turn: {
+            id: "turn-background",
+            status: "completed",
+            stopRequested: false,
+            completedAt: "2026-07-10T16:00:03Z",
+          },
+        }),
+        taskId: "task-2",
+      });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Background live task/i }));
+    expect(screen.queryByRole("button", { name: "Stop turn" })).not.toBeInTheDocument();
+    expect(bridgeMock.loadTaskProjection).toHaveBeenLastCalledWith(
+      "task-2",
+      expect.objectContaining({ knownWatermark: 3 }),
+    );
+    releaseSecondTaskTwoLoad?.(
+      projectionSnapshot({ watermarkSeq: 3, runtimeLive: false, events: [], taskId: "task-2" }),
+    );
   });
 
   it("reuses Git state without rechecking when switching chats in the same checkout", async () => {
@@ -1774,6 +1985,61 @@ describe("native runtime recovery UI", () => {
     await waitFor(() => expect(bridgeMock.loadTaskGit).toHaveBeenCalledWith("task-1"));
     expect(bridgeMock.loadTaskGit).toHaveBeenCalledTimes(1);
   });
+
+  it("keeps persisted-state reconciliation quiet on the first send", async () => {
+    const workspace = createEmptySnapshot();
+    workspace.projects = [
+      {
+        id: "project-1",
+        name: "sample",
+        path: "H:\\Code\\sample",
+        branch: "main",
+        dirtyFiles: 0,
+        expanded: true,
+      },
+    ];
+    workspace.activeProjectId = "project-1";
+    workspace.runtimes = [
+      {
+        id: "codex",
+        name: "Codex",
+        command: "codex",
+        status: "connected",
+        fidelity: "native",
+        models: ["Provider default"],
+        detail: "Authenticated local CLI",
+      },
+    ];
+    bridgeMock.loadWorkspace.mockResolvedValue(workspace);
+    bridgeMock.loadProjectGit.mockResolvedValue(workspace.git);
+    bridgeMock.startTask.mockResolvedValue({
+      id: "task-first-send",
+      projectId: "project-1",
+      title: "New chat",
+      status: "draft",
+      runtime: "codex",
+      model: "Provider default",
+      updatedAt: "2026-07-14T19:00:00Z",
+    });
+    bridgeMock.sendTurn.mockResolvedValue(undefined);
+
+    render(<App />);
+    fireEvent.change(await screen.findByRole("textbox", { name: "Task message" }), {
+      target: { value: "Start cleanly" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(bridgeMock.sendTurn).toHaveBeenCalledWith(
+        expect.objectContaining({ taskId: "task-first-send" }),
+      ),
+    );
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 900));
+    });
+    expect(screen.queryByText("Reconciling persisted task state…")).not.toBeInTheDocument();
+    expect(screen.queryByText("Loading persisted task state")).not.toBeInTheDocument();
+  }, 10_000);
 
   it("keeps project Git usable while a new chat becomes its first task", async () => {
     const workspace = createEmptySnapshot();

@@ -128,7 +128,7 @@ describe("resolveExplainRoute", () => {
     expect(route.fallbacks).toEqual(["claude"]);
   });
 
-  it("treats an empty pinned model as the economy default, not as a model id", () => {
+  it("requires a non-empty pinned model rather than treating blank as a default", () => {
     const route = resolveExplainRoute(
       { [EXPLAIN_SETTINGS.runtime]: "claude", [EXPLAIN_SETTINGS.model]: "" },
       ACTIVE,

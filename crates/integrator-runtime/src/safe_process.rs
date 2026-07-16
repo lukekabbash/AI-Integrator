@@ -56,6 +56,7 @@ pub(crate) fn run_bounded_with_outcome(
     timeout: Duration,
 ) -> Result<ProcessRunOutcome> {
     let mut command = probe_command(executable, args);
+    suppress_windows_console(&mut command);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -101,6 +102,19 @@ pub(crate) fn run_bounded_with_outcome(
         stdout_truncated,
         stderr_truncated,
     }))
+}
+
+fn suppress_windows_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    #[cfg(not(windows))]
+    let _ = command;
 }
 
 fn read_limited(mut reader: impl Read, max_output_bytes: u64) -> Result<(String, bool)> {

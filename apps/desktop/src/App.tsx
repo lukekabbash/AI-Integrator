@@ -78,6 +78,7 @@ import {
   isRuntimeUpdateRequired,
   type ComposerNotice,
 } from "./composerNotices";
+import { prettyModelLabel } from "./modelLabel";
 import { ComposerDraftStore } from "./composerDraftStore";
 import { nextForkTitle } from "./forkTitle";
 import type { RuntimeActionRequest } from "./components/SettingsView";
@@ -99,11 +100,13 @@ import { DeleteArchivedChatsModal } from "./components/DeleteArchivedChatsModal"
 import { DeleteProjectModal, type DeleteProjectScope } from "./components/DeleteProjectModal";
 import {
   FileWorkspace,
+  type FileExplainDelta,
   type FileExplainPayload,
   type FileExplainResult,
   type FileSelectionPayload,
 } from "./components/FileView";
 import { resolveExplainConfig, resolveExplainRoute } from "./explainSettings";
+import { resolveCommitMessageRoute } from "./commitMessageSettings";
 import { decorateCommitMessage, readGitDecorationSettings, readPushForce } from "./gitDecoration";
 import { TitlebarFileTabs } from "./components/TitlebarFileTabs";
 import { resolveRequestedFile } from "./components/fileViewSupport";
@@ -170,32 +173,7 @@ type ComposerTurnInput = {
   draftRevision?: number;
 };
 
-/** Brand-cased words for turning raw model ids into display labels. */
-const MODEL_LABEL_WORDS: Record<string, string> = {
-  gpt: "GPT",
-  glm: "GLM",
-  oss: "OSS",
-  claude: "Claude",
-  gemini: "Gemini",
-  grok: "Grok",
-  deepseek: "DeepSeek",
-  codex: "Codex",
-  sonnet: "Sonnet",
-  haiku: "Haiku",
-  opus: "Opus",
-  flash: "Flash",
-  pro: "Pro",
-  mini: "mini",
-  nano: "nano",
-};
 
-function formatModelLabel(modelId?: string): string {
-  if (!modelId || modelId === "Provider default") return "";
-  return modelId
-    .split(/(\s+|-)/)
-    .map((token) => MODEL_LABEL_WORDS[token.toLowerCase()] ?? token)
-    .join("");
-}
 
 function queuedMessagePrompt(message: QueuedMessage): string {
   const prompt = message.prompt.trim();
@@ -1113,10 +1091,6 @@ function EmptyTaskState({ project }: { project: ProjectSummary }) {
       </span>
       <span className="empty-task-kicker">{project.name}</span>
       <h2 id="empty-task-title">What are we working on?</h2>
-      <p>
-        Describe what you want done. Every task is saved locally first, so nothing is lost if the
-        agent disconnects mid-run.
-      </p>
     </section>
   );
 }
@@ -1127,73 +1101,57 @@ function EmptyTaskState({ project }: { project: ProjectSummary }) {
  * provider spawns; flashing a banner for that is noise.
  */
 const CONNECTION_NOTICE_DELAY_MS = 800;
-const CONNECTION_NOTICE_EXIT_MS = 220;
 
 function ConnectionNotice({
   state,
   runtime,
   resuming = false,
+  quietReconciling = false,
 }: {
   state: RuntimeProjectionState["connection"];
   runtime: string;
   /** Quiet chrome while an interrupted turn is being continued. */
   resuming?: boolean;
+  /** A fresh task has no persisted provider state to explain. */
+  quietReconciling?: boolean;
 }) {
   const displayState: RuntimeProjectionState["connection"] = resuming
     ? { state: "connecting" }
     : state;
-  const active = displayState.state !== "connected";
-  const [notice, setNotice] = useState<{
-    connection: RuntimeProjectionState["connection"];
-    resuming: boolean;
-    exiting: boolean;
-  } | null>(null);
+  const active =
+    displayState.state !== "connected" &&
+    !(quietReconciling && displayState.state === "reconciling");
+  const [visible, setVisible] = useState(false);
 
   useEffect(() => {
-    if (active) {
-      if (
-        notice &&
-        !notice.exiting &&
-        notice.connection.state === displayState.state &&
-        notice.connection.reason === displayState.reason &&
-        notice.resuming === resuming
-      )
-        return;
-      const timer = window.setTimeout(
-        () => setNotice({ connection: displayState, resuming, exiting: false }),
-        notice ? 0 : CONNECTION_NOTICE_DELAY_MS,
-      );
+    if (!active) {
+      if (!visible) return;
+      const timer = window.setTimeout(() => setVisible(false), 0);
       return () => window.clearTimeout(timer);
     }
-    if (!notice) return;
-    const timer = window.setTimeout(
-      () => setNotice(notice.exiting ? null : { ...notice, exiting: true }),
-      notice.exiting ? CONNECTION_NOTICE_EXIT_MS : 0,
-    );
+    if (visible) return;
+    const timer = window.setTimeout(() => setVisible(true), CONNECTION_NOTICE_DELAY_MS);
     return () => window.clearTimeout(timer);
-  }, [active, displayState, notice, resuming]);
+  }, [active, visible]);
 
-  if (!notice) return null;
-  const shown = notice.connection;
-  if (shown.state === "connected") return null;
+  if (!active || !visible) return null;
+  const shown = displayState;
   const labels = {
-    connecting: notice.resuming ? "Resuming…" : `Connecting to ${runtime}…`,
+    connecting: resuming ? "Resuming…" : `Connecting to ${runtime}…`,
     disconnected: `${runtime} is disconnected`,
     reconciling: "Reconciling persisted task state…",
     gap: "Some runtime events were missed",
   } as const;
   return (
     <div
-      className={`runtime-connection runtime-connection--${shown.state}${
-        notice.exiting ? " runtime-connection--exiting" : ""
-      }`}
+      className={`runtime-connection runtime-connection--${shown.state}`}
       role={shown.state === "disconnected" ? "alert" : "status"}
       aria-live="polite"
     >
       <span className="runtime-connection-dot" aria-hidden="true" />
       <span>
         <strong>{labels[shown.state]}</strong>
-        {shown.reason && !notice.resuming ? <small>{shown.reason}</small> : null}
+        {shown.reason && !resuming ? <small>{shown.reason}</small> : null}
       </span>
     </div>
   );
@@ -1431,6 +1389,7 @@ export default function App() {
     taskId: string;
     event: TranscriptEvent;
   } | null>(null);
+  const [freshTaskIds, setFreshTaskIds] = useState<ReadonlySet<string>>(() => new Set());
   const [composerDraftStore] = useState(() => new ComposerDraftStore());
   const draftPersistenceFailureShown = useRef(false);
   const pendingDraftWrites = useRef(new Map<string, ComposerDraft>());
@@ -1554,6 +1513,7 @@ export default function App() {
   const projectionBuffer = useRef<RuntimeProjectionEvent[]>([]);
   const projectionReady = useRef(false);
   const projectionTaskId = useRef("");
+  const [readyProjectionTaskId, setReadyProjectionTaskId] = useState("");
   const projectionGeneration = useRef(0);
   const navigationGeneration = useRef(0);
   const taskProjectionCache = useRef(new Map<string, RuntimeProjectionState>());
@@ -1744,6 +1704,7 @@ export default function App() {
       const generation = ++projectionGeneration.current;
       projectionReady.current = false;
       projectionTaskId.current = taskId;
+      setReadyProjectionTaskId("");
       if (!preserveBufferedEvents) projectionBuffer.current = [];
       setRuntimeState(cachedState ?? createRuntimeProjectionState(taskId));
       try {
@@ -1795,6 +1756,7 @@ export default function App() {
         if (generation !== projectionGeneration.current) return;
         projectionBuffer.current = [];
         projectionReady.current = true;
+        setReadyProjectionTaskId(taskId);
         if (
           !runtimeLive &&
           (next.connection.state === "reconciling" ||
@@ -1806,10 +1768,7 @@ export default function App() {
           // runtime; a newer buffered lifecycle event can also prove liveness.
           next = {
             ...next,
-            connection: {
-              state: "disconnected",
-              reason: "Codex is not connected",
-            },
+            connection: { state: "disconnected" },
           };
         }
         if (
@@ -1817,8 +1776,9 @@ export default function App() {
           next.turn &&
           (next.turn.status === "inProgress" || next.turn.status === "pending")
         ) {
-          // The backend normally settles this before returning the snapshot;
-          // retain a renderer fallback for a failed settlement or old store.
+          // Startup normally settles this before the renderer hydrates. Keep
+          // a visual fallback for old stores without making selection mutate
+          // the durable task state.
           next = {
             ...next,
             turn: {
@@ -1839,6 +1799,7 @@ export default function App() {
       } catch (error) {
         if (generation !== projectionGeneration.current) return;
         projectionReady.current = true;
+        setReadyProjectionTaskId(taskId);
         const failed = {
           ...createRuntimeProjectionState(taskId),
           connection: {
@@ -1933,6 +1894,22 @@ export default function App() {
         if (nativeHost) {
           unlisten = await bridge.subscribeRuntimeProjections((event) => {
             if (
+              (event.projection.kind === "connectionChanged" &&
+                event.projection.state !== "reconciling" &&
+                event.projection.state !== "connecting") ||
+              event.projection.kind === "turnError" ||
+              (event.projection.kind === "turnChanged" &&
+                event.projection.turn.status !== "pending" &&
+                event.projection.turn.status !== "inProgress")
+            ) {
+              setFreshTaskIds((current) => {
+                if (!current.has(event.taskId)) return current;
+                const next = new Set(current);
+                next.delete(event.taskId);
+                return next;
+              });
+            }
+            if (
               event.projection.kind === "itemChanged" &&
               event.projection.item.kind === "fileChange"
             ) {
@@ -1985,11 +1962,20 @@ export default function App() {
                 }
               }
             }
+            if (event.taskId !== projectionTaskId.current) {
+              const cached = taskProjectionCache.current.get(event.taskId);
+              if (cached) {
+                taskProjectionCache.current.set(
+                  event.taskId,
+                  applyRuntimeProjection(cached, event),
+                );
+              }
+              return;
+            }
             if (!projectionReady.current) {
               projectionBuffer.current.push(event);
               return;
             }
-            if (event.taskId !== projectionTaskId.current) return;
             if (isFrameBatchableRuntimeProjection(event)) {
               // Preserve and apply every normalized projection in sequence,
               // but commit text-only presentation updates once per frame.
@@ -2092,6 +2078,7 @@ export default function App() {
             });
         } else {
           projectionReady.current = true;
+          setReadyProjectionTaskId(loaded.activeTaskId ?? "");
         }
       } catch (error: unknown) {
         if (!active) return;
@@ -2782,6 +2769,7 @@ export default function App() {
   const appendTask = (task: TaskSummary) => {
     const empty = createEmptySnapshot();
     const git = snapshot.activeProjectId === task.projectId ? snapshot.git : empty.git;
+    setFreshTaskIds((current) => new Set(current).add(task.id));
     activeTaskIdRef.current = task.id;
     taskGitCache.current.set(task.id, git);
     taskGitRefreshedAt.current.set(task.id, Date.now());
@@ -2809,6 +2797,7 @@ export default function App() {
       projectionBuffer.current = [];
       projectionTaskId.current = task.id;
       projectionReady.current = true;
+      setReadyProjectionTaskId(task.id);
       taskProjectionCache.current.set(task.id, initialRuntime);
       setRuntimeState(initialRuntime);
     } else {
@@ -2955,11 +2944,18 @@ export default function App() {
       }));
     if (!targetTask) return false;
     if (isNewTask) {
+      const commitMessageRoute = resolveCommitMessageRoute(
+        localSettings,
+        snapshot.runtimes
+          .filter((runtime) => runtime.status !== "not_installed")
+          .map((runtime) => runtime.id),
+      );
       void bridge
         .generateTaskTitle({
           taskId: targetTask.id,
           prompt: input.prompt,
           runtime: input.runtime,
+          route: commitMessageRoute ?? { runtime: input.runtime, fallbacks: [] },
         })
         .then((metadata) => {
           if (!metadata) return;
@@ -3262,7 +3258,11 @@ export default function App() {
     const task = activeTask;
     const turnBusy = Boolean(
       task &&
-      ((runtimeState?.taskId === task.id && runtimeState.turn?.status === "inProgress") ||
+      ((nativeHost &&
+        (!projectionReady.current ||
+          projectionTaskId.current !== task.id ||
+          readyProjectionTaskId !== task.id)) ||
+        (runtimeState?.taskId === task.id && runtimeState.turn?.status === "inProgress") ||
         optimisticUserMessage?.taskId === task.id),
     );
     if (!task || (!turnBusy && !queuePausedTaskIdsRef.current.has(task.id))) {
@@ -4232,11 +4232,14 @@ export default function App() {
 
   /** Right-click "Ask about this" from the file reader: stay on the file
    * canvas and ask the configured explainer to analyze the selection through
-   * the isolated helper boundary. Add to chat remains the path into the
-   * transcript.
+   * the isolated helper boundary, streaming the answer into the ask panel as
+   * it is written. Add to chat remains the path into the transcript.
    *
-   * The archetype, sliders, and route all come from the Files and Git settings. */
-  const explainFileSelection = async (payload: FileExplainPayload): Promise<FileExplainResult> => {
+   * The archetype, sliders, and route all come from the Explain settings. */
+  const explainFileSelection = async (
+    payload: FileExplainPayload,
+    onDelta: (delta: FileExplainDelta) => void,
+  ): Promise<FileExplainResult> => {
     if (!activeProject) {
       throw new Error("Open a project before asking about a selection.");
     }
@@ -4250,7 +4253,15 @@ export default function App() {
         endLine: payload.endLine,
         text: payload.text,
         fileText: payload.fileText,
+        question: payload.question,
+        history: payload.history,
       },
+      (event) =>
+        onDelta({
+          kind: event.kind,
+          text: event.text,
+          agentLabel: runtimeLabel(event.runtime),
+        }),
     );
     return {
       text: outcome.text,
@@ -4411,12 +4422,16 @@ export default function App() {
 
   const generateCommitMessage = async () => {
     if (!activeTask) throw new Error("Open a task before generating a commit message.");
-    await bridge.updateTaskRouting(activeTask.id, {
-      runtime: activeTask.runtime,
-      model: activeTask.model,
-      effort: activeTask.effort,
-    });
-    return bridge.generateCommitMessage(activeTask.id, activeTask.runtime);
+    const route = resolveCommitMessageRoute(
+      localSettings,
+      snapshot.runtimes
+        .filter((runtime) => runtime.status !== "not_installed")
+        .map((runtime) => runtime.id),
+    );
+    if (!route) {
+      throw new Error("Choose which model writes commit messages in Git settings.");
+    }
+    return bridge.generateCommitMessage(activeTask.id, route);
   };
 
   const push = async () => {
@@ -4972,6 +4987,14 @@ export default function App() {
 
   useEffect(() => {
     if (!activeTask || !recoverableTurn || recoverableTurn.stopRequested) return;
+    if (
+      nativeHost &&
+      (!projectionReady.current ||
+        projectionTaskId.current !== activeTask.id ||
+        readyProjectionTaskId !== activeTask.id)
+    ) {
+      return;
+    }
     if (!autoResumeEnabled) return;
     if (activeQueuedMessages.length > 0 || optimisticTurnStarting || resumingTaskId) return;
     if (autoResumeAttemptedRef.current.has(recoveryKey)) return;
@@ -4986,6 +5009,7 @@ export default function App() {
     recoverableStopRequested,
     recoverableTurnId,
     recoveryKey,
+    readyProjectionTaskId,
     resumingTaskId,
   ]);
 
@@ -5275,6 +5299,14 @@ export default function App() {
 
   useEffect(() => {
     if (!activeTask || workspaceLoading) return;
+    if (
+      nativeHost &&
+      (!projectionReady.current ||
+        projectionTaskId.current !== activeTask.id ||
+        readyProjectionTaskId !== activeTask.id)
+    ) {
+      return;
+    }
     if (nativeHost && runtimeState?.taskId !== activeTask.id) return;
     const awaitingTurn = queueAwaitingTurnRef.current;
     if (awaitingTurn?.taskId === activeTask.id) {
@@ -5311,6 +5343,7 @@ export default function App() {
     nativeHost,
     nativeTurnRunning,
     optimisticTurnStarting,
+    readyProjectionTaskId,
     runtimeState?.taskId,
     workspaceLoading,
   ]);
@@ -5726,6 +5759,9 @@ export default function App() {
                               resuming={Boolean(
                                 activeTask && resumingTaskId === activeTask.id,
                               )}
+                              quietReconciling={Boolean(
+                                activeTask && freshTaskIds.has(activeTask.id),
+                              )}
                             />
                           ) : null}
                           {activeTask ? (
@@ -5751,7 +5787,7 @@ export default function App() {
                                 modelForEvent={
                                   localSettings["transcript.showModel"] !== false
                                     ? (event) =>
-                                        formatModelLabel(
+                                        prettyModelLabel(
                                           eventModels[event.id] ?? activeTask.model,
                                         ) || undefined
                                     : undefined

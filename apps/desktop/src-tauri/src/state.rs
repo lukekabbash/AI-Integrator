@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
@@ -233,6 +233,37 @@ pub fn remove_task_runtime<T>(runtimes: &mut HashMap<TaskId, T>, task_id: TaskId
     runtimes.remove(&task_id)
 }
 
+/// Short-lived reservation covering provider setup before the turn is visible
+/// in the durable projection. This closes the launch race without holding a
+/// mutex across provider discovery or process startup.
+pub struct TurnLaunchGuard {
+    launches: Arc<std::sync::Mutex<HashSet<TaskId>>>,
+    task_id: TaskId,
+}
+
+impl Drop for TurnLaunchGuard {
+    fn drop(&mut self) {
+        self.launches
+            .lock()
+            .expect("turn launch lock")
+            .remove(&self.task_id);
+    }
+}
+
+fn reserve_turn_launch(
+    launches: &Arc<std::sync::Mutex<HashSet<TaskId>>>,
+    task_id: TaskId,
+) -> Option<TurnLaunchGuard> {
+    let inserted = launches
+        .lock()
+        .expect("turn launch lock")
+        .insert(task_id);
+    inserted.then(|| TurnLaunchGuard {
+        launches: Arc::clone(launches),
+        task_id,
+    })
+}
+
 pub struct AppState {
     pub store: Arc<LocalStore>,
     pub data_directory: PathBuf,
@@ -252,6 +283,7 @@ pub struct AppState {
     /// different local processes even before a task session exists.
     pub acp_catalog: Mutex<HashMap<ProviderKind, AcpRuntime>>,
     pub structured: Mutex<HashMap<TaskId, StructuredRuntime>>,
+    turn_launches: Arc<std::sync::Mutex<HashSet<TaskId>>>,
     /// Opaque renderer ids mapped to trusted provider/cwd/action records.
     /// Paths remain native-only and handles are replaced on each catalog
     /// refresh for that provider/repository pair.
@@ -282,6 +314,7 @@ impl AppState {
         fs::create_dir_all(&data_directory)?;
         let store = LocalStore::open(data_directory.join("integrator.sqlite3"))?;
         store.interrupt_unfinished_runtime_sessions()?;
+        store.settle_unfinished_turns_after_restart()?;
         store.recover_dispatching_queued_messages()?;
         store.recover_orphaned_delegations()?;
         Ok(Self {
@@ -296,6 +329,7 @@ impl AppState {
             acp: Mutex::new(HashMap::new()),
             acp_catalog: Mutex::new(HashMap::new()),
             structured: Mutex::new(HashMap::new()),
+            turn_launches: Arc::new(std::sync::Mutex::new(HashSet::new())),
             native_action_handles: std::sync::Mutex::new(HashMap::new()),
             voice_typing: std::sync::Mutex::new(None),
             terminals: std::sync::Mutex::new(HashMap::new()),
@@ -304,11 +338,24 @@ impl AppState {
             broker: std::sync::Mutex::new(None),
         })
     }
+
+    /// Reserve one launch per chat while allowing unrelated chats to start and
+    /// run concurrently.
+    pub fn reserve_turn_launch(&self, task_id: TaskId) -> Option<TurnLaunchGuard> {
+        reserve_turn_launch(&self.turn_launches, task_id)
+    }
+
+    pub fn turn_launch_in_progress(&self, task_id: TaskId) -> bool {
+        self.turn_launches
+            .lock()
+            .expect("turn launch lock")
+            .contains(&task_id)
+    }
 }
 
 #[cfg(test)]
 mod task_runtime_registry_fixtures {
-    use super::{remove_task_runtime, replace_task_runtime};
+    use super::{remove_task_runtime, replace_task_runtime, reserve_turn_launch};
     use integrator_core::TaskId;
     use std::collections::HashMap;
 
@@ -368,5 +415,18 @@ mod task_runtime_registry_fixtures {
         replace_task_runtime(&mut runtimes, untrusted, "isolated-run");
         assert_eq!(runtimes.get(&trusted), Some(&"trusted-run"));
         assert_eq!(runtimes.get(&untrusted), Some(&"isolated-run"));
+    }
+
+    #[test]
+    fn turn_launch_reservations_are_task_scoped_and_release_on_drop() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let launches = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let first_guard = reserve_turn_launch(&launches, first).expect("first reservation");
+        assert!(reserve_turn_launch(&launches, first).is_none());
+        let _second_guard =
+            reserve_turn_launch(&launches, second).expect("independent reservation");
+        drop(first_guard);
+        assert!(reserve_turn_launch(&launches, first).is_some());
     }
 }

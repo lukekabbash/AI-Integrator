@@ -51,6 +51,10 @@ pub struct StructuredCliLaunchOptions {
     /// contain `.agents/hooks.json`, but is never written into the user's
     /// repository. Other structured providers ignore it.
     pub control_overlay: Option<PathBuf>,
+    /// Integrator-owned plugin bundles projected into this turn, one
+    /// `--plugin-dir` each. Claude-only: the flag is not portable, so other
+    /// providers ignore it. Overlays live in app-data, never the repository.
+    pub plugin_dirs: Vec<PathBuf>,
 }
 
 /// Effort levels `claude --effort` accepts. Unknown values are dropped rather
@@ -356,6 +360,12 @@ fn provider_args(options: &StructuredCliLaunchOptions) -> Vec<String> {
                 // silently denied in print mode.
                 args.extend(["--permission-prompt-tool".into(), "stdio".into()]);
             }
+            for plugin_dir in &options.plugin_dirs {
+                args.extend([
+                    "--plugin-dir".into(),
+                    plugin_dir.to_string_lossy().into_owned(),
+                ]);
+            }
             args
         }
         // The prompt reaches `agy` over piped stdin (print mode activates on
@@ -373,6 +383,14 @@ fn provider_args(options: &StructuredCliLaunchOptions) -> Vec<String> {
             args.push("--sandbox".into());
             if let Some(overlay) = options.control_overlay.as_deref() {
                 args.extend(["--add-dir".into(), overlay.to_string_lossy().into_owned()]);
+            }
+            // Projected skill bundles: readable inside the sandbox so the
+            // skill index injected into the prompt can be followed.
+            for plugin_dir in &options.plugin_dirs {
+                args.extend([
+                    "--add-dir".into(),
+                    plugin_dir.to_string_lossy().into_owned(),
+                ]);
             }
             match options.permission_mode {
                 // agy print mode has no control channel to answer its default
@@ -448,6 +466,7 @@ fn provider_args(options: &StructuredCliLaunchOptions) -> Vec<String> {
 fn spawn_structured_child(options: &StructuredCliLaunchOptions) -> Result<Child> {
     let args = provider_args(options);
     let mut command = platform_command(&options.executable, &args);
+    suppress_windows_console(&mut command);
     command
         .current_dir(&options.working_directory)
         .stdin(Stdio::piped())
@@ -472,6 +491,19 @@ fn spawn_structured_child(options: &StructuredCliLaunchOptions) -> Result<Child>
         command.as_std_mut().process_group(0);
     }
     command.spawn().map_err(IntegratorError::from)
+}
+
+fn suppress_windows_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    }
+
+    #[cfg(not(windows))]
+    let _ = command;
 }
 
 const STRUCTURED_IMAGE_MAX_BYTES: u64 = 12 * 1024 * 1024;
@@ -536,8 +568,7 @@ fn antigravity_prompt_with_images(prompt: &str, image_paths: &[PathBuf]) -> Stri
     let mut lines = vec![
         prompt.to_owned(),
         String::new(),
-        "Prior turn images still on disk (open these paths if you need the visual context):"
-            .into(),
+        "Prior turn images still on disk (open these paths if you need the visual context):".into(),
     ];
     for path in image_paths {
         if path.is_file() {
@@ -721,7 +752,9 @@ async fn drain_diagnostic(mut stderr: impl tokio::io::AsyncRead + Unpin) -> Stri
 async fn terminate_process_tree(child: &mut Child) {
     #[cfg(windows)]
     if let Some(pid) = child.id() {
-        let _ = Command::new("taskkill")
+        let mut command = Command::new("taskkill");
+        suppress_windows_console(&mut command);
+        let _ = command
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1017,6 +1050,7 @@ mod tests {
                 permission_mode: StructuredPermissionMode::ReadOnly,
                 mcp_config_path: None,
                 control_overlay: None,
+                plugin_dirs: Vec::new(),
             });
             assert!(!args.iter().any(|arg| arg.contains("secret prompt")));
             let has_effort = args
@@ -1053,6 +1087,37 @@ mod tests {
     }
 
     #[test]
+    fn plugin_dirs_project_per_provider_mechanism() {
+        for provider in [
+            StructuredCliProvider::Claude,
+            StructuredCliProvider::Antigravity,
+        ] {
+            let args = provider_args(&StructuredCliLaunchOptions {
+                provider,
+                executable: "agent".into(),
+                working_directory: ".".into(),
+                model: None,
+                effort: None,
+                resume_session_id: None,
+                permission_mode: StructuredPermissionMode::AcceptEdits,
+                mcp_config_path: None,
+                control_overlay: None,
+                plugin_dirs: vec!["/private/tmp/overlay/gov-data".into()],
+            });
+            let has_plugin_dir = args
+                .windows(2)
+                .any(|w| w[0] == "--plugin-dir" && w[1] == "/private/tmp/overlay/gov-data");
+            let has_add_dir = args
+                .windows(2)
+                .any(|w| w[0] == "--add-dir" && w[1] == "/private/tmp/overlay/gov-data");
+            // Claude loads bundles natively; Antigravity gets sandbox read
+            // access and follows the prompt-injected index instead.
+            assert_eq!(has_plugin_dir, provider == StructuredCliProvider::Claude);
+            assert_eq!(has_add_dir, provider == StructuredCliProvider::Antigravity);
+        }
+    }
+
+    #[test]
     fn prompt_mode_wires_the_stdio_permission_channel_for_claude() {
         let options = |mode| StructuredCliLaunchOptions {
             provider: StructuredCliProvider::Claude,
@@ -1064,6 +1129,7 @@ mod tests {
             permission_mode: mode,
             mcp_config_path: None,
             control_overlay: None,
+            plugin_dirs: Vec::new(),
         };
         for mode in [
             StructuredPermissionMode::Prompt,
@@ -1099,6 +1165,7 @@ mod tests {
             permission_mode: StructuredPermissionMode::AcceptEdits,
             mcp_config_path: Some("C:/data/broker-mcp/orchestrator-task.json".into()),
             control_overlay: None,
+            plugin_dirs: Vec::new(),
         };
         let claude = provider_args(&options(StructuredCliProvider::Claude));
         assert!(claude.windows(2).any(|w| w[0] == "--mcp-config"));
@@ -1123,6 +1190,7 @@ mod tests {
             permission_mode: StructuredPermissionMode::BypassPermissions,
             mcp_config_path: None,
             control_overlay: None,
+            plugin_dirs: Vec::new(),
         };
         let claude = provider_args(&options(StructuredCliProvider::Claude));
         assert!(
@@ -1288,6 +1356,7 @@ mod tests {
             permission_mode: StructuredPermissionMode::Prompt,
             mcp_config_path: None,
             control_overlay: None,
+            plugin_dirs: Vec::new(),
         };
         let model_arg = |args: Vec<String>| {
             args.windows(2)
@@ -1337,6 +1406,7 @@ mod tests {
             permission_mode: StructuredPermissionMode::ReadOnly,
             mcp_config_path: None,
             control_overlay: Some("/private/tmp/integrator-overlay".into()),
+            plugin_dirs: Vec::new(),
         };
 
         let first = provider_args(&options(None));
@@ -1430,6 +1500,7 @@ mod tests {
                     permission_mode: StructuredPermissionMode::ReadOnly,
                     mcp_config_path: None,
                     control_overlay: None,
+                    plugin_dirs: Vec::new(),
                 },
                 "start fixture".into(),
             )

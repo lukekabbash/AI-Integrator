@@ -43,11 +43,11 @@ describe("commit decoration", () => {
     // The default prefix ends in a colon, so the subject looks exactly like a
     // trailer. Without a blank line Git would read the subject as part of the
     // trailer block and the commit would have no subject at all.
-    const decorated = decorateCommitMessage("ai-integrator-push: fix it", {
+    const decorated = decorateCommitMessage("ai-integrator: fix it", {
       ...off,
       coAuthor: true,
     });
-    expect(decorated).toBe(`ai-integrator-push: fix it\n\n${CO_AUTHOR_TRAILER}`);
+    expect(decorated).toBe(`ai-integrator: fix it\n\n${CO_AUTHOR_TRAILER}`);
   });
 
   it("joins an existing trailer block rather than orphaning the new trailer", () => {

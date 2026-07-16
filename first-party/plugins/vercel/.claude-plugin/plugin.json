@@ -1,0 +1,7 @@
+{
+  "name": "vercel",
+  "description": "Vercel platform expertise: deployment, configuration, edge functions, and CLI workflows with links to canonical docs.",
+  "version": "0.1.0",
+  "author": { "name": "AI Integrator" },
+  "license": "Apache-2.0"
+}

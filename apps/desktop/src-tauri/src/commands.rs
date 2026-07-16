@@ -11,18 +11,20 @@ use std::{
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 use adapter_codex::{CodexEvent, CodexLaunchOptions, CodexSkillSelection, ServerRequestId};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use integrator_core::{
-    ApprovalDecision, ApprovalKind, ApprovalProjection, ComposerDraft, ConnectionState,
-    ArchivedTaskPage, IntegratorError, LocalExport, ModeOption, ModeProjection, NewQueuedMessage,
-    NewTask, ProjectId,
-    ProviderKind, ProviderResumeState, QueuedMessage, QueuedMessageId, QueuedMessageState,
-    RuntimeBinding, RuntimeProjection, RuntimeSession, Setting, StopRequestResult, Task, TaskId,
-    TaskSnapshot, TaskSnapshotQuery, TaskState, TransportRequestId, TrustedProject, TurnStatus,
-    Versioned,
+    ApprovalDecision, ApprovalKind, ApprovalProjection, ArchivedTaskPage, ComposerDraft,
+    ConnectionState, IntegratorError, LocalExport, ModeOption, ModeProjection, NewQueuedMessage,
+    NewTask, ProjectId, ProviderKind, ProviderResumeState, QueuedMessage, QueuedMessageId,
+    QueuedMessageState, RuntimeBinding, RuntimeProjection, RuntimeSession, Setting,
+    StopRequestResult, Task, TaskId, TaskSnapshot, TaskSnapshotQuery, TaskState,
+    TransportRequestId, TrustedProject, TurnStatus, Versioned,
 };
 use integrator_runtime::{
     CommitResult, CreateWorktree, DiffResult, DiffScope, FileStatus, GitOverview, GitRemote,
@@ -122,21 +124,22 @@ pub fn open_external_url(url: String) -> CommandResult<()> {
     }
 
     #[cfg(target_os = "windows")]
-    let result = Command::new("explorer.exe").arg(parsed.as_str()).spawn();
+    let mut command = Command::new("explorer.exe");
     #[cfg(target_os = "macos")]
-    let result = Command::new("open").arg(parsed.as_str()).spawn();
+    let mut command = Command::new("open");
     #[cfg(target_os = "linux")]
-    let result = Command::new("xdg-open").arg(parsed.as_str()).spawn();
+    let mut command = Command::new("xdg-open");
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    let result: std::io::Result<std::process::Child> = Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "opening external URLs is not supported on this platform",
-    ));
-
-    result.map(|_| ()).map_err(|error| CommandError {
+    return Err(CommandError {
         code: "external-open-failed",
-        message: format!("could not open the default browser: {error}"),
-    })
+        message: "opening external URLs is not supported on this platform".into(),
+    });
+
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    {
+        command.arg(parsed.as_str());
+        spawn_quiet(command, "could not open the default browser")
+    }
 }
 
 /// Opens a second window mirroring `task_id`, or focuses it if already open.
@@ -190,12 +193,13 @@ struct ResolvedNativeAction {
 /// bounded native scan of documented provider-owned roots otherwise.
 #[tauri::command]
 pub async fn provider_action_list(
+    app: AppHandle,
     state: State<'_, AppState>,
     provider: ProviderKind,
     repository: PathBuf,
 ) -> CommandResult<Vec<NativeProviderAction>> {
     let repository = authorized_project_directory(&state, repository).await?;
-    let resolved = match &provider {
+    let mut resolved = match &provider {
         ProviderKind::Codex => codex_native_actions(&state, &repository).await?,
         ProviderKind::Cursor | ProviderKind::Grok => {
             if let Some(actions) = current_acp_actions(&state, &provider).await {
@@ -227,6 +231,41 @@ pub async fn provider_action_list(
         }
         ProviderKind::CustomAcp => Vec::new(),
     };
+    // Integrator-plane skills ride alongside every provider's own catalog:
+    // Claude loads them natively via projected plugin bundles; Codex,
+    // Antigravity, and ACP runtimes receive a prompt-injected index and
+    // body-injected explicit invocations. A provider-native action with the
+    // same name wins so native routing is never shadowed.
+    {
+        let store = Arc::clone(&state.store);
+        let skills_app = app.clone();
+        let integrator = tauri::async_runtime::spawn_blocking(move || {
+            crate::integrator_skills::enabled_skills(&skills_app, &store)
+        })
+        .await
+        .map_err(|_| worker_error())?;
+        let known = resolved
+            .iter()
+            .map(|action| action.public.name.clone())
+            .collect::<std::collections::HashSet<_>>();
+        for entry in integrator {
+            if known.contains(&entry.name) {
+                continue;
+            }
+            resolved.push(ResolvedNativeAction {
+                public: NativeProviderAction {
+                    id: String::new(),
+                    name: entry.name,
+                    description: entry.description,
+                    source: entry.source,
+                    kind: NativeActionKind::Skill,
+                    invocation: NativeActionInvocation::Direct,
+                    input_hint: None,
+                },
+                provider_path: Some(entry.path),
+            });
+        }
+    }
     Ok(register_native_actions(
         &state, provider, repository, resolved,
     ))
@@ -2246,10 +2285,12 @@ pub async fn attachment_save_paste(
 ) -> CommandResult<PastedImageAttachment> {
     let data_directory = state.data_directory.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let bytes = BASE64.decode(bytes_base64.trim()).map_err(|_| CommandError {
-            code: "invalid-input",
-            message: "Clipboard image encoding was invalid.".into(),
-        })?;
+        let bytes = BASE64
+            .decode(bytes_base64.trim())
+            .map_err(|_| CommandError {
+                code: "invalid-input",
+                message: "Clipboard image encoding was invalid.".into(),
+            })?;
         save_pasted_image_bytes(&data_directory, &bytes, &mime_type)
     })
     .await
@@ -2636,7 +2677,6 @@ fn spawn_terminal_shell(
             "-EncodedCommand",
             &encoded,
         ]);
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         builder.creation_flags(CREATE_NO_WINDOW);
         builder
     };
@@ -3351,10 +3391,7 @@ fn provider_wire_prompt(
 }
 
 fn interrupted_at_for_task(store: &LocalStore, task_id: TaskId) -> Option<chrono::DateTime<Utc>> {
-    store
-        .task_latest_interrupted_at(task_id)
-        .ok()
-        .flatten()
+    store.task_latest_interrupted_at(task_id).ok().flatten()
 }
 
 fn validate_interrupted_resume_action(
@@ -3404,9 +3441,24 @@ pub async fn codex_start_turn(
         native_action_id.as_deref(),
         resume_interrupted,
     )?;
+    let _launch_guard = state.reserve_turn_launch(task_id).ok_or_else(|| CommandError {
+        code: "turn-active",
+        message: "A turn is already starting for this chat".into(),
+    })?;
+    if state
+        .store
+        .task_has_unfinished_turn(task_id)
+        .map_err(CommandError::from)?
+    {
+        return Err(CommandError {
+            code: "turn-active",
+            message: "A turn is already running for this chat".into(),
+        });
+    }
     let repository = authorized_task_directory(&state, task_id, repository).await?;
     let runtime = codex_runtime(&state, Some(task_id)).await?;
     let mut goal_objective = None;
+    let mut integrator_invocation: Option<(String, String)> = None;
     let skill = if let Some(action_id) = native_action_id.as_deref() {
         let handle =
             resolve_native_action_handle(&state, &ProviderKind::Codex, &repository, action_id)?;
@@ -3431,6 +3483,23 @@ pub async fn codex_start_turn(
                 .await
                 .map_err(CommandError::from)?;
             goal_objective = Some(objective.to_owned());
+            None
+        } else if crate::integrator_skills::is_integrator_source(&handle.source) {
+            // Integrator-plane skill: not in Codex's catalog, so the bounded
+            // skill body rides the wire instead of a `$name` selection.
+            let entry =
+                crate::integrator_skills::enabled_skill_named(&app, &state.store, &handle.name)
+                    .ok_or_else(|| {
+                        CommandError {
+                code: "stale-native-action",
+                message: "This skill changed or was disabled; choose it again from the slash menu"
+                    .into(),
+            }
+                    })?;
+            integrator_invocation = Some((
+                handle.name.clone(),
+                crate::integrator_skills::skill_invocation_block(&entry, rest)?,
+            ));
             None
         } else {
             let path = handle.provider_path.clone().ok_or_else(|| CommandError {
@@ -3467,6 +3536,11 @@ pub async fn codex_start_turn(
         skill
             .as_ref()
             .map(|(_, text)| text.as_str())
+            .or_else(|| {
+                integrator_invocation
+                    .as_ref()
+                    .map(|(_, wire)| wire.as_str())
+            })
             .unwrap_or(prompt.as_str())
     });
     let provider_prompt = provider_wire_prompt(
@@ -3498,6 +3572,14 @@ pub async fn codex_start_turn(
         }
         wire_prompt = format!("{preface}{wire_prompt}");
     }
+    // Auto-trigger channel: Codex has no verified route to load external
+    // skill directories, so the bounded index rides each plain turn.
+    if native_action_id.is_none() {
+        let skills = crate::integrator_skills::enabled_skills(&app, &state.store);
+        if let Some(index) = crate::integrator_skills::skill_index_block(&skills) {
+            wire_prompt = format!("{index}{wire_prompt}");
+        }
+    }
     *runtime
         .pending_user_prompt
         .lock()
@@ -3505,7 +3587,10 @@ pub async fn codex_start_turn(
         (wire_prompt != prompt || skill.is_some()).then(|| PendingUserPrompt {
             wire_prompt: wire_prompt.clone(),
             visible_prompt: prompt.clone(),
-            native_skill: skill.as_ref().map(|(selection, _)| selection.name.clone()),
+            native_skill: skill
+                .as_ref()
+                .map(|(selection, _)| selection.name.clone())
+                .or_else(|| integrator_invocation.as_ref().map(|(name, _)| name.clone())),
             provider_item_id: None,
         });
     let response = runtime
@@ -3608,6 +3693,9 @@ async fn task_has_live_runtime(state: &State<'_, AppState>, task_id: TaskId) -> 
     {
         return true;
     }
+    if state.turn_launch_in_progress(task_id) {
+        return true;
+    }
     state
         .delegation_children
         .lock()
@@ -3618,7 +3706,6 @@ async fn task_has_live_runtime(state: &State<'_, AppState>, task_id: TaskId) -> 
 
 #[tauri::command]
 pub async fn task_snapshot(
-    app: AppHandle<tauri::Wry>,
     state: State<'_, AppState>,
     task_id: TaskId,
     known_watermark: Option<i64>,
@@ -3627,42 +3714,14 @@ pub async fn task_snapshot(
     limit: Option<usize>,
 ) -> CommandResult<TaskSnapshot> {
     let older_page = before_seq.is_some();
-    // A turn left pending/in-progress by a previous app run can never finish:
-    // provider processes do not survive the app. Settle it as interrupted
-    // before reading, so reopening a task does not rehydrate a phantom
-    // streaming turn whose timer counts from hours ago. Older-page fetches
-    // are read-only windows and skip settlement.
+    // Snapshot hydration is a read-only view operation. Process-loss recovery
+    // runs once during AppState startup, never as a side effect of selecting a
+    // chat while other task-owned runtimes are active.
     let runtime_live = if older_page {
         false
     } else {
         task_has_live_runtime(&state, task_id).await
     };
-    if !older_page && !runtime_live {
-        let store = Arc::clone(&state.store);
-        let settled =
-            tauri::async_runtime::spawn_blocking(move || store.settle_interrupted_turn(task_id))
-                .await
-                .map_err(|_| worker_error())?
-                .map_err(CommandError::from)?;
-        if settled.is_some() {
-            let store = Arc::clone(&state.store);
-            let interrupted = tauri::async_runtime::spawn_blocking(move || {
-                let Some(delegation) = store.delegation_for_child_task(task_id)? else {
-                    return Ok(None);
-                };
-                store.interrupt_process_owned_delegation(
-                    delegation.id,
-                    "Interrupted because the subagent process is no longer running. Resume from the Agents panel or ask me to continue from the last safe boundary.",
-                )
-            })
-            .await
-            .map_err(|_| worker_error())?
-            .map_err(CommandError::from)?;
-            if let Some(delegation) = interrupted {
-                crate::delegation::emit_update(&app, delegation.parent_task_id);
-            }
-        }
-    }
     let store = Arc::clone(&state.store);
     let query = TaskSnapshotQuery {
         known_watermark,
@@ -3675,11 +3734,7 @@ pub async fn task_snapshot(
             .await
             .map_err(|_| worker_error())?
             .map_err(CommandError::from)?;
-    snapshot.runtime_live = if older_page {
-        false
-    } else {
-        runtime_live
-    };
+    snapshot.runtime_live = if older_page { false } else { runtime_live };
     Ok(snapshot)
 }
 
@@ -3878,6 +3933,14 @@ pub async fn acp_connect(
         Some(directory) => Some(authorized_project_directory(&state, directory).await?),
         None => None,
     };
+    if let Some(task_id) = task_id {
+        let runtimes = state.acp.lock().await;
+        if runtimes.get(&task_id).is_some_and(|runtime| {
+            runtime.provider == provider && runtime.alive.load(Ordering::Acquire)
+        }) {
+            return Ok(());
+        }
+    }
     let arguments = acp_launch_arguments(&provider)?;
     let statuses = tauri::async_runtime::spawn_blocking(discover_providers)
         .await
@@ -3916,13 +3979,30 @@ pub async fn acp_connect(
         session_spec: Arc::new(std::sync::Mutex::new(None)),
         replaying_history: Arc::new(AtomicBool::new(false)),
     };
-    spawn_acp_pump(app, Arc::clone(&state.store), runtime.clone());
+    let mut retained_existing = false;
     let previous = if let Some(task_id) = task_id {
         let mut runtimes = state.acp.lock().await;
-        replace_task_runtime(&mut *runtimes, task_id, runtime)
+        if runtimes.get(&task_id).is_some_and(|existing| {
+            existing.provider == provider && existing.alive.load(Ordering::Acquire)
+        }) {
+            retained_existing = true;
+            None
+        } else {
+            replace_task_runtime(&mut *runtimes, task_id, runtime.clone())
+        }
     } else {
-        state.acp_catalog.lock().await.insert(provider, runtime)
+        state
+            .acp_catalog
+            .lock()
+            .await
+            .insert(provider, runtime.clone())
     };
+    if retained_existing {
+        runtime.alive.store(false, Ordering::Release);
+        let _ = runtime.client.shutdown().await;
+        return Ok(());
+    }
+    spawn_acp_pump(app, Arc::clone(&state.store), runtime);
     if let Some(previous) = previous {
         previous.alive.store(false, Ordering::Release);
         let _ = state.store.expire_process_approvals(&previous.process_id);
@@ -4193,6 +4273,20 @@ pub async fn acp_send_turn(
         native_action_id.as_deref(),
         resume_interrupted,
     )?;
+    let _launch_guard = state.reserve_turn_launch(task_id).ok_or_else(|| CommandError {
+        code: "turn-active",
+        message: "A turn is already starting for this chat".into(),
+    })?;
+    if state
+        .store
+        .task_has_unfinished_turn(task_id)
+        .map_err(CommandError::from)?
+    {
+        return Err(CommandError {
+            code: "turn-active",
+            message: "A turn is already running for this chat".into(),
+        });
+    }
     let runtime = acp_runtime(&state, Some(task_id), None).await?;
     timeout(Duration::from_secs(15), async {
         while runtime.replaying_history.load(Ordering::Acquire)
@@ -4213,6 +4307,7 @@ pub async fn acp_send_turn(
         });
     }
     let provider_name = runtime.provider.as_str();
+    let mut integrator_invocation: Option<(String, String)> = None;
     if let Some(action_id) = native_action_id.as_deref() {
         let task = state.store.get_task(task_id).map_err(CommandError::from)?;
         let repository = task
@@ -4229,27 +4324,45 @@ pub async fn acp_send_turn(
         })?;
         let handle =
             resolve_native_action_handle(&state, &runtime.provider, &repository, action_id)?;
-        native_slash_prompt(&prompt, &handle.name)?;
-        let mut advertised = false;
-        for _ in 0..12 {
-            advertised = runtime
-                .available_actions
-                .lock()
-                .expect("action lock")
-                .iter()
-                .any(|action| action.name == handle.name);
-            if advertised {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        if !advertised {
-            return Err(CommandError {
+        let rest = native_slash_prompt(&prompt, &handle.name)?;
+        if crate::integrator_skills::is_integrator_source(&handle.source) {
+            // Integrator-plane skill: ACP providers never advertise it, so
+            // the bounded skill body rides the wire instead of a `/name`.
+            let entry =
+                crate::integrator_skills::enabled_skill_named(&app, &state.store, &handle.name)
+                    .ok_or_else(|| {
+                        CommandError {
                 code: "stale-native-action",
-                message: format!(
-                    "{provider_name} no longer advertises this command; choose it again"
-                ),
-            });
+                message: "This skill changed or was disabled; choose it again from the slash menu"
+                    .into(),
+            }
+                    })?;
+            integrator_invocation = Some((
+                handle.name.clone(),
+                crate::integrator_skills::skill_invocation_block(&entry, rest)?,
+            ));
+        } else {
+            let mut advertised = false;
+            for _ in 0..12 {
+                advertised = runtime
+                    .available_actions
+                    .lock()
+                    .expect("action lock")
+                    .iter()
+                    .any(|action| action.name == handle.name);
+                if advertised {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if !advertised {
+                return Err(CommandError {
+                    code: "stale-native-action",
+                    message: format!(
+                        "{provider_name} no longer advertises this command; choose it again"
+                    ),
+                });
+            }
         }
     }
     let binding = runtime
@@ -4274,35 +4387,35 @@ pub async fn acp_send_turn(
     // restart mid-turn can reconstruct what was asked. Interrupted resume is
     // wire-only — the prior user prompt already owns the transcript slot.
     if resume_interrupted != Some(true) {
-    let user_item = ReducedProviderEvent {
-        method: "client/acp/userMessage".into(),
-        thread_id: session_id.clone(),
-        turn_id: Some(turn_id.clone()),
-        audit_json: "{}".into(),
-        audit_truncated: false,
-        mutation: ProjectionMutation::NeutralItem(integrator_core::ItemProjection {
-            id: format!("acp:{session_id}:{turn_id}:user"),
-            provider_item_id: format!("{turn_id}-user"),
-            kind: integrator_core::ItemKind::UserMessage,
-            status: integrator_core::ItemStatus::Completed,
-            title: None,
-            body: Some(integrator_runtime::redact_and_bound(&prompt, 2 * 1024 * 1024).0),
-            native_skill: None,
-            phase: None,
-            command: None,
-            cwd: None,
-            output: None,
-            exit_code: None,
-            file_changes: None,
-            mcp_server: None,
-            mcp_tool: None,
-            tool_input: None,
-            truncated: false,
-            updated_at: started_at,
-        }),
-        occurred_at: started_at,
-    };
-    apply_and_emit(&app, &state.store, &binding, &user_item);
+        let user_item = ReducedProviderEvent {
+            method: "client/acp/userMessage".into(),
+            thread_id: session_id.clone(),
+            turn_id: Some(turn_id.clone()),
+            audit_json: "{}".into(),
+            audit_truncated: false,
+            mutation: ProjectionMutation::NeutralItem(integrator_core::ItemProjection {
+                id: format!("acp:{session_id}:{turn_id}:user"),
+                provider_item_id: format!("{turn_id}-user"),
+                kind: integrator_core::ItemKind::UserMessage,
+                status: integrator_core::ItemStatus::Completed,
+                title: None,
+                body: Some(integrator_runtime::redact_and_bound(&prompt, 2 * 1024 * 1024).0),
+                native_skill: integrator_invocation.as_ref().map(|(name, _)| name.clone()),
+                phase: None,
+                command: None,
+                cwd: None,
+                output: None,
+                exit_code: None,
+                file_changes: None,
+                mcp_server: None,
+                mcp_tool: None,
+                tool_input: None,
+                truncated: false,
+                updated_at: started_at,
+            }),
+            occurred_at: started_at,
+        };
+        apply_and_emit(&app, &state.store, &binding, &user_item);
     }
     let turn_started = ReducedProviderEvent {
         method: "client/acp/turnStarted".into(),
@@ -4333,13 +4446,16 @@ pub async fn acp_send_turn(
             .and_then(|_| interrupted_at_for_task(&state.store, task_id)),
     );
     let mut handoff_images = Vec::new();
-    let mut wire_prompt =
-        if let Some(digest) = take_context_primer(&runtime.context_primer) {
-            handoff_images = digest.image_paths.clone();
-            format_context_primer(&digest, &provider_prompt)
-        } else {
-            provider_prompt
-        };
+    let mut wire_prompt = if let Some((_, invocation)) = &integrator_invocation {
+        // Explicit Integrator-skill invocation: the wire carries the bounded
+        // skill body; the persisted user item above keeps the typed `/name`.
+        invocation.clone()
+    } else if let Some(digest) = take_context_primer(&runtime.context_primer) {
+        handoff_images = digest.image_paths.clone();
+        format_context_primer(&digest, &provider_prompt)
+    } else {
+        provider_prompt
+    };
     if delegation.as_deref().is_some_and(|mode| mode != "off") {
         let mut preface = runtime
             .delegation_preamble
@@ -4352,6 +4468,14 @@ pub async fn acp_send_turn(
         }
         if !preface.is_empty() {
             wire_prompt = format!("{preface}{wire_prompt}");
+        }
+    }
+    // Auto-trigger channel: ACP has no skill-loading parameter, so the
+    // bounded index rides each plain turn.
+    if native_action_id.is_none() {
+        let skills = crate::integrator_skills::enabled_skills(&app, &state.store);
+        if let Some(index) = crate::integrator_skills::skill_index_block(&skills) {
+            wire_prompt = format!("{index}{wire_prompt}");
         }
     }
     let client = runtime.client.clone();
@@ -4537,25 +4661,72 @@ pub async fn structured_cli_start_turn(
         native_action_id.as_deref(),
         resume_interrupted,
     )?;
+    let _launch_guard = state.reserve_turn_launch(task_id).ok_or_else(|| CommandError {
+        code: "turn-active",
+        message: "A turn is already starting for this chat".into(),
+    })?;
+    if state
+        .store
+        .task_has_unfinished_turn(task_id)
+        .map_err(CommandError::from)?
+    {
+        return Err(CommandError {
+            code: "turn-active",
+            message: "A turn is already running for this chat".into(),
+        });
+    }
+    let existing_runtime = state.structured.lock().await.get(&task_id).cloned();
+    if existing_runtime.as_ref().is_some_and(|runtime| {
+        runtime.alive.load(Ordering::Acquire)
+            && runtime.current_turn.lock().expect("turn lock").is_some()
+    }) {
+        return Err(CommandError {
+            code: "turn-active",
+            message: "A turn is already running for this chat".into(),
+        });
+    }
     let repository = authorized_task_directory(&state, task_id, cwd.clone()).await?;
     let native_action = native_action_id
         .as_deref()
         .map(|action_id| resolve_native_action_handle(&state, &provider, &repository, action_id))
         .transpose()?;
+    let mut integrator_invocation = None;
     if let Some(action) = native_action.as_ref() {
-        native_slash_prompt(&prompt, &action.name)?;
-        let still_present = discover_file_actions(&provider, &repository)
-            .into_iter()
-            .any(|candidate| {
-                candidate.name == action.name
-                    && candidate.source == action.source
-                    && candidate.invocation == NativeActionInvocation::Direct
-            });
-        if !still_present {
-            return Err(CommandError {
+        let rest = native_slash_prompt(&prompt, &action.name)?;
+        if crate::integrator_skills::is_integrator_source(&action.source) {
+            // Integrator-plane skills are not in the provider's own catalog;
+            // re-validate against the Integrator roots. Claude loads the
+            // projected bundle natively and parses the `/name` itself; agy
+            // has no native route, so the bounded skill body rides the wire.
+            let entry =
+                crate::integrator_skills::enabled_skill_named(&app, &state.store, &action.name)
+                    .ok_or_else(|| {
+                        CommandError {
                 code: "stale-native-action",
-                message: "This provider skill changed; choose it again from the slash menu".into(),
-            });
+                message: "This skill changed or was disabled; choose it again from the slash menu"
+                    .into(),
+            }
+                    })?;
+            if matches!(provider, ProviderKind::Antigravity) {
+                integrator_invocation = Some(crate::integrator_skills::skill_invocation_block(
+                    &entry, rest,
+                )?);
+            }
+        } else {
+            let still_present = discover_file_actions(&provider, &repository)
+                .into_iter()
+                .any(|candidate| {
+                    candidate.name == action.name
+                        && candidate.source == action.source
+                        && candidate.invocation == NativeActionInvocation::Direct
+                });
+            if !still_present {
+                return Err(CommandError {
+                    code: "stale-native-action",
+                    message: "This provider skill changed; choose it again from the slash menu"
+                        .into(),
+                });
+            }
         }
     }
     let native_skill = native_action
@@ -4661,7 +4832,12 @@ pub async fn structured_cli_start_turn(
             .and_then(|_| interrupted_at_for_task(&state.store, task_id)),
     );
     let mut handoff_images = Vec::new();
-    let mut wire_prompt = if native_action.is_some() {
+    let mut wire_prompt = if let Some(invocation) = integrator_invocation {
+        // Explicit Integrator-skill invocation on a runtime without native
+        // loading: the wire carries the bounded skill body; the transcript
+        // keeps the `/name` the user typed.
+        invocation
+    } else if native_action.is_some() {
         // Native slash parsing requires `/name` at byte zero. A resumed
         // Claude session already owns its history; on a first native turn we
         // prefer exact provider semantics over silently de-nativizing it.
@@ -4711,6 +4887,38 @@ pub async fn structured_cli_start_turn(
                 )
                 .map_err(CommandError::from)?,
             );
+        }
+    }
+
+    // Project the enabled Integrator skills into this turn. The overlay is a
+    // per-turn copy under app-data, so a SKILL.md edit mid-turn can never
+    // split the guidance the running process already loaded. Claude loads
+    // the bundles natively (`--plugin-dir`); Antigravity gets sandbox read
+    // access (`--add-dir`) plus a prompt-injected index for auto-triggering.
+    let mut plugin_dirs = Vec::new();
+    {
+        let skills_app = app.clone();
+        let skills_store = Arc::clone(&state.store);
+        let data_directory = state.data_directory.clone();
+        let provider_label = match structured_provider {
+            StructuredCliProvider::Claude => "claude",
+            StructuredCliProvider::Antigravity => "antigravity",
+        };
+        let projection = tauri::async_runtime::spawn_blocking(move || {
+            let skills = crate::integrator_skills::enabled_skills(&skills_app, &skills_store);
+            crate::integrator_skills::write_projection(&data_directory, provider_label, &skills)
+        })
+        .await
+        .map_err(|_| worker_error())?;
+        if let Ok(projection) = projection {
+            plugin_dirs = projection.plugin_dirs;
+            if matches!(structured_provider, StructuredCliProvider::Antigravity)
+                && native_action.is_none()
+                && let Some(index) =
+                    crate::integrator_skills::skill_index_block(&projection.entries)
+            {
+                wire_prompt = format!("{index}{wire_prompt}");
+            }
         }
     }
 
@@ -4781,6 +4989,7 @@ pub async fn structured_cli_start_turn(
                 permission_mode,
                 mcp_config_path,
                 control_overlay,
+                plugin_dirs,
             },
             wire_prompt,
             handoff_images,
@@ -4799,39 +5008,39 @@ pub async fn structured_cli_start_turn(
     }
     let now = Utc::now();
     if resume_interrupted != Some(true) {
-    apply_and_emit(
-        &app,
-        &state.store,
-        &binding,
-        &ReducedProviderEvent {
-            method: "client/structured/userMessage".into(),
-            thread_id: thread_id.clone(),
-            turn_id: Some(turn_id.clone()),
-            audit_json: "{}".into(),
-            audit_truncated: false,
-            mutation: ProjectionMutation::NeutralItem(integrator_core::ItemProjection {
-                id: format!("structured:{thread_id}:{turn_id}:user"),
-                provider_item_id: format!("{turn_id}-user"),
-                kind: integrator_core::ItemKind::UserMessage,
-                status: integrator_core::ItemStatus::Completed,
-                title: None,
-                body: Some(integrator_runtime::redact_and_bound(&prompt, 2 * 1024 * 1024).0),
-                phase: None,
-                native_skill,
-                command: None,
-                cwd: None,
-                output: None,
-                exit_code: None,
-                file_changes: None,
-                mcp_server: None,
-                mcp_tool: None,
-                tool_input: None,
-                truncated: false,
-                updated_at: now,
-            }),
-            occurred_at: now,
-        },
-    );
+        apply_and_emit(
+            &app,
+            &state.store,
+            &binding,
+            &ReducedProviderEvent {
+                method: "client/structured/userMessage".into(),
+                thread_id: thread_id.clone(),
+                turn_id: Some(turn_id.clone()),
+                audit_json: "{}".into(),
+                audit_truncated: false,
+                mutation: ProjectionMutation::NeutralItem(integrator_core::ItemProjection {
+                    id: format!("structured:{thread_id}:{turn_id}:user"),
+                    provider_item_id: format!("{turn_id}-user"),
+                    kind: integrator_core::ItemKind::UserMessage,
+                    status: integrator_core::ItemStatus::Completed,
+                    title: None,
+                    body: Some(integrator_runtime::redact_and_bound(&prompt, 2 * 1024 * 1024).0),
+                    phase: None,
+                    native_skill,
+                    command: None,
+                    cwd: None,
+                    output: None,
+                    exit_code: None,
+                    file_changes: None,
+                    mcp_server: None,
+                    mcp_tool: None,
+                    tool_input: None,
+                    truncated: false,
+                    updated_at: now,
+                }),
+                occurred_at: now,
+            },
+        );
     }
     apply_and_emit(
         &app,
@@ -6648,7 +6857,7 @@ fn spawn_quiet(mut command: Command, failure_message: &'static str) -> CommandRe
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     #[cfg(target_os = "windows")]
-    command.creation_flags(0x0800_0000);
+    command.creation_flags(CREATE_NO_WINDOW);
     command.spawn().map(|_| ()).map_err(|error| CommandError {
         code: "external-open-failed",
         message: format!("{failure_message}: {error}"),

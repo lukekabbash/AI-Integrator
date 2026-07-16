@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     commands::{CommandError, CommandResult, acp_launch_arguments, authenticate_acp_provider},
+    provider_routing::{is_worth_failing_over, provider_chain},
     state::AppState,
 };
 
@@ -22,22 +23,28 @@ const TITLE_MAX_CHARS: usize = 54;
 const SOURCE_PROMPT_MAX_CHARS: usize = 6_000;
 const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatTitleRoute {
+    pub provider: ProviderKind,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub fallbacks: Vec<ProviderKind>,
+}
+
 #[tauri::command]
 pub async fn task_generate_title(
     state: State<'_, AppState>,
     task_id: TaskId,
-    provider: ProviderKind,
+    route: ChatTitleRoute,
     prompt: String,
 ) -> CommandResult<Option<Task>> {
     let task = state.store.get_task(task_id).map_err(CommandError::from)?;
     if task.title != CHAT_TITLE_PLACEHOLDER {
         return Ok(None);
-    }
-    if task.runtime.as_deref() != Some(provider.as_str()) {
-        return Err(command_error(
-            "invalid-input",
-            "the naming provider must match the task runtime",
-        ));
     }
     let source = bounded_prompt(&prompt)?;
     let store = Arc::clone(&state.store);
@@ -58,18 +65,47 @@ pub async fn task_generate_title(
         .and_then(|name| name.to_str())
         .unwrap_or("software project");
     let naming_prompt = naming_prompt(project, &source);
-    let title =
-        generate_isolated_provider_text(&state.data_directory, provider, &naming_prompt).await?;
-    let Some(title) = parse_title(&title) else {
-        return Ok(None);
-    };
-    let store = Arc::clone(&state.store);
-    tauri::async_runtime::spawn_blocking(move || {
-        store.compare_and_set_task_title(task_id, CHAT_TITLE_PLACEHOLDER, &title)
-    })
-    .await
-    .map_err(|_| command_error("worker-failed", "the generated title could not be saved"))?
-    .map_err(CommandError::from)
+    let chain = provider_chain(route.provider, &route.fallbacks);
+    let mut last = None;
+    for (index, provider) in chain.into_iter().enumerate() {
+        let helper = if index == 0 {
+            HelperRoute {
+                model: route.model.clone(),
+                effort: route.effort.clone(),
+            }
+        } else {
+            HelperRoute::default()
+        };
+        match generate_isolated_provider_text_routed(
+            &state.data_directory,
+            provider,
+            &naming_prompt,
+            &helper,
+        )
+        .await
+        {
+            Ok(raw) => {
+                let Some(title) = parse_title(&raw) else {
+                    return Ok(None);
+                };
+                let store = Arc::clone(&state.store);
+                return tauri::async_runtime::spawn_blocking(move || {
+                    store.compare_and_set_task_title(task_id, CHAT_TITLE_PLACEHOLDER, &title)
+                })
+                .await
+                .map_err(|_| {
+                    command_error("worker-failed", "the generated title could not be saved")
+                })?
+                .map_err(CommandError::from);
+            }
+            Err(error) if is_worth_failing_over(error.code) => last = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last.unwrap_or(command_error(
+        "provider-failed",
+        "no provider could name the chat",
+    )))
 }
 
 /// Model and reasoning-effort overrides for one helper turn. A `None` field
@@ -115,14 +151,32 @@ pub(crate) async fn generate_isolated_provider_text(
     .await
 }
 
-/// The same boundary with an explicit model/effort route. Only the selection
-/// explainer passes one today: it is the single helper whose model the user
-/// picks, so it is also the only one that may opt out of the economy default.
+/// Observer for helper-turn output as it arrives. Each call carries one chunk
+/// in stream order; the concatenation of every chunk equals the returned text
+/// (before trimming). Only the selection explainer streams today — titles and
+/// commit subjects are too short to be worth painting incrementally.
+pub(crate) type DeltaSink<'a> = &'a (dyn Fn(&str) + Send + Sync);
+
+/// The same boundary with an explicit model/effort route. Callers that let the
+/// user pick a model (selection explain, commit-message drafts) pass one here;
+/// configured chat naming) pass one here; an empty route keeps the cheapest pick.
 pub(crate) async fn generate_isolated_provider_text_routed(
     data_directory: &Path,
     provider: ProviderKind,
     prompt: &str,
     route: &HelperRoute,
+) -> CommandResult<String> {
+    generate_isolated_provider_text_streamed(data_directory, provider, prompt, route, None).await
+}
+
+/// The routed boundary plus a live output stream for surfaces that render the
+/// answer as it is written.
+pub(crate) async fn generate_isolated_provider_text_streamed(
+    data_directory: &Path,
+    provider: ProviderKind,
+    prompt: &str,
+    route: &HelperRoute,
+    on_delta: Option<DeltaSink<'_>>,
 ) -> CommandResult<String> {
     let scratch = data_directory
         .join("provider-workers")
@@ -134,12 +188,12 @@ pub(crate) async fn generate_isolated_provider_text_routed(
         )
     })?;
     let result = match provider {
-        ProviderKind::Codex => generate_codex_title(&scratch, prompt, route).await,
+        ProviderKind::Codex => generate_codex_title(&scratch, prompt, route, on_delta).await,
         ProviderKind::Cursor | ProviderKind::Grok => {
-            generate_acp_title(provider, &scratch, prompt, route).await
+            generate_acp_title(provider, &scratch, prompt, route, on_delta).await
         }
         ProviderKind::Claude | ProviderKind::Antigravity => {
-            generate_structured_title(provider, &scratch, prompt, route).await
+            generate_structured_title(provider, &scratch, prompt, route, on_delta).await
         }
         ProviderKind::CustomAcp => Err(command_error(
             "provider-unavailable",
@@ -226,6 +280,7 @@ async fn generate_codex_title(
     cwd: &Path,
     prompt: &str,
     route: &HelperRoute,
+    on_delta: Option<DeltaSink<'_>>,
 ) -> CommandResult<String> {
     let executable = executable_for(ProviderKind::Codex).await?;
     let client = adapter_codex::CodexClient::spawn(CodexLaunchOptions {
@@ -264,6 +319,9 @@ async fn generate_codex_title(
                     "item/agentMessage/delta" => {
                         if let Some(delta) = params.get("delta").and_then(Value::as_str) {
                             output.push_str(delta);
+                            if let Some(emit) = on_delta {
+                                emit(delta);
+                            }
                         }
                     }
                     "item/completed" if output.is_empty() => {
@@ -272,6 +330,9 @@ async fn generate_codex_title(
                             && let Some(text) = item.get("text").and_then(Value::as_str)
                         {
                             output.push_str(text);
+                            if let Some(emit) = on_delta {
+                                emit(text);
+                            }
                         }
                     }
                     "turn/completed" => break,
@@ -315,6 +376,7 @@ async fn generate_acp_title(
     cwd: &Path,
     prompt: &str,
     route: &HelperRoute,
+    on_delta: Option<DeltaSink<'_>>,
 ) -> CommandResult<String> {
     let executable = executable_for(provider).await?;
     let client = adapter_acp::AcpClient::spawn(AcpLaunchOptions {
@@ -374,6 +436,9 @@ async fn generate_acp_title(
                             && let Some(text) = update.pointer("/content/text").and_then(Value::as_str)
                         {
                             output.push_str(text);
+                            if let Some(emit) = on_delta {
+                                emit(text);
+                            }
                         }
                     }
                     Ok(AcpEvent::ServerRequest { id, .. }) => {
@@ -418,6 +483,7 @@ async fn generate_structured_title(
     cwd: &Path,
     prompt: &str,
     route: &HelperRoute,
+    on_delta: Option<DeltaSink<'_>>,
 ) -> CommandResult<String> {
     let executable = executable_for(provider).await?;
     let (structured_provider, economy_model) = match provider {
@@ -443,6 +509,7 @@ async fn generate_structured_title(
                 permission_mode: StructuredPermissionMode::ReadOnly,
                 mcp_config_path: None,
                 control_overlay: None,
+                plugin_dirs: Vec::new(),
             },
             prompt.to_owned(),
         )
@@ -464,6 +531,9 @@ async fn generate_structured_title(
                 StructuredCliEventKind::Text { text, delta } => {
                     if delta || output.is_empty() {
                         output.push_str(&text);
+                        if let Some(emit) = on_delta {
+                            emit(&text);
+                        }
                     }
                 }
                 StructuredCliEventKind::PermissionRequest { request_id, .. } => {
@@ -881,7 +951,12 @@ mod tests {
     #[test]
     fn acp_honors_a_pinned_model_the_session_advertises() {
         assert_eq!(
-            select_acp_option(&acp_session(), "model", &["model"], Some("gpt-frontier-mini")),
+            select_acp_option(
+                &acp_session(),
+                "model",
+                &["model"],
+                Some("gpt-frontier-mini")
+            ),
             Some(("model".into(), "gpt-frontier-mini".into()))
         );
     }

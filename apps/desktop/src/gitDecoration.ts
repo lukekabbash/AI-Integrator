@@ -9,7 +9,7 @@ export const GIT_SETTINGS = {
   commitPrefix: "git.commitPrefix",
 } as const;
 
-export const DEFAULT_COMMIT_PREFIX = "ai-integrator-push:";
+export const DEFAULT_COMMIT_PREFIX = "ai-integrator:";
 
 /** The identity written when the co-author trailer is on. The address is a
  * `noreply` form because a trailer becomes part of permanent history and must
@@ -41,7 +41,7 @@ export function readPushForce(settings: Record<string, unknown>): PushForce {
  * either joins an existing block or starts one after a blank line.
  *
  * The paragraph is what matters, not the last line: a subject can itself be
- * trailer-shaped — the default commit prefix `ai-integrator-push:` is — and
+ * trailer-shaped — the default commit prefix `ai-integrator:` is — and
  * gluing the trailer under a one-line subject would make Git read the subject
  * as part of the trailer block.
  */

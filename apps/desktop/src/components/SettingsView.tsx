@@ -6,6 +6,7 @@ import {
   ArrowLeft,
   Bot,
   Braces,
+  ChevronDown,
   Folder,
   Check,
   CircleDollarSign,
@@ -13,11 +14,13 @@ import {
   Database,
   Download,
   ExternalLink,
-  FolderGit2,
+  GitBranch,
   KeyRound,
+  Lightbulb,
   LoaderCircle,
   Mic,
   MonitorCog,
+  Package,
   Palette,
   Plus,
   RefreshCw,
@@ -26,6 +29,7 @@ import {
   Search,
   Settings,
   ShieldCheck,
+  Sparkles,
   TriangleAlert,
   Trash2,
   Upload,
@@ -37,6 +41,8 @@ import {
   bridge,
   openExternalLink,
   resolveModelEffort,
+  type IntegratorSkillInfo,
+  type IntegratorSkillsOverview,
   type LocalAppInfo,
   type ModelCatalogEntry,
   type ProjectSummary,
@@ -101,14 +107,26 @@ import {
   readGitDecorationSettings,
   readPushForce,
 } from "../gitDecoration";
+import { COMMIT_MESSAGE_SETTINGS, resolveCommitMessageRoute } from "../commitMessageSettings";
+import {
+  CURATED_PLUGIN_INSTALLS,
+  SKILLS_ENABLED_KEY,
+  groupSkills,
+  isSkillEnabled,
+  readSkillEnablement,
+  withSkillEnablement,
+  withSkillsEnablement,
+} from "../skillsSettings";
 
 type SettingsSection =
   | "general"
   | "appearance"
   | "composer"
-  | "files-git"
+  | "explain"
+  | "git"
   | "models-runtimes"
   | "permissions"
+  | "skills"
   | "subagents"
   | "usage"
   | "archive";
@@ -151,11 +169,12 @@ const settingsNav: Array<{ id: SettingsSection; label: string; hint: string; ico
   { id: "general", label: "General", hint: "Local app and data", icon: MonitorCog },
   { id: "appearance", label: "Appearance", hint: "Themes, type, motion", icon: Palette },
   { id: "composer", label: "Composer", hint: "Send behavior", icon: Braces },
+  { id: "explain", label: "Explain", hint: "Ask about a selection", icon: Lightbulb },
   {
-    id: "files-git",
-    label: "Files and Git",
-    hint: "Ask about a selection, commit trailers, push safety",
-    icon: FolderGit2,
+    id: "git",
+    label: "Git",
+    hint: "Commit messages, trailers, and push safety",
+    icon: GitBranch,
   },
   {
     id: "models-runtimes",
@@ -164,6 +183,12 @@ const settingsNav: Array<{ id: SettingsSection; label: string; hint: string; ico
     icon: Bot,
   },
   { id: "permissions", label: "Permissions", hint: "Safe execution defaults", icon: ShieldCheck },
+  {
+    id: "skills",
+    label: "Skills",
+    hint: "Portable skills and plugins across runtimes",
+    icon: Sparkles,
+  },
   { id: "subagents", label: "Subagents", hint: "Cross-provider handoff policy", icon: Users },
   { id: "usage", label: "Usage and Budgets", hint: "Local usage evidence", icon: CircleDollarSign },
   { id: "archive", label: "Archive", hint: "Browse, restore, and clean up", icon: Archive },
@@ -243,6 +268,12 @@ const DEFAULT_SETTINGS: SettingsMap = {
   [GIT_SETTINGS.forcePush]: "off",
   [GIT_SETTINGS.commitPrefixEnabled]: false,
   [GIT_SETTINGS.commitPrefix]: DEFAULT_COMMIT_PREFIX,
+  // Commit-message generation requires an explicit runtime + model; empty means
+  // the Generate button asks the user to finish this section first.
+  [COMMIT_MESSAGE_SETTINGS.runtime]: "",
+  [COMMIT_MESSAGE_SETTINGS.model]: "",
+  [COMMIT_MESSAGE_SETTINGS.effort]: "",
+  [COMMIT_MESSAGE_SETTINGS.fallbacks]: [],
   "permissions.defaultProfile": "project-write",
   // Enforced by the workspace's retention sweep (App): auto-archive uses the
   // chat's last activity, auto-delete counts from the moment it was archived.
@@ -282,10 +313,12 @@ function SettingRow({
 
 function Switch({
   checked,
+  mixed = false,
   onChange,
   label,
 }: {
   checked: boolean;
+  mixed?: boolean;
   onChange: (value: boolean) => void;
   label: string;
 }) {
@@ -298,6 +331,7 @@ function Switch({
       aria-label={label}
       onClick={() => onChange(!checked)}
       data-checked={checked}
+      data-mixed={mixed}
     >
       <span />
     </button>
@@ -345,6 +379,539 @@ const DELEGATION_TARGETS: Array<{ runtime: string; label: string }> = [
   { runtime: "cursor", label: "Cursor" },
   { runtime: "grok", label: "Grok Build" },
 ];
+
+const SKILL_SOURCE_LABELS: Record<string, string> = {
+  integrator: "My skills",
+  plugin: "Installed plugin",
+  "first-party": "Ships with the app",
+};
+
+/** Publisher marks are fetched once from their declared official URLs,
+ * recorded in assets-manifest.json, and bundled locally. Settings therefore
+ * shows the real marks without leaking an app-open ping to every publisher. */
+const SKILL_BRAND_MARKS = {
+  integrator: "/brand/ai-integrator-mark-light.png",
+  anthropic: "/brand/providers/anthropic.ico",
+  openai: "/brand/skills/openai.png",
+  gemini: "/brand/providers/gemini.png",
+  xai: "/brand/providers/xai.ico",
+  vercel: "/brand/skills/vercel.ico",
+  cloudflare: "/brand/skills/cloudflare.png",
+  microsoft: "/brand/skills/microsoft.ico",
+  huggingface: "/brand/skills/huggingface.ico",
+  expo: "/brand/skills/expo.png",
+  stripe: "/brand/skills/stripe.ico",
+  remotion: "/brand/skills/remotion.png",
+  superpowers: "/brand/skills/superpowers.svg",
+  firebase: "/brand/skills/firebase.png",
+  supabase: "/brand/skills/supabase.ico",
+  tauri: "/brand/skills/tauri.svg",
+  government: "/brand/skills/data-gov.ico",
+  market: "/brand/skills/alpha-vantage.ico",
+  github: "/brand/skills/github.svg",
+} as const;
+
+type SkillBrand = keyof typeof SKILL_BRAND_MARKS;
+
+const INVERT_ON_DARK = new Set<SkillBrand>(["expo", "github", "superpowers"]);
+
+const PLUGIN_GROUP_BRANDS: Record<string, SkillBrand[]> = {
+  "integrator-authoring": ["integrator"],
+  "gov-data": ["government"],
+  "market-data": ["market"],
+  "ai-provider-docs": ["openai", "anthropic", "gemini", "xai"],
+  "release-craft": ["github"],
+  firebase: ["firebase"],
+  cloudflare: ["cloudflare"],
+  stripe: ["stripe"],
+  supabase: ["supabase"],
+  vercel: ["vercel"],
+  tauri: ["tauri"],
+  "anthropics-skills": ["anthropic"],
+  "openai-skills": ["openai"],
+  "vercel-labs-agent-skills": ["vercel"],
+  "cloudflare-skills": ["cloudflare"],
+  "microsoft-skills": ["microsoft"],
+  "huggingface-skills": ["huggingface"],
+  "expo-skills": ["expo"],
+  "stripe-ai": ["stripe"],
+  "remotion-dev-skills": ["remotion"],
+  "obra-superpowers": ["superpowers"],
+};
+
+const CURATED_INSTALL_BRANDS: Record<string, SkillBrand[]> = {
+  anthropic: ["anthropic"],
+  openai: ["openai"],
+  vercel: ["vercel"],
+  cloudflare: ["cloudflare"],
+  microsoft: ["microsoft"],
+  huggingface: ["huggingface"],
+  mobile: ["expo"],
+  stripe: ["stripe"],
+  video: ["remotion"],
+  community: ["superpowers"],
+};
+
+function SkillBrandIcon({ brands }: { brands?: SkillBrand[] }) {
+  if (!brands?.length) return <Package aria-hidden />;
+  return (
+    <span className="skill-brand-mark" aria-hidden>
+      {brands.map((brand) => (
+        <img
+          key={brand}
+          src={SKILL_BRAND_MARKS[brand]}
+          alt=""
+          data-invert-on-dark={INVERT_ON_DARK.has(brand)}
+        />
+      ))}
+    </span>
+  );
+}
+
+function SkillsCollection({
+  title,
+  description,
+  icon: Icon,
+  open,
+  onToggle,
+  children,
+}: {
+  title: string;
+  description: string;
+  icon: LucideIcon;
+  open: boolean;
+  onToggle: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="settings-section skills-collection">
+      <button
+        className="skills-collection-toggle"
+        type="button"
+        aria-expanded={open}
+        onClick={onToggle}
+      >
+        <span className="skills-collection-icon" aria-hidden>
+          <Icon />
+        </span>
+        <span>
+          <strong>{title}</strong>
+          <small>{description}</small>
+        </span>
+        <ChevronDown data-open={open} aria-hidden />
+      </button>
+      <AnimatePresence initial={false}>
+        {open ? (
+          <motion.div
+            className="skills-collection-body"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+          >
+            <div>{children}</div>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
+    </section>
+  );
+}
+
+function SkillCredentialControl({
+  skill,
+  onChanged,
+}: {
+  skill: IntegratorSkillInfo;
+  onChanged: () => void;
+}) {
+  const credential = skill.credential;
+  const [secret, setSecret] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  if (!credential) return null;
+
+  const save = async () => {
+    if (!secret.trim() || busy) return;
+    setBusy(true);
+    setMessage("");
+    try {
+      await bridge.setIntegratorSkillCredential(credential.id, secret);
+      setSecret("");
+      setMessage("Saved securely.");
+      onChanged();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : `Could not save ${credential.label}.`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const clear = async () => {
+    if (busy) return;
+    setBusy(true);
+    setMessage("");
+    try {
+      await bridge.clearIntegratorSkillCredential(credential.id);
+      setMessage("Removed from the operating system credential store.");
+      onChanged();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : `Could not remove ${credential.label}.`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="skill-credential-control">
+      <span className="skill-credential-status">
+        <KeyRound aria-hidden />
+        <span>
+          <strong>{credential.label}</strong>
+          <small>
+            {credential.available
+              ? credential.configured
+                ? "Configured in the operating system credential store"
+                : credential.required
+                  ? "Required for this skill"
+                  : "Optional — raises limits or unlocks additional data"
+              : "Native app required for secure storage"}
+          </small>
+        </span>
+      </span>
+      <label className="skill-credential-input">
+        <span className="sr-only">{credential.label}</span>
+        <input
+          type="password"
+          value={secret}
+          onChange={(event) => setSecret(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") void save();
+          }}
+          placeholder={credential.configured ? "Paste a replacement key" : "Paste API key"}
+          autoComplete="off"
+          spellCheck={false}
+          disabled={!credential.available || busy}
+        />
+      </label>
+      <div className="skill-credential-actions">
+        <button
+          className="ghost-button"
+          type="button"
+          disabled={!credential.available || busy || !secret.trim()}
+          onClick={() => void save()}
+        >
+          {busy ? <LoaderCircle className="spin" /> : <KeyRound />} Save
+        </button>
+        {credential.configured ? (
+          <button className="ghost-button" type="button" disabled={busy} onClick={() => void clear()}>
+            Remove
+          </button>
+        ) : null}
+        <button
+          className="text-button"
+          type="button"
+          onClick={() => void openExternalLink(credential.helpUrl)}
+        >
+          Get a key <ExternalLink />
+        </button>
+      </div>
+      {message ? (
+        <small className="skill-credential-message" role="status">
+          {message}
+        </small>
+      ) : null}
+    </div>
+  );
+}
+
+function SkillSettingsRow({
+  skill,
+  enabled,
+  onToggle,
+  onCredentialChanged,
+}: {
+  skill: IntegratorSkillInfo;
+  enabled: boolean;
+  onToggle: (enabled: boolean) => void;
+  onCredentialChanged: () => void;
+}) {
+  const displayName = skill.name.includes(":") ? skill.name.split(":").slice(1).join(":") : skill.name;
+  return (
+    <div className="setting-row skill-settings-row">
+      <span>
+        <strong>{displayName}</strong>
+        <small>{skill.description}</small>
+        <small className="skill-invocation-count">
+          {skill.invocationCount.toLocaleString()} {skill.invocationCount === 1 ? "invocation" : "invocations"}
+        </small>
+      </span>
+      <div className="setting-control">
+        <Switch checked={enabled} onChange={onToggle} label={`Enable ${skill.name}`} />
+      </div>
+      <SkillCredentialControl skill={skill} onChanged={onCredentialChanged} />
+    </div>
+  );
+}
+
+function SkillsSettings({
+  settings,
+  setSetting,
+}: {
+  settings: SettingsMap;
+  setSetting: (key: string, value: unknown) => void;
+}) {
+  const [overview, setOverview] = useState<IntegratorSkillsOverview | null>(null);
+  const [loadError, setLoadError] = useState("");
+  const [installRepo, setInstallRepo] = useState("");
+  const [installBusy, setInstallBusy] = useState(false);
+  const [installMessage, setInstallMessage] = useState("");
+  const [uninstalling, setUninstalling] = useState("");
+  const [openCollections, setOpenCollections] = useState({
+    thirdParty: true,
+    installed: true,
+    integrator: true,
+  });
+
+  const refresh = () => {
+    void bridge
+      .listIntegratorSkills()
+      .then((next) => {
+        setOverview(next);
+        setLoadError("");
+      })
+      .catch((error: unknown) => {
+        setLoadError(
+          error instanceof Error ? error.message : "Could not read the local skills inventory.",
+        );
+      });
+  };
+  useEffect(refresh, []);
+
+  const overrides = readSkillEnablement(settings[SKILLS_ENABLED_KEY]);
+  const toggle = (skill: IntegratorSkillInfo, enabled: boolean) =>
+    setSetting(SKILLS_ENABLED_KEY, withSkillEnablement(overrides, skill.name, enabled));
+  const toggleGroup = (skills: IntegratorSkillInfo[], enabled: boolean) =>
+    setSetting(SKILLS_ENABLED_KEY, withSkillsEnablement(overrides, skills, enabled));
+  const install = (repository: string) => {
+    const trimmed = repository.trim();
+    if (!trimmed || installBusy) return;
+    setInstallBusy(true);
+    setInstallMessage("");
+    void bridge
+      .installIntegratorPlugin(trimmed)
+      .then((next) => {
+        setOverview(next);
+        setInstallRepo("");
+        setInstallMessage(`Installed ${trimmed}. Its skills start off; enable the ones you want.`);
+      })
+      .catch((error: unknown) => {
+        setInstallMessage(
+          error instanceof Error ? error.message : "Could not install this plugin.",
+        );
+      })
+      .finally(() => setInstallBusy(false));
+  };
+
+  const uninstall = (pluginId: string, label: string) => {
+    if (uninstalling) return;
+    if (
+      !window.confirm(
+        `Uninstall ${label}? This removes its local plugin folder and bundled resources from Documents/AI Integrator/Plugins.`,
+      )
+    ) {
+      return;
+    }
+    setUninstalling(pluginId);
+    setInstallMessage("");
+    void bridge
+      .uninstallIntegratorPlugin(pluginId)
+      .then((next) => {
+        setOverview(next);
+        setInstallMessage(`Uninstalled ${label}.`);
+      })
+      .catch((error: unknown) => {
+        setInstallMessage(error instanceof Error ? error.message : "Could not uninstall this plugin.");
+      })
+      .finally(() => setUninstalling(""));
+  };
+
+  const groups = groupSkills(overview?.skills ?? []);
+  const installedGroups = groups.filter((group) => group.source !== "first-party");
+  const integratorGroups = groups.filter((group) => group.source === "first-party");
+  const installedPluginIds = new Set(
+    groups.filter((group) => group.source === "plugin").map((group) => group.title),
+  );
+  const curatedByFolder = new Map(
+    CURATED_PLUGIN_INSTALLS.map((entry) => [entry.repository.replace("/", "-"), entry]),
+  );
+  const toggleCollection = (key: keyof typeof openCollections) =>
+    setOpenCollections((current) => ({ ...current, [key]: !current[key] }));
+
+  const renderGroup = (group: (typeof groups)[number]) => {
+    const enabledCount = group.skills.filter((skill) => isSkillEnabled(overrides, skill)).length;
+    const groupEnabled = enabledCount === group.skills.length;
+    const groupMixed = enabledCount > 0 && !groupEnabled;
+    const invocations = group.skills.reduce((total, skill) => total + skill.invocationCount, 0);
+    const curated = curatedByFolder.get(group.title);
+    const label = curated?.label ?? (group.title === "My skills" ? group.title : group.title);
+    const brands = curated
+      ? CURATED_INSTALL_BRANDS[curated.icon]
+      : PLUGIN_GROUP_BRANDS[group.title];
+    return (
+      <div className="skills-plugin-group" key={`${group.source}:${group.title}`}>
+        <header className="skills-group-header">
+          <div>
+            <h3 className="skills-group-heading">
+              {group.title === "My skills" ? <Folder aria-hidden /> : <SkillBrandIcon brands={brands} />}
+              {label}
+            </h3>
+            <p>
+              {SKILL_SOURCE_LABELS[group.source] ?? group.source} · {enabledCount} of {group.skills.length} enabled · {invocations.toLocaleString()} invoked
+            </p>
+          </div>
+          <div className="skills-group-actions">
+            {group.source === "plugin" ? (
+              <button
+                className="skills-uninstall-button"
+                type="button"
+                disabled={Boolean(uninstalling)}
+                onClick={() => uninstall(group.title, label)}
+              >
+                {uninstalling === group.title ? <LoaderCircle className="spin" /> : <Trash2 />}
+                Uninstall
+              </button>
+            ) : null}
+            <Switch
+              checked={groupEnabled}
+              mixed={groupMixed}
+              onChange={(value) => toggleGroup(group.skills, value)}
+              label={`${groupEnabled ? "Disable" : "Enable"} all skills in ${label}`}
+            />
+          </div>
+        </header>
+        {group.skills.map((skill) => (
+          <SkillSettingsRow
+            key={skill.name}
+            skill={skill}
+            enabled={isSkillEnabled(overrides, skill)}
+            onToggle={(value) => toggle(skill, value)}
+            onCredentialChanged={refresh}
+          />
+        ))}
+      </div>
+    );
+  };
+
+  return (
+    <>
+      <section className="settings-section">
+        <header>
+          <h2>Skills</h2>
+          <p>
+            Portable skills you own, available in every runtime. Drop a folder with a SKILL.md into
+            the Skills folder and it appears here. Claude loads enabled skills natively; Codex,
+            Antigravity, Cursor, and Grok receive a compact skill index each turn and read the skill
+            on demand, with explicit /skill invocations carried in full.
+          </p>
+        </header>
+        <SettingRow
+          label="Skills folder"
+          description="Standalone skills you author or copy in. Enabled by default."
+        >
+          <code className="settings-path">{overview?.skillsRoot ?? "…"}</code>
+        </SettingRow>
+        <SettingRow
+          label="Plugins folder"
+          description="Installed plugin bundles. Their skills stay off until you enable them."
+        >
+          <code className="settings-path">{overview?.pluginsRoot ?? "…"}</code>
+        </SettingRow>
+        {loadError ? (
+          <p className="settings-action-message" role="status">
+            {loadError}
+          </p>
+        ) : null}
+      </section>
+      <SkillsCollection
+        title="Third Party Plugins"
+        description="Official and trusted skill catalogs you can install locally."
+        icon={Package}
+        open={openCollections.thirdParty}
+        onToggle={() => toggleCollection("thirdParty")}
+      >
+        {CURATED_PLUGIN_INSTALLS.map((entry) => {
+          const installed = installedPluginIds.has(entry.repository.replace("/", "-"));
+          return (
+            <SettingRow key={entry.repository} label={entry.label} description={entry.description}>
+              <button
+                className="ghost-button"
+                type="button"
+                disabled={installBusy || installed}
+                onClick={() => install(entry.repository)}
+              >
+                <SkillBrandIcon brands={CURATED_INSTALL_BRANDS[entry.icon]} />
+                {installed ? "Installed" : "Install"}
+              </button>
+            </SettingRow>
+          );
+        })}
+        <SettingRow
+          label="From GitHub"
+          description="Any repository containing skills/ directories, as owner/name."
+        >
+          <input
+            className="settings-inline-input"
+            value={installRepo}
+            placeholder="owner/name"
+            onChange={(event) => setInstallRepo(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") install(installRepo);
+            }}
+          />
+          <button
+            className="ghost-button"
+            type="button"
+            disabled={installBusy || !installRepo.trim()}
+            onClick={() => install(installRepo)}
+          >
+            {installBusy ? <LoaderCircle className="spin" /> : <Plus />} Install
+          </button>
+        </SettingRow>
+        {installMessage ? (
+          <p className="settings-action-message" role="status">
+            {installMessage}
+          </p>
+        ) : null}
+      </SkillsCollection>
+      <SkillsCollection
+        title="Installed Skills and Plugins"
+        description="Your standalone skills and locally installed plugin bundles."
+        icon={Folder}
+        open={openCollections.installed}
+        onToggle={() => toggleCollection("installed")}
+      >
+        {installedGroups.length > 0 ? (
+          installedGroups.map(renderGroup)
+        ) : (
+          <p className="skills-empty-state">No user skills or third-party plugins installed yet.</p>
+        )}
+      </SkillsCollection>
+      <SkillsCollection
+        title="AI Integrator Skills and Plugins"
+        description="Focused capabilities maintained and shipped with AI Integrator."
+        icon={Sparkles}
+        open={openCollections.integrator}
+        onToggle={() => toggleCollection("integrator")}
+      >
+        {integratorGroups.length > 0 ? (
+          integratorGroups.map(renderGroup)
+        ) : (
+          <p className="skills-empty-state">No bundled skills are available in this build.</p>
+        )}
+      </SkillsCollection>
+    </>
+  );
+}
 
 function SubagentsSettings({
   settings,
@@ -425,7 +992,7 @@ function SubagentsSettings({
       <section className="settings-section">
         <header>
           <h2>Delegation policy</h2>
-          <p>Mode and caps are yours; models can pick a peer but never override them.</p>
+          <p>The default delegation mode for new chats and a hard cap on concurrent subagents.</p>
         </header>
         <SettingRow
           label="Default delegation mode"
@@ -738,7 +1305,7 @@ function AppearanceSettings({
         </span>
         <div>
           <h1>Appearance</h1>
-          <p>Make the workspace yours without sacrificing code contrast or state clarity.</p>
+          <p>Theme, fonts, density, motion, and semantic color overrides.</p>
         </div>
         <button className="secondary-button" type="button" onClick={onReset}>
           <RotateCcw /> Reset
@@ -747,7 +1314,7 @@ function AppearanceSettings({
       <section className="settings-section">
         <header>
           <h2>Theme preset</h2>
-          <p>Coordinated palettes. Provider identity never recolors the workspace.</p>
+          <p>The color palette used across the whole workspace.</p>
         </header>
         <div className="theme-grid" role="radiogroup" aria-label="Theme preset">
           {THEME_PRESET_GRID_ORDER.map((themeId) => {
@@ -860,7 +1427,7 @@ function AppearanceSettings({
       <section className="settings-section">
         <header>
           <h2>Geometry and motion</h2>
-          <p>Changes apply immediately and remain reversible.</p>
+          <p>Layout density, sidebar menus, corner radius, animation, and the streaming cursor.</p>
         </header>
         <SettingRow
           label="Density"
@@ -969,7 +1536,7 @@ function AppearanceSettings({
       <section className="settings-section">
         <header>
           <h2>Typography detail</h2>
-          <p>Weight and line height apply to readable content without weakening hit targets.</p>
+          <p>Font weight, line height, and panel spacing.</p>
         </header>
         <SettingRow
           label="Body weight"
@@ -1043,7 +1610,7 @@ function AppearanceSettings({
       <section className="settings-section">
         <header>
           <h2>Semantic color overrides</h2>
-          <p>Every token is previewable and resettable. Changes stay local to this installation.</p>
+          <p>Override individual UI colors. Each token previews live and can be reset.</p>
         </header>
         <div
           className={`settings-callout ${contrastWarnings.length ? "settings-callout--warning" : "settings-callout--success"}`}
@@ -2106,13 +2673,13 @@ function UsageSettings({
         </span>
         <div>
           <h1>Usage and Budgets</h1>
-          <p>Plan limits, processed tokens, cost estimates, and actual charges stay separate.</p>
+          <p>Token counts and cost estimates for the current task and each provider.</p>
         </div>
       </div>
       <section className="settings-section">
         <header>
           <h2>Current task</h2>
-          <p>Every number includes its source and confidence.</p>
+          <p>Token and cost figures for the open task, each labeled with where it comes from.</p>
         </header>
         <div className="settings-usage-grid">
           {usage.metrics.map((metric) => (
@@ -2224,17 +2791,17 @@ function PolicySettings({
     general: {
       icon: MonitorCog,
       title: "General",
-      subtitle: "Local installation preferences and data portability.",
+      subtitle: "Startup behavior, voice typing, and where local data is stored and exported.",
     },
     composer: {
       icon: Braces,
       title: "Composer",
-      subtitle: "Keep task intent primary while the send gesture stays predictable.",
+      subtitle: "What the Enter key does, and which metadata appears above transcript replies.",
     },
     permissions: {
       icon: ShieldCheck,
       title: "Permissions",
-      subtitle: "Make the safe path fast while keeping broader authority explicit and reversible.",
+      subtitle: "The permission profile preselected when a new chat opens.",
     },
   }[section];
   const Icon = page.icon;
@@ -2253,7 +2820,10 @@ function PolicySettings({
         <section className="settings-section">
           <header>
             <h2>Startup and safety</h2>
-            <p>These choices apply locally and never create an AI Integrator account.</p>
+            <p>
+              What reopens at launch, how interrupted responses resume, and when the app asks before
+              acting.
+            </p>
           </header>
           <SettingRow
             label="Restore last workspace"
@@ -2300,9 +2870,7 @@ function PolicySettings({
         <section className="settings-section">
           <header>
             <h2>Local data location</h2>
-            <p>
-              The exact application-data directory is shown so the local boundary stays inspectable.
-            </p>
+            <p>The directory where this app keeps its settings, task metadata, and indexes.</p>
           </header>
           <div className="settings-location">
             <Database />
@@ -2371,7 +2939,7 @@ function PolicySettings({
         <section className="settings-section">
           <header>
             <h2>Turn behavior</h2>
-            <p>The send gesture applies to every chat composer immediately.</p>
+            <p>Changes apply to every chat composer immediately.</p>
           </header>
           <SettingRow
             label="Enter key"
@@ -2729,7 +3297,7 @@ function ArchiveSettings({
       <section className="settings-section">
         <header>
           <h2>Retention</h2>
-          <p>Applied locally by this app while it is running; nothing leaves your machine.</p>
+          <p>Automatically archive inactive chats and delete archived ones after a delay.</p>
         </header>
         <SettingRow
           label="Auto-archive inactive chats"
@@ -2903,41 +3471,6 @@ const navPillSpring = {
  * selection explainer's configuration, then what the app writes into commits
  * and how far a push may go.
  */
-function FilesAndGitSettings({
-  settings,
-  setSetting,
-  runtimes,
-  projectName,
-}: {
-  settings: SettingsMap;
-  setSetting: (key: string, value: unknown) => void;
-  runtimes: RuntimeConnection[];
-  projectName?: string;
-}) {
-  return (
-    <>
-      <div className="settings-page-heading">
-        <span>
-          <FolderGit2 />
-        </span>
-        <div>
-          <h1>Files and Git</h1>
-          <p>
-            What comes back when you ask about highlighted code, and what AI Integrator adds to
-            your history on the way out.
-          </p>
-        </div>
-      </div>
-      <ExplainSettings
-        settings={settings}
-        setSetting={setSetting}
-        runtimes={runtimes}
-        projectName={projectName}
-      />
-      <GitSettings settings={settings} setSetting={setSetting} />
-    </>
-  );
-}
 
 /**
  * The selection explainer's configuration: what the answer is, who it is for,
@@ -2988,7 +3521,15 @@ function ExplainSettings({
     void bridge
       .listModelCatalog(pinned)
       .then((entries) => {
-        if (active) setCatalog(entries.filter((entry) => entry.id !== "Provider default"));
+        if (!active) return;
+        const usableCatalog = entries.filter((entry) => entry.id !== "Provider default");
+        setCatalog(usableCatalog);
+        // A pinned runtime must name a catalog model — never an empty "Default".
+        const current = readSetting<string>(settings, EXPLAIN_SETTINGS.model, "");
+        if (!usableCatalog.some((entry) => entry.id === current) && usableCatalog[0]) {
+          setSetting(EXPLAIN_SETTINGS.model, usableCatalog[0].id);
+          setSetting(EXPLAIN_SETTINGS.effort, "");
+        }
       })
       .catch(() => {
         if (active) setCatalog([]);
@@ -2996,7 +3537,10 @@ function ExplainSettings({
     return () => {
       active = false;
     };
-  }, [pinned]);
+    // settings[model] is read once on load to decide whether to auto-pick; the
+    // setter itself updates it, so listing it would loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pinned, setSetting]);
 
   const config = resolveExplainConfig(settings);
   const { customMission } = config;
@@ -3026,7 +3570,10 @@ function ExplainSettings({
   const model = readSetting<string>(settings, EXPLAIN_SETTINGS.model, "");
   const entry = catalog?.find((candidate) => candidate.id === model);
   const effortOptions = entry?.efforts ?? [];
-  const effort = resolveModelEffort(entry, readSetting<string>(settings, EXPLAIN_SETTINGS.effort, ""));
+  const effort = resolveModelEffort(
+    entry,
+    readSetting<string>(settings, EXPLAIN_SETTINGS.effort, ""),
+  );
 
   const archetypeOptions: DropdownOption[] = [
     ...BUILT_IN_ARCHETYPES.map((item) => ({ value: item.id, label: item.label })),
@@ -3087,12 +3634,21 @@ function ExplainSettings({
 
   return (
     <>
+      <div className="settings-page-heading">
+        <span>
+          <Lightbulb />
+        </span>
+        <div>
+          <h1>Explain</h1>
+          <p>What comes back when you highlight code in a file and choose “Ask about this”.</p>
+        </div>
+      </div>
       <section className="settings-section">
         <header>
           <h2>Ask about this</h2>
           <p>
-            Highlight code in a file and right-click. The archetype replaces the whole
-            instruction, not just its tone.
+            Highlight code in a file and right-click. The archetype replaces the whole instruction,
+            not just its tone.
           </p>
         </header>
         <SettingRow label="Archetype" description={archetypeHint}>
@@ -3203,19 +3759,17 @@ function ExplainSettings({
         {pinned ? (
           <SettingRow
             label="Model"
-            description="Economy default picks the provider's cheapest model, the same one chat titles use."
+            description="Required. Explanations always run on a catalog model for this provider."
           >
             <Dropdown
               aria-label="Explain model"
-              value={model}
-              options={[
-                { value: "", label: "Economy default" },
-                ...(catalog ?? []).map((item) => ({ value: item.id, label: item.label })),
-              ]}
+              value={model || (catalog?.[0]?.id ?? "")}
+              options={(catalog ?? []).map((item) => ({ value: item.id, label: item.label }))}
               onChange={(value) => {
                 setSetting(EXPLAIN_SETTINGS.model, value);
                 setSetting(EXPLAIN_SETTINGS.effort, "");
               }}
+              disabled={!catalog || catalog.length === 0}
             />
           </SettingRow>
         ) : null}
@@ -3239,40 +3793,66 @@ function ExplainSettings({
           <span>
             <strong>Fallbacks</strong>
             <small>
-              Click to add a provider to the chain. If the one above it cannot answer — not
-              installed, timed out, out of usage — the next one is tried. Fallbacks run on their
-              own economy model.
+              Tried in order if the one above cannot answer — not installed, timed out, or out of
+              usage. Each fallback picks its own default model.
             </small>
           </span>
-          <div className="explain-fallback-chain">
-            <span className="explain-fallback-chip" data-primary="true">
-              <span className="explain-fallback-order">1</span>
-              {pinnedRuntime ? (
-                <ProviderIcon provider={pinnedRuntime.id} label={pinnedRuntime.name} />
-              ) : null}
-              {pinnedRuntime?.name ?? "Current model"}
-            </span>
-            {usable
-              .filter((runtime) => runtime.id !== pinned)
-              .map((runtime) => {
-                const index = fallbacks.indexOf(runtime.id);
+          <div className="explain-fallback-list">
+            <ol className="explain-fallback-chain">
+              <li className="explain-fallback-step" data-primary="true">
+                <span className="explain-fallback-order" aria-hidden="true">
+                  1
+                </span>
+                {pinnedRuntime ? (
+                  <ProviderIcon provider={pinnedRuntime.id} label={pinnedRuntime.name} />
+                ) : null}
+                <span className="explain-fallback-name">
+                  {pinnedRuntime?.name ?? "Current model"}
+                </span>
+                <span className="explain-fallback-role">Primary</span>
+              </li>
+              {fallbacks.map((runtimeId, index) => {
+                const runtime = usable.find((item) => item.id === runtimeId);
+                if (!runtime) return null;
                 return (
-                  <button
-                    key={runtime.id}
-                    type="button"
-                    className="explain-fallback-chip"
-                    aria-pressed={index >= 0}
-                    data-selected={index >= 0}
-                    onClick={() => toggleFallback(runtime.id)}
-                  >
-                    <span className="explain-fallback-order">
-                      {index >= 0 ? index + 2 : <Plus />}
-                    </span>
-                    <ProviderIcon provider={runtime.id} label={runtime.name} />
-                    {runtime.name}
-                  </button>
+                  <li key={runtime.id}>
+                    <button
+                      type="button"
+                      className="explain-fallback-step"
+                      aria-pressed="true"
+                      data-selected="true"
+                      onClick={() => toggleFallback(runtime.id)}
+                    >
+                      <span className="explain-fallback-order" aria-hidden="true">
+                        {index + 2}
+                      </span>
+                      <ProviderIcon provider={runtime.id} label={runtime.name} />
+                      <span className="explain-fallback-name">{runtime.name}</span>
+                      <span className="explain-fallback-role">Remove</span>
+                    </button>
+                  </li>
                 );
               })}
+            </ol>
+            {usable.some((runtime) => runtime.id !== pinned && !fallbacks.includes(runtime.id)) ? (
+              <div className="explain-fallback-pool" aria-label="Add fallback providers">
+                {usable
+                  .filter((runtime) => runtime.id !== pinned && !fallbacks.includes(runtime.id))
+                  .map((runtime) => (
+                    <button
+                      key={runtime.id}
+                      type="button"
+                      className="explain-fallback-add"
+                      aria-pressed="false"
+                      onClick={() => toggleFallback(runtime.id)}
+                    >
+                      <Plus aria-hidden="true" />
+                      <ProviderIcon provider={runtime.id} label={runtime.name} />
+                      <span>{runtime.name}</span>
+                    </button>
+                  ))}
+              </div>
+            ) : null}
           </div>
         </div>
       </section>
@@ -3294,23 +3874,103 @@ function ExplainSettings({
 }
 
 /**
- * Git decorations and push safety. Every control defaults off: each one either
- * writes something permanent into history or relaxes a safeguard, so none of it
- * should arrive without being asked for.
+ * Git decorations, who drafts commit subjects, and push safety. Decorations
+ * default off: each one either writes something permanent into history or
+ * relaxes a safeguard. The commit-message writer is the opposite — Generate
+ * needs an explicit model before it will spend a provider turn.
  */
 function GitSettings({
   settings,
   setSetting,
+  runtimes,
 }: {
   settings: SettingsMap;
   setSetting: (key: string, value: unknown) => void;
+  runtimes: RuntimeConnection[];
 }) {
   const decoration = readGitDecorationSettings(settings);
   const force = readPushForce(settings);
   const samplePreview = decorateCommitMessage("fix the parser panic", decoration);
 
+  const [catalog, setCatalog] = useState<ModelCatalogEntry[] | null>(null);
+  const usable = useMemo(
+    () => runtimes.filter((runtime) => runtime.status !== "not_installed"),
+    [runtimes],
+  );
+  const available = useMemo(() => usable.map((runtime) => runtime.id), [usable]);
+  const storedRuntime = readSetting<string>(settings, COMMIT_MESSAGE_SETTINGS.runtime, "");
+  const pinned = available.includes(storedRuntime as RuntimeId)
+    ? (storedRuntime as RuntimeId)
+    : null;
+  const pinnedRuntime = pinned ? usable.find((runtime) => runtime.id === pinned) : undefined;
+  const fallbacks = normalizeFallbacks(settings[COMMIT_MESSAGE_SETTINGS.fallbacks], available);
+  const model = readSetting<string>(settings, COMMIT_MESSAGE_SETTINGS.model, "");
+  const entry = catalog?.find((candidate) => candidate.id === model);
+  const effortOptions = entry?.efforts ?? [];
+  const effort = resolveModelEffort(
+    entry,
+    readSetting<string>(settings, COMMIT_MESSAGE_SETTINGS.effort, ""),
+  );
+  const routeReady = resolveCommitMessageRoute(settings, available) !== null;
+
+  // Every read of `catalog` below is itself gated on `pinned` (the model row
+  // only renders once a runtime is chosen), so an unpinned catalog going
+  // stale in state is invisible rather than a bug — only the fetch needs
+  // skipping, not a reset.
+  useEffect(() => {
+    if (!pinned) return;
+    let active = true;
+    void bridge
+      .listModelCatalog(pinned)
+      .then((entries) => {
+        if (!active) return;
+        const usableCatalog = entries.filter((entry) => entry.id !== "Provider default");
+        setCatalog(usableCatalog);
+        const current = readSetting<string>(settings, COMMIT_MESSAGE_SETTINGS.model, "");
+        if (!usableCatalog.some((item) => item.id === current) && usableCatalog[0]) {
+          setSetting(COMMIT_MESSAGE_SETTINGS.model, usableCatalog[0].id);
+          setSetting(COMMIT_MESSAGE_SETTINGS.effort, "");
+        }
+      })
+      .catch(() => {
+        if (active) setCatalog([]);
+      });
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pinned, setSetting]);
+
+  const changeRuntime = (value: string) => {
+    setSetting(COMMIT_MESSAGE_SETTINGS.runtime, value);
+    setSetting(COMMIT_MESSAGE_SETTINGS.model, "");
+    setSetting(COMMIT_MESSAGE_SETTINGS.effort, "");
+    setSetting(
+      COMMIT_MESSAGE_SETTINGS.fallbacks,
+      fallbacks.filter((item) => item !== value),
+    );
+  };
+
+  const toggleFallback = (runtime: RuntimeId) => {
+    setSetting(
+      COMMIT_MESSAGE_SETTINGS.fallbacks,
+      fallbacks.includes(runtime)
+        ? fallbacks.filter((item) => item !== runtime)
+        : [...fallbacks, runtime],
+    );
+  };
+
   return (
     <>
+      <div className="settings-page-heading">
+        <span>
+          <GitBranch />
+        </span>
+        <div>
+          <h1>Git</h1>
+          <p>What AI Integrator writes into your commits, and how far a push may go.</p>
+        </div>
+      </div>
       <section className="settings-section">
         <header>
           <h2>Commits</h2>
@@ -3352,6 +4012,141 @@ function GitSettings({
             {samplePreview}
           </pre>
         ) : null}
+      </section>
+
+      <section className="settings-section">
+        <header>
+          <h2>Commit messages</h2>
+          <p>
+            The Generate button in the Git panel drafts a subject through an isolated, tool-denied
+            helper — pick who writes it.
+          </p>
+        </header>
+        <SettingRow
+          label="Runtime"
+          description={
+            routeReady
+              ? "Drafts run on this provider first, then any fallbacks below."
+              : "Choose a provider, then a model. Generate stays off until both are set."
+          }
+        >
+          <Dropdown
+            aria-label="Commit message runtime"
+            value={pinned ?? ""}
+            options={[
+              ...(pinned
+                ? []
+                : [{ value: "", label: "Choose a runtime…", disabled: true as const }]),
+              ...usable.map((runtime) => ({
+                value: runtime.id,
+                label: runtime.name,
+                icon: <ProviderIcon provider={runtime.id} label={runtime.name} />,
+              })),
+            ]}
+            onChange={changeRuntime}
+            disabled={usable.length === 0}
+          />
+        </SettingRow>
+        {pinned ? (
+          <SettingRow
+            label="Model"
+            description="Required. Commit subjects always run on a catalog model for this provider."
+          >
+            <Dropdown
+              aria-label="Commit message model"
+              value={model || (catalog?.[0]?.id ?? "")}
+              options={(catalog ?? []).map((item) => ({ value: item.id, label: item.label }))}
+              onChange={(value) => {
+                setSetting(COMMIT_MESSAGE_SETTINGS.model, value);
+                setSetting(COMMIT_MESSAGE_SETTINGS.effort, "");
+              }}
+              disabled={!catalog || catalog.length === 0}
+            />
+          </SettingRow>
+        ) : null}
+        {pinned && effortOptions.length > 0 ? (
+          <SettingRow
+            label="Reasoning effort"
+            description="Only the levels this model advertises are offered."
+          >
+            <Dropdown
+              aria-label="Commit message reasoning effort"
+              value={effort ?? ""}
+              options={effortOptions.map((option) => ({
+                value: option.id,
+                label: option.label,
+              }))}
+              onChange={(value) => setSetting(COMMIT_MESSAGE_SETTINGS.effort, value)}
+            />
+          </SettingRow>
+        ) : null}
+        <div className="setting-row setting-row-stacked">
+          <span>
+            <strong>Fallbacks</strong>
+            <small>
+              Tried in order if the one above cannot answer — not installed, timed out, or out of
+              usage. Each fallback picks its own default model.
+            </small>
+          </span>
+          <div className="explain-fallback-list">
+            <ol className="explain-fallback-chain">
+              <li className="explain-fallback-step" data-primary="true">
+                <span className="explain-fallback-order" aria-hidden="true">
+                  1
+                </span>
+                {pinnedRuntime ? (
+                  <ProviderIcon provider={pinnedRuntime.id} label={pinnedRuntime.name} />
+                ) : null}
+                <span className="explain-fallback-name">
+                  {pinnedRuntime?.name ?? "Choose a runtime"}
+                </span>
+                <span className="explain-fallback-role">Primary</span>
+              </li>
+              {fallbacks.map((runtimeId, index) => {
+                const runtime = usable.find((item) => item.id === runtimeId);
+                if (!runtime) return null;
+                return (
+                  <li key={runtime.id}>
+                    <button
+                      type="button"
+                      className="explain-fallback-step"
+                      aria-pressed="true"
+                      data-selected="true"
+                      onClick={() => toggleFallback(runtime.id)}
+                    >
+                      <span className="explain-fallback-order" aria-hidden="true">
+                        {index + 2}
+                      </span>
+                      <ProviderIcon provider={runtime.id} label={runtime.name} />
+                      <span className="explain-fallback-name">{runtime.name}</span>
+                      <span className="explain-fallback-role">Remove</span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ol>
+            {usable.some((runtime) => runtime.id !== pinned && !fallbacks.includes(runtime.id)) ? (
+              <div className="explain-fallback-pool" aria-label="Add commit message fallbacks">
+                {usable
+                  .filter((runtime) => runtime.id !== pinned && !fallbacks.includes(runtime.id))
+                  .map((runtime) => (
+                    <button
+                      key={runtime.id}
+                      type="button"
+                      className="explain-fallback-add"
+                      aria-pressed="false"
+                      disabled={!pinned}
+                      onClick={() => toggleFallback(runtime.id)}
+                    >
+                      <Plus aria-hidden="true" />
+                      <ProviderIcon provider={runtime.id} label={runtime.name} />
+                      <span>{runtime.name}</span>
+                    </button>
+                  ))}
+              </div>
+            ) : null}
+          </div>
+        </div>
       </section>
 
       <section className="settings-section">
@@ -3577,13 +4372,19 @@ export function SettingsView(props: SettingsViewProps) {
               onRefreshRuntimes={props.onRefreshRuntimes}
             />
           ) : null}
-          {section === "files-git" ? (
-            <FilesAndGitSettings
+          {section === "explain" ? (
+            <ExplainSettings
               settings={settings}
               setSetting={setSetting}
               runtimes={props.runtimes}
               projectName={props.projects?.find((project) => !project.archived)?.name}
             />
+          ) : null}
+          {section === "git" ? (
+            <GitSettings settings={settings} setSetting={setSetting} runtimes={props.runtimes} />
+          ) : null}
+          {section === "skills" ? (
+            <SkillsSettings settings={settings} setSetting={setSetting} />
           ) : null}
           {section === "subagents" ? (
             <SubagentsSettings

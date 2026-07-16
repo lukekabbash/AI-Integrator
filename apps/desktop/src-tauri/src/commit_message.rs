@@ -6,8 +6,10 @@ use session_store::CommitMessageGenerationClaim;
 use tauri::State;
 
 use crate::{
-    chat_title::generate_isolated_provider_text,
+    chat_title::{HelperRoute, generate_isolated_provider_text_routed},
+    code_explain::ExplainRoute,
     commands::{CommandError, CommandResult, authorized_git},
+    provider_routing::{is_worth_failing_over, provider_chain},
     state::AppState,
 };
 
@@ -20,17 +22,21 @@ const RECENT_SUBJECT_LIMIT: u32 = 5;
 pub async fn git_generate_commit_message(
     state: State<'_, AppState>,
     task_id: TaskId,
-    provider: ProviderKind,
+    route: ExplainRoute,
 ) -> CommandResult<String> {
-    let task = state.store.get_task(task_id).map_err(CommandError::from)?;
-    let runtime_matches = task.runtime.as_deref() == Some(provider.as_str())
-        || (provider == ProviderKind::CustomAcp && task.runtime.as_deref() == Some("custom"));
-    if !runtime_matches {
+    if route
+        .model
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
         return Err(command_error(
             "invalid-input",
-            "the commit-message provider must match the task runtime",
+            "choose a commit-message model in Git settings",
         ));
     }
+    let task = state.store.get_task(task_id).map_err(CommandError::from)?;
     let repository = task
         .worktree_path
         .as_ref()
@@ -60,9 +66,56 @@ pub async fn git_generate_commit_message(
     }
 
     let fingerprint = diff_fingerprint(&diff.patch, diff.truncated, &recent_subjects);
+    let (bounded_diff, locally_truncated) = bounded_diff(&diff.patch);
+    let prompt = commit_message_prompt(
+        &bounded_diff,
+        diff.truncated || locally_truncated,
+        &recent_subjects,
+    );
+
+    let chain = provider_chain(route.provider, &route.fallbacks);
+    let mut last: Option<CommandError> = None;
+    for (index, provider) in chain.into_iter().enumerate() {
+        match try_generate_for_provider(
+            &state,
+            task_id,
+            provider,
+            &fingerprint,
+            &prompt,
+            if index == 0 {
+                HelperRoute {
+                    model: route.model.clone(),
+                    effort: route.effort.clone(),
+                }
+            } else {
+                HelperRoute::default()
+            },
+        )
+        .await
+        {
+            Ok(message) => return Ok(message),
+            Err(error) if error.code == "generation-in-progress" => return Err(error),
+            Err(error) if is_worth_failing_over(error.code) => last = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last.unwrap_or(command_error(
+        "provider-failed",
+        "no provider could write a commit message",
+    )))
+}
+
+async fn try_generate_for_provider(
+    state: &State<'_, AppState>,
+    task_id: TaskId,
+    provider: ProviderKind,
+    fingerprint: &str,
+    prompt: &str,
+    helper: HelperRoute,
+) -> CommandResult<String> {
     let store = Arc::clone(&state.store);
     let provider_name = provider.as_str().to_owned();
-    let fingerprint_for_claim = fingerprint.clone();
+    let fingerprint_for_claim = fingerprint.to_owned();
     let claim = tauri::async_runtime::spawn_blocking(move || {
         store.claim_commit_message_generation(task_id, &provider_name, &fingerprint_for_claim)
     })
@@ -80,14 +133,14 @@ pub async fn git_generate_commit_message(
         CommitMessageGenerationClaim::Claimed => {}
     }
 
-    let (bounded_diff, locally_truncated) = bounded_diff(&diff.patch);
-    let prompt = commit_message_prompt(
-        &bounded_diff,
-        diff.truncated || locally_truncated,
-        &recent_subjects,
-    );
     let generation = async {
-        let raw = generate_isolated_provider_text(&state.data_directory, provider, &prompt).await?;
+        let raw = generate_isolated_provider_text_routed(
+            &state.data_directory,
+            provider,
+            prompt,
+            &helper,
+        )
+        .await?;
         let message = parse_commit_message(&raw).ok_or_else(|| {
             command_error(
                 "invalid-provider-output",
@@ -96,7 +149,7 @@ pub async fn git_generate_commit_message(
         })?;
         let store = Arc::clone(&state.store);
         let provider_name = provider.as_str().to_owned();
-        let fingerprint_for_completion = fingerprint.clone();
+        let fingerprint_for_completion = fingerprint.to_owned();
         let message_for_completion = message.clone();
         tauri::async_runtime::spawn_blocking(move || {
             store.complete_commit_message_generation(
@@ -119,11 +172,12 @@ pub async fn git_generate_commit_message(
     match generation.await {
         Ok(message) => Ok(message),
         Err(error) => {
-            // Release the claim so the next click retries instead of hitting
-            // "generation-in-progress" until the stale-claim window expires.
+            // Release the claim so the next click — or the next fallback —
+            // retries instead of hitting "generation-in-progress" until the
+            // stale-claim window expires.
             let store = Arc::clone(&state.store);
             let provider_name = provider.as_str().to_owned();
-            let fingerprint_for_release = fingerprint.clone();
+            let fingerprint_for_release = fingerprint.to_owned();
             let _ = tauri::async_runtime::spawn_blocking(move || {
                 store.abandon_commit_message_generation(
                     task_id,
@@ -252,7 +306,12 @@ fn diff_fingerprint(diff: &str, truncated: bool, recent_subjects: &[String]) -> 
         hash = hash.wrapping_mul(0x100000001b3);
     }
     for subject in recent_subjects {
-        for byte in subject.as_bytes().iter().copied().chain(std::iter::once(0u8)) {
+        for byte in subject
+            .as_bytes()
+            .iter()
+            .copied()
+            .chain(std::iter::once(0u8))
+        {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x100000001b3);
         }
@@ -295,10 +354,7 @@ mod tests {
             parse_commit_message("Commit message: fix: preserve manual edits"),
             Some("fix: preserve manual edits".into())
         );
-        assert_eq!(
-            parse_commit_message("1.2.3"),
-            Some("1.2.3".into())
-        );
+        assert_eq!(parse_commit_message("1.2.3"), Some("1.2.3".into()));
         assert_eq!(
             parse_commit_message("Release 2.0.0."),
             Some("Release 2.0.0.".into())

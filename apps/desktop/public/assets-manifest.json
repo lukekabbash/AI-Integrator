@@ -62,6 +62,156 @@
       "dimensions": "48x48",
       "approved": true,
       "notes": "Downloaded from xAI's official favicon endpoint."
+    },
+    {
+      "path": "brand/skills/openai.png",
+      "kind": "skill-publisher-favicon",
+      "purpose": "OpenAI skill publisher identity in Skills settings",
+      "source": "https://developers.openai.com/favicon.png",
+      "sha256": "8D5575EE667FF715CD3E3074D5296EDC68D5AADD89720D203E13131B68B22A04",
+      "dimensions": "48x48",
+      "approved": true,
+      "notes": "Declared by OpenAI's official developer site."
+    },
+    {
+      "path": "brand/skills/vercel.ico",
+      "kind": "skill-publisher-favicon",
+      "purpose": "Vercel skill publisher identity in Skills settings",
+      "source": "https://vercel.com/favicon.ico",
+      "sha256": "6D03F17164357ABB5DC49E90A572F94C4F5E6004E659D3EFED6A9E947670D81B",
+      "dimensions": "48x48",
+      "approved": true,
+      "notes": "Downloaded from Vercel's official favicon endpoint."
+    },
+    {
+      "path": "brand/skills/cloudflare.png",
+      "kind": "skill-publisher-favicon",
+      "purpose": "Cloudflare skill publisher identity in Skills settings",
+      "source": "https://www.cloudflare.com/favicon.ico",
+      "sha256": "5414BC6E4B3F6E10F99B5D37ABF4420DA4DCAECE66F8F2C08E090E87267ADBC5",
+      "dimensions": "99x96",
+      "approved": true,
+      "notes": "Official endpoint serves PNG data; stored with the matching extension."
+    },
+    {
+      "path": "brand/skills/microsoft.ico",
+      "kind": "skill-publisher-favicon",
+      "purpose": "Microsoft skill publisher identity in Skills settings",
+      "source": "https://www.microsoft.com/favicon.ico",
+      "sha256": "90CDAF487716184E4034000935C605D1633926D348116D198F355A98B8C6CD21",
+      "dimensions": "128x128",
+      "approved": true,
+      "notes": "Downloaded from Microsoft's official favicon endpoint."
+    },
+    {
+      "path": "brand/skills/huggingface.ico",
+      "kind": "skill-publisher-favicon",
+      "purpose": "Hugging Face skill publisher identity in Skills settings",
+      "source": "https://huggingface.co/favicon.ico",
+      "sha256": "7266292A5073388702CFCA169D26766460CB90BA978BACC95C914AD7A5C611CB",
+      "dimensions": "256x256",
+      "approved": true,
+      "notes": "Downloaded from Hugging Face's official favicon endpoint."
+    },
+    {
+      "path": "brand/skills/expo.png",
+      "kind": "skill-publisher-favicon",
+      "purpose": "Expo skill publisher identity in Skills settings",
+      "source": "https://expo.dev/static/favicons/favicon-light-48x48.png",
+      "sha256": "2FE3291D2F5113829372AC71C024537823C4B7B361EA93B0799DE3AC913D3127",
+      "dimensions": "48x48",
+      "approved": true,
+      "notes": "Declared by Expo's official site for light surfaces."
+    },
+    {
+      "path": "brand/skills/stripe.ico",
+      "kind": "skill-publisher-favicon",
+      "purpose": "Stripe skill publisher identity in Skills settings",
+      "source": "https://stripe.com/favicon.ico",
+      "sha256": "50630726CBD85299C64DBB510F051E5D70013ABCD620FA2B23BE82E618140150",
+      "dimensions": "48x48",
+      "approved": true,
+      "notes": "Downloaded from Stripe's official favicon endpoint."
+    },
+    {
+      "path": "brand/skills/remotion.png",
+      "kind": "skill-publisher-favicon",
+      "purpose": "Remotion skill publisher identity in Skills settings",
+      "source": "https://www.remotion.dev/img/favicon.png",
+      "sha256": "662A084D72D99AB91B47C7A566DD0631F0CE0E4F0BF6032708C9200B0DB09FD9",
+      "dimensions": "100x100",
+      "approved": true,
+      "notes": "Declared by Remotion's official site."
+    },
+    {
+      "path": "brand/skills/superpowers.svg",
+      "kind": "skill-publisher-mark",
+      "purpose": "Superpowers skill publisher identity in Skills settings",
+      "source": "https://raw.githubusercontent.com/obra/superpowers/main/assets/superpowers-small.svg",
+      "sha256": "54A632D9EE6197CCBC10D43D42217E23D08375BEA63BA8EB4B6AF757C1535038",
+      "dimensions": "512x512 viewBox",
+      "approved": true,
+      "notes": "Official mark referenced by the repository's plugin manifest."
+    },
+    {
+      "path": "brand/skills/firebase.png",
+      "kind": "skill-publisher-favicon",
+      "purpose": "Firebase first-party skill identity in Skills settings",
+      "source": "https://www.gstatic.com/devrel-devsite/prod/v7669de8735de7fa899c49c793af6b01f3bfef3435bb66621d079ef252c528b54/firebase/images/favicon.png",
+      "sha256": "7F7D3FDCC0F5DA6CF7EE9E8444E46282674CA655B1AB81AD169E554E97105325",
+      "dimensions": "32x32",
+      "approved": true,
+      "notes": "Declared by Firebase's official developer site."
+    },
+    {
+      "path": "brand/skills/supabase.ico",
+      "kind": "skill-publisher-favicon",
+      "purpose": "Supabase first-party skill identity in Skills settings",
+      "source": "https://supabase.com/favicon/favicon.ico",
+      "sha256": "47267628AF20B00FE9D76B98ED249F4B0A59C0A3555BF9ADF77432060D933346",
+      "dimensions": "16x16",
+      "approved": true,
+      "notes": "Declared by Supabase's official site."
+    },
+    {
+      "path": "brand/skills/tauri.svg",
+      "kind": "skill-publisher-favicon",
+      "purpose": "Tauri first-party skill identity in Skills settings",
+      "source": "https://tauri.app/favicon.svg",
+      "sha256": "7DDFBF74261E8CF41139F7F784F17046801AC0F843BC40658CEA537C2B53B074",
+      "dimensions": "226x226",
+      "approved": true,
+      "notes": "Declared by Tauri's official site."
+    },
+    {
+      "path": "brand/skills/data-gov.ico",
+      "kind": "skill-publisher-favicon",
+      "purpose": "US government data skill identity in Skills settings",
+      "source": "https://s3-us-gov-west-1.amazonaws.com/cg-0817d6e3-93c4-4de8-8b32-da6919464e61/favicon.ico",
+      "sha256": "584CE3E49194D0ECE273DF163C6D0B27B44F6B78F841B8971EF94F3AADD2B41F",
+      "dimensions": "16x16",
+      "approved": true,
+      "notes": "Declared by data.gov's official site."
+    },
+    {
+      "path": "brand/skills/github.svg",
+      "kind": "skill-publisher-favicon",
+      "purpose": "Git-based release skill identity in Skills settings",
+      "source": "https://github.githubassets.com/favicons/favicon.svg",
+      "sha256": "6A9577CD4F7FA6B75BDE1025AF85B944E9DD1388373B55CCBA6E9F80AC2EAE60",
+      "dimensions": "32x32",
+      "approved": true,
+      "notes": "Declared by GitHub's official site."
+    },
+    {
+      "path": "brand/skills/alpha-vantage.ico",
+      "kind": "skill-publisher-favicon",
+      "purpose": "Market data skill identity in Skills settings",
+      "source": "https://www.alphavantage.co/static/img/favicon.ico",
+      "sha256": "457A3385DAA9F9CB953FDAE5C9A2ED7A4EAFB573F24F25B7EEFC27B1E9003025",
+      "dimensions": "48x48",
+      "approved": true,
+      "notes": "Declared by Alpha Vantage's official site."
     }
   ]
 }

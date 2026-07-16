@@ -48,9 +48,10 @@ fn definitions() -> [ProbeDefinition; 5] {
         },
         ProbeDefinition {
             provider: ProviderKind::Cursor,
-            // Cursor documents `agent` as the primary CLI entrypoint and
-            // keeps `cursor-agent` as a compatibility alias.
-            executables: &["agent", "cursor-agent"],
+            // Prefer Cursor's provider-specific alias. Other vendors also
+            // install a generic `agent` binary, so resolving that first can
+            // launch the wrong ACP implementation under Cursor's route.
+            executables: &["cursor-agent", "agent"],
             version_args: &["--version"],
             transport: ProviderTransport::AcpStdio,
         },
@@ -462,7 +463,7 @@ mod tests {
             .into_iter()
             .find(|definition| definition.provider == ProviderKind::Cursor)
             .expect("Cursor definition");
-        assert_eq!(cursor.executables, &["agent", "cursor-agent"]);
+        assert_eq!(cursor.executables, &["cursor-agent", "agent"]);
 
         let grok = definitions()
             .into_iter()
