@@ -1158,4 +1158,37 @@ describe("Transcript", () => {
       row.querySelector('.activity-nested-assistant[data-event-id="assistant-mid"]'),
     ).not.toBeNull();
   });
+
+  it("shows a quiet resumed cue on Worked for after an interruption", () => {
+    render(
+      <Transcript
+        events={[
+          event("user-1", "user", "Please fix it"),
+          {
+            id: "worked-for-assistant-1",
+            kind: "activity",
+            title: "Worked for",
+            body: "42s",
+            timestamp: "2026-07-11T12:00:01.000Z",
+            status: "success",
+            resumed: true,
+            expandedByDefault: false,
+            children: [
+              {
+                ...event("command-1", "tool", "pnpm test"),
+                activityType: "command",
+                title: "Command",
+                status: "success",
+              },
+            ],
+          },
+          event("assistant-1", "assistant", "Fixed."),
+        ]}
+      />,
+    );
+
+    const cue = screen.getByLabelText("Resumed after interruption");
+    expect(cue.tagName).toBe("EM");
+    expect(cue).toHaveTextContent("resumed");
+  });
 });

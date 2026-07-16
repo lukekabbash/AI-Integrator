@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    path::{Path, PathBuf},
     str::FromStr,
 };
 
@@ -23,6 +24,66 @@ const RENDERER_CONTENT_LIMIT: usize = 480 * 1024;
 const ITEM_BODY_LIMIT: usize = 2 * 1024 * 1024;
 const COMMAND_OUTPUT_LIMIT: usize = 1024 * 1024;
 const COMMAND_OUTPUT_HEAD: usize = 128 * 1024;
+
+/// Default handoff window: last N turns from shared task projections.
+pub const HANDOFF_DEFAULT_MAX_TURNS: usize = 10;
+/// ~50k tokens at chars/4 for fresh-session primers across any provider.
+pub const HANDOFF_DEFAULT_MAX_TOKENS: usize = 50_000;
+/// Bound vision reattachment cost on the primed turn.
+pub const HANDOFF_DEFAULT_MAX_IMAGES: usize = 4;
+/// Child/orchestrator digests stay tighter so briefs remain focused.
+pub const HANDOFF_CHILD_MAX_TOKENS: usize = 8_000;
+
+const HANDOFF_USER_CLIP: usize = 3_000;
+const HANDOFF_ASSISTANT_CLIP: usize = 4_000;
+const HANDOFF_READ_CLIP: usize = 4_000;
+const HANDOFF_COMMAND_OUTPUT_CLIP: usize = 1_024;
+const HANDOFF_NOISY_OUTPUT_THRESHOLD: usize = 8_192;
+
+/// Options for [`LocalStore::task_handoff_digest`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HandoffDigestOptions {
+    pub max_tokens: usize,
+    pub max_turns: usize,
+    pub max_images: usize,
+}
+
+impl Default for HandoffDigestOptions {
+    fn default() -> Self {
+        Self {
+            max_tokens: HANDOFF_DEFAULT_MAX_TOKENS,
+            max_turns: HANDOFF_DEFAULT_MAX_TURNS,
+            max_images: HANDOFF_DEFAULT_MAX_IMAGES,
+        }
+    }
+}
+
+impl HandoffDigestOptions {
+    #[must_use]
+    pub fn for_child() -> Self {
+        Self {
+            max_tokens: HANDOFF_CHILD_MAX_TOKENS,
+            max_turns: HANDOFF_DEFAULT_MAX_TURNS,
+            max_images: HANDOFF_DEFAULT_MAX_IMAGES,
+        }
+    }
+
+    /// Legacy byte-budget callers: treat bytes as an approximate char budget.
+    #[must_use]
+    pub fn from_max_bytes(max_bytes: usize) -> Self {
+        Self {
+            max_tokens: (max_bytes / 4).max(1),
+            ..Self::default()
+        }
+    }
+}
+
+/// Provider-neutral handoff package built from shared SQLite task projections.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HandoffDigest {
+    pub text: String,
+    pub image_paths: Vec<PathBuf>,
+}
 
 pub struct PreparedApprovalResponse {
     pub event: RuntimeProjectionEvent,
@@ -232,7 +293,7 @@ impl LocalStore {
     /// Compact UI hydrate with optional watermark/reset if-match and tail windowing.
     ///
     /// Display-only: does not change what is persisted or what
-    /// `task_conversation_digest` returns for agent seeding.
+    /// `task_handoff_digest` returns for agent seeding.
     pub fn task_snapshot_with(
         &self,
         task_id: TaskId,
@@ -733,6 +794,21 @@ impl LocalStore {
         self.transition_approval(approval_id, ApprovalState::ResponseFailed)
     }
 
+    /// True when the task tip was cancelled by Stop (user or orchestrator).
+    /// Resume-from-interrupt must refuse these tips.
+    pub fn task_tip_stop_requested(&self, task_id: TaskId) -> Result<bool> {
+        let connection = self.connection.lock();
+        let stop_requested = connection
+            .query_row(
+                "SELECT t.stop_requested FROM codex_task_projection p JOIN codex_turns t ON t.provider_session_id=p.provider_session_id AND t.turn_id=p.current_turn_id WHERE p.task_id=?1",
+                [task_id.to_string()],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        Ok(stop_requested.unwrap_or(false))
+    }
+
     pub fn request_stop(&self, task_id: TaskId) -> Result<PersistedStopRequest> {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction().map_err(storage_error)?;
@@ -817,6 +893,28 @@ impl LocalStore {
         Ok(event)
     }
 
+    /// Completed-at for the newest interrupted tip turn, used to stamp resume
+    /// wire prompts with when the prior attempt stopped.
+    pub fn task_latest_interrupted_at(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<chrono::DateTime<Utc>>> {
+        let connection = self.connection.lock();
+        let json = connection
+            .query_row(
+                "SELECT projection_json FROM codex_turns WHERE task_id=?1 AND status='interrupted' ORDER BY last_event_seq DESC LIMIT 1",
+                [task_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        let Some(json) = json else {
+            return Ok(None);
+        };
+        let turn: TurnProjection = serde_json::from_str(&json).map_err(invalid_stored)?;
+        Ok(turn.completed_at.or(turn.started_at))
+    }
+
     /// Mark a turn interrupted by transport/process loss without pretending
     /// the user pressed Stop. The distinction keeps opt-in auto-resume from
     /// undoing an intentional cancellation.
@@ -831,15 +929,13 @@ impl LocalStore {
         Ok(event)
     }
 
-    /// Render the task's persisted conversation (across all provider
-    /// sessions) as a bounded plain-text digest, newest-biased. Used to hand
-    /// context to a freshly created provider session so switching providers
-    /// or losing a thread does not lose the conversation.
-    pub fn task_conversation_digest(
+    /// Render the task's shared SQLite projections (any provider) as a bounded
+    /// handoff package for a freshly created native session.
+    pub fn task_handoff_digest(
         &self,
         task_id: TaskId,
-        max_bytes: usize,
-    ) -> Result<Option<String>> {
+        options: HandoffDigestOptions,
+    ) -> Result<Option<HandoffDigest>> {
         let connection = self.connection.lock();
         let edit_context = connection
             .query_row(
@@ -849,72 +945,141 @@ impl LocalStore {
             )
             .optional()
             .map_err(storage_error)?;
-        let mut statement = connection
+
+        let max_turns = options.max_turns.max(1);
+        let mut turn_statement = connection
             .prepare(
-                "SELECT kind, body, title FROM codex_items WHERE task_id = ?1 AND kind IN ('user_message', 'agent_message') AND body IS NOT NULL ORDER BY last_event_seq DESC LIMIT 40",
+                "SELECT turn_id, MAX(last_event_seq) AS tip
+                 FROM codex_items
+                 WHERE task_id = ?1
+                 GROUP BY turn_id
+                 ORDER BY tip DESC
+                 LIMIT ?2",
             )
             .map_err(storage_error)?;
-        let rows = statement
-            .query_map([task_id.to_string()], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
+        let turn_ids: Vec<String> = turn_statement
+            .query_map(params![task_id.to_string(), max_turns as i64], |row| {
+                row.get::<_, String>(0)
             })
             .map_err(storage_error)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(storage_error)?;
-        if rows.is_empty() && edit_context.as_ref().is_none_or(|body| body.trim().is_empty()) {
+        let turn_set: HashSet<&str> = turn_ids.iter().map(String::as_str).collect();
+
+        let mut item_statement = connection
+            .prepare(
+                "SELECT turn_id, kind, title, body, command_text, output, exit_code,
+                        file_changes_json, mcp_server, mcp_tool, projection_json, last_event_seq
+                 FROM codex_items
+                 WHERE task_id = ?1
+                 ORDER BY last_event_seq ASC",
+            )
+            .map_err(storage_error)?;
+        let item_rows: Vec<DigestItemRow> = item_statement
+            .query_map([task_id.to_string()], |row| {
+                Ok(DigestItemRow {
+                    turn_id: row.get(0)?,
+                    kind: row.get(1)?,
+                    title: row.get(2)?,
+                    body: row.get(3)?,
+                    command_text: row.get(4)?,
+                    output: row.get(5)?,
+                    exit_code: row.get(6)?,
+                    file_changes_json: row.get(7)?,
+                    mcp_server: row.get(8)?,
+                    mcp_tool: row.get(9)?,
+                    projection_json: row.get(10)?,
+                    last_event_seq: row.get(11)?,
+                })
+            })
+            .map_err(storage_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage_error)?
+            .into_iter()
+            .filter(|row| turn_set.contains(row.turn_id.as_str()))
+            .collect();
+
+        drop(turn_statement);
+        drop(item_statement);
+        drop(connection);
+
+        if item_rows.is_empty() && edit_context.as_ref().is_none_or(|body| body.trim().is_empty()) {
             return Ok(None);
         }
-        const MESSAGE_LIMIT: usize = 700;
-        let mut lines = Vec::new();
+
+        // Newest turns first for budget fill; turn_ids came DESC by tip.
+        let turn_rank: HashMap<String, usize> = turn_ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (id.clone(), index))
+            .collect();
+
+        let mut by_turn: BTreeMap<usize, Vec<DigestItemRow>> = BTreeMap::new();
+        for row in item_rows {
+            let rank = turn_rank.get(&row.turn_id).copied().unwrap_or(usize::MAX);
+            by_turn.entry(rank).or_default().push(row);
+        }
+
+        let max_chars = options.max_tokens.saturating_mul(4).max(1);
+        let mut packed_turns: Vec<Vec<String>> = Vec::new();
         let mut used = 0_usize;
-        for (kind, body, title) in rows {
-            let text = body.or(title).unwrap_or_default();
-            let text = text.trim();
-            if text.is_empty() {
+        let mut image_candidates: Vec<(i64, PathBuf)> = Vec::new();
+        let mut missing_images: Vec<String> = Vec::new();
+
+        // Fill newest-first (rank 0 first), then reverse for chronological text.
+        for (_rank, rows) in by_turn {
+            let mut turn_lines = Vec::new();
+            for row in rows {
+                if row.kind == "user_message" {
+                    let body = row.body.as_deref().unwrap_or("");
+                    for path in extract_attachment_paths(body) {
+                        if is_image_path(&path) {
+                            if path.is_file() {
+                                image_candidates.push((row.last_event_seq, path));
+                            } else {
+                                missing_images.push(path.display().to_string());
+                            }
+                        }
+                    }
+                }
+                if let Some(line) = format_digest_line(&row) {
+                    turn_lines.push(line);
+                }
+            }
+            if turn_lines.is_empty() {
                 continue;
             }
-            let speaker = if kind == "user_message" {
-                "User"
-            } else {
-                "Assistant"
-            };
-            let mut snippet = text.to_owned();
-            if snippet.len() > MESSAGE_LIMIT {
-                let mut boundary = MESSAGE_LIMIT;
-                while !snippet.is_char_boundary(boundary) {
-                    boundary -= 1;
+            let block = turn_lines.join("\n\n");
+            if used + block.len() > max_chars {
+                if packed_turns.is_empty() {
+                    // Always keep a clipped slice of the newest turn.
+                    let clipped = clip_chars(&block, max_chars);
+                    if !clipped.is_empty() {
+                        packed_turns.push(vec![clipped]);
+                        used = max_chars;
+                    }
                 }
-                snippet.truncate(boundary);
-                snippet.push('…');
-            }
-            let line = format!("{speaker}: {snippet}");
-            if used + line.len() > max_bytes {
                 break;
             }
-            used += line.len();
-            lines.push(line);
+            used += block.len() + if packed_turns.is_empty() { 0 } else { 2 };
+            packed_turns.push(turn_lines);
         }
-        lines.reverse();
+
+        packed_turns.reverse();
+        let mut lines: Vec<String> = packed_turns.into_iter().flatten().collect();
+
         if let Some(salvage) = edit_context {
             let salvage = salvage.trim();
             if !salvage.is_empty() {
                 let header = "Assistant replies discarded by a later edit (kept as context):";
                 let block = format!("{header}\n\n{salvage}");
-                if used + block.len() <= max_bytes {
+                if used + block.len() <= max_chars {
+                    used += block.len();
                     lines.push(block);
-                } else if used < max_bytes {
-                    let mut clipped = salvage.to_owned();
-                    let budget = max_bytes.saturating_sub(used + header.len() + 4);
+                } else if used < max_chars {
+                    let budget = max_chars.saturating_sub(used + header.len() + 4);
                     if budget > 0 {
-                        let mut boundary = budget.min(clipped.len());
-                        while boundary > 0 && !clipped.is_char_boundary(boundary) {
-                            boundary -= 1;
-                        }
-                        clipped.truncate(boundary);
+                        let clipped = clip_chars(salvage, budget);
                         if !clipped.is_empty() {
                             lines.push(format!("{header}\n\n{clipped}…"));
                         }
@@ -922,10 +1087,56 @@ impl LocalStore {
                 }
             }
         }
-        if lines.is_empty() {
+
+        // Dedupe images newest-last, keep last N existing files.
+        image_candidates.sort_by_key(|(seq, _)| *seq);
+        let mut seen = HashSet::new();
+        let mut image_paths = Vec::new();
+        for (_, path) in image_candidates.into_iter().rev() {
+            let key = path.to_string_lossy().to_string();
+            if !seen.insert(key) {
+                continue;
+            }
+            image_paths.push(path);
+            if image_paths.len() >= options.max_images {
+                break;
+            }
+        }
+        image_paths.reverse();
+
+        missing_images.sort();
+        missing_images.dedup();
+        if !missing_images.is_empty() {
+            let note = format!(
+                "Images referenced but missing on disk: {}",
+                missing_images.join(", ")
+            );
+            if used + note.len() <= max_chars {
+                lines.push(note);
+            }
+        }
+
+        if lines.is_empty() && image_paths.is_empty() {
             return Ok(None);
         }
-        Ok(Some(lines.join("\n\n")))
+        if lines.is_empty() {
+            lines.push("Prior turns included image attachments only.".into());
+        }
+        Ok(Some(HandoffDigest {
+            text: lines.join("\n\n"),
+            image_paths,
+        }))
+    }
+
+    /// Backward-compatible text-only digest (char budget approximated as tokens).
+    pub fn task_conversation_digest(
+        &self,
+        task_id: TaskId,
+        max_bytes: usize,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .task_handoff_digest(task_id, HandoffDigestOptions::from_max_bytes(max_bytes))?
+            .map(|digest| digest.text))
     }
 
     /// Drops the transcript from `from_stable_id` onward so a re-sent edit can
@@ -1320,24 +1531,51 @@ fn settle_failed_turn(
 /// Mark the newest unfinished turn for a task as interrupted and log the
 /// settlement. Returns the projection event to broadcast, or None when the
 /// task has no unfinished turn (or no session history to attribute it to).
+///
+/// When `stop_requested` is true and the tip already settled as a plain
+/// interrupt (cancel raced ahead of Stop), latch Stop onto that tip instead
+/// of leaving it resumeable.
 fn settle_stale_turn(
     transaction: &Transaction<'_>,
     task_id: TaskId,
     stop_requested: bool,
 ) -> Result<Option<RuntimeProjectionEvent>> {
-    let row = transaction.query_row(
+    let unfinished = transaction.query_row(
         "SELECT projection_json, provider_session_id, thread_id, turn_id FROM codex_turns WHERE task_id=?1 AND status IN ('pending','in_progress') ORDER BY last_event_seq DESC LIMIT 1",
         [task_id.to_string()],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
     ).optional().map_err(storage_error)?;
+    let row = if let Some(row) = unfinished {
+        Some(row)
+    } else if stop_requested {
+        transaction
+            .query_row(
+                "SELECT projection_json, provider_session_id, thread_id, turn_id FROM codex_turns WHERE task_id=?1 AND status='interrupted' AND stop_requested=0 ORDER BY last_event_seq DESC LIMIT 1",
+                [task_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?
+    } else {
+        None
+    };
     let Some(row) = row else {
         return Ok(None);
     };
     let mut turn: TurnProjection = serde_json::from_str(&row.0)?;
     let occurred_at = Utc::now();
     turn.status = TurnStatus::Interrupted;
-    turn.stop_requested = stop_requested;
-    turn.completed_at = Some(occurred_at);
+    // A later transport/process settlement must not clear an intentional Stop.
+    // Opt-in auto-resume keys off this flag; overwriting it would undo cancel.
+    turn.stop_requested = stop_requested || turn.stop_requested;
+    turn.completed_at = turn.completed_at.or(Some(occurred_at));
     let method = if stop_requested {
         "client/turn/stopSettled"
     } else {
@@ -1353,7 +1591,7 @@ fn settle_stale_turn(
     let seq = transaction.last_insert_rowid();
     transaction.execute(
         "UPDATE codex_turns SET status='interrupted',stop_requested=?1,completed_at=?2,projection_json=?3,last_event_seq=?4 WHERE provider_session_id=?5 AND turn_id=?6",
-        params![stop_requested, occurred_at.to_rfc3339(), serde_json::to_string(&turn)?, seq, row.1, row.3],
+        params![turn.stop_requested, turn.completed_at.map(|v| v.to_rfc3339()), serde_json::to_string(&turn)?, seq, row.1, row.3],
     ).map_err(storage_error)?;
     let event = RuntimeProjectionEvent {
         seq,
@@ -1916,6 +2154,299 @@ fn bound_command_output(value: &str) -> (String, bool) {
         true,
     )
 }
+
+struct DigestItemRow {
+    turn_id: String,
+    kind: String,
+    title: Option<String>,
+    body: Option<String>,
+    command_text: Option<String>,
+    output: Option<String>,
+    exit_code: Option<i64>,
+    file_changes_json: Option<String>,
+    mcp_server: Option<String>,
+    mcp_tool: Option<String>,
+    projection_json: Option<String>,
+    last_event_seq: i64,
+}
+
+fn strip_handoff_primer(text: &str) -> &str {
+    const OPEN: &str = "<conversation-context>";
+    const CLOSE: &str = "</conversation-context>";
+    let trimmed = text.trim_start();
+    if let Some(rest) = trimmed.strip_prefix(OPEN)
+        && let Some(end) = rest.find(CLOSE)
+    {
+        return rest[end + CLOSE.len()..].trim_start();
+    }
+    text
+}
+
+fn clip_chars(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_owned();
+    }
+    let mut boundary = max.min(value.len());
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let mut clipped = value[..boundary].to_owned();
+    if !clipped.is_empty() {
+        clipped.push('…');
+    }
+    clipped
+}
+
+fn clip_head_tail(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_owned();
+    }
+    let head = max / 2;
+    let tail = max.saturating_sub(head + 16);
+    let head_end = boundary_at_or_before(value, head);
+    let tail_start = boundary_at_or_after(value, value.len().saturating_sub(tail));
+    format!(
+        "{}\n…[truncated {} chars]…\n{}",
+        &value[..head_end],
+        value.len().saturating_sub(head_end + (value.len() - tail_start)),
+        &value[tail_start..]
+    )
+}
+
+fn tool_input_from_projection(projection_json: &Option<String>) -> Option<String> {
+    let json = projection_json.as_deref()?;
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    value
+        .get("toolInput")
+        .or_else(|| value.get("tool_input"))
+        .and_then(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .or_else(|| serde_json::to_string(v).ok())
+        })
+}
+
+fn looks_like_web_or_browse(label: &str) -> bool {
+    let lower = label.to_ascii_lowercase();
+    [
+        "websearch",
+        "web_search",
+        "webfetch",
+        "web_fetch",
+        "browser",
+        "search_web",
+        "googlesearch",
+        "duckduckgo",
+        "fetch_url",
+        "open_url",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn looks_like_file_read(label: &str, input: &str) -> bool {
+    let hay = format!("{label} {input}").to_ascii_lowercase();
+    [
+        "read",
+        "read_file",
+        "readfile",
+        "view",
+        "cat ",
+        "file_view",
+        "open_file",
+        "get_file",
+        "preview",
+    ]
+    .iter()
+    .any(|needle| hay.contains(needle))
+}
+
+fn extract_attachment_paths(body: &str) -> Vec<PathBuf> {
+    let Some(index) = body.rfind("Attached files:\n") else {
+        return Vec::new();
+    };
+    // Require start-of-body or blank line before the marker (matches UI parser).
+    if index > 0 && !body[..index].ends_with("\n\n") {
+        return Vec::new();
+    }
+    body[index + "Attached files:\n".len()..]
+        .lines()
+        .filter_map(|line| {
+            let path = line.strip_prefix("- ")?.trim();
+            (!path.is_empty()).then(|| PathBuf::from(path))
+        })
+        .collect()
+}
+
+fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico" | "avif"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn format_file_changes(json: &str) -> Option<String> {
+    let changes: Vec<serde_json::Value> = serde_json::from_str(json).ok()?;
+    if changes.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for change in changes.iter().take(24) {
+        let path = change
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let kind = change
+            .get("changeKind")
+            .or_else(|| change.get("change_kind"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        parts.push(format!("{kind} {path}"));
+    }
+    if changes.len() > 24 {
+        parts.push(format!("…+{} more", changes.len() - 24));
+    }
+    Some(format!("File changes: {}", parts.join("; ")))
+}
+
+fn format_digest_line(row: &DigestItemRow) -> Option<String> {
+    match row.kind.as_str() {
+        "reasoning_summary" | "unknown" => None,
+        "user_message" => {
+            let text = strip_handoff_primer(row.body.as_deref().unwrap_or("")).trim();
+            if text.is_empty() {
+                return None;
+            }
+            Some(format!("User: {}", clip_chars(text, HANDOFF_USER_CLIP)))
+        }
+        "agent_message" => {
+            let text = row
+                .body
+                .as_deref()
+                .or(row.title.as_deref())
+                .unwrap_or("")
+                .trim();
+            if text.is_empty() {
+                return None;
+            }
+            Some(format!(
+                "Assistant: {}",
+                clip_chars(text, HANDOFF_ASSISTANT_CLIP)
+            ))
+        }
+        "file_change" => row
+            .file_changes_json
+            .as_deref()
+            .and_then(format_file_changes),
+        "command_execution" => {
+            let command = row.command_text.as_deref().unwrap_or("command").trim();
+            let exit = row
+                .exit_code
+                .map(|code| format!(" exit={code}"))
+                .unwrap_or_default();
+            let output = row.output.as_deref().unwrap_or("").trim();
+            if output.is_empty() {
+                Some(format!("Command: `{command}`{exit}"))
+            } else if output.len() > HANDOFF_NOISY_OUTPUT_THRESHOLD {
+                Some(format!(
+                    "Command: `{command}`{exit} → {} chars truncated",
+                    output.len()
+                ))
+            } else {
+                Some(format!(
+                    "Command: `{command}`{exit}\n{}",
+                    clip_chars(output, HANDOFF_COMMAND_OUTPUT_CLIP)
+                ))
+            }
+        }
+        "mcp_tool" => {
+            let tool = row
+                .mcp_tool
+                .as_deref()
+                .or(row.title.as_deref())
+                .unwrap_or("tool");
+            let server = row.mcp_server.as_deref().unwrap_or("");
+            let label = if server.is_empty() {
+                tool.to_owned()
+            } else {
+                format!("{server} · {tool}")
+            };
+            let input = tool_input_from_projection(&row.projection_json).unwrap_or_default();
+            let output = row
+                .output
+                .as_deref()
+                .or(row.body.as_deref())
+                .unwrap_or("")
+                .trim();
+
+            if looks_like_web_or_browse(&label) || looks_like_web_or_browse(&input) {
+                let query = clip_chars(input.trim(), 120);
+                let query = if query.is_empty() {
+                    "…".into()
+                } else {
+                    query
+                };
+                return Some(format!(
+                    "WebSearch/browse ({label}): \"{query}\" → {} chars truncated",
+                    output.len()
+                ));
+            }
+
+            if looks_like_file_read(&label, &input) {
+                let path_hint = clip_chars(input.trim(), 200);
+                let meat = if output.is_empty() {
+                    "(empty)".into()
+                } else {
+                    clip_head_tail(output, HANDOFF_READ_CLIP)
+                };
+                return Some(if path_hint.is_empty() {
+                    format!("Read ({label}):\n{meat}")
+                } else {
+                    format!("Read ({label}): {path_hint}\n{meat}")
+                });
+            }
+
+            if output.len() > HANDOFF_NOISY_OUTPUT_THRESHOLD {
+                return Some(format!(
+                    "Tool ({label}): {} chars truncated",
+                    output.len()
+                ));
+            }
+            if output.is_empty() {
+                let input_clip = clip_chars(input.trim(), 200);
+                return Some(if input_clip.is_empty() {
+                    format!("Tool ({label})")
+                } else {
+                    format!("Tool ({label}): {input_clip}")
+                });
+            }
+            Some(format!(
+                "Tool ({label}):\n{}",
+                clip_chars(output, HANDOFF_COMMAND_OUTPUT_CLIP)
+            ))
+        }
+        _ => {
+            let text = row
+                .body
+                .as_deref()
+                .or(row.output.as_deref())
+                .or(row.title.as_deref())
+                .unwrap_or("")
+                .trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(format!("{}: {}", row.kind, clip_chars(text, 700)))
+            }
+        }
+    }
+}
+
 fn boundary_at_or_before(value: &str, mut index: usize) -> usize {
     while !value.is_char_boundary(index) {
         index -= 1
@@ -2741,6 +3272,140 @@ mod tests {
     }
 
     #[test]
+    fn task_tip_stop_requested_tracks_stop_latch() {
+        let (store, binding) = bound_store(ProviderKind::Codex);
+        let at = Utc::now();
+        store
+            .apply_reduced_event(
+                &binding,
+                &ReducedProviderEvent {
+                    method: "turn/started".into(),
+                    thread_id: binding.thread_id.clone().expect("thread"),
+                    turn_id: Some("tip-turn".into()),
+                    audit_json: "{}".into(),
+                    audit_truncated: false,
+                    mutation: ProjectionMutation::Turn(TurnProjection {
+                        id: "tip-turn".into(),
+                        status: TurnStatus::InProgress,
+                        stop_requested: false,
+                        error: None,
+                        started_at: Some(at),
+                        completed_at: None,
+                    }),
+                    occurred_at: at,
+                },
+            )
+            .expect("persist running turn");
+        assert!(!store
+            .task_tip_stop_requested(binding.task_id)
+            .expect("query before stop"));
+        store.request_stop(binding.task_id).expect("request stop");
+        assert!(store
+            .task_tip_stop_requested(binding.task_id)
+            .expect("query after stop"));
+    }
+
+    #[test]
+    fn settle_interrupted_preserves_user_stop_request() {
+        let (store, binding) = bound_store(ProviderKind::Cursor);
+        let at = Utc::now();
+        store
+            .apply_reduced_event(
+                &binding,
+                &ReducedProviderEvent {
+                    method: "client/acp/turnStarted".into(),
+                    thread_id: "thread-fixture".into(),
+                    turn_id: Some("stop-turn".into()),
+                    audit_json: "{}".into(),
+                    audit_truncated: false,
+                    mutation: ProjectionMutation::Turn(TurnProjection {
+                        id: "stop-turn".into(),
+                        status: TurnStatus::InProgress,
+                        stop_requested: false,
+                        error: None,
+                        started_at: Some(at),
+                        completed_at: None,
+                    }),
+                    occurred_at: at,
+                },
+            )
+            .expect("persist running turn");
+        let stopped = store.request_stop(binding.task_id).expect("request stop");
+        assert!(stopped.result.stop_requested);
+        assert!(!stopped.result.settled);
+
+        let settled = store
+            .settle_interrupted_turn(binding.task_id)
+            .expect("settle after stop")
+            .expect("settlement event");
+        assert!(matches!(
+            settled.projection,
+            RuntimeProjection::TurnChanged {
+                turn: TurnProjection {
+                    status: TurnStatus::Interrupted,
+                    stop_requested: true,
+                    ..
+                }
+            }
+        ));
+        let snapshot = store.task_snapshot(binding.task_id).expect("load snapshot");
+        assert!(matches!(
+            snapshot.hydrate.expect("hydrate").turn.as_ref(),
+            Some(TurnProjection {
+                status: TurnStatus::Interrupted,
+                stop_requested: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn settle_stopped_latches_stop_onto_already_interrupted_tip() {
+        let (store, binding) = bound_store(ProviderKind::Cursor);
+        let at = Utc::now();
+        store
+            .apply_reduced_event(
+                &binding,
+                &ReducedProviderEvent {
+                    method: "client/acp/turnStarted".into(),
+                    thread_id: "thread-fixture".into(),
+                    turn_id: Some("raced-turn".into()),
+                    audit_json: "{}".into(),
+                    audit_truncated: false,
+                    mutation: ProjectionMutation::Turn(TurnProjection {
+                        id: "raced-turn".into(),
+                        status: TurnStatus::InProgress,
+                        stop_requested: false,
+                        error: None,
+                        started_at: Some(at),
+                        completed_at: None,
+                    }),
+                    occurred_at: at,
+                },
+            )
+            .expect("persist running turn");
+        store
+            .settle_interrupted_turn(binding.task_id)
+            .expect("provider cancel settled first")
+            .expect("interrupted event");
+
+        let latched = store
+            .settle_stopped_turn(binding.task_id)
+            .expect("latch stop")
+            .expect("stop event");
+        assert!(matches!(
+            latched.projection,
+            RuntimeProjection::TurnChanged {
+                turn: TurnProjection {
+                    status: TurnStatus::Interrupted,
+                    stop_requested: true,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
     fn snapshot_watermark_and_reset_short_circuit_skips_hydrate() {
         let (store, binding) = bound_store(ProviderKind::Codex);
         let at = Utc::now();
@@ -2965,5 +3630,266 @@ mod tests {
         assert!(second.result.already_requested);
         assert_eq!(second.event.expect("stop event").provider, "cursor");
         assert_eq!(redundant_event_projection_count(&store, binding.task_id), 0);
+    }
+
+    fn persist_item(
+        store: &LocalStore,
+        binding: &RuntimeBinding,
+        turn_id: &str,
+        item: ItemProjection,
+    ) {
+        let occurred_at = item.updated_at;
+        store
+            .apply_reduced_event(
+                binding,
+                &ReducedProviderEvent {
+                    method: "item/completed".into(),
+                    thread_id: binding.thread_id.clone().unwrap_or_default(),
+                    turn_id: Some(turn_id.into()),
+                    audit_json: "{}".into(),
+                    audit_truncated: false,
+                    mutation: ProjectionMutation::ReplaceItem(item),
+                    occurred_at,
+                },
+            )
+            .expect("persist handoff fixture item");
+    }
+
+    fn base_item(
+        id: &str,
+        kind: ItemKind,
+        turn_offset_secs: i64,
+    ) -> ItemProjection {
+        let updated_at = Utc::now() + chrono::Duration::seconds(turn_offset_secs);
+        ItemProjection {
+            id: format!("fixture:{id}"),
+            provider_item_id: id.into(),
+            kind,
+            status: ItemStatus::Completed,
+            title: None,
+            body: None,
+            native_skill: None,
+            phase: None,
+            command: None,
+            cwd: None,
+            output: None,
+            exit_code: None,
+            file_changes: None,
+            mcp_server: None,
+            mcp_tool: None,
+            tool_input: None,
+            truncated: false,
+            updated_at,
+        }
+    }
+
+    #[test]
+    fn handoff_digest_happy_packs_read_meat_and_chat() {
+        let (store, binding) = bound_store(ProviderKind::Claude);
+        let mut user = base_item("u1", ItemKind::UserMessage, 1);
+        user.body = Some("fix the overflow menu".into());
+        persist_item(&store, &binding, "turn-1", user);
+
+        let mut read = base_item("r1", ItemKind::McpTool, 2);
+        read.title = Some("Read".into());
+        read.mcp_tool = Some("Read".into());
+        read.tool_input = Some(r#"{"path":"apps/desktop/src/components/TaskSidebar.tsx"}"#.into());
+        read.output = Some("export function TaskSidebar() {\n  return null;\n}".into());
+        persist_item(&store, &binding, "turn-1", read);
+
+        let mut assistant = base_item("a1", ItemKind::AgentMessage, 3);
+        assistant.body = Some("Menus are right-anchored so they open left.".into());
+        persist_item(&store, &binding, "turn-1", assistant);
+
+        let digest = store
+            .task_handoff_digest(binding.task_id, HandoffDigestOptions::default())
+            .expect("digest")
+            .expect("present");
+        assert!(digest.text.contains("fix the overflow menu"));
+        assert!(digest.text.contains("Read"));
+        assert!(digest.text.contains("TaskSidebar"));
+        assert!(digest.text.contains("right-anchored"));
+        assert!(digest.image_paths.is_empty());
+    }
+
+    #[test]
+    fn handoff_digest_degraded_drops_oldest_turns_and_stubs_web_search() {
+        let (store, binding) = bound_store(ProviderKind::Codex);
+        for index in 0..12 {
+            let mut user = base_item(
+                &format!("u{index}"),
+                ItemKind::UserMessage,
+                index * 3,
+            );
+            user.body = Some(format!("turn-{index}-user-marker"));
+            persist_item(&store, &binding, &format!("turn-{index}"), user);
+
+            let mut search = base_item(
+                &format!("s{index}"),
+                ItemKind::McpTool,
+                index * 3 + 1,
+            );
+            search.mcp_tool = Some("WebSearch".into());
+            search.title = Some("WebSearch".into());
+            search.tool_input = Some(r#"{"query":"overflow menus"}"#.into());
+            search.output = Some("x".repeat(20_000));
+            persist_item(&store, &binding, &format!("turn-{index}"), search);
+
+            let mut assistant = base_item(
+                &format!("a{index}"),
+                ItemKind::AgentMessage,
+                index * 3 + 2,
+            );
+            assistant.body = Some(format!("turn-{index}-assistant"));
+            persist_item(&store, &binding, &format!("turn-{index}"), assistant);
+        }
+
+        let digest = store
+            .task_handoff_digest(
+                binding.task_id,
+                HandoffDigestOptions {
+                    max_turns: 10,
+                    max_tokens: 50_000,
+                    max_images: 4,
+                },
+            )
+            .expect("digest")
+            .expect("present");
+        assert!(
+            !digest.text.contains("turn-0-user-marker"),
+            "oldest turn should drop: {}",
+            digest.text
+        );
+        assert!(digest.text.contains("turn-11-user-marker"));
+        assert!(digest.text.contains("chars truncated"));
+        assert!(
+            !digest.text.contains(&"x".repeat(500)),
+            "web search body must not dump into the digest"
+        );
+    }
+
+    #[test]
+    fn handoff_digest_images_reattach_existing_and_note_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let existing = dir.path().join("shot.png");
+        std::fs::write(&existing, [0x89, 0x50, 0x4E, 0x47]).expect("write png");
+        let missing = dir.path().join("gone.png");
+
+        let (store, binding) = bound_store(ProviderKind::Cursor);
+        let mut user = base_item("u-img", ItemKind::UserMessage, 1);
+        user.body = Some(format!(
+            "what is this?\n\nAttached files:\n- {}\n- {}",
+            existing.display(),
+            missing.display()
+        ));
+        persist_item(&store, &binding, "turn-img", user);
+
+        let digest = store
+            .task_handoff_digest(binding.task_id, HandoffDigestOptions::default())
+            .expect("digest")
+            .expect("present");
+        assert_eq!(digest.image_paths, vec![existing]);
+        assert!(digest.text.contains("missing on disk"));
+        assert!(digest.text.contains("gone.png"));
+    }
+
+    #[test]
+    fn handoff_digest_adversarial_truncates_huge_command_dumps() {
+        let (store, binding) = bound_store(ProviderKind::Antigravity);
+        let mut command = base_item("cmd", ItemKind::CommandExecution, 1);
+        command.command = Some("cat /dev/urandom | head -c 50000".into());
+        command.exit_code = Some(0);
+        command.output = Some("\u{0000}".repeat(50_000));
+        persist_item(&store, &binding, "turn-cmd", command);
+
+        let digest = store
+            .task_handoff_digest(binding.task_id, HandoffDigestOptions::default())
+            .expect("digest")
+            .expect("present");
+        assert!(digest.text.contains("chars truncated"));
+        assert!(digest.text.len() < 5_000);
+    }
+
+    #[test]
+    fn handoff_digest_restart_rebuilds_from_sqlite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("handoff.sqlite3");
+        let task_id = {
+            let store = LocalStore::open(&db).expect("open store");
+            let (store_ref, binding) = {
+                let task = store
+                    .create_task(NewTask {
+                        title: "Restart handoff".into(),
+                        repository_path: None,
+                        worktree_path: None,
+                        runtime: None,
+                        model: None,
+                        effort: None,
+                        parent_task_id: None,
+                    })
+                    .expect("task");
+                let binding = store
+                    .create_runtime_binding(task.id, "proc", ProviderKind::Grok)
+                    .expect("binding");
+                let binding = store
+                    .attach_provider_thread(&binding, "thread-grok")
+                    .expect("thread");
+                (store, binding)
+            };
+            let mut user = base_item("u", ItemKind::UserMessage, 1);
+            user.body = Some("survive restart marker".into());
+            persist_item(&store_ref, &binding, "turn-1", user);
+            binding.task_id
+        };
+
+        let reopened = LocalStore::open(&db).expect("reopen");
+        let digest = reopened
+            .task_handoff_digest(task_id, HandoffDigestOptions::default())
+            .expect("digest")
+            .expect("present");
+        assert!(digest.text.contains("survive restart marker"));
+    }
+
+    #[test]
+    fn handoff_digest_is_provider_neutral_across_mixed_history() {
+        let store = LocalStore::open_in_memory().expect("open");
+        let task = store
+            .create_task(NewTask {
+                title: "Mixed providers".into(),
+                repository_path: None,
+                worktree_path: None,
+                runtime: None,
+                model: None,
+                effort: None,
+                parent_task_id: None,
+            })
+            .expect("task");
+
+        let claude = store
+            .create_runtime_binding(task.id, "claude-proc", ProviderKind::Claude)
+            .expect("claude binding");
+        let claude = store
+            .attach_provider_thread(&claude, "claude-thread")
+            .expect("claude thread");
+        let mut claude_user = base_item("cu", ItemKind::UserMessage, 1);
+        claude_user.body = Some("claude said look at styles".into());
+        persist_item(&store, &claude, "turn-claude", claude_user);
+
+        let codex = store
+            .create_runtime_binding(task.id, "codex-proc", ProviderKind::Codex)
+            .expect("codex binding");
+        let codex = store
+            .attach_provider_thread(&codex, "codex-thread")
+            .expect("codex thread");
+        let mut codex_assistant = base_item("ca", ItemKind::AgentMessage, 2);
+        codex_assistant.body = Some("codex found right: 3px".into());
+        persist_item(&store, &codex, "turn-codex", codex_assistant);
+
+        let digest = store
+            .task_handoff_digest(task.id, HandoffDigestOptions::default())
+            .expect("digest")
+            .expect("present");
+        assert!(digest.text.contains("claude said look at styles"));
+        assert!(digest.text.contains("codex found right: 3px"));
     }
 }

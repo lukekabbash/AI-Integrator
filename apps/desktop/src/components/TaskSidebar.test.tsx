@@ -427,7 +427,32 @@ describe("TaskSidebar", () => {
     fireEvent.click(overflowButtons[0]);
 
     expect(screen.getByRole("menu")).toBeInTheDocument();
+    expect(screen.getByRole("menu")).toHaveAttribute("data-direction", "right");
     expect(overflowButtons[0].parentElement).toHaveAttribute("data-menu-open", "true");
+  });
+
+  it("anchors the overflow menu left when that direction is selected", () => {
+    setup({ sidebarMenuDirection: "left" });
+    const overflowButtons = screen.getAllByRole("button", { name: "More chat actions" });
+    const trigger = overflowButtons[0];
+    vi.spyOn(trigger, "getBoundingClientRect").mockReturnValue({
+      top: 120,
+      bottom: 144,
+      left: 220,
+      right: 244,
+      width: 24,
+      height: 24,
+      x: 220,
+      y: 120,
+      toJSON: () => ({}),
+    });
+
+    fireEvent.click(trigger);
+
+    const menu = screen.getByRole("menu");
+    expect(menu).toHaveAttribute("data-direction", "left");
+    // Menu width 164 → left edge at trigger.right - 3 - 164.
+    expect(menu).toHaveStyle({ left: "77px" });
   });
 
   it("opens the chat overflow menu upward when space below is tight", () => {
@@ -533,9 +558,9 @@ describe("TaskSidebar", () => {
     expect(activeGroup).toHaveAttribute("data-menu-open", "true");
     expect(activeGroup).not.toHaveAttribute("data-project-menu-open");
     expect(otherGroup).not.toHaveAttribute("data-menu-open");
-    expect(
-      within(activeGroup as HTMLElement).getByRole("menu"),
-    ).toBeInTheDocument();
+    // The menu itself portals to document.body (the sidebar clips overflow),
+    // so it's no longer a DOM descendant of the row it opened from.
+    expect(screen.getByRole("menu")).toBeInTheDocument();
   });
 
   it("marks project-menu-open only for the project overflow menu", () => {
@@ -569,7 +594,8 @@ describe("TaskSidebar", () => {
     expect(more.compareDocumentPosition(newChat) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 
     fireEvent.click(more);
-    const menu = within(group).getByRole("menu");
+    // Portaled to document.body, so query from screen rather than within(group).
+    const menu = screen.getByRole("menu");
     expect(within(menu).getByRole("menuitem", { name: /Pin/i })).toBeInTheDocument();
     expect(within(menu).getByRole("menuitem", { name: /Archive/i })).toBeInTheDocument();
     fireEvent.click(within(menu).getByRole("menuitem", { name: /Delete/i }));
@@ -586,7 +612,8 @@ describe("TaskSidebar", () => {
     fireEvent.click(
       within(group).getByRole("button", { name: `More actions for ${active.name}` }),
     );
-    fireEvent.click(within(group).getByRole("menuitem", { name: /^Pin$/i }));
+    // Portaled to document.body, so query from screen rather than within(group).
+    fireEvent.click(screen.getByRole("menuitem", { name: /^Pin$/i }));
     expect(callbacks.onUpdateProject).toHaveBeenCalledWith(active.id, { pinned: true });
   });
 
@@ -626,7 +653,8 @@ describe("TaskSidebar", () => {
       .closest(".chat-row-shell") as HTMLElement;
 
     fireEvent.click(within(row).getByRole("button", { name: "More chat actions" }));
-    fireEvent.click(within(row).getByRole("menuitem", { name: /Delete/i }));
+    // Portaled to document.body, so query from screen rather than within(row).
+    fireEvent.click(screen.getByRole("menuitem", { name: /Delete/i }));
     expect(callbacks.onDeleteTask).toHaveBeenCalledWith(active.id);
   });
 });

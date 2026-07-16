@@ -21,7 +21,11 @@ use serde_json::Value;
 mod delegation_store;
 mod projection_store;
 pub use delegation_store::NewDelegation;
-pub use projection_store::{PersistedStopRequest, PreparedApprovalResponse};
+pub use projection_store::{
+    HANDOFF_CHILD_MAX_TOKENS, HANDOFF_DEFAULT_MAX_IMAGES, HANDOFF_DEFAULT_MAX_TOKENS,
+    HANDOFF_DEFAULT_MAX_TURNS, HandoffDigest, HandoffDigestOptions, PersistedStopRequest,
+    PreparedApprovalResponse,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommitMessageGenerationClaim {
@@ -2671,6 +2675,17 @@ fn path_text(path: Option<&Path>) -> Option<String> {
 }
 
 fn parse_time(value: &str) -> Result<DateTime<Utc>> {
+    if let Ok(time) = DateTime::parse_from_rfc3339(value) {
+        return Ok(time.with_timezone(&Utc));
+    }
+    // Tolerate accidental SQLite `datetime('now')` shapes so one bad row
+    // cannot blank the whole workspace export.
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S") {
+        return Ok(naive.and_utc());
+    }
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f") {
+        return Ok(naive.and_utc());
+    }
     DateTime::parse_from_rfc3339(value)
         .map(|time| time.with_timezone(&Utc))
         .map_err(invalid_stored)

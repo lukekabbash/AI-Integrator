@@ -155,6 +155,8 @@ export interface TranscriptEvent {
   timestamp: string;
   status?: "running" | "success" | "warning" | "error" | "neutral";
   meta?: string;
+  /** Quiet cue that this Worked-for span continued after an interruption. */
+  resumed?: boolean;
   /** Optional source-control style line counts for file/tool activity. */
   changeStats?: { additions: number; deletions: number };
   children?: TranscriptEvent[];
@@ -540,8 +542,11 @@ export interface PushPreview {
   ahead: number;
   behind: number;
   refspec: string;
-  force: false;
 }
+
+/** How hard a push may rewrite remote history. `off` is the only mode that
+ * cannot destroy a commit the user has never seen. */
+export type PushForce = "off" | "lease" | "always";
 
 export interface PushConfirmation {
   expectedHead: string;
@@ -550,6 +555,9 @@ export interface PushConfirmation {
   expectedRemoteUrl?: string | null;
   expectedUpstream: string;
   expectedRefspec: string;
+  /** Intent rather than expected state: the force mode the user confirmed.
+   * Omitted means `off` — the native side defaults to the safe mode. */
+  force?: PushForce;
 }
 
 export interface PushResult {
@@ -960,6 +968,12 @@ export interface AppBridge {
     skip: number,
   ): Promise<{ commits: GitCommit[]; hasMore: boolean }>;
   loadTaskGitFile(taskId: string, file: DiffFile): Promise<DiffFile>;
+  /**
+   * The subset of `paths` Git tracks. Status already reports untracked files,
+   * so a path absent from both is ignored rather than committed — the caller
+   * needs that difference to avoid captioning an ignored file "Pushed".
+   */
+  trackedPaths(projectId: string, paths: string[]): Promise<string[]>;
   listProjectFiles(projectId: string): Promise<ProjectFileEntry[]>;
   readProjectFile(projectId: string, path: string): Promise<ProjectFileContent>;
   /** Write manually edited text back to one trusted project file (native builds only). */
@@ -4111,6 +4125,19 @@ export const bridge: AppBridge = {
       });
     }
     throw new Error("Editing project files requires the native desktop app.");
+  },
+
+  trackedPaths: async (projectId, paths) => {
+    if (paths.length === 0) return [];
+    if (isTauri()) {
+      return nativeInvoke<string[]>("git_tracked_paths", {
+        repository: repositoryForProject(projectId),
+        paths,
+      });
+    }
+    // The browser demo has no Git: treat every edited path as tracked so the
+    // committed/pushed captions still demonstrate.
+    return paths;
   },
 
   explainSelection: async (projectId, runtime, payload) => {

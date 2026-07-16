@@ -417,10 +417,7 @@ describe("native runtime recovery UI", () => {
     expect(screen.queryByRole("button", { name: "Resume" })).not.toBeInTheDocument();
   });
 
-  it("auto-resumes only provider interruptions when the local setting is enabled", async () => {
-    bridgeMock.listSettings.mockResolvedValue([
-      { key: "settings.general.autoResumeInterruptedTurns", value: true },
-    ]);
+  it("never auto-resumes an interrupted turn; Resume stays explicit", async () => {
     bridgeMock.loadTaskProjection.mockResolvedValue(projectionSnapshot({
       watermarkSeq: 1,
       runtimeLive: false,
@@ -437,20 +434,64 @@ describe("native runtime recovery UI", () => {
         }),
       ],
     }));
-    bridgeMock.sendTurn.mockResolvedValue({
-      id: "resume-user",
-      kind: "user",
-      body: "Resume from here",
-      timestamp: "2026-07-10T16:01:00Z",
-      status: "neutral",
-    });
 
     render(<App />);
-    await waitFor(() =>
-      expect(bridgeMock.sendTurn).toHaveBeenCalledWith(
-        expect.objectContaining({ resumeInterrupted: true }),
-      ),
-    );
+    expect(await screen.findByText("Response interrupted")).toBeInTheDocument();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(bridgeMock.sendTurn).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Resume" })).toBeInTheDocument();
+  });
+
+  it("does not resume when the user stopped the turn", async () => {
+    bridgeMock.loadTaskProjection.mockResolvedValue(projectionSnapshot({
+      watermarkSeq: 1,
+      runtimeLive: false,
+      events: [
+        projection(1, {
+          kind: "turnChanged",
+          turn: {
+            id: "turn-stopped",
+            status: "interrupted",
+            stopRequested: true,
+            startedAt: "2026-07-10T16:00:00Z",
+            completedAt: "2026-07-10T16:00:03Z",
+          },
+        }),
+      ],
+    }));
+
+    render(<App />);
+    await waitFor(() => expect(bridgeMock.loadTaskProjection).toHaveBeenCalled());
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(bridgeMock.sendTurn).not.toHaveBeenCalled();
+    expect(screen.queryByText("Response interrupted")).not.toBeInTheDocument();
+  });
+
+  it("does not resume after Stop even if a late interrupt clears stopRequested", async () => {
+    render(<App />);
+    expect(await screen.findByRole("button", { name: "Stop turn" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop turn" }));
+    await waitFor(() => expect(bridgeMock.stopTurn).toHaveBeenCalledWith("task-1"));
+
+    act(() => {
+      runtimeListener?.(
+        projection(20, {
+          kind: "turnChanged",
+          turn: {
+            id: "turn-1",
+            status: "interrupted",
+            stopRequested: false,
+            startedAt: "2026-07-10T16:00:00Z",
+            completedAt: "2026-07-10T16:00:03Z",
+          },
+        }),
+      );
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(bridgeMock.sendTurn).not.toHaveBeenCalled();
+    expect(screen.queryByText("Response interrupted")).not.toBeInTheDocument();
   });
 
   it("publishes main text once per frame and flushes an urgent event in order", async () => {

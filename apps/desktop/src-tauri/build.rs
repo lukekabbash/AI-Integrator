@@ -49,6 +49,7 @@ const APP_COMMANDS: &[&str] = &[
     "project_file_write",
     "project_file_rename",
     "selection_explain",
+    "selection_explain_preview",
     "project_file_opener_list",
     "project_file_open",
     "project_file_reveal",

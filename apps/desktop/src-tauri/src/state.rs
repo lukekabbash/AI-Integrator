@@ -35,10 +35,9 @@ pub struct CodexRuntime {
     pub alive: Arc<AtomicBool>,
     pub reconciling: Arc<AtomicBool>,
     pub binding: Arc<std::sync::Mutex<Option<RuntimeBinding>>>,
-    /// Conversation digest queued for injection into the first turn of a
-    /// freshly created provider thread, so a new session inherits the task's
-    /// prior context (possibly produced by a different provider).
-    pub context_primer: Arc<std::sync::Mutex<Option<String>>>,
+    /// Conversation digest + image paths queued for injection into the first
+    /// turn of a freshly created provider thread (any provider).
+    pub context_primer: Arc<std::sync::Mutex<Option<session_store::HandoffDigest>>>,
     /// Keeps provider-only context out of the durable user transcript and,
     /// when applicable, stamps a verified native skill invocation.
     pub pending_user_prompt: Arc<std::sync::Mutex<Option<PendingUserPrompt>>>,
@@ -86,7 +85,7 @@ pub struct AcpRuntime {
     /// not reclassified by Integrator).
     pub available_actions: Arc<std::sync::Mutex<Vec<crate::native_actions::NativeProviderAction>>>,
     /// See `CodexRuntime::context_primer`.
-    pub context_primer: Arc<std::sync::Mutex<Option<String>>>,
+    pub context_primer: Arc<std::sync::Mutex<Option<session_store::HandoffDigest>>>,
     /// One-shot delegation tool preamble queued at session start and spent
     /// on the first turn (ACP sessions persist, so it must not repeat).
     pub delegation_preamble: Arc<std::sync::Mutex<Option<String>>>,

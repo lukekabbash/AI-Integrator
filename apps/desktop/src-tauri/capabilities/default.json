@@ -58,6 +58,7 @@
     "allow-project-file-write",
     "allow-project-file-rename",
     "allow-selection-explain",
+    "allow-selection-explain-preview",
     "allow-project-file-opener-list",
     "allow-project-file-open",
     "allow-project-file-reveal",

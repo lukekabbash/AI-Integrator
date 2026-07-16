@@ -1460,6 +1460,8 @@ export type PanelSpacing = "tight" | "balanced" | "airy";
 export type RadiusPreset = "square" | "subtle" | "soft" | "round";
 export type RadiusScale = RadiusPreset;
 export type MotionPreference = "system" | "full" | "reduced" | "none";
+/** Chat/project `…` overflow menus in the left sidebar. */
+export type SidebarMenuDirection = "left" | "right";
 
 export interface ThemePreferences {
   readonly version: typeof THEME_FILE_VERSION;
@@ -1479,6 +1481,7 @@ export interface ThemePreferences {
   readonly motion: MotionPreference;
   readonly motionScale: number;
   readonly streamingCursor: boolean;
+  readonly sidebarMenuDirection: SidebarMenuDirection;
   readonly colorOverrides: Readonly<Partial<Record<ThemeColorToken, string>>>;
 }
 
@@ -1504,6 +1507,7 @@ export const DEFAULT_THEME_PREFERENCES: ThemePreferences = Object.freeze({
   motion: "system",
   motionScale: 1,
   streamingCursor: true,
+  sidebarMenuDirection: "right",
   colorOverrides: Object.freeze({}),
 });
 
@@ -1610,6 +1614,11 @@ export function normalizeThemePreferences(value: unknown): ThemePreferences {
       typeof source.streamingCursor === "boolean"
         ? source.streamingCursor
         : DEFAULT_THEME_PREFERENCES.streamingCursor,
+    sidebarMenuDirection: enumValue(
+      source.sidebarMenuDirection,
+      ["left", "right"],
+      DEFAULT_THEME_PREFERENCES.sidebarMenuDirection,
+    ),
     colorOverrides: sanitizeColorOverrides(source.colorOverrides),
   };
 }
@@ -1719,6 +1728,7 @@ export function applyThemePreferences(
   root.dataset.radius = preferences.radius;
   root.dataset.motion = preferences.motion;
   root.dataset.streamingCursor = String(preferences.streamingCursor);
+  root.dataset.sidebarMenuDirection = preferences.sidebarMenuDirection;
   root.style.colorScheme = preset.appearance;
   root.style.setProperty(
     "--font-interface",

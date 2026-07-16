@@ -7,12 +7,13 @@ mod code_explain;
 mod commands;
 mod commit_message;
 mod delegation;
+mod explain_context;
 mod native_actions;
 mod runtime_setup;
 mod state;
 
 use chat_title::task_generate_title;
-use code_explain::selection_explain;
+use code_explain::{selection_explain, selection_explain_preview};
 use commands::*;
 use commit_message::git_generate_commit_message;
 use delegation::{
@@ -117,12 +118,14 @@ pub fn run() {
             project_file_write,
             project_file_rename,
             selection_explain,
+            selection_explain_preview,
             project_file_opener_list,
             project_file_open,
             project_file_reveal,
             attachment_preview,
             attachment_save_paste,
             git_status,
+            git_tracked_paths,
             git_overview,
             git_remote_add,
             git_remote_update,

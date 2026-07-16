@@ -6,6 +6,7 @@ version = 4
 name = "adapter-acp"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "integrator-core",
  "serde",
  "serde_json",
@@ -1920,6 +1921,7 @@ name = "integrator-runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "dunce",
  "integrator-core",

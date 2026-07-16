@@ -400,17 +400,39 @@ impl CodexClient {
         self.start_turn_with_skill(thread_id, prompt, None).await
     }
 
-    /// Starts a turn with an optional native Codex skill reference. Codex
-    /// recommends sending both the visible `$name` text and the typed skill
-    /// item so it can inject the exact instructions without model-side lookup.
+    /// Starts a turn with optional native skill and local image attachments
+    /// (used when seeding a fresh session from Integrator's shared handoff).
     pub async fn start_turn_with_skill(
         &self,
         thread_id: &str,
         prompt: &str,
         skill: Option<&CodexSkillSelection>,
     ) -> Result<Value> {
+        self.start_turn_with_skill_and_images(thread_id, prompt, skill, &[])
+            .await
+    }
+
+    pub async fn start_turn_with_skill_and_images(
+        &self,
+        thread_id: &str,
+        prompt: &str,
+        skill: Option<&CodexSkillSelection>,
+        image_paths: &[PathBuf],
+    ) -> Result<Value> {
         validate_protocol_id(thread_id, "thread")?;
         let mut input = turn_text_input(prompt)?;
+        for path in image_paths {
+            if !path.is_absolute() || path.as_os_str().len() > 32 * 1024 {
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            input.push(json!({
+                "type": "localImage",
+                "path": path.to_string_lossy(),
+            }));
+        }
         if let Some(skill) = skill {
             validate_skill_selection(skill)?;
             input.push(json!({

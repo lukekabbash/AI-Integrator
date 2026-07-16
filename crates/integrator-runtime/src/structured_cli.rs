@@ -211,6 +211,19 @@ impl StructuredCliClient {
         options: StructuredCliLaunchOptions,
         prompt: String,
     ) -> Result<String> {
+        self.start_turn_with_images(options, prompt, Vec::new())
+            .await
+    }
+
+    /// Same as [`Self::start_turn`], reattaching local images for handoff.
+    /// Claude receives multimodal content blocks; Antigravity gets explicit
+    /// path references in the prompt text.
+    pub async fn start_turn_with_images(
+        &self,
+        options: StructuredCliLaunchOptions,
+        prompt: String,
+        image_paths: Vec<PathBuf>,
+    ) -> Result<String> {
         let mut active = self.active.lock().await;
         if active.is_some() {
             return Err(IntegratorError::Unavailable(
@@ -241,6 +254,7 @@ impl StructuredCliClient {
                 child,
                 options.provider,
                 prompt,
+                image_paths,
                 task_turn_id.clone(),
                 cancel_rx,
                 events.clone(),
@@ -460,6 +474,79 @@ fn spawn_structured_child(options: &StructuredCliLaunchOptions) -> Result<Child>
     command.spawn().map_err(IntegratorError::from)
 }
 
+const STRUCTURED_IMAGE_MAX_BYTES: u64 = 12 * 1024 * 1024;
+
+fn structured_image_mime(path: &std::path::Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "svg" => Some("image/svg+xml"),
+        "ico" => Some("image/x-icon"),
+        "avif" => Some("image/avif"),
+        _ => None,
+    }
+}
+
+fn claude_user_content(prompt: &str, image_paths: &[PathBuf]) -> Value {
+    if image_paths.is_empty() {
+        return Value::String(prompt.to_owned());
+    }
+    let mut blocks = vec![serde_json::json!({
+        "type": "text",
+        "text": prompt,
+    })];
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    for path in image_paths {
+        let Some(mime) = structured_image_mime(path) else {
+            continue;
+        };
+        let Ok(metadata) = std::fs::metadata(path) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() > STRUCTURED_IMAGE_MAX_BYTES {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        blocks.push(serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": mime,
+                "data": STANDARD.encode(bytes),
+            }
+        }));
+    }
+    Value::Array(blocks)
+}
+
+fn antigravity_prompt_with_images(prompt: &str, image_paths: &[PathBuf]) -> String {
+    if image_paths.is_empty() {
+        return prompt.to_owned();
+    }
+    let mut lines = vec![
+        prompt.to_owned(),
+        String::new(),
+        "Prior turn images still on disk (open these paths if you need the visual context):"
+            .into(),
+    ];
+    for path in image_paths {
+        if path.is_file() {
+            lines.push(format!("- {}", path.display()));
+        }
+    }
+    lines.join("\n")
+}
+
 fn platform_command(executable: &std::path::Path, args: &[String]) -> Command {
     #[cfg(windows)]
     {
@@ -510,6 +597,7 @@ async fn run_child(
     mut child: Child,
     provider: StructuredCliProvider,
     prompt: String,
+    image_paths: Vec<PathBuf>,
     turn_id: String,
     mut cancel: oneshot::Receiver<()>,
     events: broadcast::Sender<StructuredCliEvent>,
@@ -527,9 +615,10 @@ async fn run_child(
                     "request_id": "integrator-init",
                     "request": { "subtype": "initialize" },
                 });
+                let content = claude_user_content(&prompt, &image_paths);
                 let user = serde_json::json!({
                     "type": "user",
-                    "message": { "role": "user", "content": prompt },
+                    "message": { "role": "user", "content": content },
                     "parent_tool_use_id": Value::Null,
                     "session_id": "default",
                 });
@@ -540,6 +629,7 @@ async fn run_child(
                 }
             }
             StructuredCliProvider::Antigravity => {
+                let prompt = antigravity_prompt_with_images(&prompt, &image_paths);
                 let _ = stdin.write_all(prompt.as_bytes()).await;
                 let _ = stdin.shutdown().await;
             }

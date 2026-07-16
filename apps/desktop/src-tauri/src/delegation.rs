@@ -52,8 +52,28 @@ use crate::{
 };
 
 pub const DELEGATION_UPDATE_EVENT: &str = "delegation://update";
-const CHILD_DIGEST_BYTES: usize = 6 * 1024;
-const INTERRUPTED_RESUME_WIRE_PROMPT: &str = "The prior turn was interrupted. Continue from its last safe boundary. First inspect the current workspace and provider conversation state. Do not repeat completed actions. If any external or mutating outcome is uncertain, stop and explain before retrying it.";
+const CHILD_DIGEST_OPTIONS: session_store::HandoffDigestOptions =
+    session_store::HandoffDigestOptions {
+        max_tokens: session_store::HANDOFF_CHILD_MAX_TOKENS,
+        max_turns: session_store::HANDOFF_DEFAULT_MAX_TURNS,
+        max_images: session_store::HANDOFF_DEFAULT_MAX_IMAGES,
+    };
+const INTERRUPTED_RESUME_VISIBLE_PROMPT: &str = "Resume from here";
+
+fn interrupted_resume_wire_prompt(interrupted_at: Option<chrono::DateTime<chrono::Utc>>) -> String {
+    let resumed_at = chrono::Utc::now();
+    let interrupted = interrupted_at
+        .map(|time| time.to_rfc3339())
+        .unwrap_or_else(|| "an unknown time".into());
+    format!(
+        "You were interrupted at {interrupted}. It is now {} and this session has been resumed.\n\
+         Continue what you were doing as seamlessly as possible for the user.\n\
+         Complete the task assigned in the last user prompt.\n\
+         Do not repeat completed actions. Prefer the current workspace and provider conversation as source of truth if anything changed while you were interrupted.\n\
+         If any external or mutating outcome is uncertain, stop and explain before retrying it.",
+        resumed_at.to_rfc3339()
+    )
+}
 const MAX_LINE_BYTES: usize = 256 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -850,9 +870,10 @@ fn delegation_result(app: &AppHandle<tauri::Wry>, delegation: &Delegation) -> Re
     let digest = delegation.child_task_id.and_then(|task_id| {
         state
             .store
-            .task_conversation_digest(task_id, CHILD_DIGEST_BYTES)
+            .task_handoff_digest(task_id, CHILD_DIGEST_OPTIONS)
             .ok()
             .flatten()
+            .map(|digest| digest.text)
     });
     Ok(json!({
         "delegationId": delegation.id.to_string(),
@@ -1118,16 +1139,17 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
     // context, mirroring the cross-provider primer used for task handoff.
     let parent_digest = state
         .store
-        .task_conversation_digest(delegation.parent_task_id, CHILD_DIGEST_BYTES)
+        .task_handoff_digest(delegation.parent_task_id, CHILD_DIGEST_OPTIONS)
         .ok()
         .flatten();
     // Wire-only prefix: the digest rides to the provider but must never be
     // persisted as the child's visible user message, or later continuation
     // digests re-ingest it and the nesting compounds on every restart.
     let mut context_prefix = String::new();
-    if let Some(digest) = parent_digest {
+    if let Some(digest) = parent_digest.as_ref() {
         context_prefix.push_str(&format!(
-            "<orchestrator-context>\nRecent conversation from the delegating task, for background only:\n\n{digest}\n</orchestrator-context>\n\n"
+            "<orchestrator-context>\nRecent conversation from the delegating task, for background only:\n\n{}\n</orchestrator-context>\n\n",
+            digest.text
         ));
     }
     let mut preamble = String::new();
@@ -1249,6 +1271,9 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
         ChildPrompt {
             wire,
             visible: preamble,
+            image_paths: parent_digest
+                .map(|digest| digest.image_paths)
+                .unwrap_or_default(),
         },
     )
     .await?;
@@ -1849,10 +1874,12 @@ async fn spawn_acp_child(
 /// Wire vs. visible child prompt. Providers receive `wire` (injected digests
 /// and control blocks included); the persisted transcript records only
 /// `visible`, so injected context never re-enters later digests or clutters
-/// the subagent chat.
+/// the subagent chat. Optional `image_paths` reattach parent/handoff images
+/// on the first primed turn only.
 struct ChildPrompt {
     wire: String,
     visible: String,
+    image_paths: Vec<std::path::PathBuf>,
 }
 
 /// Starts (or resumes) one child turn, recording synthetic user/turn
@@ -1903,7 +1930,7 @@ async fn start_child_turn(
                     .unwrap_or(0);
                 let turn_id = runtime
                     .client
-                    .start_turn(options, prompt.wire.clone())
+                    .start_turn_with_images(options, prompt.wire.clone(), prompt.image_paths.clone())
                     .await?;
                 *runtime.current_turn.lock().expect("turn lock") = Some(turn_id.clone());
                 if let Some(event_log) = runtime.hook_event_log.clone() {
@@ -1932,7 +1959,15 @@ async fn start_child_turn(
                         native_skill: None,
                         provider_item_id: None,
                     });
-                runtime.client.start_turn(thread_id, &prompt.wire).await?;
+                runtime
+                    .client
+                    .start_turn_with_skill_and_images(
+                        thread_id,
+                        &prompt.wire,
+                        None,
+                        &prompt.image_paths,
+                    )
+                    .await?;
             }
             DelegationChildDriver::Acp {
                 runtime,
@@ -1951,10 +1986,14 @@ async fn start_child_turn(
                 let runtime = runtime.clone();
                 let session_id = session_id.clone();
                 let wire = prompt.wire.clone();
+                let images = prompt.image_paths.clone();
                 let delegation_id = child.delegation_id;
                 let child_identity = Arc::clone(&child.busy);
                 tauri::async_runtime::spawn(async move {
-                    let outcome = runtime.client.prompt(&session_id, &wire).await;
+                    let outcome = runtime
+                        .client
+                        .prompt_with_images(&session_id, &wire, &images)
+                        .await;
                     let now = Utc::now();
                     let (status, error, failed) = match &outcome {
                         Ok(response) => match adapter_acp::StopReason::from_protocol(response) {
@@ -2259,26 +2298,39 @@ async fn deliver_queued_messages_with_context(
     }
     let visible = if resume_interrupted
         && messages.len() == 1
-        && messages[0].body.trim() == "Resume from here"
+        && messages[0].body.trim() == INTERRUPTED_RESUME_VISIBLE_PROMPT
     {
-        "Resume from here".to_owned()
+        INTERRUPTED_RESUME_VISIBLE_PROMPT.to_owned()
     } else {
         note.clone()
     };
     let mut wire = String::new();
-    if resume_interrupted {
-        wire.push_str(INTERRUPTED_RESUME_WIRE_PROMPT);
+    // resume_interrupted is only set for an explicit "Resume from here" on a
+    // process-loss Interrupted child — never after Stop / orchestrator cancel.
+    // Re-check the tip at delivery in case Stop won the race after queue.
+    let tip_stopped = state
+        .store
+        .task_tip_stop_requested(child.child_task_id)
+        .unwrap_or(false);
+    if resume_interrupted && !tip_stopped {
+        let interrupted_at = state
+            .store
+            .task_latest_interrupted_at(child.child_task_id)
+            .ok()
+            .flatten();
+        wire.push_str(&interrupted_resume_wire_prompt(interrupted_at));
         wire.push_str("\n\n");
     }
     if include_continuation_context
         && let Some(digest) = state
             .store
-            .task_conversation_digest(child.child_task_id, CHILD_DIGEST_BYTES)
+            .task_handoff_digest(child.child_task_id, CHILD_DIGEST_OPTIONS)
             .ok()
             .flatten()
     {
         wire.push_str(&format!(
-            "<continuation-context>\nYou are continuing the same delegated conversation through a fresh provider session. Recent locally persisted transcript:\n\n{digest}\n</continuation-context>\n\n"
+            "<continuation-context>\nYou are continuing the same delegated conversation through a fresh provider session. Recent locally persisted transcript:\n\n{}\n</continuation-context>\n\n",
+            digest.text
         ));
     }
     wire.push_str(&format!(
@@ -2291,7 +2343,16 @@ async fn deliver_queued_messages_with_context(
     let _ = state
         .store
         .update_delegation_status(child.delegation_id, DelegationStatus::Running);
-    start_child_turn(app, child, ChildPrompt { wire, visible }).await?;
+    start_child_turn(
+        app,
+        child,
+        ChildPrompt {
+            wire,
+            visible,
+            image_paths: Vec::new(),
+        },
+    )
+    .await?;
     state
         .store
         .mark_delegation_messages_delivered(&message_ids)?;
@@ -2388,7 +2449,21 @@ pub async fn queue_message_to_child(
             delegation.status,
             DelegationStatus::Failed | DelegationStatus::Interrupted
         );
-    let resume_interrupted = delegation.status == DelegationStatus::Interrupted;
+    // Only an explicit Resume on a process-loss Interrupted child may inject
+    // the interrupt wire prompt. Stopped (user/orchestrator) tips never do,
+    // and ordinary follow-ups must not look like crash recovery either.
+    let child_stop_requested = delegation
+        .child_task_id
+        .map(|child_task_id| {
+            state
+                .store
+                .task_tip_stop_requested(child_task_id)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    let resume_interrupted = delegation.status == DelegationStatus::Interrupted
+        && message.trim() == INTERRUPTED_RESUME_VISIBLE_PROMPT
+        && !child_stop_requested;
     let child = if rebuild {
         let previous = state
             .delegation_children
@@ -2493,6 +2568,13 @@ pub async fn stop_delegation(
                 let _ = runtime.client.shutdown().await;
             }
         }
+    }
+    // Settle the child tip as a user/orchestrator Stop so reopening the pane
+    // cannot treat the cancelled turn as crash recovery and auto-resume it.
+    if let Some(child_task_id) = delegation.child_task_id {
+        let store = Arc::clone(&state.store);
+        let _ = tauri::async_runtime::spawn_blocking(move || store.settle_stopped_turn(child_task_id))
+            .await;
     }
     let updated = state
         .store

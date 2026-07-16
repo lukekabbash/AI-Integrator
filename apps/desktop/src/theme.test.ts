@@ -94,16 +94,26 @@ describe("semantic theme catalog", () => {
       themeId: "unknown",
       bodySize: 100,
       radiusOverride: -20,
+      sidebarMenuDirection: "diagonal",
     });
     expect(normalized.themeId).toBe(DEFAULT_THEME_PREFERENCES.themeId);
     expect(normalized.bodySize).toBeLessThanOrEqual(24);
     expect(normalized.radiusOverride).toBeGreaterThanOrEqual(0);
+    expect(normalized.sidebarMenuDirection).toBe("right");
+  });
+
+  it("preserves sidebar menu direction preferences", () => {
+    expect(normalizeThemePreferences({ sidebarMenuDirection: "left" }).sidebarMenuDirection).toBe(
+      "left",
+    );
+    expect(normalizeThemePreferences({}).sidebarMenuDirection).toBe("right");
   });
 
   it("applies semantic compatibility aliases to a document root", () => {
     const root = document.createElement("div");
     applyThemePreferences(DEFAULT_THEME_PREFERENCES, root);
     expect(root.dataset.theme).toBe("integrator");
+    expect(root.dataset.sidebarMenuDirection).toBe("right");
     expect(root.style.getPropertyValue("--color-accent-primary")).toBeTruthy();
     expect(root.style.getPropertyValue("--color-diff-added")).toBeTruthy();
     expect(root.style.getPropertyValue("--color-terminal-surface")).toBeTruthy();

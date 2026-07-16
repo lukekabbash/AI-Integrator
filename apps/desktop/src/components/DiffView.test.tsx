@@ -278,4 +278,67 @@ describe("DiffView", () => {
     );
     expect(screen.getByText("Loading diff…")).toBeInTheDocument();
   });
+
+  it("offers approve/revert on inline diffs, ordered ahead of the +/− counts", () => {
+    const onMarkReviewed = vi.fn();
+    const onRevert = vi.fn();
+    render(
+      <DiffView
+        file={file}
+        variant="inline"
+        showReviewActions={false}
+        onMarkReviewed={onMarkReviewed}
+        onRevert={onRevert}
+      />,
+    );
+
+    const actions = document.querySelector(".diff-inline-actions");
+    expect(actions).toBeInTheDocument();
+    // The pair must sit between the file title and the counts, which is what
+    // puts it where the header's flex: 1 title pushes it: hard against +N −M.
+    expect(actions?.nextElementSibling).toHaveClass("diff-summary");
+
+    fireEvent.click(screen.getByRole("button", { name: /Approve/i }));
+    expect(onMarkReviewed).toHaveBeenCalledWith(file);
+
+    fireEvent.click(screen.getByRole("button", { name: /Revert/i }));
+    expect(onRevert).toHaveBeenCalledWith(file);
+  });
+
+  it("reads approved once the file is reviewed", () => {
+    render(
+      <DiffView
+        file={file}
+        variant="inline"
+        showReviewActions={false}
+        reviewed
+        onMarkReviewed={vi.fn()}
+      />,
+    );
+
+    const approve = screen.getByRole("button", { name: /Approved/i });
+    expect(approve).toHaveAttribute("aria-pressed", "true");
+    expect(approve).toHaveAttribute("data-reviewed", "true");
+  });
+
+  it("disables revert until a caller can actually undo the edit", () => {
+    render(
+      <DiffView
+        file={file}
+        variant="inline"
+        showReviewActions={false}
+        onMarkReviewed={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: /Revert/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /Approve/i })).toBeEnabled();
+  });
+
+  it("keeps the full variant free of the inline pair", () => {
+    render(<DiffView file={file} viewMode="unified" onMarkReviewed={vi.fn()} onRevert={vi.fn()} />);
+
+    expect(document.querySelector(".diff-inline-actions")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Mark reviewed/i })).toBeInTheDocument();
+  });
 });

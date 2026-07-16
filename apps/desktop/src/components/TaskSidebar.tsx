@@ -30,6 +30,7 @@ import {
 } from "lucide-react";
 import type { ProjectSummary, TaskMessageSearchHit, TaskSummary } from "../bridge";
 import { parseForkTitle } from "../forkTitle";
+import type { SidebarMenuDirection } from "../theme";
 import { AnimatedFolderIcon } from "./AnimatedFolderIcon";
 import { BrandMark } from "./BrandMark";
 import { ResizeHandle } from "./ResizeHandle";
@@ -92,6 +93,8 @@ interface TaskSidebarProps {
   onDeleteTask?: (taskId: string) => void;
   onOpenSettings: () => void;
   onResize?: (delta: number) => void;
+  /** Chat/project `…` menus open left into the rail or right over the canvas. */
+  sidebarMenuDirection?: SidebarMenuDirection;
 }
 
 const statusLabel: Record<TaskSummary["status"], string> = {
@@ -187,7 +190,9 @@ const INITIAL_SEARCH_RESULT_LIMIT = 80;
 const PROJECT_CHAT_LIST_CLIP_MS = 220;
 /** Rename / Copy / Pin / Archive / Delete — used to decide flip-up vs down. */
 const CHAT_ACTION_MENU_HEIGHT = 168;
+const CHAT_ACTION_MENU_WIDTH = 164;
 const PROJECT_ACTION_MENU_HEIGHT = 112;
+const PROJECT_ACTION_MENU_WIDTH = 168;
 
 function overflowMenuPlacement(
   trigger: HTMLElement,
@@ -199,6 +204,25 @@ function overflowMenuPlacement(
   const roomBelow = (bounds?.bottom ?? window.innerHeight) - triggerRect.bottom - 8;
   const roomAbove = triggerRect.top - (bounds?.top ?? 0) - 8;
   return roomBelow < estimatedHeight && roomAbove > roomBelow ? "up" : "down";
+}
+
+/** Viewport-relative coordinates for a portaled overflow menu. The sidebar
+ * clips anything past its own edge, so the menu escapes to `document.body`
+ * and anchors from the trigger — left keeps the panel in the rail, right
+ * opens over the main pane. */
+type MenuAnchor = { left: number; top: number; bottom: number };
+
+function overflowMenuAnchor(
+  trigger: HTMLElement,
+  direction: SidebarMenuDirection,
+  width: number,
+): MenuAnchor {
+  const rect = trigger.getBoundingClientRect();
+  return {
+    left: direction === "right" ? rect.right - 3 : rect.right - 3 - width,
+    top: rect.bottom - 2,
+    bottom: window.innerHeight - rect.top + 2,
+  };
 }
 
 /** Keep paging on compositor-friendly properties. The previous height-per-row
@@ -313,6 +337,7 @@ export const TaskSidebar = memo(function TaskSidebar({
   onDeleteTask,
   onOpenSettings,
   onResize,
+  sidebarMenuDirection = "right",
 }: TaskSidebarProps) {
   const reduceMotion =
     Boolean(useReducedMotion()) ||
@@ -327,8 +352,10 @@ export const TaskSidebar = memo(function TaskSidebar({
   );
   const [openMenuId, setOpenMenuId] = useState("");
   const [menuPlacement, setMenuPlacement] = useState<"up" | "down">("down");
+  const [menuAnchor, setMenuAnchor] = useState<MenuAnchor | null>(null);
   const [openProjectMenuId, setOpenProjectMenuId] = useState("");
   const [projectMenuPlacement, setProjectMenuPlacement] = useState<"up" | "down">("down");
+  const [projectMenuAnchor, setProjectMenuAnchor] = useState<MenuAnchor | null>(null);
   const [renamingId, setRenamingId] = useState("");
   const [renameValue, setRenameValue] = useState("");
   const [showArchived, setShowArchived] = useState(false);
@@ -387,11 +414,22 @@ export const TaskSidebar = memo(function TaskSidebar({
         setOpenProjectMenuId("");
       }
     };
+    // Portaled menus are anchored to a viewport position captured at open
+    // time; scrolling the rail or resizing the window would leave them
+    // stranded next to a trigger that has moved, so just close them.
+    const onScrollOrResize = () => {
+      setOpenMenuId("");
+      setOpenProjectMenuId("");
+    };
     document.addEventListener("pointerdown", onPointerDown);
     document.addEventListener("keydown", onKeyDown);
+    chatListRef.current?.addEventListener("scroll", onScrollOrResize, { passive: true });
+    window.addEventListener("resize", onScrollOrResize);
     return () => {
       document.removeEventListener("pointerdown", onPointerDown);
       document.removeEventListener("keydown", onKeyDown);
+      chatListRef.current?.removeEventListener("scroll", onScrollOrResize);
+      window.removeEventListener("resize", onScrollOrResize);
     };
   }, [openMenuId, openProjectMenuId]);
 
@@ -736,6 +774,13 @@ export const TaskSidebar = memo(function TaskSidebar({
                     CHAT_ACTION_MENU_HEIGHT,
                   ),
                 );
+                setMenuAnchor(
+                  overflowMenuAnchor(
+                    event.currentTarget,
+                    sidebarMenuDirection,
+                    CHAT_ACTION_MENU_WIDTH,
+                  ),
+                );
                 setOpenMenuId(task.id);
               }}
               disabled={busy}
@@ -744,30 +789,38 @@ export const TaskSidebar = memo(function TaskSidebar({
             </button>
           </Tooltip>
         ) : null}
-        <AnimatePresence>
-          {openMenuId === task.id && !options?.searchResult ? (
-            <motion.div
-              className={`chat-action-menu${menuPlacement === "up" ? " chat-action-menu--up" : ""}`}
-              role="menu"
-              ref={menuRef}
-              initial={
-                reduceMotion
-                  ? false
-                  : { opacity: 0, y: menuPlacement === "up" ? 5 : -5, scale: 0.96 }
-              }
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={
-                reduceMotion
-                  ? undefined
-                  : {
-                      opacity: 0,
-                      y: menuPlacement === "up" ? 3 : -3,
-                      scale: 0.98,
-                      transition: { duration: 0.12, ease: [0.2, 0, 0, 1] },
+        {typeof document !== "undefined"
+          ? createPortal(
+              <AnimatePresence>
+                {openMenuId === task.id && !options?.searchResult && menuAnchor ? (
+                  <motion.div
+                    className={`chat-action-menu${menuPlacement === "up" ? " chat-action-menu--up" : ""}`}
+                    role="menu"
+                    ref={menuRef}
+                    data-direction={sidebarMenuDirection}
+                    style={{
+                      left: menuAnchor.left,
+                      top: menuPlacement === "up" ? "auto" : menuAnchor.top,
+                      bottom: menuPlacement === "up" ? menuAnchor.bottom : "auto",
+                    }}
+                    initial={
+                      reduceMotion
+                        ? false
+                        : { opacity: 0, y: menuPlacement === "up" ? 5 : -5, scale: 0.96 }
                     }
-              }
-              transition={reduceMotion ? { duration: 0 } : menuSpring}
-            >
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={
+                      reduceMotion
+                        ? undefined
+                        : {
+                            opacity: 0,
+                            y: menuPlacement === "up" ? 3 : -3,
+                            scale: 0.98,
+                            transition: { duration: 0.12, ease: [0.2, 0, 0, 1] },
+                          }
+                    }
+                    transition={reduceMotion ? { duration: 0 } : menuSpring}
+                  >
               <MenuActionTooltip
                 label={
                   metadataActionsEnabled ? undefined : "Native persistence is being added"
@@ -858,9 +911,12 @@ export const TaskSidebar = memo(function TaskSidebar({
                   <Trash2 /> Delete…
                 </button>
               </MenuActionTooltip>
-            </motion.div>
-          ) : null}
-        </AnimatePresence>
+                  </motion.div>
+                ) : null}
+              </AnimatePresence>,
+              document.body,
+            )
+          : null}
       </div>
     );
   };
@@ -1067,6 +1123,13 @@ export const TaskSidebar = memo(function TaskSidebar({
                                     PROJECT_ACTION_MENU_HEIGHT,
                                   ),
                                 );
+                                setProjectMenuAnchor(
+                                  overflowMenuAnchor(
+                                    event.currentTarget,
+                                    sidebarMenuDirection,
+                                    PROJECT_ACTION_MENU_WIDTH,
+                                  ),
+                                );
                                 setOpenProjectMenuId(project.id);
                               }}
                             >
@@ -1086,34 +1149,48 @@ export const TaskSidebar = memo(function TaskSidebar({
                             </Tooltip>
                           ) : null}
                         </span>
-                        <AnimatePresence>
-                          {openProjectMenuId === project.id ? (
-                            <motion.div
-                              className={`chat-action-menu project-action-menu${projectMenuPlacement === "up" ? " chat-action-menu--up" : ""}`}
-                              role="menu"
-                              ref={projectMenuRef}
-                              initial={
-                                reduceMotion
-                                  ? false
-                                  : {
-                                      opacity: 0,
-                                      y: projectMenuPlacement === "up" ? 5 : -5,
-                                      scale: 0.96,
+                        {typeof document !== "undefined"
+                          ? createPortal(
+                              <AnimatePresence>
+                                {openProjectMenuId === project.id && projectMenuAnchor ? (
+                                  <motion.div
+                                    className={`chat-action-menu project-action-menu${projectMenuPlacement === "up" ? " chat-action-menu--up" : ""}`}
+                                    role="menu"
+                                    ref={projectMenuRef}
+                                    data-direction={sidebarMenuDirection}
+                                    style={{
+                                      left: projectMenuAnchor.left,
+                                      top:
+                                        projectMenuPlacement === "up"
+                                          ? "auto"
+                                          : projectMenuAnchor.top,
+                                      bottom:
+                                        projectMenuPlacement === "up"
+                                          ? projectMenuAnchor.bottom
+                                          : "auto",
+                                    }}
+                                    initial={
+                                      reduceMotion
+                                        ? false
+                                        : {
+                                            opacity: 0,
+                                            y: projectMenuPlacement === "up" ? 5 : -5,
+                                            scale: 0.96,
+                                          }
                                     }
-                              }
-                              animate={{ opacity: 1, y: 0, scale: 1 }}
-                              exit={
-                                reduceMotion
-                                  ? undefined
-                                  : {
-                                      opacity: 0,
-                                      y: projectMenuPlacement === "up" ? 3 : -3,
-                                      scale: 0.98,
-                                      transition: { duration: 0.12, ease: [0.2, 0, 0, 1] },
+                                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                                    exit={
+                                      reduceMotion
+                                        ? undefined
+                                        : {
+                                            opacity: 0,
+                                            y: projectMenuPlacement === "up" ? 3 : -3,
+                                            scale: 0.98,
+                                            transition: { duration: 0.12, ease: [0.2, 0, 0, 1] },
+                                          }
                                     }
-                              }
-                              transition={reduceMotion ? { duration: 0 } : menuSpring}
-                            >
+                                    transition={reduceMotion ? { duration: 0 } : menuSpring}
+                                  >
                               <button
                                 role="menuitem"
                                 type="button"
@@ -1165,9 +1242,12 @@ export const TaskSidebar = memo(function TaskSidebar({
                                   <Trash2 /> Delete…
                                 </button>
                               )}
-                            </motion.div>
-                          ) : null}
-                        </AnimatePresence>
+                                  </motion.div>
+                                ) : null}
+                              </AnimatePresence>,
+                              document.body,
+                            )
+                          : null}
                       </span>
                     </div>
                     <ProjectChatListClip

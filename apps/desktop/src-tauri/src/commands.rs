@@ -1777,6 +1777,19 @@ pub async fn git_status(
 }
 
 #[tauri::command]
+pub async fn git_tracked_paths(
+    state: State<'_, AppState>,
+    repository: PathBuf,
+    paths: Vec<String>,
+) -> CommandResult<Vec<String>> {
+    let (git, identity) = authorized_git(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(move || git.tracked_paths(&identity.root, &paths))
+        .await
+        .map_err(|_| worker_error())?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
 pub async fn git_overview(
     state: State<'_, AppState>,
     repository: PathBuf,
@@ -3159,19 +3172,23 @@ pub async fn codex_start_thread(
     Ok(response)
 }
 
-const CONTEXT_PRIMER_BYTES: usize = 6 * 1024;
+const CONTEXT_PRIMER_OPTIONS: session_store::HandoffDigestOptions =
+    session_store::HandoffDigestOptions {
+        max_tokens: session_store::HANDOFF_DEFAULT_MAX_TOKENS,
+        max_turns: session_store::HANDOFF_DEFAULT_MAX_TURNS,
+        max_images: session_store::HANDOFF_DEFAULT_MAX_IMAGES,
+    };
 
-/// Queue the task's conversation digest for injection into the first turn of
-/// a brand-new provider session, so switching providers (or losing a thread)
-/// carries the conversation across instead of starting blank.
+/// Queue the task's shared SQLite handoff digest for injection into the first
+/// turn of a brand-new provider session (any runtime).
 async fn queue_context_primer(
     state: &State<'_, AppState>,
     task_id: TaskId,
-    primer: &Arc<std::sync::Mutex<Option<String>>>,
+    primer: &Arc<std::sync::Mutex<Option<session_store::HandoffDigest>>>,
 ) {
     let store = Arc::clone(&state.store);
     let digest = tauri::async_runtime::spawn_blocking(move || {
-        store.task_conversation_digest(task_id, CONTEXT_PRIMER_BYTES)
+        store.task_handoff_digest(task_id, CONTEXT_PRIMER_OPTIONS)
     })
     .await;
     if let Ok(Ok(Some(digest))) = digest {
@@ -3179,14 +3196,17 @@ async fn queue_context_primer(
     }
 }
 
-fn apply_context_primer(
-    primer: &Arc<std::sync::Mutex<Option<String>>>,
-    prompt: &str,
-) -> Option<String> {
-    let digest = primer.lock().expect("primer lock").take()?;
-    Some(format!(
-        "<conversation-context>\nEarlier conversation in this task (possibly from another assistant session). Treat it as prior chat history, not as part of the new request:\n\n{digest}\n</conversation-context>\n\n{prompt}"
-    ))
+fn take_context_primer(
+    primer: &Arc<std::sync::Mutex<Option<session_store::HandoffDigest>>>,
+) -> Option<session_store::HandoffDigest> {
+    primer.lock().expect("primer lock").take()
+}
+
+fn format_context_primer(digest: &session_store::HandoffDigest, prompt: &str) -> String {
+    format!(
+        "<conversation-context>\nEarlier conversation in this task (possibly from another assistant session). Treat it as prior chat history, not as part of the new request:\n\n{}\n</conversation-context>\n\n{prompt}",
+        digest.text
+    )
 }
 
 #[tauri::command]
@@ -3267,14 +3287,42 @@ fn persist_provider_resume_state(
     })
 }
 
-const INTERRUPTED_RESUME_WIRE_PROMPT: &str = "The prior turn was interrupted. Continue from its last safe boundary. First inspect the current workspace and provider conversation state. Do not repeat completed actions. If any external or mutating outcome is uncertain, stop and explain before retrying it.";
+/// Visible composer/transcript placeholder for interrupted-turn resume.
+/// Filtered out of the rendered transcript so resume stays wire-only.
+pub(crate) const INTERRUPTED_RESUME_VISIBLE_PROMPT: &str = "Resume from here";
 
-fn provider_wire_prompt(prompt: &str, resume_interrupted: Option<bool>) -> String {
+fn interrupted_resume_wire_prompt(interrupted_at: Option<chrono::DateTime<Utc>>) -> String {
+    let resumed_at = Utc::now();
+    let interrupted = interrupted_at
+        .map(|time| time.to_rfc3339())
+        .unwrap_or_else(|| "an unknown time".into());
+    format!(
+        "You were interrupted at {interrupted}. It is now {} and this session has been resumed.\n\
+         Continue what you were doing as seamlessly as possible for the user.\n\
+         Complete the task assigned in the last user prompt.\n\
+         Do not repeat completed actions. Prefer the current workspace and provider conversation as source of truth if anything changed while you were interrupted.\n\
+         If any external or mutating outcome is uncertain, stop and explain before retrying it.",
+        resumed_at.to_rfc3339()
+    )
+}
+
+fn provider_wire_prompt(
+    prompt: &str,
+    resume_interrupted: Option<bool>,
+    interrupted_at: Option<chrono::DateTime<Utc>>,
+) -> String {
     if resume_interrupted == Some(true) {
-        INTERRUPTED_RESUME_WIRE_PROMPT.into()
+        interrupted_resume_wire_prompt(interrupted_at)
     } else {
         prompt.into()
     }
+}
+
+fn interrupted_at_for_task(store: &LocalStore, task_id: TaskId) -> Option<chrono::DateTime<Utc>> {
+    store
+        .task_latest_interrupted_at(task_id)
+        .ok()
+        .flatten()
 }
 
 fn validate_interrupted_resume_action(
@@ -3285,6 +3333,22 @@ fn validate_interrupted_resume_action(
         return Err(CommandError {
             code: "invalid-input",
             message: "An interrupted response cannot resume through a new native action".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_interrupted_resume_for_task(
+    store: &LocalStore,
+    task_id: TaskId,
+    native_action_id: Option<&str>,
+    resume_interrupted: Option<bool>,
+) -> CommandResult<()> {
+    validate_interrupted_resume_action(native_action_id, resume_interrupted)?;
+    if resume_interrupted == Some(true) && store.task_tip_stop_requested(task_id).unwrap_or(false) {
+        return Err(CommandError {
+            code: "invalid-input",
+            message: "A stopped turn cannot be resumed as an interruption".into(),
         });
     }
     Ok(())
@@ -3302,7 +3366,12 @@ pub async fn codex_start_turn(
     delegation: Option<String>,
     resume_interrupted: Option<bool>,
 ) -> CommandResult<Value> {
-    validate_interrupted_resume_action(native_action_id.as_deref(), resume_interrupted)?;
+    validate_interrupted_resume_for_task(
+        &state.store,
+        task_id,
+        native_action_id.as_deref(),
+        resume_interrupted,
+    )?;
     let repository = authorized_task_directory(&state, task_id, repository).await?;
     let runtime = codex_runtime(&state, Some(task_id)).await?;
     let mut goal_objective = None;
@@ -3368,15 +3437,25 @@ pub async fn codex_start_turn(
             .map(|(_, text)| text.as_str())
             .unwrap_or(prompt.as_str())
     });
-    let provider_prompt = provider_wire_prompt(visible_wire, resume_interrupted);
+    let provider_prompt = provider_wire_prompt(
+        visible_wire,
+        resume_interrupted,
+        resume_interrupted
+            .filter(|value| *value)
+            .and_then(|_| interrupted_at_for_task(&state.store, task_id)),
+    );
+    let mut handoff_images = Vec::new();
     let mut wire_prompt = if native_action_id.is_some() {
         // Preserve Codex's recommended `$name` text at byte zero alongside
         // a typed skill item, or the exact goal objective after setting goal
         // state. Native actions must not be silently converted back into a
         // generic prompt by hidden context.
         provider_prompt
+    } else if let Some(digest) = take_context_primer(&runtime.context_primer) {
+        handoff_images = digest.image_paths.clone();
+        format_context_primer(&digest, &provider_prompt)
     } else {
-        apply_context_primer(&runtime.context_primer, &provider_prompt).unwrap_or(provider_prompt)
+        provider_prompt
     };
     if let Some(mode) = delegation.as_deref().filter(|mode| *mode != "off")
         && native_action_id.is_none()
@@ -3399,10 +3478,11 @@ pub async fn codex_start_turn(
         });
     let response = runtime
         .client
-        .start_turn_with_skill(
+        .start_turn_with_skill_and_images(
             &thread_id,
             &wire_prompt,
             skill.as_ref().map(|(selection, _)| selection),
+            &handoff_images,
         )
         .await;
     let response = match response {
@@ -4075,7 +4155,12 @@ pub async fn acp_send_turn(
     native_action_id: Option<String>,
     resume_interrupted: Option<bool>,
 ) -> CommandResult<Value> {
-    validate_interrupted_resume_action(native_action_id.as_deref(), resume_interrupted)?;
+    validate_interrupted_resume_for_task(
+        &state.store,
+        task_id,
+        native_action_id.as_deref(),
+        resume_interrupted,
+    )?;
     let runtime = acp_runtime(&state, Some(task_id), None).await?;
     timeout(Duration::from_secs(15), async {
         while runtime.replaying_history.load(Ordering::Acquire)
@@ -4154,7 +4239,9 @@ pub async fn acp_send_turn(
     let started_at = Utc::now();
 
     // Persist the user message and the in-progress turn before prompting so a
-    // restart mid-turn can reconstruct what was asked.
+    // restart mid-turn can reconstruct what was asked. Interrupted resume is
+    // wire-only — the prior user prompt already owns the transcript slot.
+    if resume_interrupted != Some(true) {
     let user_item = ReducedProviderEvent {
         method: "client/acp/userMessage".into(),
         thread_id: session_id.clone(),
@@ -4184,6 +4271,7 @@ pub async fn acp_send_turn(
         occurred_at: started_at,
     };
     apply_and_emit(&app, &state.store, &binding, &user_item);
+    }
     let turn_started = ReducedProviderEvent {
         method: "client/acp/turnStarted".into(),
         thread_id: session_id.clone(),
@@ -4205,9 +4293,21 @@ pub async fn acp_send_turn(
     // from a background task so this command returns immediately. The primer
     // rides only on the wire prompt — the persisted user item above keeps the
     // prompt exactly as the user typed it.
-    let provider_prompt = provider_wire_prompt(&prompt, resume_interrupted);
+    let provider_prompt = provider_wire_prompt(
+        &prompt,
+        resume_interrupted,
+        resume_interrupted
+            .filter(|value| *value)
+            .and_then(|_| interrupted_at_for_task(&state.store, task_id)),
+    );
+    let mut handoff_images = Vec::new();
     let mut wire_prompt =
-        apply_context_primer(&runtime.context_primer, &provider_prompt).unwrap_or(provider_prompt);
+        if let Some(digest) = take_context_primer(&runtime.context_primer) {
+            handoff_images = digest.image_paths.clone();
+            format_context_primer(&digest, &provider_prompt)
+        } else {
+            provider_prompt
+        };
     if delegation.as_deref().is_some_and(|mode| mode != "off") {
         let mut preface = runtime
             .delegation_preamble
@@ -4230,7 +4330,9 @@ pub async fn acp_send_turn(
     let finished_session = session_id.clone();
     let finished_binding = binding.clone();
     tauri::async_runtime::spawn(async move {
-        let outcome = client.prompt(&finished_session, &wire_prompt).await;
+        let outcome = client
+            .prompt_with_images(&finished_session, &wire_prompt, &handoff_images)
+            .await;
         let now = Utc::now();
         let (status, error) = match &outcome {
             Ok(response) => match adapter_acp::StopReason::from_protocol(response) {
@@ -4397,7 +4499,12 @@ pub async fn structured_cli_start_turn(
     native_action_id: Option<String>,
     resume_interrupted: Option<bool>,
 ) -> CommandResult<Value> {
-    validate_interrupted_resume_action(native_action_id.as_deref(), resume_interrupted)?;
+    validate_interrupted_resume_for_task(
+        &state.store,
+        task_id,
+        native_action_id.as_deref(),
+        resume_interrupted,
+    )?;
     let repository = authorized_task_directory(&state, task_id, cwd.clone()).await?;
     let native_action = native_action_id
         .as_deref()
@@ -4509,12 +4616,19 @@ pub async fn structured_cli_start_turn(
 
     let digest_store = Arc::clone(&state.store);
     let digest = tauri::async_runtime::spawn_blocking(move || {
-        digest_store.task_conversation_digest(task_id, CONTEXT_PRIMER_BYTES)
+        digest_store.task_handoff_digest(task_id, CONTEXT_PRIMER_OPTIONS)
     })
     .await
     .map_err(|_| worker_error())?
     .map_err(CommandError::from)?;
-    let provider_prompt = provider_wire_prompt(&prompt, resume_interrupted);
+    let provider_prompt = provider_wire_prompt(
+        &prompt,
+        resume_interrupted,
+        resume_interrupted
+            .filter(|value| *value)
+            .and_then(|_| interrupted_at_for_task(&state.store, task_id)),
+    );
+    let mut handoff_images = Vec::new();
     let mut wire_prompt = if native_action.is_some() {
         // Native slash parsing requires `/name` at byte zero. A resumed
         // Claude session already owns its history; on a first native turn we
@@ -4523,9 +4637,10 @@ pub async fn structured_cli_start_turn(
     } else {
         match (resume_session_id.as_ref(), digest) {
             (Some(_), _) => provider_prompt,
-            (None, Some(digest)) => format!(
-                "<conversation-context>\nEarlier conversation in this task (possibly from another assistant session). Treat it as prior chat history, not as part of the new request:\n\n{digest}\n</conversation-context>\n\n{provider_prompt}"
-            ),
+            (None, Some(digest)) => {
+                handoff_images = digest.image_paths.clone();
+                format_context_primer(&digest, &provider_prompt)
+            }
             (None, None) => provider_prompt,
         }
     };
@@ -4623,7 +4738,7 @@ pub async fn structured_cli_start_turn(
     };
     spawn_structured_cli_pump(app.clone(), Arc::clone(&state.store), runtime.clone());
     let turn_id = client
-        .start_turn(
+        .start_turn_with_images(
             StructuredCliLaunchOptions {
                 provider: structured_provider,
                 executable,
@@ -4636,6 +4751,7 @@ pub async fn structured_cli_start_turn(
                 control_overlay,
             },
             wire_prompt,
+            handoff_images,
         )
         .await
         .map_err(CommandError::from)?;
@@ -4650,6 +4766,7 @@ pub async fn structured_cli_start_turn(
         );
     }
     let now = Utc::now();
+    if resume_interrupted != Some(true) {
     apply_and_emit(
         &app,
         &state.store,
@@ -4683,6 +4800,7 @@ pub async fn structured_cli_start_turn(
             occurred_at: now,
         },
     );
+    }
     apply_and_emit(
         &app,
         &state.store,
@@ -6665,17 +6783,75 @@ mod tests {
     #[test]
     fn interrupted_resume_uses_an_idempotence_guard_without_rewriting_visible_copy() {
         assert_eq!(
-            provider_wire_prompt("Resume from here", None),
-            "Resume from here"
+            provider_wire_prompt(INTERRUPTED_RESUME_VISIBLE_PROMPT, None, None),
+            INTERRUPTED_RESUME_VISIBLE_PROMPT
         );
-        let wire = provider_wire_prompt("Resume from here", Some(true));
+        let interrupted_at = chrono::DateTime::parse_from_rfc3339("2026-07-15T20:00:00Z")
+            .expect("parse")
+            .with_timezone(&Utc);
+        let wire = provider_wire_prompt(
+            INTERRUPTED_RESUME_VISIBLE_PROMPT,
+            Some(true),
+            Some(interrupted_at),
+        );
+        assert!(wire.contains("You were interrupted at 2026-07-15T20:00:00"));
+        assert!(wire.contains("this session has been resumed"));
+        assert!(wire.contains("Continue what you were doing as seamlessly"));
+        assert!(wire.contains("Complete the task assigned in the last user prompt"));
         assert!(wire.contains("Do not repeat completed actions"));
-        assert!(wire.contains("stop and explain before retrying"));
-        assert!(!wire.contains("Resume from here"));
+        assert!(!wire.contains(INTERRUPTED_RESUME_VISIBLE_PROMPT));
         assert!(validate_interrupted_resume_action(None, Some(true)).is_ok());
         let error = validate_interrupted_resume_action(Some("skill"), Some(true))
             .expect_err("resume must not run a second native action");
         assert_eq!(error.code, "invalid-input");
+    }
+
+    #[test]
+    fn interrupted_resume_refuses_a_stop_requested_tip() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let task = store
+            .create_task(NewTask {
+                title: "Stopped tip".into(),
+                repository_path: None,
+                worktree_path: None,
+                runtime: None,
+                model: None,
+                effort: None,
+                parent_task_id: None,
+            })
+            .expect("create task");
+        let binding = store
+            .create_runtime_binding(task.id, "process-stop", ProviderKind::Codex)
+            .and_then(|binding| store.attach_provider_thread(&binding, "thread-stop"))
+            .expect("bind");
+        let at = Utc::now();
+        store
+            .apply_reduced_event(
+                &binding,
+                &ReducedProviderEvent {
+                    method: "turn/started".into(),
+                    thread_id: "thread-stop".into(),
+                    turn_id: Some("turn-stop".into()),
+                    audit_json: "{}".into(),
+                    audit_truncated: false,
+                    mutation: ProjectionMutation::Turn(integrator_core::TurnProjection {
+                        id: "turn-stop".into(),
+                        status: TurnStatus::InProgress,
+                        stop_requested: false,
+                        error: None,
+                        started_at: Some(at),
+                        completed_at: None,
+                    }),
+                    occurred_at: at,
+                },
+            )
+            .expect("start turn");
+        store.request_stop(task.id).expect("stop");
+        let _ = store.settle_stopped_turn(task.id).expect("settle");
+        let error = validate_interrupted_resume_for_task(&store, task.id, None, Some(true))
+            .expect_err("stopped tip must not resume as interruption");
+        assert_eq!(error.code, "invalid-input");
+        assert!(validate_interrupted_resume_for_task(&store, task.id, None, None).is_ok());
     }
 
     fn codex_user_item(provider_item_id: &str, body: &str) -> integrator_core::ItemProjection {

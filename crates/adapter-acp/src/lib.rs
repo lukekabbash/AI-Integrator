@@ -311,12 +311,29 @@ impl AcpClient {
     /// Long-running: the response resolves when the turn finishes. Callers
     /// should await this on a spawned task, not on a UI-facing command.
     pub async fn prompt(&self, session_id: &str, text: &str) -> Result<Value> {
+        self.prompt_with_images(session_id, text, &[]).await
+    }
+
+    /// Same as [`Self::prompt`], with optional local image paths embedded as
+    /// ACP image content blocks (base64 loaded at send time).
+    pub async fn prompt_with_images(
+        &self,
+        session_id: &str,
+        text: &str,
+        image_paths: &[std::path::PathBuf],
+    ) -> Result<Value> {
         validate_session_id(session_id)?;
+        let mut prompt = vec![json!({ "type": "text", "text": text })];
+        for path in image_paths {
+            if let Some(block) = acp_image_block(path) {
+                prompt.push(block);
+            }
+        }
         self.request(
             "session/prompt",
             json!({
                 "sessionId": session_id,
-                "prompt": [{ "type": "text", "text": text }]
+                "prompt": prompt
             }),
         )
         .await
@@ -569,6 +586,42 @@ fn quote_windows_arg(value: &str) -> String {
     quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
     quoted.push('"');
     quoted
+}
+
+const ACP_IMAGE_MAX_BYTES: u64 = 12 * 1024 * 1024;
+
+fn acp_image_mime(path: &std::path::Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "svg" => Some("image/svg+xml"),
+        "ico" => Some("image/x-icon"),
+        "avif" => Some("image/avif"),
+        _ => None,
+    }
+}
+
+fn acp_image_block(path: &std::path::Path) -> Option<Value> {
+    let mime = acp_image_mime(path)?;
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > ACP_IMAGE_MAX_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    Some(json!({
+        "type": "image",
+        "mimeType": mime,
+        "data": STANDARD.encode(bytes),
+    }))
 }
 
 fn validate_session_id(value: &str) -> Result<()> {

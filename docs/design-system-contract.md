@@ -120,6 +120,7 @@ User customization:
 - comfortable/compact density and panel spacing;
 - radius preset and advanced numeric override;
 - motion preference/speed and streaming cursor;
+- sidebar overflow-menu direction (left or right of the `…` trigger);
 - every semantic color token with preview/reset;
 - export/import a versioned theme file.
 

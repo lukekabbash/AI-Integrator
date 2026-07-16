@@ -72,6 +72,32 @@ pub async fn task_generate_title(
     .map_err(CommandError::from)
 }
 
+/// Model and reasoning-effort overrides for one helper turn. A `None` field
+/// keeps that route's own economy policy for that field alone, so a caller can
+/// pin a model without also pinning effort. `Default` is the historical
+/// behavior: cheapest of everything.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HelperRoute {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+impl HelperRoute {
+    fn model(&self) -> Option<&str> {
+        self.model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
+    fn effort(&self) -> Option<&str> {
+        self.effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+}
+
 /// Run a short, tool-denied helper turn in a fresh scratch directory. Chat
 /// titles and commit subjects share this boundary so provider selection,
 /// cheapest-model policy, timeout handling, and cleanup cannot drift apart.
@@ -79,6 +105,24 @@ pub(crate) async fn generate_isolated_provider_text(
     data_directory: &Path,
     provider: ProviderKind,
     prompt: &str,
+) -> CommandResult<String> {
+    generate_isolated_provider_text_routed(
+        data_directory,
+        provider,
+        prompt,
+        &HelperRoute::default(),
+    )
+    .await
+}
+
+/// The same boundary with an explicit model/effort route. Only the selection
+/// explainer passes one today: it is the single helper whose model the user
+/// picks, so it is also the only one that may opt out of the economy default.
+pub(crate) async fn generate_isolated_provider_text_routed(
+    data_directory: &Path,
+    provider: ProviderKind,
+    prompt: &str,
+    route: &HelperRoute,
 ) -> CommandResult<String> {
     let scratch = data_directory
         .join("provider-workers")
@@ -90,12 +134,12 @@ pub(crate) async fn generate_isolated_provider_text(
         )
     })?;
     let result = match provider {
-        ProviderKind::Codex => generate_codex_title(&scratch, prompt).await,
+        ProviderKind::Codex => generate_codex_title(&scratch, prompt, route).await,
         ProviderKind::Cursor | ProviderKind::Grok => {
-            generate_acp_title(provider, &scratch, prompt).await
+            generate_acp_title(provider, &scratch, prompt, route).await
         }
         ProviderKind::Claude | ProviderKind::Antigravity => {
-            generate_structured_title(provider, &scratch, prompt).await
+            generate_structured_title(provider, &scratch, prompt, route).await
         }
         ProviderKind::CustomAcp => Err(command_error(
             "provider-unavailable",
@@ -178,7 +222,11 @@ pub(crate) fn format_subagent_title(ordinal: usize, title: &str) -> String {
     )
 }
 
-async fn generate_codex_title(cwd: &Path, prompt: &str) -> CommandResult<String> {
+async fn generate_codex_title(
+    cwd: &Path,
+    prompt: &str,
+    route: &HelperRoute,
+) -> CommandResult<String> {
     let executable = executable_for(ProviderKind::Codex).await?;
     let client = adapter_codex::CodexClient::spawn(CodexLaunchOptions {
         executable,
@@ -193,7 +241,7 @@ async fn generate_codex_title(cwd: &Path, prompt: &str) -> CommandResult<String>
             .list_models(false)
             .await
             .map_err(CommandError::from)?;
-        let (model, effort) = cheapest_codex_model(&catalog);
+        let (model, effort) = select_codex_model(&catalog, route);
         let thread = client
             .start_ephemeral_read_only_thread(cwd, model.as_deref(), effort.as_deref())
             .await
@@ -266,6 +314,7 @@ async fn generate_acp_title(
     provider: ProviderKind,
     cwd: &Path,
     prompt: &str,
+    route: &HelperRoute,
 ) -> CommandResult<String> {
     let executable = executable_for(provider).await?;
     let client = adapter_acp::AcpClient::spawn(AcpLaunchOptions {
@@ -294,17 +343,18 @@ async fn generate_acp_title(
             .to_owned();
         session_id = Some(id.clone());
         if let Some((config_id, model)) =
-            cheapest_acp_option(&session, "model", &["model", "models"])
+            select_acp_option(&session, "model", &["model", "models"], route.model())
         {
             client
                 .set_config_option(&id, &config_id, &model)
                 .await
                 .map_err(CommandError::from)?;
         }
-        if let Some((config_id, effort)) = cheapest_acp_option(
+        if let Some((config_id, effort)) = select_acp_option(
             &session,
             "thought_level",
             &["effort", "reasoning", "thought_level"],
+            route.effort(),
         ) {
             let _ = client.set_config_option(&id, &config_id, &effort).await;
         }
@@ -367,13 +417,15 @@ async fn generate_structured_title(
     provider: ProviderKind,
     cwd: &Path,
     prompt: &str,
+    route: &HelperRoute,
 ) -> CommandResult<String> {
     let executable = executable_for(provider).await?;
-    let (structured_provider, model) = match provider {
+    let (structured_provider, economy_model) = match provider {
         ProviderKind::Claude => (StructuredCliProvider::Claude, "claude-haiku-4-5"),
         ProviderKind::Antigravity => (StructuredCliProvider::Antigravity, "Gemini 3.5 Flash"),
         _ => unreachable!("structured title route is provider-checked"),
     };
+    let model = route.model().unwrap_or(economy_model);
     let client = StructuredCliClient::new();
     let mut receiver = client.subscribe();
     let turn_id = client
@@ -386,7 +438,7 @@ async fn generate_structured_title(
                 // Claude forwards this as `--effort low`; agy composes it into
                 // the model name ("Gemini 3.5 Flash (Low)") — agy's registry
                 // only accepts suffixed names, so omitting it fails the turn.
-                effort: Some("low".into()),
+                effort: Some(route.effort().unwrap_or("low").into()),
                 resume_session_id: None,
                 permission_mode: StructuredPermissionMode::ReadOnly,
                 mcp_config_path: None,
@@ -471,41 +523,77 @@ async fn executable_for(provider: ProviderKind) -> CommandResult<std::path::Path
     })
 }
 
-fn cheapest_codex_model(catalog: &Value) -> (Option<String>, Option<String>) {
-    let entries = catalog
+/// Honor whatever the caller pinned and fall back to the economy pick per
+/// field. A pinned model is forwarded verbatim rather than checked against the
+/// catalog: the picker only offers catalog entries, and silently downgrading an
+/// explicit choice is worse than surfacing the provider's own error.
+fn select_codex_model(catalog: &Value, route: &HelperRoute) -> (Option<String>, Option<String>) {
+    let Some(model) = route.model() else {
+        let (model, effort) = cheapest_codex_model(catalog);
+        return (model, route.effort().map(str::to_owned).or(effort));
+    };
+    // A pinned model changes which efforts are legal, so the cheapest model's
+    // economy effort cannot carry over — re-derive it from the pinned entry.
+    let effort = route
+        .effort()
+        .map(str::to_owned)
+        .or_else(|| cheapest_effort_for(catalog, model));
+    (Some(model.to_owned()), effort)
+}
+
+fn codex_entries(catalog: &Value) -> Option<&Vec<Value>> {
+    catalog
         .get("models")
         .or_else(|| catalog.get("items"))
         .or_else(|| catalog.get("data"))
-        .and_then(Value::as_array);
-    let Some(entries) = entries else {
+        .and_then(Value::as_array)
+}
+
+fn codex_model_id(entry: &Value) -> Option<&str> {
+    entry
+        .get("id")
+        .or_else(|| entry.get("model"))
+        .or_else(|| entry.get("slug"))
+        .or_else(|| entry.get("name"))
+        .and_then(Value::as_str)
+}
+
+fn cheapest_advertised_effort(entry: &Value) -> Option<String> {
+    entry
+        .get("supportedReasoningEfforts")
+        .and_then(Value::as_array)
+        .and_then(|values| {
+            values
+                .iter()
+                .filter_map(reasoning_effort)
+                .min_by_key(|value| cheap_effort_score(value))
+        })
+}
+
+/// The cheapest reasoning effort the catalog advertises for one model id.
+fn cheapest_effort_for(catalog: &Value, model: &str) -> Option<String> {
+    codex_entries(catalog)?
+        .iter()
+        .find(|entry| codex_model_id(entry) == Some(model))
+        .and_then(cheapest_advertised_effort)
+}
+
+fn cheapest_codex_model(catalog: &Value) -> (Option<String>, Option<String>) {
+    let Some(entries) = codex_entries(catalog) else {
         return (None, None);
     };
     entries
         .iter()
         .filter_map(|entry| {
-            let id = entry
-                .get("id")
-                .or_else(|| entry.get("model"))
-                .or_else(|| entry.get("slug"))
-                .or_else(|| entry.get("name"))
-                .and_then(Value::as_str)?;
+            let id = codex_model_id(entry)?;
             let label = entry
                 .get("displayName")
                 .and_then(Value::as_str)
                 .unwrap_or(id);
-            let effort = entry
-                .get("supportedReasoningEfforts")
-                .and_then(Value::as_array)
-                .and_then(|values| {
-                    values
-                        .iter()
-                        .filter_map(reasoning_effort)
-                        .min_by_key(|value| cheap_effort_score(value))
-                });
             Some((
                 cheap_model_score(&format!("{id} {label}")),
                 id.to_owned(),
-                effort,
+                cheapest_advertised_effort(entry),
             ))
         })
         .min_by_key(|(score, _, _)| *score)
@@ -522,11 +610,40 @@ fn reasoning_effort(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn cheapest_acp_option(
+/// Pick one ACP session config value: the caller's choice when the session
+/// actually advertises it, otherwise the economy pick. Unlike the Codex and
+/// structured routes, an unadvertised request is dropped rather than forwarded
+/// — ACP rejects unknown option values outright, so passing one through would
+/// fail the whole turn instead of merely ignoring the preference.
+fn select_acp_option(
     session: &Value,
     category: &str,
     fallback_ids: &[&str],
+    requested: Option<&str>,
 ) -> Option<(String, String)> {
+    let (config_id, values) = acp_option_values(session, category, fallback_ids)?;
+    if let Some(requested) = requested
+        && values.iter().any(|(value, _)| value == requested)
+    {
+        return Some((config_id, requested.to_owned()));
+    }
+    values
+        .into_iter()
+        .min_by_key(|(value, name)| {
+            if category == "model" {
+                cheap_model_score(&format!("{value} {name}"))
+            } else {
+                cheap_effort_score(value)
+            }
+        })
+        .map(|(value, _)| (config_id, value))
+}
+
+fn acp_option_values(
+    session: &Value,
+    category: &str,
+    fallback_ids: &[&str],
+) -> Option<(String, Vec<(String, String)>)> {
     let options = session
         .get("configOptions")
         .or_else(|| session.pointer("/session/configOptions"))
@@ -545,16 +662,7 @@ fn cheapest_acp_option(
     let config_id = option.get("id").and_then(Value::as_str)?.to_owned();
     let mut values = Vec::new();
     collect_acp_values(option.get("options"), &mut values);
-    values
-        .into_iter()
-        .min_by_key(|(value, name)| {
-            if category == "model" {
-                cheap_model_score(&format!("{value} {name}"))
-            } else {
-                cheap_effort_score(value)
-            }
-        })
-        .map(|(value, _)| (config_id, value))
+    Some((config_id, values))
 }
 
 fn collect_acp_values(value: Option<&Value>, output: &mut Vec<(String, String)>) {
@@ -713,7 +821,14 @@ mod tests {
 
     #[test]
     fn acp_prefers_the_provider_economy_model() {
-        let session = json!({
+        assert_eq!(
+            select_acp_option(&acp_session(), "model", &["model"], None),
+            Some(("model".into(), "cursor-small".into()))
+        );
+    }
+
+    fn acp_session() -> Value {
+        json!({
             "sessionId": "session-1",
             "configOptions": [{
                 "id": "model",
@@ -723,9 +838,60 @@ mod tests {
                     { "value": "cursor-small", "name": "Cursor Small" }
                 ]
             }]
-        });
+        })
+    }
+
+    fn route(model: Option<&str>, effort: Option<&str>) -> HelperRoute {
+        HelperRoute {
+            model: model.map(str::to_owned),
+            effort: effort.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_pinned_model_overrides_the_codex_economy_pick() {
+        let catalog = json!({ "models": [
+            { "id": "gpt-frontier", "supportedReasoningEfforts": ["medium", "high"] },
+            { "id": "gpt-codex-mini", "supportedReasoningEfforts": ["medium", "minimal"] }
+        ] });
+        // The pinned model brings its own cheapest effort: `minimal` belongs to
+        // gpt-codex-mini and is not legal for gpt-frontier.
         assert_eq!(
-            cheapest_acp_option(&session, "model", &["model"]),
+            select_codex_model(&catalog, &route(Some("gpt-frontier"), None)),
+            (Some("gpt-frontier".into()), Some("medium".into()))
+        );
+        assert_eq!(
+            select_codex_model(&catalog, &route(Some("gpt-frontier"), Some("high"))),
+            (Some("gpt-frontier".into()), Some("high".into()))
+        );
+    }
+
+    #[test]
+    fn an_empty_pinned_route_falls_back_to_the_economy_pick() {
+        let catalog = json!({ "models": [
+            { "id": "gpt-frontier", "supportedReasoningEfforts": ["medium", "high"] },
+            { "id": "gpt-codex-mini", "supportedReasoningEfforts": ["medium", "minimal"] }
+        ] });
+        assert_eq!(
+            select_codex_model(&catalog, &route(Some("   "), None)),
+            (Some("gpt-codex-mini".into()), Some("minimal".into()))
+        );
+    }
+
+    #[test]
+    fn acp_honors_a_pinned_model_the_session_advertises() {
+        assert_eq!(
+            select_acp_option(&acp_session(), "model", &["model"], Some("gpt-frontier-mini")),
+            Some(("model".into(), "gpt-frontier-mini".into()))
+        );
+    }
+
+    #[test]
+    fn acp_drops_a_pinned_model_the_session_does_not_advertise() {
+        // ACP rejects unknown option values, so an unavailable pin degrades to
+        // the economy model rather than failing the turn.
+        assert_eq!(
+            select_acp_option(&acp_session(), "model", &["model"], Some("claude-opus-4-8")),
             Some(("model".into(), "cursor-small".into()))
         );
     }

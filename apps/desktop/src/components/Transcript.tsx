@@ -31,8 +31,14 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { bridge, openExternalLink, attachmentKind, type TranscriptEvent } from "../bridge";
-import { DiffView, type DiffSelectionPayload } from "./DiffView";
+import {
+  bridge,
+  openExternalLink,
+  attachmentKind,
+  type DiffFile,
+  type TranscriptEvent,
+} from "../bridge";
+import { DiffView, type DiffCommitState, type DiffSelectionPayload } from "./DiffView";
 import { FileIcon } from "./FileIcon";
 import { Tooltip } from "./Tooltip";
 import { splitAttachmentBlock } from "./conversationFormatting";
@@ -83,6 +89,21 @@ interface TranscriptProps {
   onOpenFile?: (path: string) => void;
   /** Selection-to-chat from transcript-embedded diffs. */
   onAddDiffSelection?: (payload: DiffSelectionPayload) => void;
+  /** Marks the file an inline edit diff touches reviewed for this task. */
+  onApproveDiff?: (file: DiffFile) => void;
+  /**
+   * Reports whether the file an inline edit diff touches is already reviewed.
+   * Review state is per file, so every edit of the same file reads as approved
+   * once any one of them is.
+   */
+  isDiffApproved?: (file: DiffFile) => boolean;
+  /** Undoes the edit an inline diff describes. Revert renders disabled without it. */
+  onRevertDiff?: (file: DiffFile) => void;
+  /**
+   * Places the edited file in Git so settled edits caption instead of offering
+   * actions. Returning undefined keeps the action pair.
+   */
+  diffCommitState?: (file: DiffFile) => DiffCommitState | undefined;
 }
 
 const LOAD_OLDER_THRESHOLD_PX = 96;
@@ -558,6 +579,10 @@ interface ActivityEventProps {
   onExpandedChange: (eventId: string, expanded: boolean) => void;
   onOpenFile?: (path: string) => void;
   onAddDiffSelection?: (payload: DiffSelectionPayload) => void;
+  onApproveDiff?: (file: DiffFile) => void;
+  isDiffApproved?: (file: DiffFile) => boolean;
+  onRevertDiff?: (file: DiffFile) => void;
+  diffCommitState?: (file: DiffFile) => DiffCommitState | undefined;
 }
 
 const ActivityEvent = memo(function ActivityEventRow({
@@ -567,6 +592,10 @@ const ActivityEvent = memo(function ActivityEventRow({
   onExpandedChange,
   onOpenFile,
   onAddDiffSelection,
+  onApproveDiff,
+  isDiffApproved,
+  onRevertDiff,
+  diffCommitState,
 }: ActivityEventProps): React.ReactElement {
   const expanded = isExpanded(event);
   const hasChildren = Boolean(event.children?.length);
@@ -629,6 +658,11 @@ const ActivityEvent = memo(function ActivityEventRow({
               </button>
             ) : event.title ? (
               <span title={pathOnlyBody && filePath ? filePath : undefined}>{displayBody}</span>
+            ) : null}
+            {isWorkedFor && event.resumed ? (
+              <em className="activity-resumed-cue" aria-label="Resumed after interruption">
+                resumed
+              </em>
             ) : null}
           </span>
           {event.changeStats || event.meta ? (
@@ -712,6 +746,10 @@ const ActivityEvent = memo(function ActivityEventRow({
                   onExpandedChange={onExpandedChange}
                   onOpenFile={onOpenFile}
                   onAddDiffSelection={onAddDiffSelection}
+                  onApproveDiff={onApproveDiff}
+                  isDiffApproved={isDiffApproved}
+                  onRevertDiff={onRevertDiff}
+                  diffCommitState={diffCommitState}
                 />
               ),
             )}
@@ -729,6 +767,10 @@ const ActivityEvent = memo(function ActivityEventRow({
               file={event.diff}
               variant="inline"
               showReviewActions={false}
+              reviewed={isDiffApproved?.(event.diff) ?? false}
+              onMarkReviewed={onApproveDiff}
+              onRevert={onRevertDiff}
+              commitState={diffCommitState?.(event.diff)}
               onAddSelection={onAddDiffSelection}
             />
           </motion.div>
@@ -811,6 +853,10 @@ export function Transcript({
   onEditUserMessage,
   onOpenFile,
   onAddDiffSelection,
+  onApproveDiff,
+  isDiffApproved,
+  onRevertDiff,
+  diffCommitState,
 }: TranscriptProps) {
   const [initialViewportState] = useState(() => readTranscriptViewportState(ownerKey));
   const [copiedEventId, setCopiedEventId] = useState<string | null>(null);
@@ -877,6 +923,8 @@ export function Transcript({
   const editUserRef = useRef(onEditUserMessage);
   const openFileRef = useRef(onOpenFile);
   const addDiffSelectionRef = useRef(onAddDiffSelection);
+  const approveDiffRef = useRef(onApproveDiff);
+  const revertDiffRef = useRef(onRevertDiff);
 
   const liveActivity = running ? findTrailingActivity(events) : undefined;
   const renderedEventCount = events.length - (liveActivity ? 1 : 0);
@@ -986,7 +1034,18 @@ export function Transcript({
     editUserRef.current = onEditUserMessage;
     openFileRef.current = onOpenFile;
     addDiffSelectionRef.current = onAddDiffSelection;
-  }, [onAddDiffSelection, onAskAbout, onBranch, onEditUserMessage, onOpenFile, onRegenerate]);
+    approveDiffRef.current = onApproveDiff;
+    revertDiffRef.current = onRevertDiff;
+  }, [
+    onAddDiffSelection,
+    onApproveDiff,
+    onAskAbout,
+    onBranch,
+    onEditUserMessage,
+    onOpenFile,
+    onRegenerate,
+    onRevertDiff,
+  ]);
 
   const queueViewportSave = useCallback(() => {
     if (!ownerKey) return;
@@ -1248,6 +1307,10 @@ export function Transcript({
         armPagination();
       }
     };
+    const handlePointerDown = (event: PointerEvent) => {
+      // Scrollbar drags hit the container itself; row content does not.
+      if (event.target === container) armPagination();
+    };
     let lastTouchY: number | undefined;
     const handleTouchStart = (event: TouchEvent) => {
       lastTouchY = event.touches[0]?.clientY;
@@ -1266,12 +1329,14 @@ export function Transcript({
     container.addEventListener("scroll", handleScroll, { passive: true });
     container.addEventListener("wheel", handleWheel, { passive: true });
     container.addEventListener("keydown", handleKeyDown);
+    container.addEventListener("pointerdown", handlePointerDown, { passive: true });
     container.addEventListener("touchstart", handleTouchStart, { passive: true });
     container.addEventListener("touchmove", handleTouchMove, { passive: true });
     return () => {
       container.removeEventListener("scroll", handleScroll);
       container.removeEventListener("wheel", handleWheel);
       container.removeEventListener("keydown", handleKeyDown);
+      container.removeEventListener("pointerdown", handlePointerDown);
       container.removeEventListener("touchstart", handleTouchStart);
       container.removeEventListener("touchmove", handleTouchMove);
     };
@@ -1534,6 +1599,8 @@ export function Transcript({
     (payload: DiffSelectionPayload) => addDiffSelectionRef.current?.(payload),
     [],
   );
+  const approveDiff = useCallback((file: DiffFile) => approveDiffRef.current?.(file), []);
+  const revertDiff = useCallback((file: DiffFile) => revertDiffRef.current?.(file), []);
 
   const renderTranscriptEvent = (event: TranscriptEvent) => {
     if (event.kind === "user") {
@@ -1598,6 +1665,10 @@ export function Transcript({
         onExpandedChange={setActivityExpanded}
         onOpenFile={onOpenFile ? openFile : undefined}
         onAddDiffSelection={onAddDiffSelection ? addDiffSelection : undefined}
+        onApproveDiff={onApproveDiff ? approveDiff : undefined}
+        isDiffApproved={isDiffApproved}
+        onRevertDiff={onRevertDiff ? revertDiff : undefined}
+        diffCommitState={diffCommitState}
       />
     );
   };
@@ -1829,6 +1900,10 @@ export function Transcript({
                         onExpandedChange={setActivityExpanded}
                         onOpenFile={onOpenFile ? openFile : undefined}
                         onAddDiffSelection={onAddDiffSelection ? addDiffSelection : undefined}
+                        onApproveDiff={onApproveDiff ? approveDiff : undefined}
+                        isDiffApproved={isDiffApproved}
+                        onRevertDiff={onRevertDiff ? revertDiff : undefined}
+                        diffCommitState={diffCommitState}
                       />
                     </motion.div>
                   ),

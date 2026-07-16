@@ -106,7 +106,7 @@ describe("Runtime Settings command disclosure", () => {
     });
   });
 
-  it("persists interruption recovery and transcript density as local settings", async () => {
+  it("persists general and transcript density as local settings", async () => {
     render(
       <SettingsView
         preferences={DEFAULT_THEME_PREFERENCES}
@@ -120,16 +120,11 @@ describe("Runtime Settings command disclosure", () => {
 
     fireEvent.click(screen.getByText("General").closest("button") as HTMLButtonElement);
     await screen.findByRole("heading", { name: "General" });
-    const autoResume = screen.getByRole("switch", {
-      name: "Automatically resume interrupted responses",
-    });
-    expect(autoResume).toHaveAttribute("aria-checked", "false");
-    fireEvent.click(autoResume);
+    const saveContext = screen.getByRole("switch", { name: "Save context on edit" });
+    expect(saveContext).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(saveContext);
     await waitFor(() =>
-      expect(bridgeMock.setSetting).toHaveBeenCalledWith(
-        "settings.general.autoResumeInterruptedTurns",
-        true,
-      ),
+      expect(bridgeMock.setSetting).toHaveBeenCalledWith("settings.general.saveContextOnEdit", true),
     );
 
     fireEvent.click(screen.getByText("Composer").closest("button") as HTMLButtonElement);

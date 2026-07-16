@@ -221,12 +221,10 @@ describe("AI Integrator desktop workspace", () => {
     expect(window.localStorage.getItem("aiintegrator.settings.v1")).toContain(
       "general.openLastWorkspace",
     );
-    const autoResume = screen.getByRole("switch", {
-      name: "Automatically resume interrupted responses",
-    });
-    expect(autoResume).toHaveAttribute("aria-checked", "false");
-    fireEvent.click(autoResume);
-    expect(autoResume).toHaveAttribute("aria-checked", "true");
+    const saveContext = screen.getByRole("switch", { name: "Save context on edit" });
+    expect(saveContext).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(saveContext);
+    expect(saveContext).toHaveAttribute("aria-checked", "true");
 
     fireEvent.click(screen.getByRole("button", { name: /Appearance/i }));
     expect(

@@ -214,7 +214,14 @@ export function applyRuntimeProjection(
     case "turnChanged":
       return {
         ...next,
-        turn: projection.turn,
+        turn: {
+          ...projection.turn,
+          // Once the user presses Stop, later interrupted settlements must not
+          // clear that intent — auto-resume keys off stopRequested.
+          stopRequested:
+            projection.turn.stopRequested ||
+            (state.turn?.id === projection.turn.id && Boolean(state.turn.stopRequested)),
+        },
         // A freshly started turn is a new attempt; stale errors from prior
         // attempts should not keep stacking at the bottom of the transcript.
         errors:
@@ -894,6 +901,7 @@ function makeWorkedForEvent(
   finalAssistantId: string,
   turn: TurnProjection | undefined,
   segmentKey: string,
+  resumed = false,
 ): TranscriptEvent {
   const status = activityGroupStatus(children);
   const additions = children.reduce(
@@ -912,6 +920,7 @@ function makeWorkedForEvent(
     body: workedForDuration(children, turn),
     timestamp: children[0]?.timestamp ?? turn?.completedAt ?? new Date(0).toISOString(),
     status,
+    resumed: resumed || undefined,
     changeStats: additions || deletions ? { additions, deletions } : undefined,
     children,
     expandedByDefault: false,
@@ -1015,11 +1024,20 @@ function collapseSettledTurnActivity(
   return result;
 }
 
+/** Wire-only resume placeholder; never rendered as a user bubble. */
+export const INTERRUPTED_RESUME_VISIBLE_PROMPT = "Resume from here";
+
 function deriveItemTranscriptEvents(
   item: ItemProjection,
   timestamp: string,
   status: TranscriptEvent["status"],
 ): TranscriptEvent[] {
+  if (
+    item.kind === "userMessage" &&
+    item.body?.trim() === INTERRUPTED_RESUME_VISIBLE_PROMPT
+  ) {
+    return [];
+  }
   const hasFileChanges =
     (item.kind === "fileChange" || item.kind === "mcpTool") && Boolean(item.fileChanges?.length);
   const toolPresentation =

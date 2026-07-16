@@ -67,4 +67,19 @@ describe("DiffView layout contract", () => {
     expect(styles).toContain("border-color: CanvasText");
     expect(styles).toContain("background: Canvas");
   });
+
+  it("hangs transcript diffs off the activity indent with no rail down their left", () => {
+    const review = rule(".activity-diff-review");
+
+    expect(review).toContain("margin: 4px 0 8px 25px");
+    expect(review).not.toContain("border-left");
+  });
+
+  it("keeps the inline action pair from being squeezed by the file title", () => {
+    // .diff-file-title holds flex: 1, so the pair only stays glued to the
+    // counts while it refuses to flex.
+    expect(rule(".diff-file-title")).toContain("flex: 1");
+    expect(rule(".diff-inline-actions")).toContain("flex: none");
+    expect(rule(".diff-inline-action")).toContain("white-space: nowrap");
+  });
 });

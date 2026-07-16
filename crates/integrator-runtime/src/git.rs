@@ -261,12 +261,39 @@ pub struct PushPreview {
     pub ahead: u64,
     pub behind: u64,
     pub refspec: String,
-    pub force: bool,
+}
+
+/// Whether a push may rewrite remote history, and how carefully.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PushForce {
+    /// Never rewrite. The default, and the only mode that cannot destroy a
+    /// commit that is not already in the local history.
+    #[default]
+    Off,
+    /// Rewrite only while the remote is still where the last fetch left it, so
+    /// a commit pushed by someone else since then aborts the push instead of
+    /// being overwritten. Note the lease is only as fresh as the last fetch:
+    /// fetching immediately before a forced push re-arms it against work the
+    /// user has still never seen.
+    Lease,
+    /// Rewrite unconditionally, discarding whatever the remote holds.
+    Always,
+}
+
+impl PushForce {
+    fn flag(self) -> Option<&'static str> {
+        match self {
+            Self::Off => None,
+            Self::Lease => Some("--force-with-lease"),
+            Self::Always => Some("--force"),
+        }
+    }
 }
 
 /// Exact repository state presented to the user before a push. The native
-/// service recomputes every field immediately before starting Git and never
-/// uses these renderer-owned strings as process arguments.
+/// service recomputes every `expected_*` field immediately before starting Git
+/// and never uses these renderer-owned strings as process arguments.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PushConfirmation {
@@ -276,6 +303,13 @@ pub struct PushConfirmation {
     pub expected_remote_url: Option<String>,
     pub expected_upstream: String,
     pub expected_refspec: String,
+    /// Intent rather than state: the force mode the user confirmed. Unlike the
+    /// `expected_*` fields there is no repository value to recompute it
+    /// against, so it travels inside the confirmed payload rather than beside
+    /// it — a force push is then something the user agreed to, not a flag a
+    /// caller can add after the preview they saw. Absent means `Off`.
+    #[serde(default)]
+    pub force: PushForce,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -698,6 +732,25 @@ impl GitService {
         self.worktrees(repository)
     }
 
+    /// The subset of `paths` that Git tracks.
+    ///
+    /// `status --untracked-files=all` already reports untracked files, so a path
+    /// missing from both that and this set is ignored rather than committed.
+    /// Callers use the difference to avoid claiming an ignored file was pushed.
+    pub fn tracked_paths(&self, repository: &Path, paths: &[String]) -> Result<Vec<String>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args = vec!["ls-files", "-z", "--"];
+        args.extend(paths.iter().map(String::as_str));
+        let output = self.required(repository, &args)?;
+        Ok(output
+            .split('\0')
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
     pub fn status(&self, repository: &Path) -> Result<Vec<FileStatus>> {
         let output = self.required(
             repository,
@@ -1014,14 +1067,13 @@ impl GitService {
             ahead,
             behind,
             refspec,
-            force: false,
         })
     }
 
     /// Push the exact local commit and destination the user confirmed. A
     /// changed HEAD, branch, upstream, remote, URL, or refspec invalidates the
-    /// confirmation. Force pushing and implicit branch publication are not
-    /// part of this command.
+    /// confirmation. Implicit branch publication is not part of this command;
+    /// force pushing is, but only in the mode the confirmation carries.
     pub fn push_confirmed(
         &self,
         repository: &Path,
@@ -1051,13 +1103,9 @@ impl GitService {
             ));
         }
 
-        let args = [
-            "push",
-            "--porcelain",
-            "--",
-            remote.as_str(),
-            current.refspec.as_str(),
-        ];
+        let mut args = vec!["push", "--porcelain"];
+        args.extend(confirmation.force.flag());
+        args.extend(["--", remote.as_str(), current.refspec.as_str()]);
         let outcome = run_bounded_with_outcome(
             &self.executable,
             &args,
@@ -1159,7 +1207,6 @@ impl GitService {
             ahead: status.ahead,
             behind: status.behind,
             refspec,
-            force: false,
         })
     }
 
@@ -1797,6 +1844,10 @@ mod tests {
     }
 
     fn confirmation_for(preview: &PushPreview) -> PushConfirmation {
+        forced_confirmation_for(preview, PushForce::Off)
+    }
+
+    fn forced_confirmation_for(preview: &PushPreview, force: PushForce) -> PushConfirmation {
         PushConfirmation {
             expected_head: preview.head.clone(),
             expected_branch: preview.branch.clone(),
@@ -1804,6 +1855,7 @@ mod tests {
             expected_remote_url: preview.sanitized_remote_url.clone(),
             expected_upstream: preview.upstream.clone().expect("configured upstream"),
             expected_refspec: preview.refspec.clone(),
+            force,
         }
     }
 
@@ -1957,7 +2009,6 @@ mod tests {
         let preview = git.push_preview(root).expect("preview");
         assert!(preview.head.starts_with(&history[0].id));
         assert_eq!(preview.branch, "main");
-        assert!(!preview.force);
     }
 
     #[test]
@@ -2018,6 +2069,88 @@ mod tests {
                 .expect("remote head")
                 .trim(),
             commit.commit
+        );
+    }
+
+    #[test]
+    fn force_modes_map_to_the_flag_they_promise() {
+        assert_eq!(PushForce::Off.flag(), None);
+        assert_eq!(PushForce::Lease.flag(), Some("--force-with-lease"));
+        assert_eq!(PushForce::Always.flag(), Some("--force"));
+        // A payload with no force field means the safe mode, never a remembered one.
+        assert_eq!(PushForce::default(), PushForce::Off);
+    }
+
+    #[test]
+    fn a_forced_push_rewrites_remote_history_only_when_the_confirmation_asks_for_it() {
+        if which::which("git").is_err() {
+            return;
+        }
+        let local_directory = tempfile::tempdir().expect("local repo");
+        let remote_directory = tempfile::tempdir().expect("bare remote");
+        let root = local_directory.path();
+        initialize_repository(root);
+        configure_identity(root);
+        assert!(
+            Command::new("git")
+                .args(["init", "--bare"])
+                .current_dir(remote_directory.path())
+                .status()
+                .expect("bare git init")
+                .success()
+        );
+        let remote_path = remote_directory.path().to_string_lossy().into_owned();
+        assert!(
+            Command::new("git")
+                .args(["remote", "add", "origin", &remote_path])
+                .current_dir(root)
+                .status()
+                .expect("git remote add")
+                .success()
+        );
+        let git = GitService::discover().expect("discover git");
+        fs::write(root.join("sample.txt"), "initial\n").expect("write initial fixture");
+        git.stage(root, &[PathBuf::from("sample.txt")])
+            .expect("stage initial fixture");
+        git.commit(root, "Initial fixture").expect("initial commit");
+        assert!(
+            Command::new("git")
+                .args(["push", "-u", "origin", "main"])
+                .current_dir(root)
+                .status()
+                .expect("initial push")
+                .success()
+        );
+
+        // Rewrite the commit that was already pushed, so the local branch and
+        // the remote diverge and only a forced push can reconcile them.
+        fs::write(root.join("sample.txt"), "rewritten\n").expect("write rewritten fixture");
+        git.stage(root, &[PathBuf::from("sample.txt")])
+            .expect("stage rewritten fixture");
+        assert!(
+            Command::new("git")
+                .args(["commit", "--amend", "-m", "Rewritten fixture"])
+                .current_dir(root)
+                .status()
+                .expect("git commit --amend")
+                .success()
+        );
+
+        let preview = git.push_preview(root).expect("push preview");
+        assert_eq!((preview.ahead, preview.behind), (1, 1));
+        // The ordinary confirmation carries no force mode, so a diverged push
+        // is refused rather than quietly rewriting the remote.
+        assert!(git.push_confirmed(root, &confirmation_for(&preview)).is_err());
+
+        let result = git
+            .push_confirmed(root, &forced_confirmation_for(&preview, PushForce::Lease))
+            .expect("leased force push");
+        assert_eq!(result.outcome, PushOutcome::Pushed);
+        assert_eq!(
+            git.required(remote_directory.path(), &["rev-parse", "refs/heads/main"])
+                .expect("remote head")
+                .trim(),
+            preview.head
         );
     }
 

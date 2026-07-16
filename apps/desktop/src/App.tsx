@@ -81,6 +81,7 @@ import {
 import { ComposerDraftStore } from "./composerDraftStore";
 import { nextForkTitle } from "./forkTitle";
 import type { RuntimeActionRequest } from "./components/SettingsView";
+import type { DiffCommitState } from "./components/DiffView";
 import { createDemoSnapshot, createEmptySnapshot, type WorkspaceSnapshot } from "./demoData";
 import { reconcileGitSnapshot } from "./gitSnapshot";
 import {
@@ -111,6 +112,7 @@ import {
   createRuntimeProjectionState,
   createRuntimeTranscriptDeriver,
   hydrateRuntimeProjectionState,
+  INTERRUPTED_RESUME_VISIBLE_PROMPT,
   isFrameBatchableRuntimeProjection,
   mergeOlderProjectionHydrate,
   taskActivityUpdate,
@@ -1103,13 +1105,20 @@ const CONNECTION_NOTICE_EXIT_MS = 220;
 function ConnectionNotice({
   state,
   runtime,
+  resuming = false,
 }: {
   state: RuntimeProjectionState["connection"];
   runtime: string;
+  /** Quiet chrome while an interrupted turn is being continued. */
+  resuming?: boolean;
 }) {
-  const active = state.state !== "connected";
+  const displayState: RuntimeProjectionState["connection"] = resuming
+    ? { state: "connecting" }
+    : state;
+  const active = displayState.state !== "connected";
   const [notice, setNotice] = useState<{
     connection: RuntimeProjectionState["connection"];
+    resuming: boolean;
     exiting: boolean;
   } | null>(null);
 
@@ -1118,12 +1127,13 @@ function ConnectionNotice({
       if (
         notice &&
         !notice.exiting &&
-        notice.connection.state === state.state &&
-        notice.connection.reason === state.reason
+        notice.connection.state === displayState.state &&
+        notice.connection.reason === displayState.reason &&
+        notice.resuming === resuming
       )
         return;
       const timer = window.setTimeout(
-        () => setNotice({ connection: state, exiting: false }),
+        () => setNotice({ connection: displayState, resuming, exiting: false }),
         notice ? 0 : CONNECTION_NOTICE_DELAY_MS,
       );
       return () => window.clearTimeout(timer);
@@ -1134,13 +1144,13 @@ function ConnectionNotice({
       notice.exiting ? CONNECTION_NOTICE_EXIT_MS : 0,
     );
     return () => window.clearTimeout(timer);
-  }, [active, notice, state]);
+  }, [active, displayState, notice, resuming]);
 
   if (!notice) return null;
   const shown = notice.connection;
   if (shown.state === "connected") return null;
   const labels = {
-    connecting: `Connecting to ${runtime}…`,
+    connecting: notice.resuming ? "Resuming…" : `Connecting to ${runtime}…`,
     disconnected: `${runtime} is disconnected`,
     reconciling: "Reconciling persisted task state…",
     gap: "Some runtime events were missed",
@@ -1156,7 +1166,7 @@ function ConnectionNotice({
       <span className="runtime-connection-dot" aria-hidden="true" />
       <span>
         <strong>{labels[shown.state]}</strong>
-        {shown.reason ? <small>{shown.reason}</small> : null}
+        {shown.reason && !notice.resuming ? <small>{shown.reason}</small> : null}
       </span>
     </div>
   );
@@ -1197,11 +1207,26 @@ function recordRuntimeVerificationEvent(
   return false;
 }
 
+// Some runtimes leave a pending approval in place after retracting the
+// command it was for, instead of transitioning it to "cancelled"/"expired".
+// Responding to it is a no-op the backend rejects, so its buttons look dead.
+// Recognize the tell (varies by provider wording) and drop it client-side
+// rather than showing an approval no click can resolve.
+const STALE_APPROVAL_PATTERN = /no longer (?:required|needed|applicable|valid)/i;
+
+function isStaleApproval(approval: ApprovalProjection): boolean {
+  return (
+    STALE_APPROVAL_PATTERN.test(approval.reason ?? "") ||
+    STALE_APPROVAL_PATTERN.test(approval.command ?? "")
+  );
+}
+
 function ApprovalControl({
   approval,
   busy,
   autoApproving,
   runtime,
+  crowded,
   onDecision,
 }: {
   approval: ApprovalProjection;
@@ -1209,6 +1234,9 @@ function ApprovalControl({
   autoApproving?: boolean;
   /** Which provider raised the approval; tailors plan-review actions. */
   runtime?: RuntimeId;
+  /** The status shelf (run timer / recovery / queue) floats above the
+   *  composer at the same time — pull back to clear it. */
+  crowded?: boolean;
   onDecision: (decision: ApprovalDecision) => void;
 }) {
   const isCommand = approval.approvalKind === "commandExecution";
@@ -1223,6 +1251,7 @@ function ApprovalControl({
     <section
       className="approval-control"
       data-auto={autoApproving || undefined}
+      data-crowded={crowded || undefined}
       aria-labelledby={`approval-${approval.id}`}
     >
       <header className="approval-header">
@@ -1406,6 +1435,13 @@ export default function App() {
     message: string;
   } | null>(null);
   const autoResumeAttemptedRef = useRef(new Set<string>());
+  /** Worked-for rows that continued after an interruption; quiet (resumed) cue. */
+  const resumedWorkedForIdsRef = useRef(new Set<string>());
+  const resumeWorkedForBaselineRef = useRef<Set<string> | null>(null);
+  const [resumedWorkedForVersion, setResumedWorkedForVersion] = useState(0);
+  // Turns the user explicitly stopped. Survives a late interrupted settlement
+  // that forgets stopRequested, so Resume cannot undo Stop.
+  const userStoppedTurnsRef = useRef(new Set<string>());
   const [queueBusyId, setQueueBusyId] = useState("");
   const queueBusyIdRef = useRef("");
   const priorityQueueIdRef = useRef("");
@@ -2921,7 +2957,7 @@ export default function App() {
           : task,
       ),
     }));
-    if (nativeHost) {
+    if (nativeHost && !options?.resumeInterrupted) {
       setOptimisticUserMessage({
         taskId: targetTask.id,
         event: {
@@ -3111,6 +3147,19 @@ export default function App() {
 
   const resumeInterruptedTurn = async (): Promise<boolean> => {
     if (!activeTask || resumingTaskId) return false;
+    // Stop is an intentional cancel; never resume (auto or manual) from it.
+    const stoppedKey =
+      runtimeState?.taskId === activeTask.id && runtimeState.turn
+        ? `${activeTask.id}:${runtimeState.turn.id}`
+        : "";
+    if (
+      (stoppedKey && userStoppedTurnsRef.current.has(stoppedKey)) ||
+      (runtimeState?.taskId === activeTask.id &&
+        runtimeState.turn?.status === "interrupted" &&
+        runtimeState.turn.stopRequested)
+    ) {
+      return false;
+    }
     const attemptedRecoveryKey =
       runtimeState?.taskId === activeTask.id && runtimeState.turn?.status === "interrupted"
         ? `${activeTask.id}:${runtimeState.turn.id}`
@@ -3129,9 +3178,14 @@ export default function App() {
         : "off";
     setResumingTaskId(activeTask.id);
     setRecoveryFailure(null);
+    resumeWorkedForBaselineRef.current = new Set(
+      projectedTranscript
+        .filter((event) => event.title === "Worked for")
+        .map((event) => event.id),
+    );
     const accepted = await sendTurn(
       {
-        prompt: "Resume from here",
+        prompt: INTERRUPTED_RESUME_VISIBLE_PROMPT,
         runtime: activeTask.runtime,
         model: activeTask.model ?? "Provider default",
         effort: activeTask.effort,
@@ -3144,6 +3198,7 @@ export default function App() {
     );
     setResumingTaskId("");
     if (!accepted) {
+      resumeWorkedForBaselineRef.current = null;
       setRecoveryFailure({
         key: attemptedRecoveryKey,
         message: "Couldn’t restore this response. You can retry or send a new message.",
@@ -4486,7 +4541,9 @@ export default function App() {
   ]);
 
   const pendingApproval = runtimeState?.approvals.find(
-    (approval) => approval.state === "pending" || approval.state === "responseFailed",
+    (approval) =>
+      (approval.state === "pending" || approval.state === "responseFailed") &&
+      !isStaleApproval(approval),
   );
   const transcriptDensity: TranscriptDensity =
     localSettings["transcript.activityDensity"] === "summary" ||
@@ -4515,30 +4572,90 @@ export default function App() {
             Date.parse(optimisticForActiveTask.event.timestamp) - 1_000,
       )
     : false;
-  const projectedTranscript = useMemo(
-    () =>
+  const nativeTurnRunning =
+    runtimeState?.taskId === activeTask?.id && runtimeState?.turn?.status === "inProgress";
+  const projectedTranscript = useMemo(() => {
+    const events =
       nativeHost
         ? providerHasOptimisticMessage || !optimisticForActiveTask
           ? nativeRuntimeEvents
           : [...nativeRuntimeEvents, optimisticForActiveTask.event].sort(
               (a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp),
             )
-        : snapshot.transcript,
-    [
-      nativeHost,
-      nativeRuntimeEvents,
-      optimisticForActiveTask,
-      providerHasOptimisticMessage,
-      snapshot.transcript,
-    ],
+        : snapshot.transcript;
+    if (resumedWorkedForIdsRef.current.size === 0) return events;
+    return events.map((event) =>
+      event.title === "Worked for" && resumedWorkedForIdsRef.current.has(event.id)
+        ? { ...event, resumed: true }
+        : event,
+    );
+  }, [
+    nativeHost,
+    nativeRuntimeEvents,
+    optimisticForActiveTask,
+    providerHasOptimisticMessage,
+    resumedWorkedForVersion,
+    snapshot.transcript,
+  ]);
+  // Transcript edits caption "Committed"/"Pushed" once Git owns them. Git status
+  // already lists untracked files, so a path in neither the working tree nor the
+  // tracked set is ignored — those keep the action pair instead of claiming a
+  // commit that never happened. Keyed as a string so a streaming turn, which
+  // rebuilds projectedTranscript on every token, does not re-run `ls-files`.
+  const transcriptEditPathKey = useMemo(() => {
+    const paths = new Set<string>();
+    const collect = (events: TranscriptEvent[]) => {
+      for (const event of events) {
+        if (event.diff) paths.add(event.diff.path);
+        if (event.children) collect(event.children);
+      }
+    };
+    collect(projectedTranscript);
+    return [...paths].sort().join("\0");
+  }, [projectedTranscript]);
+  const [trackedEditPaths, setTrackedEditPaths] = useState<ReadonlySet<string>>(new Set());
+  useEffect(() => {
+    const projectId = activeProject?.id;
+    const paths = transcriptEditPathKey ? transcriptEditPathKey.split("\0") : [];
+    if (!projectId || paths.length === 0) {
+      setTrackedEditPaths(new Set());
+      return;
+    }
+    let cancelled = false;
+    void bridge
+      .trackedPaths(projectId, paths)
+      .then((tracked) => {
+        if (!cancelled) setTrackedEditPaths(new Set(tracked));
+      })
+      .catch(() => {
+        // Unknown beats guessing: an empty set leaves every edit actionable.
+        if (!cancelled) setTrackedEditPaths(new Set());
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProject?.id, transcriptEditPathKey]);
+  const diffCommitState = useCallback(
+    (file: DiffFile): DiffCommitState | undefined => {
+      const git = snapshot.git;
+      if (git.kind !== "repository") return undefined;
+      if (git.files.some((entry) => entry.path === file.path)) return "uncommitted";
+      if (!trackedEditPaths.has(file.path)) return undefined;
+      // No upstream means nothing has been pushed, whatever `ahead` reads.
+      if (!git.upstream) return "committed";
+      return git.ahead > 0 ? "committed" : "pushed";
+    },
+    [snapshot.git, trackedEditPaths],
   );
-  const nativeTurnRunning =
-    runtimeState?.taskId === activeTask?.id && runtimeState?.turn?.status === "inProgress";
   // Once the provider has projected the user item, its authoritative event
   // replaces the local bubble and the provider's turn state owns the spinner.
   // If startup fails, sendTurn clears the optimistic item and Composer
-  // restores the draft instead.
-  const optimisticTurnStarting = Boolean(optimisticForActiveTask && !providerHasOptimisticMessage);
+  // restores the draft instead. Resume has no user bubble — treat resuming
+  // as the quiet “still starting” signal until the provider turn is live.
+  const optimisticTurnStarting = Boolean(
+    (optimisticForActiveTask && !providerHasOptimisticMessage) ||
+      (activeTask && resumingTaskId === activeTask.id && !nativeTurnRunning),
+  );
   const activeQueuedMessages = useMemo(
     () =>
       activeTask
@@ -4631,9 +4748,14 @@ export default function App() {
         } · ${usagePillTokens}`
       : `Plan usage not exposed to AI Integrator · ${usagePillTokens}`;
   const activeRuntimeState = runtimeState?.taskId === activeTask?.id ? runtimeState : undefined;
+  const activeTurnStopKey =
+    activeTask && activeRuntimeState?.turn
+      ? `${activeTask.id}:${activeRuntimeState.turn.id}`
+      : "";
   const recoverableTurn =
     activeRuntimeState?.turn?.status === "interrupted" &&
-    !activeRuntimeState.turn.stopRequested
+    !activeRuntimeState.turn.stopRequested &&
+    !(activeTurnStopKey && userStoppedTurnsRef.current.has(activeTurnStopKey))
       ? activeRuntimeState.turn
       : undefined;
   const activeAgentCount = nativeTurnRunning
@@ -4765,6 +4887,12 @@ export default function App() {
   const autoResumeEnabled = localSettings["general.autoResumeInterruptedTurns"] === true;
   const recoverableTurnId = recoverableTurn?.id;
   const recoverableStopRequested = recoverableTurn?.stopRequested;
+  // Auto-resume (or an in-flight resume) should feel continuous — no interrupt banner.
+  // Surface the control again if auto/manual resume failed.
+  const showRecoveryControl = Boolean(
+    recoverableTurn &&
+      ((!autoResumeEnabled && resumingTaskId !== activeTask?.id) || Boolean(recoveryError)),
+  );
 
   useEffect(() => {
     if (!activeTask || !recoverableTurn || recoverableTurn.stopRequested) return;
@@ -4783,6 +4911,30 @@ export default function App() {
     recoverableTurnId,
     recoveryKey,
     resumingTaskId,
+  ]);
+
+  // After a resumed turn settles, stamp new Worked-for rows with a quiet cue.
+  useEffect(() => {
+    const baseline = resumeWorkedForBaselineRef.current;
+    if (!baseline || !activeTask) return;
+    const turn = activeRuntimeState?.turn;
+    if (!turn || turn.status === "inProgress" || turn.status === "pending") return;
+    let marked = false;
+    for (const event of projectedTranscript) {
+      if (event.title !== "Worked for" || baseline.has(event.id)) continue;
+      if (resumedWorkedForIdsRef.current.has(event.id)) continue;
+      resumedWorkedForIdsRef.current.add(event.id);
+      marked = true;
+    }
+    if (marked) setResumedWorkedForVersion((version) => version + 1);
+    if (turn.status === "completed" || turn.status === "failed" || turn.status === "interrupted") {
+      resumeWorkedForBaselineRef.current = null;
+    }
+  }, [
+    activeRuntimeState?.turn?.id,
+    activeRuntimeState?.turn?.status,
+    activeTask?.id,
+    projectedTranscript,
   ]);
 
   useEffect(() => {
@@ -4874,6 +5026,21 @@ export default function App() {
   const stopTurn = async (continueQueue = false) => {
     if (!activeTask || stoppingTurn) return false;
     const taskId = activeTask.id;
+    const turnId =
+      runtimeState?.taskId === taskId && runtimeState.turn ? runtimeState.turn.id : "";
+    if (turnId) userStoppedTurnsRef.current.add(`${taskId}:${turnId}`);
+    // Mark Stop locally before the provider settles so auto-resume cannot treat
+    // the coming interrupted status as a crash recovery.
+    setRuntimeState((current) => {
+      if (current?.taskId !== taskId || !current.turn) return current;
+      if (current.turn.stopRequested) return current;
+      const next = {
+        ...current,
+        turn: { ...current.turn, stopRequested: true },
+      };
+      taskProjectionCache.current.set(taskId, next);
+      return next;
+    });
     const pauseQueue =
       !continueQueue && snapshot.queuedMessages.some((message) => message.taskId === taskId);
     if (pauseQueue) queuePausedTaskIdsRef.current.add(taskId);
@@ -4881,6 +5048,7 @@ export default function App() {
     setOperationError("");
     try {
       const result = await bridge.stopTurn(taskId);
+      if (result.turnId) userStoppedTurnsRef.current.add(`${taskId}:${result.turnId}`);
       setOperationStatus(
         result.settled
           ? "Session was no longer running — marked as stopped"
@@ -4890,6 +5058,7 @@ export default function App() {
       );
       return true;
     } catch (error) {
+      if (turnId) userStoppedTurnsRef.current.delete(`${taskId}:${turnId}`);
       if (pauseQueue) queuePausedTaskIdsRef.current.delete(taskId);
       setOperationError(error instanceof Error ? error.message : "Could not stop this turn");
       return false;
@@ -5406,6 +5575,7 @@ export default function App() {
                       onDeleteArchivedChats={handleSidebarDeleteArchivedChats}
                       onOpenSettings={handleSidebarOpenSettings}
                       onResize={handleSidebarResize}
+                      sidebarMenuDirection={preferences.sidebarMenuDirection}
                     />
                   </motion.div>
                 ) : null}
@@ -5472,6 +5642,9 @@ export default function App() {
                             <ConnectionNotice
                               state={runtimeState.connection}
                               runtime={runtimeLabel(activeTask?.runtime ?? settingsDefaultRuntime)}
+                              resuming={Boolean(
+                                activeTask && resumingTaskId === activeTask.id,
+                              )}
                             />
                           ) : null}
                           {activeTask ? (
@@ -5514,6 +5687,23 @@ export default function App() {
                                 onAddDiffSelection={(payload) =>
                                   addSelectionToChat(payload, "diff")
                                 }
+                                isDiffApproved={(file) =>
+                                  Boolean(
+                                    activeTask &&
+                                      reviewedFiles[`${activeTask.id}:${diffFileKey(file)}`],
+                                  )
+                                }
+                                onApproveDiff={(file) => {
+                                  if (!activeTask) return;
+                                  setReviewedFiles((current) => ({
+                                    ...current,
+                                    [`${activeTask.id}:${diffFileKey(file)}`]: true,
+                                  }));
+                                  setOperationStatus(
+                                    `${file.path} marked reviewed for this session`,
+                                  );
+                                }}
+                                diffCommitState={diffCommitState}
                               />
                             </Suspense>
                           ) : (
@@ -5528,6 +5718,13 @@ export default function App() {
                               autoApproveActive && pendingApproval.approvalKind !== "planReview"
                             }
                             runtime={activeTask?.runtime}
+                            crowded={Boolean(
+                              activeTask &&
+                                (nativeTurnRunning ||
+                                  optimisticTurnStarting ||
+                                  visibleQueuedMessages.length > 0 ||
+                                  showRecoveryControl),
+                            )}
                             onDecision={(decision) =>
                               void respondToApproval(pendingApproval, decision)
                             }
@@ -5538,7 +5735,7 @@ export default function App() {
                           (nativeTurnRunning ||
                             optimisticTurnStarting ||
                             visibleQueuedMessages.length > 0 ||
-                            Boolean(recoverableTurn)) ? (
+                            Boolean(showRecoveryControl)) ? (
                             <TaskStatusPill
                               key="task-status-pill"
                               runningSince={
@@ -5550,7 +5747,7 @@ export default function App() {
                               usage={runtimeUsage}
                               activeAgentCount={activeAgentCount}
                               recovery={
-                                recoverableTurn ? (
+                                showRecoveryControl ? (
                                   <div className="turn-recovery-control" role="status">
                                     <span>
                                       <strong>Response interrupted</strong>

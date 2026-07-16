@@ -830,6 +830,27 @@ function AppearanceSettings({
           </div>
         </SettingRow>
         <SettingRow
+          label="Sidebar menus"
+          description="Open chat and project ··· menus to the left or right of the trigger."
+        >
+          <div className="segmented">
+            <button
+              type="button"
+              data-active={preferences.sidebarMenuDirection === "left"}
+              onClick={() => onChange({ sidebarMenuDirection: "left" })}
+            >
+              Left
+            </button>
+            <button
+              type="button"
+              data-active={preferences.sidebarMenuDirection === "right"}
+              onClick={() => onChange({ sidebarMenuDirection: "right" })}
+            >
+              Right
+            </button>
+          </div>
+        </SettingRow>
+        <SettingRow
           label="Corner softness"
           description="Controls menus, panes, the composer, and common controls."
         >
@@ -2191,16 +2212,6 @@ function PolicySettings({
             />
           </SettingRow>
           <SettingRow
-            label="Confirm external actions"
-            description="Ask before a link opens in your default browser."
-          >
-            <Switch
-              checked={readSetting(settings, "general.confirmExternalActions", true)}
-              onChange={(value) => setSetting("general.confirmExternalActions", value)}
-              label="Confirm external actions"
-            />
-          </SettingRow>
-          <SettingRow
             label="Automatically resume interrupted responses"
             description="After a crash or lost connection, reconnect the provider and continue from its last safe boundary. Off leaves a Resume control above the composer."
           >
@@ -2208,6 +2219,16 @@ function PolicySettings({
               checked={readSetting(settings, "general.autoResumeInterruptedTurns", false)}
               onChange={(value) => setSetting("general.autoResumeInterruptedTurns", value)}
               label="Automatically resume interrupted responses"
+            />
+          </SettingRow>
+          <SettingRow
+            label="Confirm external actions"
+            description="Ask before a link opens in your default browser."
+          >
+            <Switch
+              checked={readSetting(settings, "general.confirmExternalActions", true)}
+              onChange={(value) => setSetting("general.confirmExternalActions", value)}
+              label="Confirm external actions"
             />
           </SettingRow>
           <SettingRow

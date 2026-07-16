@@ -452,6 +452,8 @@ describe("SubagentConversation", () => {
     });
 
     expect(await screen.findByText("Subagent interrupted")).toBeInTheDocument();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(onSend).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Resume" }));
     await waitFor(() =>
       expect(onSend).toHaveBeenCalledWith(
@@ -460,5 +462,87 @@ describe("SubagentConversation", () => {
         expect.objectContaining({ runtime: "codex", model: "gpt-5.6-luna" }),
       ),
     );
+  });
+
+  it("does not resume a stopped subagent when its pane opens", async () => {
+    vi.spyOn(bridge, "loadTaskProjection").mockResolvedValue({
+      watermarkSeq: 1,
+      resetSeq: 0,
+      runtimeLive: false,
+      hydrate: {
+        items: [],
+        plan: [],
+        planTruncated: false,
+        approvals: [],
+        turn: {
+          id: "turn-stopped",
+          status: "interrupted",
+          stopRequested: true,
+          startedAt: "2026-07-12T10:05:00Z",
+          completedAt: "2026-07-12T10:06:00Z",
+        },
+        firstSeen: {},
+        hasMoreOlder: false,
+      },
+    });
+    vi.spyOn(bridge, "subscribeRuntimeProjections").mockResolvedValue(() => undefined);
+    vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
+      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
+    ]);
+    const onSend = vi.fn().mockResolvedValue(undefined);
+
+    renderSubagent({
+      delegation: stoppedDelegation,
+      runtimes,
+      onClose: vi.fn(),
+      onSend,
+    });
+
+    await waitFor(() => expect(bridge.loadTaskProjection).toHaveBeenCalled());
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(screen.queryByText("Subagent interrupted")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Resume" })).not.toBeInTheDocument();
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("does not treat an orchestrator-stopped child tip as resumeable on view", async () => {
+    vi.spyOn(bridge, "loadTaskProjection").mockResolvedValue({
+      watermarkSeq: 1,
+      resetSeq: 0,
+      runtimeLive: false,
+      hydrate: {
+        items: [],
+        plan: [],
+        planTruncated: false,
+        approvals: [],
+        turn: {
+          id: "turn-orphan",
+          status: "interrupted",
+          // Legacy tip before stop settlement; delegation status is authoritative.
+          stopRequested: false,
+          startedAt: "2026-07-12T10:05:00Z",
+          completedAt: "2026-07-12T10:06:00Z",
+        },
+        firstSeen: {},
+        hasMoreOlder: false,
+      },
+    });
+    vi.spyOn(bridge, "subscribeRuntimeProjections").mockResolvedValue(() => undefined);
+    vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
+      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
+    ]);
+    const onSend = vi.fn().mockResolvedValue(undefined);
+
+    renderSubagent({
+      delegation: { ...stoppedDelegation, status: "stopped" },
+      runtimes,
+      onClose: vi.fn(),
+      onSend,
+    });
+
+    await waitFor(() => expect(bridge.loadTaskProjection).toHaveBeenCalled());
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(screen.queryByRole("button", { name: "Resume" })).not.toBeInTheDocument();
+    expect(onSend).not.toHaveBeenCalled();
   });
 });

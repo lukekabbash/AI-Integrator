@@ -1064,6 +1064,43 @@ describe("runtime projection reducer", () => {
     expect(runtimeTranscript(state)).toHaveLength(0);
   });
 
+  it("omits wire-only interrupted resume placeholders from the transcript", () => {
+    let state = applyRuntimeProjection(
+      createRuntimeProjectionState("task-1"),
+      event(1, {
+        kind: "itemChanged",
+        item: {
+          id: "user-resume",
+          providerItemId: "provider-user-resume",
+          kind: "userMessage",
+          status: "completed",
+          body: "Resume from here",
+          truncated: false,
+          updatedAt: "2026-07-10T16:01:00Z",
+        },
+      }),
+    );
+    state = applyRuntimeProjection(
+      state,
+      event(2, {
+        kind: "itemChanged",
+        item: {
+          id: "assistant-1",
+          providerItemId: "provider-assistant-1",
+          kind: "agentMessage",
+          status: "completed",
+          body: "Continuing.",
+          truncated: false,
+          updatedAt: "2026-07-10T16:01:01Z",
+        },
+      }),
+    );
+    expect(runtimeTranscript(state).map((entry) => entry.kind)).toEqual(["assistant"]);
+    expect(runtimeTranscript(state).some((entry) => entry.body === "Resume from here")).toBe(
+      false,
+    );
+  });
+
   it("titles plan-review approvals distinctly in the transcript", () => {
     const state = applyRuntimeProjection(
       createRuntimeProjectionState("task-1"),
@@ -1124,6 +1161,41 @@ describe("runtime projection reducer", () => {
     const transcript = runtimeTranscript(state);
     expect(transcript).not.toContainEqual(expect.objectContaining({ status: "running" }));
     expect(transcript).not.toContainEqual(expect.objectContaining({ kind: "notice" }));
+  });
+
+  it("keeps a user stop request across a later interrupted settlement", () => {
+    let state = createRuntimeProjectionState("task-1");
+    state = applyRuntimeProjection(
+      state,
+      event(42, {
+        kind: "turnChanged",
+        turn: {
+          id: "turn-1",
+          status: "inProgress",
+          stopRequested: true,
+          startedAt: "2026-07-10T16:00:00Z",
+        },
+      }),
+    );
+    state = applyRuntimeProjection(
+      state,
+      event(43, {
+        kind: "turnChanged",
+        turn: {
+          id: "turn-1",
+          status: "interrupted",
+          stopRequested: false,
+          startedAt: "2026-07-10T16:00:00Z",
+          completedAt: "2026-07-10T16:00:03Z",
+        },
+      }),
+    );
+
+    expect(state.turn).toMatchObject({
+      id: "turn-1",
+      status: "interrupted",
+      stopRequested: true,
+    });
   });
 
   it("keeps unfinished items spinning while the turn is still in progress", () => {

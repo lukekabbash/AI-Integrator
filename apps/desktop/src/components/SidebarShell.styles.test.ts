@@ -33,6 +33,14 @@ describe("sidebar shell corners", () => {
     expect(styles).not.toContain(".titlebar-title::before");
   });
 
+  it("keeps File/Edit/View menus above the sidebar and canvas", () => {
+    expect(rule(".native-titlebar")).toContain("z-index: 50");
+    expect(rule(".titlebar-menu")).toContain("z-index: 60");
+    expect(rule(".native-titlebar:has(.titlebar-menu) .titlebar-left")).toContain(
+      "overflow: visible",
+    );
+  });
+
   it("reserves the open sidebar width so the chat title keeps its canvas edge", () => {
     expect(rule('[data-sidebar-visible="true"] .titlebar-brand-mini')).toContain(
       "width: calc(var(--sidebar-width, 272px) - 18px)",

@@ -1,4 +1,12 @@
-import { Check, FileCode2, MessageSquarePlus, RefreshCw } from "lucide-react";
+import {
+  Check,
+  FileCode2,
+  GitCommitHorizontal,
+  MessageSquarePlus,
+  RefreshCw,
+  UploadCloud,
+  Undo2,
+} from "lucide-react";
 import { useCallback, useMemo, useRef, useState } from "react";
 import { highlightCodeLine } from "./codeHighlight";
 import {
@@ -35,6 +43,14 @@ import type { DiffFile, DiffLine } from "../bridge";
 
 type DiffViewMode = "unified" | "split";
 
+/**
+ * Where the edited file sits in Git. A committed or pushed edit has nothing
+ * left to approve or revert, so the action pair gives way to a caption.
+ * Absent means unknown — the caller could not place the file, so the pair
+ * stays rather than captioning a guess.
+ */
+export type DiffCommitState = "uncommitted" | "committed" | "pushed";
+
 const INITIAL_DIFF_ROWS = 400;
 const DIFF_ROW_CHUNK = 400;
 
@@ -50,6 +66,14 @@ export interface DiffViewProps {
   /** A persisted review state owned by the task/project store. */
   reviewed?: boolean;
   onMarkReviewed?: (file: DiffFile) => void | Promise<void>;
+  /**
+   * Undoes the edit this diff describes. Inline diffs render the Revert half of
+   * the action pair disabled until a caller supplies this, because restoring the
+   * pre-edit text writes to the working tree.
+   */
+  onRevert?: (file: DiffFile) => void | Promise<void>;
+  /** Replaces the inline action pair with a caption once Git owns the edit. */
+  commitState?: DiffCommitState;
   onRefresh?: () => void | Promise<void>;
   refreshing?: boolean;
   /** Hide task-level review actions when embedded in a transcript activity. */
@@ -357,6 +381,8 @@ export function DiffView({
   variant = "full",
   reviewed = false,
   onMarkReviewed,
+  onRevert,
+  commitState,
   onRefresh,
   refreshing = false,
   showReviewActions = true,
@@ -364,6 +390,9 @@ export function DiffView({
   onAddSelection,
 }: DiffViewProps) {
   const canMarkReviewed = Boolean(onMarkReviewed);
+  // Only Git-owned edits caption. "uncommitted" and unknown both keep the pair,
+  // so a file we could not place never reads as though it were committed.
+  const settled = commitState === "committed" || commitState === "pushed";
   const inline = variant === "inline";
   const mode: DiffViewMode = inline ? "unified" : viewMode;
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -395,6 +424,38 @@ export function DiffView({
             )}
           </span>
         </div>
+        {inline && settled ? (
+          <span className="diff-inline-state" data-state={commitState}>
+            {commitState === "pushed" ? (
+              <UploadCloud aria-hidden="true" />
+            ) : (
+              <GitCommitHorizontal aria-hidden="true" />
+            )}
+            {commitState === "pushed" ? "Pushed" : "Committed"}
+          </span>
+        ) : inline && (canMarkReviewed || onRevert) ? (
+          <div className="diff-inline-actions" role="group" aria-label={`Actions for ${file.path}`}>
+            <button
+              className="diff-inline-action"
+              type="button"
+              data-reviewed={reviewed}
+              aria-pressed={reviewed}
+              onClick={() => void onMarkReviewed?.(file)}
+              disabled={!canMarkReviewed}
+            >
+              <Check aria-hidden="true" /> {reviewed ? "Approved" : "Approve"}
+            </button>
+            <button
+              className="diff-inline-action"
+              type="button"
+              onClick={() => void onRevert?.(file)}
+              disabled={!onRevert}
+              title={onRevert ? undefined : "Reverting an edit is not available yet."}
+            >
+              <Undo2 aria-hidden="true" /> Revert
+            </button>
+          </div>
+        ) : null}
         <div className="diff-summary">
           <span className="diff-add">
             {file.statsLoaded === false ? "…" : `+${file.additions}`}

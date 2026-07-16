@@ -124,6 +124,9 @@ select:focus-visible,
   /* Anchors .titlebar-drag; without this the drag overlay resolves against
      the page and swallows clicks on everything below the titlebar. */
   position: relative;
+  /* File/Edit/View menus drop into the sidebar and canvas; keep the bar above
+     .app-content so those menus are not covered. */
+  z-index: 50;
   height: 38px;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
@@ -231,6 +234,11 @@ select:focus-visible,
   align-items: center;
   overflow: hidden;
   z-index: 1;
+}
+/* overflow:hidden clips title/tabs, but also the absolute File/Edit/View menus.
+   Open the clip only while a menu is mounted so the panel can paint below. */
+.native-titlebar:has(.titlebar-menu) .titlebar-left {
+  overflow: visible;
 }
 .titlebar-brand-mini {
   flex: none;
@@ -356,7 +364,7 @@ select:focus-visible,
 }
 .titlebar-menu {
   position: absolute;
-  z-index: 40;
+  z-index: 60;
   top: calc(100% + 5px);
   left: -5px;
   min-width: 156px;
@@ -2043,14 +2051,20 @@ kbd {
   color: var(--color-text-tertiary);
   font-size: 10px;
 }
-/* Sits on the same column as the composer (24px side inset, 780px cap). */
+/* Sits on the same column as the composer (24px side inset, 780px cap).
+   Raised above the status shelf's stacking context (z-index 6) and the
+   composer (7) so it's never the one hidden when both float at once; the
+   [data-crowded] margin gives it real clearance instead of just winning
+   the paint order. */
 .approval-control {
+  position: relative;
+  z-index: 8;
   width: min(calc(100% - 48px), 780px);
   box-sizing: border-box;
-  margin: 0 auto 8px;
-  padding: 12px 14px;
+  margin: 0 auto 6px;
+  padding: 10px 12px;
   display: grid;
-  gap: 10px;
+  gap: 8px;
   border: 1px solid color-mix(in srgb, var(--color-warning) 28%, var(--color-border-subtle));
   border-radius: var(--radius-composer, 16px);
   background: color-mix(in srgb, var(--color-warning) 5%, var(--color-layer-1));
@@ -2058,6 +2072,10 @@ kbd {
     0 8px 22px color-mix(in srgb, black 12%, transparent),
     inset 0 1px color-mix(in srgb, white 3%, transparent);
   animation: approval-enter 180ms ease-out;
+  transition: margin-bottom 180ms ease;
+}
+.approval-control[data-crowded] {
+  margin-bottom: 132px;
 }
 @keyframes approval-enter {
   from {
@@ -2095,13 +2113,13 @@ kbd {
 .approval-header {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   min-width: 0;
 }
 .approval-icon {
   flex: none;
-  width: 28px;
-  height: 28px;
+  width: 24px;
+  height: 24px;
   display: grid;
   place-items: center;
   border-radius: var(--radius-control, 9px);
@@ -2115,8 +2133,8 @@ kbd {
   color: var(--color-accent);
 }
 .approval-icon svg {
-  width: 14px;
-  height: 14px;
+  width: 12px;
+  height: 12px;
 }
 .approval-heading {
   min-width: 0;
@@ -2125,7 +2143,7 @@ kbd {
 }
 .approval-kicker {
   color: var(--color-warning);
-  font-size: 9.5px;
+  font-size: 9px;
   font-weight: 650;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -2136,7 +2154,7 @@ kbd {
 .approval-control h3 {
   margin: 0;
   color: var(--color-text-primary);
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 600;
   letter-spacing: -0.01em;
   line-height: 1.3;
@@ -2144,35 +2162,35 @@ kbd {
 .approval-body {
   min-width: 0;
   display: grid;
-  gap: 6px;
+  gap: 5px;
 }
 .approval-control p {
   margin: 0;
   color: var(--color-text-secondary);
-  font-size: 11.5px;
-  line-height: 1.45;
+  font-size: 11px;
+  line-height: 1.4;
 }
 .approval-command,
 .approval-plan {
   display: block;
   margin: 0;
   overflow: auto;
-  padding: 8px 10px;
+  padding: 7px 9px;
   border: 1px solid var(--color-border-subtle);
   border-radius: var(--radius-control, 9px);
   background: color-mix(in srgb, var(--color-canvas) 72%, var(--color-layer-2));
   color: var(--color-text-primary);
   font-family: var(--font-code);
-  font-size: 11.5px;
-  line-height: 1.5;
+  font-size: 11px;
+  line-height: 1.45;
   white-space: pre-wrap;
   word-break: break-word;
 }
 .approval-command {
-  max-height: 88px;
+  max-height: 72px;
 }
 .approval-plan {
-  max-height: 220px;
+  max-height: 180px;
 }
 .approval-files {
   margin: 0;
@@ -2180,12 +2198,12 @@ kbd {
   list-style: none;
   display: grid;
   gap: 3px;
-  max-height: 88px;
+  max-height: 72px;
   overflow: auto;
 }
 .approval-files code {
   font-family: var(--font-code);
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--color-text-secondary);
 }
 .approval-cwd {
@@ -2195,7 +2213,7 @@ kbd {
 }
 .approval-failed {
   color: var(--color-danger);
-  font-size: 11px;
+  font-size: 10.5px;
 }
 .approval-actions {
   display: flex;
@@ -2205,10 +2223,10 @@ kbd {
   gap: 6px;
 }
 .approval-actions button {
-  height: 28px;
+  height: 26px;
   min-width: auto;
-  padding-inline: 11px;
-  font-size: 11px;
+  padding-inline: 10px;
+  font-size: 10.5px;
 }
 .approval-decline:hover:not(:disabled) {
   border-color: color-mix(in srgb, var(--color-danger) 50%, var(--color-border-base));
@@ -2567,7 +2585,10 @@ kbd {
   gap: 14px;
 }
 .task-status-float-row[data-has-queue] {
-  bottom: -12px;
+  /* Deep enough that the surface's rounded bottom sits behind the composer
+     (which paints on top, z-index 7 > 6) instead of peeking out beside it —
+     the two curves read as one continuous shape. */
+  bottom: -18px;
 }
 .task-status-pill {
   width: max-content;
@@ -2594,7 +2615,9 @@ kbd {
   max-width: 720px;
   overflow: hidden;
   border: 1px solid var(--color-border-subtle);
-  border-radius: 15px;
+  /* Match the composer's own radius so the visible top curve continues the
+     composer's, rather than reading as a different-shaped card stacked on it. */
+  border-radius: var(--radius-composer, 16px);
   color: var(--color-text-tertiary);
   background: color-mix(in srgb, var(--color-layer-1) 82%, transparent);
   backdrop-filter: blur(10px);
@@ -2701,6 +2724,10 @@ kbd {
   min-width: 0;
   display: flex;
   flex-direction: column;
+  /* Caps growth at ~4 rows so a long queue scrolls in place instead of
+     pushing the shelf (and anything docked above it) further up the page. */
+  max-height: 168px;
+  overflow-y: auto;
 }
 .queued-message {
   width: 100%;
@@ -3076,6 +3103,20 @@ kbd {
 .activity-event--worked-for > .activity-event-summary .activity-copy span {
   font-variant-numeric: tabular-nums;
 }
+.activity-resumed-cue {
+  margin-left: 4px;
+  color: color-mix(in srgb, var(--color-text-tertiary) 52%, var(--color-surface-canvas));
+  font-size: 9px;
+  font-style: italic;
+  font-weight: 400;
+  letter-spacing: 0.01em;
+}
+.activity-resumed-cue::before {
+  content: "(";
+}
+.activity-resumed-cue::after {
+  content: ")";
+}
 @media (prefers-reduced-motion: reduce) {
   .activity-event--worked-for {
     transform: none !important;
@@ -3115,16 +3156,21 @@ kbd {
 /* The chevron belongs to the row's disclosure control so the label and icon
    share one hover surface and one click target. Closed rows: meta sits in the
    caret seat (like chat pins); hover scooches meta left and fades the caret
-   in. Open rows keep both settled. */
+   in. Open rows keep both settled. Explicit columns keep the caret on the
+   right edge when meta is absent (Read / Searched), matching Edits rows. */
 .activity-event-disclosure {
+  grid-column: 4;
   width: 18px;
   height: 26px;
   display: inline-grid;
-  place-items: center;
+  /* Flush to the trailing edge so Read/Searched carets match Edits meta. */
+  justify-items: end;
+  align-items: center;
   opacity: 0;
   transition: opacity 0.16s cubic-bezier(0.2, 0, 0, 1);
 }
 .activity-event-meta {
+  grid-column: 3;
   display: inline-flex;
   align-items: center;
   justify-self: end;
@@ -8594,8 +8640,6 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   transition: none;
 }
 .project-action-menu {
-  top: calc(100% + 2px);
-  right: 0;
   width: 168px;
 }
 .project-action-menu-danger {
@@ -9071,11 +9115,11 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
 .chat-more-button svg {
   width: 14px;
 }
+/* Portaled to document.body so it can clear the sidebar clip. Position comes
+   from inline left/top/bottom; direction (left|right) sets transform origin. */
 .chat-action-menu {
-  position: absolute;
+  position: fixed;
   z-index: 45;
-  top: calc(100% - 2px);
-  right: 3px;
   width: 164px;
   padding: 4px;
   display: grid;
@@ -9084,14 +9128,24 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   border-radius: var(--radius-panel);
   box-shadow: var(--shadow-elevated);
   background: var(--color-layer-1);
+  transform-origin: top left;
+}
+.chat-action-menu[data-direction="left"] {
   transform-origin: top right;
 }
 /* Near the bottom of the rail, flip above the row so the menu isn't clipped. */
 .chat-action-menu--up {
-  top: auto;
-  bottom: calc(100% - 2px);
+  transform-origin: bottom left;
+}
+.chat-action-menu[data-direction="left"].chat-action-menu--up {
   transform-origin: bottom right;
 }
+.chat-action-menu[data-direction="left"]  .chat-action-menu--up {
+    transform-origin: bottom left;
+  }
+  .chat-action-menu[data-direction="left"].chat-action-menu--up {
+    transform-origin: bottom right;
+  }
 .chat-action-menu-tooltip-target {
   display: grid;
   min-width: 0;
@@ -9463,7 +9517,6 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   box-sizing: border-box;
   margin: 4px 0 8px 25px;
   overflow: hidden;
-  border-left: 1px solid var(--color-border-subtle);
 }
 .activity-diff-review .diff-workspace {
   min-height: 0;
@@ -9505,6 +9558,64 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
 }
 .diff-workspace--inline .diff-footer {
   display: none;
+}
+
+/* Per-edit actions in a transcript diff header. The file title holds flex: 1,
+   so this pair lands right-aligned immediately before the +/− counts. */
+.diff-inline-actions {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.diff-inline-action {
+  height: 20px;
+  padding: 0 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border: 0;
+  border-radius: calc(var(--radius-control) - 3px);
+  color: var(--color-text-secondary);
+  background: transparent;
+  font-size: 10px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.diff-inline-action > svg {
+  width: 11px;
+  height: 11px;
+}
+.diff-inline-action:hover:not(:disabled) {
+  color: var(--color-text-primary);
+  background: var(--color-layer-2);
+}
+.diff-inline-action:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.diff-inline-action[data-reviewed="true"] {
+  color: var(--color-diff-add-text);
+}
+/* Replaces the pair once Git owns the edit: a caption, not a control. */
+.diff-inline-state {
+  flex: none;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--color-text-tertiary);
+  font-size: 10px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.diff-inline-state > svg {
+  width: 11px;
+  height: 11px;
+}
+.diff-inline-state[data-state="pushed"] {
+  color: var(--color-diff-add-text);
 }
 
 /* Flat recent-chats list for fast switching */
@@ -9640,6 +9751,9 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
     animation: selection-settle var(--duration-fast) var(--ease-standard) both;
   }
   .chat-action-menu--up {
+    transform-origin: bottom left;
+  }
+  .chat-action-menu[data-direction="left"].chat-action-menu--up {
     transform-origin: bottom right;
   }
   .transcript > .transcript-row > .turn,

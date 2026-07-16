@@ -9,8 +9,9 @@ use crate::{ProviderKind, ProviderSessionId, RuntimeSessionId, Task, TaskId};
 ///
 /// Kept above the transcript virtualization threshold (250) so a typical open
 /// paints without an immediate older-page fetch, while bounding SQLite/IPC
-/// deserialize cost for long chats. Agent seeding uses `task_conversation_digest`
-/// (unchanged); this constant is display-hydrate only.
+/// deserialize cost for long chats. Agent seeding uses `task_handoff_digest`
+/// (unchanged contract: shared SQLite by task_id across providers); this
+/// constant is display-hydrate only.
 pub const TASK_PROJECTION_HYDRATE_TAIL: usize = 300;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
