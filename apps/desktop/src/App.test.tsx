@@ -569,13 +569,13 @@ describe("AI Integrator desktop workspace", () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "View" }));
     fireEvent.click(await screen.findByRole("menuitem", { name: "Runtime setup" }));
-    expect(await screen.findByRole("heading", { name: /coding agents/i })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /Find my agents/i }));
+    expect(await screen.findByRole("heading", { name: /coding agent/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Set up my runtimes/i }));
     expect(
-      await screen.findByRole("heading", { name: /Connect what is already here/i }),
+      await screen.findByRole("heading", { name: /Connect your installed CLIs/i }),
     ).toBeInTheDocument();
     expect(
-      await screen.findByText(/Passwords and tokens are never imported into AI Integrator/),
+      await screen.findByText(/never pass through or get stored by AI Integrator/),
     ).toBeInTheDocument();
   });
 

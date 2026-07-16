@@ -13,11 +13,13 @@ import {
   Database,
   Download,
   ExternalLink,
+  FolderGit2,
   KeyRound,
   LoaderCircle,
   Mic,
   MonitorCog,
   Palette,
+  Plus,
   RefreshCw,
   RotateCcw,
   Save,
@@ -65,18 +67,46 @@ import {
 } from "../theme";
 import { BrandMark } from "./BrandMark";
 import { Tooltip } from "./Tooltip";
-import { Dropdown, ProviderIcon } from "./Dropdown";
+import { Dropdown, ProviderIcon, type DropdownOption } from "./Dropdown";
+import { Slider } from "./Slider";
 import { RuntimeSetupTerminal } from "./RuntimeSetupTerminal";
 import {
   normalizeRuntimeRouteDefaults,
   readRuntimeRouteDefault,
   RUNTIME_ROUTE_DEFAULTS_SETTING,
 } from "../routingDefaults";
+import {
+  BUILT_IN_ARCHETYPES,
+  contextSummary,
+  CUSTOM_ARCHETYPE_PREFIX,
+  DEFAULT_CUSTOM_LABEL,
+  DEFAULT_CUSTOM_MISSION,
+  DEFAULT_TECHNICALITY,
+  DEFAULT_VERBOSITY,
+  EXPLAIN_SETTINGS,
+  INHERIT_RUNTIME,
+  NEW_ARCHETYPE_OPTION,
+  normalizeCustomArchetypes,
+  normalizeFallbacks,
+  readTechnicality,
+  readVerbosity,
+  resolveExplainConfig,
+  technicalityLabel,
+  verbosityLabel,
+} from "../explainSettings";
+import {
+  DEFAULT_COMMIT_PREFIX,
+  decorateCommitMessage,
+  GIT_SETTINGS,
+  readGitDecorationSettings,
+  readPushForce,
+} from "../gitDecoration";
 
 type SettingsSection =
   | "general"
   | "appearance"
   | "composer"
+  | "files-git"
   | "models-runtimes"
   | "permissions"
   | "subagents"
@@ -121,6 +151,12 @@ const settingsNav: Array<{ id: SettingsSection; label: string; hint: string; ico
   { id: "general", label: "General", hint: "Local app and data", icon: MonitorCog },
   { id: "appearance", label: "Appearance", hint: "Themes, type, motion", icon: Palette },
   { id: "composer", label: "Composer", hint: "Send behavior", icon: Braces },
+  {
+    id: "files-git",
+    label: "Files and Git",
+    hint: "Ask about a selection, commit trailers, push safety",
+    icon: FolderGit2,
+  },
   {
     id: "models-runtimes",
     label: "Models and Runtimes",
@@ -189,6 +225,24 @@ const DEFAULT_SETTINGS: SettingsMap = {
   "models.defaultModel": "",
   "models.defaultEffort": "medium",
   [RUNTIME_ROUTE_DEFAULTS_SETTING]: {},
+  // Read by the selection explainer (FileView's "Ask about this"). The prompt
+  // itself is composed natively from these; nothing here is a display-only
+  // preference.
+  [EXPLAIN_SETTINGS.archetype]: "explanation",
+  [EXPLAIN_SETTINGS.customArchetypes]: [],
+  [EXPLAIN_SETTINGS.verbosity]: DEFAULT_VERBOSITY,
+  [EXPLAIN_SETTINGS.technicality]: DEFAULT_TECHNICALITY,
+  // Empty runtime means the explainer follows whatever the chat is using.
+  [EXPLAIN_SETTINGS.runtime]: INHERIT_RUNTIME,
+  [EXPLAIN_SETTINGS.model]: "",
+  [EXPLAIN_SETTINGS.effort]: "",
+  [EXPLAIN_SETTINGS.fallbacks]: [],
+  // Git decorations are all opt-in: each one either changes permanent history
+  // or relaxes a push safeguard, so none may arrive by default.
+  [GIT_SETTINGS.coAuthor]: false,
+  [GIT_SETTINGS.forcePush]: "off",
+  [GIT_SETTINGS.commitPrefixEnabled]: false,
+  [GIT_SETTINGS.commitPrefix]: DEFAULT_COMMIT_PREFIX,
   "permissions.defaultProfile": "project-write",
   // Enforced by the workspace's retention sweep (App): auto-archive uses the
   // chat's last activity, auto-delete counts from the moment it was archived.
@@ -2844,6 +2898,493 @@ const navPillSpring = {
   mass: 0.7,
 };
 
+/**
+ * Everything that happens on a file surface and on the way out to Git: the
+ * selection explainer's configuration, then what the app writes into commits
+ * and how far a push may go.
+ */
+function FilesAndGitSettings({
+  settings,
+  setSetting,
+  runtimes,
+  projectName,
+}: {
+  settings: SettingsMap;
+  setSetting: (key: string, value: unknown) => void;
+  runtimes: RuntimeConnection[];
+  projectName?: string;
+}) {
+  return (
+    <>
+      <div className="settings-page-heading">
+        <span>
+          <FolderGit2 />
+        </span>
+        <div>
+          <h1>Files and Git</h1>
+          <p>
+            What comes back when you ask about highlighted code, and what AI Integrator adds to
+            your history on the way out.
+          </p>
+        </div>
+      </div>
+      <ExplainSettings
+        settings={settings}
+        setSetting={setSetting}
+        runtimes={runtimes}
+        projectName={projectName}
+      />
+      <GitSettings settings={settings} setSetting={setSetting} />
+    </>
+  );
+}
+
+/**
+ * The selection explainer's configuration: what the answer is, who it is for,
+ * how long it runs, and which provider produces it.
+ *
+ * The prompt shown at the foot is rendered natively by the same function a real
+ * explanation calls, so it is the prompt rather than a description of one.
+ */
+function ExplainSettings({
+  settings,
+  setSetting,
+  runtimes,
+  projectName,
+}: {
+  settings: SettingsMap;
+  setSetting: (key: string, value: unknown) => void;
+  runtimes: RuntimeConnection[];
+  projectName?: string;
+}) {
+  const [preview, setPreview] = useState("");
+  const [catalog, setCatalog] = useState<ModelCatalogEntry[] | null>(null);
+
+  const customArchetypes = normalizeCustomArchetypes(settings[EXPLAIN_SETTINGS.customArchetypes]);
+  const archetype = readSetting<string>(settings, EXPLAIN_SETTINGS.archetype, "explanation");
+  const verbosity = readVerbosity(settings);
+  const technicality = readTechnicality(settings);
+  const storedRuntime = readSetting<string>(settings, EXPLAIN_SETTINGS.runtime, INHERIT_RUNTIME);
+
+  const usable = useMemo(
+    () => runtimes.filter((runtime) => runtime.status !== "not_installed"),
+    [runtimes],
+  );
+  const available = useMemo(() => usable.map((runtime) => runtime.id), [usable]);
+  const pinned = available.includes(storedRuntime as RuntimeId)
+    ? (storedRuntime as RuntimeId)
+    : null;
+  const pinnedRuntime = pinned ? usable.find((runtime) => runtime.id === pinned) : undefined;
+  const fallbacks = normalizeFallbacks(settings[EXPLAIN_SETTINGS.fallbacks], available);
+
+  // Only a pinned runtime has a model to choose: without one the explainer
+  // inherits the chat's route. Every read of `catalog` is itself gated on
+  // `pinned` (the model/effort rows only render when pinned), so an unpinned
+  // catalog going stale in state is invisible rather than a bug — there is no
+  // need to reset it here, only to skip fetching.
+  useEffect(() => {
+    if (!pinned) return;
+    let active = true;
+    void bridge
+      .listModelCatalog(pinned)
+      .then((entries) => {
+        if (active) setCatalog(entries.filter((entry) => entry.id !== "Provider default"));
+      })
+      .catch(() => {
+        if (active) setCatalog([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, [pinned]);
+
+  const config = resolveExplainConfig(settings);
+  const { customMission } = config;
+  const configArchetype = config.archetype;
+  useEffect(() => {
+    let active = true;
+    const handle = window.setTimeout(() => {
+      void bridge
+        .explainPromptPreview(
+          { archetype: configArchetype, customMission, verbosity, technicality },
+          projectName,
+        )
+        .then((text) => {
+          if (active) setPreview(text);
+        })
+        .catch(() => {
+          if (active) setPreview("The prompt preview is only available in the desktop app.");
+        });
+    }, 120);
+    return () => {
+      active = false;
+      window.clearTimeout(handle);
+    };
+  }, [configArchetype, customMission, verbosity, technicality, projectName]);
+
+  const selectedCustom = customArchetypes.find((item) => item.id === archetype);
+  const model = readSetting<string>(settings, EXPLAIN_SETTINGS.model, "");
+  const entry = catalog?.find((candidate) => candidate.id === model);
+  const effortOptions = entry?.efforts ?? [];
+  const effort = resolveModelEffort(entry, readSetting<string>(settings, EXPLAIN_SETTINGS.effort, ""));
+
+  const archetypeOptions: DropdownOption[] = [
+    ...BUILT_IN_ARCHETYPES.map((item) => ({ value: item.id, label: item.label })),
+    ...customArchetypes.map((item) => ({ value: item.id, label: item.label })),
+    { value: NEW_ARCHETYPE_OPTION, label: "New archetype…" },
+  ];
+  const archetypeHint =
+    BUILT_IN_ARCHETYPES.find((item) => item.id === archetype)?.hint ??
+    "Your own mission, sent in place of the built-in ones.";
+
+  const createArchetype = () => {
+    const id = `${CUSTOM_ARCHETYPE_PREFIX}${Date.now().toString(36)}`;
+    const taken = new Set(customArchetypes.map((item) => item.label));
+    let label = DEFAULT_CUSTOM_LABEL;
+    for (let index = 2; taken.has(label); index += 1) label = `${DEFAULT_CUSTOM_LABEL} ${index}`;
+    setSetting(EXPLAIN_SETTINGS.customArchetypes, [
+      ...customArchetypes,
+      { id, label, mission: DEFAULT_CUSTOM_MISSION },
+    ]);
+    setSetting(EXPLAIN_SETTINGS.archetype, id);
+  };
+
+  const updateArchetype = (id: string, patch: { label?: string; mission?: string }) => {
+    setSetting(
+      EXPLAIN_SETTINGS.customArchetypes,
+      customArchetypes.map((item) => (item.id === id ? { ...item, ...patch } : item)),
+    );
+  };
+
+  const removeArchetype = (id: string) => {
+    setSetting(
+      EXPLAIN_SETTINGS.customArchetypes,
+      customArchetypes.filter((item) => item.id !== id),
+    );
+    if (archetype === id) setSetting(EXPLAIN_SETTINGS.archetype, "explanation");
+  };
+
+  const changeRuntime = (value: string) => {
+    setSetting(EXPLAIN_SETTINGS.runtime, value);
+    // A model id means nothing to a different provider, and an effort the new
+    // model does not advertise would be dropped anyway.
+    setSetting(EXPLAIN_SETTINGS.model, "");
+    setSetting(EXPLAIN_SETTINGS.effort, "");
+    setSetting(
+      EXPLAIN_SETTINGS.fallbacks,
+      fallbacks.filter((item) => item !== value),
+    );
+  };
+
+  const toggleFallback = (runtime: RuntimeId) => {
+    setSetting(
+      EXPLAIN_SETTINGS.fallbacks,
+      fallbacks.includes(runtime)
+        ? fallbacks.filter((item) => item !== runtime)
+        : [...fallbacks, runtime],
+    );
+  };
+
+  return (
+    <>
+      <section className="settings-section">
+        <header>
+          <h2>Ask about this</h2>
+          <p>
+            Highlight code in a file and right-click. The archetype replaces the whole
+            instruction, not just its tone.
+          </p>
+        </header>
+        <SettingRow label="Archetype" description={archetypeHint}>
+          <Dropdown
+            aria-label="Explain archetype"
+            value={archetype}
+            options={archetypeOptions}
+            onChange={(value) =>
+              value === NEW_ARCHETYPE_OPTION
+                ? createArchetype()
+                : setSetting(EXPLAIN_SETTINGS.archetype, value)
+            }
+          />
+        </SettingRow>
+        {selectedCustom ? (
+          <div className="explain-archetype-editor">
+            <label>
+              <span>Name</span>
+              <input
+                value={selectedCustom.label}
+                aria-label="Archetype name"
+                maxLength={40}
+                onChange={(event) =>
+                  updateArchetype(selectedCustom.id, { label: event.target.value })
+                }
+              />
+            </label>
+            <label>
+              <span>Mission</span>
+              <textarea
+                value={selectedCustom.mission}
+                aria-label="Archetype mission"
+                rows={3}
+                maxLength={600}
+                placeholder={DEFAULT_CUSTOM_MISSION}
+                onChange={(event) =>
+                  updateArchetype(selectedCustom.id, { mission: event.target.value })
+                }
+              />
+            </label>
+            <div className="explain-archetype-editor-actions">
+              <small>
+                One or two sentences works best. An empty mission falls back to Explanation.
+              </small>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => removeArchetype(selectedCustom.id)}
+              >
+                <Trash2 /> Delete archetype
+              </button>
+            </div>
+          </div>
+        ) : null}
+        <SettingRow label="Verbosity" description={contextSummary(verbosity)}>
+          <Slider
+            aria-label="Verbosity"
+            min={1}
+            max={100}
+            value={verbosity}
+            wide
+            format={(value) => `${verbosityLabel(value)} · ${value}`}
+            onChange={(value) => setSetting(EXPLAIN_SETTINGS.verbosity, value)}
+          />
+        </SettingRow>
+        <SettingRow
+          label="Audience"
+          description="Who the answer is written for, from someone new to programming to an expert in this stack."
+        >
+          <Slider
+            aria-label="Audience"
+            min={0}
+            max={3}
+            value={technicality}
+            wide
+            format={technicalityLabel}
+            onChange={(value) => setSetting(EXPLAIN_SETTINGS.technicality, value)}
+          />
+        </SettingRow>
+      </section>
+
+      <section className="settings-section">
+        <header>
+          <h2>Who answers</h2>
+          <p>
+            Explanations run isolated and tool-denied on a scratch directory, whichever provider
+            answers.
+          </p>
+        </header>
+        <SettingRow
+          label="Runtime"
+          description="Current model follows whatever the chat is already using."
+        >
+          <Dropdown
+            aria-label="Explain runtime"
+            value={storedRuntime}
+            options={[
+              { value: INHERIT_RUNTIME, label: "Current model" },
+              ...usable.map((runtime) => ({
+                value: runtime.id,
+                label: runtime.name,
+                icon: <ProviderIcon provider={runtime.id} label={runtime.name} />,
+              })),
+            ]}
+            onChange={changeRuntime}
+          />
+        </SettingRow>
+        {pinned ? (
+          <SettingRow
+            label="Model"
+            description="Economy default picks the provider's cheapest model, the same one chat titles use."
+          >
+            <Dropdown
+              aria-label="Explain model"
+              value={model}
+              options={[
+                { value: "", label: "Economy default" },
+                ...(catalog ?? []).map((item) => ({ value: item.id, label: item.label })),
+              ]}
+              onChange={(value) => {
+                setSetting(EXPLAIN_SETTINGS.model, value);
+                setSetting(EXPLAIN_SETTINGS.effort, "");
+              }}
+            />
+          </SettingRow>
+        ) : null}
+        {pinned && effortOptions.length > 0 ? (
+          <SettingRow
+            label="Reasoning effort"
+            description="Only the levels this model advertises are offered."
+          >
+            <Dropdown
+              aria-label="Explain reasoning effort"
+              value={effort ?? ""}
+              options={effortOptions.map((option) => ({
+                value: option.id,
+                label: option.label,
+              }))}
+              onChange={(value) => setSetting(EXPLAIN_SETTINGS.effort, value)}
+            />
+          </SettingRow>
+        ) : null}
+        <div className="setting-row setting-row-stacked">
+          <span>
+            <strong>Fallbacks</strong>
+            <small>
+              Click to add a provider to the chain. If the one above it cannot answer — not
+              installed, timed out, out of usage — the next one is tried. Fallbacks run on their
+              own economy model.
+            </small>
+          </span>
+          <div className="explain-fallback-chain">
+            <span className="explain-fallback-chip" data-primary="true">
+              <span className="explain-fallback-order">1</span>
+              {pinnedRuntime ? (
+                <ProviderIcon provider={pinnedRuntime.id} label={pinnedRuntime.name} />
+              ) : null}
+              {pinnedRuntime?.name ?? "Current model"}
+            </span>
+            {usable
+              .filter((runtime) => runtime.id !== pinned)
+              .map((runtime) => {
+                const index = fallbacks.indexOf(runtime.id);
+                return (
+                  <button
+                    key={runtime.id}
+                    type="button"
+                    className="explain-fallback-chip"
+                    aria-pressed={index >= 0}
+                    data-selected={index >= 0}
+                    onClick={() => toggleFallback(runtime.id)}
+                  >
+                    <span className="explain-fallback-order">
+                      {index >= 0 ? index + 2 : <Plus />}
+                    </span>
+                    <ProviderIcon provider={runtime.id} label={runtime.name} />
+                    {runtime.name}
+                  </button>
+                );
+              })}
+          </div>
+        </div>
+      </section>
+
+      <section className="settings-section">
+        <header>
+          <h2>Prompt</h2>
+          <p>
+            Exactly what gets sent, composed by the same code a real explanation uses. The file and
+            selection are stand-ins.
+          </p>
+        </header>
+        <pre className="explain-prompt-preview" aria-label="Composed explain prompt" tabIndex={0}>
+          {preview}
+        </pre>
+      </section>
+    </>
+  );
+}
+
+/**
+ * Git decorations and push safety. Every control defaults off: each one either
+ * writes something permanent into history or relaxes a safeguard, so none of it
+ * should arrive without being asked for.
+ */
+function GitSettings({
+  settings,
+  setSetting,
+}: {
+  settings: SettingsMap;
+  setSetting: (key: string, value: unknown) => void;
+}) {
+  const decoration = readGitDecorationSettings(settings);
+  const force = readPushForce(settings);
+  const samplePreview = decorateCommitMessage("fix the parser panic", decoration);
+
+  return (
+    <>
+      <section className="settings-section">
+        <header>
+          <h2>Commits</h2>
+          <p>These change permanent history, so both are off until you turn them on.</p>
+        </header>
+        <SettingRow
+          label="Credit AI Integrator as co-author"
+          description="Adds a Co-authored-by trailer to every commit made from the app. Rewriting it later means rewriting history."
+        >
+          <Switch
+            checked={decoration.coAuthor}
+            onChange={(value) => setSetting(GIT_SETTINGS.coAuthor, value)}
+            label="Credit AI Integrator as co-author"
+          />
+        </SettingRow>
+        <SettingRow
+          label="Prefix commit subjects"
+          description="Marks commits made from the app so they are easy to find in a log."
+        >
+          <Switch
+            checked={decoration.commitPrefixEnabled}
+            onChange={(value) => setSetting(GIT_SETTINGS.commitPrefixEnabled, value)}
+            label="Prefix commit subjects"
+          />
+        </SettingRow>
+        {decoration.commitPrefixEnabled ? (
+          <SettingRow label="Commit prefix" description="Written ahead of the subject you type.">
+            <input
+              className="setting-text-input"
+              aria-label="Commit prefix"
+              value={decoration.commitPrefix}
+              maxLength={40}
+              onChange={(event) => setSetting(GIT_SETTINGS.commitPrefix, event.target.value)}
+            />
+          </SettingRow>
+        ) : null}
+        {decoration.coAuthor || decoration.commitPrefixEnabled ? (
+          <pre className="git-commit-preview" aria-label="Example decorated commit message">
+            {samplePreview}
+          </pre>
+        ) : null}
+      </section>
+
+      <section className="settings-section">
+        <header>
+          <h2>Pushing</h2>
+          <p>A push is still previewed and confirmed before anything reaches the remote.</p>
+        </header>
+        <SettingRow
+          label="Force push"
+          description="Off refuses any push that would rewrite the remote. With lease rewrites only while the remote is where your last fetch left it, so a teammate's commit aborts the push instead of vanishing."
+        >
+          <Dropdown
+            aria-label="Force push"
+            value={force}
+            options={[
+              { value: "off", label: "Off" },
+              { value: "lease", label: "With lease" },
+              { value: "always", label: "Always force" },
+            ]}
+            onChange={(value) => setSetting(GIT_SETTINGS.forcePush, value)}
+          />
+        </SettingRow>
+        {force === "always" ? (
+          <p className="settings-inline-warning" role="status">
+            <TriangleAlert /> Always force overwrites the remote branch even when it holds commits
+            you have never seen. Those commits are not recoverable from your machine.
+          </p>
+        ) : null}
+      </section>
+    </>
+  );
+}
+
 export function SettingsView(props: SettingsViewProps) {
   const reduceMotion =
     Boolean(useReducedMotion()) || document.documentElement.dataset.motion === "none";
@@ -3034,6 +3575,14 @@ export function SettingsView(props: SettingsViewProps) {
               setSetting={setSetting}
               actionRequest={props.runtimeActionRequest}
               onRefreshRuntimes={props.onRefreshRuntimes}
+            />
+          ) : null}
+          {section === "files-git" ? (
+            <FilesAndGitSettings
+              settings={settings}
+              setSetting={setSetting}
+              runtimes={props.runtimes}
+              projectName={props.projects?.find((project) => !project.archived)?.name}
             />
           ) : null}
           {section === "subagents" ? (

@@ -129,7 +129,11 @@ select:focus-visible,
   z-index: 50;
   height: 38px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  /* .titlebar-left and .titlebar-title pack adjacent (both auto-sized) so
+     title sits right after the sidebar-width-matched menu cluster below,
+     instead of drifting per how much .titlebar-end needs on the right. The
+     1fr lives in the trailing column, so narrowing eats that gap first. */
+  grid-template-columns: auto auto minmax(0, 1fr);
   align-items: center;
   padding: 0 10px 0 14px;
   background: var(--color-canvas);
@@ -6884,20 +6888,44 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
 }
 .setup-progress {
   display: flex;
-  align-items: center;
-  gap: 6px;
+  align-items: stretch;
+  gap: 10px;
   margin-bottom: 36px;
 }
-.setup-progress span {
-  width: 24px;
-  height: 4px;
-  overflow: hidden;
-  border-radius: 99px;
-  color: transparent;
-  background: var(--color-layer-2);
+.setup-progress button {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 84px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--color-text-tertiary);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-align: left;
+  cursor: default;
+  transition: color 0.25s ease;
 }
-.setup-progress span[data-active="true"],
-.setup-progress span[data-complete="true"] {
+.setup-progress button:not(:disabled) {
+  cursor: pointer;
+}
+.setup-progress button:not(:disabled):hover {
+  color: var(--color-text-primary);
+}
+.setup-progress button[data-active="true"] {
+  color: var(--color-text-primary);
+}
+.setup-progress-bar {
+  display: block;
+  height: 4px;
+  border-radius: 99px;
+  background: var(--color-layer-2);
+  transition: background 0.35s ease;
+}
+.setup-progress button[data-active="true"] .setup-progress-bar,
+.setup-progress button[data-complete="true"] .setup-progress-bar {
   background: var(--color-accent);
 }
 .setup-content {
@@ -6951,12 +6979,17 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
 }
 .runtime-row {
   min-height: 92px;
-  padding: 12px 4px;
+  padding: 12px 10px;
   display: grid;
   grid-template-columns: 30px minmax(0, 1fr) auto;
   align-items: center;
   gap: 12px;
   border-bottom: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-control, 8px);
+  transition: background 0.2s ease;
+}
+.runtime-row:hover {
+  background: var(--color-layer-1);
 }
 .runtime-logo {
   width: 30px;
@@ -7024,6 +7057,55 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   align-items: center;
   justify-content: space-between;
 }
+.setup-footnote {
+  margin: 14px 0 0;
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+}
+.setup-exec-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+.setup-exec-grid > div {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 18px 16px;
+  border: 1px solid var(--color-border-base);
+  border-radius: var(--radius-panel);
+  background: var(--color-layer-1);
+  transition:
+    border-color 0.25s ease,
+    transform 0.25s ease;
+}
+.setup-exec-grid > div:hover {
+  border-color: var(--color-border-strong, var(--color-border-base));
+  transform: translateY(-2px);
+}
+.setup-exec-grid > div > svg {
+  width: 20px;
+  color: var(--color-accent);
+}
+.setup-exec-grid strong {
+  color: var(--color-text-primary);
+  font-size: 13px;
+}
+.setup-exec-grid span {
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  line-height: 1.55;
+}
+@media (max-width: 760px) {
+  .setup-exec-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.setup-finish-buttons {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
 .privacy-map {
   display: grid;
   grid-template-columns: 1fr 40px 1fr;
@@ -7039,6 +7121,10 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   border: 1px solid var(--color-border-base);
   border-radius: var(--radius-panel);
   background: var(--color-layer-1);
+  transition: border-color 0.25s ease;
+}
+.privacy-map > div:not(:nth-child(2)):hover {
+  border-color: var(--color-border-strong, var(--color-border-base));
 }
 .privacy-map > div:nth-child(4) {
   grid-column: 1 / -1;
@@ -7549,6 +7635,11 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   color: var(--color-text-secondary);
   font: 9.5px var(--font-code);
   text-align: right;
+}
+/* Sliders whose value is a word ("Beginner", "Thorough") rather than a short
+   numeric reading need room the 36px numeric column cannot give them. */
+.range-control[data-wide] output {
+  width: 78px;
 }
 .switch {
   position: relative;
@@ -8248,6 +8339,138 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   color: var(--color-text-primary);
   background: var(--color-layer-1);
   font: 10.5px var(--font-code);
+}
+/* A control too wide for the 180px value column drops below its label instead
+   of squeezing it: the fallback chain and the archetype editor both grow with
+   the number of runtimes and the length of a mission. */
+.setting-row-stacked {
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+}
+.explain-archetype-editor {
+  display: grid;
+  gap: 10px;
+  padding: 12px 3px 14px;
+  border-top: 1px solid var(--color-border-subtle);
+}
+.explain-archetype-editor label {
+  display: grid;
+  gap: 5px;
+}
+.explain-archetype-editor label > span {
+  color: var(--color-text-secondary);
+  font-size: 10.5px;
+}
+.explain-archetype-editor input,
+.explain-archetype-editor textarea {
+  padding: 8px 9px;
+  border: 1px solid var(--color-border-base);
+  border-radius: var(--radius-control);
+  color: var(--color-text-primary);
+  background: var(--color-layer-1);
+  font: 11px var(--font-code);
+  resize: vertical;
+}
+.explain-archetype-editor-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.explain-archetype-editor-actions small {
+  color: var(--color-text-secondary);
+}
+.explain-fallback-chain {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.explain-fallback-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  padding: 0 11px 0 6px;
+  border: 1px solid var(--color-border-base);
+  border-radius: 99px;
+  color: var(--color-text-secondary);
+  background: var(--color-layer-1);
+  font-size: 11px;
+  transition:
+    border-color var(--motion-fast),
+    color var(--motion-fast);
+}
+button.explain-fallback-chip {
+  cursor: pointer;
+}
+button.explain-fallback-chip:hover {
+  border-color: var(--color-border-strong);
+  color: var(--color-text-primary);
+}
+.explain-fallback-chip[data-selected="true"],
+.explain-fallback-chip[data-primary="true"] {
+  border-color: var(--color-accent-secondary);
+  color: var(--color-text-primary);
+}
+.explain-fallback-order {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 99px;
+  background: var(--color-layer-2);
+  font: 9.5px var(--font-code);
+}
+.explain-fallback-chip[data-selected="true"] .explain-fallback-order,
+.explain-fallback-chip[data-primary="true"] .explain-fallback-order {
+  color: var(--color-layer-1);
+  background: var(--color-accent-secondary);
+}
+.explain-fallback-order svg {
+  width: 11px;
+  height: 11px;
+}
+.explain-fallback-chip .provider-icon {
+  width: 14px;
+  height: 14px;
+}
+.explain-prompt-preview,
+.git-commit-preview {
+  margin: 0;
+  padding: 12px 13px;
+  max-height: 380px;
+  overflow: auto;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-control);
+  color: var(--color-text-secondary);
+  background: var(--color-layer-1);
+  font: 10.5px/1.6 var(--font-code);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.git-commit-preview {
+  margin-top: 12px;
+  max-height: none;
+}
+.settings-inline-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--color-status-warning);
+  border-radius: var(--radius-control);
+  color: var(--color-text-primary);
+  background: var(--color-status-warning-surface);
+  font-size: 11px;
+}
+.settings-inline-warning svg {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: var(--color-status-warning);
 }
 .credential-form {
   display: grid;

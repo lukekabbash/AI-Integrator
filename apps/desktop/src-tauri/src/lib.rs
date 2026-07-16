@@ -70,6 +70,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_bootstrap,
             open_external_url,
+            open_task_window,
             provider_discover,
             provider_action_list,
             task_create,

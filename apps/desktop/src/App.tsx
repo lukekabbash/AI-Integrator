@@ -97,7 +97,14 @@ import { Composer } from "./components/Composer";
 import { DeleteChatModal } from "./components/DeleteChatModal";
 import { DeleteArchivedChatsModal } from "./components/DeleteArchivedChatsModal";
 import { DeleteProjectModal, type DeleteProjectScope } from "./components/DeleteProjectModal";
-import { FileWorkspace, type FileSelectionPayload } from "./components/FileView";
+import {
+  FileWorkspace,
+  type FileExplainPayload,
+  type FileExplainResult,
+  type FileSelectionPayload,
+} from "./components/FileView";
+import { resolveExplainConfig, resolveExplainRoute } from "./explainSettings";
+import { decorateCommitMessage, readGitDecorationSettings, readPushForce } from "./gitDecoration";
 import { TitlebarFileTabs } from "./components/TitlebarFileTabs";
 import { resolveRequestedFile } from "./components/fileViewSupport";
 import { TaskStatusPill } from "./components/TaskStatusPill";
@@ -407,6 +414,13 @@ function initialCenterView(): CenterView {
   return new URLSearchParams(window.location.search).get("view") === "review" ? "review" : "task";
 }
 
+/** Set only for a secondary window opened via "Open in new window"; pins its
+ * initial chat ahead of (and independent from) the shared nav localStorage. */
+function initialTaskId(): string {
+  if (typeof window === "undefined") return "";
+  return new URLSearchParams(window.location.search).get("taskId") ?? "";
+}
+
 function NativeTitlebar({
   context,
   title,
@@ -426,6 +440,7 @@ function NativeTitlebar({
   onToggleSidebar,
   onToggleTaskTools,
   onToggleTerminal,
+  onOpenNewWindow,
   onReviewChanges,
   onOpenSettings,
   onOpenSetup,
@@ -451,6 +466,8 @@ function NativeTitlebar({
   onToggleSidebar: () => void;
   onToggleTaskTools: () => void;
   onToggleTerminal: () => void;
+  /** Opens (or focuses) a mirrored second window pinned to the active chat. */
+  onOpenNewWindow: () => void;
   onReviewChanges: () => void;
   onOpenSettings: () => void;
   onOpenSetup: () => void;
@@ -583,6 +600,16 @@ function NativeTitlebar({
                   }}
                 >
                   Toggle terminal
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    onOpenNewWindow();
+                    setOpenMenu(null);
+                  }}
+                >
+                  Open in new window
                 </button>
                 <button
                   type="button"
@@ -1990,6 +2017,14 @@ export default function App() {
           bridge.loadWorkspace(),
           Promise.resolve(bridge.listSettings?.()).catch(() => []),
         ]);
+        const deepLinkTaskId = initialTaskId();
+        const deepLinkTask = deepLinkTaskId
+          ? loaded.tasks.find((task) => task.id === deepLinkTaskId)
+          : undefined;
+        if (deepLinkTask) {
+          loaded.activeTaskId = deepLinkTask.id;
+          loaded.activeProjectId = deepLinkTask.projectId;
+        }
         const persisted = persistedSettings ?? [];
         if (!active) return;
         // Composer defaults (runtime, effort, permission, Enter behavior) are
@@ -4169,23 +4204,59 @@ export default function App() {
     }
   };
 
+  /** Who answers an "Ask about this" request. Resolved once so the panel's
+   * label and the request itself cannot disagree about which agent was asked:
+   * an unpinned explainer runtime inherits whatever this chat is using. */
+  const explainRoute = useMemo(
+    () =>
+      resolveExplainRoute(
+        localSettings,
+        {
+          runtime: (activeTask?.runtime as RuntimeId | undefined) ?? settingsDefaultRuntime,
+          model: activeTask?.model ?? undefined,
+          effort: activeTask?.effort ?? undefined,
+        },
+        snapshot.runtimes
+          .filter((runtime) => runtime.status !== "not_installed")
+          .map((runtime) => runtime.id),
+      ),
+    [
+      localSettings,
+      activeTask?.runtime,
+      activeTask?.model,
+      activeTask?.effort,
+      settingsDefaultRuntime,
+      snapshot.runtimes,
+    ],
+  );
+
   /** Right-click "Ask about this" from the file reader: stay on the file
-   * canvas and ask the active runtime to explain the selection through the
-   * isolated helper boundary. Add to chat remains the path into the transcript. */
-  const explainFileSelection = async (payload: FileSelectionPayload) => {
+   * canvas and ask the configured explainer to analyze the selection through
+   * the isolated helper boundary. Add to chat remains the path into the
+   * transcript.
+   *
+   * The archetype, sliders, and route all come from the Files and Git settings. */
+  const explainFileSelection = async (payload: FileExplainPayload): Promise<FileExplainResult> => {
     if (!activeProject) {
       throw new Error("Open a project before asking about a selection.");
     }
-    return bridge.explainSelection(
+    const outcome = await bridge.explainSelection(
       activeProject.id,
-      activeTask?.runtime ?? settingsDefaultRuntime,
+      explainRoute,
+      resolveExplainConfig(localSettings),
       {
         path: payload.path,
         startLine: payload.startLine,
         endLine: payload.endLine,
         text: payload.text,
+        fileText: payload.fileText,
       },
     );
+    return {
+      text: outcome.text,
+      agentLabel: runtimeLabel(outcome.runtime),
+      usedFallback: outcome.usedFallback,
+    };
   };
 
   const renameProjectFile = async (file: ProjectFileEntry, newName: string) => {
@@ -4318,7 +4389,11 @@ export default function App() {
     );
   };
 
-  const commit = async (message: string) => {
+  /** Commit decorations are applied here rather than in the composer so the
+   * message the user edits stays theirs, and rather than natively so
+   * `GitService::commit` keeps passing its message through verbatim. */
+  const commit = async (raw: string) => {
+    const message = decorateCommitMessage(raw, readGitDecorationSettings(localSettings));
     if (activeTask) {
       const git = await bridge.commit(activeTask.id, message);
       applyTaskGitSnapshot(activeTask.id, git);
@@ -4359,6 +4434,7 @@ export default function App() {
       expectedRemoteUrl: preview.sanitizedRemoteUrl,
       expectedUpstream: preview.upstream,
       expectedRefspec: preview.refspec,
+      force: readPushForce(localSettings),
     };
     const result = activeTask
       ? await bridge.confirmPush(activeTask.id, confirmation)
@@ -5440,6 +5516,9 @@ export default function App() {
             const owner = selectedDelegation?.id ?? "main";
             toggleTerminal(owner);
           }}
+          onOpenNewWindow={() => {
+            if (snapshot.activeTaskId) void bridge.openTaskWindow?.(snapshot.activeTaskId);
+          }}
           onReviewChanges={reviewChanges}
           onOpenSettings={() => setScreen("settings")}
           onOpenSetup={() => setScreen("setup")}
@@ -5516,6 +5595,10 @@ export default function App() {
                 runtimes={snapshot.runtimes}
                 onBack={() => setScreen("workspace")}
                 onRuntimeAction={openRuntimeAction}
+                onCreateProject={() => {
+                  setScreen("workspace");
+                  setAddProjectOpen(true);
+                }}
                 onFinish={() => setScreen("workspace")}
               />
             </Suspense>
@@ -5626,9 +5709,7 @@ export default function App() {
                           onSave={(content) => saveFileTab(activeFileTab.path, content)}
                           onExplainSelection={explainFileSelection}
                           onAddComposerContext={addSelectionAsComposerContext}
-                          explainAgentLabel={runtimeLabel(
-                            activeTask?.runtime ?? settingsDefaultRuntime,
-                          )}
+                          explainAgentLabel={runtimeLabel(explainRoute.runtime)}
                         />
                       ) : (
                         <div className="route-loading" role="status" aria-live="polite">

@@ -79,6 +79,21 @@ export interface FileSelectionPayload extends SelectionPayload {
   path: string;
 }
 
+/** What the explainer needs beyond the selection itself. */
+export interface FileExplainPayload extends FileSelectionPayload {
+  /** The live editor buffer. Sent rather than read from disk so an explanation
+   * describes what is on screen, including unsaved edits. */
+  fileText: string;
+}
+
+export interface FileExplainResult {
+  text: string;
+  /** Who actually answered. The route can fail over to another provider, so
+   * this is not necessarily the agent the request was addressed to. */
+  agentLabel: string;
+  usedFallback: boolean;
+}
+
 const INITIAL_FILE_LINES = 400;
 const FILE_LINE_CHUNK = 400;
 const FILE_AUTOSAVE_DELAY_MS = 450;
@@ -167,6 +182,10 @@ type ExplainPanelState =
       payload: FileSelectionPayload;
       status: "ready";
       explanation: string;
+      /** Carried on the result rather than read from the prop: a failed-over
+       * answer must not be attributed to the agent that could not give it. */
+      answeredBy: string;
+      usedFallback: boolean;
     }
   | {
       payload: FileSelectionPayload;
@@ -233,7 +252,9 @@ function SelectionExplainPanel({
           ? `Explaining with ${agentLabel}…`
           : state.status === "error"
             ? `${agentLabel} could not explain this selection`
-            : `Explained by ${agentLabel}`}
+            : state.usedFallback
+              ? `${agentLabel} could not answer, so ${state.answeredBy} did`
+              : `Explained by ${state.answeredBy}`}
       </p>
       {state.status === "loading" ? (
         <div className="selection-explain-loading">
@@ -389,7 +410,7 @@ export function FileWorkspace({
   editable?: boolean;
   onSave?: (content: string) => Promise<void>;
   /** Context menu: open the in-file explain panel for the current agent. */
-  onExplainSelection?: (payload: FileSelectionPayload) => Promise<string>;
+  onExplainSelection?: (payload: FileExplainPayload) => Promise<FileExplainResult>;
   /** Context menu: the selection becomes a removable composer context card. */
   onAddComposerContext?: (payload: FileSelectionPayload) => void;
   /** Label for the active runtime shown in the explain panel. */
@@ -461,10 +482,16 @@ export function FileWorkspace({
       if (!onExplainSelection) return;
       const requestId = ++explainRequestId.current;
       setExplain({ payload, status: "loading" });
-      void onExplainSelection(payload)
-        .then((explanation) => {
+      void onExplainSelection({ ...payload, fileText: draft })
+        .then((result) => {
           if (requestId !== explainRequestId.current) return;
-          setExplain({ payload, status: "ready", explanation });
+          setExplain({
+            payload,
+            status: "ready",
+            explanation: result.text,
+            answeredBy: result.agentLabel,
+            usedFallback: result.usedFallback,
+          });
         })
         .catch((error: unknown) => {
           if (requestId !== explainRequestId.current) return;
@@ -476,7 +503,7 @@ export function FileWorkspace({
           });
         });
     },
-    [onExplainSelection],
+    [onExplainSelection, draft],
   );
 
   const closeExplain = useCallback(() => {

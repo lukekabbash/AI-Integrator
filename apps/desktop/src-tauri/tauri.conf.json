@@ -15,7 +15,7 @@
         "title": "AI Integrator",
         "width": 1440,
         "height": 900,
-        "minWidth": 960,
+        "minWidth": 720,
         "minHeight": 640,
         "resizable": true,
         "fullscreen": false,

@@ -139,6 +139,38 @@ pub fn open_external_url(url: String) -> CommandResult<()> {
     })
 }
 
+/// Opens a second window mirroring `task_id`, or focuses it if already open.
+/// Runtime/session state lives in process-wide `AppState`, and task events
+/// broadcast to every window, so the new window sees the same live task
+/// without any additional wiring.
+#[tauri::command]
+pub fn open_task_window(app: AppHandle, task_id: TaskId) -> CommandResult<()> {
+    let label = format!("task-{task_id}");
+    if let Some(window) = app.get_webview_window(&label) {
+        let _ = window.show();
+        let _ = window.set_focus();
+        return Ok(());
+    }
+
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        label,
+        tauri::WebviewUrl::App(format!("index.html?taskId={task_id}").into()),
+    )
+    .title("AI Integrator")
+    .inner_size(1440.0, 900.0)
+    .min_inner_size(720.0, 640.0)
+    .resizable(true)
+    .decorations(false)
+    .center()
+    .build()
+    .map(|_| ())
+    .map_err(|error| CommandError {
+        code: "unavailable",
+        message: format!("could not open a new window: {error}"),
+    })
+}
+
 #[tauri::command]
 pub async fn provider_discover() -> CommandResult<Vec<integrator_core::ProviderStatus>> {
     let statuses = tauri::async_runtime::spawn_blocking(discover_providers)

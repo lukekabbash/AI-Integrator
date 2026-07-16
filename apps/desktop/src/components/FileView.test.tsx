@@ -279,9 +279,11 @@ describe("FileWorkspace", () => {
   });
 
   it("opens the in-file explain panel instead of sending the selection to chat", async () => {
-    const onExplainSelection = vi
-      .fn()
-      .mockResolvedValue("This line declares a string constant used by the surrounding module.");
+    const onExplainSelection = vi.fn().mockResolvedValue({
+      text: "This line declares a string constant used by the surrounding module.",
+      agentLabel: "Codex",
+      usedFallback: false,
+    });
     const onAddComposerContext = vi.fn();
     renderWorkspace({
       onExplainSelection,
@@ -302,6 +304,9 @@ describe("FileWorkspace", () => {
         startLine: 1,
         endLine: 1,
         intent: "ask",
+        // The live buffer travels with the selection: context is gathered from
+        // what is on screen, not from what is on disk.
+        fileText: expect.stringContaining("const value"),
       }),
     );
     expect(onAddComposerContext).not.toHaveBeenCalled();
@@ -322,6 +327,23 @@ describe("FileWorkspace", () => {
         screen.queryByRole("menu", { name: "Selection actions for src/App.tsx" }),
       ).not.toBeInTheDocument(),
     );
+  });
+
+  it("credits the provider that answered rather than the one that was asked", async () => {
+    // The route fails over, so attributing a fallback's answer to the primary
+    // would tell the reader a model produced text it never saw.
+    const onExplainSelection = vi.fn().mockResolvedValue({
+      text: "A fallback answered this one.",
+      agentLabel: "Claude",
+      usedFallback: true,
+    });
+    renderWorkspace({ onExplainSelection, explainAgentLabel: "Codex" });
+
+    fireEvent.contextMenu(selectFirstLine(), { clientX: 60, clientY: 60 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Ask about this" }));
+
+    expect(await screen.findByText("Codex could not answer, so Claude did")).toBeInTheDocument();
+    expect(screen.queryByText("Explained by Codex")).not.toBeInTheDocument();
   });
 
   it("surfaces explain failures in the panel without leaving the file", async () => {

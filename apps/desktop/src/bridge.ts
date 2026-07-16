@@ -867,6 +867,53 @@ export interface RuntimeTerminalOutputEvent {
   exitCode?: number | null;
 }
 
+/** What the selection explainer is asked to do. Each archetype swaps the whole
+ * mission rather than modifying one prompt, so `socratic` can forbid the very
+ * thing `explanation` requires. `custom` carries the user's own mission. */
+export type ExplainArchetype =
+  | "explanation"
+  | "socratic"
+  | "optimization"
+  | "critique"
+  | "security"
+  | "custom";
+
+/** A user-authored archetype. `id` is what `explain.archetype` stores, so it
+ * must not collide with a built-in name. */
+export interface CustomArchetype {
+  id: string;
+  label: string;
+  mission: string;
+}
+
+export interface ExplainConfig {
+  archetype: ExplainArchetype;
+  /** Read only when `archetype` is `custom`. */
+  customMission?: string;
+  /** 1-100. Drives both the answer's length and how much context is gathered. */
+  verbosity: number;
+  /** 0-3, beginner to expert. */
+  technicality: number;
+}
+
+export interface ExplainRoute {
+  runtime: RuntimeId;
+  /** Catalog model id; omitted keeps the provider's economy default. */
+  model?: string;
+  effort?: string;
+  /** Runtimes to try in order once the primary cannot answer. Each runs on its
+   * own economy model — a model id means nothing to a different provider. */
+  fallbacks: RuntimeId[];
+}
+
+export interface ExplainOutcome {
+  text: string;
+  /** Who actually answered. Not necessarily the runtime the user picked, since
+   * the route fails over, so the panel must label the answer with this. */
+  runtime: RuntimeId;
+  usedFallback: boolean;
+}
+
 export interface AppBridge {
   getAppInfo(): Promise<LocalAppInfo>;
   getStorageTotals(): Promise<StorageTotals>;
@@ -982,9 +1029,23 @@ export interface AppBridge {
    * boundary shared with chat naming. Returns plain prose. */
   explainSelection(
     projectId: string,
-    runtime: RuntimeId,
-    payload: { path: string; startLine?: number; endLine?: number; text: string },
-  ): Promise<string>;
+    route: ExplainRoute,
+    config: ExplainConfig,
+    payload: {
+      path: string;
+      startLine?: number;
+      endLine?: number;
+      text: string;
+      /** The live editor buffer. The file view is editable, so the selection's
+       * own file is sent rather than read from disk: reading it back would
+       * explain a stale version whenever there are unsaved edits. */
+      fileText?: string;
+    },
+  ): Promise<ExplainOutcome>;
+  /** The exact prompt the given settings would send. Composed natively by the
+   * same function a real explanation uses, so the settings preview cannot drift
+   * from what actually reaches the provider. */
+  explainPromptPreview(config: ExplainConfig, project?: string): Promise<string>;
   /** Rename a file in place inside the trusted project (native builds only). */
   renameProjectFile(projectId: string, path: string, newName: string): Promise<ProjectFileEntry>;
   /** Native-detected, allowlisted file-opening targets for one trusted project. */
@@ -1022,6 +1083,8 @@ export interface AppBridge {
   ): Promise<TaskSummary>;
   /** Persists a terminal task lifecycle state; live running/waiting remains projection-owned. */
   setTaskStatus?(taskId: string, status: TaskStatus): Promise<void>;
+  /** Opens (or focuses) a second window mirroring this chat; task events broadcast to both. */
+  openTaskWindow?(taskId: string): Promise<void>;
   sendTurn(input: SendTurnInput): Promise<TranscriptEvent>;
   /** Delegated subagents of a task (native delegation broker; empty in browser mode). */
   listDelegations(taskId: string): Promise<DelegationView[]>;
@@ -1592,6 +1655,16 @@ function isTauri(): boolean {
   return typeof window !== "undefined" && Boolean((window as TauriWindow).__TAURI_INTERNALS__);
 }
 
+/** True for a secondary window opened via "Open in new window": it mirrors a
+ * pinned chat rather than owning the shared nav restore point, so it must
+ * not overwrite localStorage with whatever it happens to be showing. */
+function isDeepLinkedWindow(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    new URLSearchParams(window.location.search).has("taskId")
+  );
+}
+
 export function formatBridgeError(error: unknown, fallback: string): string {
   if (error instanceof Error && error.message.trim()) return error.message;
   if (typeof error === "string" && error.trim()) return error;
@@ -1856,6 +1929,12 @@ async function invokeOrDemo<T>(
 
 function runtimeId(provider: NativeProviderStatus["provider"]): RuntimeId {
   return provider === "custom-acp" ? "custom" : provider;
+}
+
+/** The inverse of `runtimeId`: the renderer says `custom`, the native
+ * `ProviderKind` spells that variant `custom-acp`. */
+function wireProvider(runtime: RuntimeId): NativeProviderStatus["provider"] {
+  return runtime === "custom" ? "custom-acp" : runtime;
 }
 
 function mapRuntime(status: NativeProviderStatus): RuntimeConnection {
@@ -4140,25 +4219,63 @@ export const bridge: AppBridge = {
     return paths;
   },
 
-  explainSelection: async (projectId, runtime, payload) => {
+  explainSelection: async (projectId, route, config, payload) => {
     if (isTauri()) {
-      return nativeInvoke<string>("selection_explain", {
+      const outcome = await nativeInvoke<{
+        text: string;
+        provider: NativeProviderStatus["provider"];
+        usedFallback: boolean;
+      }>("selection_explain", {
         repository: repositoryForProject(projectId),
-        provider: runtime === "custom" ? "custom-acp" : runtime,
+        route: {
+          provider: wireProvider(route.runtime),
+          model: route.model ?? null,
+          effort: route.effort ?? null,
+          fallbacks: route.fallbacks.map(wireProvider),
+        },
+        config: {
+          archetype: config.archetype,
+          customMission: config.customMission ?? null,
+          verbosity: config.verbosity,
+          technicality: config.technicality,
+        },
         path: payload.path,
         startLine: payload.startLine ?? null,
         endLine: payload.endLine ?? null,
         selection: payload.text,
+        fileText: payload.fileText ?? null,
       });
+      return {
+        text: outcome.text,
+        runtime: runtimeId(outcome.provider),
+        usedFallback: outcome.usedFallback,
+      };
     }
     // Browser preview: a canned explanation keeps the flow demonstrable
     // without a provider CLI.
     await new Promise((resolve) => window.setTimeout(resolve, 600));
     const lines = payload.text.split("\n").length;
-    return `This selection spans ${lines} line${lines === 1 ? "" : "s"} of ${
-      payload.path.split("/").at(-1) ?? payload.path
-    }. In the desktop app, your current runtime explains the highlighted code here in read-only mode.`;
+    return {
+      text: `This selection spans ${lines} line${lines === 1 ? "" : "s"} of ${
+        payload.path.split("/").at(-1) ?? payload.path
+      }. In the desktop app, your ${config.archetype} agent analyzes the highlighted code here in read-only mode.`,
+      runtime: route.runtime,
+      usedFallback: false,
+    };
   },
+
+  explainPromptPreview: async (config, project) =>
+    invokeOrDemo(
+      "selection_explain_preview",
+      {
+        config: { ...config, customMission: config.customMission ?? null },
+        project: project ?? null,
+      },
+      () =>
+        `You are the isolated ${config.archetype} agent for the project ${JSON.stringify(
+          project ?? "your project",
+        )}.\n\nThe desktop app composes the real prompt natively; this browser preview is a stand-in.`,
+    ),
 
   renameProjectFile: async (projectId, path, newName) => {
     if (isTauri()) {
@@ -4460,6 +4577,16 @@ export const bridge: AppBridge = {
     };
     cachedWorkspace = next;
     writeDemoSnapshot(next);
+  },
+
+  openTaskWindow: async (taskId) => {
+    if (isTauri()) {
+      await nativeInvoke("open_task_window", { taskId });
+      return;
+    }
+    const url = new URL(window.location.href);
+    url.searchParams.set("taskId", taskId);
+    window.open(url.toString(), "_blank", "noopener,noreferrer");
   },
 
   sendTurn: async (input) => {
@@ -4879,7 +5006,7 @@ export const bridge: AppBridge = {
         composerDrafts: cachedWorkspace?.composerDrafts ?? snapshot.composerDrafts,
         queuedMessages: cachedWorkspace?.queuedMessages ?? snapshot.queuedMessages,
       };
-      writeStoredNavigation(snapshot);
+      if (!isDeepLinkedWindow()) writeStoredNavigation(snapshot);
       return;
     }
 
