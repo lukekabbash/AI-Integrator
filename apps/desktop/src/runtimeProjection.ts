@@ -300,6 +300,11 @@ export function applyRuntimeProjection(
         resetSeq: event.seq,
         connection: { state: "reconciling", reason: projection.reason },
       };
+    // A projection kind this renderer build does not know (backend/renderer
+    // version skew) must degrade to "ignore this event", not to an undefined
+    // state that blanks the transcript or throws inside a setState updater.
+    default:
+      return next;
   }
 }
 

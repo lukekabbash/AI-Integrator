@@ -11,6 +11,12 @@ function rule(selector: string): string {
 }
 
 describe("Skills and Plugins icon hierarchy", () => {
+  it("contains long skill Markdown without widening the centered modal", () => {
+    expect(rule(".plugin-modal")).toContain("min-width: 0");
+    expect(rule(".plugin-modal-body")).toContain("min-width: 0");
+    expect(rule(".skill-markdown")).toContain("max-width: 100%");
+  });
+
   it("keeps capability icons unboxed and marketplace titles beside their icons", () => {
     for (const selector of [".browse-card-tile", ".skills-plugin-tile"]) {
       expect(rule(selector)).not.toContain("border:");

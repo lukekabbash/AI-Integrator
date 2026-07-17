@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::Write,
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
 };
@@ -16,6 +17,7 @@ use integrator_core::{
 use integrator_runtime::{
     AuthorizedRepositoryCache, GitService, StructuredCliClient, discover_providers,
 };
+use portable_pty::{ChildKiller, MasterPty};
 use session_store::LocalStore;
 use tokio::sync::{Mutex, broadcast};
 use zeroize::Zeroizing;
@@ -211,25 +213,13 @@ pub enum DelegationChildDriver {
     },
 }
 
-/// The command currently executing in a terminal session. Dropping the kill
-/// sender aborts nothing on its own; `terminal_interrupt` fires it to stop
-/// the child process.
-pub struct TerminalRun {
-    pub run_id: String,
-    pub kill: tokio::sync::oneshot::Sender<()>,
-}
-
-/// One interactive terminal bound to a trusted repository. Commands always
-/// execute inside `root`; `cwd` tracks `cd` but may never escape the
-/// repository the user explicitly trusted.
+/// One live PTY-backed terminal bound to a trusted repository. The shell
+/// owns its current directory; the renderer only receives an opaque session
+/// id and can write bytes, resize, interrupt, or close the session.
 pub struct TerminalSession {
-    pub root: PathBuf,
-    pub cwd: PathBuf,
-    pub running: Option<TerminalRun>,
-}
-
-pub struct VoiceTypingSession {
-    pub sender: tokio::sync::mpsc::Sender<VoiceTypingCommand>,
+    pub master: Box<dyn MasterPty + Send>,
+    pub writer: Box<dyn Write + Send>,
+    pub killer: Box<dyn ChildKiller + Send + Sync>,
 }
 
 #[derive(Default)]
@@ -249,11 +239,6 @@ impl NativeSecretCache {
     fn remove(&mut self, id: &str) {
         self.values.remove(id);
     }
-}
-
-pub enum VoiceTypingCommand {
-    Append(Vec<u8>),
-    Stop(tokio::sync::oneshot::Sender<()>),
 }
 
 /// Install or reconnect one task-owned runtime without disturbing work owned
@@ -339,7 +324,6 @@ pub struct AppState {
     /// persistent store; this zeroizing process-local cache prevents repeated
     /// credential reads and never crosses the native command boundary.
     skill_credentials: std::sync::Mutex<NativeSecretCache>,
-    pub voice_typing: std::sync::Mutex<Option<VoiceTypingSession>>,
     pub terminals: std::sync::Mutex<HashMap<String, TerminalSession>>,
     /// Vendor setup/update PTYs. Each session is born from a native allowlisted
     /// plan; the renderer can write terminal bytes but cannot choose a program,
@@ -386,7 +370,6 @@ impl AppState {
             turn_launches: Arc::new(std::sync::Mutex::new(HashSet::new())),
             native_action_handles: std::sync::Mutex::new(HashMap::new()),
             skill_credentials: std::sync::Mutex::new(NativeSecretCache::default()),
-            voice_typing: std::sync::Mutex::new(None),
             terminals: std::sync::Mutex::new(HashMap::new()),
             runtime_terminals: std::sync::Mutex::new(HashMap::new()),
             repository_watchers: std::sync::Mutex::new(RepositoryWatchRegistry::default()),

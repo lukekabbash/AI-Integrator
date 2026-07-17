@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     fs,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -20,7 +21,6 @@ use adapter_codex::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
-use futures_util::{SinkExt, StreamExt};
 use integrator_core::{
     ApprovalDecision, ApprovalKind, ApprovalProjection, ArchivedTaskPage, ComposerDraft,
     ConnectionState, IntegratorError, ItemKind, ItemProjection, ItemStatus, LocalExport,
@@ -39,16 +39,12 @@ use integrator_runtime::{
     reduce_acp_plan_review_request, reduce_acp_update, reduce_connection_event,
     reduce_provider_event,
 };
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use session_store::LocalStore;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, timeout};
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest, http::header};
 use zeroize::Zeroizing;
 
 use crate::credential_store::{self, CredentialStorage};
@@ -59,7 +55,7 @@ use crate::native_actions::{
 use crate::state::{
     AcpPermissionOption, AcpRuntime, AcpSessionSpec, AcpTurnSettlement, AppState, CodexRuntime,
     PendingStructuredPermission, PendingUserPrompt, StructuredResumeContext, StructuredRuntime,
-    VoiceTypingCommand, VoiceTypingSession, remove_task_runtime, replace_task_runtime,
+    remove_task_runtime, replace_task_runtime,
 };
 
 pub(crate) type CommandResult<T> = std::result::Result<T, CommandError>;
@@ -1185,8 +1181,11 @@ fn store_provider_quota(store: &LocalStore, provider: ProviderKind, params: &Val
 
 const VOICE_TYPING_SERVICE: &str = "ai-integrator";
 const VOICE_TYPING_ACCOUNT: &str = "openai-stt";
-const VOICE_TYPING_EVENT: &str = "voice-typing://event";
-const VOICE_TYPING_URL: &str = "wss://api.openai.com/v1/realtime?intent=transcription";
+const VOICE_TYPING_URL: &str = "https://api.openai.com/v1/audio/transcriptions";
+const VOICE_TYPING_MODEL: &str = "gpt-4o-mini-transcribe";
+/// OpenAI rejects transcription uploads above 25 MB; the WAV header adds a
+/// fixed 44 bytes on top of the PCM payload.
+const VOICE_TYPING_MAX_PCM_BYTES: usize = 25 * 1024 * 1024 - 44;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1196,26 +1195,9 @@ pub struct VoiceTypingCredentialStatus {
     provider: &'static str,
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct VoiceTypingEvent {
-    kind: &'static str,
+#[derive(Debug, Deserialize)]
+struct TranscriptionResponse {
     text: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct RealtimeServerEvent {
-    #[serde(rename = "type")]
-    event_type: String,
-    delta: Option<String>,
-    transcript: Option<String>,
-    error: Option<RealtimeError>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RealtimeError {
-    code: Option<String>,
-    message: Option<String>,
 }
 
 fn voice_typing_error(message: impl Into<String>) -> CommandError {
@@ -1230,15 +1212,6 @@ fn voice_typing_storage_name() -> &'static str {
         CredentialStorage::ProtectedLocalFile => "protected-local-file",
         CredentialStorage::OsCredentialStore => "os-credential-store",
     }
-}
-
-fn voice_typing_lock(
-    state: &AppState,
-) -> CommandResult<std::sync::MutexGuard<'_, Option<VoiceTypingSession>>> {
-    state
-        .voice_typing
-        .lock()
-        .map_err(|_| voice_typing_error("Voice typing state is unavailable."))
 }
 
 #[tauri::command]
@@ -1284,11 +1257,32 @@ pub fn voice_typing_credential_clear() -> CommandResult<()> {
     })
 }
 
+/// Minimal RIFF/WAVE container for 16-bit little-endian mono PCM so the clip
+/// can be uploaded as a self-describing file.
+fn pcm16_to_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
+    let byte_rate = sample_rate * 2;
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + pcm.len() as u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+    wav.extend_from_slice(pcm);
+    wav
+}
+
 #[tauri::command]
-pub async fn voice_typing_start(app: AppHandle, state: State<'_, AppState>) -> CommandResult<()> {
-    if voice_typing_lock(&state)?.is_some() {
-        return Err(voice_typing_error("Voice typing is already active."));
-    }
+pub async fn voice_typing_transcribe(
+    pcm_base64: String,
+    sample_rate: u32,
+) -> CommandResult<String> {
     let Some(api_key) = credential_store::read(VOICE_TYPING_SERVICE, VOICE_TYPING_ACCOUNT)
         .map_err(|_| {
             voice_typing_error("Add an OpenAI API key in Settings before using the mic button.")
@@ -1298,249 +1292,89 @@ pub async fn voice_typing_start(app: AppHandle, state: State<'_, AppState>) -> C
             "Add an OpenAI API key in Settings before using the mic button.",
         ));
     };
-
-    let mut request = VOICE_TYPING_URL
-        .into_client_request()
-        .map_err(|_| voice_typing_error("The voice typing connection could not be created."))?;
-    let authorization = header::HeaderValue::from_str(&format!("Bearer {}", api_key.trim()))
-        .map_err(|_| voice_typing_error("The OpenAI API key format is not valid."))?;
-    request
-        .headers_mut()
-        .insert(header::AUTHORIZATION, authorization);
-
-    let (mut socket, _) = connect_async(request)
-        .await
-        .map_err(|_| voice_typing_error("Could not connect to OpenAI Realtime transcription."))?;
-    let session_update = serde_json::json!({
-        "type": "session.update",
-        "session": {
-            "type": "transcription",
-            "audio": {
-                "input": {
-                    "format": {"type": "audio/pcm", "rate": 24000},
-                    // Whisper only returns whole utterances after the fact; the
-                    // gpt-4o transcribe family streams partial deltas so words
-                    // can appear in the composer while the user is speaking.
-                    "transcription": {
-                        "model": "gpt-4o-mini-transcribe"
-                    },
-                    // Live typing depends on the server committing speech
-                    // segments itself; without VAD nothing is transcribed
-                    // until the final commit at stop.
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "silence_duration_ms": 250,
-                        "prefix_padding_ms": 300
-                    }
-                }
-            }
-        }
-    });
-    socket
-        .send(Message::Text(session_update.to_string().into()))
-        .await
-        .map_err(|_| voice_typing_error("OpenAI Realtime transcription rejected the session."))?;
-    drop(api_key);
-
-    let already_active = voice_typing_lock(&state)?.is_some();
-    if already_active {
-        let _ = socket.close(None).await;
-        return Err(voice_typing_error("Voice typing is already active."));
-    }
-    let (sender, receiver) = mpsc::channel(32);
-    {
-        let mut active = voice_typing_lock(&state)?;
-        if active.is_some() {
-            return Err(voice_typing_error("Voice typing is already active."));
-        }
-        *active = Some(VoiceTypingSession { sender });
-    }
-
-    let cleanup_app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        run_voice_typing(socket, receiver, app).await;
-        if let Some(state) = cleanup_app.try_state::<AppState>()
-            && let Ok(mut active) = state.voice_typing.lock()
-        {
-            active.take();
-        }
-    });
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn voice_typing_append(state: State<'_, AppState>, pcm: Vec<u8>) -> CommandResult<()> {
-    eprintln!("[voice-typing] append received {} bytes", pcm.len());
-    if pcm.is_empty() {
-        return Ok(());
-    }
-    if pcm.len() > 128 * 1024 {
+    if !(8000..=48000).contains(&sample_rate) {
         return Err(voice_typing_error(
-            "The voice typing audio chunk is too large.",
+            "The recording sample rate is not supported.",
         ));
     }
-    let sender = voice_typing_lock(&state)?
-        .as_ref()
-        .map(|session| session.sender.clone())
-        .ok_or_else(|| voice_typing_error("Voice typing is not active."))?;
-    sender
-        .send(VoiceTypingCommand::Append(pcm))
+    let pcm = BASE64
+        .decode(pcm_base64.as_bytes())
+        .map_err(|_| voice_typing_error("The recorded audio could not be decoded."))?;
+    if pcm.len() < 4 {
+        return Err(voice_typing_error("The recording contains no audio."));
+    }
+    if pcm.len() > VOICE_TYPING_MAX_PCM_BYTES {
+        return Err(voice_typing_error(
+            "The recording is too long to transcribe. Try a shorter clip.",
+        ));
+    }
+
+    let wav = pcm16_to_wav(&pcm, sample_rate);
+    let boundary = format!("integrator-voice-{}", uuid::Uuid::new_v4());
+    let mut body = Vec::with_capacity(wav.len() + 512);
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{VOICE_TYPING_MODEL}\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"voice.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(&wav);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
+        .https_only(true)
+        .user_agent(concat!("AI-Integrator/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|_| voice_typing_error("The transcription client could not be created."))?;
+    let response = client
+        .post(VOICE_TYPING_URL)
+        .bearer_auth(api_key.trim())
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body)
+        .send()
         .await
-        .map_err(|_| voice_typing_error("The voice typing connection ended."))
-}
+        .map_err(|error| {
+            if error.is_timeout() {
+                voice_typing_error("Transcription timed out. Check your connection and try again.")
+            } else {
+                voice_typing_error("Could not reach the OpenAI transcription service.")
+            }
+        })?;
+    drop(api_key);
 
-#[tauri::command]
-pub async fn voice_typing_stop(state: State<'_, AppState>) -> CommandResult<()> {
-    let sender = voice_typing_lock(&state)?
-        .as_ref()
-        .map(|session| session.sender.clone())
-        .ok_or_else(|| voice_typing_error("Voice typing is not active."))?;
-    let (done_sender, done_receiver) = oneshot::channel();
-    sender
-        .send(VoiceTypingCommand::Stop(done_sender))
+    let status = response.status();
+    if !status.is_success() {
+        // Response bodies can carry request details; map to fixed messages
+        // instead of forwarding provider text to the renderer.
+        return Err(match status.as_u16() {
+            401 | 403 => {
+                voice_typing_error("OpenAI rejected the API key. Update it in Settings → General.")
+            }
+            413 => voice_typing_error("The recording is too long to transcribe."),
+            429 => voice_typing_error(
+                "OpenAI rate-limited the transcription request. Try again shortly.",
+            ),
+            _ => voice_typing_error("OpenAI could not transcribe the recording."),
+        });
+    }
+    let body = response
+        .bytes()
         .await
-        .map_err(|_| voice_typing_error("The voice typing connection ended."))?;
-    timeout(Duration::from_secs(3), done_receiver)
-        .await
-        .map_err(|_| voice_typing_error("Voice typing timed out while finalizing the transcript."))?
-        .map_err(|_| voice_typing_error("The voice typing connection ended."))?;
-    Ok(())
-}
-
-fn emit_voice_typing_event(app: &AppHandle, kind: &'static str, text: String) {
-    let _ = app.emit(VOICE_TYPING_EVENT, VoiceTypingEvent { kind, text });
-}
-
-fn handle_voice_typing_message(app: &AppHandle, message: Message) -> bool {
-    let Message::Text(text) = message else {
-        return false;
-    };
-    let Ok(event) = serde_json::from_str::<RealtimeServerEvent>(&text) else {
-        return false;
-    };
-    // Session rejections and transcription failures otherwise vanish silently,
-    // leaving "no words appear" with nothing to diagnose from.
-    if matches!(event.event_type.as_str(), "error")
-        || event.event_type.ends_with(".failed")
-        || event.event_type.ends_with("session.updated")
-        || event.event_type.ends_with("session.created")
-        || event.event_type.starts_with("input_audio_buffer.")
-        || event.event_type.ends_with(".delta")
-        || event.event_type.ends_with(".completed")
-    {
-        eprintln!("[voice-typing] {text}");
-    }
-    match event.event_type.as_str() {
-        "conversation.item.input_audio_transcription.delta" => {
-            if let Some(delta) = event.delta.filter(|value| !value.is_empty()) {
-                emit_voice_typing_event(app, "delta", delta);
-            }
-            false
-        }
-        "conversation.item.input_audio_transcription.completed" => {
-            emit_voice_typing_event(app, "completed", event.transcript.unwrap_or_default());
-            true
-        }
-        "conversation.item.input_audio_transcription.failed" => {
-            emit_voice_typing_event(
-                app,
-                "error",
-                "Transcription of a speech segment failed; keep talking or restart the mic.".into(),
-            );
-            false
-        }
-        "error" => {
-            let error = event.error;
-            // The stop-time safety commit races with server VAD, which usually
-            // has already committed all speech; an empty-buffer complaint there
-            // is expected and also signals nothing further is pending.
-            if error
-                .as_ref()
-                .and_then(|error| error.code.as_deref())
-                .is_some_and(|code| code == "input_audio_buffer_commit_empty")
-            {
-                return true;
-            }
-            emit_voice_typing_event(
-                app,
-                "error",
-                error
-                    .and_then(|error| error.message)
-                    .unwrap_or_else(|| "OpenAI Realtime transcription returned an error.".into()),
-            );
-            false
-        }
-        _ => false,
-    }
-}
-
-async fn wait_for_voice_typing_completion<S>(socket: &mut WebSocketStream<S>, app: &AppHandle)
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    while let Some(result) = socket.next().await {
-        match result {
-            Ok(message) => {
-                if handle_voice_typing_message(app, message) {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-async fn run_voice_typing<S>(
-    mut socket: WebSocketStream<S>,
-    mut receiver: mpsc::Receiver<VoiceTypingCommand>,
-    app: AppHandle,
-) where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    loop {
-        tokio::select! {
-            incoming = socket.next() => {
-                match incoming {
-                    Some(Ok(message)) => {
-                        if matches!(message, Message::Close(_)) {
-                            break;
-                        }
-                        let _ = handle_voice_typing_message(&app, message);
-                    }
-                    Some(Err(_)) | None => break,
-                }
-            }
-            command = receiver.recv() => {
-                let Some(command) = command else { break };
-                match command {
-                    VoiceTypingCommand::Append(pcm) => {
-                        eprintln!("[voice-typing] sending {} bytes to OpenAI", pcm.len());
-                        let append = serde_json::json!({
-                            "type": "input_audio_buffer.append",
-                            "audio": BASE64.encode(pcm),
-                        });
-                        if socket.send(Message::Text(append.to_string().into())).await.is_err() {
-                            emit_voice_typing_event(&app, "error", "The voice typing connection ended.".into());
-                            break;
-                        }
-                    }
-                    VoiceTypingCommand::Stop(done_sender) => {
-                        let commit = serde_json::json!({"type": "input_audio_buffer.commit"});
-                        if socket.send(Message::Text(commit.to_string().into())).await.is_ok() {
-                            let _ = timeout(
-                                Duration::from_secs(2),
-                                wait_for_voice_typing_completion(&mut socket, &app),
-                            )
-                            .await;
-                        }
-                        let _ = done_sender.send(());
-                        let _ = socket.close(None).await;
-                        break;
-                    }
-                }
-            }
-        }
-    }
+        .map_err(|_| voice_typing_error("The transcription response could not be read."))?;
+    let transcription: TranscriptionResponse = serde_json::from_slice(&body)
+        .map_err(|_| voice_typing_error("The transcription response could not be read."))?;
+    Ok(transcription.text.trim().to_owned())
 }
 
 #[tauri::command]
@@ -2410,7 +2244,9 @@ pub async fn git_push_confirmed(
         .map_err(Into::into)
 }
 
-const MAX_TERMINAL_OUTPUT_LINES: usize = 4_000;
+const MAX_TERMINAL_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+const TERMINAL_OUTPUT_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const TERMINAL_OUTPUT_EVENT: &str = "terminal://output";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2422,193 +2258,149 @@ pub struct TerminalSessionInfo {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TerminalCommandStarted {
-    /// Absent when the command completed inline (blank input or a `cd`).
-    run_id: Option<String>,
-    cwd: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct TerminalOutputPayload {
     session_id: String,
-    run_id: String,
     stream: &'static str,
-    line: Option<String>,
-    exit_code: Option<i32>,
-    cwd: String,
+    data: Option<String>,
+    exit_code: Option<u32>,
 }
 
 /// Opens an interactive terminal session rooted at an explicitly trusted
-/// repository. This is the only place the renderer gains command execution,
-/// and every command it sends runs inside the trusted root with the user
-/// typing it — never a provider or a remote payload.
+/// repository. This is the only place the renderer gains command execution;
+/// the shell starts in the trusted root and every byte is user-entered,
+/// never a provider or a remote payload.
 #[tauri::command]
 pub async fn terminal_open(
+    app: AppHandle<tauri::Wry>,
     state: State<'_, AppState>,
     repository: PathBuf,
+    cols: u16,
+    rows: u16,
 ) -> CommandResult<TerminalSessionInfo> {
     let project_root = authorized_project_directory(&state, repository).await?;
     let root = dunce::canonicalize(&project_root).map_err(|error| CommandError {
         code: "terminal-unavailable",
         message: format!("could not resolve the repository root: {error}"),
     })?;
+    let size = terminal_pty_size(cols, rows)?;
+    let pair = native_pty_system()
+        .openpty(size)
+        .map_err(|error| terminal_error("could not open the terminal", error))?;
+    let mut command = terminal_shell_command();
+    command.cwd(&root);
+    apply_terminal_environment(&mut command);
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|error| terminal_error("could not start the terminal shell", error))?;
+    drop(pair.slave);
+    let reader = match pair.master.try_clone_reader() {
+        Ok(reader) => reader,
+        Err(error) => {
+            let _ = child.kill();
+            return Err(terminal_error("could not read the terminal", error));
+        }
+    };
+    let writer = match pair.master.take_writer() {
+        Ok(writer) => writer,
+        Err(error) => {
+            let _ = child.kill();
+            return Err(terminal_error("could not write to the terminal", error));
+        }
+    };
+    let killer = child.clone_killer();
     let id = uuid::Uuid::new_v4().to_string();
     let info = TerminalSessionInfo {
         id: id.clone(),
         cwd: display_path(&root),
-        shell: terminal_shell_label().into(),
+        shell: terminal_shell_label(),
     };
     state.terminals.lock().expect("terminal lock").insert(
         id,
         crate::state::TerminalSession {
-            root: root.clone(),
-            cwd: root,
-            running: None,
+            master: pair.master,
+            writer,
+            killer,
         },
     );
+    let session_id = info.id.clone();
+    std::thread::spawn(move || {
+        pump_terminal_output(&app, &session_id, reader);
+        let exit_code = child.wait().ok().map(|status| status.exit_code());
+        let state = app.state::<AppState>();
+        let removed = state
+            .terminals
+            .lock()
+            .expect("terminal lock")
+            .remove(&session_id)
+            .is_some();
+        if removed {
+            let _ = app.emit(
+                TERMINAL_OUTPUT_EVENT,
+                &TerminalOutputPayload {
+                    session_id,
+                    stream: "exit",
+                    data: None,
+                    exit_code,
+                },
+            );
+        }
+    });
     Ok(info)
 }
 
 #[tauri::command]
-pub async fn terminal_run(
-    app: AppHandle<tauri::Wry>,
+pub fn terminal_write(
     state: State<'_, AppState>,
     session_id: String,
-    command: String,
-) -> CommandResult<TerminalCommandStarted> {
-    let trimmed = command.trim().to_owned();
-    let (root, cwd) = {
-        let sessions = state.terminals.lock().expect("terminal lock");
-        let session = sessions.get(&session_id).ok_or_else(unknown_terminal)?;
-        if session.running.is_some() {
-            return Err(CommandError {
-                code: "terminal-busy",
-                message: "a command is already running in this terminal".into(),
-            });
-        }
-        (session.root.clone(), session.cwd.clone())
-    };
-    if trimmed.is_empty() {
-        return Ok(TerminalCommandStarted {
-            run_id: None,
-            cwd: display_path(&cwd),
+    data: String,
+) -> CommandResult<()> {
+    if data.len() > 16 * 1024 {
+        return Err(CommandError {
+            code: "invalid-input",
+            message: "terminal input is too large".into(),
         });
     }
-    if let Some(target) = parse_cd_command(&trimmed) {
-        let next = resolve_terminal_cd(&root, &cwd, target)?;
-        let mut sessions = state.terminals.lock().expect("terminal lock");
-        let session = sessions.get_mut(&session_id).ok_or_else(unknown_terminal)?;
-        session.cwd = next.clone();
-        return Ok(TerminalCommandStarted {
-            run_id: None,
-            cwd: display_path(&next),
-        });
-    }
+    let mut sessions = state.terminals.lock().expect("terminal lock");
+    let session = sessions.get_mut(&session_id).ok_or_else(unknown_terminal)?;
+    session
+        .writer
+        .write_all(data.as_bytes())
+        .map_err(|error| terminal_error("could not send input to the terminal", error))?;
+    session
+        .writer
+        .flush()
+        .map_err(|error| terminal_error("could not flush terminal input", error))
+}
 
-    let run_id = uuid::Uuid::new_v4().to_string();
-    let mut child = spawn_terminal_shell(&trimmed, &cwd)?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
-    {
-        let mut sessions = state.terminals.lock().expect("terminal lock");
-        let session = sessions.get_mut(&session_id).ok_or_else(unknown_terminal)?;
-        session.running = Some(crate::state::TerminalRun {
-            run_id: run_id.clone(),
-            kill: kill_tx,
-        });
-    }
-
-    let cwd_display = display_path(&cwd);
-    let out_task = stdout.map(|pipe| {
-        tauri::async_runtime::spawn(pump_terminal_pipe(
-            app.clone(),
-            session_id.clone(),
-            run_id.clone(),
-            cwd_display.clone(),
-            "stdout",
-            pipe,
-        ))
-    });
-    let err_task = stderr.map(|pipe| {
-        tauri::async_runtime::spawn(pump_terminal_pipe(
-            app.clone(),
-            session_id.clone(),
-            run_id.clone(),
-            cwd_display.clone(),
-            "stderr",
-            pipe,
-        ))
-    });
-
-    let waiter_app = app;
-    let waiter_session = session_id.clone();
-    let waiter_run = run_id.clone();
-    tauri::async_runtime::spawn(async move {
-        let mut kill_rx = kill_rx;
-        let status = tokio::select! {
-            status = child.wait() => status.ok(),
-            _ = &mut kill_rx => {
-                let _ = child.start_kill();
-                child.wait().await.ok()
-            }
-        };
-        // Flush remaining pipe output before reporting completion so exit
-        // never overtakes the command's own final lines.
-        if let Some(task) = out_task {
-            let _ = task.await;
-        }
-        if let Some(task) = err_task {
-            let _ = task.await;
-        }
-        let cwd = {
-            let state = waiter_app.state::<AppState>();
-            let mut sessions = state.terminals.lock().expect("terminal lock");
-            match sessions.get_mut(&waiter_session) {
-                Some(session) => {
-                    if session
-                        .running
-                        .as_ref()
-                        .is_some_and(|run| run.run_id == waiter_run)
-                    {
-                        session.running = None;
-                    }
-                    display_path(&session.cwd)
-                }
-                None => return,
-            }
-        };
-        let _ = waiter_app.emit(
-            "terminal://output",
-            &TerminalOutputPayload {
-                session_id: waiter_session,
-                run_id: waiter_run,
-                stream: "exit",
-                line: None,
-                exit_code: status.and_then(|status| status.code()),
-                cwd,
-            },
-        );
-    });
-
-    Ok(TerminalCommandStarted {
-        run_id: Some(run_id),
-        cwd: cwd_display,
-    })
+#[tauri::command]
+pub fn terminal_resize(
+    state: State<'_, AppState>,
+    session_id: String,
+    cols: u16,
+    rows: u16,
+) -> CommandResult<()> {
+    let size = terminal_pty_size(cols, rows)?;
+    let sessions = state.terminals.lock().expect("terminal lock");
+    let session = sessions.get(&session_id).ok_or_else(unknown_terminal)?;
+    session
+        .master
+        .resize(size)
+        .map_err(|error| terminal_error("could not resize the terminal", error))
 }
 
 #[tauri::command]
 pub fn terminal_interrupt(state: State<'_, AppState>, session_id: String) -> CommandResult<()> {
-    let run = {
-        let mut sessions = state.terminals.lock().expect("terminal lock");
-        let session = sessions.get_mut(&session_id).ok_or_else(unknown_terminal)?;
-        session.running.take()
-    };
-    if let Some(run) = run {
-        let _ = run.kill.send(());
-    }
-    Ok(())
+    let mut sessions = state.terminals.lock().expect("terminal lock");
+    let session = sessions.get_mut(&session_id).ok_or_else(unknown_terminal)?;
+    session
+        .writer
+        .write_all(b"\x03")
+        .map_err(|error| terminal_error("could not interrupt the terminal", error))?;
+    session
+        .writer
+        .flush()
+        .map_err(|error| terminal_error("could not flush terminal interrupt", error))
 }
 
 #[tauri::command]
@@ -2618,10 +2410,8 @@ pub fn terminal_close(state: State<'_, AppState>, session_id: String) -> Command
         .lock()
         .expect("terminal lock")
         .remove(&session_id);
-    if let Some(session) = session
-        && let Some(run) = session.running
-    {
-        let _ = run.kill.send(());
+    if let Some(mut session) = session {
+        let _ = session.killer.kill();
     }
     Ok(())
 }
@@ -2633,151 +2423,125 @@ fn unknown_terminal() -> CommandError {
     }
 }
 
-fn terminal_shell_label() -> &'static str {
-    if cfg!(windows) { "PowerShell" } else { "sh" }
+fn terminal_error(context: &str, error: impl std::fmt::Display) -> CommandError {
+    CommandError {
+        code: "terminal-unavailable",
+        message: format!("{context}: {error}"),
+    }
+}
+
+fn terminal_shell_label() -> String {
+    #[cfg(windows)]
+    {
+        "PowerShell".into()
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("SHELL")
+            .as_deref()
+            .map(Path::new)
+            .and_then(Path::file_name)
+            .and_then(std::ffi::OsStr::to_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("sh")
+            .into()
+    }
 }
 
 fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// Recognizes the `cd` builtin the session handles itself; everything else
-/// goes to the shell. Bare `cd` (and `cd ~`) returns to the project root
-/// because a terminal session never leaves the trusted repository.
-fn parse_cd_command(command: &str) -> Option<&str> {
-    if command == "cd" {
-        return Some("");
-    }
-    command
-        .strip_prefix("cd ")
-        .map(str::trim)
-        .map(|target| target.trim_matches(|quote| quote == '"' || quote == '\''))
+fn terminal_shell_command() -> CommandBuilder {
+    #[cfg(windows)]
+    let mut builder = CommandBuilder::new("powershell.exe");
+    #[cfg(not(windows))]
+    let builder = {
+        let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
+        let mut builder = CommandBuilder::new(shell);
+        builder.args(["-i"]);
+        builder
+    };
+    #[cfg(windows)]
+    builder.args(["-NoLogo"]);
+    builder
 }
 
-fn resolve_terminal_cd(
-    root: &Path,
-    cwd: &Path,
-    target: &str,
-) -> std::result::Result<PathBuf, CommandError> {
-    if target.is_empty() || target == "~" {
-        return Ok(root.to_path_buf());
-    }
-    let raw = Path::new(target);
-    let candidate = if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        cwd.join(raw)
-    };
-    let canonical = dunce::canonicalize(&candidate).map_err(|_| CommandError {
-        code: "invalid-input",
-        message: format!("cd: no such directory: {target}"),
-    })?;
-    if !canonical.starts_with(root) {
-        return Err(CommandError {
-            code: "unauthorized",
-            message: "cd: terminal sessions stay inside the trusted project".into(),
-        });
-    }
-    if !canonical.is_dir() {
+fn apply_terminal_environment(command: &mut CommandBuilder) {
+    // The desktop dev harness may itself run without color. That process-level
+    // preference must not leak into a user-owned interactive shell; the user's
+    // shell profile can still opt out again if that is their own preference.
+    command.env_remove("NO_COLOR");
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    command.env("TERM_PROGRAM", "AI Integrator");
+    command.env("CLICOLOR", "1");
+}
+
+fn terminal_pty_size(cols: u16, rows: u16) -> CommandResult<PtySize> {
+    if !(20..=500).contains(&cols) || !(5..=300).contains(&rows) {
         return Err(CommandError {
             code: "invalid-input",
-            message: format!("cd: not a directory: {target}"),
+            message: "terminal dimensions are out of range".into(),
         });
     }
-    Ok(canonical)
-}
-
-fn spawn_terminal_shell(
-    command: &str,
-    cwd: &Path,
-) -> std::result::Result<tokio::process::Child, CommandError> {
-    #[cfg(windows)]
-    let mut builder = {
-        // -EncodedCommand sidesteps PowerShell re-parsing the quoted argument
-        // string, so the user's command arrives byte-for-byte. UTF-8 console
-        // output keeps non-ASCII tool output readable in the drawer.
-        let script = format!(
-            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n{command}\nif ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }}"
-        );
-        let utf16: Vec<u8> = script
-            .encode_utf16()
-            .flat_map(|unit| unit.to_le_bytes())
-            .collect();
-        let encoded = BASE64.encode(&utf16);
-        let mut builder = tokio::process::Command::new("powershell.exe");
-        builder.args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-EncodedCommand",
-            &encoded,
-        ]);
-        builder.creation_flags(CREATE_NO_WINDOW);
-        builder
-    };
-    #[cfg(not(windows))]
-    let mut builder = {
-        let mut builder = tokio::process::Command::new("/bin/sh");
-        builder.args(["-c", command]);
-        builder
-    };
-    builder
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    builder.spawn().map_err(|error| CommandError {
-        code: "terminal-spawn-failed",
-        message: format!("could not start the shell: {error}"),
+    Ok(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
     })
 }
 
-async fn pump_terminal_pipe<R>(
-    app: AppHandle<tauri::Wry>,
-    session_id: String,
-    run_id: String,
-    cwd: String,
-    stream: &'static str,
-    pipe: R,
-) where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncBufReadExt;
-    let mut reader = tokio::io::BufReader::new(pipe);
-    let mut buffer = Vec::new();
+fn pump_terminal_output(
+    app: &AppHandle<tauri::Wry>,
+    session_id: &str,
+    mut reader: Box<dyn Read + Send>,
+) {
+    let mut buffer = [0_u8; 8 * 1024];
     let mut emitted = 0usize;
+    let mut truncated = false;
     loop {
-        buffer.clear();
-        match reader.read_until(b'\n', &mut buffer).await {
+        let read = match reader.read(&mut buffer) {
             Ok(0) | Err(_) => break,
-            Ok(_) => {
-                if emitted >= MAX_TERMINAL_OUTPUT_LINES {
-                    // Keep draining so the child never blocks on a full pipe.
-                    continue;
-                }
-                emitted += 1;
-                let line = if emitted == MAX_TERMINAL_OUTPUT_LINES {
-                    format!("… output truncated after {MAX_TERMINAL_OUTPUT_LINES} lines")
-                } else {
-                    String::from_utf8_lossy(&buffer)
-                        .trim_end_matches(['\r', '\n'])
-                        .to_owned()
-                };
-                let _ = app.emit(
-                    "terminal://output",
-                    &TerminalOutputPayload {
-                        session_id: session_id.clone(),
-                        run_id: run_id.clone(),
-                        stream,
-                        line: Some(line),
-                        exit_code: None,
-                        cwd: cwd.clone(),
-                    },
+            Ok(read) => read,
+        };
+        if emitted >= MAX_TERMINAL_OUTPUT_BYTES {
+            if !truncated {
+                truncated = true;
+                let _ = emit_terminal_output(
+                    app,
+                    session_id,
+                    "\r\n… terminal output truncated after 2 MB\r\n",
                 );
             }
+            continue;
         }
+        let allowed = read.min(MAX_TERMINAL_OUTPUT_BYTES - emitted);
+        emitted += allowed;
+        let _ = emit_terminal_output(
+            app,
+            session_id,
+            &String::from_utf8_lossy(&buffer[..allowed]),
+        );
+        std::thread::sleep(TERMINAL_OUTPUT_FRAME_INTERVAL);
     }
+}
+
+fn emit_terminal_output(
+    app: &AppHandle<tauri::Wry>,
+    session_id: &str,
+    data: &str,
+) -> tauri::Result<()> {
+    app.emit(
+        TERMINAL_OUTPUT_EVENT,
+        &TerminalOutputPayload {
+            session_id: session_id.into(),
+            stream: "output",
+            data: Some(data.into()),
+            exit_code: None,
+        },
+    )
 }
 
 #[tauri::command]
@@ -5360,6 +5124,15 @@ pub(crate) fn spawn_structured_cli_pump(
             let event = match receiver.recv().await {
                 Ok(event) => event,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    // Lagged is recoverable: recv resumes from the oldest
+                    // retained event. The turn's terminal Result/Exited events
+                    // are the newest in the ring and cannot have been evicted
+                    // (nothing is sent after them until this pump settles the
+                    // turn), so keep consuming — the turn still completes and
+                    // settles normally. Cancelling here killed healthy turns
+                    // whenever persistence briefly fell behind a delta burst;
+                    // the only true loss is the skipped mid-turn deltas, which
+                    // the gap notice below reports.
                     structured_connection_event(
                         &app,
                         &store,
@@ -5367,23 +5140,8 @@ pub(crate) fn spawn_structured_cli_pump(
                         "client/receiverLagged",
                         ConnectionState::Gap,
                         Some(&format!(
-                            "activity stream dropped {skipped} events; the turn outcome requires recovery"
+                            "activity stream dropped {skipped} events; some streamed content may be missing from the transcript"
                         )),
-                    );
-                    let turn = runtime.current_turn.lock().expect("turn lock").take();
-                    if let Some(turn) = turn {
-                        let _ = runtime.client.cancel(&turn).await;
-                    }
-                    runtime.alive.store(false, Ordering::Release);
-                    settle_interrupted_turn(
-                        &app,
-                        &store,
-                        runtime
-                            .binding
-                            .lock()
-                            .expect("binding lock")
-                            .as_ref()
-                            .map(|binding| binding.task_id),
                     );
                     continue;
                 }
@@ -7386,6 +7144,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn voice_wav_container_describes_mono_pcm16() {
+        let pcm = vec![0u8, 1, 2, 3];
+        let wav = pcm16_to_wav(&pcm, 24000);
+        assert_eq!(wav.len(), 44 + pcm.len());
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(u32::from_le_bytes(wav[4..8].try_into().unwrap()), 40);
+        assert_eq!(&wav[8..16], b"WAVEfmt ");
+        assert_eq!(u32::from_le_bytes(wav[16..20].try_into().unwrap()), 16);
+        assert_eq!(u16::from_le_bytes(wav[20..22].try_into().unwrap()), 1);
+        assert_eq!(u16::from_le_bytes(wav[22..24].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 24000);
+        assert_eq!(u32::from_le_bytes(wav[28..32].try_into().unwrap()), 48000);
+        assert_eq!(u16::from_le_bytes(wav[32..34].try_into().unwrap()), 2);
+        assert_eq!(u16::from_le_bytes(wav[34..36].try_into().unwrap()), 16);
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 4);
+        assert_eq!(&wav[44..], &pcm[..]);
+    }
+
+    #[test]
     fn interrupted_resume_uses_an_idempotence_guard_without_rewriting_visible_copy() {
         assert_eq!(
             provider_wire_prompt(INTERRUPTED_RESUME_VISIBLE_PROMPT, None, None),
@@ -7947,33 +7725,76 @@ mod tests {
     }
 
     #[test]
-    fn cd_builtin_is_recognized_and_unquoted() {
-        assert_eq!(parse_cd_command("cd"), Some(""));
-        assert_eq!(parse_cd_command("cd src"), Some("src"));
-        assert_eq!(parse_cd_command("cd \"my dir\""), Some("my dir"));
-        assert_eq!(parse_cd_command("cd 'my dir'"), Some("my dir"));
-        assert_eq!(parse_cd_command("cdx"), None);
-        assert_eq!(parse_cd_command("echo cd"), None);
+    fn terminal_dimensions_are_bounded_before_opening_a_pty() {
+        assert!(terminal_pty_size(80, 24).is_ok());
+        assert!(terminal_pty_size(19, 24).is_err());
+        assert!(terminal_pty_size(80, 4).is_err());
+        assert!(terminal_pty_size(501, 24).is_err());
     }
 
     #[test]
-    fn terminal_cd_never_escapes_the_trusted_root() {
-        let root = std::env::temp_dir().join(format!("terminal-cd-{}", uuid::Uuid::new_v4()));
-        let inside = root.join("inside");
-        fs::create_dir_all(&inside).expect("create test directories");
-        let canonical_root = dunce::canonicalize(&root).expect("canonicalize root");
-
-        let resolved = resolve_terminal_cd(&canonical_root, &canonical_root, "inside")
-            .expect("descend into a child directory");
-        assert!(resolved.starts_with(&canonical_root));
+    fn terminal_environment_advertises_color_without_inheriting_the_harness_opt_out() {
+        let mut command = terminal_shell_command();
+        apply_terminal_environment(&mut command);
+        assert!(command.get_env("NO_COLOR").is_none());
         assert_eq!(
-            resolve_terminal_cd(&canonical_root, &resolved, "").expect("bare cd returns to root"),
-            canonical_root
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new("xterm-256color"))
         );
-        let escape = resolve_terminal_cd(&canonical_root, &resolved, "../..");
-        assert!(escape.is_err(), "parent traversal past the root must fail");
+        assert_eq!(
+            command.get_env("COLORTERM"),
+            Some(std::ffi::OsStr::new("truecolor"))
+        );
+        assert_eq!(command.get_env("CLICOLOR"), Some(std::ffi::OsStr::new("1")));
+    }
 
-        fs::remove_dir_all(&root).expect("clean up test directories");
+    #[test]
+    fn native_terminal_round_trips_user_input() {
+        let pair = native_pty_system()
+            .openpty(terminal_pty_size(80, 24).expect("valid terminal size"))
+            .expect("open native PTY");
+        let mut command = terminal_shell_command();
+        command.cwd(std::env::temp_dir());
+        apply_terminal_environment(&mut command);
+        let mut child = pair
+            .slave
+            .spawn_command(command)
+            .expect("start interactive shell");
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().expect("clone PTY reader");
+        let mut writer = pair.master.take_writer().expect("take PTY writer");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let _ = reader.read_to_end(&mut output);
+            let _ = sender.send(output);
+        });
+
+        #[cfg(windows)]
+        let input = b"if (-not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected) { $e=[char]27; Write-Output ($e + '[38;5;196m__AI_INTEGRATOR_' + 'PTY_READY__' + $e + '[0m') } else { Write-Output ('__NOT_' + 'A_TTY__') }\r\nexit\r\n";
+        #[cfg(not(windows))]
+        let input = b"if [ -t 0 ] && [ -t 1 ]; then printf '\\033[38;5;196m__AI_INTEGRATOR_%s__\\033[0m\\n' 'PTY_READY'; else printf '__NOT_%s__\\n' 'A_TTY'; fi\nexit\n";
+        writer.write_all(input).expect("write PTY input");
+        writer.flush().expect("flush PTY input");
+
+        let output = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| {
+                let _ = child.kill();
+                panic!("interactive shell did not answer within ten seconds");
+            });
+        child.wait().expect("wait for interactive shell");
+        assert!(
+            String::from_utf8_lossy(&output).contains("__AI_INTEGRATOR_PTY_READY__"),
+            "interactive shell output did not contain the sentinel"
+        );
+        assert!(
+            output
+                .windows(b"\x1b[38;5;196m__AI_INTEGRATOR_PTY_READY__\x1b[0m".len())
+                .any(|window| window == b"\x1b[38;5;196m__AI_INTEGRATOR_PTY_READY__\x1b[0m"),
+            "interactive shell output did not preserve ANSI color"
+        );
+        assert!(!String::from_utf8_lossy(&output).contains("__NOT_A_TTY__"));
     }
 
     #[test]

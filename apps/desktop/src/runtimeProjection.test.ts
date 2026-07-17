@@ -104,6 +104,37 @@ describe("sidebar task activity projection", () => {
 });
 
 describe("runtime projection reducer", () => {
+  it("ignores unknown projection kinds instead of corrupting state", () => {
+    let state = createRuntimeProjectionState("task-1");
+    state = applyRuntimeProjection(
+      state,
+      event(1, {
+        kind: "turnChanged",
+        turn: { id: "turn-1", status: "inProgress", stopRequested: false },
+      }),
+    );
+    // Backend/renderer version skew: a kind this build does not know must
+    // advance the sequence and change nothing else — never return undefined.
+    const skewed = applyRuntimeProjection(
+      state,
+      event(2, {
+        kind: "somethingFromTheFuture",
+      } as unknown as RuntimeProjectionEvent["projection"]),
+    );
+    expect(skewed).toBeDefined();
+    expect(skewed.lastSeq).toBe(2);
+    expect(skewed.turn).toEqual(state.turn);
+    // The stream keeps flowing afterwards.
+    const settled = applyRuntimeProjection(
+      skewed,
+      event(3, {
+        kind: "turnChanged",
+        turn: { id: "turn-1", status: "completed", stopRequested: false },
+      }),
+    );
+    expect(settled.turn?.status).toBe("completed");
+  });
+
   it("deduplicates only by sequence and replaces stable item projections", () => {
     let state = createRuntimeProjectionState("task-1");
     state = applyRuntimeProjection(

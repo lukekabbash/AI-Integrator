@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence } from "motion/react";
 import { createPortal } from "react-dom";
 import { PanelRightClose, PanelRightOpen, TerminalSquare, X } from "lucide-react";
@@ -48,7 +48,6 @@ interface SubagentConversationProps {
   onToggleTerminal?: () => void;
   onSend?: (delegationId: string, message: string, routing: DelegationRouting) => Promise<void>;
   onStop?: (delegationId: string) => Promise<void>;
-  terminal?: ReactNode;
 }
 
 function activeStatus(status: DelegationView["status"]): boolean {
@@ -78,7 +77,6 @@ export function SubagentConversation({
   onToggleTerminal,
   onSend,
   onStop,
-  terminal,
 }: SubagentConversationProps) {
   const [projection, setProjection] = useState<RuntimeProjectionState | null>(null);
   const [loading, setLoading] = useState(Boolean(delegation.childTaskId));
@@ -679,7 +677,6 @@ export function SubagentConversation({
           )}
         </div>
       )}
-      {terminal}
     </section>
   );
 }

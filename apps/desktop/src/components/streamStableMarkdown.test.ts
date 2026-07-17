@@ -1,5 +1,44 @@
 import { describe, expect, it } from "vitest";
-import { repairStreamedTables, stabilizeStreamingMarkdown } from "./streamStableMarkdown";
+import {
+  normalizeStreamedMarkdown,
+  repairStreamedTables,
+  stabilizeStreamingMarkdown,
+} from "./streamStableMarkdown";
+
+describe("normalizeStreamedMarkdown", () => {
+  it("repairs numbered headings that arrive without markdown whitespace", () => {
+    expect(normalizeStreamedMarkdown("Intro. ###1. First gridPhoto tiles\n###2. Second")).toBe(
+      "Intro.\n\n### 1. First grid\n\nPhoto tiles\n### 2. Second",
+    );
+  });
+
+  it("repairs glued sentence starts without changing inline code", () => {
+    expect(
+      normalizeStreamedMarkdown(
+        "fetchesFolder extract uses `downloadItemsAsZip` and possibleKeep direct play",
+      ),
+    ).toBe("fetches\n\nFolder extract uses `downloadItemsAsZip` and possible\n\nKeep direct play");
+  });
+
+  it("separates a glued bold fix label and list item", () => {
+    expect(
+      normalizeStreamedMarkdown(
+        "The fetch is slow. **Fix:** use a cache\nroute-split- **AbortController**",
+      ),
+    ).toBe("The fetch is slow.\n\n**Fix:** use a cache\nroute-split\n- **AbortController**");
+  });
+
+  it("does not rewrite fenced code", () => {
+    const code = "```md\n###1. literal\nroute-split- **literal**\n```";
+    expect(normalizeStreamedMarkdown(code)).toBe(code);
+  });
+
+  it("leaves ordinary prose without numbered headings alone", () => {
+    expect(normalizeStreamedMarkdown("Use ### as a literal marker.")).toBe(
+      "Use ### as a literal marker.",
+    );
+  });
+});
 
 describe("stabilizeStreamingMarkdown", () => {
   it("holds back a trailing bare dash so setext headings do not flash", () => {

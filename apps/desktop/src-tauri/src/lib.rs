@@ -61,8 +61,8 @@ pub fn run_antigravity_hook() -> i32 {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // rustls 0.23 panics on the first TLS connection (voice typing's
-    // websocket) unless a process-wide crypto provider is installed.
+    // rustls 0.23 panics on the first TLS connection (reqwest is built with
+    // rustls-no-provider) unless a process-wide crypto provider is installed.
     let _ = rustls::crypto::ring::default_provider().install_default();
     tauri::Builder::default()
         // A second launch focuses the existing window instead of spawning a
@@ -155,9 +155,7 @@ pub fn run() {
             voice_typing_credential_status,
             voice_typing_credential_set,
             voice_typing_credential_clear,
-            voice_typing_start,
-            voice_typing_append,
-            voice_typing_stop,
+            voice_typing_transcribe,
             project_register,
             project_create,
             project_default_parent,
@@ -194,7 +192,8 @@ pub fn run() {
             git_publish_github,
             git_history,
             terminal_open,
-            terminal_run,
+            terminal_write,
+            terminal_resize,
             terminal_interrupt,
             terminal_close,
             runtime_action_plan_list,

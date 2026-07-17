@@ -2208,9 +2208,9 @@ function DelegationRow({
             {delegationStatusLabel(delegation.status)}
           </span>
         </span>
-        <span className="agent-activity" title={delegation.brief}>
-          {delegation.brief}
-        </span>
+        <Tooltip label={delegation.brief} markdown multiline placement="bottom-left">
+          <span className="agent-activity">{delegation.brief}</span>
+        </Tooltip>
         <AgentRoute runtime={delegation.runtime} model={delegation.model} />
         {delegation.unreadFromChild > 0 ? (
           <span className="agent-unread">

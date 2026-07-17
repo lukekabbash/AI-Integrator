@@ -4,19 +4,65 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProjectSummary, TerminalOutputEvent } from "../bridge";
 
-const { terminalMock } = vi.hoisted(() => ({
-  terminalMock: {
+const terminalMock = vi.hoisted(() => {
+  const instances: FakeTerminal[] = [];
+
+  class FakeTerminal {
+    cols = 80;
+    rows = 24;
+    options = { disableStdin: false };
+    writes: string[] = [];
+    dataListener: ((data: string) => void) | undefined;
+
+    constructor() {
+      instances.push(this);
+    }
+
+    loadAddon = vi.fn();
+    open = vi.fn();
+    focus = vi.fn();
+    dispose = vi.fn();
+    write = (data: string) => this.writes.push(data);
+    onData = (listener: (data: string) => void) => {
+      this.dataListener = listener;
+      return { dispose: vi.fn() };
+    };
+    emitData = (data: string) => this.dataListener?.(data);
+  }
+
+  class FakeFitAddon {
+    fit = vi.fn();
+  }
+
+  return {
+    FakeTerminal,
+    FakeFitAddon,
+    instances,
     openTerminal: vi.fn(),
-    runTerminalCommand: vi.fn(),
+    writeTerminal: vi.fn(),
+    resizeTerminal: vi.fn(),
     interruptTerminal: vi.fn(),
     closeTerminal: vi.fn(),
     subscribeTerminalOutput: vi.fn(),
-  },
-}));
+  };
+});
 
+vi.mock("@xterm/xterm", () => ({ Terminal: terminalMock.FakeTerminal }));
+vi.mock("@xterm/addon-fit", () => ({ FitAddon: terminalMock.FakeFitAddon }));
 vi.mock("../bridge", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../bridge")>();
-  return { ...actual, bridge: { ...actual.bridge, ...terminalMock } };
+  return {
+    ...actual,
+    bridge: {
+      ...actual.bridge,
+      openTerminal: terminalMock.openTerminal,
+      writeTerminal: terminalMock.writeTerminal,
+      resizeTerminal: terminalMock.resizeTerminal,
+      interruptTerminal: terminalMock.interruptTerminal,
+      closeTerminal: terminalMock.closeTerminal,
+      subscribeTerminalOutput: terminalMock.subscribeTerminalOutput,
+    },
+  };
 });
 
 import { TerminalDrawer } from "./TerminalDrawer";
@@ -24,179 +70,198 @@ import { TerminalDrawer } from "./TerminalDrawer";
 const project: ProjectSummary = {
   id: "integrator",
   name: "AI Integrator",
-  path: "H:\\Code\\integrator-3",
+  path: "/workspace/integrator-3",
   branch: "main",
   dirtyFiles: 0,
   expanded: true,
 };
 
 let outputListener: ((event: TerminalOutputEvent) => void) | undefined;
+let outputListeners: Array<(event: TerminalOutputEvent) => void> = [];
+let sessionOrdinal = 0;
 
 describe("TerminalDrawer", () => {
+  beforeEach(() => {
+    terminalMock.instances.length = 0;
+    outputListener = undefined;
+    outputListeners = [];
+    sessionOrdinal = 0;
+    terminalMock.openTerminal.mockReset().mockImplementation(async () => {
+      sessionOrdinal += 1;
+      return {
+        id: `term-${sessionOrdinal}`,
+        cwd: project.path,
+        shell: "PowerShell",
+      };
+    });
+    terminalMock.writeTerminal.mockReset().mockResolvedValue(undefined);
+    terminalMock.resizeTerminal.mockReset().mockResolvedValue(undefined);
+    terminalMock.interruptTerminal.mockReset().mockResolvedValue(undefined);
+    terminalMock.closeTerminal.mockReset().mockResolvedValue(undefined);
+    terminalMock.subscribeTerminalOutput
+      .mockReset()
+      .mockImplementation(async (listener: (event: TerminalOutputEvent) => void) => {
+        outputListeners.push(listener);
+        outputListener ??= listener;
+        return vi.fn();
+      });
+  });
+
   afterEach(() => vi.restoreAllMocks());
 
-  beforeEach(() => {
-    for (const mock of Object.values(terminalMock)) mock.mockReset();
-    outputListener = undefined;
-    terminalMock.openTerminal.mockResolvedValue({
-      id: "term-1",
-      cwd: "H:\\Code\\integrator-3",
-      shell: "PowerShell",
-    });
-    terminalMock.subscribeTerminalOutput.mockImplementation(async (listener) => {
-      outputListener = listener;
-      return vi.fn();
-    });
-    terminalMock.runTerminalCommand.mockResolvedValue({
-      runId: "run-1",
-      cwd: "H:\\Code\\integrator-3",
-    });
-    terminalMock.closeTerminal.mockResolvedValue(undefined);
-    terminalMock.interruptTerminal.mockResolvedValue(undefined);
-  });
-
-  it("opens a project session, streams command output, and reports the exit", async () => {
+  it("opens one real terminal session and forwards PTY input/output", async () => {
     render(<TerminalDrawer open project={project} onClose={() => undefined} />);
 
-    await waitFor(() => expect(terminalMock.openTerminal).toHaveBeenCalledWith("integrator"));
-    const input = await screen.findByRole("textbox", { name: "Terminal command" });
-    fireEvent.change(input, { target: { value: "npm test" } });
-    fireEvent.submit(input.closest("form") as HTMLFormElement);
     await waitFor(() =>
-      expect(terminalMock.runTerminalCommand).toHaveBeenCalledWith("term-1", "npm test"),
+      expect(terminalMock.openTerminal).toHaveBeenCalledWith("integrator", {
+        cols: 80,
+        rows: 24,
+      }),
     );
-    expect(await screen.findByText(/npm test/)).toBeInTheDocument();
+    const terminal = terminalMock.instances[0];
+    terminal.emitData("codex\n");
+    expect(terminalMock.writeTerminal).toHaveBeenCalledWith("term-1", "codex\n");
 
     act(() => {
       outputListener?.({
         sessionId: "term-1",
-        runId: "run-1",
-        stream: "stdout",
-        line: "1 passed",
-        cwd: "H:\\Code\\integrator-3",
+        stream: "output",
+        data: "\u001b[32mready\u001b[0m\r\n",
       });
     });
-    expect(await screen.findByText("1 passed")).toBeInTheDocument();
-
-    act(() => {
-      outputListener?.({
-        sessionId: "term-1",
-        runId: "run-1",
-        stream: "exit",
-        exitCode: 2,
-        cwd: "H:\\Code\\integrator-3",
-      });
-    });
-    expect(await screen.findByText("Exited with code 2")).toBeInTheDocument();
-    expect(screen.getByRole("textbox", { name: "Terminal command" })).not.toBeDisabled();
+    expect(terminal.writes).toContain("\u001b[32mready\u001b[0m\r\n");
   });
 
-  it("ignores output that belongs to another session", async () => {
+  it("keeps the same session when the full-width surface is hidden and shown", async () => {
+    const view = render(<TerminalDrawer open project={project} onClose={() => undefined} />);
+    await waitFor(() => expect(terminalMock.openTerminal).toHaveBeenCalledTimes(1));
+
+    view.rerender(<TerminalDrawer open={false} project={project} onClose={() => undefined} />);
+    view.rerender(<TerminalDrawer open project={project} onClose={() => undefined} />);
+
+    expect(terminalMock.openTerminal).toHaveBeenCalledTimes(1);
+    expect(terminalMock.closeTerminal).not.toHaveBeenCalled();
+  });
+
+  it("creates, switches, and closes independent terminal sessions", async () => {
     render(<TerminalDrawer open project={project} onClose={() => undefined} />);
-    await screen.findByRole("textbox", { name: "Terminal command" });
+    await waitFor(() => expect(terminalMock.openTerminal).toHaveBeenCalledTimes(1));
 
-    outputListener?.({
-      sessionId: "another-terminal",
-      runId: "run-9",
-      stream: "stdout",
-      line: "foreign output",
-      cwd: "C:\\Elsewhere",
+    fireEvent.click(screen.getByRole("button", { name: "New terminal" }));
+    await waitFor(() => expect(terminalMock.openTerminal).toHaveBeenCalledTimes(2));
+    expect(screen.getByText("Terminal 2", { selector: ".terminal-title strong" })).toBeVisible();
+
+    terminalMock.instances[1].emitData("pwd\r");
+    expect(terminalMock.writeTerminal).toHaveBeenCalledWith("term-2", "pwd\r");
+
+    act(() => {
+      for (const listener of outputListeners) {
+        listener({ sessionId: "term-2", stream: "output", data: "second terminal\r\n" });
+      }
     });
-    expect(screen.queryByText("foreign output")).not.toBeInTheDocument();
+    expect(terminalMock.instances[1].writes).toContain("second terminal\r\n");
+    expect(terminalMock.instances[0].writes).not.toContain("second terminal\r\n");
+
+    fireEvent.click(screen.getByTitle("Terminal 1"));
+    expect(screen.getByText("Terminal 1", { selector: ".terminal-title strong" })).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close Terminal 2" }));
+    await waitFor(() => expect(terminalMock.closeTerminal).toHaveBeenCalledWith("term-2"));
+    expect(screen.queryByTitle("Terminal 2")).not.toBeInTheDocument();
   });
 
-  it("explains itself in the browser preview instead of pretending to run", async () => {
+  it("collapses the terminal list without removing its sessions or new-terminal action", async () => {
+    render(<TerminalDrawer open project={project} onClose={() => undefined} />);
+    await waitFor(() => expect(terminalMock.openTerminal).toHaveBeenCalled());
+    const rail = screen.getByRole("complementary", { name: "Terminal sessions" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse terminal list" }));
+
+    expect(rail).toHaveAttribute("data-collapsed", "true");
+    expect(screen.getByRole("button", { name: "Expand terminal list" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "New terminal" })).toBeInTheDocument();
+    expect(terminalMock.closeTerminal).not.toHaveBeenCalled();
+  });
+
+  it("resizes the panel from its accessible top-edge separator", async () => {
+    render(<TerminalDrawer open project={project} onClose={() => undefined} />);
+    const handle = screen.getByRole("separator", { name: "Resize terminal panel" });
+    expect(handle).toHaveAttribute("aria-valuenow", "300");
+
+    fireEvent.keyDown(handle, { key: "ArrowUp" });
+    expect(handle).toHaveAttribute("aria-valuenow", "324");
+
+    fireEvent.keyDown(handle, { key: "Home" });
+    expect(handle).toHaveAttribute("aria-valuenow", "180");
+
+    fireEvent.doubleClick(handle);
+    expect(handle).toHaveAttribute("aria-valuenow", "300");
+
+    fireEvent.pointerDown(handle, { pointerId: 7, clientY: 500 });
+    fireEvent.pointerMove(handle, { pointerId: 7, clientY: 400 });
+    expect(handle).toHaveAttribute("aria-valuenow", "400");
+    fireEvent.pointerUp(handle, { pointerId: 7, clientY: 400 });
+  });
+
+  it("ignores output for another session", async () => {
+    render(<TerminalDrawer open project={project} onClose={() => undefined} />);
+    await waitFor(() => expect(terminalMock.openTerminal).toHaveBeenCalled());
+    const terminal = terminalMock.instances[0];
+
+    act(() => {
+      outputListener?.({
+        sessionId: "another-terminal",
+        stream: "output",
+        data: "foreign output",
+      });
+    });
+
+    expect(terminal.writes).not.toContain("foreign output");
+  });
+
+  it("explains native-only availability in the browser preview", async () => {
     terminalMock.openTerminal.mockRejectedValue(
       new Error("The terminal is available in the native desktop app."),
     );
     render(<TerminalDrawer open project={project} onClose={() => undefined} />);
+
     expect(
       await screen.findByText("The terminal is available in the native desktop app."),
-    ).toBeInTheDocument();
-    expect(screen.queryByRole("textbox", { name: "Terminal command" })).not.toBeInTheDocument();
+    ).toHaveAttribute("role", "alert");
   });
 
-  it("batches burst output into one frame and progressively exposes full scrollback", async () => {
-    const frames: FrameRequestCallback[] = [];
-    const requestFrame = vi
-      .spyOn(window, "requestAnimationFrame")
-      .mockImplementation((callback) => {
-        frames.push(callback);
-        return frames.length;
-      });
-    vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => undefined);
+  it("surfaces a disconnected PTY write and offers a clean restart", async () => {
+    terminalMock.writeTerminal.mockRejectedValueOnce({
+      code: "not-found",
+      message: "unknown terminal session",
+    });
     render(<TerminalDrawer open project={project} onClose={() => undefined} />);
-    await screen.findByRole("textbox", { name: "Terminal command" });
+    await waitFor(() => expect(terminalMock.openTerminal).toHaveBeenCalledTimes(1));
 
-    act(() => {
-      for (let index = 0; index < 1_000; index += 1) {
-        outputListener?.({
-          sessionId: "term-1",
-          runId: "run-1",
-          stream: "stdout",
-          line: `burst-line-${index}`,
-          cwd: project.path,
-        });
-      }
-    });
-    expect(requestFrame).toHaveBeenCalledTimes(1);
-    expect(screen.queryByText("burst-line-999")).not.toBeInTheDocument();
-
-    act(() => frames.shift()?.(performance.now()));
-    const log = screen.getByRole("log");
-    expect(log.querySelectorAll("p")).toHaveLength(400);
-    expect(screen.getByText("Showing 400 of 1,000 saved lines")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Show all 1,000 saved lines" }));
-    expect(log.querySelectorAll("p")).toHaveLength(1_000);
-    expect(screen.getByText("burst-line-999")).toBeInTheDocument();
-  });
-
-  it("freezes visible output when scrolled away and exposes queued latest lines", async () => {
-    const frames: FrameRequestCallback[] = [];
-    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
-      frames.push(callback);
-      return frames.length;
-    });
-    vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => undefined);
-    render(<TerminalDrawer open project={project} onClose={() => undefined} />);
-    await screen.findByRole("textbox", { name: "Terminal command" });
-
-    act(() => {
-      for (let index = 0; index < 500; index += 1) {
-        outputListener?.({
-          sessionId: "term-1",
-          runId: "run-1",
-          stream: "stdout",
-          line: `anchored-line-${index}`,
-          cwd: project.path,
-        });
-      }
-      frames.shift()?.(performance.now());
-    });
-    const log = screen.getByRole("log");
-    Object.defineProperty(log, "scrollHeight", { configurable: true, value: 1_000 });
-    Object.defineProperty(log, "clientHeight", { configurable: true, value: 100 });
-    log.scrollTop = 0;
-    fireEvent.scroll(log);
-
-    act(() => {
-      for (let index = 500; index < 510; index += 1) {
-        outputListener?.({
-          sessionId: "term-1",
-          runId: "run-1",
-          stream: "stdout",
-          line: `anchored-line-${index}`,
-          cwd: project.path,
-        });
-      }
-      frames.shift()?.(performance.now());
-    });
+    terminalMock.instances[0].emitData("pwd\r");
 
     expect(
-      screen.getByRole("button", { name: "10 new lines · Jump to latest" }),
-    ).toBeInTheDocument();
-    expect(screen.queryByText("anchored-line-509")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "10 new lines · Jump to latest" }));
-    expect(screen.getByText("anchored-line-509")).toBeInTheDocument();
+      await screen.findByText("The terminal session disconnected. Restart it to continue."),
+    ).toHaveAttribute("role", "alert");
+    expect(terminalMock.instances[0].options.disableStdin).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Restart" }));
+    await waitFor(() => expect(terminalMock.openTerminal).toHaveBeenCalledTimes(2));
+    expect(terminalMock.closeTerminal).toHaveBeenCalledWith("term-1");
+  });
+
+  it("updates xterm colors when the app theme changes", async () => {
+    const view = render(<TerminalDrawer open project={project} onClose={() => undefined} />);
+    await waitFor(() => expect(terminalMock.openTerminal).toHaveBeenCalled());
+
+    document.documentElement.style.setProperty("--color-terminal-surface", "rgb(1, 2, 3)");
+
+    await waitFor(() =>
+      expect(terminalMock.instances[0].options).toMatchObject({
+        theme: { background: "rgb(1, 2, 3)" },
+      }),
+    );
+    view.unmount();
+    document.documentElement.style.removeProperty("--color-terminal-surface");
   });
 });

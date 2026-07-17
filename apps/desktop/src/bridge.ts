@@ -390,11 +390,6 @@ export interface VoiceTypingCredentialStatus {
   provider: "openai";
 }
 
-export interface VoiceTypingEvent {
-  kind: "delta" | "completed" | "error";
-  text: string;
-}
-
 export interface DiffLine {
   oldNumber?: number;
   newNumber?: number;
@@ -886,19 +881,11 @@ export interface TerminalSessionInfo {
   shell: string;
 }
 
-export interface TerminalCommandStarted {
-  /** Absent when the command completed inline (blank input or a `cd`). */
-  runId?: string | null;
-  cwd: string;
-}
-
 export interface TerminalOutputEvent {
   sessionId: string;
-  runId: string;
-  stream: "stdout" | "stderr" | "exit";
-  line?: string;
+  stream: "output" | "exit";
+  data?: string;
   exitCode?: number | null;
-  cwd: string;
 }
 
 export type RuntimeActionKind = "install" | "update" | "login";
@@ -1004,10 +991,8 @@ export interface AppBridge {
   getVoiceTypingCredentialStatus?(): Promise<VoiceTypingCredentialStatus>;
   setVoiceTypingCredential?(apiKey: string): Promise<VoiceTypingCredentialStatus>;
   clearVoiceTypingCredential?(): Promise<void>;
-  startVoiceTyping?(): Promise<void>;
-  appendVoiceTypingPcm?(pcm: number[]): Promise<void>;
-  stopVoiceTyping?(): Promise<void>;
-  subscribeVoiceTyping?(listener: (event: VoiceTypingEvent) => void): Promise<() => void>;
+  /** Transcribes one finished recording (base64 16-bit LE mono PCM). */
+  transcribeVoiceClip?(pcmBase64: string, sampleRate: number): Promise<string>;
   /** Native file picker for composer context attachments (any file on disk).
    * Images arrive with an inline preview data URL; null means cancelled. */
   pickContextAttachments?(): Promise<ContextAttachment[] | null>;
@@ -1144,8 +1129,12 @@ export interface AppBridge {
   listProjectFileOpeners(projectId: string): Promise<ProjectFileOpener[]>;
   openProjectFileExternal(projectId: string, path: string, openerId: string): Promise<void>;
   revealProjectFile(projectId: string, path: string): Promise<void>;
-  openTerminal(projectId: string): Promise<TerminalSessionInfo>;
-  runTerminalCommand(sessionId: string, command: string): Promise<TerminalCommandStarted>;
+  openTerminal(
+    projectId: string,
+    dimensions: { cols: number; rows: number },
+  ): Promise<TerminalSessionInfo>;
+  writeTerminal(sessionId: string, data: string): Promise<void>;
+  resizeTerminal(sessionId: string, dimensions: { cols: number; rows: number }): Promise<void>;
   interruptTerminal(sessionId: string): Promise<void>;
   closeTerminal(sessionId: string): Promise<void>;
   subscribeTerminalOutput(listener: (event: TerminalOutputEvent) => void): Promise<() => void>;
@@ -3490,29 +3479,11 @@ export const bridge: AppBridge = {
     if (isTauri()) await nativeInvoke("voice_typing_credential_clear");
   },
 
-  startVoiceTyping: async () => {
+  transcribeVoiceClip: async (pcmBase64, sampleRate) => {
     if (!isTauri()) {
       throw new Error("Voice typing is available in the native app only.");
     }
-    await nativeInvoke("voice_typing_start");
-  },
-
-  appendVoiceTypingPcm: async (pcm) => {
-    if (!isTauri()) {
-      throw new Error("Voice typing is available in the native app only.");
-    }
-    await nativeInvoke("voice_typing_append", { pcm });
-  },
-
-  stopVoiceTyping: async () => {
-    if (!isTauri()) return;
-    await nativeInvoke("voice_typing_stop");
-  },
-
-  subscribeVoiceTyping: async (listener) => {
-    if (!isTauri()) return () => undefined;
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<VoiceTypingEvent>("voice-typing://event", (event) => listener(event.payload));
+    return nativeInvoke<string>("voice_typing_transcribe", { pcmBase64, sampleRate });
   },
 
   exportLocalData: async () => {
@@ -4932,20 +4903,26 @@ export const bridge: AppBridge = {
     });
   },
 
-  openTerminal: async (projectId) => {
+  openTerminal: async (projectId, dimensions) => {
     if (!isTauri()) {
       throw new Error("The terminal is available in the native desktop app.");
     }
     return nativeInvoke<TerminalSessionInfo>("terminal_open", {
       repository: repositoryForProject(projectId),
+      ...dimensions,
     });
   },
 
-  runTerminalCommand: async (sessionId, command) => {
+  writeTerminal: async (sessionId, data) => {
     if (!isTauri()) {
       throw new Error("The terminal is available in the native desktop app.");
     }
-    return nativeInvoke<TerminalCommandStarted>("terminal_run", { sessionId, command });
+    await nativeInvoke("terminal_write", { sessionId, data });
+  },
+
+  resizeTerminal: async (sessionId, dimensions) => {
+    if (!isTauri()) return;
+    await nativeInvoke("terminal_resize", { sessionId, ...dimensions });
   },
 
   interruptTerminal: async (sessionId) => {

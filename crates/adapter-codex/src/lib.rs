@@ -20,8 +20,16 @@ use tokio::{
 };
 
 pub const CODEX_PROTOCOL_VERSION: u32 = 3;
-const EVENT_CAPACITY: usize = 256;
+// Matches adapter-acp: a token-delta burst against a briefly slow consumer
+// must not evict load-bearing turn-boundary events from the ring.
+const EVENT_CAPACITY: usize = 1024;
 const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+/// Bytes of an oversized frame retained for response-id identification.
+const DISCARDED_FRAME_HEAD_BYTES: usize = 8 * 1024;
+/// Upper bound on a single stdin frame write. Generous: pipe writes to a
+/// live local process complete in milliseconds; only a wedged agent that has
+/// stopped draining stdin can hit this.
+const STDIN_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_SERVER_REQUEST_ID_BYTES: usize = 512;
 
 /// A JSON-RPC server-request identifier as presented by Codex.
@@ -574,8 +582,18 @@ impl CodexClient {
     async fn write_message(&self, value: Value) -> Result<()> {
         let encoded = encode_message(&value)?;
         let mut stdin = self.inner.stdin.lock().await;
-        stdin.write_all(&encoded).await?;
-        stdin.flush().await?;
+        // Bounded write: a healthy agent drains its stdin pipe in
+        // milliseconds even for the largest allowed frame. Without a bound,
+        // an agent that stops reading parks this write holding the stdin
+        // mutex, and interrupt/cancel paths queue behind it forever.
+        tokio::time::timeout(STDIN_WRITE_TIMEOUT, async {
+            stdin.write_all(&encoded).await?;
+            stdin.flush().await
+        })
+        .await
+        .map_err(|_| {
+            IntegratorError::Unavailable("Codex agent stopped reading its stdin".into())
+        })??;
         Ok(())
     }
 }
@@ -616,15 +634,12 @@ fn spawn_stdout_reader(
             async move {
                 match frame {
                     JsonlFrame::Message(message) => route_message(message, pending, events).await,
-                    JsonlFrame::Invalid => {
-                        let _ = events.send(CodexEvent::ProtocolViolation {
-                            code: "invalid-json".into(),
-                        });
+                    JsonlFrame::Invalid(bytes) => {
+                        fail_discarded_response(&bytes, &pending, &events, "invalid-json").await;
                     }
-                    JsonlFrame::TooLarge => {
-                        let _ = events.send(CodexEvent::ProtocolViolation {
-                            code: "message-too-large".into(),
-                        });
+                    JsonlFrame::TooLarge(head) => {
+                        fail_discarded_response(&head, &pending, &events, "message-too-large")
+                            .await;
                     }
                 }
             }
@@ -678,11 +693,13 @@ where
         for byte in &chunk[..count] {
             if *byte == b'\n' {
                 if discarding {
-                    on_message(JsonlFrame::TooLarge).await;
+                    on_message(JsonlFrame::TooLarge(std::mem::take(&mut line))).await;
                 } else if !line.is_empty() {
                     match serde_json::from_slice::<Value>(&line) {
                         Ok(value) => on_message(JsonlFrame::Message(value)).await,
-                        Err(_) => on_message(JsonlFrame::Invalid).await,
+                        Err(_) => {
+                            on_message(JsonlFrame::Invalid(std::mem::take(&mut line))).await;
+                        }
                     }
                 }
                 line.clear();
@@ -690,26 +707,155 @@ where
             } else if !discarding {
                 line.push(*byte);
                 if line.len() > MAX_MESSAGE_BYTES {
-                    line.clear();
+                    // Keep a bounded head so the dispatcher can identify
+                    // which pending request (if any) the discarded frame was
+                    // answering; the rest of the line is skipped.
+                    line.truncate(DISCARDED_FRAME_HEAD_BYTES);
                     discarding = true;
                 }
             }
         }
     }
     if discarding {
-        on_message(JsonlFrame::TooLarge).await;
+        on_message(JsonlFrame::TooLarge(std::mem::take(&mut line))).await;
     } else if !line.is_empty() {
         match serde_json::from_slice::<Value>(&line) {
             Ok(value) => on_message(JsonlFrame::Message(value)).await,
-            Err(_) => on_message(JsonlFrame::Invalid).await,
+            Err(_) => on_message(JsonlFrame::Invalid(std::mem::take(&mut line))).await,
         }
     }
 }
 
 enum JsonlFrame {
     Message(Value),
-    Invalid,
-    TooLarge,
+    Invalid(Vec<u8>),
+    TooLarge(Vec<u8>),
+}
+
+/// A discarded frame (oversized or malformed) must still fail the pending
+/// request it was answering — otherwise that caller waits forever on a
+/// response the transport has already thrown away. The violation event is
+/// emitted either way; the pending entry is resolved only on positive
+/// response evidence from [`discarded_response_id`].
+async fn fail_discarded_response(
+    bytes: &[u8],
+    pending: &Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
+    events: &broadcast::Sender<CodexEvent>,
+    code: &str,
+) {
+    let _ = events.send(CodexEvent::ProtocolViolation { code: code.into() });
+    let Some(id) = discarded_response_id(bytes) else {
+        return;
+    };
+    let Some(sender) = pending.lock().await.remove(&id) else {
+        return;
+    };
+    let _ = sender.send(Err(IntegratorError::Unavailable(format!(
+        "Codex agent response was discarded ({code})"
+    ))));
+}
+
+/// Scans a (possibly truncated) JSON object head for positive evidence that
+/// the frame was a JSON-RPC *response*: a top-level integer `id`, a top-level
+/// `result` or `error` key, and no top-level `method` key (which would make
+/// it an agent-initiated request whose id lives in a different namespace).
+/// Anything ambiguous — truncated id digits, non-integer id, no response
+/// key in the retained head — returns `None`, leaving pending state alone,
+/// so a misattributed failure is structurally impossible.
+fn discarded_response_id(bytes: &[u8]) -> Option<u64> {
+    let mut i = 0_usize;
+    while bytes.get(i).is_some_and(|byte| byte.is_ascii_whitespace()) {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'{') {
+        return None;
+    }
+    i += 1;
+    let mut depth = 1_usize;
+    let mut expecting_key = true;
+    let mut id = None;
+    let mut is_response = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let start = i + 1;
+                i += 1;
+                let mut end = None;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            end = Some(i);
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                let Some(end) = end else { break };
+                if depth == 1 && expecting_key {
+                    while bytes.get(i).is_some_and(|byte| byte.is_ascii_whitespace()) {
+                        i += 1;
+                    }
+                    if bytes.get(i) != Some(&b':') {
+                        break;
+                    }
+                    match &bytes[start..end] {
+                        b"method" => return None,
+                        b"result" | b"error" => is_response = true,
+                        b"id" => {
+                            i += 1;
+                            expecting_key = false;
+                            while bytes.get(i).is_some_and(|byte| byte.is_ascii_whitespace()) {
+                                i += 1;
+                            }
+                            let digits = i;
+                            while bytes.get(i).is_some_and(|byte| byte.is_ascii_digit()) {
+                                i += 1;
+                            }
+                            // Require a terminator so digits cut off by the
+                            // head boundary can never parse as a shorter id.
+                            let terminated = matches!(bytes.get(i), Some(b',' | b'}'))
+                                || bytes.get(i).is_some_and(|byte| byte.is_ascii_whitespace());
+                            if i == digits || !terminated {
+                                return None;
+                            }
+                            let parsed: u64 = std::str::from_utf8(&bytes[digits..i])
+                                .ok()
+                                .and_then(|text| text.parse().ok())?;
+                            id = Some(parsed);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                if depth == 1 {
+                    break;
+                }
+                depth -= 1;
+                i += 1;
+            }
+            b',' => {
+                if depth == 1 {
+                    expecting_key = true;
+                }
+                i += 1;
+            }
+            b':' => {
+                if depth == 1 {
+                    expecting_key = false;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    if is_response { id } else { None }
 }
 
 async fn route_message(
@@ -1097,8 +1243,8 @@ mod tests {
             let observed = Arc::clone(&observed);
             async move {
                 observed.lock().await.push(match frame {
-                    JsonlFrame::Invalid => "invalid",
-                    JsonlFrame::TooLarge => "too-large",
+                    JsonlFrame::Invalid(_) => "invalid",
+                    JsonlFrame::TooLarge(_) => "too-large",
                     JsonlFrame::Message(_) => "message",
                 });
             }
@@ -1116,7 +1262,7 @@ mod tests {
                 observed
                     .lock()
                     .await
-                    .push(matches!(frame, JsonlFrame::TooLarge));
+                    .push(matches!(frame, JsonlFrame::TooLarge(_)));
             }
         })
         .await;
@@ -1131,7 +1277,7 @@ mod tests {
                 captured
                     .lock()
                     .await
-                    .push(matches!(frame, JsonlFrame::TooLarge));
+                    .push(matches!(frame, JsonlFrame::TooLarge(_)));
             }
         })
         .await;

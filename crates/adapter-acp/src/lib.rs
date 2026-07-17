@@ -27,6 +27,12 @@ use tokio::{
 };
 
 const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+/// Bytes of an oversized frame retained for response-id identification.
+const DISCARDED_FRAME_HEAD_BYTES: usize = 8 * 1024;
+/// Upper bound on a single stdin frame write. Generous: pipe writes to a
+/// live local process complete in milliseconds; only a wedged agent that has
+/// stopped draining stdin can hit this.
+const STDIN_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_REQUEST_ID_BYTES: usize = 512;
 const EVENT_CAPACITY: usize = 1024;
 pub const ACP_PROTOCOL_VERSION: u64 = 1;
@@ -522,8 +528,19 @@ impl AcpClient {
     async fn write_message(&self, value: Value) -> Result<()> {
         let encoded = encode_message(&value)?;
         let mut stdin = self.inner.stdin.lock().await;
-        stdin.write_all(&encoded).await?;
-        stdin.flush().await?;
+        // Bounded write: a healthy agent drains its stdin pipe in
+        // milliseconds even for the largest allowed frame. Without a bound,
+        // an agent that stops reading parks this write holding the stdin
+        // mutex, and cancel() — the user's escape hatch — queues behind it
+        // forever.
+        tokio::time::timeout(STDIN_WRITE_TIMEOUT, async {
+            stdin.write_all(&encoded).await?;
+            stdin.flush().await
+        })
+        .await
+        .map_err(|_| {
+            IntegratorError::Unavailable("ACP agent stopped reading its stdin".into())
+        })??;
         Ok(())
     }
 }
@@ -734,15 +751,12 @@ fn spawn_stdout_reader(
             async move {
                 match frame {
                     JsonlFrame::Message(message) => route_message(message, pending, events).await,
-                    JsonlFrame::Invalid => {
-                        let _ = events.send(AcpEvent::ProtocolViolation {
-                            code: "invalid-json".into(),
-                        });
+                    JsonlFrame::Invalid(bytes) => {
+                        fail_discarded_response(&bytes, &pending, &events, "invalid-json").await;
                     }
-                    JsonlFrame::TooLarge => {
-                        let _ = events.send(AcpEvent::ProtocolViolation {
-                            code: "message-too-large".into(),
-                        });
+                    JsonlFrame::TooLarge(head) => {
+                        fail_discarded_response(&head, &pending, &events, "message-too-large")
+                            .await;
                     }
                 }
             }
@@ -802,11 +816,13 @@ where
         for byte in &chunk[..count] {
             if *byte == b'\n' {
                 if discarding {
-                    on_message(JsonlFrame::TooLarge).await;
+                    on_message(JsonlFrame::TooLarge(std::mem::take(&mut line))).await;
                 } else if !line.is_empty() {
                     match serde_json::from_slice::<Value>(&line) {
                         Ok(value) => on_message(JsonlFrame::Message(value)).await,
-                        Err(_) => on_message(JsonlFrame::Invalid).await,
+                        Err(_) => {
+                            on_message(JsonlFrame::Invalid(std::mem::take(&mut line))).await;
+                        }
                     }
                 }
                 line.clear();
@@ -814,26 +830,161 @@ where
             } else if !discarding {
                 line.push(*byte);
                 if line.len() > MAX_MESSAGE_BYTES {
-                    line.clear();
+                    // Keep a bounded head so the dispatcher can identify
+                    // which pending request (if any) the discarded frame was
+                    // answering; the rest of the line is skipped.
+                    line.truncate(DISCARDED_FRAME_HEAD_BYTES);
                     discarding = true;
                 }
             }
         }
     }
     if discarding {
-        on_message(JsonlFrame::TooLarge).await;
+        on_message(JsonlFrame::TooLarge(std::mem::take(&mut line))).await;
     } else if !line.is_empty() {
         match serde_json::from_slice::<Value>(&line) {
             Ok(value) => on_message(JsonlFrame::Message(value)).await,
-            Err(_) => on_message(JsonlFrame::Invalid).await,
+            Err(_) => on_message(JsonlFrame::Invalid(std::mem::take(&mut line))).await,
         }
     }
 }
 
 enum JsonlFrame {
     Message(Value),
-    Invalid,
-    TooLarge,
+    Invalid(Vec<u8>),
+    TooLarge(Vec<u8>),
+}
+
+/// A discarded frame (oversized or malformed) must still fail the pending
+/// request it was answering — otherwise that caller waits forever on a
+/// response the transport has already thrown away. The violation event is
+/// emitted either way; the pending entry is resolved only on positive
+/// response evidence from [`discarded_response_id`].
+async fn fail_discarded_response(
+    bytes: &[u8],
+    pending: &Mutex<HashMap<u64, PendingRequest>>,
+    events: &broadcast::Sender<AcpEvent>,
+    code: &str,
+) {
+    let _ = events.send(AcpEvent::ProtocolViolation { code: code.into() });
+    let Some(id) = discarded_response_id(bytes) else {
+        return;
+    };
+    let Some(request) = pending.lock().await.remove(&id) else {
+        return;
+    };
+    let error = IntegratorError::Unavailable(format!("ACP agent response was discarded ({code})"));
+    emit_prompt_finished(
+        events,
+        &request,
+        AcpPromptOutcome::Error {
+            message: error.to_string(),
+        },
+    );
+    let _ = request.sender.send(Err(error));
+}
+
+/// Scans a (possibly truncated) JSON object head for positive evidence that
+/// the frame was a JSON-RPC *response*: a top-level integer `id`, a top-level
+/// `result` or `error` key, and no top-level `method` key (which would make
+/// it an agent-initiated request whose id lives in a different namespace).
+/// Anything ambiguous — truncated id digits, non-integer id, no response
+/// key in the retained head — returns `None`, leaving pending state alone,
+/// so a misattributed failure is structurally impossible.
+fn discarded_response_id(bytes: &[u8]) -> Option<u64> {
+    let mut i = 0_usize;
+    while bytes.get(i).is_some_and(|byte| byte.is_ascii_whitespace()) {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'{') {
+        return None;
+    }
+    i += 1;
+    let mut depth = 1_usize;
+    let mut expecting_key = true;
+    let mut id = None;
+    let mut is_response = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let start = i + 1;
+                i += 1;
+                let mut end = None;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            end = Some(i);
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                let Some(end) = end else { break };
+                if depth == 1 && expecting_key {
+                    while bytes.get(i).is_some_and(|byte| byte.is_ascii_whitespace()) {
+                        i += 1;
+                    }
+                    if bytes.get(i) != Some(&b':') {
+                        break;
+                    }
+                    match &bytes[start..end] {
+                        b"method" => return None,
+                        b"result" | b"error" => is_response = true,
+                        b"id" => {
+                            i += 1;
+                            expecting_key = false;
+                            while bytes.get(i).is_some_and(|byte| byte.is_ascii_whitespace()) {
+                                i += 1;
+                            }
+                            let digits = i;
+                            while bytes.get(i).is_some_and(|byte| byte.is_ascii_digit()) {
+                                i += 1;
+                            }
+                            // Require a terminator so digits cut off by the
+                            // head boundary can never parse as a shorter id.
+                            let terminated = matches!(bytes.get(i), Some(b',' | b'}'))
+                                || bytes.get(i).is_some_and(|byte| byte.is_ascii_whitespace());
+                            if i == digits || !terminated {
+                                return None;
+                            }
+                            let parsed: u64 = std::str::from_utf8(&bytes[digits..i])
+                                .ok()
+                                .and_then(|text| text.parse().ok())?;
+                            id = Some(parsed);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                if depth == 1 {
+                    break;
+                }
+                depth -= 1;
+                i += 1;
+            }
+            b',' => {
+                if depth == 1 {
+                    expecting_key = true;
+                }
+                i += 1;
+            }
+            b':' => {
+                if depth == 1 {
+                    expecting_key = false;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    if is_response { id } else { None }
 }
 
 async fn route_message(
@@ -935,6 +1086,90 @@ fn protocol_error(error: &Value) -> String {
 mod tests {
     use super::*;
     use tokio::sync::broadcast;
+
+    #[test]
+    fn discarded_response_id_requires_positive_response_evidence() {
+        // Plain response: id + result → identified.
+        assert_eq!(
+            discarded_response_id(br#"{"jsonrpc":"2.0","id":42,"result":{"x":1}}"#),
+            Some(42)
+        );
+        // Error response counts too, and truncation after evidence is fine.
+        assert_eq!(
+            discarded_response_id(br#"{"jsonrpc":"2.0","id":7,"error":{"message":"boo"#),
+            Some(7)
+        );
+        // result key first, giant payload truncated, id after: still fine.
+        assert_eq!(
+            discarded_response_id(br#"{"result":{"a":"b"},"id":3,"#),
+            Some(3)
+        );
+        // Agent-initiated request: id shares no namespace with ours → None.
+        assert_eq!(
+            discarded_response_id(br#"{"jsonrpc":"2.0","id":42,"method":"fs/read","params":{}}"#),
+            None
+        );
+        // Notification (no id): None.
+        assert_eq!(
+            discarded_response_id(br#"{"jsonrpc":"2.0","method":"session/update","params":{}}"#),
+            None
+        );
+        // Truncated id digits at the head boundary must never parse short.
+        assert_eq!(discarded_response_id(br#"{"result":null,"id":12"#), None);
+        // Non-integer id: None.
+        assert_eq!(discarded_response_id(br#"{"id":"42","result":null}"#), None);
+        // Nested "method"/"id" inside values must not confuse depth tracking.
+        assert_eq!(
+            discarded_response_id(
+                br#"{"id":9,"result":{"method":"x","id":1,"text":"\"}{"},"more":1}"#
+            ),
+            Some(9)
+        );
+        // Not JSON at all: None.
+        assert_eq!(discarded_response_id(b"this is not json"), None);
+    }
+
+    #[tokio::test]
+    async fn discarded_response_fails_the_matching_pending_request() {
+        let (events, mut receiver) = broadcast::channel(16);
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (sender, response) = tokio::sync::oneshot::channel();
+        pending.lock().await.insert(
+            5,
+            PendingRequest {
+                method: "session/prompt".into(),
+                session_id: Some("sess-1".into()),
+                sender,
+            },
+        );
+        fail_discarded_response(
+            br#"{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}"#,
+            &pending,
+            &events,
+            "message-too-large",
+        )
+        .await;
+        assert!(pending.lock().await.is_empty(), "pending entry resolved");
+        let result = response.await.expect("sender used");
+        assert!(result.is_err(), "discarded frame surfaces as an error");
+        // Violation event plus the load-bearing PromptFinished boundary.
+        let mut saw_violation = false;
+        let mut saw_finished = false;
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                AcpEvent::ProtocolViolation { code } => {
+                    assert_eq!(code, "message-too-large");
+                    saw_violation = true;
+                }
+                AcpEvent::PromptFinished { session_id, .. } => {
+                    assert_eq!(session_id, "sess-1");
+                    saw_finished = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_violation && saw_finished);
+    }
 
     #[test]
     fn stop_reason_maps_protocol_values() {

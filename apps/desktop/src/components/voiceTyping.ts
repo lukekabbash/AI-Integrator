@@ -3,12 +3,6 @@ export interface VoiceInsertAnchor {
   end: number;
 }
 
-export function appendVoiceSegment(base: string, segment: string): string {
-  if (!base) return segment;
-  if (!segment) return base;
-  return `${base}${/\s$/.test(base) || /^\s/.test(segment) ? "" : " "}${segment}`;
-}
-
 export function insertVoiceText(
   base: string,
   transcript: string,

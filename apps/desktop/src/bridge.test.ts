@@ -1882,8 +1882,8 @@ describe("native trusted-project bridge", () => {
         storage: "os-credential-store",
         provider: "openai",
       })
-      .mockResolvedValue(undefined);
-    listenMock.mockResolvedValue(vi.fn());
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValue("hello world");
 
     await expect(bridge.getVoiceTypingCredentialStatus?.()).resolves.toMatchObject({
       configured: false,
@@ -1895,22 +1895,17 @@ describe("native trusted-project bridge", () => {
       },
     );
     await bridge.clearVoiceTypingCredential?.();
-    await bridge.startVoiceTyping?.();
-    await bridge.appendVoiceTypingPcm?.([0, 1, 255, 254]);
-    await bridge.stopVoiceTyping?.();
-    await bridge.subscribeVoiceTyping?.(vi.fn());
+    await expect(bridge.transcribeVoiceClip?.("AAEC/w==", 24000)).resolves.toBe("hello world");
 
     expect(invokeMock).toHaveBeenNthCalledWith(1, "voice_typing_credential_status", undefined);
     expect(invokeMock).toHaveBeenNthCalledWith(2, "voice_typing_credential_set", {
       apiKey: "test-key-not-a-secret",
     });
     expect(invokeMock).toHaveBeenNthCalledWith(3, "voice_typing_credential_clear", undefined);
-    expect(invokeMock).toHaveBeenNthCalledWith(4, "voice_typing_start", undefined);
-    expect(invokeMock).toHaveBeenNthCalledWith(5, "voice_typing_append", {
-      pcm: [0, 1, 255, 254],
+    expect(invokeMock).toHaveBeenNthCalledWith(4, "voice_typing_transcribe", {
+      pcmBase64: "AAEC/w==",
+      sampleRate: 24000,
     });
-    expect(invokeMock).toHaveBeenNthCalledWith(6, "voice_typing_stop", undefined);
-    expect(listenMock).toHaveBeenCalledWith("voice-typing://event", expect.any(Function));
   });
 
   it("keeps queued-message mutations behind narrow task-scoped commands", async () => {

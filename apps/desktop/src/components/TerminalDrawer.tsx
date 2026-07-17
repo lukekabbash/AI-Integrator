@@ -1,6 +1,24 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { AnimatePresence, m } from "motion/react";
-import { CircleStop } from "lucide-react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type PointerEvent,
+} from "react";
+import { FitAddon } from "@xterm/addon-fit";
+import { Terminal } from "@xterm/xterm";
+import "@xterm/xterm/css/xterm.css";
+import {
+  CircleStop,
+  PanelRightClose,
+  PanelRightOpen,
+  Plus,
+  RefreshCw,
+  SquareTerminal,
+  X,
+} from "lucide-react";
+import { m } from "motion/react";
 import {
   bridge,
   type ProjectSummary,
@@ -8,27 +26,321 @@ import {
   type TerminalSessionInfo,
 } from "../bridge";
 
-interface TerminalLine {
+const DEFAULT_TERMINAL_HEIGHT_PX = 300;
+const MIN_TERMINAL_HEIGHT_PX = 180;
+const MIN_CHAT_HEIGHT_PX = 180;
+const MAX_TERMINALS = 12;
+
+type TerminalPhase = "opening" | "running" | "exited" | "failed";
+
+interface TerminalTab {
   id: number;
-  kind: "command" | "stdout" | "stderr" | "notice";
-  text: string;
+  label: string;
 }
 
-const DRAWER_HEIGHT_PX = 220;
-const MAX_SCROLLBACK_LINES = 2_000;
-const INITIAL_RENDERED_LINES = 400;
-const SCROLLBACK_CHUNK = 400;
-const FOLLOW_THRESHOLD_PX = 48;
-
-function promptFor(shell: string | undefined, cwd: string): string {
-  return shell === "PowerShell" ? `PS ${cwd}>` : `${cwd}$`;
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(maximum, Math.max(minimum, value));
 }
 
-/**
- * An interactive command runner scoped to the open project. Each command
- * executes in the trusted repository (the backend confines `cd` to it), so
- * this stays a project terminal rather than a general system shell.
- */
+function maximumTerminalHeight(): number {
+  return Math.max(MIN_TERMINAL_HEIGHT_PX, window.innerHeight - MIN_CHAT_HEIGHT_PX);
+}
+
+function terminalTheme(): NonNullable<ConstructorParameters<typeof Terminal>[0]>["theme"] {
+  const styles = getComputedStyle(document.documentElement);
+  const color = (name: string) => styles.getPropertyValue(name).trim();
+  return {
+    background: color("--color-terminal-surface"),
+    foreground: color("--color-terminal-text"),
+    cursor: color("--color-terminal-text"),
+    selectionBackground: color("--color-selection-active"),
+    black: color("--color-terminal-ansi0"),
+    red: color("--color-terminal-ansi1"),
+    green: color("--color-terminal-ansi2"),
+    yellow: color("--color-terminal-ansi3"),
+    blue: color("--color-terminal-ansi4"),
+    magenta: color("--color-terminal-ansi5"),
+    cyan: color("--color-terminal-ansi6"),
+    white: color("--color-terminal-ansi7"),
+    brightBlack: color("--color-terminal-ansi8"),
+    brightRed: color("--color-terminal-ansi9"),
+    brightGreen: color("--color-terminal-ansi10"),
+    brightYellow: color("--color-terminal-ansi11"),
+    brightBlue: color("--color-terminal-ansi12"),
+    brightMagenta: color("--color-terminal-ansi13"),
+    brightCyan: color("--color-terminal-ansi14"),
+    brightWhite: color("--color-terminal-ansi15"),
+  };
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : typeof error === "object" &&
+            error !== null &&
+            "message" in error &&
+            typeof error.message === "string"
+          ? error.message
+          : fallback;
+  if (/unknown command.*terminal_|terminal_.*not found/i.test(message)) {
+    return "Restart AI Integrator to finish enabling the terminal.";
+  }
+  if (/unknown terminal session/i.test(message)) {
+    return "The terminal session disconnected. Restart it to continue.";
+  }
+  return message.trim() || fallback;
+}
+
+function phaseLabel(phase: TerminalPhase): string {
+  if (phase === "running") return "Ready";
+  if (phase === "opening") return "Starting…";
+  if (phase === "exited") return "Exited";
+  return "Unavailable";
+}
+
+function TerminalPane({
+  id,
+  visible,
+  label,
+  project,
+  onCloseDrawer,
+  onPhaseChange,
+}: {
+  id: number;
+  visible: boolean;
+  label: string;
+  project: ProjectSummary;
+  onCloseDrawer: () => void;
+  onPhaseChange: (id: number, phase: TerminalPhase) => void;
+}) {
+  const hostRef = useRef<HTMLDivElement>(null);
+  const terminalRef = useRef<Terminal | null>(null);
+  const fitVisibleRef = useRef<(() => void) | null>(null);
+  const visibleRef = useRef(visible);
+  const [session, setSession] = useState<TerminalSessionInfo | null>(null);
+  const [phase, setPhase] = useState<TerminalPhase>("opening");
+  const [failure, setFailure] = useState("");
+  const [sessionVersion, setSessionVersion] = useState(0);
+
+  useEffect(() => {
+    visibleRef.current = visible;
+  }, [visible]);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    let active = true;
+    let sessionId = "";
+    let unlisten: (() => void) | undefined;
+    let resizeObserver: ResizeObserver | undefined;
+    let themeObserver: MutationObserver | undefined;
+    let initialFitFrame = 0;
+    let lastDimensions = "";
+    const pending: TerminalOutputEvent[] = [];
+    setSession(null);
+    setFailure("");
+    setPhase("opening");
+    onPhaseChange(id, "opening");
+    const terminal = new Terminal({
+      cursorBlink: true,
+      cursorStyle: "bar",
+      cursorWidth: 1,
+      disableStdin: true,
+      fontFamily: "var(--font-code)",
+      fontSize: 12.5,
+      lineHeight: 1.4,
+      scrollback: 10_000,
+      theme: terminalTheme(),
+    });
+    const fit = new FitAddon();
+    terminalRef.current = terminal;
+    terminal.loadAddon(fit);
+    terminal.open(host);
+
+    const fitVisibleTerminal = () => {
+      if (host.clientWidth < 20 || host.clientHeight < 20) return;
+      fit.fit();
+      if (!sessionId) return;
+      const cols = Math.max(20, terminal.cols);
+      const rows = Math.max(5, terminal.rows);
+      const dimensions = `${cols}:${rows}`;
+      if (dimensions === lastDimensions) return;
+      lastDimensions = dimensions;
+      void bridge.resizeTerminal(sessionId, { cols, rows }).catch(() => undefined);
+    };
+    fitVisibleRef.current = fitVisibleTerminal;
+
+    if (typeof ResizeObserver !== "undefined") {
+      resizeObserver = new ResizeObserver(fitVisibleTerminal);
+      resizeObserver.observe(host);
+    }
+    initialFitFrame = window.requestAnimationFrame(fitVisibleTerminal);
+
+    if (typeof MutationObserver !== "undefined") {
+      themeObserver = new MutationObserver(() => {
+        terminal.options.theme = terminalTheme();
+      });
+      themeObserver.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ["style", "class", "data-theme", "data-appearance"],
+      });
+    }
+
+    const updatePhase = (next: TerminalPhase) => {
+      setPhase(next);
+      onPhaseChange(id, next);
+    };
+
+    const fail = (error: unknown, fallback: string) => {
+      if (!active) return;
+      const message = errorMessage(error, fallback);
+      terminal.options.disableStdin = true;
+      terminal.write(`\r\n\x1b[31m${message}\x1b[0m\r\n`);
+      setFailure(message);
+      updatePhase("failed");
+    };
+
+    const handleOutput = (event: TerminalOutputEvent) => {
+      if (!sessionId) {
+        pending.push(event);
+        return;
+      }
+      if (event.sessionId !== sessionId) return;
+      if (event.stream === "output") {
+        if (event.data) terminal.write(event.data);
+        return;
+      }
+      terminal.options.disableStdin = true;
+      terminal.write(
+        `\r\n\x1b[2mTerminal exited${event.exitCode == null ? "" : ` with code ${event.exitCode}`}.\x1b[0m\r\n`,
+      );
+      setSession(null);
+      updatePhase("exited");
+    };
+
+    const dataDisposable = terminal.onData((data) => {
+      if (!sessionId) return;
+      void bridge
+        .writeTerminal(sessionId, data)
+        .catch((error) => fail(error, "The terminal stopped accepting input."));
+    });
+
+    void (async () => {
+      try {
+        unlisten = await bridge.subscribeTerminalOutput(handleOutput);
+        const opened = await bridge.openTerminal(project.id, {
+          cols: Math.max(20, terminal.cols),
+          rows: Math.max(5, terminal.rows),
+        });
+        if (!active) {
+          await bridge.closeTerminal(opened.id).catch(() => undefined);
+          return;
+        }
+        sessionId = opened.id;
+        setSession(opened);
+        updatePhase("running");
+        terminal.options.disableStdin = false;
+        for (const event of pending.splice(0)) handleOutput(event);
+        fitVisibleTerminal();
+        if (visibleRef.current) terminal.focus();
+      } catch (error) {
+        fail(error, "The terminal could not start.");
+      }
+    })();
+
+    return () => {
+      active = false;
+      window.cancelAnimationFrame(initialFitFrame);
+      resizeObserver?.disconnect();
+      themeObserver?.disconnect();
+      dataDisposable.dispose();
+      unlisten?.();
+      terminal.dispose();
+      terminalRef.current = null;
+      if (fitVisibleRef.current === fitVisibleTerminal) fitVisibleRef.current = null;
+      if (sessionId) void bridge.closeTerminal(sessionId).catch(() => undefined);
+    };
+  }, [id, onPhaseChange, project.id, sessionVersion]);
+
+  useEffect(() => {
+    if (!visible) return;
+    let settleFrame = 0;
+    const frame = window.requestAnimationFrame(() => {
+      settleFrame = window.requestAnimationFrame(() => {
+        fitVisibleRef.current?.();
+        terminalRef.current?.focus();
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.cancelAnimationFrame(settleFrame);
+    };
+  }, [visible]);
+
+  const stop = () => {
+    if (!session) return;
+    void bridge.interruptTerminal(session.id).catch((error) => {
+      const message = errorMessage(error, "The terminal could not be interrupted.");
+      terminalRef.current?.write(`\r\n\x1b[31m${message}\x1b[0m\r\n`);
+      setFailure(message);
+    });
+  };
+
+  return (
+    <section className="terminal-session-pane" aria-label={label} hidden={!visible}>
+      <header className="terminal-header">
+        <div className="terminal-title">
+          <strong>{label}</strong>
+          <span>{project.name}</span>
+        </div>
+        {session?.shell ? <small className="terminal-shell">{session.shell}</small> : null}
+        <span className="terminal-status" data-phase={phase} role="status">
+          <i aria-hidden="true" />
+          {phaseLabel(phase)}
+        </span>
+        <div className="terminal-actions">
+          {phase === "running" ? (
+            <button
+              className="terminal-stop"
+              type="button"
+              onClick={stop}
+              aria-label={`Interrupt ${label}`}
+            >
+              <CircleStop aria-hidden="true" /> Stop
+            </button>
+          ) : null}
+          {phase === "failed" || phase === "exited" ? (
+            <button
+              className="terminal-restart"
+              type="button"
+              onClick={() => setSessionVersion((version) => version + 1)}
+            >
+              <RefreshCw aria-hidden="true" /> Restart
+            </button>
+          ) : null}
+          <button
+            className="terminal-close"
+            type="button"
+            onClick={onCloseDrawer}
+            aria-label="Close terminal panel"
+          >
+            <X aria-hidden="true" />
+          </button>
+        </div>
+      </header>
+      <div className="terminal-pty-host" ref={hostRef} />
+      {failure ? (
+        <p className="terminal-failure" role="alert">
+          {failure}
+        </p>
+      ) : null}
+    </section>
+  );
+}
+
 export function TerminalDrawer({
   open,
   project,
@@ -40,345 +352,205 @@ export function TerminalDrawer({
   onClose: () => void;
   motionScale?: number;
 }) {
-  const [session, setSession] = useState<TerminalSessionInfo | null>(null);
-  const [lines, setLines] = useState<TerminalLine[]>([]);
-  const [input, setInput] = useState("");
-  const [running, setRunning] = useState(false);
-  const [unavailableReason, setUnavailableReason] = useState("");
-  const [cwd, setCwd] = useState(project.path);
-  const [history, setHistory] = useState<string[]>([]);
-  const [renderedLineLimit, setRenderedLineLimit] = useState(INITIAL_RENDERED_LINES);
-  const [frozenEndId, setFrozenEndId] = useState<number | null>(null);
-  const historyCursor = useRef(-1);
-  const opening = useRef(false);
-  const nextLineId = useRef(0);
-  const bodyRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const pendingLinesRef = useRef<Array<Omit<TerminalLine, "id">>>([]);
-  const pendingFrameRef = useRef<number | null>(null);
-  const pendingAnchorRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
+  const nextTerminalId = useRef(2);
+  const dragRef = useRef<{ pointerId: number; startY: number; startHeight: number } | null>(null);
+  const [height, setHeight] = useState(DEFAULT_TERMINAL_HEIGHT_PX);
+  const [resizing, setResizing] = useState(false);
+  const [railCollapsed, setRailCollapsed] = useState(false);
+  const [terminals, setTerminals] = useState<TerminalTab[]>([{ id: 1, label: "Terminal 1" }]);
+  const [activeTerminalId, setActiveTerminalId] = useState(1);
+  const [phases, setPhases] = useState<Record<number, TerminalPhase>>({ 1: "opening" });
 
-  const flushPendingLines = useCallback(() => {
-    pendingFrameRef.current = null;
-    const pending = pendingLinesRef.current.splice(0);
-    if (!pending.length) return;
-    const appended = pending.map((line) => ({ ...line, id: nextLineId.current++ }));
-    setLines((current) => [...current, ...appended].slice(-MAX_SCROLLBACK_LINES));
+  const addTerminal = useCallback(() => {
+    const id = nextTerminalId.current;
+    nextTerminalId.current += 1;
+    setTerminals((current) => [...current, { id, label: `Terminal ${id}` }]);
+    setPhases((current) => ({ ...current, [id]: "opening" }));
+    setActiveTerminalId(id);
   }, []);
 
-  const appendLine = useCallback(
-    (kind: TerminalLine["kind"], text: string) => {
-      pendingLinesRef.current.push({ kind, text });
-      if (pendingFrameRef.current === null) {
-        pendingFrameRef.current = window.requestAnimationFrame(flushPendingLines);
-      }
-    },
-    [flushPendingLines],
-  );
+  useEffect(() => {
+    if (open && terminals.length === 0) addTerminal();
+  }, [addTerminal, open, terminals.length]);
 
   useEffect(() => {
-    if (!open || session || unavailableReason || opening.current) return;
-    opening.current = true;
-    let active = true;
-    void bridge
-      .openTerminal(project.id)
-      .then((info) => {
-        if (!active) return;
-        setSession(info);
-        setCwd(info.cwd);
-      })
-      .catch((error: unknown) => {
-        if (!active) return;
-        setUnavailableReason(
-          error instanceof Error ? error.message : "The terminal could not be opened.",
-        );
-      })
-      .finally(() => {
-        opening.current = false;
-      });
-    return () => {
-      active = false;
+    const keepHeightInBounds = () => {
+      setHeight((current) => clamp(current, MIN_TERMINAL_HEIGHT_PX, maximumTerminalHeight()));
     };
-  }, [open, session, unavailableReason, project.id]);
+    window.addEventListener("resize", keepHeightInBounds);
+    return () => window.removeEventListener("resize", keepHeightInBounds);
+  }, []);
 
-  useEffect(() => {
-    if (!session) return;
-    let active = true;
-    let unlisten: (() => void) | undefined;
-    void bridge
-      .subscribeTerminalOutput((event: TerminalOutputEvent) => {
-        if (event.sessionId !== session.id) return;
-        if (event.stream === "exit") {
-          setRunning(false);
-          setCwd(event.cwd);
-          if (event.exitCode === undefined || event.exitCode === null) {
-            appendLine("notice", "Command interrupted");
-          } else if (event.exitCode !== 0) {
-            appendLine("notice", `Exited with code ${event.exitCode}`);
-          }
-          inputRef.current?.focus();
-          return;
-        }
-        if (event.line !== undefined) {
-          appendLine(event.stream === "stderr" ? "stderr" : "stdout", event.line);
-        }
-      })
-      .then((dispose) => {
-        if (active) unlisten = dispose;
-        else dispose();
-      });
-    return () => {
-      active = false;
-      unlisten?.();
-    };
-  }, [appendLine, session]);
+  const handlePhaseChange = useCallback((id: number, phase: TerminalPhase) => {
+    setPhases((current) => (current[id] === phase ? current : { ...current, [id]: phase }));
+  }, []);
 
-  useEffect(
-    () => () => {
-      if (pendingFrameRef.current !== null) {
-        window.cancelAnimationFrame(pendingFrameRef.current);
-      }
-      pendingLinesRef.current = [];
-    },
-    [],
-  );
-
-  // The backend session dies with this drawer (project switch or app
-  // navigation), never on a visibility toggle, so scrollback survives.
-  useEffect(() => {
-    if (!session) return;
-    return () => {
-      void bridge.closeTerminal(session.id).catch(() => undefined);
-    };
-  }, [session]);
-
-  useEffect(() => {
-    const body = bodyRef.current;
-    if (body && frozenEndId === null) body.scrollTop = body.scrollHeight;
-  }, [frozenEndId, lines]);
-
-  useLayoutEffect(() => {
-    const pendingAnchor = pendingAnchorRef.current;
-    const body = bodyRef.current;
-    if (!pendingAnchor || !body) return;
-    pendingAnchorRef.current = null;
-    body.scrollTop =
-      pendingAnchor.scrollTop + Math.max(0, body.scrollHeight - pendingAnchor.scrollHeight);
-  }, [renderedLineLimit]);
-
-  useEffect(() => {
-    if (open) inputRef.current?.focus();
-  }, [open]);
-
-  const runCommand = async () => {
-    const command = input.trim();
-    if (!command || !session || running) return;
-    setInput("");
-    historyCursor.current = -1;
-    setHistory((current) =>
-      current.at(-1) === command ? current : [...current.slice(-99), command],
-    );
-    appendLine("command", `${promptFor(session.shell, cwd)} ${command}`);
-    try {
-      const started = await bridge.runTerminalCommand(session.id, command);
-      setCwd(started.cwd);
-      if (started.runId) setRunning(true);
-    } catch (error: unknown) {
-      appendLine("stderr", error instanceof Error ? error.message : "The command did not start.");
-    }
-  };
-
-  const recallHistory = (direction: 1 | -1) => {
-    if (history.length === 0) return;
-    const cursor =
-      historyCursor.current === -1 && direction === -1
-        ? history.length - 1
-        : Math.min(Math.max(historyCursor.current + direction, 0), history.length - 1);
-    if (historyCursor.current === -1 && direction === 1) return;
-    historyCursor.current = cursor;
-    setInput(history[cursor] ?? "");
-  };
-
-  const stop = () => {
-    if (!session) return;
-    void bridge.interruptTerminal(session.id).catch(() => undefined);
-  };
-
-  const frozenIndex =
-    frozenEndId === null ? -1 : lines.findIndex((line) => line.id === frozenEndId);
-  const visibleEnd = frozenIndex >= 0 ? frozenIndex + 1 : lines.length;
-  const visibleStart = Math.max(0, visibleEnd - renderedLineLimit);
-  const visibleLines = useMemo(
-    () => lines.slice(visibleStart, visibleEnd),
-    [lines, visibleEnd, visibleStart],
-  );
-  const hiddenEarlierCount = visibleStart;
-  const pendingLatestCount = lines.length - visibleEnd;
-
-  const revealEarlier = (all: boolean) => {
-    const body = bodyRef.current;
-    if (body) {
-      pendingAnchorRef.current = { scrollHeight: body.scrollHeight, scrollTop: body.scrollTop };
-    }
-    setRenderedLineLimit(all ? visibleEnd : renderedLineLimit + SCROLLBACK_CHUNK);
-  };
-
-  const jumpToLatest = () => {
-    setFrozenEndId(null);
-    window.requestAnimationFrame(() => {
-      if (bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
+  const closeTerminal = (id: number) => {
+    const index = terminals.findIndex((terminal) => terminal.id === id);
+    const remaining = terminals.filter((terminal) => terminal.id !== id);
+    setTerminals(remaining);
+    setPhases((current) => {
+      const next = { ...current };
+      delete next[id];
+      return next;
     });
+    if (activeTerminalId === id) {
+      setActiveTerminalId(remaining[Math.min(index, remaining.length - 1)]?.id ?? 0);
+    }
+    if (remaining.length === 0) onClose();
   };
 
-  // Mirrors panelTransition in App.tsx so the drawer slides with the same
-  // feel as the app's other panels and honors the motion preference. A pure
-  // height slide: the bottom-anchored inner keeps content intact while the
-  // drawer sinks into (or rises from) the pane's bottom edge.
-  const drawerTransition = {
-    duration: 0.32 * motionScale,
-    ease: [0.33, 1, 0.15, 1] as const,
+  const resizeTo = (nextHeight: number) => {
+    setHeight(clamp(nextHeight, MIN_TERMINAL_HEIGHT_PX, maximumTerminalHeight()));
+  };
+
+  const handleResizePointerDown = (event: PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    dragRef.current = {
+      pointerId: event.pointerId,
+      startY: event.clientY,
+      startHeight: height,
+    };
+    setResizing(true);
+  };
+
+  const handleResizePointerMove = (event: PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    resizeTo(drag.startHeight + drag.startY - event.clientY);
+  };
+
+  const finishResize = (event: PointerEvent<HTMLDivElement>) => {
+    if (dragRef.current?.pointerId !== event.pointerId) return;
+    event.currentTarget.releasePointerCapture?.(event.pointerId);
+    dragRef.current = null;
+    setResizing(false);
+  };
+
+  const handleResizeKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "ArrowUp") resizeTo(height + 24);
+    else if (event.key === "ArrowDown") resizeTo(height - 24);
+    else if (event.key === "Home") resizeTo(MIN_TERMINAL_HEIGHT_PX);
+    else if (event.key === "End") resizeTo(maximumTerminalHeight());
+    else return;
+    event.preventDefault();
   };
 
   return (
-    <AnimatePresence>
-      {open ? (
-        <m.section
-          className="terminal-drawer"
-          aria-label="Project terminal"
-          initial={{ height: 0 }}
-          animate={{ height: DRAWER_HEIGHT_PX }}
-          exit={{ height: 0 }}
-          transition={drawerTransition}
-          onKeyDown={(event) => {
-            // The command input is disabled while a command runs, so the
-            // interrupt shortcut must live on the drawer itself.
-            if (event.key === "c" && event.ctrlKey && running) {
-              event.preventDefault();
-              stop();
-            }
-          }}
+    <m.section
+      className="terminal-drawer"
+      aria-label="Project terminal"
+      data-resizing={resizing}
+      initial={{ height: 0 }}
+      animate={{ height: open ? height : 0 }}
+      transition={{
+        duration: resizing ? 0 : 0.32 * motionScale,
+        ease: [0.33, 1, 0.15, 1] as const,
+      }}
+    >
+      <div
+        className="terminal-resize-handle"
+        role="separator"
+        aria-label="Resize terminal panel"
+        aria-orientation="horizontal"
+        aria-valuemin={MIN_TERMINAL_HEIGHT_PX}
+        aria-valuemax={maximumTerminalHeight()}
+        aria-valuenow={Math.round(height)}
+        tabIndex={0}
+        title="Drag to resize · Double-click to reset"
+        onPointerDown={handleResizePointerDown}
+        onPointerMove={handleResizePointerMove}
+        onPointerUp={finishResize}
+        onPointerCancel={finishResize}
+        onDoubleClick={() => resizeTo(DEFAULT_TERMINAL_HEIGHT_PX)}
+        onKeyDown={handleResizeKeyDown}
+      >
+        <i aria-hidden="true" />
+      </div>
+      <div className="terminal-drawer-inner">
+        <div className="terminal-session-stack">
+          {terminals.map((terminal) => (
+            <TerminalPane
+              key={terminal.id}
+              id={terminal.id}
+              visible={open && activeTerminalId === terminal.id}
+              label={terminal.label}
+              project={project}
+              onCloseDrawer={onClose}
+              onPhaseChange={handlePhaseChange}
+            />
+          ))}
+        </div>
+        <aside
+          className="terminal-session-rail"
+          data-collapsed={railCollapsed}
+          aria-label="Terminal sessions"
         >
-          {/* Fixed-height, bottom-anchored: while the section's height animates,
-              the content stays intact and slides past the top clip edge instead
-              of squishing. */}
-          <div className="terminal-drawer-inner">
-            <header className="terminal-header">
-              <strong>Terminal</strong>
-              <span>
-                {project.name}
-                {session ? ` · ${session.shell}` : ""}
-              </span>
-              {running ? (
-                <button
-                  className="terminal-stop"
-                  type="button"
-                  onClick={stop}
-                  aria-label="Stop command"
-                >
-                  <CircleStop aria-hidden="true" /> Stop
-                </button>
-              ) : null}
-              <button type="button" onClick={onClose}>
-                Close
-              </button>
-            </header>
-            {hiddenEarlierCount > 0 || pendingLatestCount > 0 ? (
-              <div className="terminal-scrollback-controls">
-                {hiddenEarlierCount > 0 ? (
-                  <>
-                    <span role="status">
-                      Showing {visibleLines.length.toLocaleString()} of{" "}
-                      {visibleEnd.toLocaleString()} saved lines
-                    </span>
-                    <button
-                      className="secondary-button"
-                      type="button"
-                      onClick={() => revealEarlier(false)}
-                    >
-                      Show earlier {Math.min(SCROLLBACK_CHUNK, hiddenEarlierCount).toLocaleString()}{" "}
-                      lines
-                    </button>
-                    <button
-                      className="secondary-button"
-                      type="button"
-                      onClick={() => revealEarlier(true)}
-                    >
-                      Show all {visibleEnd.toLocaleString()} saved lines
-                    </button>
-                  </>
-                ) : null}
-                {pendingLatestCount > 0 ? (
-                  <button className="secondary-button" type="button" onClick={jumpToLatest}>
-                    {pendingLatestCount.toLocaleString()} new lines · Jump to latest
-                  </button>
-                ) : null}
-              </div>
-            ) : null}
-            <div
-              className="terminal-body"
-              role="log"
-              aria-live="polite"
-              ref={bodyRef}
-              onScroll={(event) => {
-                const body = event.currentTarget;
-                const atLatest =
-                  body.scrollHeight - body.scrollTop - body.clientHeight <= FOLLOW_THRESHOLD_PX;
-                if (!atLatest && frozenEndId === null) {
-                  setFrozenEndId(lines.at(-1)?.id ?? null);
-                } else if (atLatest && frozenEndId !== null) {
-                  setFrozenEndId(null);
-                }
-              }}
+          <header className="terminal-session-rail-header">
+            <button
+              type="button"
+              onClick={() => setRailCollapsed((current) => !current)}
+              aria-label={railCollapsed ? "Expand terminal list" : "Collapse terminal list"}
+              title={railCollapsed ? "Expand terminal list" : "Collapse terminal list"}
             >
-              {unavailableReason ? <p className="terminal-notice">{unavailableReason}</p> : null}
-              {!unavailableReason && !session ? (
-                <p className="terminal-notice">Opening terminal…</p>
-              ) : null}
-              {visibleLines.map((line) => (
-                <p key={line.id} className={`terminal-line--${line.kind}`}>
-                  {line.kind === "command" ? (
-                    <span className="terminal-command">{line.text}</span>
-                  ) : (
-                    line.text
-                  )}
-                </p>
-              ))}
-            </div>
-            {session ? (
-              <form
-                className="terminal-input-row"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  void runCommand();
-                }}
-              >
-                <span className="terminal-command" aria-hidden="true">
-                  {promptFor(session.shell, cwd)}
-                </span>
-                <input
-                  ref={inputRef}
-                  value={input}
-                  onChange={(event) => setInput(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "ArrowUp") {
-                      event.preventDefault();
-                      recallHistory(-1);
-                    } else if (event.key === "ArrowDown") {
-                      event.preventDefault();
-                      recallHistory(1);
-                    }
-                  }}
-                  placeholder={running ? "A command is running…" : "Type a command and press Enter"}
-                  aria-label="Terminal command"
-                  disabled={running}
-                  spellCheck={false}
-                  autoComplete="off"
-                />
-              </form>
-            ) : null}
+              {railCollapsed ? (
+                <PanelRightOpen aria-hidden="true" />
+              ) : (
+                <PanelRightClose aria-hidden="true" />
+              )}
+            </button>
+            <strong>Terminals</strong>
+            <small>{terminals.length}</small>
+          </header>
+          <div className="terminal-session-list">
+            {terminals.map((terminal) => {
+              const terminalPhase = phases[terminal.id] ?? "opening";
+              return (
+                <div
+                  className="terminal-session-row"
+                  data-active={activeTerminalId === terminal.id}
+                  key={terminal.id}
+                >
+                  <button
+                    className="terminal-session-select"
+                    type="button"
+                    onClick={() => setActiveTerminalId(terminal.id)}
+                    aria-pressed={activeTerminalId === terminal.id}
+                    title={terminal.label}
+                  >
+                    <SquareTerminal aria-hidden="true" />
+                    <span>{terminal.label}</span>
+                    <i data-phase={terminalPhase} aria-label={phaseLabel(terminalPhase)} />
+                  </button>
+                  <button
+                    className="terminal-session-remove"
+                    type="button"
+                    onClick={() => closeTerminal(terminal.id)}
+                    aria-label={`Close ${terminal.label}`}
+                    title={`Close ${terminal.label}`}
+                  >
+                    <X aria-hidden="true" />
+                  </button>
+                </div>
+              );
+            })}
           </div>
-        </m.section>
-      ) : null}
-    </AnimatePresence>
+          <button
+            className="terminal-session-new"
+            type="button"
+            onClick={addTerminal}
+            disabled={terminals.length >= MAX_TERMINALS}
+            aria-label="New terminal"
+            title={
+              terminals.length >= MAX_TERMINALS ? `Maximum ${MAX_TERMINALS} terminals` : undefined
+            }
+          >
+            <Plus aria-hidden="true" />
+            <span>New terminal</span>
+          </button>
+        </aside>
+      </div>
+    </m.section>
   );
 }

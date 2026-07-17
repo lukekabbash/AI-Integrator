@@ -11,7 +11,9 @@ use tokio::{
 
 use crate::redact_and_bound;
 
-const EVENT_CAPACITY: usize = 512;
+// Sized for fast token-delta bursts: the consumer persists each event, so a
+// small ring converts brief persistence stalls into dropped stream chunks.
+const EVENT_CAPACITY: usize = 2048;
 const DIAGNOSTIC_LIMIT: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -685,16 +687,21 @@ async fn run_child(
         .take()
         .map(|stderr| tokio::spawn(drain_diagnostic(stderr)));
     let mut stdout = child.stdout.take().map(BufReader::new);
-    let mut line = String::new();
+    let mut line = Vec::new();
     let mut session_id = None;
     let mut cancelled = false;
     let mut saw_text_delta = false;
     while let Some(reader) = stdout.as_mut() {
         line.clear();
         tokio::select! {
-            read = reader.read_line(&mut line) => match read {
+            // read_until + lossy conversion instead of read_line: read_line
+            // fails the whole loop on a single invalid-UTF-8 byte (killing
+            // the stream while the child keeps running), whereas invalid
+            // bytes here degrade to U+FFFD inside one line at worst.
+            read = reader.read_until(b'\n', &mut line) => match read {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
+                    let line = String::from_utf8_lossy(&line);
                     for event in parse_provider_line(provider, &line) {
                         if let Some(id) = event.session_id.clone() { session_id = Some(id); }
                         if matches!(event.event, StructuredCliEventKind::Text { delta: true, .. }) {

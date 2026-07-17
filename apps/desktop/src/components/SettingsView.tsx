@@ -1224,7 +1224,7 @@ function McpAuthorizationControl({
           </button>
         ) : (
           <button
-            className="ghost-button"
+            className="ghost-button mcp-authorization-signin"
             type="button"
             disabled={busy || !authorization.available}
             onClick={() => void connect()}

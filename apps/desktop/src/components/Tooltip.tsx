@@ -11,13 +11,19 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { AnimatePresence, m as motion } from "motion/react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
-export type TooltipPlacement = "top" | "bottom" | "right" | "left";
+export type TooltipPlacement = "top" | "bottom" | "right" | "left" | "bottom-left" | "top-left";
 
 interface TooltipProps {
   label: ReactNode;
   /** Optional second line rendered smaller and dimmer (e.g. a shortcut hint). */
   hint?: ReactNode;
+  /** Allows longer supporting copy to wrap inside the themed bubble. */
+  multiline?: boolean;
+  /** Renders string labels as GitHub-flavored Markdown. */
+  markdown?: boolean;
   placement?: TooltipPlacement;
   /** Delay before showing, in ms. Hiding is immediate. */
   delay?: number;
@@ -48,6 +54,10 @@ function restingOffset(placement: TooltipPlacement): { x: number; y: number } {
       return { x: -4, y: 0 };
     case "left":
       return { x: 4, y: 0 };
+    case "bottom-left":
+      return { x: 4, y: -4 };
+    case "top-left":
+      return { x: 4, y: 4 };
   }
 }
 
@@ -59,6 +69,8 @@ function restingOffset(placement: TooltipPlacement): { x: number; y: number } {
 export function Tooltip({
   label,
   hint,
+  multiline = false,
+  markdown = false,
   placement = "top",
   delay = 420,
   disabled = false,
@@ -67,11 +79,30 @@ export function Tooltip({
   const [anchor, setAnchor] = useState<DOMRect | null>(null);
   const [pendingTarget, setPendingTarget] = useState<Element | null>(null);
   const bubbleRef = useRef<HTMLDivElement>(null);
+  const hideTimerRef = useRef<number | null>(null);
+  const interactive = multiline;
 
-  const hide = useCallback(() => {
-    setPendingTarget(null);
-    setAnchor(null);
+  const cancelHide = useCallback(() => {
+    if (hideTimerRef.current !== null) {
+      window.clearTimeout(hideTimerRef.current);
+      hideTimerRef.current = null;
+    }
   }, []);
+  const hide = useCallback(() => {
+    cancelHide();
+    if (!interactive) {
+      setPendingTarget(null);
+      setAnchor(null);
+      return;
+    }
+    hideTimerRef.current = window.setTimeout(() => {
+      hideTimerRef.current = null;
+      setPendingTarget(null);
+      setAnchor(null);
+    }, 120);
+  }, [cancelHide, interactive]);
+
+  useEffect(() => () => cancelHide(), [cancelHide]);
 
   useEffect(() => {
     if (disabled || !pendingTarget) return;
@@ -99,6 +130,7 @@ export function Tooltip({
 
   const scheduleShow = (target: Element) => {
     if (disabled) return;
+    cancelHide();
     setPendingTarget(target);
   };
 
@@ -149,6 +181,10 @@ export function Tooltip({
                   placement={placement}
                   label={label}
                   hint={hint}
+                  multiline={multiline}
+                  markdown={markdown}
+                  onMouseEnter={cancelHide}
+                  onMouseLeave={hide}
                   bubbleRef={bubbleRef}
                 />
               ) : null}
@@ -164,15 +200,27 @@ function TooltipBubble({
   placement,
   label,
   hint,
+  multiline,
+  markdown,
+  onMouseEnter,
+  onMouseLeave,
   bubbleRef,
 }: {
   anchor: DOMRect;
   placement: TooltipPlacement;
   label: ReactNode;
   hint?: ReactNode;
+  multiline: boolean;
+  markdown: boolean;
+  onMouseEnter: () => void;
+  onMouseLeave: () => void;
   bubbleRef: React.RefObject<HTMLDivElement | null>;
 }) {
   const [position, setPosition] = useState<{ left: number; top: number } | null>(null);
+  const resolvedPlacement: TooltipPlacement =
+    placement === "bottom-left" && anchor.top + anchor.height / 2 > window.innerHeight / 2
+      ? "top-left"
+      : placement;
 
   useLayoutEffect(() => {
     const bubble = bubbleRef.current;
@@ -180,7 +228,7 @@ function TooltipBubble({
     const size = bubble.getBoundingClientRect();
     let left: number;
     let top: number;
-    switch (placement) {
+    switch (resolvedPlacement) {
       case "top":
         left = anchor.left + anchor.width / 2 - size.width / 2;
         top = anchor.top - size.height - GAP;
@@ -197,21 +245,31 @@ function TooltipBubble({
         left = anchor.left - size.width - GAP;
         top = anchor.top + anchor.height / 2 - size.height / 2;
         break;
+      case "bottom-left":
+        left = anchor.left - size.width - GAP;
+        top = anchor.bottom + GAP;
+        break;
+      case "top-left":
+        left = anchor.left - size.width - GAP;
+        top = anchor.top - size.height - GAP;
+        break;
     }
     left = Math.min(Math.max(EDGE, left), window.innerWidth - size.width - EDGE);
     top = Math.min(Math.max(EDGE, top), window.innerHeight - size.height - EDGE);
     setPosition({ left, top });
-  }, [anchor, placement, bubbleRef]);
+  }, [anchor, bubbleRef, resolvedPlacement]);
 
   const still = motionDisabled();
-  const from = restingOffset(placement);
+  const from = restingOffset(resolvedPlacement);
 
   return (
     <motion.div
       ref={bubbleRef}
-      className="app-tooltip"
+      className={`app-tooltip${multiline ? " app-tooltip--multiline" : ""}`}
       role="tooltip"
-      data-placement={placement}
+      data-placement={resolvedPlacement}
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
       style={{
         left: position?.left ?? -9999,
         top: position?.top ?? -9999,
@@ -222,7 +280,13 @@ function TooltipBubble({
       exit={still ? undefined : { opacity: 0, scale: 0.96, transition: { duration: 0.1 } }}
       transition={{ type: "spring", stiffness: 640, damping: 34, mass: 0.6 }}
     >
-      <span className="app-tooltip-label">{label}</span>
+      <div className={`app-tooltip-label${markdown ? " app-tooltip-markdown" : ""}`}>
+        {markdown && typeof label === "string" ? (
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{label}</ReactMarkdown>
+        ) : (
+          label
+        )}
+      </div>
       {hint ? <span className="app-tooltip-hint">{hint}</span> : null}
     </motion.div>
   );

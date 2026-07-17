@@ -30,6 +30,49 @@ function previousLineIsBlank(body: string, lastNewline: number): boolean {
 }
 
 /**
+ * Repairs a small class of provider output that is intended to be markdown
+ * but omits the whitespace markdown needs around block markers. This is most
+ * visible with numbered headings such as `###1.` arriving mid-paragraph.
+ *
+ * Fenced code is kept byte-for-byte intact: a code sample is content, not
+ * something the transcript should reinterpret as prose.
+ */
+function normalizeMarkdownText(segment: string): string {
+  return (
+    segment
+      .replace(/(^|\n)[ \t]*###\s*(\d+\.)/g, "$1### $2")
+      .replace(/([^\n])(?:[ \t]+|)###\s*(\d+\.)/g, "$1\n\n### $2")
+      .replace(/([^\n])-[ \t]+(?=\*\*)/g, "$1\n- ")
+      // A few providers also omit the boundary between a section and the next
+      // sentence (`gridPhoto`, `fetchesFolder`, `possibleKeep`). These are
+      // common sentence starts, not a general camelCase rewrite.
+      .replace(/([a-z])(?=(?:Photo|Folder|Every|Re|Keep)\b)/g, "$1\n\n")
+      .replace(/([.!?])[ \t]+(\*\*Fix:\*\*)/gi, "$1\n\n$2")
+  );
+}
+
+function normalizeMarkdownSegment(segment: string): string {
+  return segment
+    .split(/(`[^`\n]*`)/g)
+    .map((part, index) => (index % 2 === 1 ? part : normalizeMarkdownText(part)))
+    .join("");
+}
+
+/**
+ * Makes common malformed streamed markdown readable without attempting to
+ * rewrite ordinary prose. Provider streams occasionally omit the newline
+ * before a numbered section or the space after its heading marker.
+ */
+export function normalizeStreamedMarkdown(body: string): string {
+  if (!body) return body;
+
+  return body
+    .split(/(```[\s\S]*?(?:```|$))/g)
+    .map((segment, index) => (index % 2 === 1 ? segment : normalizeMarkdownSegment(segment)))
+    .join("");
+}
+
+/**
  * Returns markdown that avoids setext/list-marker parse thrash.
  *
  * While `streaming` is true, bare trailing markers (including thematic-break
@@ -48,11 +91,7 @@ export function stabilizeStreamingMarkdown(body: string, streaming = true): stri
   const lastLine = body.slice(lastNewline + 1);
   if (!isHoldableTrailingLine(lastLine)) return body;
 
-  if (
-    !streaming &&
-    isThematicBreakLine(lastLine) &&
-    previousLineIsBlank(body, lastNewline)
-  ) {
+  if (!streaming && isThematicBreakLine(lastLine) && previousLineIsBlank(body, lastNewline)) {
     return body;
   }
 

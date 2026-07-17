@@ -274,4 +274,49 @@ describe("Composer compact controls", () => {
       ),
     );
   });
+
+  it("disables approval prompts for Antigravity and normalizes stale ask drafts", async () => {
+    const antigravity: RuntimeConnection = {
+      id: "antigravity",
+      name: "Antigravity",
+      command: "agy",
+      status: "connected",
+      fidelity: "structured",
+      models: ["gemini-3.5-flash"],
+      detail: "Ready",
+    };
+    mockModelCatalog(() => [{ id: "gemini-3.5-flash", label: "Gemini 3.5 Flash" }]);
+    const onSend = vi.fn().mockResolvedValue(true);
+
+    render(
+      <Composer
+        runtimes={[antigravity]}
+        defaultRuntime="antigravity"
+        defaultModel="gemini-3.5-flash"
+        initialDraft={{
+          prompt: "Run safely.",
+          attachments: [],
+          runtime: "antigravity",
+          model: "gemini-3.5-flash",
+          permission: "ask",
+          delegation: "off",
+          selectionStart: 11,
+          selectionEnd: 11,
+        }}
+        onSend={onSend}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Permission" })).toHaveTextContent("Project write");
+    fireEvent.click(screen.getByRole("button", { name: "Permission" }));
+    expect(screen.getByRole("option", { name: "Ask as needed" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(onSend).toHaveBeenCalledWith(
+        expect.objectContaining({ runtime: "antigravity", permission: "project-write" }),
+      ),
+    );
+  });
 });

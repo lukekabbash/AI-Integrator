@@ -33,7 +33,7 @@ import type { ComposerNotice } from "../composerNotices";
 import { prettyModelLabel, resolveModelLabel } from "../modelLabel";
 import type { RuntimeRouteDefaults } from "../routingDefaults";
 import { Dropdown, ProviderIcon } from "./Dropdown";
-import { appendVoiceSegment, insertVoiceText, type VoiceInsertAnchor } from "./voiceTyping";
+import { insertVoiceText } from "./voiceTyping";
 
 interface ComposerProps {
   runtimes: RuntimeConnection[];
@@ -126,6 +126,7 @@ interface VoiceCapture {
   stream: MediaStream;
   source: MediaStreamAudioSourceNode;
   processor: ScriptProcessorNode;
+  analyser: AnalyserNode;
   sink: GainNode;
 }
 
@@ -134,7 +135,19 @@ function normalizeRuntime(runtimes: RuntimeConnection[], desired: RuntimeId): Ru
   return runtimes.some((item) => item.id === desired) ? desired : (runtimes[0]?.id ?? "codex");
 }
 
-type VoicePhase = "idle" | "starting" | "recording" | "stopping";
+type VoicePhase = "idle" | "starting" | "recording" | "transcribing";
+
+/** Recordings buffer locally and upload once at stop, so cap the clip at the
+ * point where the WAV would approach OpenAI's 25 MB transcription limit. */
+const VOICE_MAX_SECONDS = 300;
+const VOICE_TIMER_WARN_SECONDS = 270;
+const VOICE_METER_BARS = 12;
+
+function formatVoiceElapsed(totalSeconds: number): string {
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
 
 interface AutocompleteToken {
   kind: "file" | "skill";
@@ -445,10 +458,12 @@ function clipboardImageFiles(data: DataTransfer | null): File[] {
   return fromItems;
 }
 
-function encodePcm16(samples: Float32Array, sourceRate: number): number[] {
+/** Box-filter downsample to 24 kHz signed 16-bit PCM. No anti-alias filter;
+ * averaging each output window is adequate for speech into a transcriber. */
+function encodePcm16(samples: Float32Array, sourceRate: number): Int16Array {
   const targetRate = 24000;
   const outputLength = Math.max(1, Math.round((samples.length * targetRate) / sourceRate));
-  const bytes = new Array<number>(outputLength * 2);
+  const pcm = new Int16Array(outputLength);
   for (let index = 0; index < outputLength; index += 1) {
     const start = Math.floor((index * sourceRate) / targetRate);
     const end = Math.min(
@@ -458,12 +473,29 @@ function encodePcm16(samples: Float32Array, sourceRate: number): number[] {
     let sum = 0;
     for (let sampleIndex = start; sampleIndex < end; sampleIndex += 1) sum += samples[sampleIndex];
     const sample = Math.max(-1, Math.min(1, sum / Math.max(1, end - start)));
-    const pcm = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-    const rounded = Math.round(pcm);
-    bytes[index * 2] = rounded & 0xff;
-    bytes[index * 2 + 1] = (rounded >> 8) & 0xff;
+    pcm[index] = Math.round(sample < 0 ? sample * 0x8000 : sample * 0x7fff);
   }
-  return bytes;
+  return pcm;
+}
+
+/** Serializes buffered PCM chunks to base64 for the one-shot native upload.
+ * Int16Array is little-endian on every supported platform, matching the WAV
+ * container the backend wraps around these bytes. */
+function pcmChunksToBase64(chunks: Int16Array[]): string {
+  let totalSamples = 0;
+  for (const chunk of chunks) totalSamples += chunk.length;
+  const bytes = new Uint8Array(totalSamples * 2);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength), offset);
+    offset += chunk.byteLength;
+  }
+  let binary = "";
+  const step = 0x8000;
+  for (let index = 0; index < bytes.length; index += step) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + step));
+  }
+  return btoa(binary);
 }
 
 /** Session-persistent slash-menu cache so enabled skills render instantly
@@ -594,6 +626,7 @@ export function Composer({
   const [voicePhase, setVoicePhase] = useState<VoicePhase>("idle");
   const [voiceError, setVoiceError] = useState("");
   const [voiceNotice, setVoiceNotice] = useState("");
+  const [voiceElapsed, setVoiceElapsed] = useState(0);
   const [micDevices, setMicDevices] = useState<MediaDeviceInfo[]>([]);
   const [micDeviceId, setMicDeviceId] = useState("default");
   const [controlsMenuOpen, setControlsMenuOpen] = useState(false);
@@ -604,13 +637,13 @@ export function Composer({
   const controlsMenuRef = useRef<HTMLDivElement>(null);
   const controlsMenuButtonRef = useRef<HTMLButtonElement>(null);
   const voiceCaptureRef = useRef<VoiceCapture | null>(null);
-  const voiceAppendQueueRef = useRef(Promise.resolve());
-  const voiceBaseRef = useRef("");
-  const voiceAnchorRef = useRef<VoiceInsertAnchor>({ start: 0, end: 0 });
-  const voiceCommittedTranscriptRef = useRef("");
-  const voiceLiveTranscriptRef = useRef("");
+  const voicePcmChunksRef = useRef<Int16Array[]>([]);
+  /** Bumped on start/cancel/unmount so a stale async result cannot land. */
+  const voiceGenerationRef = useRef(0);
   const voiceSessionActiveRef = useRef(false);
+  const voiceStartedAtRef = useRef(0);
   const voiceNoticeTimerRef = useRef<number | undefined>(undefined);
+  const voiceBarRefs = useRef<(HTMLSpanElement | null)[]>([]);
   const [dismissedNoticeIds, setDismissedNoticeIds] = useState<Set<string>>(new Set());
   const [noticeClock, setNoticeClock] = useState(() => Date.now());
   /** Once the user picks any routing value, settings defaults stop syncing. */
@@ -620,6 +653,12 @@ export function Composer({
   const suppressDraftEmissionRef = useRef(false);
   const onDraftChangeRef = useRef(onDraftChange);
   const selectedRuntime = runtimes.find((item) => item.id === runtime) ?? runtimes[0];
+  const antigravityPromptUnsupported = runtime === "antigravity";
+  // Antigravity's print-mode process has no control channel for approval
+  // prompts. Keep stale settings/drafts safe when a user routes a composer to
+  // Antigravity after choosing Ask as needed on another provider.
+  const effectivePermission =
+    antigravityPromptUnsupported && permission === "ask" ? "project-write" : permission;
   const cachedCatalog = useSyncExternalStore(
     bridge.subscribeModelCatalogs,
     () => bridge.getCachedModelCatalog(runtime),
@@ -661,12 +700,21 @@ export function Composer({
       runtime,
       model: activeModel,
       effort,
-      permission,
+      permission: effectivePermission,
       delegation: effectiveDelegation,
       selectionStart: caret,
       selectionEnd: caret,
     }),
-    [activeModel, attachments, caret, effectiveDelegation, effort, permission, prompt, runtime],
+    [
+      activeModel,
+      attachments,
+      caret,
+      effectiveDelegation,
+      effectivePermission,
+      effort,
+      prompt,
+      runtime,
+    ],
   );
   const visibleNotices = notices.filter(
     (notice) =>
@@ -674,6 +722,7 @@ export function Composer({
       (notice.expiresAt === undefined || notice.expiresAt > noticeClock),
   );
   const voiceRecording = voicePhase === "recording";
+  const voiceTranscribing = voicePhase === "transcribing";
   const voiceActive = voicePhase !== "idle";
   const motionDisabled =
     typeof document !== "undefined" &&
@@ -843,16 +892,6 @@ export function Composer({
     });
   };
 
-  /** Marks a manual draft edit as the new voice baseline so programmatic
-   * insertions cooperate with an in-flight dictation session. */
-  const resetVoiceBaseline = (nextPrompt: string, position: number) => {
-    if (!voiceActive) return;
-    voiceBaseRef.current = nextPrompt;
-    voiceCommittedTranscriptRef.current = "";
-    voiceLiveTranscriptRef.current = "";
-    voiceAnchorRef.current = { start: position, end: position };
-  };
-
   const addAttachments = async () => {
     const pick = bridge.pickContextAttachments;
     if (!pick) return;
@@ -903,7 +942,6 @@ export function Composer({
       setAttachments((current) => appendUniqueAttachments(current, [attachment]));
       setPrompt(next);
       setCaret(position);
-      resetVoiceBaseline(next, position);
       requestAnimationFrame(() => {
         const textarea = textareaRef.current;
         textarea?.focus();
@@ -923,7 +961,6 @@ export function Composer({
     const position = token.start + insert.length;
     setPrompt(next);
     setCaret(position);
-    resetVoiceBaseline(next, position);
     requestAnimationFrame(() => {
       const textarea = textareaRef.current;
       textarea?.focus();
@@ -957,7 +994,6 @@ export function Composer({
     const position = start + text.length;
     setPrompt(next);
     setCaret(position);
-    resetVoiceBaseline(next, position);
     onInsertHandled?.(insertRequest.id);
     requestAnimationFrame(() => {
       textarea?.focus();
@@ -998,7 +1034,6 @@ export function Composer({
       restoredRuntime === "antigravity" || restoredRuntime === "custom" ? "off" : value.delegation,
     );
     setCaret(position);
-    resetVoiceBaseline(value.prompt, position);
     queueMicrotask(() => {
       suppressDraftEmissionRef.current = false;
     });
@@ -1050,7 +1085,11 @@ export function Composer({
     const nextRuntime = normalizeRuntime(runtimes, defaultRuntime);
     setRuntime(nextRuntime);
     setModel(defaultModel);
-    setPermission(defaultPermission ?? "project-write");
+    setPermission(
+      nextRuntime === "antigravity" && defaultPermission === "ask"
+        ? "project-write"
+        : (defaultPermission ?? "project-write"),
+    );
     setEffort(defaultEffort);
   }, [defaultRuntime, defaultModel, defaultPermission, defaultEffort, runtimes]);
 
@@ -1068,52 +1107,6 @@ export function Composer({
     }
     return () => {
       active = false;
-    };
-  }, []);
-
-  useEffect(() => {
-    let active = true;
-    let unsubscribe: (() => void) | undefined;
-    const subscribeVoiceTyping = bridge.subscribeVoiceTyping;
-    if (!subscribeVoiceTyping) {
-      return () => {
-        active = false;
-      };
-    }
-    void subscribeVoiceTyping((event) => {
-      if (!active || !voiceSessionActiveRef.current) return;
-      if (event.kind === "error") {
-        setVoiceError(event.text);
-        return;
-      }
-      if (event.kind === "completed") {
-        // A completed event contains the full current utterance, while delta
-        // events contain fragments of that same utterance. Keep the committed
-        // utterances separate so a new utterance cannot erase earlier words or
-        // duplicate its own deltas.
-        const completedText = event.text || voiceLiveTranscriptRef.current;
-        voiceCommittedTranscriptRef.current = appendVoiceSegment(
-          voiceCommittedTranscriptRef.current,
-          completedText,
-        );
-        voiceLiveTranscriptRef.current = "";
-      } else {
-        voiceLiveTranscriptRef.current += event.text;
-      }
-      const transcript = appendVoiceSegment(
-        voiceCommittedTranscriptRef.current,
-        voiceLiveTranscriptRef.current,
-      );
-      setPrompt(insertVoiceText(voiceBaseRef.current, transcript, voiceAnchorRef.current));
-    })
-      .then((cleanup) => {
-        if (active) unsubscribe = cleanup;
-        else cleanup();
-      })
-      .catch(() => undefined);
-    return () => {
-      active = false;
-      unsubscribe?.();
     };
   }, []);
 
@@ -1145,6 +1138,7 @@ export function Composer({
     if (capture) {
       capture.processor.onaudioprocess = null;
       capture.source.disconnect();
+      capture.analyser.disconnect();
       capture.processor.disconnect();
       capture.sink.disconnect();
       capture.stream.getTracks().forEach((track) => track.stop());
@@ -1152,45 +1146,141 @@ export function Composer({
     }
   }, []);
 
-  const stopVoiceTyping = useCallback(async () => {
-    if (!voiceActive) return;
-    // Clearing the session flag first also aborts a startup still in flight,
-    // so a second click on the mic always shuts voice typing off.
-    voiceSessionActiveRef.current = false;
-    setVoicePhase("stopping");
-    await releaseVoiceCapture();
-    await voiceAppendQueueRef.current.catch(() => undefined);
-    voiceAppendQueueRef.current = Promise.resolve();
-    try {
-      if (bridge.stopVoiceTyping) await bridge.stopVoiceTyping();
-      setVoiceError("");
-      setVoiceNotice("Voice text kept in the draft.");
-      if (voiceNoticeTimerRef.current !== undefined) {
-        window.clearTimeout(voiceNoticeTimerRef.current);
-      }
-      voiceNoticeTimerRef.current = window.setTimeout(() => {
-        setVoiceNotice("");
-        voiceNoticeTimerRef.current = undefined;
-      }, 4500);
-    } catch (error) {
-      setVoiceError(error instanceof Error ? error.message : "Could not stop voice typing.");
-    } finally {
-      setVoicePhase("idle");
+  const showVoiceNotice = useCallback((text: string) => {
+    setVoiceNotice(text);
+    if (voiceNoticeTimerRef.current !== undefined) {
+      window.clearTimeout(voiceNoticeTimerRef.current);
     }
-  }, [releaseVoiceCapture, voiceActive]);
+    voiceNoticeTimerRef.current = window.setTimeout(() => {
+      setVoiceNotice("");
+      voiceNoticeTimerRef.current = undefined;
+    }, 4500);
+  }, []);
+
+  /** Discards the session: buffered audio is dropped, and bumping the
+   * generation invalidates a startup or transcription still in flight. */
+  const cancelVoiceRecording = useCallback(
+    async (notice: string) => {
+      voiceGenerationRef.current += 1;
+      voiceSessionActiveRef.current = false;
+      voicePcmChunksRef.current = [];
+      await releaseVoiceCapture();
+      setVoiceError("");
+      setVoicePhase("idle");
+      if (notice) showVoiceNotice(notice);
+    },
+    [releaseVoiceCapture, showVoiceNotice],
+  );
+
+  /** Stops capture and sends the buffered clip for one-shot transcription. */
+  const finishVoiceRecording = useCallback(async () => {
+    if (!voiceSessionActiveRef.current) return;
+    voiceSessionActiveRef.current = false;
+    const generation = voiceGenerationRef.current;
+    const chunks = voicePcmChunksRef.current;
+    voicePcmChunksRef.current = [];
+    await releaseVoiceCapture();
+    const totalSamples = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    if (totalSamples < 24000 / 4) {
+      setVoicePhase("idle");
+      showVoiceNotice("The recording was too short to transcribe.");
+      return;
+    }
+    setVoicePhase("transcribing");
+    setVoiceError("");
+    try {
+      const transcribe = bridge.transcribeVoiceClip;
+      if (!transcribe) throw new Error("Voice typing is unavailable in this app build.");
+      const text = await transcribe(pcmChunksToBase64(chunks), 24000);
+      if (voiceGenerationRef.current !== generation) return;
+      setVoicePhase("idle");
+      if (!text) {
+        showVoiceNotice("No speech was detected in the recording.");
+        return;
+      }
+      // Insert at the caret as it stands now, so typing or sending during
+      // the recording never resurrects older draft text.
+      const textarea = textareaRef.current;
+      const current = textarea?.value ?? prompt;
+      const start = Math.min(textarea?.selectionStart ?? current.length, current.length);
+      const end = Math.min(Math.max(textarea?.selectionEnd ?? start, start), current.length);
+      const next = insertVoiceText(current, text, { start, end });
+      const position = start + (next.length - current.length) + (end - start);
+      draftTouchedRef.current = true;
+      setPrompt(next);
+      setCaret(position);
+      showVoiceNotice("Voice text added to the draft.");
+      requestAnimationFrame(() => {
+        const node = textareaRef.current;
+        node?.focus();
+        node?.setSelectionRange(position, position);
+      });
+    } catch (error) {
+      if (voiceGenerationRef.current !== generation) return;
+      setVoicePhase("idle");
+      setVoiceError(error instanceof Error ? error.message : "Could not transcribe the recording.");
+    }
+  }, [prompt, releaseVoiceCapture, showVoiceNotice]);
 
   useEffect(() => {
-    if (!voiceRecording) return;
+    if (!voiceActive) return;
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       event.preventDefault();
-      void stopVoiceTyping();
+      void cancelVoiceRecording(
+        voiceTranscribing ? "Transcription discarded." : "Recording discarded.",
+      );
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [stopVoiceTyping, voiceRecording]);
+  }, [cancelVoiceRecording, voiceActive, voiceTranscribing]);
 
-  const startVoiceTyping = async () => {
+  // The elapsed clock doubles as the length limiter: recordings buffer
+  // locally, so the clip must stop before the upload outgrows the API cap.
+  useEffect(() => {
+    if (!voiceRecording) return;
+    const interval = window.setInterval(() => {
+      const elapsed = Math.floor((performance.now() - voiceStartedAtRef.current) / 1000);
+      setVoiceElapsed(elapsed);
+      if (elapsed >= VOICE_MAX_SECONDS) void finishVoiceRecording();
+    }, 500);
+    return () => window.clearInterval(interval);
+  }, [finishVoiceRecording, voiceRecording]);
+
+  // Levels write straight to the bar elements from an animation frame; state
+  // updates here would re-render the whole composer at display refresh rate.
+  useEffect(() => {
+    if (!voiceRecording) return;
+    const analyser = voiceCaptureRef.current?.analyser;
+    if (!analyser) return;
+    const bars = voiceBarRefs.current;
+    const bins = new Uint8Array(analyser.frequencyBinCount);
+    let raf = 0;
+    const tick = () => {
+      analyser.getByteFrequencyData(bins);
+      const band = Math.floor(bins.length / VOICE_METER_BARS) || 1;
+      for (let bar = 0; bar < VOICE_METER_BARS; bar += 1) {
+        const node = bars[bar];
+        if (!node) continue;
+        let sum = 0;
+        const start = bar * band;
+        const end = Math.min(bins.length, start + band);
+        for (let index = start; index < end; index += 1) sum += bins[index];
+        const level = sum / Math.max(1, end - start) / 255;
+        node.style.transform = `scaleY(${Math.max(0.18, Math.min(1, level * 1.6)).toFixed(3)})`;
+      }
+      raf = window.requestAnimationFrame(tick);
+    };
+    raf = window.requestAnimationFrame(tick);
+    return () => {
+      window.cancelAnimationFrame(raf);
+      for (const node of bars) {
+        if (node) node.style.transform = "";
+      }
+    };
+  }, [voiceRecording]);
+
+  const startVoiceRecording = async () => {
     if (voicePhase !== "idle") return;
     if (!voiceConfigured) {
       setVoiceError("Add your OpenAI API key in Settings → General to enable voice typing.");
@@ -1200,19 +1290,16 @@ export function Composer({
       setVoiceError("This desktop environment does not provide microphone capture.");
       return;
     }
-    if (!bridge.startVoiceTyping || !bridge.appendVoiceTypingPcm) {
+    if (!bridge.transcribeVoiceClip) {
       setVoiceError("Voice typing is unavailable in this app build.");
       return;
     }
+    const generation = ++voiceGenerationRef.current;
     setVoicePhase("starting");
     setVoiceError("");
     setVoiceNotice("");
-    voiceBaseRef.current = prompt;
-    voiceCommittedTranscriptRef.current = "";
-    voiceLiveTranscriptRef.current = "";
-    const start = textareaRef.current?.selectionStart ?? prompt.length;
-    const end = textareaRef.current?.selectionEnd ?? start;
-    voiceAnchorRef.current = { start, end };
+    setVoiceElapsed(0);
+    voicePcmChunksRef.current = [];
     voiceSessionActiveRef.current = true;
     let stream: MediaStream | undefined;
     let context: AudioContext | undefined;
@@ -1225,30 +1312,25 @@ export function Composer({
           ...(micDeviceId !== "default" ? { deviceId: { exact: micDeviceId } } : {}),
         },
       });
-      if (!voiceSessionActiveRef.current) {
-        // The mic was clicked again while permission was pending; abort.
+      if (voiceGenerationRef.current !== generation) {
+        // Cancelled while the permission prompt was pending; the cancel path
+        // already reset the phase.
         stream.getTracks().forEach((track) => track.stop());
-        setVoicePhase("idle");
         return;
       }
       context = new AudioContext({ sampleRate: 24000 });
       await context.resume();
       const source = context.createMediaStreamSource(stream);
+      const analyser = context.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.6;
       const processor = context.createScriptProcessor(4096, 1, 1);
       const sink = context.createGain();
       sink.gain.value = 0;
+      source.connect(analyser);
       source.connect(processor);
       processor.connect(sink);
       sink.connect(context.destination);
-      await bridge.startVoiceTyping();
-      if (!voiceSessionActiveRef.current) {
-        // Cancelled during backend startup; unwind instead of recording.
-        stream.getTracks().forEach((track) => track.stop());
-        await context.close().catch(() => undefined);
-        if (bridge.stopVoiceTyping) await bridge.stopVoiceTyping().catch(() => undefined);
-        setVoicePhase("idle");
-        return;
-      }
       let chunkCount = 0;
       let sawSignal = false;
       processor.onaudioprocess = (event) => {
@@ -1262,24 +1344,16 @@ export function Composer({
             }
           }
         }
-        const bytes = encodePcm16(samples, context?.sampleRate ?? 24000);
-        voiceAppendQueueRef.current = voiceAppendQueueRef.current
-          .catch(() => undefined)
-          .then(() => bridge.appendVoiceTypingPcm!(bytes))
-          .catch((error) => {
-            setVoiceError(
-              error instanceof Error ? error.message : "Could not send microphone audio.",
-            );
-          });
+        voicePcmChunksRef.current.push(encodePcm16(samples, context?.sampleRate ?? 24000));
       };
       // Capture can fail silently: the audio graph never ticks, or the track
       // delivers only digital silence (wrong device, OS-level mic privacy
       // block). Surface both instead of leaving a mute session running.
       window.setTimeout(() => {
-        if (!voiceSessionActiveRef.current) return;
+        if (!voiceSessionActiveRef.current || voiceGenerationRef.current !== generation) return;
         if (chunkCount === 0) {
           setVoiceError(
-            "The microphone is not producing audio. Check Windows microphone privacy settings and the selected device.",
+            "The microphone is not producing audio. Check the OS microphone privacy settings and the selected device.",
           );
         } else if (!sawSignal) {
           setVoiceError(
@@ -1287,39 +1361,38 @@ export function Composer({
           );
         }
       }, 3000);
-      voiceCaptureRef.current = { context, stream, source, processor, sink };
+      voiceCaptureRef.current = { context, stream, source, processor, analyser, sink };
+      voiceStartedAtRef.current = performance.now();
       setVoicePhase("recording");
     } catch (error) {
       stream?.getTracks().forEach((track) => track.stop());
       await context?.close().catch(() => undefined);
-      if (bridge.stopVoiceTyping) await bridge.stopVoiceTyping().catch(() => undefined);
-      voiceSessionActiveRef.current = false;
-      setVoiceError(error instanceof Error ? error.message : "Could not start voice typing.");
-      setVoicePhase("idle");
-    } finally {
-      // The phase is the source of truth for the button and status copy.
+      if (voiceGenerationRef.current === generation) {
+        voiceSessionActiveRef.current = false;
+        setVoiceError(error instanceof Error ? error.message : "Could not start voice recording.");
+        setVoicePhase("idle");
+      }
     }
   };
 
   useEffect(
     () => () => {
+      voiceGenerationRef.current += 1;
+      voiceSessionActiveRef.current = false;
+      voicePcmChunksRef.current = [];
       const capture = voiceCaptureRef.current;
-      const shouldStopVoiceSession = voiceSessionActiveRef.current || Boolean(capture);
       voiceCaptureRef.current = null;
       if (capture) {
         capture.processor.onaudioprocess = null;
         capture.source.disconnect();
+        capture.analyser.disconnect();
         capture.processor.disconnect();
         capture.sink.disconnect();
         capture.stream.getTracks().forEach((track) => track.stop());
         void capture.context.close().catch(() => undefined);
       }
-      voiceSessionActiveRef.current = false;
       if (voiceNoticeTimerRef.current !== undefined) {
         window.clearTimeout(voiceNoticeTimerRef.current);
-      }
-      if (shouldStopVoiceSession && bridge.stopVoiceTyping) {
-        void bridge.stopVoiceTyping().catch(() => undefined);
       }
     },
     [],
@@ -1463,7 +1536,7 @@ export function Composer({
         runtime,
         model: activeModel,
         effort: effortOptions.length > 0 ? activeEffort : undefined,
-        permission,
+        permission: effectivePermission,
         delegation: effectiveDelegation,
         ...(nativeActionId ? { nativeActionId } : {}),
         ...(nativeAction
@@ -1488,6 +1561,7 @@ export function Composer({
   };
 
   const changePermission = (next: string) => {
+    if (runtime === "antigravity" && next === "ask") return;
     draftTouchedRef.current = true;
     routingTouched.current = true;
     setPermission(next as typeof permission);
@@ -1509,7 +1583,11 @@ export function Composer({
   const permissionOptions = [
     { value: "read-only", label: "Read only" },
     { value: "project-write", label: "Project write" },
-    { value: "ask", label: "Ask as needed" },
+    {
+      value: "ask",
+      label: "Ask as needed",
+      disabled: antigravityPromptUnsupported,
+    },
     { value: "full-access", label: "Full access" },
   ];
   const delegationOptions = [
@@ -1539,7 +1617,7 @@ export function Composer({
     controlsSubmenu === "mode"
       ? sessionModes?.currentModeId
       : controlsSubmenu === "permission"
-        ? permission
+        ? effectivePermission
         : effectiveDelegation;
   const chooseCompactControl = (value: string) => {
     if (controlsSubmenu === "mode") onSessionModeChange?.(value);
@@ -1589,6 +1667,37 @@ export function Composer({
         </div>
       ) : null}
       <div className="composer" data-busy={sending}>
+        {voiceActive ? (
+          <div className="composer-voice-hud" role="status" aria-live="polite">
+            {voiceRecording ? (
+              <>
+                <span className="composer-voice-hint">Stop to transcribe · Esc to cancel</span>
+                <span
+                  className={`composer-voice-timer${
+                    voiceElapsed >= VOICE_TIMER_WARN_SECONDS ? " composer-voice-timer--warn" : ""
+                  }`}
+                >
+                  {formatVoiceElapsed(voiceElapsed)}
+                </span>
+                <span className="composer-voice-bars" aria-hidden="true">
+                  {Array.from({ length: VOICE_METER_BARS }, (_, index) => (
+                    <span
+                      key={index}
+                      className="composer-voice-bar"
+                      ref={(node) => {
+                        voiceBarRefs.current[index] = node;
+                      }}
+                    />
+                  ))}
+                </span>
+              </>
+            ) : (
+              <span className="composer-voice-hint">
+                {voicePhase === "starting" ? "Starting the microphone…" : "Transcribing…"}
+              </span>
+            )}
+          </div>
+        ) : null}
         <AnimatePresence>
           {autocompleteOpen ? (
             <motion.div
@@ -1698,18 +1807,6 @@ export function Composer({
               const committedCaret = detachedPrefix.prompt.length;
               if (detached.attachments.length > 0) {
                 setAttachments((current) => appendUniqueAttachments(current, detached.attachments));
-              }
-              if (voiceActive) {
-                // Treat a manual edit as the new draft baseline. This keeps
-                // typed text and already-transcribed words intact instead of
-                // rebuilding the textarea from the old pre-recording value.
-                voiceBaseRef.current = committedPrompt;
-                voiceCommittedTranscriptRef.current = "";
-                voiceLiveTranscriptRef.current = "";
-                voiceAnchorRef.current = {
-                  start: committedCaret,
-                  end: committedCaret,
-                };
               }
               setPrompt(committedPrompt);
               setCaret(committedCaret);
@@ -1838,7 +1935,7 @@ export function Composer({
                 aria-label="Permission"
                 disabled={permissionDisabled}
                 leading={<ShieldCheck />}
-                value={permission}
+                value={effectivePermission}
                 onChange={changePermission}
                 options={permissionOptions}
                 compact
@@ -1962,6 +2059,11 @@ export function Composer({
                               aria-checked={option.value === compactControlValue}
                               data-selected={option.value === compactControlValue}
                               key={option.value}
+                              disabled={
+                                controlsSubmenu === "permission" &&
+                                option.value === "ask" &&
+                                antigravityPromptUnsupported
+                              }
                               onClick={() => chooseCompactControl(option.value)}
                             >
                               {option.label}
@@ -2071,30 +2173,46 @@ export function Composer({
               compact
             />
             <button
-              className={`icon-button composer-mic${voiceRecording ? " is-recording" : ""}`}
+              className={`icon-button composer-mic${voiceRecording ? " is-recording" : ""}${
+                voiceTranscribing ? " is-transcribing" : ""
+              }`}
               type="button"
-              onClick={() => void (voiceActive ? stopVoiceTyping() : startVoiceTyping())}
-              aria-label={voiceActive ? "Stop voice typing" : "Start voice typing"}
-              aria-pressed={voiceRecording}
-              aria-keyshortcuts={voiceRecording ? "Escape" : undefined}
-              disabled={
-                voicePhase === "stopping" || voiceConfigured === null || voiceConfigured === false
+              onClick={() =>
+                void (voiceRecording
+                  ? finishVoiceRecording()
+                  : voicePhase === "starting"
+                    ? cancelVoiceRecording("Recording discarded.")
+                    : startVoiceRecording())
               }
+              aria-label={
+                voiceRecording
+                  ? "Stop recording and transcribe"
+                  : voicePhase === "starting"
+                    ? "Cancel voice recording startup"
+                    : "Start voice typing"
+              }
+              aria-pressed={voiceRecording}
+              aria-keyshortcuts={voiceActive ? "Escape" : undefined}
+              disabled={voiceTranscribing || voiceConfigured === null || voiceConfigured === false}
               title={
                 voicePhase === "starting"
-                  ? "Cancel voice typing startup"
-                  : voicePhase === "stopping"
-                    ? "Finishing voice text in the draft"
+                  ? "Cancel voice recording startup"
+                  : voiceTranscribing
+                    ? "Transcribing the recording"
                     : voiceRecording
-                      ? "Stop listening and keep the words in the draft"
+                      ? "Stop recording and transcribe into the draft"
                       : voiceConfigured
-                        ? "Start realtime voice typing"
+                        ? "Record a voice clip and transcribe it into the draft"
                         : voiceConfigured === null
                           ? "Checking voice typing setup"
                           : "Add an OpenAI API key in Settings → General"
               }
             >
-              {voiceActive ? <Square aria-hidden="true" /> : <Mic aria-hidden="true" />}
+              {voiceRecording || voicePhase === "starting" ? (
+                <Square aria-hidden="true" />
+              ) : (
+                <Mic aria-hidden="true" />
+              )}
             </button>
             <Dropdown
               className="mic-select"
@@ -2168,23 +2286,10 @@ export function Composer({
         </div>
       </div>
       <p className="composer-footnote">Agents can make mistakes; review changes</p>
-      {voiceActive || voiceNotice || voiceError ? (
+      {voiceNotice || voiceError ? (
         // Absolutely positioned so transient status lines never change the
         // composer's height or push it up while typing.
         <div className="composer-status-overlay" aria-label="Composer status">
-          {voiceActive ? (
-            <p
-              className={`composer-voice-status composer-voice-status--${voicePhase}`}
-              role="status"
-              aria-live="polite"
-            >
-              {voicePhase === "starting"
-                ? "Starting voice typing…"
-                : voicePhase === "stopping"
-                  ? "Finishing your words… they will stay in the draft."
-                  : "Listening… click the mic again or press Escape when you’re done."}
-            </p>
-          ) : null}
           {voiceNotice ? (
             <p
               className="composer-voice-status composer-voice-status--saved"

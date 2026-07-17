@@ -2167,7 +2167,20 @@ fn watch_structured_child(
     };
     let mut receiver = client.subscribe();
     tauri::async_runtime::spawn(async move {
-        while let Ok(event) = receiver.recv().await {
+        loop {
+            let event = match receiver.recv().await {
+                Ok(event) => event,
+                // Lagged is recoverable: the receiver resumes from the oldest
+                // retained event. Exiting here would silently stop observing
+                // turn boundaries and wedge the delegation forever.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    eprintln!(
+                        "delegation watcher lagged behind structured stream by {skipped} events"
+                    );
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
             if let Some(session_id) = event.session_id.clone() {
                 let changed = {
                     let mut guard = session_ref.lock().expect("session lock");
@@ -2204,7 +2217,17 @@ fn watch_codex_child(
     let child_identity = Arc::clone(&child.busy);
     let mut receiver = client.subscribe();
     tauri::async_runtime::spawn(async move {
-        while let Ok(event) = receiver.recv().await {
+        loop {
+            let event = match receiver.recv().await {
+                Ok(event) => event,
+                // Recoverable: resume from the oldest retained event instead
+                // of abandoning turn-boundary tracking for this delegation.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    eprintln!("delegation watcher lagged behind codex stream by {skipped} events");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
             match event {
                 adapter_codex::CodexEvent::Notification { method, params } => {
                     if method == "turn/completed" {
@@ -2234,7 +2257,19 @@ fn watch_acp_child(app: AppHandle<tauri::Wry>, child: &DelegationChild, runtime:
     let child_identity = Arc::clone(&child.busy);
     let mut receiver = runtime.turn_settled.subscribe();
     tauri::async_runtime::spawn(async move {
-        while let Ok(settlement) = receiver.recv().await {
+        loop {
+            let settlement = match receiver.recv().await {
+                Ok(settlement) => settlement,
+                // One settlement per turn makes lag unlikely, but a missed
+                // window must not permanently stop settlement tracking.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    eprintln!(
+                        "delegation watcher lagged behind ACP settlements by {skipped} events"
+                    );
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
             child_turn_settled(
                 app.clone(),
                 delegation_id,

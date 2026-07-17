@@ -73,8 +73,14 @@ pub(crate) fn run_bounded_with_outcome(
         .stderr
         .take()
         .ok_or_else(|| IntegratorError::Unavailable("process stderr unavailable".into()))?;
-    let stdout_reader = thread::spawn(move || read_limited(stdout, max_output_bytes));
-    let stderr_reader = thread::spawn(move || read_limited(stderr, max_output_bytes));
+    let (stdout_sender, stdout_receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = stdout_sender.send(read_limited(stdout, max_output_bytes));
+    });
+    let (stderr_sender, stderr_receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = stderr_sender.send(read_limited(stderr, max_output_bytes));
+    });
 
     let started = Instant::now();
     let status = loop {
@@ -88,12 +94,13 @@ pub(crate) fn run_bounded_with_outcome(
         }
         thread::sleep(Duration::from_millis(20));
     };
-    let (stdout, stdout_truncated) = stdout_reader
-        .join()
-        .map_err(|_| IntegratorError::Unavailable("stdout reader failed".into()))??;
-    let (stderr, stderr_truncated) = stderr_reader
-        .join()
-        .map_err(|_| IntegratorError::Unavailable("stderr reader failed".into()))??;
+    // The child has exited, but the pipes only reach EOF once every process
+    // holding the write ends does. A probed CLI that forked a daemon
+    // grandchild (inheriting stdout/stderr) would otherwise hang this call
+    // indefinitely despite the probe timeout above, so give the readers a
+    // short grace period and then report whatever arrived as truncated.
+    let (stdout, stdout_truncated) = recv_reader_output(&stdout_receiver, "stdout")?;
+    let (stderr, stderr_truncated) = recv_reader_output(&stderr_receiver, "stderr")?;
     Ok(ProcessRunOutcome::Completed(ProcessOutput {
         success: status.success(),
         exit_code: status.code(),
@@ -115,6 +122,24 @@ fn suppress_windows_console(command: &mut Command) {
 
     #[cfg(not(windows))]
     let _ = command;
+}
+
+const PIPE_EOF_GRACE: Duration = Duration::from_secs(2);
+
+fn recv_reader_output(
+    receiver: &std::sync::mpsc::Receiver<Result<(String, bool)>>,
+    label: &str,
+) -> Result<(String, bool)> {
+    match receiver.recv_timeout(PIPE_EOF_GRACE) {
+        Ok(result) => result,
+        // A grandchild is holding the pipe open past the child's exit; the
+        // detached reader thread stays parked until that process exits, and
+        // we return what we have instead of blocking the probe.
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok((String::new(), true)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(IntegratorError::Unavailable(
+            format!("{label} reader failed"),
+        )),
+    }
 }
 
 fn read_limited(mut reader: impl Read, max_output_bytes: u64) -> Result<(String, bool)> {
@@ -228,6 +253,35 @@ mod tests {
         let (output, truncated) = read_limited(input, 100).expect("bounded read");
         assert_eq!(output.len(), 100);
         assert!(truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grandchild_holding_pipes_cannot_hang_the_probe_past_the_grace_period() {
+        let started = Instant::now();
+        let outcome = run_bounded_with_outcome(
+            Path::new("/bin/bash"),
+            &["-c", "echo probed; sleep 10 & exit 0"],
+            None,
+            1024,
+            Duration::from_secs(5),
+        )
+        .expect("probe run");
+        // The child exits immediately; only the sleeping grandchild holds the
+        // pipe write ends. The call must return after the EOF grace period,
+        // not after the grandchild exits.
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "probe blocked on grandchild-held pipes for {:?}",
+            started.elapsed()
+        );
+        match outcome {
+            ProcessRunOutcome::Completed(output) => {
+                assert!(output.success);
+                assert!(output.stdout_truncated || output.stdout.contains("probed"));
+            }
+            ProcessRunOutcome::TimedOut => panic!("child exited; probe must not time out"),
+        }
     }
 
     #[test]

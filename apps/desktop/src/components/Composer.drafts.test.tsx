@@ -105,8 +105,10 @@ describe("Composer draft lifecycle", () => {
     await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
   });
 
-  it("does not stop a voice session that was never started", () => {
-    const stopVoiceTyping = vi.spyOn(bridge, "stopVoiceTyping").mockResolvedValue(undefined);
+  it("does not transcribe when no voice recording was ever started", () => {
+    const transcribeVoiceClip = vi
+      .spyOn(bridge, "transcribeVoiceClip")
+      .mockResolvedValue("unused");
     const { unmount } = render(
       <Composer
         runtimes={runtimes}
@@ -117,6 +119,6 @@ describe("Composer draft lifecycle", () => {
     );
 
     unmount();
-    expect(stopVoiceTyping).not.toHaveBeenCalled();
+    expect(transcribeVoiceClip).not.toHaveBeenCalled();
   });
 });
