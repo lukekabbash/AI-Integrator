@@ -50,12 +50,16 @@ pub fn create_overlay(
 ) -> Result<AntigravityOverlay> {
     let root = data_directory.join("antigravity-control").join(scope);
     let agents = root.join(".agents");
+    let rules = agents.join("rules");
     fs::create_dir_all(&agents).map_err(IntegratorError::from)?;
+    fs::create_dir_all(&rules).map_err(IntegratorError::from)?;
     #[cfg(unix)]
     {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
             .map_err(IntegratorError::from)?;
         fs::set_permissions(&agents, fs::Permissions::from_mode(0o700))
+            .map_err(IntegratorError::from)?;
+        fs::set_permissions(&rules, fs::Permissions::from_mode(0o700))
             .map_err(IntegratorError::from)?;
     }
 
@@ -90,6 +94,13 @@ pub fn create_overlay(
         }
     });
     write_private_json(&agents.join("hooks.json"), &config)?;
+    write_private_text(
+        &rules.join("ai-integrator.md"),
+        &crate::harness_prompt::instructions(
+            integrator_core::ProviderKind::Antigravity,
+            crate::harness_prompt::LocalToolsProjection::Unavailable,
+        ),
+    )?;
     Ok(AntigravityOverlay { root, event_log })
 }
 
@@ -426,6 +437,17 @@ fn write_private_json(path: &Path, value: &Value) -> Result<()> {
     file.write_all(b"\n").map_err(IntegratorError::from)
 }
 
+fn write_private_text(path: &Path, value: &str) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path).map_err(IntegratorError::from)?;
+    file.write_all(value.as_bytes())
+        .map_err(IntegratorError::from)?;
+    file.write_all(b"\n").map_err(IntegratorError::from)
+}
+
 fn write_hook_response(phase: &str, decision: &str, reason: Option<&str>) -> i32 {
     let response = match phase {
         "PreToolUse" => json!({ "decision": decision, "reason": reason }),
@@ -526,6 +548,11 @@ mod tests {
         }
         assert!(config.contains("--antigravity-hook"));
         assert!(config.contains("project-write"));
+        let harness = std::fs::read_to_string(overlay.root.join(".agents/rules/ai-integrator.md"))
+            .expect("read harness rule");
+        assert!(harness.contains("durable harness policy"));
+        assert!(harness.contains("using the antigravity runtime"));
+        assert!(harness.contains("delegation are unavailable"));
     }
 
     #[test]

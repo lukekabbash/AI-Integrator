@@ -2,7 +2,7 @@
 import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { bridge, type RuntimeConnection } from "../bridge";
+import { bridge, type ModelCatalogEntry, type RuntimeConnection, type RuntimeId } from "../bridge";
 import { Composer } from "./Composer";
 
 const runtimes: RuntimeConnection[] = [
@@ -17,11 +17,37 @@ const runtimes: RuntimeConnection[] = [
   },
 ];
 
-afterEach(() => vi.restoreAllMocks());
+function mockModelCatalog(
+  resolve: (runtime: RuntimeId) => ModelCatalogEntry[] | Promise<ModelCatalogEntry[]>,
+) {
+  const catalogs = new Map<RuntimeId, ModelCatalogEntry[]>();
+  const listeners = new Set<() => void>();
+  vi.spyOn(bridge, "getCachedModelCatalog").mockImplementation((runtime) => catalogs.get(runtime));
+  vi.spyOn(bridge, "subscribeModelCatalogs").mockImplementation((listener) => {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  });
+  return vi.spyOn(bridge, "listModelCatalog").mockImplementation(async (runtime) => {
+    const catalog = await resolve(runtime);
+    catalogs.set(runtime, catalog);
+    for (const listener of listeners) listener();
+    return catalog;
+  });
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  bridge.invalidateModelCatalog("codex");
+  bridge.invalidateModelCatalog("claude");
+  bridge.invalidateModelCatalog("antigravity");
+  bridge.invalidateModelCatalog("cursor");
+  bridge.invalidateModelCatalog("grok");
+  bridge.invalidateModelCatalog("custom");
+});
 
 describe("Composer compact controls", () => {
   it("keeps routing and mic visible while the overflow menu controls mode and policy", async () => {
-    vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
+    mockModelCatalog(() => [
       {
         id: "gpt-5.6-luna",
         label: "GPT-5.6 Luna",
@@ -105,9 +131,7 @@ describe("Composer compact controls", () => {
   });
 
   it("replaces a legacy provider-default route with the discovered model", async () => {
-    vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
-      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
-    ]);
+    mockModelCatalog(() => [{ id: "gpt-5.6-luna", label: "GPT-5.6 Luna" }]);
     const onRoutingChange = vi.fn();
 
     render(
@@ -132,6 +156,33 @@ describe("Composer compact controls", () => {
     });
   });
 
+  it("reuses the warmed model catalog when a chat remounts", async () => {
+    bridge.invalidateModelCatalog("codex");
+    const listModelCatalog = vi.spyOn(bridge, "listModelCatalog");
+    const props = {
+      runtimes: [{ ...runtimes[0], models: [] }],
+      defaultRuntime: "codex" as const,
+      defaultModel: "Provider default",
+      onSend: vi.fn().mockResolvedValue(true),
+    };
+
+    const first = render(<Composer {...props} />);
+    expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("Checking model…");
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Model" })).not.toHaveTextContent(
+        "Checking model…",
+      ),
+    );
+    const warmedLabel = screen.getByRole("button", { name: "Model" }).textContent;
+    expect(listModelCatalog).toHaveBeenCalledTimes(1);
+    first.unmount();
+
+    render(<Composer {...props} />);
+    expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent(warmedLabel ?? "");
+    expect(screen.getByRole("button", { name: "Model" })).not.toHaveTextContent("Checking model…");
+    expect(listModelCatalog).toHaveBeenCalledTimes(1);
+  });
+
   it("recalls each runtime's preferred model and effort when switching", async () => {
     const routeRuntimes: RuntimeConnection[] = [
       ...runtimes,
@@ -145,7 +196,7 @@ describe("Composer compact controls", () => {
         detail: "Ready",
       },
     ];
-    vi.spyOn(bridge, "listModelCatalog").mockImplementation(async (runtime) =>
+    mockModelCatalog((runtime) =>
       runtime === "claude"
         ? [
             {
@@ -196,9 +247,7 @@ describe("Composer compact controls", () => {
       models: ["gemini-3.5-flash"],
       detail: "Ready",
     };
-    vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
-      { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash" },
-    ]);
+    mockModelCatalog(() => [{ id: "gemini-3.5-flash", label: "Gemini 3.5 Flash" }]);
     const onSend = vi.fn().mockResolvedValue(true);
 
     render(

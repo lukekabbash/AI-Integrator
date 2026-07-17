@@ -93,8 +93,23 @@ pub enum AcpEvent {
     RecoveryBoundary {
         replayed_history: bool,
     },
+    /// Ordered after every `session/update` notification emitted before the
+    /// matching `session/prompt` response. Consumers must settle and clear the
+    /// active turn from this boundary rather than from the prompt future,
+    /// otherwise queued tail chunks can be misattributed or dropped.
+    PromptFinished {
+        session_id: String,
+        outcome: AcpPromptOutcome,
+    },
     StderrActivity,
     Exited,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum AcpPromptOutcome {
+    Response { stop_reason: StopReason },
+    Error { message: String },
 }
 
 #[derive(Clone, Debug)]
@@ -106,7 +121,8 @@ pub struct AcpLaunchOptions {
 }
 
 /// The result of a completed `session/prompt` turn.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum StopReason {
     EndTurn,
     MaxTokens,
@@ -140,15 +156,23 @@ pub struct AcpClient {
 pub struct AcpSessionCapabilities {
     pub load: bool,
     pub resume: bool,
+    pub mcp_http: bool,
+    pub mcp_sse: bool,
 }
 
 struct Inner {
     child: Mutex<Option<Child>>,
     stdin: Mutex<ChildStdin>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
+    pending: Arc<Mutex<HashMap<u64, PendingRequest>>>,
     events: broadcast::Sender<AcpEvent>,
     next_id: AtomicU64,
     initialization: Mutex<Value>,
+}
+
+struct PendingRequest {
+    method: String,
+    session_id: Option<String>,
+    sender: oneshot::Sender<Result<Value>>,
 }
 
 impl AcpClient {
@@ -457,14 +481,37 @@ impl AcpClient {
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
-        self.inner.pending.lock().await.insert(id, sender);
+        let session_id = (method == "session/prompt")
+            .then(|| {
+                params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .flatten();
+        self.inner.pending.lock().await.insert(
+            id,
+            PendingRequest {
+                method: method.to_owned(),
+                session_id,
+                sender,
+            },
+        );
         if let Err(error) = self
             .write_message(
                 json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
             )
             .await
         {
-            self.inner.pending.lock().await.remove(&id);
+            if let Some(pending) = self.inner.pending.lock().await.remove(&id) {
+                emit_prompt_finished(
+                    &self.inner.events,
+                    &pending,
+                    AcpPromptOutcome::Error {
+                        message: error.to_string(),
+                    },
+                );
+            }
             return Err(error);
         }
         receiver
@@ -504,6 +551,14 @@ fn session_capabilities(initialization: &Value) -> AcpSessionCapabilities {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         resume: agent.pointer("/sessionCapabilities/resume").is_some(),
+        mcp_http: agent
+            .pointer("/mcpCapabilities/http")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        mcp_sse: agent
+            .pointer("/mcpCapabilities/sse")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -669,7 +724,7 @@ fn encode_message(value: &Value) -> Result<Vec<u8>> {
 
 fn spawn_stdout_reader(
     stdout: impl AsyncRead + Unpin + Send + 'static,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
+    pending: Arc<Mutex<HashMap<u64, PendingRequest>>>,
     events: broadcast::Sender<AcpEvent>,
 ) {
     tokio::spawn(async move {
@@ -694,8 +749,16 @@ fn spawn_stdout_reader(
         })
         .await;
         let mut pending = pending.lock().await;
-        for (_, sender) in pending.drain() {
-            let _ = sender.send(Err(IntegratorError::Unavailable("ACP agent exited".into())));
+        for (_, request) in pending.drain() {
+            let error = IntegratorError::Unavailable("ACP agent exited".into());
+            emit_prompt_finished(
+                &events,
+                &request,
+                AcpPromptOutcome::Error {
+                    message: error.to_string(),
+                },
+            );
+            let _ = request.sender.send(Err(error));
         }
         let _ = events.send(AcpEvent::Exited);
     });
@@ -775,7 +838,7 @@ enum JsonlFrame {
 
 async fn route_message(
     message: Value,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
+    pending: Arc<Mutex<HashMap<u64, PendingRequest>>>,
     events: broadcast::Sender<AcpEvent>,
 ) {
     let id_value = message.get("id");
@@ -804,13 +867,22 @@ async fn route_message(
             });
             return;
         };
-        if let Some(sender) = pending.lock().await.remove(&id) {
+        if let Some(request) = pending.lock().await.remove(&id) {
             let result = if let Some(error) = message.get("error") {
                 Err(IntegratorError::Protocol(protocol_error(error)))
             } else {
                 Ok(message.get("result").cloned().unwrap_or(Value::Null))
             };
-            let _ = sender.send(result);
+            let outcome = match &result {
+                Ok(response) => AcpPromptOutcome::Response {
+                    stop_reason: StopReason::from_protocol(response),
+                },
+                Err(error) => AcpPromptOutcome::Error {
+                    message: error.to_string(),
+                },
+            };
+            emit_prompt_finished(&events, &request, outcome);
+            let _ = request.sender.send(result);
         } else {
             let _ = events.send(AcpEvent::ProtocolViolation {
                 code: "unknown-response-id".into(),
@@ -827,6 +899,23 @@ async fn route_message(
     }
     let _ = events.send(AcpEvent::ProtocolViolation {
         code: "invalid-frame".into(),
+    });
+}
+
+fn emit_prompt_finished(
+    events: &broadcast::Sender<AcpEvent>,
+    request: &PendingRequest,
+    outcome: AcpPromptOutcome,
+) {
+    if request.method != "session/prompt" {
+        return;
+    }
+    let Some(session_id) = request.session_id.clone() else {
+        return;
+    };
+    let _ = events.send(AcpEvent::PromptFinished {
+        session_id,
+        outcome,
     });
 }
 
@@ -898,12 +987,15 @@ mod tests {
             session_capabilities(&json!({
                 "agentCapabilities": {
                     "loadSession": true,
-                    "sessionCapabilities": { "resume": {} }
+                    "sessionCapabilities": { "resume": {} },
+                    "mcpCapabilities": { "http": true, "sse": false }
                 }
             })),
             AcpSessionCapabilities {
                 load: true,
                 resume: true,
+                mcp_http: true,
+                mcp_sse: false,
             }
         );
         assert_eq!(
@@ -916,7 +1008,14 @@ mod tests {
     async fn happy_response_is_delivered_to_the_matching_request() {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (sender, receiver) = oneshot::channel();
-        pending.lock().await.insert(7, sender);
+        pending.lock().await.insert(
+            7,
+            PendingRequest {
+                method: "initialize".into(),
+                session_id: None,
+                sender,
+            },
+        );
         let (events, _) = broadcast::channel(4);
 
         route_message(
@@ -937,16 +1036,101 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn degraded_error_response_preserves_only_protocol_error() {
+    async fn prompt_boundary_follows_every_buffered_stream_notification() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (sender, response) = oneshot::channel();
+        pending.lock().await.insert(
+            8,
+            PendingRequest {
+                method: "session/prompt".into(),
+                session_id: Some("session-1".into()),
+                sender,
+            },
+        );
+        let (events, mut receiver) = broadcast::channel(128);
+        let expected = (0..64)
+            .map(|index| format!("tail-{index}"))
+            .collect::<Vec<_>>();
+
+        for text in &expected {
+            route_message(
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "session-1",
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": { "type": "text", "text": text }
+                        }
+                    }
+                }),
+                Arc::clone(&pending),
+                events.clone(),
+            )
+            .await;
+        }
+        route_message(
+            json!({ "jsonrpc": "2.0", "id": 8, "result": { "stopReason": "end_turn" } }),
+            Arc::clone(&pending),
+            events,
+        )
+        .await;
+
+        let mut streamed = Vec::new();
+        for _ in 0..expected.len() {
+            let AcpEvent::Notification { method, params } =
+                receiver.recv().await.expect("stream notification")
+            else {
+                panic!("expected buffered stream notification");
+            };
+            assert_eq!(method, "session/update");
+            streamed.push(
+                params
+                    .pointer("/update/content/text")
+                    .and_then(Value::as_str)
+                    .expect("stream text")
+                    .to_owned(),
+            );
+        }
+        assert_eq!(streamed, expected);
+        assert_eq!(
+            receiver.recv().await.expect("prompt boundary"),
+            AcpEvent::PromptFinished {
+                session_id: "session-1".into(),
+                outcome: AcpPromptOutcome::Response {
+                    stop_reason: StopReason::EndTurn,
+                },
+            }
+        );
+        assert_eq!(
+            response
+                .await
+                .expect("pending response")
+                .expect("ACP result"),
+            json!({ "stopReason": "end_turn" })
+        );
+        assert!(pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn degraded_prompt_error_preserves_protocol_error_and_orders_the_boundary() {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (sender, receiver) = oneshot::channel();
-        pending.lock().await.insert(8, sender);
-        let (events, _) = broadcast::channel(4);
+        pending.lock().await.insert(
+            9,
+            PendingRequest {
+                method: "session/prompt".into(),
+                session_id: Some("session-1".into()),
+                sender,
+            },
+        );
+        let (events, mut event_receiver) = broadcast::channel(4);
 
         route_message(
             json!({
                 "jsonrpc": "2.0",
-                "id": 8,
+                "id": 9,
                 "error": { "code": -32000, "message": "session expired" }
             }),
             Arc::clone(&pending),
@@ -954,6 +1138,15 @@ mod tests {
         )
         .await;
 
+        assert_eq!(
+            event_receiver.recv().await.expect("prompt boundary"),
+            AcpEvent::PromptFinished {
+                session_id: "session-1".into(),
+                outcome: AcpPromptOutcome::Error {
+                    message: "provider protocol error: session expired (code -32000)".into(),
+                },
+            }
+        );
         let error = receiver
             .await
             .expect("pending response")

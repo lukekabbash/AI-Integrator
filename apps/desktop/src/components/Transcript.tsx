@@ -42,7 +42,7 @@ import { DiffView, type DiffCommitState, type DiffSelectionPayload } from "./Dif
 import { FileIcon } from "./FileIcon";
 import { Tooltip } from "./Tooltip";
 import { splitAttachmentBlock } from "./conversationFormatting";
-import { stabilizeStreamingMarkdown } from "./streamStableMarkdown";
+import { repairStreamedTables, stabilizeStreamingMarkdown } from "./streamStableMarkdown";
 import {
   readTranscriptViewportState,
   writeTranscriptViewportState,
@@ -184,7 +184,7 @@ const MarkdownBody = memo(function MarkdownBody({
   /** When true, also hold thematic-break candidates until the stream settles. */
   streaming?: boolean;
 }) {
-  const source = stabilizeStreamingMarkdown(body, streaming);
+  const source = stabilizeStreamingMarkdown(repairStreamedTables(body), streaming);
   return (
     <ReactMarkdown remarkPlugins={MARKDOWN_REMARK_PLUGINS} components={MARKDOWN_COMPONENTS}>
       {source}

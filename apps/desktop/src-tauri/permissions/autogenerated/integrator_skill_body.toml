@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-integrator-skill-body"
+description = "Enables the integrator_skill_body command without any pre-configured scope."
+commands.allow = ["integrator_skill_body"]
+
+[[permission]]
+identifier = "deny-integrator-skill-body"
+description = "Denies the integrator_skill_body command without any pre-configured scope."
+commands.deny = ["integrator_skill_body"]

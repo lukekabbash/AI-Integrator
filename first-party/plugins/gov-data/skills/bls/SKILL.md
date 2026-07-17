@@ -8,17 +8,21 @@ description: Fetch US labor statistics from the Bureau of Labor Statistics API â
 ## Requirements
 
 Works without a key for small volumes (v2 API allows limited daily queries
-unregistered; a free registration key raises the cap to 500/day). If
-`BLS_API_KEY` is set, include it in the payload as `registrationkey`.
+unregistered; a free registration key raises the cap to 500/day). Users can
+save that optional key in AI Integrator Settings. Call `skill_data_request`
+on the `integrator` MCP server with provider `bls`; it adds
+`registrationkey` without exposing the secret.
 
 ## Core endpoint
 
 POST `https://api.bls.gov/publicAPI/v2/timeseries/data/` with JSON body:
 
 ```json
-{"seriesid": ["CUUR0000SA0", "LNS14000000"],
- "startyear": "2020", "endyear": "2026",
- "registrationkey": "..."}
+{
+  "seriesid": ["CUUR0000SA0", "LNS14000000"],
+  "startyear": "2020",
+  "endyear": "2026"
+}
 ```
 
 Up to 50 series per request (25 unregistered), 20-year range max per call.

@@ -7,8 +7,10 @@ description: Fetch US energy data from the EIA API — electricity generation an
 
 ## Requirements
 
-A free key from https://www.eia.gov/opendata/register.php set as
-`EIA_API_KEY`. Required for all requests.
+A free key from https://www.eia.gov/opendata/register.php saved in AI
+Integrator Settings. Required for all requests. Call `skill_data_request` on
+the `integrator` MCP server with provider `eia`; never ask for, print, or
+inspect the key.
 
 ## Core pattern (APIv2)
 
@@ -17,7 +19,7 @@ Base: `https://api.eia.gov/v2/`
 Data requests take the form:
 
 ```
-https://api.eia.gov/v2/{route}/data/?api_key=$EIA_API_KEY&frequency=monthly&data[0]=value&facets[...]=...&start=2020-01&sort[0][column]=period&sort[0][direction]=desc
+https://api.eia.gov/v2/{route}/data/?frequency=monthly&data[0]=value&facets[...]=...&start=2020-01&sort[0][column]=period&sort[0][direction]=desc
 ```
 
 Discover routes by walking the tree: a GET on any non-`/data` route returns

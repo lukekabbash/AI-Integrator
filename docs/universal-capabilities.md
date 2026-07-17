@@ -132,6 +132,35 @@ transcript record.
 | Antigravity | **shipped**: per-turn overlay bundles granted via `--add-dir` (sandbox-readable) + prompt-index pointing at the overlay copies; explicit `/name` injects the bounded body. | **B+** |
 | ACP (Cursor, Grok, future) | **shipped: prompt-index** on each plain turn (name + description + absolute path per skill) with the instruction to read the SKILL.md on match; explicit `/name` invocation injects the resolved body into that turn's wire prompt. The persisted transcript keeps the typed `/name` and records `native_skill`. | **B (index) / A- (explicit invoke)** |
 
+MCP projection uses the same canonical enabled set with transport-specific
+encoding:
+
+| Runtime | MCP projection |
+| --- | --- |
+| Claude | Per-turn private `--mcp-config`, merged with the Integrator broker config. |
+| Codex | Task-scoped `thread/start` config under `mcp_servers`; no global Codex config write. |
+| Antigravity | Private `.agents/mcp_config.json` inside the existing `--add-dir` control overlay; no repository or global Gemini config write. |
+| ACP (Cursor, Grok, future) | `mcpServers` on `session/new`, `session/load`, or `session/resume`; stdio is mandatory and remote HTTP is sent only when the agent advertises `mcpCapabilities.http`. |
+
+Changing MCP enablement, server files, or keychain-backed credentials advances
+a local MCP revision. Older provider resume handles become stale, while their
+transcript, provider-session history, permission, and routing metadata remain
+intact; the next send starts a fresh provider session with the new MCP set.
+
+Every provider session also receives one bounded, capability-aware AI
+Integrator harness policy through the strongest durable instruction surface
+that runtime exposes: Codex `developerInstructions`, Claude
+`--append-system-prompt`, Grok `--rules`, an Antigravity private-overlay rule,
+or the always-present Integrator MCP tool schema for Cursor ACP. The policy does
+not ride as user text, repeat in conversation history, or accumulate across
+turns. It tells the model to use only tools actually exposed in that session,
+call projected Integrator MCP tools directly, and never reconstruct the broker
+through shell commands, process inspection, environment-variable discovery,
+or credential handling. Runtimes without the local broker are told that
+`skill_data_request` and delegation are unavailable. The harness policy is
+capped below 1.6 KiB (roughly 400 tokens); existing user/project Codex developer
+instructions remain ahead of it in the same developer layer.
+
 Degradation is honest: when projection is unavailable, the setting UI states
 "the underlying CLI may still discover its own skills" (QOL 114 fallback
 language). `ProviderCapabilities.skills` gating in `providers.rs` remains the
@@ -246,23 +275,19 @@ waived):
 
 All first-party plugins live in-repo under `first-party/plugins/` (bundled
 into the app as read-only `Bundled` source; also published to the public
-catalog repo). Authored runtime-neutral: no Claude-specific tool names in
-bodies; scripts are plain Python/bash with stdlib + `requests`-free `urllib`
-where possible; every skill states its own API-key needs and never asks
-Integrator to store credentials (settings validator forbids it — keys go in
-the user's environment).
+catalog repo). Authored runtime-neutral: no vendor-runtime-specific tool names
+in bodies. Bundled data skills may use Integrator's narrow
+`skill_data_request` tool; API keys are saved explicitly in Settings, remain
+in the operating system credential store, and never enter prompts, renderer
+state, environment variables, or command arguments.
 
 | Plugin | Skills | Notes |
 | --- | --- | --- |
 | `integrator-authoring` | `skill-creator` (enabled by default), `plugin-packager` | Interviews, writes into `Documents/AI Integrator/Skills/`, validates frontmatter against the spec. The one skill on by default. |
-| `gov-data` | `fred`, `bls`, `census`, `eia`, `sec-edgar` | Flagship, genuinely differentiated. Free/public APIs; FRED+EIA+Census need free registered keys (env vars), BLS anonymous ≤ some daily cap — bodies state limits honestly. |
-| `market-data` | `market-data` | Stooq CSV (keyless) primary, Alpha Vantage free tier optional. **Not yfinance** — unsupported scraper, ToS-fragile; the body says why and offers it only as explicit-user-choice last resort. |
-| `ai-provider-docs` | `openai-docs`, `gemini-docs`, `xai-docs`, `ai-gateway-docs`, `openrouter-docs` | Each anchored to the provider's verified llms.txt (§7 doc packs) where one exists; Gemini is link-only. Claude API docs are covered by cataloging Anthropic's official `claude-api` skill (Apache-2.0) rather than authoring a duplicate — also sidesteps the spec rule that skill names may not contain "claude"/"anthropic". |
-| `vercel` | `vercel-docs` | Deploy/config/edge patterns, llms.txt endpoints, CLI cheatsheet. |
+| `gov-data` | `fred`, `bls`, `census`, `eia`, `sec-edgar` | Flagship, genuinely differentiated. Free/public APIs; FRED, Census, and EIA require free registered keys saved in Settings. BLS can run keyless within its lower provider limits. |
+| `market-data` | `alpha-vantage`, `stooq`, `yfinance` | Provider-specific boundaries: Alpha Vantage uses the credential-safe data tool; Stooq is keyless historical CSV; yfinance is an available convenience path but is not bundled or installed as a first-party dependency. Prefer Alpha Vantage or Stooq when equally suitable. |
+| `ai-provider-docs` | `gemini-docs`, `xai-docs`, `ai-gateway-docs`, `openrouter-docs` | Each anchored to the provider's verified llms.txt (§7 doc packs) where one exists; Gemini is link-only. OpenAI and Claude API guidance comes from the vendors' official installable catalogs rather than bundled duplicates. |
 | `firebase` | `firebase-docs` | Auth/Firestore/Functions/Hosting patterns + emulator workflows. |
-| `cloudflare` | `cloudflare-docs` | Workers/Pages/R2/D1/KV patterns, wrangler cheatsheet. |
-| `stripe` | `stripe-docs` | Payment-intent flows, webhook verification, test-mode patterns. |
-| `supabase` | `supabase-docs` | Postgres/RLS/auth/realtime patterns. |
 | `tauri` | `tauri-docs` | Dogfood: v2 capabilities/permissions, IPC, updater, signing. |
 | `release-craft` | `changelog-writer`, `release-notes` | From git history to conventional changelog/notes. |
 
@@ -329,6 +354,9 @@ SKILL.md edit (turn must complete on the old overlay).
   (non-destructive; hash-dedup hides the shadowed copy).
 - Store is a static signed catalog, not a service. No accounts, no billing
   category (design-system contract L30).
-- yfinance rejected as a first-party dependency (unsupported scraper).
+- yfinance rejected as a first-party dependency (unsupported scraper). Its
+  provider-specific skill may be selected when it is the practical fit, while
+  preferring Alpha Vantage or Stooq when equally suitable; it never grants
+  install or network authority.
 - Identity = `(name, content_hash)`; handles stay ephemeral; settings store
   JSON maps, not per-skill keys.

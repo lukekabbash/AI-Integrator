@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { LazyMotion, domAnimation } from "motion/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bridge, type RuntimeConnection } from "../bridge";
@@ -19,6 +19,20 @@ const repository = "fixture-repository";
 
 beforeEach(() => {
   document.documentElement.dataset.motion = "none";
+  const values = new Map<string, string>();
+  Object.defineProperty(window, "localStorage", {
+    configurable: true,
+    value: {
+      get length() {
+        return values.size;
+      },
+      clear: () => values.clear(),
+      getItem: (key: string) => values.get(key) ?? null,
+      key: (index: number) => [...values.keys()][index] ?? null,
+      removeItem: (key: string) => values.delete(key),
+      setItem: (key: string, value: string) => values.set(key, value),
+    } satisfies Storage,
+  });
 });
 
 afterEach(() => {
@@ -28,6 +42,134 @@ afterEach(() => {
 });
 
 describe("Composer provider-native actions", () => {
+  it("never sends a process-stale cached action handle", async () => {
+    const cacheKey = `codex\u0000${repository}`;
+    window.localStorage.setItem(
+      "aiintegrator.native-actions.v1",
+      JSON.stringify({
+        [cacheKey]: [
+          {
+            id: "stale-skill",
+            name: "skill-creator",
+            description: "Create a Codex skill",
+            source: "system",
+            kind: "skill",
+            invocation: "direct",
+          },
+        ],
+      }),
+    );
+    let resolveActions:
+      ((actions: Awaited<ReturnType<typeof bridge.listNativeProviderActions>>) => void) | undefined;
+    vi.spyOn(bridge, "listNativeProviderActions").mockReturnValue(
+      new Promise((resolve) => {
+        resolveActions = resolve;
+      }),
+    );
+    const onSend = vi.fn().mockResolvedValue(true);
+    render(
+      <LazyMotion features={domAnimation} strict>
+        <Composer
+          runtimes={[codex]}
+          defaultRuntime="codex"
+          defaultModel="Provider default"
+          workingDirectory={repository}
+          onSend={onSend}
+        />
+      </LazyMotion>,
+    );
+
+    const textbox = screen.getByRole("textbox", { name: "Task message" });
+    fireEvent.change(textbox, {
+      target: { value: "/skill-creator", selectionStart: 14 },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    expect(onSend).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveActions?.([
+        {
+          id: "fresh-skill",
+          name: "skill-creator",
+          description: "Create a Codex skill",
+          source: "system",
+          kind: "skill",
+          invocation: "direct",
+        },
+      ]);
+    });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "choose it again from the refreshed slash menu",
+    );
+    expect(textbox).toHaveValue("/skill-creator");
+    expect(onSend).not.toHaveBeenCalled();
+
+    fireEvent.change(textbox, { target: { value: "/", selectionStart: 1 } });
+    fireEvent.click(await screen.findByRole("option", { name: /skill-creator/ }));
+    fireEvent.change(textbox, {
+      target: { value: "/skill-creator update the skill", selectionStart: 31 },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(onSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          nativeActionId: "fresh-skill",
+        }),
+      ),
+    );
+    expect(onSend).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends Codex goal through its process-stable built-in route", async () => {
+    const cacheKey = `codex\u0000${repository}`;
+    window.localStorage.setItem(
+      "aiintegrator.native-actions.v1",
+      JSON.stringify({
+        [cacheKey]: [
+          {
+            id: "stale-goal",
+            name: "goal",
+            description: "Keep working until done",
+            source: "built-in",
+            kind: "command",
+            invocation: "direct",
+          },
+        ],
+      }),
+    );
+    vi.spyOn(bridge, "listNativeProviderActions").mockReturnValue(new Promise(() => undefined));
+    const onSend = vi.fn().mockResolvedValue(true);
+    render(
+      <LazyMotion features={domAnimation} strict>
+        <Composer
+          runtimes={[codex]}
+          defaultRuntime="codex"
+          defaultModel="Provider default"
+          workingDirectory={repository}
+          onSend={onSend}
+        />
+      </LazyMotion>,
+    );
+
+    const textbox = screen.getByRole("textbox", { name: "Task message" });
+    fireEvent.change(textbox, {
+      target: { value: "/goal finish the release", selectionStart: 24 },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(onSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          prompt: "/goal finish the release",
+          nativeActionId: "builtin:codex:goal:v1",
+          nativeAction: { name: "goal", kind: "command" },
+        }),
+      ),
+    );
+  });
+
   it("prefetches and retains the provider catalog while sending the opaque selection", async () => {
     const listActions = vi.spyOn(bridge, "listNativeProviderActions").mockResolvedValue([
       {
@@ -106,6 +248,7 @@ describe("Composer provider-native actions", () => {
       target: { value: "/skill-creator typed directly", selectionStart: 29 },
     });
     expect(document.querySelector('[data-native-skill="skill-creator"]')).toBeInTheDocument();
+    expect(onSend).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2));
     expect(onSend).toHaveBeenLastCalledWith(

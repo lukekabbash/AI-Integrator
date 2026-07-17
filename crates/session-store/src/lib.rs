@@ -722,6 +722,28 @@ const MIGRATIONS: &[(i64, &str)] = &[
             WHERE native_skill IS NOT NULL;
         "#,
     ),
+    (
+        19,
+        r#"
+        DELETE FROM codex_items
+        WHERE item_id GLOB 'item-[0-9]*'
+          AND substr(item_id, 6) NOT GLOB '*[^0-9]*'
+          AND kind IN ('user_message', 'agent_message')
+          AND EXISTS (
+              SELECT 1
+              FROM codex_items AS original
+              WHERE original.provider_session_id = codex_items.provider_session_id
+                AND original.turn_id = codex_items.turn_id
+                AND original.kind = codex_items.kind
+                AND original.item_id NOT GLOB 'item-[0-9]*'
+                AND original.first_event_seq < codex_items.first_event_seq
+                AND (
+                    codex_items.kind = 'user_message'
+                    OR COALESCE(original.body, '') = COALESCE(codex_items.body, '')
+                )
+          );
+        "#,
+    ),
 ];
 
 pub struct LocalStore {
@@ -885,12 +907,13 @@ impl LocalStore {
     }
 
     /// Verified skill invocations are persisted on the provider-backed user
-    /// item itself, so retries and snapshot updates cannot inflate the count.
+    /// item itself. Distinct stable ids keep retries, snapshot updates, and
+    /// copied fork history from inflating the count.
     pub fn skill_invocation_counts(&self) -> Result<BTreeMap<String, u64>> {
         let connection = self.connection.lock();
         let mut statement = connection
             .prepare(
-                "SELECT native_skill, COUNT(*) FROM codex_items \
+                "SELECT native_skill, COUNT(DISTINCT stable_id) FROM codex_items \
                  WHERE native_skill IS NOT NULL GROUP BY native_skill",
             )
             .map_err(storage_error)?;
@@ -2993,7 +3016,7 @@ mod tests {
     }
 
     #[test]
-    fn fork_is_refused_mid_turn_and_for_an_unknown_branch_point() {
+    fn fork_while_running_excludes_the_live_turn_and_keeps_earlier_branching_available() {
         let store = LocalStore::open_in_memory().expect("open store");
         let source = fork_source(&store);
         seed_conversation(&store, source.id);
@@ -3035,17 +3058,115 @@ mod tests {
             )
             .expect("start a turn");
 
+        for (provider_item_id, kind, status, body) in [
+            (
+                "live-user",
+                ItemKind::UserMessage,
+                ItemStatus::Completed,
+                "unfinished request",
+            ),
+            (
+                "live-assistant",
+                ItemKind::AgentMessage,
+                ItemStatus::InProgress,
+                "partial reply",
+            ),
+        ] {
+            store
+                .apply_reduced_event(
+                    &binding,
+                    &ReducedProviderEvent {
+                        method: "item/updated".into(),
+                        thread_id: "fork-thread".into(),
+                        turn_id: Some("turn-2".into()),
+                        audit_json: "{}".into(),
+                        audit_truncated: false,
+                        mutation: ProjectionMutation::ReplaceItem(ItemProjection {
+                            id: format!("codex:fork-thread:turn-2:{provider_item_id}"),
+                            provider_item_id: provider_item_id.into(),
+                            kind,
+                            status,
+                            title: None,
+                            body: Some(body.into()),
+                            native_skill: None,
+                            phase: None,
+                            command: None,
+                            cwd: None,
+                            output: None,
+                            exit_code: None,
+                            file_changes: None,
+                            mcp_server: None,
+                            mcp_tool: None,
+                            tool_input: None,
+                            truncated: false,
+                            updated_at: Utc::now(),
+                        }),
+                        occurred_at: Utc::now(),
+                    },
+                )
+                .expect("append live item");
+        }
+
+        let copy = store
+            .fork_task(source.id, None, "Port the parser: Copy 1".into())
+            .expect("copy settled history while source runs");
+        assert_eq!(
+            item_bodies(&store, copy.id),
+            vec![
+                "port the parser to the new lexer",
+                "here is the port",
+                "now delete the old lexer",
+                "deleted",
+            ]
+        );
+        assert_eq!(
+            item_bodies(&store, source.id),
+            vec![
+                "port the parser to the new lexer",
+                "here is the port",
+                "now delete the old lexer",
+                "deleted",
+                "unfinished request",
+                "partial reply",
+            ]
+        );
+        assert!(
+            store
+                .task_has_unfinished_turn(source.id)
+                .expect("source turn remains live")
+        );
+        assert!(
+            !store
+                .task_has_unfinished_turn(copy.id)
+                .expect("copy contains settled history only")
+        );
+
+        let branch = store
+            .fork_task(
+                source.id,
+                Some("codex:fork-thread:turn-1:item-1"),
+                "Port the parser: Branch 1".into(),
+            )
+            .expect("branch above the live turn");
+        assert_eq!(
+            item_bodies(&store, branch.id),
+            vec!["port the parser to the new lexer", "here is the port"]
+        );
+
         assert!(matches!(
-            store.fork_task(source.id, None, "Port the parser: Copy 1".into()),
+            store.fork_task(
+                source.id,
+                Some("codex:fork-thread:turn-2:live-assistant"),
+                "x".into()
+            ),
             Err(IntegratorError::InvalidInput(_))
         ));
-        // The refusal must not leave a half-built task behind.
         assert!(
             !store
                 .list_tasks()
                 .expect("list tasks")
                 .iter()
-                .any(|task| task.title == "Port the parser: Copy 1")
+                .any(|task| task.title == "x")
         );
     }
 
@@ -3425,6 +3546,172 @@ mod tests {
         let path = directory.path().join("integrator.sqlite3");
         LocalStore::open(&path).expect("first open");
         LocalStore::open(&path).expect("second open");
+    }
+
+    #[test]
+    fn resume_replay_migration_removes_only_shadow_message_rows() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("resume-replay.sqlite3");
+        let task_id = TaskId::new();
+        let provider_session_id = ProviderSessionId::new();
+        let now = Utc::now();
+        {
+            let mut connection = Connection::open(&path).expect("open v18 fixture");
+            LocalStore::configure(&connection).expect("configure v18 fixture");
+            connection
+                .execute(
+                    "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+                    [],
+                )
+                .expect("create migration ledger");
+            for (version, sql) in MIGRATIONS.iter().filter(|(version, _)| *version < 19) {
+                let transaction = connection.transaction().expect("migration transaction");
+                transaction
+                    .execute_batch(sql)
+                    .expect("apply pre-repair migration");
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migrations(version,applied_at) VALUES (?1,?2)",
+                        params![version, now.to_rfc3339()],
+                    )
+                    .expect("record migration");
+                transaction.commit().expect("commit migration");
+            }
+            connection.execute(
+                "INSERT INTO tasks(id,title,state,created_at,updated_at) VALUES (?1,'Replay fixture','ready',?2,?2)",
+                params![task_id.to_string(), now.to_rfc3339()],
+            ).expect("insert task");
+            connection.execute(
+                "INSERT INTO provider_sessions(id,task_id,provider,provider_thread_id,created_at,updated_at) VALUES (?1,?2,'codex','thread-1',?3,?3)",
+                params![provider_session_id.to_string(), task_id.to_string(), now.to_rfc3339()],
+            ).expect("insert provider session");
+
+            let rows = [
+                (
+                    "turn-1",
+                    "user-live",
+                    "stable-user-live",
+                    "user_message",
+                    "completed",
+                    "visible question",
+                    10_i64,
+                ),
+                (
+                    "turn-1",
+                    "assistant-live",
+                    "stable-assistant-live",
+                    "agent_message",
+                    "completed",
+                    "visible answer",
+                    11,
+                ),
+                (
+                    "turn-1",
+                    "item-1",
+                    "stable-replayed-user",
+                    "user_message",
+                    "in_progress",
+                    "<integrator-skills>private</integrator-skills>\n\nvisible question",
+                    20,
+                ),
+                (
+                    "turn-1",
+                    "item-2",
+                    "stable-replayed-assistant",
+                    "agent_message",
+                    "in_progress",
+                    "visible answer",
+                    21,
+                ),
+                (
+                    "turn-1",
+                    "item-3",
+                    "stable-distinct-assistant",
+                    "agent_message",
+                    "completed",
+                    "a distinct snapshot-only answer",
+                    22,
+                ),
+                (
+                    "turn-2",
+                    "item-1",
+                    "stable-snapshot-only-user",
+                    "user_message",
+                    "completed",
+                    "snapshot-only question",
+                    30,
+                ),
+            ];
+            for (turn_id, item_id, stable_id, kind, status, body, seq) in rows {
+                let projection = ItemProjection {
+                    id: stable_id.into(),
+                    provider_item_id: item_id.into(),
+                    kind: match kind {
+                        "user_message" => ItemKind::UserMessage,
+                        _ => ItemKind::AgentMessage,
+                    },
+                    status: match status {
+                        "completed" => ItemStatus::Completed,
+                        _ => ItemStatus::InProgress,
+                    },
+                    title: None,
+                    body: Some(body.into()),
+                    native_skill: None,
+                    phase: None,
+                    command: None,
+                    cwd: None,
+                    output: None,
+                    exit_code: None,
+                    file_changes: None,
+                    mcp_server: None,
+                    mcp_tool: None,
+                    tool_input: None,
+                    truncated: false,
+                    updated_at: now,
+                };
+                connection.execute(
+                    "INSERT INTO codex_items(provider_session_id,task_id,thread_id,turn_id,item_id,stable_id,kind,status,body,updated_at,projection_json,last_event_seq,first_event_seq,first_occurred_at)
+                     VALUES (?1,?2,'thread-1',?3,?4,?5,?6,?7,?8,?9,?10,?11,?11,?9)",
+                    params![
+                        provider_session_id.to_string(),
+                        task_id.to_string(),
+                        turn_id,
+                        item_id,
+                        stable_id,
+                        kind,
+                        status,
+                        body,
+                        now.to_rfc3339(),
+                        serde_json::to_string(&projection).expect("serialize projection"),
+                        seq,
+                    ],
+                ).expect("insert item");
+            }
+        }
+
+        let store = LocalStore::open(&path).expect("apply replay repair");
+        let connection = store.connection.lock();
+        let remaining = connection
+            .prepare(
+                "SELECT turn_id,item_id FROM codex_items
+                 WHERE provider_session_id=?1 ORDER BY first_event_seq",
+            )
+            .expect("prepare remaining items")
+            .query_map([provider_session_id.to_string()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query remaining items")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect remaining items");
+        assert_eq!(
+            remaining,
+            vec![
+                ("turn-1".into(), "user-live".into()),
+                ("turn-1".into(), "assistant-live".into()),
+                ("turn-1".into(), "item-3".into()),
+                ("turn-2".into(), "item-1".into()),
+            ]
+        );
     }
 
     #[test]

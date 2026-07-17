@@ -119,6 +119,37 @@ impl LocalStore {
             .map_err(storage_error)
     }
 
+    /// Materialized items for one provider turn in their original display
+    /// order. Codex thread snapshots can replace live item ids with temporary
+    /// `item-N` ids; reconciliation uses these rows to preserve the durable
+    /// identity and visible user text already owned by the local projection.
+    pub fn provider_turn_items(
+        &self,
+        provider_session_id: ProviderSessionId,
+        turn_id: &str,
+    ) -> Result<Vec<ItemProjection>> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT projection_json FROM codex_items
+                 WHERE provider_session_id = ?1 AND turn_id = ?2
+                 ORDER BY CASE WHEN first_event_seq = 0 THEN last_event_seq ELSE first_event_seq END,
+                          last_event_seq,
+                          item_id",
+            )
+            .map_err(storage_error)?;
+        statement
+            .query_map(params![provider_session_id.to_string(), turn_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(storage_error)?
+            .map(|row| {
+                let json = row.map_err(storage_error)?;
+                serde_json::from_str(&json).map_err(Into::into)
+            })
+            .collect()
+    }
+
     pub fn create_runtime_binding(
         &self,
         task_id: TaskId,
@@ -555,8 +586,9 @@ impl LocalStore {
     }
 
     /// Copies a task's persisted conversation into a new task, keeping every
-    /// item up to and including `through_stable_id`, or all of them when it is
-    /// `None`. Returns the new task.
+    /// settled item up to and including `through_stable_id`, or every settled
+    /// turn when it is `None`. An unfinished source turn stays exclusively in
+    /// the source task. Returns the new task.
     ///
     /// The fork deliberately gets no `provider_resume_states` row. Resuming
     /// makes the provider reload its own transcript and ignore this store
@@ -590,37 +622,36 @@ impl LocalStore {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction().map_err(storage_error)?;
 
-        // A half-written turn would be copied mid-flight and then never
-        // settle, because the runtime that owns it belongs to the source.
-        let in_flight = transaction
-            .query_row(
-                "SELECT COUNT(*) FROM codex_turns WHERE task_id = ?1 AND status IN (?2, ?3)",
-                params![
-                    task_id.to_string(),
-                    TurnStatus::Pending.as_str(),
-                    TurnStatus::InProgress.as_str()
-                ],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(storage_error)?;
-        if in_flight > 0 {
-            return Err(IntegratorError::InvalidInput(
-                "cannot copy a chat while it is still running".into(),
-            ));
-        }
-
         let cutoff = match through_stable_id {
-            Some(stable_id) => transaction
-                .query_row(
-                    "SELECT last_event_seq FROM codex_items WHERE task_id = ?1 AND stable_id = ?2 ORDER BY last_event_seq DESC LIMIT 1",
-                    params![task_id.to_string(), stable_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
-                .map_err(storage_error)?
-                .ok_or_else(|| {
-                    IntegratorError::NotFound(format!("transcript item {stable_id}"))
-                })?,
+            Some(stable_id) => {
+                let (cutoff, turn_status) = transaction
+                    .query_row(
+                        "SELECT item.last_event_seq, turn.status
+                         FROM codex_items item
+                         LEFT JOIN codex_turns turn
+                           ON turn.provider_session_id = item.provider_session_id
+                          AND turn.turn_id = item.turn_id
+                         WHERE item.task_id = ?1 AND item.stable_id = ?2
+                         ORDER BY item.last_event_seq DESC
+                         LIMIT 1",
+                        params![task_id.to_string(), stable_id],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+                    )
+                    .optional()
+                    .map_err(storage_error)?
+                    .ok_or_else(|| {
+                        IntegratorError::NotFound(format!("transcript item {stable_id}"))
+                    })?;
+                if turn_status.as_deref().is_some_and(|status| {
+                    status == TurnStatus::Pending.as_str()
+                        || status == TurnStatus::InProgress.as_str()
+                }) {
+                    return Err(IntegratorError::InvalidInput(
+                        "cannot branch from a response while it is still running".into(),
+                    ));
+                }
+                cutoff
+            }
             None => i64::MAX,
         };
 
@@ -680,8 +711,18 @@ impl LocalStore {
                     "INSERT INTO codex_turns(provider_session_id, task_id, thread_id, turn_id, status, stop_requested, error, started_at, completed_at, projection_json, last_event_seq, first_event_seq, first_occurred_at, snapshot_event_json)
                      SELECT ?1, ?2, thread_id, turn_id, status, 0, error, started_at, completed_at, projection_json, last_event_seq, first_event_seq, first_occurred_at,
                             json_set(snapshot_event_json, '$.taskId', ?2, '$.providerSessionId', ?1)
-                     FROM codex_turns WHERE provider_session_id = ?3 AND last_event_seq <= ?4",
-                    params![new_session_id, fork.id.to_string(), old_session_id, cutoff],
+                     FROM codex_turns
+                     WHERE provider_session_id = ?3
+                       AND last_event_seq <= ?4
+                       AND status NOT IN (?5, ?6)",
+                    params![
+                        new_session_id,
+                        fork.id.to_string(),
+                        old_session_id,
+                        cutoff,
+                        TurnStatus::Pending.as_str(),
+                        TurnStatus::InProgress.as_str()
+                    ],
                 )
                 .map_err(storage_error)?;
             transaction
@@ -690,8 +731,24 @@ impl LocalStore {
                      SELECT ?1, ?2, thread_id, turn_id, item_id, stable_id, kind, status, title, body, command_text, cwd, output, exit_code, file_changes_json, mcp_server, mcp_tool, truncated, updated_at, projection_json, last_event_seq, first_event_seq, first_occurred_at,
                             json_set(snapshot_event_json, '$.taskId', ?2, '$.providerSessionId', ?1)
                             , native_skill
-                     FROM codex_items WHERE provider_session_id = ?3 AND last_event_seq <= ?4",
-                    params![new_session_id, fork.id.to_string(), old_session_id, cutoff],
+                     FROM codex_items item
+                     WHERE item.provider_session_id = ?3
+                       AND item.last_event_seq <= ?4
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM codex_turns turn
+                           WHERE turn.provider_session_id = item.provider_session_id
+                             AND turn.turn_id = item.turn_id
+                             AND turn.status IN (?5, ?6)
+                       )",
+                    params![
+                        new_session_id,
+                        fork.id.to_string(),
+                        old_session_id,
+                        cutoff,
+                        TurnStatus::Pending.as_str(),
+                        TurnStatus::InProgress.as_str()
+                    ],
                 )
                 .map_err(storage_error)?;
             session_map.insert(old_session_id.clone(), new_session_id);
@@ -953,9 +1010,8 @@ impl LocalStore {
                 .map_err(storage_error)?;
             let mut task_ids = Vec::new();
             for row in rows {
-                task_ids.push(
-                    TaskId::from_str(&row.map_err(storage_error)?).map_err(invalid_stored)?,
-                );
+                task_ids
+                    .push(TaskId::from_str(&row.map_err(storage_error)?).map_err(invalid_stored)?);
             }
             task_ids
         };
@@ -2671,6 +2727,25 @@ mod tests {
         }
     }
 
+    fn append_command_output(provider_item_id: &str, delta: &str) -> ReducedProviderEvent {
+        let occurred_at = Utc::now();
+        ReducedProviderEvent {
+            method: "item/commandExecution/outputDelta".into(),
+            thread_id: "thread-fixture".into(),
+            turn_id: Some("turn-command".into()),
+            audit_json: "{}".into(),
+            audit_truncated: false,
+            mutation: ProjectionMutation::AppendItem {
+                provider_item_id: provider_item_id.into(),
+                item_kind: ItemKind::CommandExecution,
+                field: ItemTextField::Output,
+                delta: delta.into(),
+                updated_at: occurred_at,
+            },
+            occurred_at,
+        }
+    }
+
     fn persist_reset(
         store: &LocalStore,
         binding: &RuntimeBinding,
@@ -2993,13 +3068,27 @@ mod tests {
         assert_eq!(snapshot.watermark_seq, other.seq);
         let hydrate = snapshot.hydrate.expect("hydrate");
         assert_eq!(hydrate.items.len(), 2);
-        assert_eq!(hydrate.items[0].body.as_deref(), Some("helloworld"));
+        assert_eq!(hydrate.items[0].body.as_deref(), Some("hello world"));
         assert_eq!(
             hydrate.first_seen.get(&hydrate.items[0].id),
             Some(&occurred_at)
         );
         assert_eq!(hydrate.before_seq, Some(latest.seq));
         assert!(!hydrate.has_more_older);
+    }
+
+    #[test]
+    fn streamed_command_output_preserves_model_visible_json() {
+        let (store, binding) = bound_store(ProviderKind::Codex);
+        let output = r#"{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"integrator-local-tools","version":"0.1.0"}}}"#;
+        store
+            .apply_reduced_event(&binding, &append_command_output("command-1", output))
+            .expect("persist command output");
+
+        let snapshot = store.task_snapshot(binding.task_id).expect("load snapshot");
+        let hydrate = snapshot.hydrate.expect("hydrate");
+        assert_eq!(hydrate.items.len(), 1);
+        assert_eq!(hydrate.items[0].output.as_deref(), Some(output));
     }
 
     #[test]
@@ -3198,7 +3287,7 @@ mod tests {
         assert_eq!(snapshot.reset_seq, reset.seq);
         let hydrate = snapshot.hydrate.expect("hydrate");
         assert_eq!(hydrate.items.len(), 1);
-        assert_eq!(hydrate.items[0].body.as_deref(), Some("after reset"));
+        assert_eq!(hydrate.items[0].body.as_deref(), Some(" after reset"));
         assert_eq!(
             hydrate.first_seen.get(&hydrate.items[0].id),
             Some(&after_at)

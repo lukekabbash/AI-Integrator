@@ -491,7 +491,7 @@ describe("TaskSidebar", () => {
 
   it("copies a chat from the overflow menu and closes it", () => {
     const snapshot = createDemoSnapshot();
-    const task = { ...snapshot.tasks[0], status: "ready" as const };
+    const task = { ...snapshot.tasks[0], status: "completed" as const };
     const { callbacks } = setup({ tasks: [task], activeTaskId: task.id });
     fireEvent.click(screen.getByRole("button", { name: "More chat actions" }));
 
@@ -501,16 +501,17 @@ describe("TaskSidebar", () => {
     expect(screen.queryByRole("menu")).toBeNull();
   });
 
-  it("refuses to copy a chat that is still running", () => {
+  it("copies settled history from a chat that is still running", () => {
     const snapshot = createDemoSnapshot();
     const task = { ...snapshot.tasks[0], status: "running" as const };
     const { callbacks } = setup({ tasks: [task], activeTaskId: task.id });
     fireEvent.click(screen.getByRole("button", { name: "More chat actions" }));
 
     const copy = within(screen.getByRole("menu")).getByRole("menuitem", { name: /Copy/ });
-    expect(copy).toBeDisabled();
+    expect(copy).toBeEnabled();
     fireEvent.click(copy);
-    expect(callbacks.onCopyTask).not.toHaveBeenCalled();
+    expect(callbacks.onCopyTask).toHaveBeenCalledWith(task.id);
+    expect(screen.queryByRole("menu")).toBeNull();
   });
 
   it("clips a fork's name rather than the marker that identifies it", () => {

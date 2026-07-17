@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
@@ -14,17 +15,19 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-use adapter_codex::{CodexEvent, CodexLaunchOptions, CodexSkillSelection, ServerRequestId};
+use adapter_codex::{
+    CodexEvent, CodexLaunchOptions, CodexSkillSelection, CodexThreadOverrides, ServerRequestId,
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use integrator_core::{
     ApprovalDecision, ApprovalKind, ApprovalProjection, ArchivedTaskPage, ComposerDraft,
-    ConnectionState, IntegratorError, LocalExport, ModeOption, ModeProjection, NewQueuedMessage,
-    NewTask, ProjectId, ProviderKind, ProviderResumeState, QueuedMessage, QueuedMessageId,
-    QueuedMessageState, RuntimeBinding, RuntimeProjection, RuntimeSession, Setting,
-    StopRequestResult, Task, TaskId, TaskSnapshot, TaskSnapshotQuery, TaskState,
-    TransportRequestId, TrustedProject, TurnStatus, Versioned,
+    ConnectionState, IntegratorError, ItemKind, ItemProjection, ItemStatus, LocalExport,
+    ModeOption, ModeProjection, NewQueuedMessage, NewTask, ProjectId, ProviderKind,
+    ProviderResumeState, QueuedMessage, QueuedMessageId, QueuedMessageState, RuntimeBinding,
+    RuntimeProjection, RuntimeSession, Setting, StopRequestResult, Task, TaskId, TaskSnapshot,
+    TaskSnapshotQuery, TaskState, TransportRequestId, TrustedProject, TurnStatus, Versioned,
 };
 use integrator_runtime::{
     CommitResult, CreateWorktree, DiffResult, DiffScope, FileStatus, GitOverview, GitRemote,
@@ -32,9 +35,9 @@ use integrator_runtime::{
     ProjectionMutation, ProviderEventInput, PullMode, PushConfirmation, PushPreview, PushResult,
     ReducedProviderEvent, RepositoryIdentity, StructuredCliEventKind, StructuredCliLaunchOptions,
     StructuredCliProvider, StructuredPermissionMode, StructuredUsage, WorktreeInfo, acp_mode_event,
-    acp_turn_projection, discover_providers, parse_acp_mode_state, provider_executable,
-    reduce_acp_permission_request, reduce_acp_plan_review_request, reduce_acp_update,
-    reduce_connection_event, reduce_provider_event,
+    acp_turn_projection, parse_acp_mode_state, provider_executable, reduce_acp_permission_request,
+    reduce_acp_plan_review_request, reduce_acp_update, reduce_connection_event,
+    reduce_provider_event,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -46,13 +49,15 @@ use tokio::time::{Duration, timeout};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest, http::header};
+use zeroize::Zeroizing;
 
+use crate::credential_store::{self, CredentialStorage};
 use crate::native_actions::{
     NativeActionHandle, NativeActionInvocation, NativeActionKind, NativeProviderAction,
     discover_file_actions, parse_acp_actions,
 };
 use crate::state::{
-    AcpPermissionOption, AcpRuntime, AcpSessionSpec, AppState, CodexRuntime,
+    AcpPermissionOption, AcpRuntime, AcpSessionSpec, AcpTurnSettlement, AppState, CodexRuntime,
     PendingStructuredPermission, PendingUserPrompt, StructuredResumeContext, StructuredRuntime,
     VoiceTypingCommand, VoiceTypingSession, remove_task_runtime, replace_task_runtime,
 };
@@ -175,11 +180,14 @@ pub fn open_task_window(app: AppHandle, task_id: TaskId) -> CommandResult<()> {
 }
 
 #[tauri::command]
-pub async fn provider_discover() -> CommandResult<Vec<integrator_core::ProviderStatus>> {
-    let statuses = tauri::async_runtime::spawn_blocking(discover_providers)
+pub async fn provider_discover(
+    state: State<'_, AppState>,
+    force: Option<bool>,
+) -> CommandResult<Vec<integrator_core::ProviderStatus>> {
+    state
+        .provider_statuses(force.unwrap_or(false))
         .await
-        .map_err(|_| worker_error())?;
-    Ok(statuses)
+        .map_err(Into::into)
 }
 
 #[derive(Clone, Debug)]
@@ -187,6 +195,8 @@ struct ResolvedNativeAction {
     public: NativeProviderAction,
     provider_path: Option<PathBuf>,
 }
+
+const CODEX_GOAL_ACTION_ID: &str = "builtin:codex:goal:v1";
 
 /// Returns the active provider's own skill/command inventory for one trusted
 /// repository. Discovery uses the provider protocol where one exists and a
@@ -211,7 +221,7 @@ pub async fn provider_action_list(
                     })
                     .collect()
             } else {
-                probe_acp_actions(&provider, &repository).await?
+                probe_acp_actions(&state, &provider, &repository).await?
             }
         }
         ProviderKind::Claude | ProviderKind::Antigravity => {
@@ -295,9 +305,10 @@ async fn codex_native_actions(
     let (client, ephemeral) = match existing {
         Some(client) => (client, false),
         None => {
-            let statuses = tauri::async_runtime::spawn_blocking(discover_providers)
+            let statuses = state
+                .provider_statuses(false)
                 .await
-                .map_err(|_| worker_error())?;
+                .map_err(CommandError::from)?;
             let executable =
                 provider_executable(&statuses, ProviderKind::Codex).ok_or_else(|| {
                     CommandError {
@@ -330,7 +341,7 @@ async fn codex_native_actions(
 fn codex_goal_action() -> ResolvedNativeAction {
     ResolvedNativeAction {
         public: NativeProviderAction {
-            id: String::new(),
+            id: CODEX_GOAL_ACTION_ID.into(),
             name: "goal".into(),
             description: "Keep working until a completion condition is met".into(),
             source: "built-in".into(),
@@ -417,19 +428,21 @@ async fn current_acp_actions(
 }
 
 async fn probe_acp_actions(
+    state: &State<'_, AppState>,
     provider: &ProviderKind,
     repository: &Path,
 ) -> CommandResult<Vec<ResolvedNativeAction>> {
-    let statuses = tauri::async_runtime::spawn_blocking(discover_providers)
+    let statuses = state
+        .provider_statuses(false)
         .await
-        .map_err(|_| worker_error())?;
+        .map_err(CommandError::from)?;
     let executable = provider_executable(&statuses, *provider).ok_or_else(|| CommandError {
         code: "provider-unavailable",
         message: format!("{} CLI is not installed", provider.as_str()),
     })?;
     let client = adapter_acp::AcpClient::spawn(adapter_acp::AcpLaunchOptions {
         executable,
-        arguments: acp_launch_arguments(provider)?,
+        arguments: acp_launch_arguments(provider, None)?,
         working_directory: Some(repository.to_path_buf()),
         client_version: env!("CARGO_PKG_VERSION").into(),
     })
@@ -532,6 +545,10 @@ fn reconcile_native_action_handles(
     handles.retain(|_, handle| handle.provider != provider || handle.repository != repository);
     let mut public_actions = Vec::new();
     for mut resolved in resolved.into_iter().take(512) {
+        if resolved.public.id == CODEX_GOAL_ACTION_ID {
+            public_actions.push(resolved.public);
+            continue;
+        }
         let handle = NativeActionHandle {
             provider,
             repository: repository.clone(),
@@ -559,6 +576,9 @@ fn resolve_native_action_handle(
     repository: &Path,
     action_id: &str,
 ) -> CommandResult<NativeActionHandle> {
+    if let Some(handle) = stateless_native_action_handle(provider, repository, action_id) {
+        return Ok(handle);
+    }
     let handle = state
         .native_action_handles
         .lock()
@@ -582,6 +602,24 @@ fn resolve_native_action_handle(
         });
     }
     Ok(handle)
+}
+
+fn stateless_native_action_handle(
+    provider: &ProviderKind,
+    repository: &Path,
+    action_id: &str,
+) -> Option<NativeActionHandle> {
+    (provider == &ProviderKind::Codex && action_id == CODEX_GOAL_ACTION_ID).then(|| {
+        NativeActionHandle {
+            provider: ProviderKind::Codex,
+            repository: repository.to_path_buf(),
+            name: "goal".into(),
+            source: "built-in".into(),
+            kind: NativeActionKind::Command,
+            invocation: NativeActionInvocation::Direct,
+            provider_path: None,
+        }
+    })
 }
 
 fn native_slash_prompt<'a>(prompt: &'a str, name: &str) -> CommandResult<&'a str> {
@@ -811,11 +849,11 @@ pub async fn task_update_metadata(
     .map_err(Into::into)
 }
 
-/// Copies a chat into a new one, keeping the transcript up to and including
-/// `through_event_id`, or all of it when that is absent. The new chat carries
-/// no provider resume state, so its first prompt starts a fresh provider
-/// session seeded from the copied transcript rather than resuming the source's
-/// thread.
+/// Copies a chat into a new one, keeping settled history up to and including
+/// `through_event_id`, or every settled turn when that is absent. Any live turn
+/// stays only in the source. The new chat carries no provider resume state, so
+/// its first prompt starts a fresh provider session seeded from the copied
+/// transcript rather than resuming the source's thread.
 #[tauri::command]
 pub async fn task_fork(
     state: State<'_, AppState>,
@@ -919,10 +957,16 @@ pub async fn setting_set(
     value: Value,
 ) -> CommandResult<Setting> {
     let store = Arc::clone(&state.store);
-    tauri::async_runtime::spawn_blocking(move || store.set_setting(&key, value))
-        .await
-        .map_err(|_| worker_error())?
-        .map_err(Into::into)
+    tauri::async_runtime::spawn_blocking(move || {
+        let setting = store.set_setting(&key, value)?;
+        if key == crate::integrator_mcp::ENABLED_SETTING_KEY {
+            crate::integrator_mcp::mark_configuration_changed(&store)?;
+        }
+        Ok::<Setting, IntegratorError>(setting)
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -1181,11 +1225,11 @@ fn voice_typing_error(message: impl Into<String>) -> CommandError {
     }
 }
 
-fn credential_entry() -> CommandResult<keyring::Entry> {
-    keyring::Entry::new(VOICE_TYPING_SERVICE, VOICE_TYPING_ACCOUNT).map_err(|_| CommandError {
-        code: "credential-store-unavailable",
-        message: "The operating system credential store is unavailable.".into(),
-    })
+fn voice_typing_storage_name() -> &'static str {
+    match credential_store::storage() {
+        CredentialStorage::ProtectedLocalFile => "protected-local-file",
+        CredentialStorage::OsCredentialStore => "os-credential-store",
+    }
 }
 
 fn voice_typing_lock(
@@ -1199,54 +1243,45 @@ fn voice_typing_lock(
 
 #[tauri::command]
 pub fn voice_typing_credential_status() -> CommandResult<VoiceTypingCredentialStatus> {
-    let entry = credential_entry()?;
-    let configured = match entry.get_password() {
-        Ok(value) => !value.is_empty(),
-        Err(keyring::Error::NoEntry) => false,
-        Err(_) => {
-            return Err(CommandError {
-                code: "credential-store-unavailable",
-                message: "The operating system credential store could not be read.".into(),
-            });
-        }
-    };
+    let configured = credential_store::read(VOICE_TYPING_SERVICE, VOICE_TYPING_ACCOUNT)
+        .map_err(|_| CommandError {
+            code: "credential-store-unavailable",
+            message: "Native credential storage could not be read.".into(),
+        })?
+        .is_some();
     Ok(VoiceTypingCredentialStatus {
         configured,
-        storage: "os-credential-store",
+        storage: voice_typing_storage_name(),
         provider: "openai",
     })
 }
 
 #[tauri::command]
 pub fn voice_typing_credential_set(api_key: String) -> CommandResult<VoiceTypingCredentialStatus> {
+    let api_key = Zeroizing::new(api_key);
     let value = api_key.trim();
     if value.is_empty() {
         return Err(voice_typing_error("Paste an OpenAI API key before saving."));
     }
-    let entry = credential_entry()?;
-    entry.set_password(value).map_err(|_| CommandError {
-        code: "credential-store-unavailable",
-        message: "The OpenAI API key could not be saved to the operating system credential store."
-            .into(),
+    credential_store::write(VOICE_TYPING_SERVICE, VOICE_TYPING_ACCOUNT, value).map_err(|_| {
+        CommandError {
+            code: "credential-store-unavailable",
+            message: "The OpenAI API key could not be saved to native credential storage.".into(),
+        }
     })?;
     Ok(VoiceTypingCredentialStatus {
         configured: true,
-        storage: "os-credential-store",
+        storage: voice_typing_storage_name(),
         provider: "openai",
     })
 }
 
 #[tauri::command]
 pub fn voice_typing_credential_clear() -> CommandResult<()> {
-    let entry = credential_entry()?;
-    match entry.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(_) => Err(CommandError {
-            code: "credential-store-unavailable",
-            message: "The OpenAI API key could not be removed from the operating system credential store."
-                .into(),
-        }),
-    }
+    credential_store::delete(VOICE_TYPING_SERVICE, VOICE_TYPING_ACCOUNT).map_err(|_| CommandError {
+        code: "credential-store-unavailable",
+        message: "The OpenAI API key could not be removed from native credential storage.".into(),
+    })
 }
 
 #[tauri::command]
@@ -1254,15 +1289,15 @@ pub async fn voice_typing_start(app: AppHandle, state: State<'_, AppState>) -> C
     if voice_typing_lock(&state)?.is_some() {
         return Err(voice_typing_error("Voice typing is already active."));
     }
-    let entry = credential_entry()?;
-    let api_key = entry.get_password().map_err(|_| {
-        voice_typing_error("Add an OpenAI API key in Settings before using the mic button.")
-    })?;
-    if api_key.trim().is_empty() {
+    let Some(api_key) = credential_store::read(VOICE_TYPING_SERVICE, VOICE_TYPING_ACCOUNT)
+        .map_err(|_| {
+            voice_typing_error("Add an OpenAI API key in Settings before using the mic button.")
+        })?
+    else {
         return Err(voice_typing_error(
             "Add an OpenAI API key in Settings before using the mic button.",
         ));
-    }
+    };
 
     let mut request = VOICE_TYPING_URL
         .into_client_request()
@@ -2752,9 +2787,10 @@ pub async fn codex_connect(
     working_directory: Option<PathBuf>,
     task_id: Option<TaskId>,
 ) -> CommandResult<()> {
-    let statuses = tauri::async_runtime::spawn_blocking(discover_providers)
+    let statuses = state
+        .provider_statuses(false)
         .await
-        .map_err(|_| worker_error())?;
+        .map_err(CommandError::from)?;
     let executable =
         provider_executable(&statuses, ProviderKind::Codex).ok_or_else(|| CommandError {
             code: "provider-unavailable",
@@ -2999,6 +3035,21 @@ fn pump_provider_event(
     request_id: Option<TransportRequestId>,
 ) {
     let Some(binding) = binding else { return };
+    let Some(reduced) = reduce_codex_provider_event(runtime, binding, method, params, request_id)
+    else {
+        return;
+    };
+    persist_codex_provider_event(app, store, binding, &reduced);
+}
+
+fn reduce_codex_provider_event(
+    runtime: &CodexRuntime,
+    binding: &RuntimeBinding,
+    method: String,
+    params: Value,
+    request_id: Option<TransportRequestId>,
+) -> Option<ReducedProviderEvent> {
+    let raw_user_prompt = raw_codex_user_prompt(&params);
     let mut reduced = match reduce_provider_event(ProviderEventInput {
         method,
         params,
@@ -3006,7 +3057,7 @@ fn pump_provider_event(
         occurred_at: Utc::now(),
     }) {
         Ok(Some(reduced)) => reduced,
-        Ok(None) => return,
+        Ok(None) => return None,
         Err(_) => reduce_connection_event(
             "client/reducerRejected",
             binding.thread_id.as_deref().unwrap_or("unknown"),
@@ -3015,22 +3066,55 @@ fn pump_provider_event(
             Utc::now(),
         ),
     };
-    annotate_codex_user_prompt(runtime, &mut reduced);
-    if let Ok(event) = store.apply_reduced_event(binding, &reduced) {
+    annotate_codex_user_prompt(runtime, raw_user_prompt.as_deref(), &mut reduced);
+    Some(reduced)
+}
+
+fn persist_codex_provider_event(
+    app: &AppHandle<tauri::Wry>,
+    store: &LocalStore,
+    binding: &RuntimeBinding,
+    reduced: &ReducedProviderEvent,
+) {
+    if let Ok(event) = store.apply_reduced_event(binding, reduced) {
         let _ = app.emit("runtime://projection", &event);
     }
 }
 
-fn annotate_codex_user_prompt(runtime: &CodexRuntime, reduced: &mut ReducedProviderEvent) {
+fn raw_codex_user_prompt(params: &Value) -> Option<String> {
+    let item = params.get("item").unwrap_or(params);
+    if item.get("type").and_then(Value::as_str) != Some("userMessage") {
+        return None;
+    }
+    Some(
+        item.get("content")?
+            .as_array()?
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| part.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn annotate_codex_user_prompt(
+    runtime: &CodexRuntime,
+    raw_prompt: Option<&str>,
+    reduced: &mut ReducedProviderEvent,
+) {
     let mut pending = runtime
         .pending_user_prompt
         .lock()
         .expect("user prompt lock");
-    annotate_pending_user_prompt(&mut pending, reduced);
+    annotate_pending_user_prompt(&mut pending, raw_prompt, reduced);
 }
 
 fn annotate_pending_user_prompt(
     pending: &mut Option<PendingUserPrompt>,
+    raw_prompt: Option<&str>,
     reduced: &mut ReducedProviderEvent,
 ) {
     let item = match &mut reduced.mutation {
@@ -3046,15 +3130,14 @@ fn annotate_pending_user_prompt(
         return;
     };
     let same_item = pending.provider_item_id.as_deref() == Some(item.provider_item_id.as_str());
-    let same_prompt = item
-        .body
-        .as_deref()
+    let same_prompt = raw_prompt
         .is_some_and(|body| body == pending.wire_prompt || body == pending.visible_prompt);
     if !same_item && !same_prompt {
         return;
     }
     pending.provider_item_id = Some(item.provider_item_id.clone());
-    item.body = Some(pending.visible_prompt.clone());
+    item.body =
+        Some(integrator_runtime::redact_and_bound(&pending.visible_prompt, 2 * 1024 * 1024).0);
     item.native_skill = pending.native_skill.clone();
 }
 
@@ -3184,37 +3267,53 @@ pub async fn codex_start_thread(
         }
     };
     let runtime = codex_runtime(&state, Some(task_id)).await?;
-    let codex_config = if let Some(mode) = delegation.as_deref().filter(|mode| *mode != "off") {
-        let broker = state
-            .broker
-            .lock()
-            .expect("broker lock")
-            .clone()
-            .ok_or_else(|| CommandError {
-                code: "provider-unavailable",
-                message: "the delegation broker is not ready; retry this turn".into(),
-            })?;
-        Some(
-            crate::delegation::codex_mcp_config(
-                &broker,
-                "orchestrator",
-                &task_id.to_string(),
-                mode,
-            )
-            .map_err(CommandError::from)?,
-        )
-    } else {
-        None
-    };
+    let broker = state
+        .broker
+        .lock()
+        .expect("broker lock")
+        .clone()
+        .ok_or_else(|| CommandError {
+            code: "provider-unavailable",
+            message: "Integrator local tools are not ready; retry this chat".into(),
+        })?;
+    let base_config = crate::delegation::codex_mcp_config(
+        &broker,
+        "orchestrator",
+        &task_id.to_string(),
+        delegation.as_deref().unwrap_or("off"),
+    )
+    .map_err(CommandError::from)?;
+    let mcp_app = app.clone();
+    let mcp_store = Arc::clone(&state.store);
+    let codex_config = Some(
+        tauri::async_runtime::spawn_blocking(move || {
+            let enabled_servers = crate::integrator_mcp::enabled_servers(&mcp_app, &mcp_store);
+            crate::integrator_mcp::merge_codex_mcp_config(base_config, &enabled_servers)
+        })
+        .await
+        .map_err(|_| worker_error())?,
+    );
+    let effective_config = runtime
+        .client
+        .read_config(&cwd)
+        .await
+        .map_err(CommandError::from)?;
+    let developer_instructions = crate::harness_prompt::codex_developer_instructions(
+        &effective_config,
+        crate::harness_prompt::LocalToolsProjection::Projected,
+    );
     let response = runtime
         .client
-        .start_thread_with_policies_and_config(
+        .start_thread_with_policies_and_overrides(
             &cwd,
             model.as_deref(),
             effort.as_deref(),
             approval_policy,
             sandbox,
-            codex_config,
+            CodexThreadOverrides {
+                config: codex_config,
+                developer_instructions: Some(developer_instructions),
+            },
         )
         .await
         .map_err(CommandError::from)?;
@@ -3250,6 +3349,10 @@ const CONTEXT_PRIMER_OPTIONS: session_store::HandoffDigestOptions =
         max_turns: session_store::HANDOFF_DEFAULT_MAX_TURNS,
         max_images: session_store::HANDOFF_DEFAULT_MAX_IMAGES,
     };
+
+fn should_load_handoff_digest(resume_session_id: Option<&str>, has_native_action: bool) -> bool {
+    resume_session_id.is_none() && !has_native_action
+}
 
 /// Queue the task's shared SQLite handoff digest for injection into the first
 /// turn of a brand-new provider session (any runtime).
@@ -3289,10 +3392,33 @@ pub async fn codex_resume_thread(
     thread_id: String,
 ) -> CommandResult<Value> {
     state.store.get_task(task_id).map_err(CommandError::from)?;
+    let saved = state
+        .store
+        .provider_resume_state(task_id)
+        .map_err(CommandError::from)?
+        .filter(|saved| {
+            saved.provider == ProviderKind::Codex
+                && saved.session_ref == thread_id
+                && crate::integrator_mcp::resume_state_is_current(&state.store, saved)
+        })
+        .ok_or_else(|| CommandError {
+            code: "not-found",
+            message: "This Codex thread is no longer the active resumable session for the task"
+                .into(),
+        })?;
     let runtime = codex_runtime(&state, Some(task_id)).await?;
+    let effective_config = runtime
+        .client
+        .read_config(&saved.repository_root)
+        .await
+        .map_err(CommandError::from)?;
+    let developer_instructions = crate::harness_prompt::codex_developer_instructions(
+        &effective_config,
+        crate::harness_prompt::LocalToolsProjection::Projected,
+    );
     let response = runtime
         .client
-        .resume_thread(&thread_id)
+        .resume_thread_with_developer_instructions(&thread_id, Some(&developer_instructions))
         .await
         .map_err(CommandError::from)?;
     bind_thread(&state, &runtime, task_id, &thread_id).await?;
@@ -3304,7 +3430,20 @@ pub async fn codex_resume_thread(
         ConnectionState::Connected,
         None,
     );
-    reconcile_thread_response(&app, &state.store, &runtime, &response);
+    // `thread/resume` reconnects Codex to its own history; SQLite already
+    // owns the visible transcript. Re-projecting the returned turns here
+    // appends the same messages again because Codex snapshot ids (`item-N`)
+    // are not the stable ids emitted by the live event stream.
+    persist_provider_resume_state(
+        &state.store,
+        task_id,
+        ProviderKind::Codex,
+        &thread_id,
+        &saved.repository_root,
+        &saved.permission,
+        &saved.delegation,
+    )
+    .map_err(CommandError::from)?;
     Ok(response)
 }
 
@@ -3361,6 +3500,7 @@ fn persist_provider_resume_state(
 
 /// Visible composer/transcript placeholder for interrupted-turn resume.
 /// Filtered out of the rendered transcript so resume stays wire-only.
+#[cfg(test)]
 pub(crate) const INTERRUPTED_RESUME_VISIBLE_PROMPT: &str = "Resume from here";
 
 fn interrupted_resume_wire_prompt(interrupted_at: Option<chrono::DateTime<Utc>>) -> String {
@@ -3441,10 +3581,12 @@ pub async fn codex_start_turn(
         native_action_id.as_deref(),
         resume_interrupted,
     )?;
-    let _launch_guard = state.reserve_turn_launch(task_id).ok_or_else(|| CommandError {
-        code: "turn-active",
-        message: "A turn is already starting for this chat".into(),
-    })?;
+    let _launch_guard = state
+        .reserve_turn_launch(task_id)
+        .ok_or_else(|| CommandError {
+            code: "turn-active",
+            message: "A turn is already starting for this chat".into(),
+        })?;
     if state
         .store
         .task_has_unfinished_turn(task_id)
@@ -3712,12 +3854,13 @@ pub async fn task_snapshot(
     known_reset_seq: Option<i64>,
     before_seq: Option<i64>,
     limit: Option<usize>,
+    skip_runtime_check: Option<bool>,
 ) -> CommandResult<TaskSnapshot> {
     let older_page = before_seq.is_some();
     // Snapshot hydration is a read-only view operation. Process-loss recovery
     // runs once during AppState startup, never as a side effect of selecting a
     // chat while other task-owned runtimes are active.
-    let runtime_live = if older_page {
+    let runtime_live = if older_page || skip_runtime_check.unwrap_or(false) {
         false
     } else {
         task_has_live_runtime(&state, task_id).await
@@ -3941,10 +4084,14 @@ pub async fn acp_connect(
             return Ok(());
         }
     }
-    let arguments = acp_launch_arguments(&provider)?;
-    let statuses = tauri::async_runtime::spawn_blocking(discover_providers)
+    let arguments = acp_launch_arguments(
+        &provider,
+        Some(crate::harness_prompt::LocalToolsProjection::Projected),
+    )?;
+    let statuses = state
+        .provider_statuses(false)
         .await
-        .map_err(|_| worker_error())?;
+        .map_err(CommandError::from)?;
     let executable = provider_executable(&statuses, provider).ok_or_else(|| CommandError {
         code: "provider-unavailable",
         message: format!("{} CLI is not installed", provider.as_str()),
@@ -3961,6 +4108,7 @@ pub async fn acp_connect(
         let _ = client.shutdown().await;
         return Err(error);
     }
+    let (turn_settled, _) = tokio::sync::broadcast::channel(8);
     let runtime = AcpRuntime {
         client,
         provider,
@@ -3968,6 +4116,8 @@ pub async fn acp_connect(
         alive: Arc::new(AtomicBool::new(true)),
         binding: Arc::new(std::sync::Mutex::new(None)),
         current_turn: Arc::new(std::sync::Mutex::new(None)),
+        current_turn_started_at: Arc::new(std::sync::Mutex::new(None)),
+        turn_settled,
         permission_options: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_modes: Arc::new(std::sync::Mutex::new(None)),
         plan_requests: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
@@ -4011,12 +4161,25 @@ pub async fn acp_connect(
     Ok(())
 }
 
-pub(crate) fn acp_launch_arguments(provider: &ProviderKind) -> CommandResult<Vec<String>> {
+pub(crate) fn acp_launch_arguments(
+    provider: &ProviderKind,
+    harness_tools: Option<crate::harness_prompt::LocalToolsProjection>,
+) -> CommandResult<Vec<String>> {
     Ok(match provider {
         ProviderKind::Cursor => vec!["acp".into()],
         // Scripted ACP starts disable implicit self-updates; the vendor CLI
         // and its vendor-owned cached login remain the authority.
-        ProviderKind::Grok => vec!["--no-auto-update".into(), "agent".into(), "stdio".into()],
+        ProviderKind::Grok => {
+            let mut arguments = vec!["--no-auto-update".into()];
+            if let Some(tools) = harness_tools {
+                arguments.extend([
+                    "--rules".into(),
+                    crate::harness_prompt::instructions(ProviderKind::Grok, tools),
+                ]);
+            }
+            arguments.extend(["agent".into(), "stdio".into()]);
+            arguments
+        }
         _ => {
             return Err(CommandError {
                 code: "provider-unavailable",
@@ -4056,7 +4219,9 @@ pub async fn acp_start_session(
     let provider_name = provider.as_str().to_owned();
     // Delegation broker injection: ACP's `session/new` carries MCP servers
     // natively. The tool preamble is queued one-shot for the first turn.
-    let mcp_servers = acp_session_mcp_servers(&state, task_id, delegation.as_deref())?;
+    let mcp_servers =
+        acp_session_mcp_servers(&app, &state, &runtime, task_id, &cwd, delegation.as_deref())
+            .await?;
     if let Some(mode) = delegation.as_deref().filter(|mode| *mode != "off") {
         *runtime.delegation_preamble.lock().expect("preamble lock") =
             Some(crate::delegation::orchestrator_preamble(&state.store, mode));
@@ -4109,14 +4274,14 @@ pub async fn acp_start_session(
     Ok(response)
 }
 
-fn acp_session_mcp_servers(
+async fn acp_session_mcp_servers(
+    app: &AppHandle<tauri::Wry>,
     state: &AppState,
+    runtime: &AcpRuntime,
     task_id: TaskId,
+    cwd: &Path,
     delegation: Option<&str>,
 ) -> CommandResult<Vec<Value>> {
-    let Some(mode) = delegation.filter(|mode| *mode != "off") else {
-        return Ok(Vec::new());
-    };
     let broker = state
         .broker
         .lock()
@@ -4124,17 +4289,36 @@ fn acp_session_mcp_servers(
         .clone()
         .ok_or_else(|| CommandError {
             code: "provider-unavailable",
-            message: "the delegation broker is not ready; retry this turn".into(),
+            message: "Integrator local tools are not ready; retry this chat".into(),
         })?;
-    Ok(vec![
+    let harness_instructions = (runtime.provider == ProviderKind::Cursor).then(|| {
+        crate::harness_prompt::instructions(
+            ProviderKind::Cursor,
+            crate::harness_prompt::LocalToolsProjection::Projected,
+        )
+    });
+    let mut entries = vec![
         crate::delegation::acp_mcp_server_entry(
             &broker,
             "orchestrator",
             &task_id.to_string(),
-            mode,
+            delegation.unwrap_or("off"),
+            harness_instructions.as_deref(),
         )
         .map_err(CommandError::from)?,
-    ])
+    ];
+    let mcp_app = app.clone();
+    let mcp_store = Arc::clone(&state.store);
+    let capabilities = runtime.client.session_capabilities().await;
+    let mcp_cwd = cwd.to_path_buf();
+    let projected = tauri::async_runtime::spawn_blocking(move || {
+        let enabled_servers = crate::integrator_mcp::enabled_servers(&mcp_app, &mcp_store);
+        crate::integrator_mcp::acp_mcp_server_entries(&enabled_servers, capabilities, &mcp_cwd)
+    })
+    .await
+    .map_err(|_| worker_error())??;
+    entries.extend(projected);
+    Ok(entries)
 }
 
 async fn bind_acp_session(
@@ -4184,6 +4368,12 @@ pub async fn acp_resume_session(
             code: "not-found",
             message: "This task has no saved provider session to resume".into(),
         })?;
+    if !crate::integrator_mcp::resume_state_is_current(&state.store, &saved) {
+        return Err(CommandError {
+            code: "not-found",
+            message: "The saved provider session predates the current MCP configuration".into(),
+        });
+    }
     let runtime = acp_runtime(&state, Some(task_id), None).await?;
     if saved.provider != runtime.provider || saved.repository_root != cwd {
         return Err(CommandError {
@@ -4191,7 +4381,15 @@ pub async fn acp_resume_session(
             message: "The saved provider session does not match this task and workspace".into(),
         });
     }
-    let mcp_servers = acp_session_mcp_servers(&state, task_id, Some(&saved.delegation))?;
+    let mcp_servers = acp_session_mcp_servers(
+        &app,
+        &state,
+        &runtime,
+        task_id,
+        &cwd,
+        Some(&saved.delegation),
+    )
+    .await?;
     let binding = bind_acp_session(&state, &runtime, task_id, &saved.session_ref).await?;
     *runtime.session_spec.lock().expect("session spec lock") = Some(AcpSessionSpec {
         cwd: cwd.clone(),
@@ -4273,10 +4471,12 @@ pub async fn acp_send_turn(
         native_action_id.as_deref(),
         resume_interrupted,
     )?;
-    let _launch_guard = state.reserve_turn_launch(task_id).ok_or_else(|| CommandError {
-        code: "turn-active",
-        message: "A turn is already starting for this chat".into(),
-    })?;
+    let _launch_guard = state
+        .reserve_turn_launch(task_id)
+        .ok_or_else(|| CommandError {
+            code: "turn-active",
+            message: "A turn is already starting for this chat".into(),
+        })?;
     if state
         .store
         .task_has_unfinished_turn(task_id)
@@ -4380,8 +4580,12 @@ pub async fn acp_send_turn(
         message: format!("{provider_name} session identity is missing"),
     })?;
     let turn_id = uuid::Uuid::new_v4().to_string();
-    *runtime.current_turn.lock().expect("turn lock") = Some(turn_id.clone());
     let started_at = Utc::now();
+    *runtime
+        .current_turn_started_at
+        .lock()
+        .expect("turn start lock") = Some(started_at);
+    *runtime.current_turn.lock().expect("turn lock") = Some(turn_id.clone());
 
     // Persist the user message and the in-progress turn before prompting so a
     // restart mid-turn can reconstruct what was asked. Interrupted resume is
@@ -4434,10 +4638,12 @@ pub async fn acp_send_turn(
     };
     apply_and_emit(&app, &state.store, &binding, &turn_started);
 
-    // session/prompt resolves when the turn ends; finish the turn projection
-    // from a background task so this command returns immediately. The primer
-    // rides only on the wire prompt — the persisted user item above keeps the
-    // prompt exactly as the user typed it.
+    // The prompt future keeps the request alive, but it does not settle the
+    // turn. The ACP adapter emits an ordered PromptFinished boundary after all
+    // preceding session/update notifications; the projection pump owns final
+    // persistence and clears current_turn only when it reaches that boundary.
+    // The primer rides only on the wire prompt — the persisted user item above
+    // keeps the prompt exactly as the user typed it.
     let provider_prompt = provider_wire_prompt(
         &prompt,
         resume_interrupted,
@@ -4479,44 +4685,10 @@ pub async fn acp_send_turn(
         }
     }
     let client = runtime.client.clone();
-    let current_turn = Arc::clone(&runtime.current_turn);
-    let store = Arc::clone(&state.store);
-    let emit_app = app.clone();
-    let finished_turn = turn_id.clone();
-    let finished_session = session_id.clone();
-    let finished_binding = binding.clone();
     tauri::async_runtime::spawn(async move {
-        let outcome = client
-            .prompt_with_images(&finished_session, &wire_prompt, &handoff_images)
+        let _ = client
+            .prompt_with_images(&session_id, &wire_prompt, &handoff_images)
             .await;
-        let now = Utc::now();
-        let (status, error) = match &outcome {
-            Ok(response) => match adapter_acp::StopReason::from_protocol(response) {
-                adapter_acp::StopReason::Cancelled => (TurnStatus::Interrupted, None),
-                adapter_acp::StopReason::Refusal => (
-                    TurnStatus::Failed,
-                    Some("The agent refused the turn".into()),
-                ),
-                _ => (TurnStatus::Completed, None),
-            },
-            Err(error) => (TurnStatus::Failed, Some(error.to_string())),
-        };
-        let mut turn = acp_turn_projection(&finished_turn, status, error, started_at, now);
-        turn.stop_requested = false;
-        let reduced = ReducedProviderEvent {
-            method: "client/acp/turnFinished".into(),
-            thread_id: finished_session,
-            turn_id: Some(finished_turn.clone()),
-            audit_json: "{}".into(),
-            audit_truncated: false,
-            mutation: ProjectionMutation::Turn(turn),
-            occurred_at: now,
-        };
-        apply_and_emit(&emit_app, &store, &finished_binding, &reduced);
-        let mut current = current_turn.lock().expect("turn lock");
-        if current.as_deref() == Some(finished_turn.as_str()) {
-            *current = None;
-        }
     });
     Ok(serde_json::json!({ "turnId": turn_id }))
 }
@@ -4661,10 +4833,12 @@ pub async fn structured_cli_start_turn(
         native_action_id.as_deref(),
         resume_interrupted,
     )?;
-    let _launch_guard = state.reserve_turn_launch(task_id).ok_or_else(|| CommandError {
-        code: "turn-active",
-        message: "A turn is already starting for this chat".into(),
-    })?;
+    let _launch_guard = state
+        .reserve_turn_launch(task_id)
+        .ok_or_else(|| CommandError {
+            code: "turn-active",
+            message: "A turn is already starting for this chat".into(),
+        })?;
     if state
         .store
         .task_has_unfinished_turn(task_id)
@@ -4771,9 +4945,10 @@ pub async fn structured_cli_start_turn(
             });
         }
     };
-    let statuses = tauri::async_runtime::spawn_blocking(discover_providers)
+    let statuses = state
+        .provider_statuses(false)
         .await
-        .map_err(|_| worker_error())?;
+        .map_err(CommandError::from)?;
     let executable = provider_executable(&statuses, provider).ok_or_else(|| CommandError {
         code: "provider-unavailable",
         message: format!("{} CLI is not installed", provider.as_str()),
@@ -4782,6 +4957,15 @@ pub async fn structured_cli_start_turn(
     // A task owns at most one structured provider process, but other tasks keep
     // running independently in the background. Replacing a process is scoped
     // to this task only (for a retry, provider change, or resumed next turn).
+    let saved_resume = state
+        .store
+        .provider_resume_state(task_id)
+        .map_err(CommandError::from)?
+        .filter(|saved| {
+            saved.provider == provider
+                && saved.repository_root == repository
+                && crate::integrator_mcp::resume_state_is_current(&state.store, saved)
+        });
     let mut resume_session_id = None;
     let mut control_overlay = None;
     let previous = {
@@ -4795,7 +4979,7 @@ pub async fn structured_cli_start_turn(
             .expect("binding lock")
             .as_ref()
             .is_some_and(|binding| binding.task_id == task_id && binding.provider == provider);
-        if same_provider {
+        if same_provider && saved_resume.is_some() {
             resume_session_id = previous.session_ref.lock().expect("session lock").clone();
             control_overlay = previous.control_overlay.clone();
         }
@@ -4807,23 +4991,23 @@ pub async fn structured_cli_start_turn(
         let _ = state.store.expire_process_approvals(&previous.process_id);
     }
     if resume_session_id.is_none()
-        && let Some(saved) = state
-            .store
-            .provider_resume_state(task_id)
-            .map_err(CommandError::from)?
-        && saved.provider == provider
-        && saved.repository_root == repository
+        && let Some(saved) = saved_resume
     {
         resume_session_id = Some(saved.session_ref);
     }
 
-    let digest_store = Arc::clone(&state.store);
-    let digest = tauri::async_runtime::spawn_blocking(move || {
-        digest_store.task_handoff_digest(task_id, CONTEXT_PRIMER_OPTIONS)
-    })
-    .await
-    .map_err(|_| worker_error())?
-    .map_err(CommandError::from)?;
+    let digest =
+        if should_load_handoff_digest(resume_session_id.as_deref(), native_action.is_some()) {
+            let digest_store = Arc::clone(&state.store);
+            tauri::async_runtime::spawn_blocking(move || {
+                digest_store.task_handoff_digest(task_id, CONTEXT_PRIMER_OPTIONS)
+            })
+            .await
+            .map_err(|_| worker_error())?
+            .map_err(CommandError::from)?
+        } else {
+            None
+        };
     let provider_prompt = provider_wire_prompt(
         &prompt,
         resume_interrupted,
@@ -4857,7 +5041,29 @@ pub async fn structured_cli_start_turn(
     // session, so the tool preamble and any pending subagent updates ride on
     // every wire prompt while delegation is active.
     let delegation_mode = delegation.as_deref().filter(|mode| *mode != "off");
-    let mut mcp_config_path = None;
+    let mut mcp_config_path = if matches!(structured_provider, StructuredCliProvider::Claude) {
+        let broker = state
+            .broker
+            .lock()
+            .expect("broker lock")
+            .clone()
+            .ok_or_else(|| CommandError {
+                code: "provider-unavailable",
+                message: "Integrator local tools are not ready; retry this chat".into(),
+            })?;
+        Some(
+            crate::delegation::write_mcp_config(
+                &app,
+                &broker,
+                "orchestrator",
+                &task_id.to_string(),
+                delegation.as_deref().unwrap_or("off"),
+            )
+            .map_err(CommandError::from)?,
+        )
+    } else {
+        None
+    };
     if let Some(mode) = delegation_mode {
         let store = Arc::clone(&state.store);
         let mut preface = crate::delegation::orchestrator_preamble(&store, mode);
@@ -4866,27 +5072,6 @@ pub async fn structured_cli_start_turn(
         }
         if native_action.is_none() {
             wire_prompt = format!("{preface}{wire_prompt}");
-        }
-        if matches!(structured_provider, StructuredCliProvider::Claude) {
-            let broker = state
-                .broker
-                .lock()
-                .expect("broker lock")
-                .clone()
-                .ok_or_else(|| CommandError {
-                    code: "provider-unavailable",
-                    message: "the delegation broker is not ready; retry this turn".into(),
-                })?;
-            mcp_config_path = Some(
-                crate::delegation::write_mcp_config(
-                    &app,
-                    &broker,
-                    "orchestrator",
-                    &task_id.to_string(),
-                    mode,
-                )
-                .map_err(CommandError::from)?,
-            );
         }
     }
 
@@ -4922,6 +5107,41 @@ pub async fn structured_cli_start_turn(
         }
     }
 
+    let mcp_app = app.clone();
+    let mcp_store = Arc::clone(&state.store);
+    let enabled_mcp_servers = tauri::async_runtime::spawn_blocking(move || {
+        crate::integrator_mcp::enabled_servers(&mcp_app, &mcp_store)
+    })
+    .await
+    .map_err(|_| worker_error())?;
+
+    // Claude reads a per-turn `--mcp-config`, merged with the broker config so
+    // both local surfaces share one provider-owned configuration input.
+    if matches!(structured_provider, StructuredCliProvider::Claude) {
+        let data_directory = state.data_directory.clone();
+        let base_config = mcp_config_path.clone();
+        let servers = enabled_mcp_servers.clone();
+        let projected = tauri::async_runtime::spawn_blocking(move || {
+            crate::integrator_mcp::write_claude_mcp_config(
+                &data_directory,
+                &servers,
+                base_config.as_deref(),
+            )
+        })
+        .await
+        .map_err(|_| worker_error())?;
+        match projected {
+            Ok(Some(path)) => mcp_config_path = Some(path),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(CommandError {
+                    code: "unavailable",
+                    message: format!("could not prepare Claude MCP configuration: {error}"),
+                });
+            }
+        }
+    }
+
     let client = integrator_runtime::StructuredCliClient::new();
     let process_id = uuid::Uuid::new_v4().to_string();
     let mut hook_event_log = None;
@@ -4938,6 +5158,17 @@ pub async fn structured_cli_start_turn(
             permission_mode,
         )
         .map_err(CommandError::from)?;
+        let overlay_root = overlay.root.clone();
+        let servers = enabled_mcp_servers.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::integrator_mcp::write_antigravity_mcp_config(&overlay_root, &servers)
+        })
+        .await
+        .map_err(|_| worker_error())?
+        .map_err(|error| CommandError {
+            code: "unavailable",
+            message: format!("could not prepare Antigravity MCP configuration: {error}"),
+        })?;
         control_overlay = Some(overlay.root);
         hook_event_log = Some(overlay.event_log);
     }
@@ -4985,6 +5216,13 @@ pub async fn structured_cli_start_turn(
                 working_directory: repository,
                 model: model.filter(|value| value != "Provider default"),
                 effort: effort.filter(|value| !value.is_empty()),
+                system_instructions: matches!(structured_provider, StructuredCliProvider::Claude)
+                    .then(|| {
+                        crate::harness_prompt::instructions(
+                            provider,
+                            crate::harness_prompt::LocalToolsProjection::Projected,
+                        )
+                    }),
                 resume_session_id,
                 permission_mode,
                 mcp_config_path,
@@ -5873,6 +6111,63 @@ pub(crate) fn spawn_acp_pump(
                     );
                     apply_and_emit(&app, &store, binding, &reduced);
                 }
+                adapter_acp::AcpEvent::PromptFinished {
+                    session_id,
+                    outcome,
+                } => {
+                    let Some(binding) = binding.as_ref() else {
+                        continue;
+                    };
+                    if binding.thread_id.as_deref() != Some(session_id.as_str()) {
+                        continue;
+                    }
+                    let Some(turn_id) = runtime.current_turn.lock().expect("turn lock").take()
+                    else {
+                        continue;
+                    };
+                    let now = Utc::now();
+                    let started_at = runtime
+                        .current_turn_started_at
+                        .lock()
+                        .expect("turn start lock")
+                        .take()
+                        .unwrap_or(now);
+                    let (status, error, failed) = match outcome {
+                        adapter_acp::AcpPromptOutcome::Response {
+                            stop_reason: adapter_acp::StopReason::Cancelled,
+                        } => (TurnStatus::Interrupted, None, false),
+                        adapter_acp::AcpPromptOutcome::Response {
+                            stop_reason: adapter_acp::StopReason::Refusal,
+                        } => (
+                            TurnStatus::Failed,
+                            Some("The agent refused the turn".into()),
+                            true,
+                        ),
+                        adapter_acp::AcpPromptOutcome::Response { .. } => {
+                            (TurnStatus::Completed, None, false)
+                        }
+                        adapter_acp::AcpPromptOutcome::Error { message } => {
+                            (TurnStatus::Failed, Some(message), true)
+                        }
+                    };
+                    let mut turn = acp_turn_projection(&turn_id, status, error, started_at, now);
+                    turn.stop_requested = false;
+                    let finished = ReducedProviderEvent {
+                        method: if runtime.unattended {
+                            "client/delegation/turnFinished".into()
+                        } else {
+                            "client/acp/turnFinished".into()
+                        },
+                        thread_id: session_id,
+                        turn_id: Some(turn_id),
+                        audit_json: "{}".into(),
+                        audit_truncated: false,
+                        mutation: ProjectionMutation::Turn(turn),
+                        occurred_at: now,
+                    };
+                    apply_and_emit(&app, &store, binding, &finished);
+                    let _ = runtime.turn_settled.send(AcpTurnSettlement { failed });
+                }
                 adapter_acp::AcpEvent::ProtocolViolation { code } => {
                     if !runtime.replaying_history.swap(true, Ordering::AcqRel) {
                         begin_acp_reconciliation(
@@ -6296,7 +6591,8 @@ fn reconcile_thread_response(
         .flatten()
     {
         let turn_id = turn.get("id").and_then(Value::as_str).unwrap_or("unknown");
-        let method = if turn.get("status").and_then(Value::as_str) == Some("inProgress") {
+        let turn_in_progress = turn.get("status").and_then(Value::as_str) == Some("inProgress");
+        let method = if turn_in_progress {
             "turn/started"
         } else {
             "turn/completed"
@@ -6310,30 +6606,98 @@ fn reconcile_thread_response(
             serde_json::json!({ "threadId": thread_id, "turn": turn }),
             None,
         );
-        for item in turn
+        let existing_items = binding
+            .as_ref()
+            .and_then(|binding| binding.provider_session_id)
+            .and_then(|provider_session_id| {
+                store.provider_turn_items(provider_session_id, turn_id).ok()
+            })
+            .unwrap_or_default();
+        let mut matched_items = HashSet::new();
+        for (ordinal, item) in turn
             .get("items")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
+            .enumerate()
         {
-            let method = match item.get("status").and_then(Value::as_str) {
-                Some("completed" | "failed" | "declined") => "item/completed",
-                _ => "item/started",
+            let Some(binding) = binding.as_ref() else {
+                continue;
             };
-            pump_provider_event(
-                app,
-                store,
+            let params = serde_json::json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "item": item
+            });
+            let Some(mut reduced) = reduce_codex_provider_event(
                 runtime,
-                binding.as_ref(),
-                method.into(),
-                serde_json::json!({
-                    "threadId": thread_id,
-                    "turnId": turn_id,
-                    "item": item
-                }),
+                binding,
+                reconciled_item_method(turn_in_progress, item).into(),
+                params,
                 None,
-            );
+            ) else {
+                continue;
+            };
+            reconcile_replayed_item(&existing_items, &mut matched_items, ordinal, &mut reduced);
+            persist_codex_provider_event(app, store, binding, &reduced);
         }
+    }
+}
+
+fn reconciled_item_method(turn_in_progress: bool, item: &Value) -> &'static str {
+    match item.get("status").and_then(Value::as_str) {
+        Some("completed" | "failed" | "declined") => "item/completed",
+        Some("pending" | "inProgress") => "item/started",
+        _ if turn_in_progress => "item/started",
+        _ => "item/completed",
+    }
+}
+
+fn reconcile_replayed_item(
+    existing_items: &[ItemProjection],
+    matched_items: &mut HashSet<String>,
+    ordinal: usize,
+    reduced: &mut ReducedProviderEvent,
+) {
+    let incoming = match &mut reduced.mutation {
+        ProjectionMutation::ReplaceItem(item)
+        | ProjectionMutation::NeutralItem(item)
+        | ProjectionMutation::MergeItem(item) => item,
+        _ => return,
+    };
+    let existing = existing_items
+        .iter()
+        .find(|item| {
+            item.provider_item_id == incoming.provider_item_id && !matched_items.contains(&item.id)
+        })
+        .or_else(|| {
+            existing_items
+                .get(ordinal)
+                .filter(|item| item.kind == incoming.kind && !matched_items.contains(&item.id))
+        })
+        .or_else(|| {
+            existing_items
+                .iter()
+                .find(|item| item.kind == incoming.kind && !matched_items.contains(&item.id))
+        });
+    let Some(existing) = existing else {
+        return;
+    };
+    matched_items.insert(existing.id.clone());
+    incoming.id = existing.id.clone();
+    incoming.provider_item_id = existing.provider_item_id.clone();
+    if incoming.kind == ItemKind::UserMessage {
+        incoming.body = existing.body.clone();
+        incoming.native_skill = existing.native_skill.clone();
+    }
+    if matches!(
+        existing.status,
+        ItemStatus::Completed | ItemStatus::Failed | ItemStatus::Declined
+    ) && matches!(
+        incoming.status,
+        ItemStatus::Pending | ItemStatus::InProgress
+    ) {
+        incoming.status = existing.status.clone();
     }
 }
 
@@ -7095,12 +7459,17 @@ mod tests {
         assert!(validate_interrupted_resume_for_task(&store, task.id, None, None).is_ok());
     }
 
-    fn codex_user_item(provider_item_id: &str, body: &str) -> integrator_core::ItemProjection {
+    fn codex_item(
+        provider_item_id: &str,
+        kind: integrator_core::ItemKind,
+        status: integrator_core::ItemStatus,
+        body: &str,
+    ) -> integrator_core::ItemProjection {
         integrator_core::ItemProjection {
             id: format!("codex:{provider_item_id}"),
             provider_item_id: provider_item_id.into(),
-            kind: integrator_core::ItemKind::UserMessage,
-            status: integrator_core::ItemStatus::Completed,
+            kind,
+            status,
             title: None,
             body: Some(body.into()),
             native_skill: None,
@@ -7116,6 +7485,15 @@ mod tests {
             truncated: false,
             updated_at: Utc::now(),
         }
+    }
+
+    fn codex_user_item(provider_item_id: &str, body: &str) -> integrator_core::ItemProjection {
+        codex_item(
+            provider_item_id,
+            integrator_core::ItemKind::UserMessage,
+            integrator_core::ItemStatus::Completed,
+            body,
+        )
     }
 
     #[test]
@@ -7140,7 +7518,7 @@ mod tests {
             occurred_at,
         };
 
-        annotate_pending_user_prompt(&mut pending, &mut reduced);
+        annotate_pending_user_prompt(&mut pending, Some("$skill-creator build one"), &mut reduced);
 
         let ProjectionMutation::ReplaceItem(item) = &reduced.mutation else {
             panic!("expected replaced user item");
@@ -7163,7 +7541,7 @@ mod tests {
             mutation: ProjectionMutation::MergeItem(codex_user_item("user-1", "normalized")),
             occurred_at,
         };
-        annotate_pending_user_prompt(&mut pending, &mut update);
+        annotate_pending_user_prompt(&mut pending, None, &mut update);
         let ProjectionMutation::MergeItem(item) = &update.mutation else {
             panic!("expected merged user item");
         };
@@ -7188,11 +7566,11 @@ mod tests {
             turn_id: Some("turn-1".into()),
             audit_json: "{}".into(),
             audit_truncated: false,
-            mutation: ProjectionMutation::ReplaceItem(codex_user_item("user-1", &wire_prompt)),
+            mutation: ProjectionMutation::ReplaceItem(codex_user_item("user-1", visible_prompt)),
             occurred_at: Utc::now(),
         };
 
-        annotate_pending_user_prompt(&mut pending, &mut reduced);
+        annotate_pending_user_prompt(&mut pending, Some(&wire_prompt), &mut reduced);
 
         let ProjectionMutation::ReplaceItem(item) = &reduced.mutation else {
             panic!("expected replaced user item");
@@ -7222,7 +7600,11 @@ mod tests {
             occurred_at: Utc::now(),
         };
 
-        annotate_pending_user_prompt(&mut pending, &mut reduced);
+        annotate_pending_user_prompt(
+            &mut pending,
+            Some("/unknown-command leave this plain"),
+            &mut reduced,
+        );
 
         let ProjectionMutation::ReplaceItem(item) = &reduced.mutation else {
             panic!("expected replaced user item");
@@ -7253,17 +7635,118 @@ mod tests {
     }
 
     #[test]
+    fn raw_codex_user_prompt_is_captured_before_projection_normalization() {
+        let params = serde_json::json!({
+            "item": {
+                "type": "userMessage",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "<integrator-skills>private context</integrator-skills>"
+                    },
+                    { "type": "input_text", "text": "Review the queue behavior" }
+                ]
+            }
+        });
+        assert_eq!(
+            raw_codex_user_prompt(&params).as_deref(),
+            Some(
+                "<integrator-skills>private context</integrator-skills>\nReview the queue behavior"
+            )
+        );
+    }
+
+    #[test]
+    fn resumed_items_reuse_durable_ids_and_visible_user_text() {
+        let existing = vec![
+            codex_user_item("user-live", "do u have EIA/census skills"),
+            codex_item(
+                "assistant-live",
+                integrator_core::ItemKind::AgentMessage,
+                integrator_core::ItemStatus::Completed,
+                "Yes. I have both enabled.",
+            ),
+        ];
+        let mut matched = HashSet::new();
+        let mut replayed_user = ReducedProviderEvent {
+            method: "item/started".into(),
+            thread_id: "thread-1".into(),
+            turn_id: Some("turn-1".into()),
+            audit_json: "{}".into(),
+            audit_truncated: false,
+            mutation: ProjectionMutation::ReplaceItem(codex_item(
+                "item-1",
+                integrator_core::ItemKind::UserMessage,
+                integrator_core::ItemStatus::InProgress,
+                "<integrator-skills>private context</integrator-skills>\n\ndo u have EIA/census skills",
+            )),
+            occurred_at: Utc::now(),
+        };
+        reconcile_replayed_item(&existing, &mut matched, 0, &mut replayed_user);
+        let ProjectionMutation::ReplaceItem(user) = &replayed_user.mutation else {
+            panic!("expected replayed user item");
+        };
+        assert_eq!(user.id, existing[0].id);
+        assert_eq!(user.provider_item_id, "user-live");
+        assert_eq!(user.body.as_deref(), Some("do u have EIA/census skills"));
+        assert_eq!(user.status, integrator_core::ItemStatus::Completed);
+
+        let mut replayed_assistant = ReducedProviderEvent {
+            method: "item/started".into(),
+            thread_id: "thread-1".into(),
+            turn_id: Some("turn-1".into()),
+            audit_json: "{}".into(),
+            audit_truncated: false,
+            mutation: ProjectionMutation::ReplaceItem(codex_item(
+                "item-2",
+                integrator_core::ItemKind::AgentMessage,
+                integrator_core::ItemStatus::InProgress,
+                "Yes. I have both enabled.",
+            )),
+            occurred_at: Utc::now(),
+        };
+        reconcile_replayed_item(&existing, &mut matched, 1, &mut replayed_assistant);
+        let ProjectionMutation::ReplaceItem(assistant) = &replayed_assistant.mutation else {
+            panic!("expected replayed assistant item");
+        };
+        assert_eq!(assistant.id, existing[1].id);
+        assert_eq!(assistant.provider_item_id, "assistant-live");
+        assert_eq!(assistant.status, integrator_core::ItemStatus::Completed);
+    }
+
+    #[test]
+    fn completed_thread_snapshot_defaults_items_to_completed() {
+        assert_eq!(
+            reconciled_item_method(false, &serde_json::json!({ "id": "item-1" })),
+            "item/completed"
+        );
+        assert_eq!(
+            reconciled_item_method(
+                true,
+                &serde_json::json!({ "id": "item-1", "status": "inProgress" })
+            ),
+            "item/started"
+        );
+    }
+
+    #[test]
     fn acp_launch_is_provider_aware_and_rejects_non_acp_routes() {
         assert_eq!(
-            acp_launch_arguments(&ProviderKind::Cursor).expect("Cursor ACP route"),
+            acp_launch_arguments(&ProviderKind::Cursor, None).expect("Cursor ACP route"),
             vec!["acp"]
         );
-        assert_eq!(
-            acp_launch_arguments(&ProviderKind::Grok).expect("Grok ACP route"),
-            vec!["--no-auto-update", "agent", "stdio"]
-        );
-        assert!(acp_launch_arguments(&ProviderKind::Antigravity).is_err());
-        assert!(acp_launch_arguments(&ProviderKind::Claude).is_err());
+        let grok = acp_launch_arguments(
+            &ProviderKind::Grok,
+            Some(crate::harness_prompt::LocalToolsProjection::Unavailable),
+        )
+        .expect("Grok ACP route");
+        assert_eq!(grok[0], "--no-auto-update");
+        assert_eq!(grok[1], "--rules");
+        assert!(grok[2].contains("durable harness policy"));
+        assert!(grok[2].contains("delegation are unavailable"));
+        assert_eq!(&grok[3..], ["agent", "stdio"]);
+        assert!(acp_launch_arguments(&ProviderKind::Antigravity, None).is_err());
+        assert!(acp_launch_arguments(&ProviderKind::Claude, None).is_err());
     }
 
     #[test]
@@ -7380,6 +7863,7 @@ mod tests {
     #[test]
     fn codex_goal_is_a_pathless_direct_command() {
         let goal = codex_goal_action();
+        assert_eq!(goal.public.id, CODEX_GOAL_ACTION_ID);
         assert_eq!(goal.public.name, "goal");
         assert_eq!(goal.public.kind, NativeActionKind::Command);
         assert_eq!(goal.public.invocation, NativeActionInvocation::Direct);
@@ -7388,6 +7872,29 @@ mod tests {
             Some("completion condition")
         );
         assert!(goal.provider_path.is_none());
+    }
+
+    #[test]
+    fn codex_goal_does_not_depend_on_process_local_action_handles() {
+        let repository = PathBuf::from("fixture-repository");
+        let mut handles = std::collections::HashMap::new();
+        let actions = reconcile_native_action_handles(
+            &mut handles,
+            ProviderKind::Codex,
+            repository,
+            vec![codex_goal_action()],
+        );
+
+        assert_eq!(actions[0].id, CODEX_GOAL_ACTION_ID);
+        assert!(handles.is_empty());
+        let resolved = stateless_native_action_handle(
+            &ProviderKind::Codex,
+            Path::new("."),
+            actions[0].id.as_str(),
+        )
+        .expect("stateless goal handle");
+        assert_eq!(resolved.name, "goal");
+        assert_eq!(resolved.kind, NativeActionKind::Command);
     }
 
     #[test]
@@ -7401,6 +7908,13 @@ mod tests {
             StructuredCliProvider::Antigravity
         );
         assert!(structured_provider(&ProviderKind::Cursor).is_err());
+    }
+
+    #[test]
+    fn structured_handoff_digest_is_only_loaded_for_a_fresh_plain_turn() {
+        assert!(should_load_handoff_digest(None, false));
+        assert!(!should_load_handoff_digest(Some("session-1"), false));
+        assert!(!should_load_handoff_digest(None, true));
     }
 
     #[test]

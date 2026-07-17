@@ -13,20 +13,27 @@ use std::{
     sync::Arc,
 };
 
+use integrator_core::IntegratorError;
 use integrator_runtime::GithubCliService;
 use serde::Serialize;
 use serde_json::Value;
 use session_store::LocalStore;
 use tauri::Manager;
+use zeroize::Zeroizing;
 
 use crate::commands::{CommandError, CommandResult};
+use crate::credential_store::{self, CredentialStorage};
 use crate::native_actions::{IntegratorSkillEntry, discover_integrator_skills};
 use crate::state::AppState;
 
 /// Written by the renderer through the standard settings path
 /// (`setSetting("skills.integrator.enabled", …)` prefixes `settings.`).
 const ENABLED_SETTING_KEY: &str = "settings.skills.integrator.enabled";
-const SKILL_CREDENTIAL_SERVICE: &str = "dev.aiintegrator.skill-credential";
+const PRODUCTION_SKILL_CREDENTIAL_SERVICE: &str = "dev.aiintegrator.skill-credential.production.v1";
+const DEVELOPMENT_SKILL_SECRET_PRESENCE_SETTING_KEY: &str =
+    "settings.skills.secure-data.development.presence";
+const PRODUCTION_SKILL_SECRET_PRESENCE_SETTING_KEY: &str =
+    "settings.skills.secure-data.production.presence";
 const PROJECTION_DIR: &str = "skills-projection";
 /// Per-skill copy bounds for the projection overlay. Oversized content is
 /// skipped file-by-file so one huge reference file cannot block a skill.
@@ -38,11 +45,11 @@ pub fn skills_root(documents: &Path) -> PathBuf {
     documents.join("AI Integrator").join("Skills")
 }
 
-pub fn plugins_root(documents: &Path) -> PathBuf {
+pub(crate) fn plugins_root(documents: &Path) -> PathBuf {
     documents.join("AI Integrator").join("Plugins")
 }
 
-fn documents_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
+pub(crate) fn documents_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
     app.path().document_dir().ok()
 }
 
@@ -54,13 +61,14 @@ pub fn ensure_roots(app: &tauri::AppHandle) -> io::Result<()> {
     };
     fs::create_dir_all(skills_root(&documents))?;
     fs::create_dir_all(plugins_root(&documents))?;
+    fs::create_dir_all(crate::integrator_mcp::mcps_root(&documents))?;
     Ok(())
 }
 
 /// First-party plugins bundled with the app. Release builds resolve the
 /// bundled resource tree; dev builds fall back to the repository checkout so
 /// `tauri dev` exercises the same catalog without a packaging step.
-fn bundled_root(app: &tauri::AppHandle) -> Option<PathBuf> {
+pub(crate) fn bundled_root(app: &tauri::AppHandle) -> Option<PathBuf> {
     if let Ok(resources) = app.path().resource_dir() {
         let bundled = resources.join("first-party-plugins");
         if bundled.is_dir() {
@@ -143,6 +151,7 @@ pub struct IntegratorSkillCredentialInfo {
     pub required: bool,
     pub configured: bool,
     pub available: bool,
+    pub storage: CredentialStorage,
     pub help_url: String,
 }
 
@@ -161,12 +170,15 @@ fn overview(app: &tauri::AppHandle, store: &LocalStore) -> CommandResult<Integra
         message: "could not locate the Documents folder".into(),
     })?;
     let overrides = enabled_overrides(store);
-    let invocation_counts = store.skill_invocation_counts().map_err(CommandError::from)?;
+    let credential_presence = credential_presence(store);
+    let invocation_counts = store
+        .skill_invocation_counts()
+        .map_err(CommandError::from)?;
     let skills = discover_all(app)
         .into_iter()
         .map(|entry| {
             let credential = credential_definition(&entry)
-                .map(|definition| credential_info(definition));
+                .map(|definition| credential_info(&credential_presence, definition));
             IntegratorSkillInfo {
                 enabled: is_enabled(&overrides, &entry.name),
                 default_enabled: default_enabled(&entry.name),
@@ -209,7 +221,7 @@ const BLS_CREDENTIAL: SkillCredentialDefinition = SkillCredentialDefinition {
 const CENSUS_CREDENTIAL: SkillCredentialDefinition = SkillCredentialDefinition {
     id: "census-api-key",
     label: "Census API key",
-    required: false,
+    required: true,
     help_url: "https://api.census.gov/data/key_signup.html",
 };
 const EIA_CREDENTIAL: SkillCredentialDefinition = SkillCredentialDefinition {
@@ -221,7 +233,7 @@ const EIA_CREDENTIAL: SkillCredentialDefinition = SkillCredentialDefinition {
 const ALPHA_VANTAGE_CREDENTIAL: SkillCredentialDefinition = SkillCredentialDefinition {
     id: "alpha-vantage-api-key",
     label: "Alpha Vantage API key",
-    required: false,
+    required: true,
     help_url: "https://www.alphavantage.co/support/#api-key",
 };
 
@@ -234,7 +246,7 @@ fn credential_definition(entry: &IntegratorSkillEntry) -> Option<SkillCredential
         "gov-data:bls" => Some(BLS_CREDENTIAL),
         "gov-data:census" => Some(CENSUS_CREDENTIAL),
         "gov-data:eia" => Some(EIA_CREDENTIAL),
-        "market-data:market-data" => Some(ALPHA_VANTAGE_CREDENTIAL),
+        "market-data:alpha-vantage" => Some(ALPHA_VANTAGE_CREDENTIAL),
         _ => None,
     }
 }
@@ -251,37 +263,116 @@ fn credential_by_id(id: &str) -> Option<SkillCredentialDefinition> {
     .find(|definition| definition.id == id)
 }
 
-fn skill_credential_entry(id: &str) -> CommandResult<keyring::Entry> {
-    keyring::Entry::new(SKILL_CREDENTIAL_SERVICE, id).map_err(|_| CommandError {
-        code: "credential-store-unavailable",
-        message: "The operating system credential store is unavailable.".into(),
-    })
+fn skill_secret_presence_setting_key() -> &'static str {
+    match credential_store::storage() {
+        CredentialStorage::ProtectedLocalFile => DEVELOPMENT_SKILL_SECRET_PRESENCE_SETTING_KEY,
+        CredentialStorage::OsCredentialStore => PRODUCTION_SKILL_SECRET_PRESENCE_SETTING_KEY,
+    }
 }
 
-fn credential_info(definition: SkillCredentialDefinition) -> IntegratorSkillCredentialInfo {
-    let status = skill_credential_entry(definition.id).and_then(|entry| match entry.get_password() {
-        Ok(value) => Ok(!value.is_empty()),
-        Err(keyring::Error::NoEntry) => Ok(false),
-        Err(_) => Err(CommandError {
-            code: "credential-store-unavailable",
-            message: "The operating system credential store could not be read.".into(),
-        }),
-    });
+fn credential_presence_at(store: &LocalStore, setting_key: &str) -> serde_json::Map<String, Value> {
+    store
+        .get_setting(setting_key)
+        .ok()
+        .flatten()
+        .and_then(|setting| setting.value.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn credential_presence(store: &LocalStore) -> serde_json::Map<String, Value> {
+    credential_presence_at(store, skill_secret_presence_setting_key())
+}
+
+fn set_credential_presence_at(store: &LocalStore, setting_key: &str, id: &str, configured: bool) {
+    let mut presence = credential_presence_at(store, setting_key);
+    presence.insert(id.into(), Value::Bool(configured));
+    let _ = store.set_setting(setting_key, Value::Object(presence));
+}
+
+fn set_credential_presence(store: &LocalStore, id: &str, configured: bool) {
+    set_credential_presence_at(store, skill_secret_presence_setting_key(), id, configured);
+}
+
+fn credential_is_configured(store: &LocalStore, id: &str) -> bool {
+    credential_presence(store)
+        .get(id)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+pub(crate) fn skill_credential_secret(
+    state: &AppState,
+    id: &str,
+    required: bool,
+) -> integrator_core::Result<Option<Zeroizing<String>>> {
+    let definition = credential_by_id(id)
+        .ok_or_else(|| IntegratorError::InvalidInput("unknown skill credential".into()))?;
+    if let Some(secret) = state.cached_skill_credential(definition.id)? {
+        return Ok(Some(secret));
+    }
+    if !credential_is_configured(&state.store, definition.id) {
+        return if required {
+            Err(IntegratorError::InvalidInput(format!(
+                "add the {} in AI Integrator Settings before using this skill",
+                definition.label
+            )))
+        } else {
+            Ok(None)
+        };
+    }
+    let value = match credential_store::read(PRODUCTION_SKILL_CREDENTIAL_SERVICE, definition.id) {
+        Ok(value) => value,
+        Err(_) if !required => return Ok(None),
+        Err(_) => {
+            return Err(IntegratorError::Unavailable(
+                "the native credential store could not be read".into(),
+            ));
+        }
+    };
+    if let Some(secret) = value {
+        state.cache_skill_credential(definition.id, secret.clone())?;
+        set_credential_presence(&state.store, definition.id, true);
+        Ok(Some(secret))
+    } else {
+        set_credential_presence(&state.store, definition.id, false);
+        if required {
+            Err(IntegratorError::InvalidInput(format!(
+                "add the {} in AI Integrator Settings before using this skill",
+                definition.label
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+fn credential_info(
+    presence: &serde_json::Map<String, Value>,
+    definition: SkillCredentialDefinition,
+) -> IntegratorSkillCredentialInfo {
+    let storage = credential_store::storage();
+    let available = credential_store::available(PRODUCTION_SKILL_CREDENTIAL_SERVICE, definition.id);
     IntegratorSkillCredentialInfo {
         id: definition.id.into(),
         label: definition.label.into(),
         required: definition.required,
-        configured: status.as_ref().copied().unwrap_or(false),
-        available: status.is_ok(),
+        configured: presence
+            .get(definition.id)
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        available,
+        storage,
         help_url: definition.help_url.into(),
     }
 }
 
 #[tauri::command]
 pub fn integrator_skill_credential_set(
+    state: tauri::State<'_, AppState>,
     credential_id: String,
     secret: String,
 ) -> CommandResult<()> {
+    let secret = Zeroizing::new(secret);
     let id = credential_id.trim();
     let Some(definition) = credential_by_id(id) else {
         return Err(CommandError {
@@ -296,19 +387,27 @@ pub fn integrator_skill_credential_set(
             message: format!("Paste a valid {} before saving.", definition.label),
         });
     }
-    skill_credential_entry(definition.id)?
-        .set_password(value)
-        .map_err(|_| CommandError {
+    credential_store::write(PRODUCTION_SKILL_CREDENTIAL_SERVICE, definition.id, value).map_err(
+        |_| CommandError {
             code: "credential-store-unavailable",
             message: format!(
-                "The {} could not be saved to the operating system credential store.",
+                "The {} could not be saved to native credential storage.",
                 definition.label
             ),
-        })
+        },
+    )?;
+    state
+        .cache_skill_credential(definition.id, Zeroizing::new(value.to_owned()))
+        .map_err(CommandError::from)?;
+    set_credential_presence(&state.store, definition.id, true);
+    Ok(())
 }
 
 #[tauri::command]
-pub fn integrator_skill_credential_clear(credential_id: String) -> CommandResult<()> {
+pub fn integrator_skill_credential_clear(
+    state: tauri::State<'_, AppState>,
+    credential_id: String,
+) -> CommandResult<()> {
     let id = credential_id.trim();
     let Some(definition) = credential_by_id(id) else {
         return Err(CommandError {
@@ -316,16 +415,20 @@ pub fn integrator_skill_credential_clear(credential_id: String) -> CommandResult
             message: "Unknown skill credential.".into(),
         });
     };
-    match skill_credential_entry(definition.id)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(_) => Err(CommandError {
+    credential_store::delete(PRODUCTION_SKILL_CREDENTIAL_SERVICE, definition.id).map_err(|_| {
+        CommandError {
             code: "credential-store-unavailable",
             message: format!(
-                "The {} could not be removed from the operating system credential store.",
+                "The {} could not be removed from native credential storage.",
                 definition.label
             ),
-        }),
-    }
+        }
+    })?;
+    state
+        .forget_skill_credential(definition.id)
+        .map_err(CommandError::from)?;
+    set_credential_presence(&state.store, definition.id, false);
+    Ok(())
 }
 
 #[tauri::command]
@@ -340,6 +443,71 @@ pub async fn integrator_skills_overview(
             code: "unavailable",
             message: "skills discovery worker failed".into(),
         })?
+}
+
+/// Bounded read-only display of one local skill's SKILL.md, for the
+/// explicit "view full prompt" action — never surfaced automatically, and
+/// distinct from discovery/projection, which never expose skill bodies.
+const MAX_SKILL_BODY_BYTES: u64 = 256 * 1024;
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegratorSkillBody {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+    pub truncated: bool,
+}
+
+#[tauri::command]
+pub async fn integrator_skill_body(
+    app: tauri::AppHandle,
+    name: String,
+) -> CommandResult<IntegratorSkillBody> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let entry = discover_all(&app)
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| CommandError {
+                code: "not-found",
+                message: "This skill is no longer available.".into(),
+            })?;
+        let path = skill_file(&entry);
+        let metadata = fs::symlink_metadata(&path).map_err(|_| CommandError {
+            code: "not-found",
+            message: "The skill file is unavailable.".into(),
+        })?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(CommandError {
+                code: "not-found",
+                message: "The skill file is unavailable.".into(),
+            });
+        }
+        let content = fs::read_to_string(&path).map_err(|_| CommandError {
+            code: "unavailable",
+            message: "Could not read the skill file.".into(),
+        })?;
+        let truncated = metadata.len() > MAX_SKILL_BODY_BYTES;
+        let body = if truncated {
+            content
+                .chars()
+                .take(MAX_SKILL_BODY_BYTES as usize)
+                .collect()
+        } else {
+            content
+        };
+        Ok(IntegratorSkillBody {
+            name: entry.name,
+            description: entry.description,
+            body,
+            truncated,
+        })
+    })
+    .await
+    .map_err(|_| CommandError {
+        code: "unavailable",
+        message: "skill body worker failed".into(),
+    })?
 }
 
 /// Install one plugin repository (`owner/name`) into the user's Plugins root
@@ -419,47 +587,12 @@ pub async fn integrator_skills_uninstall(
     let store = Arc::clone(&state.store);
     tauri::async_runtime::spawn_blocking(move || {
         let id = plugin_id.trim();
-        if id.is_empty()
-            || id.starts_with('.')
-            || !id
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
-        {
-            return Err(CommandError {
-                code: "invalid-input",
-                message: "Unknown installed plugin.".into(),
-            });
-        }
         let documents = documents_dir(&app).ok_or(CommandError {
             code: "unavailable",
             message: "could not locate the Documents folder".into(),
         })?;
         let root = plugins_root(&documents);
-        let target = root.join(id);
-        let metadata = fs::symlink_metadata(&target).map_err(|_| CommandError {
-            code: "not-found",
-            message: "This plugin is no longer installed.".into(),
-        })?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(CommandError {
-                code: "unauthorized",
-                message: "The selected plugin is not a removable plugin directory.".into(),
-            });
-        }
-        let canonical_root = fs::canonicalize(&root).map_err(|_| CommandError {
-            code: "unavailable",
-            message: "The Plugins folder could not be verified.".into(),
-        })?;
-        let canonical_target = fs::canonicalize(&target).map_err(|_| CommandError {
-            code: "not-found",
-            message: "This plugin is no longer installed.".into(),
-        })?;
-        if canonical_target.parent() != Some(canonical_root.as_path()) {
-            return Err(CommandError {
-                code: "unauthorized",
-                message: "The selected plugin is outside the Plugins folder.".into(),
-            });
-        }
+        let canonical_target = resolve_uninstall_target(&root, id)?;
         fs::remove_dir_all(&canonical_target).map_err(|error| CommandError {
             code: "unavailable",
             message: format!("Could not uninstall the plugin: {error}"),
@@ -478,6 +611,46 @@ pub async fn integrator_skills_uninstall(
         code: "unavailable",
         message: "plugin uninstall worker failed".into(),
     })?
+}
+
+fn resolve_uninstall_target(root: &Path, id: &str) -> CommandResult<PathBuf> {
+    if id.is_empty()
+        || id.starts_with('.')
+        || !id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+    {
+        return Err(CommandError {
+            code: "invalid-input",
+            message: "Unknown installed plugin.".into(),
+        });
+    }
+    let target = root.join(id);
+    let metadata = fs::symlink_metadata(&target).map_err(|_| CommandError {
+        code: "not-found",
+        message: "This plugin is no longer installed.".into(),
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(CommandError {
+            code: "unauthorized",
+            message: "The selected plugin is not a removable plugin directory.".into(),
+        });
+    }
+    let canonical_root = fs::canonicalize(root).map_err(|_| CommandError {
+        code: "unavailable",
+        message: "The Plugins folder could not be verified.".into(),
+    })?;
+    let canonical_target = fs::canonicalize(target).map_err(|_| CommandError {
+        code: "not-found",
+        message: "This plugin is no longer installed.".into(),
+    })?;
+    if canonical_target.parent() != Some(canonical_root.as_path()) {
+        return Err(CommandError {
+            code: "unauthorized",
+            message: "The selected plugin is outside the Plugins folder.".into(),
+        });
+    }
+    Ok(canonical_target)
 }
 
 /// Remove stale projection overlays. Called once at startup; overlays are
@@ -540,12 +713,44 @@ pub fn skill_invocation_block(entry: &IntegratorSkillEntry, rest: &str) -> Comma
     } else {
         request
     };
+    let guidance = skill_api_guidance(entry)
+        .map(|value| format!("\n\nSecure data access: {value}"))
+        .unwrap_or_default();
     Ok(format!(
         "The user explicitly invoked the skill \"{name}\". Follow its instructions for this \
          request. Supporting files live next to the skill at {dir}.\n<skill name=\"{name}\">\n\
-         {body}\n</skill>\n\nUser request: {request}",
+         {body}\n</skill>{guidance}\n\nUser request: {request}",
         name = entry.name,
         dir = entry.path.to_string_lossy(),
+    ))
+}
+
+fn skill_api_guidance(entry: &IntegratorSkillEntry) -> Option<String> {
+    if entry.source != "first-party" {
+        return None;
+    }
+    let example = match entry.name.as_str() {
+        "gov-data:fred" => {
+            r#"{"provider":"fred","path":"/fred/series/observations","query":{"series_id":"GDP","file_type":"json"}}"#
+        }
+        "gov-data:bls" => {
+            r#"{"provider":"bls","body":{"seriesid":["LNS14000000"],"startyear":"2020","endyear":"2026"}}"#
+        }
+        "gov-data:census" => {
+            r#"{"provider":"census","path":"/data/2023/acs/acs5","query":{"get":"NAME,B01003_001E","for":"state:*"}}"#
+        }
+        "gov-data:eia" => {
+            r#"{"provider":"eia","path":"/v2/petroleum/pri/gnd/data/","query":{"frequency":"weekly","data[0]":"value"}}"#
+        }
+        "market-data:alpha-vantage" => {
+            r#"{"provider":"alpha-vantage","query":{"function":"TIME_SERIES_DAILY","symbol":"AAPL","outputsize":"compact"}}"#
+        }
+        _ => return None,
+    };
+    Some(format!(
+        "Call `skill_data_request` on the `integrator` MCP server with `{example}`. \
+         The running native app reads the configured key from the OS credential store; \
+         never request, print, or inspect environment variables for this credential."
     ))
 }
 
@@ -629,6 +834,16 @@ pub fn write_projection(
             fs::create_dir_all(&target)?;
             fs::copy(&entry.path, target.join("SKILL.md"))?;
         }
+        if let Some(guidance) = skill_api_guidance(entry) {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(target.join("SKILL.md"))?;
+            write!(
+                file,
+                "\n\n## AI Integrator secure data access\n\n{guidance}\n"
+            )?;
+        }
         entries.push(IntegratorSkillEntry {
             name: entry.name.clone(),
             description: entry.description.clone(),
@@ -696,6 +911,49 @@ mod tests {
     }
 
     #[test]
+    fn market_data_secret_authority_belongs_only_to_alpha_vantage() {
+        let entry = |name: &str| IntegratorSkillEntry {
+            name: name.into(),
+            description: "d".into(),
+            source: "first-party".into(),
+            path: PathBuf::from("/skills/provider"),
+        };
+        assert_eq!(
+            credential_definition(&entry("market-data:alpha-vantage"))
+                .map(|definition| definition.id),
+            Some(ALPHA_VANTAGE_CREDENTIAL.id)
+        );
+        assert!(ALPHA_VANTAGE_CREDENTIAL.required);
+        assert!(credential_definition(&entry("market-data:stooq")).is_none());
+        assert!(credential_definition(&entry("market-data:yfinance")).is_none());
+        assert!(skill_api_guidance(&entry("market-data:stooq")).is_none());
+        assert!(skill_api_guidance(&entry("market-data:yfinance")).is_none());
+    }
+
+    #[test]
+    fn uninstall_target_is_one_real_top_level_directory() {
+        let root = std::env::temp_dir().join(format!("skills-uninstall-{}", uuid::Uuid::new_v4()));
+        let plugin = root.join("openai-skills");
+        fs::create_dir_all(&plugin).expect("plugin fixture");
+        assert_eq!(
+            resolve_uninstall_target(&root, "openai-skills").expect("safe plugin"),
+            fs::canonicalize(&plugin).expect("canonical plugin")
+        );
+        assert!(resolve_uninstall_target(&root, "../escape").is_err());
+        assert!(resolve_uninstall_target(&root, ".hidden").is_err());
+        #[cfg(unix)]
+        {
+            let outside = root.with_extension("outside");
+            fs::create_dir_all(&outside).expect("outside fixture");
+            std::os::unix::fs::symlink(&outside, root.join("linked-plugin"))
+                .expect("plugin symlink fixture");
+            assert!(resolve_uninstall_target(&root, "linked-plugin").is_err());
+            fs::remove_dir_all(outside).expect("clean outside fixture");
+        }
+        fs::remove_dir_all(root).expect("clean uninstall fixtures");
+    }
+
+    #[test]
     fn projection_copies_bounded_plugin_bundles_and_skips_symlinks() {
         let root = std::env::temp_dir().join(format!("skills-proj-{}", uuid::Uuid::new_v4()));
         let skill_dir = root.join("source").join("fred");
@@ -756,6 +1014,19 @@ mod tests {
     }
 
     #[test]
+    fn secure_data_tool_stays_out_of_the_automatic_skill_index() {
+        let entry = IntegratorSkillEntry {
+            name: "market-data:alpha-vantage".into(),
+            description: "Fetch current market data".into(),
+            source: "first-party".into(),
+            path: PathBuf::from("/skills/alpha-vantage"),
+        };
+        let block = skill_index_block(&[entry]).expect("index");
+        assert!(!block.contains("skill_data_request"));
+        assert!(!block.contains("--skill-api"));
+    }
+
+    #[test]
     fn invocation_block_carries_body_and_rejects_oversized_or_missing_files() {
         let root = std::env::temp_dir().join(format!("skills-invoke-{}", uuid::Uuid::new_v4()));
         let skill_dir = root.join("fred");
@@ -788,5 +1059,53 @@ mod tests {
         };
         assert!(skill_invocation_block(&oversized, "").is_err());
         fs::remove_dir_all(root).expect("clean up invocation fixtures");
+    }
+
+    #[test]
+    fn explicit_first_party_invocation_includes_the_secure_data_tool() {
+        let root = std::env::temp_dir().join(format!("skills-api-{}", uuid::Uuid::new_v4()));
+        let skill_dir = root.join("alpha-vantage");
+        fs::create_dir_all(&skill_dir).expect("fixture");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: alpha-vantage\ndescription: d\n---\nFETCH MARKET DATA",
+        )
+        .expect("skill file");
+        let entry = IntegratorSkillEntry {
+            name: "market-data:alpha-vantage".into(),
+            description: "d".into(),
+            source: "first-party".into(),
+            path: skill_dir,
+        };
+        let block = skill_invocation_block(&entry, "AAPL today").expect("invocation");
+        assert!(block.contains("skill_data_request"));
+        assert!(block.contains("\"provider\":\"alpha-vantage\""));
+        fs::remove_dir_all(root).expect("clean up invocation fixtures");
+    }
+
+    #[test]
+    fn credential_presence_is_non_secret_local_metadata() {
+        let store = LocalStore::open_in_memory().expect("store");
+        assert!(credential_presence(&store).is_empty());
+        assert!(!credential_is_configured(&store, CENSUS_CREDENTIAL.id));
+
+        set_credential_presence(&store, CENSUS_CREDENTIAL.id, true);
+        assert_eq!(
+            credential_presence(&store)
+                .get(CENSUS_CREDENTIAL.id)
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(credential_is_configured(&store, CENSUS_CREDENTIAL.id));
+        set_credential_presence(&store, CENSUS_CREDENTIAL.id, false);
+        assert!(!credential_is_configured(&store, CENSUS_CREDENTIAL.id));
+    }
+
+    #[test]
+    fn development_avoids_the_os_credential_store() {
+        assert_eq!(
+            credential_store::storage(),
+            CredentialStorage::ProtectedLocalFile
+        );
     }
 }

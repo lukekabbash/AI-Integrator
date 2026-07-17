@@ -198,6 +198,51 @@ impl GithubCliService {
         Ok(())
     }
 
+    /// Every `SKILL.md` path in a repository's default branch, sorted. Used
+    /// to preview a plugin's real catalog before installing anything.
+    pub fn repository_skill_paths(&self, repository: &str) -> Result<Vec<String>> {
+        validate_repository_name(repository)?;
+        let url = format!("repos/{}/git/trees/HEAD?recursive=1", repository.trim());
+        let output = self.output(&["api", &url], GITHUB_NETWORK_TIMEOUT)?;
+        if !output.success {
+            return Err(IntegratorError::Unavailable(redact_text(&output.stderr)));
+        }
+        let parsed: Value = serde_json::from_str(&output.stdout)?;
+        let tree = parsed
+            .get("tree")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut paths: Vec<String> = tree
+            .into_iter()
+            .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("blob"))
+            .filter_map(|entry| entry.get("path").and_then(Value::as_str).map(str::to_owned))
+            .filter(|path| path.ends_with("SKILL.md"))
+            .collect();
+        paths.sort();
+        paths.truncate(2_000);
+        Ok(paths)
+    }
+
+    /// One file's raw text content via the Contents API's raw media type
+    /// (no base64 decoding needed). `path` must come from a trusted listing
+    /// such as [`Self::repository_skill_paths`].
+    pub fn raw_file_content(&self, repository: &str, path: &str) -> Result<String> {
+        validate_repository_name(repository)?;
+        if path.is_empty() || path.len() > 500 || path.contains("..") || path.contains('\0') {
+            return Err(IntegratorError::InvalidInput("invalid file path".into()));
+        }
+        let url = format!("repos/{}/contents/{path}", repository.trim());
+        let output = self.output(
+            &["api", "-H", "Accept: application/vnd.github.raw", &url],
+            GITHUB_TIMEOUT,
+        )?;
+        if !output.success {
+            return Err(IntegratorError::Unavailable(redact_text(&output.stderr)));
+        }
+        Ok(output.stdout)
+    }
+
     fn required(&self, args: &[&str], cwd: &Path, timeout: Duration) -> Result<String> {
         let output = run_bounded_with_limits(
             &self.executable,

@@ -2154,8 +2154,8 @@ function DelegationRow({
       animate={{ opacity: 1, x: 0 }}
       exit={reduceMotion ? { opacity: 0 } : { opacity: 0, x: -4 }}
       transition={reduceMotion ? { duration: 0 } : { type: "spring", stiffness: 460, damping: 36 }}
-      onHoverStart={() => setHovered(true)}
-      onHoverEnd={() => setHovered(false)}
+      onPointerEnter={() => setHovered(true)}
+      onPointerLeave={() => setHovered(false)}
       onFocus={() => setHovered(true)}
       onBlur={(event) => {
         if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setHovered(false);
@@ -2282,8 +2282,8 @@ function AgentRow({
       initial={reduceMotion ? false : { opacity: 0, x: -5 }}
       animate={{ opacity: 1, x: 0 }}
       transition={reduceMotion ? { duration: 0 } : { type: "spring", stiffness: 460, damping: 36 }}
-      onHoverStart={() => setHovered(true)}
-      onHoverEnd={() => setHovered(false)}
+      onPointerEnter={() => setHovered(true)}
+      onPointerLeave={() => setHovered(false)}
     >
       <AgentGlyph
         variant={identity.variant}

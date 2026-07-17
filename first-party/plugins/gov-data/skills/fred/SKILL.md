@@ -7,20 +7,21 @@ description: Fetch US and international economic time series from FRED (Federal 
 
 ## Requirements
 
-A free API key from https://fred.stlouisfed.org/docs/api/api_key.html, set as
-the environment variable `FRED_API_KEY`. If it is missing, tell the user how
-to get one — do not proceed with scraping.
+A free API key from https://fred.stlouisfed.org/docs/api/api_key.html, saved
+in AI Integrator Settings. Call `skill_data_request` on the `integrator` MCP
+server with provider `fred`; never ask for, print, or inspect the key. If it
+is missing, tell the user how to get one — do not scrape.
 
 ## Core endpoints
 
 Base: `https://api.stlouisfed.org/fred/`
 
 - Observations (the data):
-  `series/observations?series_id=GDP&api_key=$FRED_API_KEY&file_type=json`
+  `series/observations?series_id=GDP&file_type=json`
   Optional: `observation_start=YYYY-MM-DD`, `observation_end`, `units`
   (`pc1` = % change from year ago, `pch` = % change), `frequency` (`q`, `a`).
 - Search for a series id:
-  `series/search?search_text=median+home+price&api_key=...&file_type=json`
+  `series/search?search_text=median+home+price&file_type=json`
 - Series metadata: `series?series_id=CPIAUCSL&...`
 
 ## Series ids you should know

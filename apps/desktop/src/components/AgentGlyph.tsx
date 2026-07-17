@@ -16,21 +16,83 @@ interface AgentGlyphProps {
 type MotionFamily =
   "dormant" | "forming" | "working" | "watching" | "interrupted" | "resting" | "failed";
 
-// All ten bodies share the same path structure, so an agent can transform
-// without losing its ordinal identity. The runes below stay fixed per ordinal;
-// lifecycle motion is a separate layer and never changes who the glyph belongs to.
-const bodyPaths = [
-  "M16 3.25 C23.8 3.25 28.75 8.2 28.75 16 C28.75 23.8 23.8 28.75 16 28.75 C8.2 28.75 3.25 23.8 3.25 16 C3.25 8.2 8.2 3.25 16 3.25 Z",
-  "M16 2.75 C20.2 7.7 24.8 12.2 29.25 16 C24.8 19.8 20.2 24.3 16 29.25 C11.8 24.3 7.2 19.8 2.75 16 C7.2 12.2 11.8 7.7 16 2.75 Z",
-  "M16 3.5 C20.5 3.5 24.2 3.5 26.8 5.2 C28.5 9 28.5 23 26.8 26.8 C22.8 28.5 9.2 28.5 5.2 26.8 C3.5 23 3.5 9 5.2 5.2 C7.8 3.5 11.5 3.5 16 3.5 Z",
-  "M16 6 C24 6 30 10.2 30 16 C30 21.8 24 26 16 26 C8 26 2 21.8 2 16 C2 10.2 8 6 16 6 Z",
-  "M16 2 C21.8 2 26 8 26 16 C26 24 21.8 30 16 30 C10.2 30 6 24 6 16 C6 8 10.2 2 16 2 Z",
-  "M16 2.75 C19.4 8.2 24.6 10.6 29.25 16 C24.6 21.4 19.4 23.8 16 29.25 C12.6 23.8 7.4 21.4 2.75 16 C7.4 10.6 12.6 8.2 16 2.75 Z",
-  "M16 3 C23.5 1.8 29.7 8.2 27.3 16.4 C25.2 24.4 21.4 30 13.2 27.8 C5.2 28.2 0.9 22.1 3.4 13.9 C5.5 6 9.1 4.4 16 3 Z",
-  "M16 2.8 C21.3 6.2 28.4 8.9 29.2 14.4 C26 20 23.6 27.1 18 29.2 C12.4 26 5.3 23.6 2.8 18 C6 12.4 8.4 5.3 16 2.8 Z",
-  "M16 3 C21.5 3 23.3 9.8 29 12.2 C28.1 19.1 23.5 21.8 19 28.8 C12 29 9.7 24.2 3 20.5 C2.6 13.8 8.5 10.5 10 4.5 C11.7 3.4 13.6 3 16 3 Z",
-  "M16 3.2 C22 3.2 27.3 4.8 29 8.2 C24.5 12.7 24.5 19.3 29 23.8 C27.3 27.2 22 28.8 16 28.8 C10 28.8 4.7 27.2 3 23.8 C7.5 19.3 7.5 12.7 3 8.2 C4.7 4.8 10 3.2 16 3.2 Z",
+interface SigilFrame {
+  radii: readonly number[];
+  rotation?: number;
+  scaleX?: number;
+  scaleY?: number;
+}
+
+// Straight segments only: these are rose-window, compass, shield, reliquary,
+// and heraldic-star frames rather than organic blobs. Every frame has sixteen
+// vertices, so morphing moves crisp joints without ever bowing an edge.
+const sigilFrames: readonly SigilFrame[] = [
+  {
+    radii: [
+      13.8, 13.1, 13.8, 13.1, 13.8, 13.1, 13.8, 13.1, 13.8, 13.1, 13.8, 13.1, 13.8, 13.1, 13.8,
+      13.1,
+    ],
+  },
+  {
+    radii: [14.2, 8.4, 14.2, 8.4, 14.2, 8.4, 14.2, 8.4, 14.2, 8.4, 14.2, 8.4, 14.2, 8.4, 14.2, 8.4],
+  },
+  {
+    radii: [
+      13.9, 11.2, 9.4, 11.2, 13.9, 11.2, 9.4, 11.2, 13.9, 11.2, 9.4, 11.2, 13.9, 11.2, 9.4, 11.2,
+    ],
+    rotation: 11.25,
+  },
+  {
+    radii: [
+      13.9, 12.4, 13.9, 12.4, 13.9, 12.4, 13.9, 12.4, 13.9, 12.4, 13.9, 12.4, 13.9, 12.4, 13.9,
+      12.4,
+    ],
+    scaleX: 1.04,
+    scaleY: 0.68,
+  },
+  {
+    radii: [
+      13.9, 12.4, 13.9, 12.4, 13.9, 12.4, 13.9, 12.4, 13.9, 12.4, 13.9, 12.4, 13.9, 12.4, 13.9,
+      12.4,
+    ],
+    scaleX: 0.68,
+    scaleY: 1.04,
+  },
+  { radii: [14.2, 8.1, 9.5, 8.1, 14.2, 8.1, 9.5, 8.1, 14.2, 8.1, 9.5, 8.1, 14.2, 8.1, 9.5, 8.1] },
+  {
+    radii: [
+      13.8, 10.6, 12.8, 8.7, 13.8, 10.6, 12.8, 8.7, 13.8, 10.6, 12.8, 8.7, 13.8, 10.6, 12.8, 8.7,
+    ],
+    rotation: 11.25,
+  },
+  {
+    radii: [14.3, 9.8, 12.2, 9.1, 14.3, 9.8, 12.2, 9.1, 14.3, 9.8, 12.2, 9.1, 14.3, 9.8, 12.2, 9.1],
+    rotation: 22.5,
+  },
+  {
+    radii: [
+      14.2, 10.4, 12.8, 8.6, 13.4, 9.2, 14, 10.2, 13.1, 9.1, 12.4, 8.8, 14.1, 10.1, 13.2, 9.4,
+    ],
+  },
+  {
+    radii: [13.8, 9.2, 11.8, 13.2, 9, 13.2, 11.8, 9.2, 13.8, 9.2, 11.8, 13.2, 9, 13.2, 11.8, 9.2],
+    rotation: 11.25,
+  },
 ] as const;
+
+function sigilPath({ radii, rotation = 0, scaleX = 1, scaleY = 1 }: SigilFrame): string {
+  const rotationRadians = (rotation * Math.PI) / 180;
+  return `${radii
+    .map((radius, index) => {
+      const angle = -Math.PI / 2 + rotationRadians + (index / radii.length) * Math.PI * 2;
+      const x = Number((16 + Math.cos(angle) * radius * scaleX).toFixed(2));
+      const y = Number((16 + Math.sin(angle) * radius * scaleY).toFixed(2));
+      return `${index === 0 ? "M" : "L"}${x} ${y}`;
+    })
+    .join(" ")} Z`;
+}
+
+const bodyPaths = sigilFrames.map(sigilPath);
 
 const runes: readonly ReactNode[] = [
   <Fragment key="axis">
@@ -58,8 +120,8 @@ const runes: readonly ReactNode[] = [
     <circle cx="16" cy="16" r="1.7" />
   </Fragment>,
   <Fragment key="wave">
-    <path d="M8 16c2.65-5.5 5.3-5.5 7.95 0s5.3 5.5 7.95 0" />
-    <path d="M10.2 22h11.6M10.2 10h11.6" />
+    <path d="m9 20 7-11 7 11H9Z" />
+    <path d="m9 12 7 11 7-11H9Z" />
     <circle cx="16" cy="16" r="1.4" />
   </Fragment>,
   <Fragment key="cycle">
@@ -129,19 +191,23 @@ function loop(duration: number) {
   };
 }
 
+function mechanicalLoop(duration: number) {
+  return { ...loop(duration), ease: [0.72, 0, 0.28, 1] as const };
+}
+
 function pathTransition(state: AgentGlyphState, still: boolean) {
   if (still) return { duration: 0 };
   switch (state) {
     case "starting":
-      return loop(2.15);
+      return mechanicalLoop(2.15);
     case "running":
-      return loop(4.1);
+      return mechanicalLoop(4.1);
     case "pending-approval":
-      return loop(6.2);
+      return mechanicalLoop(6.2);
     case "waiting":
-      return loop(5.4);
+      return mechanicalLoop(5.4);
     case "interrupted":
-      return loop(4.8);
+      return mechanicalLoop(4.8);
     default:
       return { duration: 0.2 };
   }
@@ -179,7 +245,7 @@ const MOTION_PROFILES: Record<MotionFamily, MotionProfile> = {
   },
   working: {
     body: {
-      animate: { rotate: [0, 2.2, -1.2, 0], scale: [0.96, 1.025, 0.985, 0.96] },
+      animate: { rotate: [0, 1.6, -0.8, 0], scale: [0.99, 1.012, 1, 0.99] },
       duration: 4.1,
     },
     rune: {
@@ -194,7 +260,7 @@ const MOTION_PROFILES: Record<MotionFamily, MotionProfile> = {
   },
   watching: {
     body: {
-      animate: { rotate: [-1.2, 1.2, -1.2], scale: [0.985, 1.01, 0.985] },
+      animate: { rotate: [-0.8, 0.8, -0.8] },
       duration: 5.8,
     },
     rune: {

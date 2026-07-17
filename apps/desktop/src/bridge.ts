@@ -71,6 +71,7 @@ export interface IntegratorSkillCredentialInfo {
   required: boolean;
   configured: boolean;
   available: boolean;
+  storage: "protectedLocalFile" | "osCredentialStore";
   helpUrl: string;
 }
 
@@ -80,6 +81,36 @@ export interface IntegratorSkillsOverview {
   pluginsRoot: string;
   bundledAvailable: boolean;
   skills: IntegratorSkillInfo[];
+}
+
+/** One skill read live from a curated repository's SKILL.md, before install. */
+export interface RemoteSkillPreview {
+  name: string;
+  description: string;
+  path: string;
+}
+
+export interface RemoteSkillsPreview {
+  skills: RemoteSkillPreview[];
+  /** Real count on GitHub; may exceed `skills.length` when truncated. */
+  totalFound: number;
+  truncated: boolean;
+}
+
+/** One remote skill's full raw SKILL.md text, fetched on demand only when
+ * the user explicitly opens it. */
+export interface RemoteSkillBody {
+  name: string;
+  body: string;
+  truncated: boolean;
+}
+
+/** One local (installed) skill's full raw SKILL.md text. */
+export interface IntegratorSkillBody {
+  name: string;
+  description: string;
+  body: string;
+  truncated: boolean;
 }
 
 /**
@@ -355,7 +386,7 @@ export interface LocalAppInfo {
 
 export interface VoiceTypingCredentialStatus {
   configured: boolean;
-  storage: "os-credential-store" | "native-only";
+  storage: "os-credential-store" | "protected-local-file" | "native-only";
   provider: "openai";
 }
 
@@ -607,7 +638,8 @@ export interface ForkTaskInput {
   title: string;
   /**
    * Transcript event id of the assistant reply to branch from. The copy keeps
-   * that reply and everything before it. Omitted for a whole-chat copy.
+   * that reply and everything before it. Omitted for a whole-chat copy, which
+   * excludes the source's unfinished turn when one is still running.
    */
   throughEventId?: string;
 }
@@ -842,6 +874,8 @@ export interface LoadTaskProjectionOptions {
   /** Load items/approvals with last_event_seq < beforeSeq. */
   beforeSeq?: number;
   limit?: number;
+  /** Read the durable projection without waiting on native runtime ownership checks. */
+  skipRuntimeCheck?: boolean;
 }
 
 export type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
@@ -905,12 +939,7 @@ export interface RuntimeTerminalOutputEvent {
  * mission rather than modifying one prompt, so `socratic` can forbid the very
  * thing `explanation` requires. `custom` carries the user's own mission. */
 export type ExplainArchetype =
-  | "explanation"
-  | "socratic"
-  | "optimization"
-  | "critique"
-  | "security"
-  | "custom";
+  "explanation" | "socratic" | "optimization" | "critique" | "security" | "custom";
 
 /** A user-authored archetype. `id` is what `explain.archetype` stores, so it
  * must not collide with a built-in name. */
@@ -990,10 +1019,7 @@ export interface AppBridge {
   clearLocalData(): Promise<void>;
   loadWorkspace(): Promise<WorkspaceSnapshot>;
   /** Paginated archived root chats for Archive UI (not part of workspace bootstrap). */
-  listArchivedTasks(input?: {
-    cursor?: string;
-    limit?: number;
-  }): Promise<ArchivedTaskPage>;
+  listArchivedTasks(input?: { cursor?: string; limit?: number }): Promise<ArchivedTaskPage>;
   /** Search locally persisted user/assistant message text without loading chat snapshots. */
   searchTaskMessages(
     query: string,
@@ -1011,14 +1037,15 @@ export interface AppBridge {
   listProjects(): Promise<ProjectSummary[]>;
   /** Detach a project and wipe Integrator history; optionally delete the folder. */
   removeProject(projectId: string, options?: { deleteFiles?: boolean }): Promise<void>;
-  probeRuntimes(): Promise<RuntimeConnection[]>;
+  probeRuntimes(options?: { force?: boolean }): Promise<RuntimeConnection[]>;
   beginRuntimeLogin(runtime: RuntimeId): Promise<RuntimeConnection>;
   startTask(input: StartTaskInput): Promise<TaskSummary>;
   /**
    * Copy a chat into a new one. `throughEventId` keeps the transcript up to and
    * including that assistant reply and drops the rest; omitting it copies the
-   * whole conversation. The copy never resumes the source's provider session,
-   * so its first prompt opens a fresh one seeded from the copied transcript.
+   * settled conversation and leaves any unfinished turn only in the source.
+   * The copy never resumes the source's provider session, so its first prompt
+   * opens a fresh one seeded from the copied transcript.
    */
   forkTask(input: ForkTaskInput): Promise<TaskSummary>;
   /**
@@ -1077,6 +1104,12 @@ export interface AppBridge {
   readProjectFile(projectId: string, path: string): Promise<ProjectFileContent>;
   /** Write manually edited text back to one trusted project file (native builds only). */
   writeProjectFile(projectId: string, path: string, content: string): Promise<ProjectFileContent>;
+  /**
+   * Subscribe to debounced working-tree mutations for the checkout currently
+   * displayed by this window. The native side authorizes and owns the watcher;
+   * the renderer receives only an invalidation signal.
+   */
+  subscribeWorkingTreeChanges(repository: string, listener: () => void): Promise<() => void>;
   /** Explain a highlighted selection through the isolated, tool-denied helper
    * boundary shared with chat naming. Returns plain prose; when `onDelta` is
    * given, answer text also streams through it while the call runs, and the
@@ -1195,6 +1228,10 @@ export interface AppBridge {
   persistSession(snapshot: WorkspaceSnapshot): Promise<void>;
   listModels(runtime: RuntimeId): Promise<string[]>;
   listModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]>;
+  getCachedModelCatalog(runtime: RuntimeId): ModelCatalogEntry[] | undefined;
+  refreshModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]>;
+  invalidateModelCatalog(runtime: RuntimeId): void;
+  subscribeModelCatalogs(listener: () => void): () => void;
   /** Provider-owned skills/commands for one explicitly trusted repository. */
   listNativeProviderActions(
     runtime: RuntimeId,
@@ -1208,9 +1245,82 @@ export interface AppBridge {
   installIntegratorPlugin(repository: string): Promise<IntegratorSkillsOverview>;
   /** Remove one exact top-level plugin returned by discovery. */
   uninstallIntegratorPlugin(pluginId: string): Promise<IntegratorSkillsOverview>;
+  /** Read a curated repository's real skill list from GitHub before install. */
+  previewCuratedPlugin(repository: string): Promise<RemoteSkillsPreview>;
+  /** Fetch one remote skill's full raw SKILL.md text on demand. */
+  previewSkillBody(repository: string, path: string): Promise<RemoteSkillBody>;
+  /** Read one local (installed) skill's full raw SKILL.md text. */
+  getIntegratorSkillBody(name: string): Promise<IntegratorSkillBody>;
   /** Save or clear a bundled-skill secret in the native OS credential store. */
   setIntegratorSkillCredential(credentialId: string, secret: string): Promise<void>;
   clearIntegratorSkillCredential(credentialId: string): Promise<void>;
+  /** MCP servers from the user's MCPs folder plus plugin bundles. */
+  listIntegratorMcps(): Promise<IntegratorMcpOverview>;
+  /** Write one server file into the user's MCPs folder (form or quick-add). */
+  saveIntegratorMcp(name: string, config: IntegratorMcpConfig): Promise<IntegratorMcpOverview>;
+  /** Delete one server file from the user's MCPs folder. */
+  removeIntegratorMcp(name: string): Promise<IntegratorMcpOverview>;
+  /** Copy servers configured in Claude Code / Cursor / Claude Desktop into
+   * the MCPs folder. Vendor configs are read, never written. */
+  importIntegratorMcps(): Promise<IntegratorMcpImportResult>;
+  /** Store or clear a server's keychain-backed env secret. */
+  setIntegratorMcpCredential(server: string, key: string, secret: string): Promise<void>;
+  clearIntegratorMcpCredential(server: string, key: string): Promise<void>;
+  /** Complete or revoke browser OAuth for one discovered remote MCP server.
+   * Tokens remain in the native OS credential store. */
+  connectIntegratorMcp(server: string): Promise<IntegratorMcpOverview>;
+  disconnectIntegratorMcp(server: string): Promise<IntegratorMcpOverview>;
+}
+
+/** One MCP server visible to the Integrator plane. `transport` is "stdio"
+ * (command + args + env) or "remote" (url). Servers always start disabled —
+ * enabling a process is an explicit act. */
+export interface IntegratorMcpServer {
+  name: string;
+  /** "user" (MCPs folder) | "plugin" (installed) | "first-party" (bundled). */
+  source: string;
+  /** Display origin: plugin folder name, or "MCPs folder". */
+  origin: string;
+  enabled: boolean;
+  /** Native credential slots (env values set to "{{keychain}}"). */
+  credentials?: Array<{
+    key: string;
+    configured: boolean;
+    available: boolean;
+    storage: "protectedLocalFile" | "osCredentialStore";
+  }>;
+  /** Native-only OAuth state for remote HTTP servers. */
+  authorization?: {
+    state: "connected" | "notConnected" | "needsAttention";
+    available: boolean;
+  };
+  /** True only when this remote server is configured for browser OAuth. */
+  oauth?: boolean;
+  transport: "stdio" | "remote";
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+}
+
+/** Form/quick-add shape accepted by saveIntegratorMcp. */
+export interface IntegratorMcpConfig {
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  auth?: "oauth";
+}
+
+export interface IntegratorMcpOverview {
+  mcpsRoot: string;
+  servers: IntegratorMcpServer[];
+}
+
+export interface IntegratorMcpImportResult {
+  imported: string[];
+  skipped: string[];
+  overview: IntegratorMcpOverview;
 }
 
 /**
@@ -1275,6 +1385,8 @@ interface NativeProviderStatus {
 interface NativeAcpSessionCapabilities {
   load: boolean;
   resume: boolean;
+  mcpHttp: boolean;
+  mcpSse: boolean;
 }
 
 interface NativeExport {
@@ -1376,11 +1488,64 @@ const acpSessionCertification = new Map<RuntimeId, NativeAcpSessionCapabilities>
 let cachedWorkspace: WorkspaceSnapshot | undefined;
 let cachedNativeSettings: LocalSetting[] | undefined;
 let codexCatalogConnected = false;
+let pendingMcpConfiguration: Promise<void> = Promise.resolve();
+const MCP_REVISION_SETTING_KEY = "settings.mcp.integrator.revision";
+
+function trackMcpConfiguration<T>(operation: Promise<T>): Promise<T> {
+  const settled = operation.then(
+    () => undefined,
+    () => undefined,
+  );
+  pendingMcpConfiguration = Promise.all([pendingMcpConfiguration, settled]).then(() => undefined);
+  return operation;
+}
 
 /// Placeholder that defers to the provider CLI's own configured model; it is
 /// intentionally spaced so the send path never forwards it as a model id.
 export const PROVIDER_DEFAULT_MODEL = "Provider default";
 const modelCatalogCache = new Map<RuntimeId, ModelCatalogEntry[]>();
+const modelCatalogLoads = new Map<RuntimeId, Promise<ModelCatalogEntry[]>>();
+const modelCatalogEpochs = new Map<RuntimeId, number>();
+const modelCatalogListeners = new Set<() => void>();
+const runtimeFingerprints = new Map<RuntimeId, string>();
+
+function emitModelCatalogChange(): void {
+  for (const listener of modelCatalogListeners) listener();
+}
+
+function cacheModelCatalog(runtime: RuntimeId, catalog: ModelCatalogEntry[]): ModelCatalogEntry[] {
+  if (modelCatalogCache.get(runtime) === catalog) return catalog;
+  modelCatalogCache.set(runtime, catalog);
+  emitModelCatalogChange();
+  return catalog;
+}
+
+function invalidateModelCatalog(runtime: RuntimeId): void {
+  modelCatalogEpochs.set(runtime, (modelCatalogEpochs.get(runtime) ?? 0) + 1);
+  modelCatalogLoads.delete(runtime);
+  if (modelCatalogCache.delete(runtime)) emitModelCatalogChange();
+}
+
+function runtimeFingerprint(status: NativeProviderStatus): string {
+  return JSON.stringify([
+    status.executable ?? "",
+    status.version ?? "",
+    status.authentication,
+    status.diagnosticCode ?? "",
+    status.certification ?? "",
+  ]);
+}
+
+function reconcileRuntimeFingerprints(statuses: NativeProviderStatus[]): void {
+  for (const status of statuses) {
+    const runtime = runtimeId(status.provider);
+    const next = runtimeFingerprint(status);
+    const previous = runtimeFingerprints.get(runtime);
+    if (previous !== undefined && previous !== next) invalidateModelCatalog(runtime);
+    runtimeFingerprints.set(runtime, next);
+  }
+}
+
 /** Cursor only: thought-level session config option id per model id. */
 const cursorEffortConfigByModel = new Map<string, string>();
 /** Cursor only: the ACP config option id used for model selection. */
@@ -1739,10 +1904,7 @@ function isTauri(): boolean {
  * pinned chat rather than owning the shared nav restore point, so it must
  * not overwrite localStorage with whatever it happens to be showing. */
 function isDeepLinkedWindow(): boolean {
-  return (
-    typeof window !== "undefined" &&
-    new URLSearchParams(window.location.search).has("taskId")
-  );
+  return typeof window !== "undefined" && new URLSearchParams(window.location.search).has("taskId");
 }
 
 export function formatBridgeError(error: unknown, fallback: string): string {
@@ -2055,13 +2217,14 @@ function mapRuntime(status: NativeProviderStatus): RuntimeConnection {
             ? "structured"
             : "pty",
     models: [],
-    certification: acpSession && acpProbeEligible
-      ? acpSession.load
-        ? "certified"
-        : "uncertified"
-      : status.certification === "sessionProbeRequired"
-        ? "session_probe_required"
-        : (status.certification ?? "uncertified"),
+    certification:
+      acpSession && acpProbeEligible
+        ? acpSession.load
+          ? "certified"
+          : "uncertified"
+        : status.certification === "sessionProbeRequired"
+          ? "session_probe_required"
+          : (status.certification ?? "uncertified"),
     capabilities: status.capabilities
       ? {
           ...status.capabilities,
@@ -2081,10 +2244,10 @@ function mapRuntime(status: NativeProviderStatus): RuntimeConnection {
             ? "Installed CLI and ACP session recovery verified."
             : acpSession && acpProbeEligible
               ? "ACP connected, but session/load is unavailable; interrupted history cannot be reconciled authoritatively."
-          : status.certification === "sessionProbeRequired" && connected
-            ? "Installed CLI verified; session capabilities are checked during the ACP handshake."
-            : (status.diagnosticCode ??
-              (connected ? "Authenticated local CLI" : "Status unavailable")),
+              : status.certification === "sessionProbeRequired" && connected
+                ? "Installed CLI verified; session capabilities are checked during the ACP handshake."
+                : (status.diagnosticCode ??
+                  (connected ? "Authenticated local CLI" : "Status unavailable")),
   };
 }
 
@@ -2183,12 +2346,19 @@ async function loadNativeWorkspace(): Promise<WorkspaceSnapshot> {
   const projects: ProjectSummary[] = (local.projects ?? []).map(mapProject);
   const projectByPath = new Map(projects.map((project) => [project.path, project]));
   const runtimeByTask = new Map<string, RuntimeId>();
+  codexThreadByTask.clear();
+  activeCodexThreads.clear();
+  codexDelegationByTask.clear();
   providerResumeByTask.clear();
   providerRouteByTask.clear();
+  const mcpRevisionAt = (local.settings ?? []).find(
+    (setting) => setting.key === MCP_REVISION_SETTING_KEY,
+  )?.updatedAt;
   for (const resume of local.providerResumeStates ?? []) {
-    providerResumeByTask.set(resume.taskId, resume);
     providerRouteByTask.set(resume.taskId, resume);
-    if (resume.provider === "codex") {
+    const isCurrent = !mcpRevisionAt || Date.parse(resume.updatedAt) >= Date.parse(mcpRevisionAt);
+    if (isCurrent) providerResumeByTask.set(resume.taskId, resume);
+    if (isCurrent && resume.provider === "codex") {
       codexDelegationByTask.set(resume.taskId, resume.delegation);
     }
   }
@@ -2206,17 +2376,19 @@ async function loadNativeWorkspace(): Promise<WorkspaceSnapshot> {
     }
     // A writing task is reviewed in its assigned worktree, not the base
     // checkout. Project identity still derives from repositoryPath above.
-    return mapNativeTaskSummary(
-      task,
-      project.id,
-      runtimeByTask.get(task.id) ?? ("codex" as const),
-    );
+    return mapNativeTaskSummary(task, project.id, runtimeByTask.get(task.id) ?? ("codex" as const));
   });
   const lastTaskByProject: Record<string, string> = {};
   for (const task of tasks) lastTaskByProject[task.projectId] ??= task.id;
   for (const session of local.providerSessions) {
-    if (session.provider === "codex")
+    const resume = providerResumeByTask.get(session.taskId);
+    if (
+      session.provider === "codex" &&
+      resume?.provider === "codex" &&
+      resume.sessionRef === session.providerThreadId
+    ) {
       codexThreadByTask.set(session.taskId, session.providerThreadId);
+    }
   }
   const storedNavigation = readStoredNavigation();
   const unreadTaskIds = new Set(storedNavigation.unreadTaskIds ?? []);
@@ -2362,7 +2534,7 @@ function clearCursorSessionCaches(taskId?: string): void {
   cursorSessionByTask.clear();
   cursorDelegationByTask.clear();
   cursorAppliedSelection.clear();
-  modelCatalogCache.delete("cursor");
+  invalidateModelCatalog("cursor");
   cursorModelConfigId = undefined;
   cursorEffortConfigByModel.clear();
   cursorModelParams = new Map();
@@ -2398,11 +2570,20 @@ function resetGrokConnectionState(taskId?: string): void {
   }
 }
 
+function invalidateMcpSessionCaches(): void {
+  providerResumeByTask.clear();
+  codexThreadByTask.clear();
+  activeCodexThreads.clear();
+  codexDelegationByTask.clear();
+  resetCursorConnectionState();
+  resetGrokConnectionState();
+}
+
 function updateCursorCatalog(response: unknown): ModelCatalogEntry[] {
   const catalog = extractAcpCatalog(response);
   mergeCursorModelParams(catalog, cursorModelParams);
   if (catalog.length > 0) {
-    modelCatalogCache.set("cursor", catalog);
+    cacheModelCatalog("cursor", catalog);
   }
   return catalog;
 }
@@ -2419,7 +2600,7 @@ async function refreshCursorModelParams(taskId?: string): Promise<void> {
     if (params.size > 0) cursorModelParams = params;
     const catalog = extractCursorExtensionCatalog(response);
     mergeCursorModelParams(catalog, params);
-    if (catalog.length > 0) modelCatalogCache.set("cursor", catalog);
+    if (catalog.length > 0) cacheModelCatalog("cursor", catalog);
   } catch {
     // Older cursor-agent builds without the extension RPC.
   }
@@ -2456,17 +2637,28 @@ async function ensureCursorSessionForTaskUnlocked(
         saved?.provider === "cursor" &&
         saved.repositoryRoot === cwd &&
         saved.delegation === delegationMode;
-      const session = resumable
-        ? await nativeInvoke<unknown>("acp_resume_session", {
+      const startSession = () =>
+        nativeInvoke<unknown>("acp_start_session", {
+          taskId: nativeTaskId,
+          cwd,
+          delegation: delegationMode,
+          permission,
+        });
+      let session: unknown;
+      if (resumable) {
+        try {
+          session = await nativeInvoke<unknown>("acp_resume_session", {
             taskId: nativeTaskId,
             cwd,
-          })
-        : await nativeInvoke<unknown>("acp_start_session", {
-            taskId: nativeTaskId,
-            cwd,
-            delegation: delegationMode,
-            permission,
           });
+        } catch (error) {
+          if (!isStaleProviderResumeError(error)) throw error;
+          providerResumeByTask.delete(nativeTaskId);
+          session = await startSession();
+        }
+      } else {
+        session = await startSession();
+      }
       const sessionId = extractSessionId(session);
       if (sessionId) {
         providerResumeByTask.set(nativeTaskId, {
@@ -2559,17 +2751,28 @@ async function ensureGrokSession(input: SendTurnInput): Promise<string> {
       saved?.provider === "grok" &&
       saved.repositoryRoot === cwd &&
       saved.delegation === input.delegation;
-    const session = resumable
-      ? await nativeInvoke<unknown>("acp_resume_session", {
+    const startSession = () =>
+      nativeInvoke<unknown>("acp_start_session", {
+        taskId: nativeTaskId,
+        cwd,
+        delegation: input.delegation,
+        permission: input.permission,
+      });
+    let session: unknown;
+    if (resumable) {
+      try {
+        session = await nativeInvoke<unknown>("acp_resume_session", {
           taskId: nativeTaskId,
           cwd,
-        })
-      : await nativeInvoke<unknown>("acp_start_session", {
-          taskId: nativeTaskId,
-          cwd,
-          delegation: input.delegation,
-          permission: input.permission,
         });
+      } catch (error) {
+        if (!isStaleProviderResumeError(error)) throw error;
+        providerResumeByTask.delete(nativeTaskId);
+        session = await startSession();
+      }
+    } else {
+      session = await startSession();
+    }
     const sessionId = extractSessionId(session);
     if (sessionId) {
       providerResumeByTask.set(nativeTaskId, {
@@ -2708,9 +2911,7 @@ const DEMO_EFFORTS: ModelEffortOption[] = [
   { id: "high", label: "High" },
 ];
 
-async function loadModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]> {
-  const cached = modelCatalogCache.get(runtime);
-  if (cached) return cached;
+async function discoverModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]> {
   // Curated catalog in every mode: agy exposes no programmatic model list.
   if (runtime === "antigravity") return ANTIGRAVITY_CATALOG;
   if (isTauri() && runtime === "codex") {
@@ -2723,10 +2924,7 @@ async function loadModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]
         includeHidden: false,
       });
       const catalog = extractCodexCatalog(response);
-      if (catalog.length > 0) {
-        modelCatalogCache.set(runtime, catalog);
-        return catalog;
-      }
+      if (catalog.length > 0) return catalog;
     } catch {
       // Codex unavailable right now; fall through to the static catalog.
     }
@@ -2782,6 +2980,28 @@ async function loadModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]
   return toCatalogEntries(FALLBACK_MODELS[runtime] ?? []);
 }
 
+async function loadModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]> {
+  const cached = modelCatalogCache.get(runtime);
+  if (cached !== undefined) return cached;
+  const pending = modelCatalogLoads.get(runtime);
+  if (pending) return pending;
+
+  const epoch = modelCatalogEpochs.get(runtime) ?? 0;
+  const request = discoverModelCatalog(runtime)
+    .then((catalog) => {
+      if ((modelCatalogEpochs.get(runtime) ?? 0) !== epoch) {
+        if (modelCatalogLoads.get(runtime) === request) modelCatalogLoads.delete(runtime);
+        return loadModelCatalog(runtime);
+      }
+      return cacheModelCatalog(runtime, catalog);
+    })
+    .finally(() => {
+      if (modelCatalogLoads.get(runtime) === request) modelCatalogLoads.delete(runtime);
+    });
+  modelCatalogLoads.set(runtime, request);
+  return request;
+}
+
 async function ensureCodexThread(input: SendTurnInput): Promise<string> {
   const nativeTaskId = await ensureNativeTask(input.taskId);
   const existing = codexThreadByTask.get(nativeTaskId) ?? codexThreadByTask.get(input.taskId);
@@ -2822,7 +3042,17 @@ function isMissingCodexThreadError(error: unknown): boolean {
   const message = formatBridgeError(error, "").toLowerCase();
   return (
     message.includes("no rollout found for thread id") ||
+    message.includes("no longer the active resumable session") ||
     /(?:thread|rollout).*(?:not found|does not exist|unknown)/i.test(message)
+  );
+}
+
+function isStaleProviderResumeError(error: unknown): boolean {
+  const message = formatBridgeError(error, "").toLowerCase();
+  return (
+    message.includes("no saved provider session") ||
+    message.includes("predates the current mcp configuration") ||
+    message.includes("no longer the active resumable session")
   );
 }
 
@@ -3226,14 +3456,18 @@ export const bridge: AppBridge = {
 
   setSetting: async (key, value) => {
     if (isTauri()) {
-      const setting = await nativeInvoke<LocalSetting>("setting_set", { key, value });
-      if (cachedNativeSettings) {
-        cachedNativeSettings = [
-          setting,
-          ...cachedNativeSettings.filter((candidate) => candidate.key !== setting.key),
-        ];
-      }
-      return setting;
+      const update = async () => {
+        const setting = await nativeInvoke<LocalSetting>("setting_set", { key, value });
+        if (key === "settings.mcp.integrator.enabled") invalidateMcpSessionCaches();
+        if (cachedNativeSettings) {
+          cachedNativeSettings = [
+            setting,
+            ...cachedNativeSettings.filter((candidate) => candidate.key !== setting.key),
+          ];
+        }
+        return setting;
+      };
+      return key === "settings.mcp.integrator.enabled" ? trackMcpConfiguration(update()) : update();
     }
     return writeBrowserSetting(key, value);
   },
@@ -3401,9 +3635,7 @@ export const bridge: AppBridge = {
     return {
       tasks: slice,
       nextCursor:
-        start + slice.length < all.length && last
-          ? `${last.updatedAt}\t${last.id}`
-          : undefined,
+        start + slice.length < all.length && last ? `${last.updatedAt}\t${last.id}` : undefined,
       total: all.length,
     };
   },
@@ -3681,14 +3913,34 @@ export const bridge: AppBridge = {
     return nativeInvoke<string | null>("attachment_preview", { path }).catch(() => null);
   },
 
-  probeRuntimes: () =>
-    invokeOrDemo<NativeProviderStatus[]>("provider_discover", undefined, () => []).then(
-      (statuses) => (isTauri() ? statuses.map(mapRuntime) : readDemoSnapshot().runtimes),
-    ),
+  probeRuntimes: (options) =>
+    invokeOrDemo<NativeProviderStatus[]>(
+      "provider_discover",
+      { force: options?.force ?? false },
+      () => [],
+    ).then((statuses) => {
+      if (!isTauri()) return readDemoSnapshot().runtimes;
+      reconcileRuntimeFingerprints(statuses);
+      return statuses.map(mapRuntime);
+    }),
 
   listModels: async (runtime) => (await loadModelCatalog(runtime)).map((entry) => entry.id),
 
   listModelCatalog: loadModelCatalog,
+
+  getCachedModelCatalog: (runtime) => modelCatalogCache.get(runtime),
+
+  refreshModelCatalog: async (runtime) => {
+    invalidateModelCatalog(runtime);
+    return loadModelCatalog(runtime);
+  },
+
+  invalidateModelCatalog,
+
+  subscribeModelCatalogs: (listener) => {
+    modelCatalogListeners.add(listener);
+    return () => modelCatalogListeners.delete(listener);
+  },
 
   listIntegratorSkills: async () => {
     if (isTauri()) {
@@ -3720,6 +3972,7 @@ export const bridge: AppBridge = {
             required: true,
             configured: false,
             available: false,
+            storage: "osCredentialStore",
             helpUrl: "https://fred.stlouisfed.org/docs/api/api_key.html",
           },
         },
@@ -3741,6 +3994,27 @@ export const bridge: AppBridge = {
     throw new Error("Plugin uninstall needs the desktop app; the browser preview is read-only.");
   },
 
+  previewCuratedPlugin: async (repository) => {
+    if (isTauri()) {
+      return nativeInvoke<RemoteSkillsPreview>("integrator_skills_preview", { repository });
+    }
+    throw new Error("Live GitHub previews need the desktop app; the browser preview is read-only.");
+  },
+
+  previewSkillBody: async (repository, path) => {
+    if (isTauri()) {
+      return nativeInvoke<RemoteSkillBody>("integrator_skill_preview_body", { repository, path });
+    }
+    throw new Error("Live GitHub previews need the desktop app; the browser preview is read-only.");
+  },
+
+  getIntegratorSkillBody: async (name) => {
+    if (isTauri()) {
+      return nativeInvoke<IntegratorSkillBody>("integrator_skill_body", { name });
+    }
+    throw new Error("Reading skill files needs the desktop app; the browser preview is read-only.");
+  },
+
   setIntegratorSkillCredential: async (credentialId, secret) => {
     if (!isTauri()) {
       throw new Error("Secure skill credentials are available in the native app only.");
@@ -3751,6 +4025,134 @@ export const bridge: AppBridge = {
   clearIntegratorSkillCredential: async (credentialId) => {
     if (!isTauri()) return;
     await nativeInvoke("integrator_skill_credential_clear", { credentialId });
+  },
+
+  listIntegratorMcps: async () => {
+    if (isTauri()) {
+      return nativeInvoke<IntegratorMcpOverview>("integrator_mcp_overview");
+    }
+    return {
+      mcpsRoot: "Documents/AI Integrator/MCPs",
+      servers: [
+        {
+          name: "playwright",
+          source: "user",
+          origin: "MCPs folder",
+          enabled: false,
+          transport: "stdio",
+          command: "npx",
+          args: ["@playwright/mcp@latest"],
+          env: {},
+        },
+        {
+          name: "stripe-ai:stripe",
+          source: "plugin",
+          origin: "stripe-ai",
+          enabled: false,
+          authorization: { state: "notConnected", available: true },
+          oauth: true,
+          transport: "remote",
+          url: "https://mcp.stripe.com",
+        },
+      ],
+    };
+  },
+
+  saveIntegratorMcp: async (name, config) => {
+    if (isTauri()) {
+      return trackMcpConfiguration(
+        (async () => {
+          const overview = await nativeInvoke<IntegratorMcpOverview>("integrator_mcp_save", {
+            name,
+            config,
+          });
+          invalidateMcpSessionCaches();
+          return overview;
+        })(),
+      );
+    }
+    throw new Error("MCP configuration needs the desktop app; the browser preview is read-only.");
+  },
+
+  removeIntegratorMcp: async (name) => {
+    if (isTauri()) {
+      return trackMcpConfiguration(
+        (async () => {
+          const overview = await nativeInvoke<IntegratorMcpOverview>("integrator_mcp_remove", {
+            name,
+          });
+          invalidateMcpSessionCaches();
+          return overview;
+        })(),
+      );
+    }
+    throw new Error("MCP configuration needs the desktop app; the browser preview is read-only.");
+  },
+
+  importIntegratorMcps: async () => {
+    if (isTauri()) {
+      return trackMcpConfiguration(
+        (async () => {
+          const result = await nativeInvoke<IntegratorMcpImportResult>("integrator_mcp_import");
+          invalidateMcpSessionCaches();
+          return result;
+        })(),
+      );
+    }
+    throw new Error("MCP import needs the desktop app; the browser preview is read-only.");
+  },
+
+  setIntegratorMcpCredential: async (server, key, secret) => {
+    if (!isTauri()) {
+      throw new Error("Secure MCP credentials are available in the native app only.");
+    }
+    await trackMcpConfiguration(
+      (async () => {
+        await nativeInvoke("integrator_mcp_credential_set", { server, key, secret });
+        invalidateMcpSessionCaches();
+      })(),
+    );
+  },
+
+  clearIntegratorMcpCredential: async (server, key) => {
+    if (!isTauri()) return;
+    await trackMcpConfiguration(
+      (async () => {
+        await nativeInvoke("integrator_mcp_credential_clear", { server, key });
+        invalidateMcpSessionCaches();
+      })(),
+    );
+  },
+
+  connectIntegratorMcp: async (server) => {
+    if (!isTauri()) {
+      throw new Error("MCP browser sign-in is available in the native app only.");
+    }
+    return trackMcpConfiguration(
+      (async () => {
+        const overview = await nativeInvoke<IntegratorMcpOverview>("integrator_mcp_oauth_connect", {
+          server,
+        });
+        invalidateMcpSessionCaches();
+        return overview;
+      })(),
+    );
+  },
+
+  disconnectIntegratorMcp: async (server) => {
+    if (!isTauri()) {
+      throw new Error("MCP browser sign-in is available in the native app only.");
+    }
+    return trackMcpConfiguration(
+      (async () => {
+        const overview = await nativeInvoke<IntegratorMcpOverview>(
+          "integrator_mcp_oauth_disconnect",
+          { server },
+        );
+        invalidateMcpSessionCaches();
+        return overview;
+      })(),
+    );
   },
 
   listNativeProviderActions: async (runtime, repository) => {
@@ -3785,10 +4187,13 @@ export const bridge: AppBridge = {
 
   beginRuntimeLogin: async (runtime) => {
     if (isTauri()) {
+      invalidateModelCatalog(runtime);
       if (runtime !== "codex") {
-        const status = (await nativeInvoke<NativeProviderStatus[]>("provider_discover")).find(
-          (item) => runtimeId(item.provider) === runtime,
-        );
+        const statuses = await nativeInvoke<NativeProviderStatus[]>("provider_discover", {
+          force: true,
+        });
+        reconcileRuntimeFingerprints(statuses);
+        const status = statuses.find((item) => runtimeId(item.provider) === runtime);
         if (!status) throw new Error(`${runtime} was not found after status check`);
         return mapRuntime(status);
       }
@@ -3797,9 +4202,11 @@ export const bridge: AppBridge = {
       const workingDirectory = active ? repositoryForTask(active.id) : undefined;
       await nativeInvoke("codex_connect", { workingDirectory });
       codexCatalogConnected = true;
-      const status = (await nativeInvoke<NativeProviderStatus[]>("provider_discover")).find(
-        (item) => item.provider === "codex",
-      );
+      const statuses = await nativeInvoke<NativeProviderStatus[]>("provider_discover", {
+        force: true,
+      });
+      reconcileRuntimeFingerprints(statuses);
+      const status = statuses.find((item) => item.provider === "codex");
       if (!status) throw new Error("Codex was not found after connection");
       return mapRuntime(status);
     }
@@ -4358,6 +4765,28 @@ export const bridge: AppBridge = {
     throw new Error("Editing project files requires the native desktop app.");
   },
 
+  subscribeWorkingTreeChanges: async (repository, listener) => {
+    if (!isTauri()) return () => undefined;
+    const watchId = crypto.randomUUID();
+    const { listen } = await import("@tauri-apps/api/event");
+    const unlisten = await listen<{ watchId: string }>("git://working-tree-changed", (event) => {
+      if (event.payload.watchId === watchId) listener();
+    });
+    try {
+      await nativeInvoke("repository_watch_start", { watchId, repository });
+    } catch (error) {
+      unlisten();
+      throw error;
+    }
+    let stopped = false;
+    return () => {
+      if (stopped) return;
+      stopped = true;
+      unlisten();
+      void nativeInvoke("repository_watch_stop", { watchId }).catch(() => undefined);
+    };
+  },
+
   trackedPaths: async (projectId, paths) => {
     if (paths.length === 0) return [];
     if (isTauri()) {
@@ -4679,10 +5108,7 @@ export const bridge: AppBridge = {
         ...cachedWorkspace,
         tasks: archived
           ? cachedWorkspace.tasks.filter((item) => item.id !== taskId)
-          : [
-              updated,
-              ...cachedWorkspace.tasks.filter((item) => item.id !== taskId),
-            ],
+          : [updated, ...cachedWorkspace.tasks.filter((item) => item.id !== taskId)],
       };
     }
     return {
@@ -4780,6 +5206,7 @@ export const bridge: AppBridge = {
 
   sendTurn: async (input) => {
     if (isTauri()) {
+      await pendingMcpConfiguration;
       const resumeTaskId = nativeTaskIds.get(input.taskId) ?? input.taskId;
       const savedResume = input.resumeInterrupted
         ? providerResumeByTask.get(resumeTaskId)
@@ -4789,12 +5216,12 @@ export const bridge: AppBridge = {
         : undefined;
       const routedInput: SendTurnInput =
         savedRoute && mapStoredRuntime(savedRoute.provider) === input.runtime
-        ? {
-            ...input,
-            permission: savedRoute.permission,
-            delegation: savedRoute.delegation,
-          }
-        : input;
+          ? {
+              ...input,
+              permission: savedRoute.permission,
+              delegation: savedRoute.delegation,
+            }
+          : input;
       if (routedInput.runtime === "codex") {
         const nativeTaskId = await ensureNativeTask(routedInput.taskId);
         let threadId: string | undefined;
@@ -4822,6 +5249,7 @@ export const bridge: AppBridge = {
           if (isCodexConnectionError(error)) {
             codexConnectedTasks.delete(nativeTaskId);
             if (threadId) activeCodexThreads.delete(threadId);
+            invalidateModelCatalog("codex");
           }
           throw error;
         }
@@ -4838,6 +5266,7 @@ export const bridge: AppBridge = {
           });
         } catch (error) {
           resetCursorConnectionState(routedInput.taskId);
+          invalidateModelCatalog("cursor");
           throw error;
         }
       } else if (routedInput.runtime === "grok") {
@@ -4852,6 +5281,7 @@ export const bridge: AppBridge = {
           });
         } catch (error) {
           resetGrokConnectionState(routedInput.taskId);
+          invalidateModelCatalog("grok");
           throw error;
         }
       } else if (routedInput.runtime === "claude" || routedInput.runtime === "antigravity") {
@@ -4994,6 +5424,7 @@ export const bridge: AppBridge = {
       knownResetSeq: options?.knownResetSeq,
       beforeSeq: options?.beforeSeq,
       limit: options?.limit,
+      skipRuntimeCheck: options?.skipRuntimeCheck,
     });
   },
 

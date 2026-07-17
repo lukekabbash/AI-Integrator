@@ -1,11 +1,14 @@
-//! Delegation broker: the host side of the cross-provider subagent bridge.
+//! Integrator local tool host and delegation broker.
 //!
 //! The broker listens on a loopback TCP port with a per-app-run token. Agent
 //! sessions reach it through `integrator.exe --broker-mcp`, a thin stdio MCP
 //! server injected into provider CLIs (see `broker_mcp.rs`), which forwards
 //! every `tools/call` here as one line-delimited JSON-RPC request.
 //!
-//! Delegation is fully asynchronous. `delegate_start` returns immediately;
+//! Secure skill data requests and delegation calls share the same
+//! token-authenticated loopback transport, but credentials remain inside the
+//! running app and are never returned by the broker. Delegation is fully
+//! asynchronous. `delegate_start` returns immediately;
 //! children run in their own tasks/processes; messages queue in SQLite and
 //! deliver only when the recipient is idle (children) or pulls them
 //! (orchestrators). Nothing here ever interrupts the user's conversation.
@@ -31,8 +34,8 @@ use integrator_core::{
 };
 use integrator_runtime::{
     ProjectionMutation, ReducedProviderEvent, StructuredCliEventKind, StructuredCliLaunchOptions,
-    StructuredCliProvider, StructuredPermissionMode, acp_turn_projection, discover_providers,
-    parse_acp_mode_state, provider_executable, redact_and_bound,
+    StructuredCliProvider, StructuredPermissionMode, acp_turn_projection, parse_acp_mode_state,
+    provider_executable, redact_and_bound,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -355,9 +358,9 @@ pub fn broker_env(
     ]
 }
 
-/// Thread-scoped Codex config for the local delegation broker. Keeping this
-/// on `thread/start` avoids mutating the user's global Codex configuration and
-/// gives every task its own broker scope and short-lived app-run token.
+/// Thread-scoped Codex config for Integrator's local tools. Keeping this on
+/// `thread/start` avoids mutating the user's global Codex configuration and
+/// gives every task its own scope and short-lived app-run token.
 pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) -> Result<Value> {
     let executable = std::env::current_exe().map_err(IntegratorError::from)?;
     let env: serde_json::Map<String, Value> = broker_env(info, role, scope, mode)
@@ -365,8 +368,15 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
         .map(|(key, value)| (key.to_owned(), Value::String(value)))
         .collect();
     let enabled_tools = match role {
-        "child" => json!(["task_complete", "orchestrator_ask", "orchestrator_report"]),
+        "child" => json!([
+            "skill_data_request",
+            "task_complete",
+            "orchestrator_ask",
+            "orchestrator_report"
+        ]),
+        _ if mode == "off" => json!(["skill_data_request"]),
         _ => json!([
+            "skill_data_request",
             "peers_list",
             "delegate_start",
             "delegation_status",
@@ -383,11 +393,11 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
                 "env": env,
                 "required": true,
                 "enabled_tools": enabled_tools,
-                // Delegation already has a narrower, task-scoped approval
-                // boundary: broker mode, enabled profiles, concurrency caps,
-                // and the Agents-rail gate in manual mode. A second Codex MCP
-                // prompt cannot be surfaced by Integrator and deadlocks the
-                // turn before the loopback broker receives the call.
+                // These tools already have narrower native boundaries: skill
+                // data is read-only and origin-allowlisted; delegation is
+                // scoped by mode, profiles, concurrency, and the Agents-rail
+                // gate. A second Codex MCP prompt cannot be surfaced by
+                // Integrator and deadlocks before the host receives the call.
                 "default_tools_approval_mode": "approve",
             }
         }
@@ -470,12 +480,19 @@ pub fn acp_mcp_server_entry(
     role: &str,
     scope: &str,
     mode: &str,
+    instructions: Option<&str>,
 ) -> Result<Value> {
     let executable = std::env::current_exe().map_err(IntegratorError::from)?;
-    let env: Vec<Value> = broker_env(info, role, scope, mode)
+    let mut env: Vec<Value> = broker_env(info, role, scope, mode)
         .into_iter()
         .map(|(key, value)| json!({ "name": key, "value": value }))
         .collect();
+    if let Some(instructions) = instructions {
+        env.push(json!({
+            "name": "INTEGRATOR_BROKER_INSTRUCTIONS",
+            "value": instructions,
+        }));
+    }
     Ok(json!({
         "name": "integrator",
         "command": executable.to_string_lossy(),
@@ -597,6 +614,11 @@ async fn dispatch_tool(
     params: &Value,
 ) -> Result<Value> {
     match (session.role.as_str(), method) {
+        ("orchestrator" | "child", "skill_data_request") => {
+            validate_skill_data_scope(app, session)?;
+            let state = app.state::<AppState>();
+            crate::skill_api::execute(app, &state, params).await
+        }
         ("orchestrator", "peers_list") => {
             let task_id = orchestrator_scope(session)?;
             peers_list(app, task_id, &session.mode)
@@ -671,6 +693,26 @@ async fn dispatch_tool(
             method, session.role
         ))),
     }
+}
+
+fn validate_skill_data_scope(app: &AppHandle<tauri::Wry>, session: &BrokerSession) -> Result<()> {
+    let state = app.state::<AppState>();
+    match session.role.as_str() {
+        "orchestrator" => {
+            let task_id = orchestrator_scope(session)?;
+            state.store.get_task(task_id)?;
+        }
+        "child" => {
+            let delegation_id = child_scope(session)?;
+            state.store.get_delegation(delegation_id)?;
+        }
+        _ => {
+            return Err(IntegratorError::Unauthorized(
+                "this broker role cannot request skill data".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn orchestrator_scope(session: &BrokerSession) -> Result<TaskId> {
@@ -1128,9 +1170,7 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
         .store
         .attach_delegation_child(delegation_id, child_task.id)?;
 
-    let statuses = tauri::async_runtime::spawn_blocking(discover_providers)
-        .await
-        .map_err(|_| IntegratorError::Unavailable("provider discovery failed".into()))?;
+    let statuses = state.provider_statuses(false).await?;
     let executable = provider_executable(&statuses, provider).ok_or_else(|| {
         IntegratorError::Unavailable(format!("{} CLI is not installed", provider.as_str()))
     })?;
@@ -1223,6 +1263,10 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
                     "child",
                     &delegation_id.to_string(),
                     "off",
+                    Some(&crate::harness_prompt::instructions(
+                        ProviderKind::Cursor,
+                        crate::harness_prompt::LocalToolsProjection::Projected,
+                    )),
                 )?),
                 _ => None,
             };
@@ -1318,9 +1362,7 @@ async fn respawn_existing_child(
             )
         })?;
     let provider = ProviderKind::from_str(&delegation.runtime)?;
-    let statuses = tauri::async_runtime::spawn_blocking(discover_providers)
-        .await
-        .map_err(|_| IntegratorError::Unavailable("provider discovery failed".into()))?;
+    let statuses = state.provider_statuses(false).await?;
     let executable = provider_executable(&statuses, provider).ok_or_else(|| {
         IntegratorError::Unavailable(format!("{} CLI is not installed", provider.as_str()))
     })?;
@@ -1367,6 +1409,10 @@ async fn respawn_existing_child(
                     "child",
                     &delegation.id.to_string(),
                     "off",
+                    Some(&crate::harness_prompt::instructions(
+                        ProviderKind::Cursor,
+                        crate::harness_prompt::LocalToolsProjection::Projected,
+                    )),
                 )?),
                 _ => None,
             };
@@ -1491,33 +1537,51 @@ async fn spawn_codex_child(
         "workspace-write"
     };
     let has_tools = mcp_config.is_some();
+    let effective_config = client.read_config(&cwd).await?;
+    let developer_instructions = crate::harness_prompt::codex_developer_instructions(
+        &effective_config,
+        if has_tools {
+            crate::harness_prompt::LocalToolsProjection::Projected
+        } else {
+            crate::harness_prompt::LocalToolsProjection::Unavailable
+        },
+    );
     // Children run unattended: never block on approvals; their persisted
     // delegation permission selects the actual Codex sandbox boundary.
     let response = match delegation.child_session_ref.as_deref() {
-        Some(thread_id) => match client.resume_thread(thread_id).await {
+        Some(thread_id) => match client
+            .resume_thread_with_developer_instructions(thread_id, Some(&developer_instructions))
+            .await
+        {
             Ok(response) => response,
             Err(_) => {
                 client
-                    .start_thread_with_policies_and_config(
+                    .start_thread_with_policies_and_overrides(
                         &cwd,
                         delegation.model.as_deref(),
                         delegation.effort.as_deref(),
                         "never",
                         sandbox,
-                        mcp_config.clone(),
+                        adapter_codex::CodexThreadOverrides {
+                            config: mcp_config.clone(),
+                            developer_instructions: Some(developer_instructions.clone()),
+                        },
                     )
                     .await?
             }
         },
         None => {
             client
-                .start_thread_with_policies_and_config(
+                .start_thread_with_policies_and_overrides(
                     &cwd,
                     delegation.model.as_deref(),
                     delegation.effort.as_deref(),
                     "never",
                     sandbox,
-                    mcp_config,
+                    adapter_codex::CodexThreadOverrides {
+                        config: mcp_config,
+                        developer_instructions: Some(developer_instructions),
+                    },
                 )
                 .await?
         }
@@ -1733,7 +1797,12 @@ async fn spawn_acp_child(
     mcp_server: Option<Value>,
 ) -> Result<DelegationChild> {
     let state = app.state::<AppState>();
-    let arguments = crate::commands::acp_launch_arguments(&provider)
+    let tools = if mcp_server.is_some() {
+        crate::harness_prompt::LocalToolsProjection::Projected
+    } else {
+        crate::harness_prompt::LocalToolsProjection::Unavailable
+    };
+    let arguments = crate::commands::acp_launch_arguments(&provider, Some(tools))
         .map_err(|error| IntegratorError::InvalidInput(error.message))?;
     let client = adapter_acp::AcpClient::spawn(adapter_acp::AcpLaunchOptions {
         executable,
@@ -1835,6 +1904,7 @@ async fn spawn_acp_child(
     state
         .store
         .set_delegation_session_ref(delegation.id, &session_id)?;
+    let (turn_settled, _) = tokio::sync::broadcast::channel(8);
     let runtime = AcpRuntime {
         client: client.clone(),
         provider,
@@ -1842,6 +1912,8 @@ async fn spawn_acp_child(
         alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         binding: Arc::new(std::sync::Mutex::new(Some(binding))),
         current_turn: Arc::new(std::sync::Mutex::new(None)),
+        current_turn_started_at: Arc::new(std::sync::Mutex::new(None)),
+        turn_settled,
         permission_options: Arc::new(std::sync::Mutex::new(HashMap::new())),
         session_modes: Arc::new(std::sync::Mutex::new(parse_acp_mode_state(&response))),
         plan_requests: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
@@ -1857,7 +1929,7 @@ async fn spawn_acp_child(
         replaying_history: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     crate::commands::spawn_acp_pump(app.clone(), Arc::clone(&state.store), runtime.clone());
-    Ok(DelegationChild {
+    let child = DelegationChild {
         delegation_id: delegation.id,
         child_task_id,
         parent_task_id: delegation.parent_task_id,
@@ -1865,10 +1937,12 @@ async fn spawn_acp_child(
         completed: Arc::new(std::sync::Mutex::new(false)),
         sentinel_watermark: sentinel_watermark_for(&state.store, child_task_id, has_tools),
         driver: DelegationChildDriver::Acp {
-            runtime,
+            runtime: runtime.clone(),
             session_id,
         },
-    })
+    };
+    watch_acp_child(app.clone(), &child, runtime);
+    Ok(child)
 }
 
 /// Wire vs. visible child prompt. Providers receive `wire` (injected digests
@@ -1914,6 +1988,16 @@ async fn start_child_turn(
                     working_directory: cwd.clone(),
                     model: model.clone(),
                     effort: effort.clone(),
+                    system_instructions: matches!(provider, ProviderKind::Claude).then(|| {
+                        crate::harness_prompt::instructions(
+                            *provider,
+                            if mcp_config.is_some() {
+                                crate::harness_prompt::LocalToolsProjection::Projected
+                            } else {
+                                crate::harness_prompt::LocalToolsProjection::Unavailable
+                            },
+                        )
+                    }),
                     resume_session_id: session_ref.lock().expect("session lock").clone(),
                     permission_mode: if permission.is_read_only() {
                         StructuredPermissionMode::ReadOnly
@@ -1978,68 +2062,25 @@ async fn start_child_turn(
                 runtime,
                 session_id,
             } => {
-                // `session/prompt` resolves when the turn finishes, so the
-                // turn runs on a background task and settles the delegation
-                // itself — there is no separate watcher for ACP children.
                 let turn_id = uuid::Uuid::new_v4().to_string();
-                *runtime.current_turn.lock().expect("turn lock") = Some(turn_id.clone());
                 let started_at = Utc::now();
+                *runtime
+                    .current_turn_started_at
+                    .lock()
+                    .expect("turn start lock") = Some(started_at);
+                *runtime.current_turn.lock().expect("turn lock") = Some(turn_id.clone());
                 if let Some(binding) = runtime.binding.lock().expect("binding lock").clone() {
                     emit_child_turn_started(app, &binding, &turn_id, &prompt.visible);
                 }
-                let app = app.clone();
-                let runtime = runtime.clone();
+                // The shared ACP pump settles the turn from its ordered
+                // PromptFinished boundary, then notifies watch_acp_child.
+                // This future only keeps the provider request alive.
+                let client = runtime.client.clone();
                 let session_id = session_id.clone();
                 let wire = prompt.wire.clone();
                 let images = prompt.image_paths.clone();
-                let delegation_id = child.delegation_id;
-                let child_identity = Arc::clone(&child.busy);
                 tauri::async_runtime::spawn(async move {
-                    let outcome = runtime
-                        .client
-                        .prompt_with_images(&session_id, &wire, &images)
-                        .await;
-                    let now = Utc::now();
-                    let (status, error, failed) = match &outcome {
-                        Ok(response) => match adapter_acp::StopReason::from_protocol(response) {
-                            adapter_acp::StopReason::Cancelled => {
-                                (TurnStatus::Interrupted, None, false)
-                            }
-                            adapter_acp::StopReason::Refusal => (
-                                TurnStatus::Failed,
-                                Some("The agent refused the turn".to_owned()),
-                                true,
-                            ),
-                            _ => (TurnStatus::Completed, None, false),
-                        },
-                        Err(error) => (TurnStatus::Failed, Some(error.to_string()), true),
-                    };
-                    let binding = runtime.binding.lock().expect("binding lock").clone();
-                    if let Some(binding) = binding
-                        && let Some(thread_id) = binding.thread_id.clone()
-                    {
-                        let mut turn =
-                            acp_turn_projection(&turn_id, status, error, started_at, now);
-                        turn.stop_requested = false;
-                        let finished = ReducedProviderEvent {
-                            method: "client/delegation/turnFinished".into(),
-                            thread_id,
-                            turn_id: Some(turn_id.clone()),
-                            audit_json: "{}".into(),
-                            audit_truncated: false,
-                            mutation: ProjectionMutation::Turn(turn),
-                            occurred_at: now,
-                        };
-                        let state = app.state::<AppState>();
-                        crate::commands::apply_and_emit(&app, &state.store, &binding, &finished);
-                    }
-                    {
-                        let mut current = runtime.current_turn.lock().expect("turn lock");
-                        if current.as_deref() == Some(turn_id.as_str()) {
-                            *current = None;
-                        }
-                    }
-                    child_turn_settled(app, delegation_id, failed, &child_identity).await;
+                    let _ = client.prompt_with_images(&session_id, &wire, &images).await;
                 });
             }
         }
@@ -2186,14 +2227,32 @@ fn watch_codex_child(
     });
 }
 
+/// Settles ACP delegation state only after the shared projection pump has
+/// persisted every stream update preceding the provider's prompt response.
+fn watch_acp_child(app: AppHandle<tauri::Wry>, child: &DelegationChild, runtime: AcpRuntime) {
+    let delegation_id = child.delegation_id;
+    let child_identity = Arc::clone(&child.busy);
+    let mut receiver = runtime.turn_settled.subscribe();
+    tauri::async_runtime::spawn(async move {
+        while let Ok(settlement) = receiver.recv().await {
+            child_turn_settled(
+                app.clone(),
+                delegation_id,
+                settlement.failed,
+                &child_identity,
+            )
+            .await;
+        }
+    });
+}
+
 /// The delegation state machine tick that runs whenever a child turn ends:
 /// deliver queued orchestrator/user messages as the next turn, otherwise go
 /// idle (`waiting`), or settle terminal states.
 ///
-/// Boxed rather than `async fn`: ACP children settle from inside
-/// `start_child_turn`'s own spawned task, so this future is recursive
-/// (settle → deliver queued → start turn → settle) and needs type erasure
-/// for the compiler to prove it `Send`.
+/// Boxed rather than `async fn`: settlement can deliver queued guidance and
+/// start the next child turn, whose ordered boundary returns here again. That
+/// recursive lifecycle needs type erasure for the compiler to prove it `Send`.
 fn child_turn_settled(
     app: AppHandle<tauri::Wry>,
     delegation_id: DelegationId,
@@ -2803,6 +2862,7 @@ mod tests {
         assert_eq!(
             server["enabled_tools"],
             json!([
+                "skill_data_request",
                 "peers_list",
                 "delegate_start",
                 "delegation_status",
@@ -2820,7 +2880,26 @@ mod tests {
     }
 
     #[test]
-    fn acp_mcp_entry_carries_the_orchestrator_scope_for_cursor_and_grok() {
+    fn codex_local_tools_remain_available_when_delegation_is_off() {
+        let config = codex_mcp_config(
+            &BrokerInfo {
+                port: 43125,
+                token: "ephemeral-test-token".into(),
+            },
+            "orchestrator",
+            "task-3",
+            "off",
+        )
+        .expect("Codex MCP config");
+
+        assert_eq!(
+            config["mcp_servers"]["integrator"]["enabled_tools"],
+            json!(["skill_data_request"])
+        );
+    }
+
+    #[test]
+    fn cursor_mcp_entry_carries_scope_and_durable_harness_instructions() {
         let entry = acp_mcp_server_entry(
             &BrokerInfo {
                 port: 43124,
@@ -2829,6 +2908,7 @@ mod tests {
             "orchestrator",
             "task-2",
             "manual",
+            Some("durable harness policy"),
         )
         .expect("ACP MCP entry");
 
@@ -2840,6 +2920,10 @@ mod tests {
         }));
         assert!(env.iter().any(|value| {
             value["name"] == "INTEGRATOR_BROKER_MODE" && value["value"] == "manual"
+        }));
+        assert!(env.iter().any(|value| {
+            value["name"] == "INTEGRATOR_BROKER_INSTRUCTIONS"
+                && value["value"] == "durable harness policy"
         }));
     }
 

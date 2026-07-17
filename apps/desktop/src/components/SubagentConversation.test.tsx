@@ -3,7 +3,14 @@ import "@testing-library/jest-dom/vitest";
 import type { ComponentProps } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { bridge, type DelegationView, type GitSnapshot, type RuntimeConnection } from "../bridge";
+import {
+  bridge,
+  type DelegationView,
+  type GitSnapshot,
+  type ModelCatalogEntry,
+  type RuntimeConnection,
+  type RuntimeId,
+} from "../bridge";
 import { SubagentConversation } from "./SubagentConversation";
 
 const runtimes: RuntimeConnection[] = [
@@ -95,6 +102,24 @@ const childGit: GitSnapshot = {
   ],
 };
 
+function mockModelCatalog(
+  resolve: (runtime: RuntimeId) => ModelCatalogEntry[] | Promise<ModelCatalogEntry[]>,
+) {
+  const catalogs = new Map<RuntimeId, ModelCatalogEntry[]>();
+  const listeners = new Set<() => void>();
+  vi.spyOn(bridge, "getCachedModelCatalog").mockImplementation((runtime) => catalogs.get(runtime));
+  vi.spyOn(bridge, "subscribeModelCatalogs").mockImplementation((listener) => {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  });
+  vi.spyOn(bridge, "listModelCatalog").mockImplementation(async (runtime) => {
+    const catalog = await resolve(runtime);
+    catalogs.set(runtime, catalog);
+    for (const listener of listeners) listener();
+    return catalog;
+  });
+}
+
 function childProjectionEvent(
   seq: number,
   body: string,
@@ -135,6 +160,12 @@ afterEach(() => {
   cleanup();
   document.querySelectorAll(".test-subagent-header-target").forEach((target) => target.remove());
   vi.restoreAllMocks();
+  bridge.invalidateModelCatalog("codex");
+  bridge.invalidateModelCatalog("claude");
+  bridge.invalidateModelCatalog("antigravity");
+  bridge.invalidateModelCatalog("cursor");
+  bridge.invalidateModelCatalog("grok");
+  bridge.invalidateModelCatalog("custom");
 });
 
 describe("SubagentConversation", () => {
@@ -160,6 +191,7 @@ describe("SubagentConversation", () => {
     vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
       { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
     ]);
+    await import("./Transcript");
     const frameCallbacks = new Map<number, FrameRequestCallback>();
     let nextFrameId = 0;
     vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
@@ -213,9 +245,7 @@ describe("SubagentConversation", () => {
       },
     });
     vi.spyOn(bridge, "subscribeRuntimeProjections").mockResolvedValue(() => undefined);
-    vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
-      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
-    ]);
+    mockModelCatalog(() => [{ id: "gpt-5.6-luna", label: "GPT-5.6 Luna" }]);
     const headerTarget = renderSubagent({
       delegation: { ...stoppedDelegation, status: "running" },
       runtimes,
@@ -246,7 +276,7 @@ describe("SubagentConversation", () => {
     });
     vi.spyOn(bridge, "loadTaskGit").mockResolvedValue(childGit);
     vi.spyOn(bridge, "subscribeRuntimeProjections").mockResolvedValue(() => undefined);
-    vi.spyOn(bridge, "listModelCatalog").mockImplementation(async (runtime) =>
+    mockModelCatalog((runtime) =>
       runtime === "claude"
         ? [
             {
@@ -315,9 +345,7 @@ describe("SubagentConversation", () => {
     });
     vi.spyOn(bridge, "loadTaskGit").mockResolvedValue(childGit);
     vi.spyOn(bridge, "subscribeRuntimeProjections").mockResolvedValue(() => undefined);
-    vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
-      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
-    ]);
+    mockModelCatalog(() => [{ id: "gpt-5.6-luna", label: "GPT-5.6 Luna" }]);
 
     renderSubagent({
       delegation: stoppedDelegation,
@@ -369,7 +397,7 @@ describe("SubagentConversation", () => {
       diffLoaded: true,
     });
     vi.spyOn(bridge, "subscribeRuntimeProjections").mockResolvedValue(() => undefined);
-    vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
+    mockModelCatalog(() => [
       {
         id: "gpt-5.6-luna",
         label: "GPT-5.6 Luna",
@@ -439,9 +467,7 @@ describe("SubagentConversation", () => {
       },
     });
     vi.spyOn(bridge, "subscribeRuntimeProjections").mockResolvedValue(() => undefined);
-    vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
-      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
-    ]);
+    mockModelCatalog(() => [{ id: "gpt-5.6-luna", label: "GPT-5.6 Luna" }]);
     const onSend = vi.fn().mockResolvedValue(undefined);
 
     renderSubagent({
@@ -486,9 +512,7 @@ describe("SubagentConversation", () => {
       },
     });
     vi.spyOn(bridge, "subscribeRuntimeProjections").mockResolvedValue(() => undefined);
-    vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
-      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
-    ]);
+    mockModelCatalog(() => [{ id: "gpt-5.6-luna", label: "GPT-5.6 Luna" }]);
     const onSend = vi.fn().mockResolvedValue(undefined);
 
     renderSubagent({
@@ -528,9 +552,7 @@ describe("SubagentConversation", () => {
       },
     });
     vi.spyOn(bridge, "subscribeRuntimeProjections").mockResolvedValue(() => undefined);
-    vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
-      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
-    ]);
+    mockModelCatalog(() => [{ id: "gpt-5.6-luna", label: "GPT-5.6 Luna" }]);
     const onSend = vi.fn().mockResolvedValue(undefined);
 
     renderSubagent({

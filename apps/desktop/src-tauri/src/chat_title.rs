@@ -292,11 +292,18 @@ async fn generate_codex_title(
     .map_err(CommandError::from)?;
     let mut receiver = client.subscribe();
     let generation = async {
-        let catalog = client
-            .list_models(false)
-            .await
-            .map_err(CommandError::from)?;
-        let (model, effort) = select_codex_model(&catalog, route);
+        let (model, effort) = if codex_route_requires_catalog(route) {
+            let catalog = client
+                .list_models(false)
+                .await
+                .map_err(CommandError::from)?;
+            select_codex_model(&catalog, route)
+        } else {
+            (
+                route.model().map(str::to_owned),
+                route.effort().map(str::to_owned),
+            )
+        };
         let thread = client
             .start_ephemeral_read_only_thread(cwd, model.as_deref(), effort.as_deref())
             .await
@@ -381,7 +388,7 @@ async fn generate_acp_title(
     let executable = executable_for(provider).await?;
     let client = adapter_acp::AcpClient::spawn(AcpLaunchOptions {
         executable,
-        arguments: acp_launch_arguments(&provider)?,
+        arguments: acp_launch_arguments(&provider, None)?,
         working_directory: Some(cwd.to_path_buf()),
         client_version: env!("CARGO_PKG_VERSION").into(),
     })
@@ -505,6 +512,7 @@ async fn generate_structured_title(
                 // the model name ("Gemini 3.5 Flash (Low)") — agy's registry
                 // only accepts suffixed names, so omitting it fails the turn.
                 effort: Some(route.effort().unwrap_or("low").into()),
+                system_instructions: None,
                 resume_session_id: None,
                 permission_mode: StructuredPermissionMode::ReadOnly,
                 mcp_config_path: None,
@@ -597,6 +605,10 @@ async fn executable_for(provider: ProviderKind) -> CommandResult<std::path::Path
 /// field. A pinned model is forwarded verbatim rather than checked against the
 /// catalog: the picker only offers catalog entries, and silently downgrading an
 /// explicit choice is worse than surfacing the provider's own error.
+fn codex_route_requires_catalog(route: &HelperRoute) -> bool {
+    route.model().is_none() || route.effort().is_none()
+}
+
 fn select_codex_model(catalog: &Value, route: &HelperRoute) -> (Option<String>, Option<String>) {
     let Some(model) = route.model() else {
         let (model, effort) = cheapest_codex_model(catalog);
@@ -804,10 +816,16 @@ fn parse_title(raw: &str) -> Option<String> {
         || title.chars().count() > TITLE_MAX_CHARS
         || title == CHAT_TITLE_PLACEHOLDER
         || title.chars().any(char::is_control)
+        || looks_like_provider_error(title)
     {
         return None;
     }
     Some(title.to_owned())
+}
+
+pub(crate) fn looks_like_provider_error(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized.starts_with("error:") || normalized.contains("retriableerror:")
 }
 
 fn command_error(code: &'static str, message: impl Into<String>) -> CommandError {
@@ -838,6 +856,14 @@ mod tests {
         assert_eq!(parse_title("Run rm -rf now please thanks"), None);
         assert_eq!(parse_title("Good Title\nExplanation"), None);
         assert_eq!(parse_title(CHAT_TITLE_PLACEHOLDER), None);
+        assert_eq!(
+            parse_title("Error: RetriableError: [resource_exhausted] Error"),
+            None
+        );
+        assert_eq!(
+            parse_title("Improve Error Handling"),
+            Some("Improve Error Handling".into())
+        );
     }
 
     #[test]
@@ -934,6 +960,19 @@ mod tests {
             select_codex_model(&catalog, &route(Some("gpt-frontier"), Some("high"))),
             (Some("gpt-frontier".into()), Some("high".into()))
         );
+    }
+
+    #[test]
+    fn a_fully_pinned_codex_helper_route_skips_catalog_discovery() {
+        assert!(!codex_route_requires_catalog(&route(
+            Some("gpt-frontier"),
+            Some("high")
+        )));
+        assert!(codex_route_requires_catalog(&route(
+            Some("gpt-frontier"),
+            None
+        )));
+        assert!(codex_route_requires_catalog(&route(None, Some("low"))));
     }
 
     #[test]

@@ -63,6 +63,7 @@ export function taskActivityUpdate(
     };
   }
   if (projection.kind === "turnError") {
+    if (projection.retryable) return null;
     return { status: "failed", updatedAt: event.occurredAt, unread: !taskIsActive };
   }
   return null;
@@ -443,6 +444,8 @@ const TOOL_ACTIONS: Readonly<Record<string, ToolAction>> = {
   replace_file_content: "edit",
   multi_replace_file_content: "edit",
   search: "search",
+  web_search: "search",
+  websearch: "search",
   grep: "search",
   glob: "search",
   find: "search",
@@ -524,7 +527,8 @@ function toolSummary(
   const semanticTitle = semanticToolTitle(item);
   if (semanticTitle) return { title: semanticTitle, body: path ?? fallback ?? "", changeStats };
   const running = item.status === "pending" || item.status === "inProgress";
-  if (action === "read") return { title: running ? "Reading" : "Read", body: path ?? fallback ?? "" };
+  if (action === "read")
+    return { title: running ? "Reading" : "Read", body: path ?? fallback ?? "" };
   if (action === "write")
     return { title: running ? "Creating" : "Created", body: path ?? fallback ?? "", changeStats };
   if (action === "edit")
@@ -770,7 +774,10 @@ function activityGroupSummary(children: TranscriptEvent[]): string {
     .join(" · ");
 }
 
-function activityGroupTitle(family: ActivityGroupFamily, status: TranscriptEvent["status"]): string {
+function activityGroupTitle(
+  family: ActivityGroupFamily,
+  status: TranscriptEvent["status"],
+): string {
   const running = status === "running";
   if (family === "edit") return running ? "Editing" : "Edits";
   return running ? "Working" : "Activity";
@@ -784,9 +791,7 @@ function activityGroupBody(family: ActivityGroupFamily, children: TranscriptEven
   return activityGroupSummary(children);
 }
 
-function activityGroupActivityType(
-  family: ActivityGroupFamily,
-): TranscriptEvent["activityType"] {
+function activityGroupActivityType(family: ActivityGroupFamily): TranscriptEvent["activityType"] {
   return family === "edit" ? "file" : "other";
 }
 
@@ -865,9 +870,7 @@ function groupActivityEvents(
 }
 
 function isUnresolvedAttention(event: TranscriptEvent): boolean {
-  return (
-    event.kind === "approval" && (event.status === "warning" || event.status === "error")
-  );
+  return event.kind === "approval" && (event.status === "warning" || event.status === "error");
 }
 
 function isTurnCollapsible(event: TranscriptEvent): boolean {
@@ -884,10 +887,7 @@ function isTurnCollapsible(event: TranscriptEvent): boolean {
   );
 }
 
-function workedForDuration(
-  children: TranscriptEvent[],
-  turn: TurnProjection | undefined,
-): string {
+function workedForDuration(children: TranscriptEvent[], turn: TurnProjection | undefined): string {
   const started = turn?.startedAt ? Date.parse(turn.startedAt) : Number.NaN;
   const completed = turn?.completedAt ? Date.parse(turn.completedAt) : Number.NaN;
   if (Number.isFinite(started) && Number.isFinite(completed) && completed >= started) {
@@ -1032,10 +1032,7 @@ function deriveItemTranscriptEvents(
   timestamp: string,
   status: TranscriptEvent["status"],
 ): TranscriptEvent[] {
-  if (
-    item.kind === "userMessage" &&
-    item.body?.trim() === INTERRUPTED_RESUME_VISIBLE_PROMPT
-  ) {
+  if (item.kind === "userMessage" && item.body?.trim() === INTERRUPTED_RESUME_VISIBLE_PROMPT) {
     return [];
   }
   const hasFileChanges =
@@ -1070,6 +1067,20 @@ function deriveItemTranscriptEvents(
         meta: providerLabel
           ? [common.meta, "Reasoning summary"].filter(Boolean).join(" · ")
           : common.meta,
+      },
+    ];
+  }
+  if (item.kind === "unknown") {
+    const legacyWebSearch = item.body?.trim() === "Unsupported item type: webSearch";
+    const running = item.status === "pending" || item.status === "inProgress";
+    return [
+      {
+        ...common,
+        kind: legacyWebSearch ? "tool" : "activity",
+        activityType: legacyWebSearch ? "tool" : "other",
+        title: legacyWebSearch ? (running ? "Searching" : "Searched") : "Provider activity",
+        body: legacyWebSearch ? "Web search" : "Additional provider activity",
+        expandedByDefault: false,
       },
     ];
   }
@@ -1230,9 +1241,7 @@ export function runtimeTranscript(
 
 export function createRuntimeTranscriptDeriver(
   density: TranscriptDensity = "normal",
-): (
-  state: RuntimeProjectionState,
-) => TranscriptEvent[] {
+): (state: RuntimeProjectionState) => TranscriptEvent[] {
   let cachedTaskId: string | undefined;
   let itemCache = new WeakMap<
     ItemProjection,

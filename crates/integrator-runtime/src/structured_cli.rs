@@ -41,6 +41,11 @@ pub struct StructuredCliLaunchOptions {
     /// Reasoning effort. Only Claude exposes a CLI flag for this (`--effort`);
     /// other providers ignore it.
     pub effort: Option<String>,
+    /// Durable AI Integrator policy carried in the provider's native system
+    /// instruction layer. Claude receives this through
+    /// `--append-system-prompt`; Antigravity loads it from the private control
+    /// overlay instead.
+    pub system_instructions: Option<String>,
     pub resume_session_id: Option<String>,
     pub permission_mode: StructuredPermissionMode,
     /// MCP config file granting this session the delegation-broker tool
@@ -48,8 +53,8 @@ pub struct StructuredCliLaunchOptions {
     /// providers ignore it.
     pub mcp_config_path: Option<PathBuf>,
     /// Integrator-owned Antigravity customization root. The directory may
-    /// contain `.agents/hooks.json`, but is never written into the user's
-    /// repository. Other structured providers ignore it.
+    /// contain `.agents/hooks.json` and `.agents/mcp_config.json`, but is
+    /// never written into the user's repository. Other providers ignore it.
     pub control_overlay: Option<PathBuf>,
     /// Integrator-owned plugin bundles projected into this turn, one
     /// `--plugin-dir` each. Claude-only: the flag is not portable, so other
@@ -365,6 +370,13 @@ fn provider_args(options: &StructuredCliLaunchOptions) -> Vec<String> {
                     "--plugin-dir".into(),
                     plugin_dir.to_string_lossy().into_owned(),
                 ]);
+            }
+            if let Some(instructions) = options
+                .system_instructions
+                .as_deref()
+                .filter(|instructions| !instructions.is_empty())
+            {
+                args.extend(["--append-system-prompt".into(), instructions.into()]);
             }
             args
         }
@@ -1046,6 +1058,7 @@ mod tests {
                 working_directory: ".".into(),
                 model: None,
                 effort: Some("high".into()),
+                system_instructions: None,
                 resume_session_id: Some("session-1".into()),
                 permission_mode: StructuredPermissionMode::ReadOnly,
                 mcp_config_path: None,
@@ -1087,6 +1100,33 @@ mod tests {
     }
 
     #[test]
+    fn claude_harness_policy_uses_the_native_system_prompt_layer() {
+        let options = |provider| StructuredCliLaunchOptions {
+            provider,
+            executable: "agent".into(),
+            working_directory: ".".into(),
+            model: None,
+            effort: None,
+            system_instructions: Some("durable harness policy".into()),
+            resume_session_id: None,
+            permission_mode: StructuredPermissionMode::ReadOnly,
+            mcp_config_path: None,
+            control_overlay: None,
+            plugin_dirs: Vec::new(),
+        };
+        let claude = provider_args(&options(StructuredCliProvider::Claude));
+        assert!(claude.windows(2).any(|pair| {
+            pair[0] == "--append-system-prompt" && pair[1] == "durable harness policy"
+        }));
+        let antigravity = provider_args(&options(StructuredCliProvider::Antigravity));
+        assert!(
+            !antigravity
+                .iter()
+                .any(|argument| argument == "--append-system-prompt")
+        );
+    }
+
+    #[test]
     fn plugin_dirs_project_per_provider_mechanism() {
         for provider in [
             StructuredCliProvider::Claude,
@@ -1098,6 +1138,7 @@ mod tests {
                 working_directory: ".".into(),
                 model: None,
                 effort: None,
+                system_instructions: None,
                 resume_session_id: None,
                 permission_mode: StructuredPermissionMode::AcceptEdits,
                 mcp_config_path: None,
@@ -1125,6 +1166,7 @@ mod tests {
             working_directory: ".".into(),
             model: None,
             effort: None,
+            system_instructions: None,
             resume_session_id: None,
             permission_mode: mode,
             mcp_config_path: None,
@@ -1161,6 +1203,7 @@ mod tests {
             working_directory: ".".into(),
             model: None,
             effort: None,
+            system_instructions: None,
             resume_session_id: None,
             permission_mode: StructuredPermissionMode::AcceptEdits,
             mcp_config_path: Some("C:/data/broker-mcp/orchestrator-task.json".into()),
@@ -1186,6 +1229,7 @@ mod tests {
             working_directory: ".".into(),
             model: None,
             effort: None,
+            system_instructions: None,
             resume_session_id: None,
             permission_mode: StructuredPermissionMode::BypassPermissions,
             mcp_config_path: None,
@@ -1352,6 +1396,7 @@ mod tests {
             working_directory: ".".into(),
             model: model.map(str::to_owned),
             effort: effort.map(str::to_owned),
+            system_instructions: None,
             resume_session_id: None,
             permission_mode: StructuredPermissionMode::Prompt,
             mcp_config_path: None,
@@ -1402,6 +1447,7 @@ mod tests {
             working_directory: "/workspace/project".into(),
             model: None,
             effort: None,
+            system_instructions: None,
             resume_session_id: resume_session_id.map(str::to_owned),
             permission_mode: StructuredPermissionMode::ReadOnly,
             mcp_config_path: None,
@@ -1496,6 +1542,7 @@ mod tests {
                     working_directory: directory.path().into(),
                     model: None,
                     effort: None,
+                    system_instructions: None,
                     resume_session_id: None,
                     permission_mode: StructuredPermissionMode::ReadOnly,
                     mcp_config_path: None,

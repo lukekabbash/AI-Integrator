@@ -439,15 +439,39 @@ fn parse_item(
                 TOOL_DETAIL_LIMIT,
             );
         }
+        "webSearch" => {
+            projection.kind = ItemKind::McpTool;
+            projection.title = Some("Web search".into());
+            projection.mcp_tool = Some("web_search".into());
+            if let Some(query) = web_search_query(value) {
+                projection.body = Some(query.clone());
+                projection.tool_input = Some(
+                    serde_json::to_string_pretty(&json!({ "query": query }))
+                        .expect("web search input serializes"),
+                );
+            }
+        }
         _ => {
             projection.title = Some("Provider activity".into());
-            projection.body = Some(format!(
-                "Unsupported item type: {}",
-                bound_and_redact(item_type, 128).0
-            ));
+            projection.body = Some("Additional provider activity".into());
         }
     }
     Ok(projection)
+}
+
+fn web_search_query(value: &Value) -> Option<String> {
+    [
+        value.get("query"),
+        value.pointer("/action/query"),
+        value.pointer("/action/pattern"),
+        value.pointer("/action/url"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .map(str::trim)
+    .find(|query| !query.is_empty())
+    .map(|query| bound_and_redact(query, TEXT_LIMIT).0)
 }
 
 fn parse_plan(value: Option<&Value>) -> (Vec<PlanStep>, bool) {
@@ -544,97 +568,289 @@ fn bound_and_redact(value: &str, limit: usize) -> (String, bool) {
     truncate_utf8(&redacted, limit)
 }
 
+// Provider tool output may already have been visible to the model. Do not hide
+// legitimate evidence from the user based on entropy or length guesses; redact
+// only explicit credential syntax that must not become durable transcript data.
 fn redact_text(value: &str) -> String {
+    if let Some(redacted) = redact_json_document(value) {
+        return redacted;
+    }
     let mut private_key = false;
-    value
-        .lines()
-        .map(|line| {
-            let upper = line.to_ascii_uppercase();
-            if upper.contains("-----BEGIN") && upper.contains("PRIVATE KEY-----") {
-                private_key = true;
-                return "[redacted-private-key]".into();
+    let mut output = String::with_capacity(value.len());
+    for segment in value.split_inclusive('\n') {
+        let (line, ending) = if let Some(line) = segment.strip_suffix("\r\n") {
+            (line, "\r\n")
+        } else if let Some(line) = segment.strip_suffix('\n') {
+            (line, "\n")
+        } else {
+            (segment, "")
+        };
+        let upper = line.to_ascii_uppercase();
+        if upper.contains("-----BEGIN") && upper.contains("PRIVATE KEY-----") {
+            private_key = true;
+            output.push_str("[redacted-private-key]");
+        } else if private_key {
+            if upper.contains("-----END") && upper.contains("PRIVATE KEY-----") {
+                private_key = false;
             }
-            if private_key {
-                if upper.contains("-----END") && upper.contains("PRIVATE KEY-----") {
-                    private_key = false;
-                }
-                return "[redacted-private-key]".into();
-            }
-            let trimmed = line.trim_start();
-            let lower = trimmed.to_ascii_lowercase();
-            if lower.starts_with("authorization:")
-                || lower.starts_with("cookie:")
-                || lower.starts_with("set-cookie:")
-            {
-                return "[redacted-header]".into();
-            }
-            let mut words = Vec::new();
-            let mut redact_next = false;
-            for word in line.split_whitespace() {
-                let lower_word = word.to_ascii_lowercase();
-                let sensitive_assignment = word.split_once('=').is_some_and(|(key, _)| {
-                    let key = key.to_ascii_uppercase();
-                    key.contains("TOKEN")
-                        || key.contains("SECRET")
-                        || key.contains("PASSWORD")
-                        || key.contains("API_KEY")
-                });
-                let high_entropy = word.len() >= 32
-                    && word.chars().any(|c| c.is_ascii_lowercase())
-                    && word.chars().any(|c| c.is_ascii_uppercase())
-                    && word.chars().any(|c| c.is_ascii_digit());
-                let path_like =
-                    (word.contains('/') || word.contains('\\')) && !word.contains("://");
-                if redact_next
-                    || sensitive_assignment
-                    || (high_entropy && !path_like)
-                    || lower_word.starts_with("sk-")
-                {
-                    words.push("[redacted]".to_owned());
-                    redact_next = false;
-                } else if lower_word == "bearer" {
-                    words.push("Bearer".into());
-                    redact_next = true;
-                } else if word.contains("://") && word.contains('@') {
-                    words.push(redact_credential_url(word));
-                } else {
-                    words.push(word.to_owned());
-                }
-            }
-            words.join(" ")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+            output.push_str("[redacted-private-key]");
+        } else if let Some(header) = redact_sensitive_header(line) {
+            output.push_str(&header);
+        } else {
+            output.push_str(&redact_line(line));
+        }
+        output.push_str(ending);
+    }
+    output
 }
 
-/// Redact with `redact_text`, but keep each line's original whitespace when
-/// that line carried nothing to hide. `redact_text` rebuilds lines by joining
-/// words with single spaces, which corrupts patch payloads: unified-diff
-/// prefix columns and code indentation are significant there.
-fn redact_preserving_layout(value: &str) -> String {
-    let redacted: Vec<&str> = value.lines().collect();
-    let fully_redacted = redact_text(value);
-    let redacted_lines: Vec<&str> = fully_redacted.lines().collect();
-    if redacted.len() != redacted_lines.len() {
-        return fully_redacted;
+fn redact_sensitive_header(line: &str) -> Option<String> {
+    let value = line.trim_start();
+    let (name, _) = value.split_once(':')?;
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization" | "cookie" | "set-cookie"
+    )
+    .then(|| {
+        let indentation = &line[..line.len() - value.len()];
+        format!("{indentation}{name}: [redacted]")
+    })
+}
+
+fn redact_line(line: &str) -> String {
+    let mut output = String::with_capacity(line.len());
+    let mut cursor = 0;
+    let mut redact_next = false;
+    while cursor < line.len() {
+        let token_start = line[cursor..]
+            .char_indices()
+            .find(|(_, character)| !character.is_whitespace())
+            .map(|(index, _)| cursor + index)
+            .unwrap_or(line.len());
+        output.push_str(&line[cursor..token_start]);
+        if token_start == line.len() {
+            break;
+        }
+        let token_end = line[token_start..]
+            .char_indices()
+            .find(|(_, character)| character.is_whitespace())
+            .map(|(index, _)| token_start + index)
+            .unwrap_or(line.len());
+        let token = &line[token_start..token_end];
+        let normalized = token.trim_matches(|character: char| {
+            matches!(
+                character,
+                '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
+            )
+        });
+        if redact_next || looks_like_known_secret(normalized) {
+            output.push_str("[redacted]");
+            redact_next = false;
+        } else if normalized.eq_ignore_ascii_case("bearer") {
+            output.push_str(token);
+            redact_next = true;
+        } else if let Some(redacted) = redact_sensitive_assignment(token) {
+            output.push_str(&redacted);
+        } else if token.contains("://") && token.contains('@') {
+            output.push_str(&redact_credential_url(token));
+        } else {
+            output.push_str(token);
+        }
+        cursor = token_end;
     }
-    redacted
-        .iter()
-        .zip(&redacted_lines)
-        .map(|(original, redacted_line)| {
-            let collapsed = original.split_whitespace().collect::<Vec<_>>().join(" ");
-            if *redacted_line == collapsed {
-                (*original).to_owned()
-            } else {
-                (*redacted_line).to_owned()
-            }
+    output
+}
+
+fn redact_sensitive_assignment(token: &str) -> Option<String> {
+    let (key, _) = token.split_once('=')?;
+    is_sensitive_assignment_key(key).then(|| format!("{key}=[redacted]"))
+}
+
+fn is_sensitive_assignment_key(key: &str) -> bool {
+    let key = key
+        .trim_matches(|character: char| {
+            matches!(
+                character,
+                '"' | '\'' | '`' | '(' | '[' | '{' | '<' | '-' | '/'
+            )
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .replace('-', "_")
+        .to_ascii_uppercase();
+    matches!(
+        key.as_str(),
+        "TOKEN"
+            | "AUTH_TOKEN"
+            | "ACCESS_TOKEN"
+            | "REFRESH_TOKEN"
+            | "ID_TOKEN"
+            | "API_KEY"
+            | "APIKEY"
+            | "SECRET"
+            | "CLIENT_SECRET"
+            | "PASSWORD"
+            | "PASSWD"
+            | "PRIVATE_KEY"
+            | "GITHUB_PAT"
+            | "AWS_SECRET_ACCESS_KEY"
+            | "AWS_SESSION_TOKEN"
+    ) || key.ends_with("_TOKEN")
+        || key.ends_with("_SECRET")
+        || key.ends_with("_PASSWORD")
+        || key.ends_with("_PASSWD")
+        || key.ends_with("_API_KEY")
+        || key.ends_with("_PRIVATE_KEY")
+        || key.ends_with("_PAT")
+}
+
+fn looks_like_known_secret(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    (token.len() >= 16
+        && (lower.starts_with("sk-")
+            || lower.starts_with("ghp_")
+            || lower.starts_with("gho_")
+            || lower.starts_with("ghu_")
+            || lower.starts_with("ghs_")
+            || lower.starts_with("ghr_")
+            || lower.starts_with("github_pat_")
+            || lower.starts_with("xoxb-")
+            || lower.starts_with("xoxp-")
+            || lower.starts_with("xoxa-")
+            || lower.starts_with("xoxr-")))
+        || (token.len() >= 30 && token.starts_with("AIza"))
+        || (token.len() == 20 && (token.starts_with("AKIA") || token.starts_with("ASIA")))
+        || looks_like_jwt(token)
+}
+
+fn redact_json_document(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut parsed = serde_json::from_str::<Value>(trimmed).ok()?;
+    if !redact_explicit_json_secrets(&mut parsed) {
+        return None;
+    }
+    let start = value.len() - value.trim_start().len();
+    let end = value.trim_end().len();
+    let serialized = if trimmed.contains('\n') {
+        serde_json::to_string_pretty(&parsed).ok()?
+    } else {
+        parsed.to_string()
+    };
+    Some(format!(
+        "{}{}{}",
+        &value[..start],
+        serialized,
+        &value[end..]
+    ))
+}
+
+fn redact_explicit_json_secrets(value: &mut Value) -> bool {
+    match value {
+        Value::Object(fields) => {
+            let mut changed = false;
+            for (key, value) in fields {
+                if is_sensitive_json_key(key) {
+                    *value = Value::String("[redacted]".into());
+                    changed = true;
+                } else {
+                    changed |= redact_explicit_json_secrets(value);
+                }
+            }
+            changed
+        }
+        Value::Array(values) => {
+            let mut changed = false;
+            for value in values {
+                changed |= redact_explicit_json_secrets(value);
+            }
+            changed
+        }
+        Value::String(text) => {
+            let trimmed = text.trim();
+            let replacement = if looks_like_known_secret(trimmed) {
+                Some("[redacted]".into())
+            } else if trimmed
+                .get(..7)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bearer "))
+            {
+                Some("Bearer [redacted]".into())
+            } else if trimmed.contains("://") && trimmed.contains('@') {
+                Some(redact_credential_url(text))
+            } else if trimmed.to_ascii_uppercase().contains("-----BEGIN")
+                && trimmed.to_ascii_uppercase().contains("PRIVATE KEY-----")
+            {
+                Some("[redacted-private-key]".into())
+            } else {
+                None
+            };
+            if let Some(replacement) = replacement {
+                *text = replacement;
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn is_sensitive_json_key(key: &str) -> bool {
+    let key = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<String>();
+    matches!(
+        key.as_str(),
+        "token"
+            | "authtoken"
+            | "accesstoken"
+            | "refreshtoken"
+            | "idtoken"
+            | "sessiontoken"
+            | "csrftoken"
+            | "apikey"
+            | "secret"
+            | "clientsecret"
+            | "password"
+            | "passwd"
+            | "privatekey"
+            | "githubpat"
+            | "authorization"
+            | "cookie"
+            | "setcookie"
+            | "awssecretaccesskey"
+    ) || key.ends_with("apikey")
+        || key.ends_with("password")
+        || key.ends_with("privatekey")
+        || key.ends_with("clientsecret")
+}
+
+fn looks_like_jwt(token: &str) -> bool {
+    let mut segments = token.split('.');
+    let Some(header) = segments.next() else {
+        return false;
+    };
+    let Some(payload) = segments.next() else {
+        return false;
+    };
+    let Some(signature) = segments.next() else {
+        return false;
+    };
+    segments.next().is_none()
+        && header.starts_with("eyJ")
+        && payload.len() >= 8
+        && signature.len() >= 8
+        && [header, payload, signature].into_iter().all(|segment| {
+            segment.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            })
+        })
 }
 
 fn bound_and_redact_patch(value: &str, limit: usize) -> (String, bool) {
-    truncate_utf8(&redact_preserving_layout(value), limit)
+    truncate_utf8(&redact_text(value), limit)
 }
 
 fn redact_credential_url(value: &str) -> String {
@@ -807,18 +1023,30 @@ fn transport_id_from_value(value: &Value) -> Option<TransportRequestId> {
     }
 }
 
-/// Strip the client-injected `<conversation-context>` handoff block from an
-/// echoed user message so the transcript shows only what the user typed.
+/// Strip leading client-injected context blocks from an echoed user message
+/// so the transcript shows only what the user typed.
 fn strip_context_primer(text: &str) -> &str {
-    const OPEN: &str = "<conversation-context>";
-    const CLOSE: &str = "</conversation-context>";
-    let trimmed = text.trim_start();
-    if let Some(rest) = trimmed.strip_prefix(OPEN)
-        && let Some(end) = rest.find(CLOSE)
-    {
-        return rest[end + CLOSE.len()..].trim_start();
+    const BLOCKS: [(&str, &str); 5] = [
+        ("<ai-integrator-harness>", "</ai-integrator-harness>"),
+        ("<integrator-skills>", "</integrator-skills>"),
+        ("<delegation>", "</delegation>"),
+        ("<delegation-update>", "</delegation-update>"),
+        ("<conversation-context>", "</conversation-context>"),
+    ];
+    let mut remaining = text;
+    loop {
+        let trimmed = remaining.trim_start();
+        let Some((rest, close)) = BLOCKS
+            .iter()
+            .find_map(|(open, close)| trimmed.strip_prefix(open).map(|rest| (rest, *close)))
+        else {
+            return remaining;
+        };
+        let Some(end) = rest.find(close) else {
+            return remaining;
+        };
+        remaining = rest[end + close.len()..].trim_start();
     }
-    text
 }
 
 /// Collect ACP `diff` content blocks (`{type, path, oldText, newText}`) from a
@@ -1211,6 +1439,28 @@ mod tests {
     }
 
     #[test]
+    fn all_leading_integrator_context_is_stripped_from_echoed_user_messages() {
+        let event = reduce_provider_event(ProviderEventInput {
+            method: "item/completed".into(),
+            params: json!({ "threadId":"th1", "turnId":"tu1", "item": {
+                "type":"userMessage", "id":"it1",
+                "content":[{"text":"<ai-integrator-harness>\nprivate\n</ai-integrator-harness>\n\
+                    <integrator-skills>\nskills\n</integrator-skills>\n\
+                    <delegation>\ntools\n</delegation>\nactual question"}]
+            }}),
+            request_id: None,
+            occurred_at: Utc::now(),
+        })
+        .expect("reduce")
+        .expect("accepted");
+        assert!(matches!(
+            event.mutation,
+            ProjectionMutation::ReplaceItem(ItemProjection { body: Some(ref body), .. })
+                if body == "actual question"
+        ));
+    }
+
+    #[test]
     fn text_happy_path_reduces_to_agent_item() {
         let event = reduce_provider_event(ProviderEventInput {
             method: "item/completed".into(),
@@ -1305,7 +1555,7 @@ mod tests {
     }
 
     #[test]
-    fn long_file_paths_are_not_mistaken_for_high_entropy_secrets() {
+    fn legitimate_paths_and_opaque_identifiers_remain_visible() {
         assert_eq!(
             redact_text("/Users/lukekabbash/Documents/Code/integrator-3/src/App2.tsx"),
             "/Users/lukekabbash/Documents/Code/integrator-3/src/App2.tsx"
@@ -1314,13 +1564,47 @@ mod tests {
             redact_text(r"C:\Users\Luke\Documents\Integrator-3\src\App2.tsx"),
             r"C:\Users\Luke\Documents\Integrator-3\src\App2.tsx"
         );
+        assert_eq!(
+            redact_text("prefix AbcdefghijklmnopQRSTUVWX1234567890 suffix"),
+            "prefix AbcdefghijklmnopQRSTUVWX1234567890 suffix"
+        );
     }
 
     #[test]
-    fn high_entropy_non_path_tokens_are_still_redacted() {
+    fn model_visible_json_rpc_output_is_preserved_exactly() {
+        let output = r#"{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"integrator-local-tools","version":"0.1.0"}}}"#;
+        assert_eq!(redact_text(output), output);
+    }
+
+    #[test]
+    fn conservative_redaction_preserves_layout_and_non_secret_names() {
+        let output =
+            "  TOKEN_COUNT=2048  SECRETARY=Luke\tPASSWORD_POLICY=required\n    aligned output\n";
+        assert_eq!(redact_text(output), output);
+    }
+
+    #[test]
+    fn explicit_credentials_are_still_redacted() {
+        let openai_key = format!("sk-{}", "a".repeat(32));
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123";
         assert_eq!(
-            redact_text("prefix AbcdefghijklmnopQRSTUVWX1234567890 suffix"),
-            "prefix [redacted] suffix"
+            redact_text(&format!(
+                "OPENAI_API_KEY=secret Bearer bearer-value {openai_key} {jwt}"
+            )),
+            "OPENAI_API_KEY=[redacted] Bearer [redacted] [redacted] [redacted]"
+        );
+        assert_eq!(
+            redact_text("  Authorization: Bearer bearer-value\r\nCookie: session=value\r\n"),
+            "  Authorization: [redacted]\r\nCookie: [redacted]\r\n"
+        );
+    }
+
+    #[test]
+    fn json_redaction_targets_secret_fields_without_hiding_metrics() {
+        let output = r#"{"apiKey":"secret-value","tokenCount":2048,"passwordPolicy":"required"}"#;
+        assert_eq!(
+            redact_text(output),
+            r#"{"apiKey":"[redacted]","passwordPolicy":"required","tokenCount":2048}"#
         );
     }
 
@@ -1729,6 +2013,95 @@ mod tests {
                 .expect("tool output")
                 .contains("matches")
         );
+    }
+
+    #[test]
+    fn codex_web_search_becomes_search_activity() {
+        let started = reduce_provider_event(ProviderEventInput {
+            method: "item/started".into(),
+            params: json!({
+                "threadId": "th1",
+                "turnId": "tu1",
+                "item": {
+                    "type": "webSearch",
+                    "id": "search-1",
+                    "query": "",
+                    "action": {"type": "other"}
+                }
+            }),
+            request_id: None,
+            occurred_at: Utc::now(),
+        })
+        .expect("reduce")
+        .expect("accepted");
+        let completed = reduce_provider_event(ProviderEventInput {
+            method: "item/completed".into(),
+            params: json!({
+                "threadId": "th1",
+                "turnId": "tu1",
+                "item": {
+                    "type": "webSearch",
+                    "id": "search-1",
+                    "query": "Stripe MCP connector sign in status",
+                    "action": {
+                        "type": "search",
+                        "query": "Stripe MCP connector sign in status"
+                    }
+                }
+            }),
+            request_id: None,
+            occurred_at: Utc::now(),
+        })
+        .expect("reduce")
+        .expect("accepted");
+
+        let ProjectionMutation::ReplaceItem(started) = started.mutation else {
+            panic!("expected started item");
+        };
+        let ProjectionMutation::ReplaceItem(completed) = completed.mutation else {
+            panic!("expected completed item");
+        };
+        assert_eq!(started.id, completed.id);
+        assert_eq!(started.kind, ItemKind::McpTool);
+        assert_eq!(started.status, ItemStatus::InProgress);
+        assert_eq!(completed.status, ItemStatus::Completed);
+        assert_eq!(completed.mcp_tool.as_deref(), Some("web_search"));
+        assert_eq!(
+            completed.body.as_deref(),
+            Some("Stripe MCP connector sign in status")
+        );
+        assert!(
+            completed
+                .tool_input
+                .as_deref()
+                .expect("search input")
+                .contains("Stripe MCP connector sign in status")
+        );
+    }
+
+    #[test]
+    fn unknown_items_use_neutral_provider_activity_copy() {
+        let event = reduce_provider_event(ProviderEventInput {
+            method: "item/completed".into(),
+            params: json!({
+                "threadId": "th1",
+                "turnId": "tu1",
+                "item": {
+                    "type": "futureProviderItem",
+                    "id": "future-1"
+                }
+            }),
+            request_id: None,
+            occurred_at: Utc::now(),
+        })
+        .expect("reduce")
+        .expect("accepted");
+        let ProjectionMutation::ReplaceItem(item) = event.mutation else {
+            panic!("expected provider item");
+        };
+        assert_eq!(item.kind, ItemKind::Unknown);
+        assert_eq!(item.title.as_deref(), Some("Provider activity"));
+        assert_eq!(item.body.as_deref(), Some("Additional provider activity"));
     }
 
     #[test]

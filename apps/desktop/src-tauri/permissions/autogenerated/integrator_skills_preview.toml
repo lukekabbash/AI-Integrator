@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-integrator-skills-preview"
+description = "Enables the integrator_skills_preview command without any pre-configured scope."
+commands.allow = ["integrator_skills_preview"]
+
+[[permission]]
+identifier = "deny-integrator-skills-preview"
+description = "Denies the integrator_skills_preview command without any pre-configured scope."
+commands.deny = ["integrator_skills_preview"]

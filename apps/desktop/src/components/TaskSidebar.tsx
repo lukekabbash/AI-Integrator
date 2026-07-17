@@ -81,7 +81,7 @@ interface TaskSidebarProps {
     taskId: string,
     patch: { title?: string; pinned?: boolean; archived?: boolean },
   ) => void;
-  /** Duplicate a chat and its whole transcript into a new one. */
+  /** Duplicate a chat's settled transcript into a new one. */
   onCopyTask?: (taskId: string) => void;
   onUpdateProject?: (
     projectId: string,
@@ -837,10 +837,10 @@ export const TaskSidebar = memo(function TaskSidebar({
               </MenuActionTooltip>
               <MenuActionTooltip
                 label={
-                  task.status === "running"
-                    ? "Wait for this chat to finish before copying it"
-                    : !metadataActionsEnabled || !onCopyTask
-                      ? "Native persistence is being added"
+                  !metadataActionsEnabled || !onCopyTask
+                    ? "Native persistence is being added"
+                    : task.status === "starting" || task.status === "running"
+                      ? "Copy settled history without the unfinished turn"
                       : "Duplicate this chat and its history"
                 }
               >
@@ -851,7 +851,7 @@ export const TaskSidebar = memo(function TaskSidebar({
                     setOpenMenuId("");
                     onCopyTask?.(task.id);
                   }}
-                  disabled={!metadataActionsEnabled || !onCopyTask || task.status === "running"}
+                  disabled={!metadataActionsEnabled || !onCopyTask}
                 >
                   <CopyPlus /> Copy
                 </button>

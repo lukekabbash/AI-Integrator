@@ -3,6 +3,7 @@ import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
+import { clearOptimisticMessageForTask, isComposerTurnBusy } from "./appTurnState";
 import { bridge } from "./bridge";
 import { createDemoSnapshot, createEmptySnapshot } from "./demoData";
 
@@ -14,11 +15,49 @@ function storeSnapshot(snapshot: ReturnType<typeof createDemoSnapshot>) {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  bridge.invalidateModelCatalog("codex");
+  bridge.invalidateModelCatalog("claude");
+  bridge.invalidateModelCatalog("antigravity");
+  bridge.invalidateModelCatalog("cursor");
+  bridge.invalidateModelCatalog("grok");
+  bridge.invalidateModelCatalog("custom");
   window.localStorage.clear();
   document.documentElement.removeAttribute("style");
 });
 
 describe("AI Integrator desktop workspace", () => {
+  it("does not let an older task clear another task's optimistic message", () => {
+    const current = {
+      taskId: "task-b",
+      event: {
+        id: "optimistic-b",
+        kind: "user" as const,
+        body: "Newer task message",
+        timestamp: "2026-07-16T03:00:00Z",
+        status: "neutral" as const,
+      },
+    };
+
+    expect(clearOptimisticMessageForTask(current, "task-a")).toBe(current);
+    expect(clearOptimisticMessageForTask(current, "task-b")).toBeNull();
+  });
+
+  it("treats every launch and queue handoff phase as composer-busy", () => {
+    const idle = {
+      projectedTurnActive: false,
+      optimisticTurnStarting: false,
+      resuming: false,
+      queueBusy: false,
+      queueAwaiting: false,
+      optimisticMessage: false,
+    };
+    expect(isComposerTurnBusy(idle)).toBe(false);
+
+    for (const key of Object.keys(idle) as Array<keyof typeof idle>) {
+      expect(isComposerTurnBusy({ ...idle, [key]: true })).toBe(true);
+    }
+  });
+
   it("renders the agent-first workspace with Git and local usage evidence", async () => {
     render(<App />);
     expect(
@@ -34,6 +73,19 @@ describe("AI Integrator desktop workspace", () => {
     expect(usagePill).not.toHaveTextContent("%");
     expect(usagePill).toHaveTextContent("tokens");
     expect(screen.getByPlaceholderText("Commit message")).toBeInTheDocument();
+  });
+
+  it("opens a new chat without reloading the warmed model catalog", async () => {
+    bridge.invalidateModelCatalog("codex");
+    const listModelCatalog = vi.spyOn(bridge, "listModelCatalog");
+
+    render(<App />);
+    await waitFor(() => expect(listModelCatalog).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "New chatCtrl N" }));
+    await screen.findByRole("textbox", { name: "Task message" });
+
+    expect(listModelCatalog).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Model" })).not.toHaveTextContent("Checking model…");
   });
 
   it("moves one selection line between Task and Review", async () => {
@@ -183,24 +235,25 @@ describe("AI Integrator desktop workspace", () => {
       "General",
       "Appearance",
       "Composer",
-      "Models and Runtimes",
+      "Runtimes and Models",
+      "Skills and Plugins",
+      "Subagents",
       "Permissions",
+      "Git",
+      "Explain",
       "Usage and Budgets",
-      "Archive",
+      "Archives",
     ];
+    expect(
+      Array.from(navigation.querySelectorAll("nav button"), (button) => button.textContent?.trim()),
+    ).toEqual(categoryLabels);
     for (const label of categoryLabels) {
       expect(
         within(navigation).getByRole("button", { name: new RegExp(label, "i") }),
       ).toBeInTheDocument();
     }
     // Placeholder categories with no consuming behavior must not resurface.
-    for (const removed of [
-      "Delegation",
-      "Skills",
-      "Memory & context",
-      "Notifications",
-      "Advanced",
-    ]) {
+    for (const removed of ["Delegation", "Memory & context", "Notifications", "Advanced"]) {
       expect(
         within(navigation).queryByRole("button", { name: new RegExp(removed, "i") }),
       ).not.toBeInTheDocument();
@@ -234,8 +287,8 @@ describe("AI Integrator desktop workspace", () => {
     expect(screen.getByRole("slider", { name: "Body line height" })).toBeInTheDocument();
     expect(screen.getByRole("textbox", { name: "Search Settings" })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /^Models/ }));
-    expect(await screen.findByRole("heading", { name: "Models and Runtimes" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Runtimes/ }));
+    expect(await screen.findByRole("heading", { name: "Runtimes and Models" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Edit defaults for Codex" }));
     fireEvent.click(screen.getByRole("button", { name: "Preferred model for codex" }));
     fireEvent.click(screen.getByRole("option", { name: "GPT-5.4" }));
@@ -250,13 +303,13 @@ describe("AI Integrator desktop workspace", () => {
     expect(screen.getByText("Codex")).toBeInTheDocument();
   });
 
-  it("manages archived chats from the Archive settings section", async () => {
+  it("manages archived chats from the Archives settings section", async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Open Settings" }));
     await screen.findByRole("heading", { name: "Appearance" });
     const navigation = screen.getByRole("complementary", { name: "Settings navigation" });
-    fireEvent.click(within(navigation).getByRole("button", { name: "Archive" }));
-    expect(await screen.findByRole("heading", { name: "Archive" })).toBeInTheDocument();
+    fireEvent.click(within(navigation).getByRole("button", { name: "Archives" }));
+    expect(await screen.findByRole("heading", { name: "Archives" })).toBeInTheDocument();
 
     // Retention controls persist like every other setting.
     const autoDelete = screen.getByRole("button", { name: "Auto-delete archived chats" });
@@ -296,7 +349,7 @@ describe("AI Integrator desktop workspace", () => {
 
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Open Settings" }));
-    fireEvent.click(await screen.findByRole("button", { name: /^Models/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Runtimes/ }));
     fireEvent.click(await screen.findByRole("button", { name: "Edit defaults for Codex" }));
     fireEvent.click(await screen.findByRole("button", { name: "Preferred model for codex" }));
     fireEvent.click(screen.getByRole("option", { name: "GPT-5.4" }));
@@ -353,7 +406,7 @@ describe("AI Integrator desktop workspace", () => {
   it("uses Settings changes when the next chat is created", async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Open Settings" }));
-    fireEvent.click(await screen.findByRole("button", { name: /^Models/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Runtimes/ }));
     fireEvent.click(screen.getByRole("button", { name: "Favorite runtime" }));
     fireEvent.click(screen.getByRole("option", { name: "Claude Code" }));
     fireEvent.click(screen.getByRole("button", { name: "Edit defaults for Claude Code" }));

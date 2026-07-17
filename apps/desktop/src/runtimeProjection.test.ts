@@ -70,7 +70,7 @@ describe("sidebar task activity projection", () => {
         event(4, { kind: "turnError", message: "provider exited", retryable: true }),
         true,
       ),
-    ).toMatchObject({ status: "failed", unread: false });
+    ).toBeNull();
     expect(
       taskActivityUpdate(
         event(5, {
@@ -517,6 +517,58 @@ describe("runtime projection reducer", () => {
       { label: "Input", body: '{\n  "query": "flaky tests"\n}' },
       { label: "Output", body: "3 results" },
     ]);
+  });
+
+  it("renders provider web search as calm search activity", () => {
+    const state = applyRuntimeProjection(
+      createRuntimeProjectionState("task-1"),
+      event(50, {
+        kind: "itemChanged",
+        item: {
+          id: "codex:thread-1:turn-1:search-1",
+          providerItemId: "search-1",
+          kind: "mcpTool",
+          status: "completed",
+          title: "Web search",
+          mcpTool: "web_search",
+          body: "Stripe MCP connector sign in status",
+          toolInput: '{\n  "query": "Stripe MCP connector sign in status"\n}',
+          truncated: false,
+          updatedAt: "2026-07-10T16:00:00Z",
+        },
+      }),
+    );
+
+    expect(runtimeTranscript(state)[0]).toMatchObject({
+      kind: "tool",
+      title: "Searched",
+      body: "Stripe MCP connector sign in status",
+    });
+  });
+
+  it("normalizes legacy unsupported web search rows", () => {
+    const state = applyRuntimeProjection(
+      createRuntimeProjectionState("task-1"),
+      event(50, {
+        kind: "itemChanged",
+        item: {
+          id: "codex:thread-1:turn-1:legacy-search",
+          providerItemId: "legacy-search",
+          kind: "unknown",
+          status: "completed",
+          title: "Provider activity",
+          body: "Unsupported item type: webSearch",
+          truncated: false,
+          updatedAt: "2026-07-10T16:00:00Z",
+        },
+      }),
+    );
+
+    expect(runtimeTranscript(state)[0]).toMatchObject({
+      kind: "tool",
+      title: "Searched",
+      body: "Web search",
+    });
   });
 
   it("uses typed subagent copy and fails unknown tools closed", () => {
@@ -1096,9 +1148,7 @@ describe("runtime projection reducer", () => {
       }),
     );
     expect(runtimeTranscript(state).map((entry) => entry.kind)).toEqual(["assistant"]);
-    expect(runtimeTranscript(state).some((entry) => entry.body === "Resume from here")).toBe(
-      false,
-    );
+    expect(runtimeTranscript(state).some((entry) => entry.body === "Resume from here")).toBe(false);
   });
 
   it("titles plan-review approvals distinctly in the transcript", () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { stabilizeStreamingMarkdown } from "./streamStableMarkdown";
+import { repairStreamedTables, stabilizeStreamingMarkdown } from "./streamStableMarkdown";
 
 describe("stabilizeStreamingMarkdown", () => {
   it("holds back a trailing bare dash so setext headings do not flash", () => {
@@ -40,5 +40,53 @@ describe("stabilizeStreamingMarkdown", () => {
     expect(stabilizeStreamingMarkdown("Just a sentence.")).toBe("Just a sentence.");
     expect(stabilizeStreamingMarkdown("- already an item")).toBe("- already an item");
     expect(stabilizeStreamingMarkdown("")).toBe("");
+  });
+});
+
+describe("repairStreamedTables", () => {
+  it("splits a header/delimiter/rows table glued onto one line", () => {
+    const glued =
+      "Every provider has two faces:\n" +
+      "| Role | Shape | Examples ||------|--------|----------|| **Wire** | slug | `gpt-5.6-sol` || **Display** | title case | `GPT5.6 Sol` |\n" +
+      "And each product invents its own dialect:";
+    expect(repairStreamedTables(glued)).toBe(
+      "Every provider has two faces:\n" +
+        "| Role | Shape | Examples |\n" +
+        "|------|--------|----------|\n" +
+        "| **Wire** | slug | `gpt-5.6-sol` |\n" +
+        "| **Display** | title case | `GPT5.6 Sol` |\n" +
+        "\n" +
+        "And each product invents its own dialect:",
+    );
+  });
+
+  it("inserts the blank line a table needs so trailing prose isn't absorbed as a phantom row", () => {
+    // Already has real newlines between rows, just no blank line after the
+    // last one — remark-gfm would otherwise fold "Done." into the table.
+    const table = "| A | B |\n|---|---|\n| 1 | 2 |\nDone.";
+    expect(repairStreamedTables(table)).toBe("| A | B |\n|---|---|\n| 1 | 2 |\n\nDone.");
+  });
+
+  it("splits chained seams even when a cell lands empty on one", () => {
+    // Header + delimiter + row + (empty-first-cell row), all glued on one line.
+    // The lone "|" left over from the empty cell doesn't look like a row, so
+    // it (and the fragment after it) fall out of the table as plain text —
+    // an imperfect but harmless read of a pathological, real-world-unseen input.
+    const glued = "|h1|h2||---|---||a1|a2|||b2|";
+    expect(repairStreamedTables(glued)).toBe("|h1|h2|\n|---|---|\n|a1|a2|\n\n|\n|b2|");
+  });
+
+  it("leaves boolean `||` in code alone when no delimiter row is present", () => {
+    const code = "Use `if (a || b)` to short-circuit.";
+    expect(repairStreamedTables(code)).toBe(code);
+  });
+
+  it("leaves an already-correct table alone", () => {
+    const table = "| A | B |\n|---|---|\n| 1 | 2 |";
+    expect(repairStreamedTables(table)).toBe(table);
+  });
+
+  it("leaves text without any pipes alone", () => {
+    expect(repairStreamedTables("Just a sentence.")).toBe("Just a sentence.");
   });
 });

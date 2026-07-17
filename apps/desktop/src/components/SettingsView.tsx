@@ -1,14 +1,28 @@
-import { useCallback, useMemo, useRef, useState, useEffect } from "react";
+import {
+  startTransition,
+  useCallback,
+  useMemo,
+  useRef,
+  useState,
+  useEffect,
+  useTransition,
+  type AnchorHTMLAttributes,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
 import { AnimatePresence, LayoutGroup, m as motion, useReducedMotion } from "motion/react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   Archive,
   ArchiveRestore,
   ArrowLeft,
   Bot,
+  Boxes,
   Braces,
-  ChevronDown,
   Folder,
   Check,
+  ChevronDown,
+  ChevronRight,
   CircleDollarSign,
   Copy,
   Database,
@@ -27,6 +41,7 @@ import {
   RotateCcw,
   Save,
   Search,
+  Server,
   Settings,
   ShieldCheck,
   Sparkles,
@@ -41,6 +56,12 @@ import {
   bridge,
   openExternalLink,
   resolveModelEffort,
+  type IntegratorMcpConfig,
+  type IntegratorMcpOverview,
+  type IntegratorMcpServer,
+  type IntegratorSkillBody,
+  type RemoteSkillBody,
+  type RemoteSkillsPreview,
   type IntegratorSkillInfo,
   type IntegratorSkillsOverview,
   type LocalAppInfo,
@@ -117,6 +138,12 @@ import {
   withSkillEnablement,
   withSkillsEnablement,
 } from "../skillsSettings";
+import {
+  CURATED_MCP_SERVERS,
+  MCP_ENABLED_KEY,
+  mcpLaunchPreview,
+  parseMcpForm,
+} from "../mcpSettings";
 
 type SettingsSection =
   | "general"
@@ -169,29 +196,29 @@ const settingsNav: Array<{ id: SettingsSection; label: string; hint: string; ico
   { id: "general", label: "General", hint: "Local app and data", icon: MonitorCog },
   { id: "appearance", label: "Appearance", hint: "Themes, type, motion", icon: Palette },
   { id: "composer", label: "Composer", hint: "Send behavior", icon: Braces },
-  { id: "explain", label: "Explain", hint: "Ask about a selection", icon: Lightbulb },
+  {
+    id: "models-runtimes",
+    label: "Runtimes and Models",
+    hint: "Defaults, connections, and capability",
+    icon: Bot,
+  },
+  {
+    id: "skills",
+    label: "Skills and Plugins",
+    hint: "Marketplace, installed capabilities, and MCP connectors",
+    icon: Sparkles,
+  },
+  { id: "subagents", label: "Subagents", hint: "Cross-provider handoff policy", icon: Users },
+  { id: "permissions", label: "Permissions", hint: "Safe execution defaults", icon: ShieldCheck },
   {
     id: "git",
     label: "Git",
     hint: "Commit messages, trailers, and push safety",
     icon: GitBranch,
   },
-  {
-    id: "models-runtimes",
-    label: "Models and Runtimes",
-    hint: "Defaults, connections, and capability",
-    icon: Bot,
-  },
-  { id: "permissions", label: "Permissions", hint: "Safe execution defaults", icon: ShieldCheck },
-  {
-    id: "skills",
-    label: "Skills",
-    hint: "Portable skills and plugins across runtimes",
-    icon: Sparkles,
-  },
-  { id: "subagents", label: "Subagents", hint: "Cross-provider handoff policy", icon: Users },
+  { id: "explain", label: "Explain", hint: "Ask about a selection", icon: Lightbulb },
   { id: "usage", label: "Usage and Budgets", hint: "Local usage evidence", icon: CircleDollarSign },
-  { id: "archive", label: "Archive", hint: "Browse, restore, and clean up", icon: Archive },
+  { id: "archive", label: "Archives", hint: "Browse, restore, and clean up", icon: Archive },
 ];
 
 type SettingsMap = Record<string, unknown>;
@@ -294,14 +321,21 @@ function readSetting<T>(settings: SettingsMap, key: string, fallback: T): T {
 function SettingRow({
   label,
   description,
+  icon,
   children,
 }: {
   label: string;
   description: string;
+  icon?: React.ReactNode;
   children: React.ReactNode;
 }) {
   return (
-    <div className="setting-row">
+    <div className="setting-row" data-has-icon={icon ? true : undefined}>
+      {icon ? (
+        <span className="setting-row-icon" aria-hidden>
+          {icon}
+        </span>
+      ) : null}
       <span>
         <strong>{label}</strong>
         <small>{description}</small>
@@ -313,25 +347,25 @@ function SettingRow({
 
 function Switch({
   checked,
-  mixed = false,
   onChange,
   label,
+  disabled = false,
 }: {
   checked: boolean;
-  mixed?: boolean;
   onChange: (value: boolean) => void;
   label: string;
+  disabled?: boolean;
 }) {
   return (
     <button
       className="switch"
       type="button"
       role="switch"
+      disabled={disabled}
       aria-checked={checked}
       aria-label={label}
       onClick={() => onChange(!checked)}
       data-checked={checked}
-      data-mixed={mixed}
     >
       <span />
     </button>
@@ -404,11 +438,19 @@ const SKILL_BRAND_MARKS = {
   remotion: "/brand/skills/remotion.png",
   superpowers: "/brand/skills/superpowers.svg",
   firebase: "/brand/skills/firebase.png",
+  google: "/brand/skills/google.png",
+  googleDrive: "/brand/skills/google-drive.png",
+  nvidia: "/brand/skills/nvidia.ico",
   supabase: "/brand/skills/supabase.ico",
   tauri: "/brand/skills/tauri.svg",
   government: "/brand/skills/data-gov.ico",
   market: "/brand/skills/alpha-vantage.ico",
   github: "/brand/skills/github.svg",
+  notion: "/brand/skills/notion.ico",
+  linear: "/brand/skills/linear.ico",
+  figma: "/brand/skills/figma.ico",
+  sentry: "/brand/skills/sentry.ico",
+  blender: "/brand/skills/blender.ico",
 } as const;
 
 type SkillBrand = keyof typeof SKILL_BRAND_MARKS;
@@ -437,6 +479,11 @@ const PLUGIN_GROUP_BRANDS: Record<string, SkillBrand[]> = {
   "stripe-ai": ["stripe"],
   "remotion-dev-skills": ["remotion"],
   "obra-superpowers": ["superpowers"],
+  "firebase-agent-skills": ["firebase"],
+  "google-skills": ["google"],
+  "googleworkspace-cli": ["googleDrive"],
+  "nvidia-skills": ["nvidia"],
+  "supabase-agent-skills": ["supabase"],
 };
 
 const CURATED_INSTALL_BRANDS: Record<string, SkillBrand[]> = {
@@ -450,6 +497,17 @@ const CURATED_INSTALL_BRANDS: Record<string, SkillBrand[]> = {
   stripe: ["stripe"],
   video: ["remotion"],
   community: ["superpowers"],
+  firebase: ["firebase"],
+  google: ["google"],
+  "google-drive": ["googleDrive"],
+  nvidia: ["nvidia"],
+  supabase: ["supabase"],
+  github: ["github"],
+  notion: ["notion"],
+  linear: ["linear"],
+  figma: ["figma"],
+  sentry: ["sentry"],
+  blender: ["blender"],
 };
 
 function SkillBrandIcon({ brands }: { brands?: SkillBrand[] }) {
@@ -468,53 +526,15 @@ function SkillBrandIcon({ brands }: { brands?: SkillBrand[] }) {
   );
 }
 
-function SkillsCollection({
-  title,
-  description,
-  icon: Icon,
-  open,
-  onToggle,
-  children,
-}: {
-  title: string;
-  description: string;
-  icon: LucideIcon;
-  open: boolean;
-  onToggle: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <section className="settings-section skills-collection">
-      <button
-        className="skills-collection-toggle"
-        type="button"
-        aria-expanded={open}
-        onClick={onToggle}
-      >
-        <span className="skills-collection-icon" aria-hidden>
-          <Icon />
-        </span>
-        <span>
-          <strong>{title}</strong>
-          <small>{description}</small>
-        </span>
-        <ChevronDown data-open={open} aria-hidden />
-      </button>
-      <AnimatePresence initial={false}>
-        {open ? (
-          <motion.div
-            className="skills-collection-body"
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: "auto", opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
-          >
-            <div>{children}</div>
-          </motion.div>
-        ) : null}
-      </AnimatePresence>
-    </section>
-  );
+function McpServerIcon({ server }: { server: IntegratorMcpServer }) {
+  const curated =
+    server.source === "user"
+      ? CURATED_MCP_SERVERS.find((entry) => entry.name === server.name)
+      : undefined;
+  const brands = curated
+    ? CURATED_INSTALL_BRANDS[curated.icon]
+    : PLUGIN_GROUP_BRANDS[server.origin];
+  return brands?.length ? <SkillBrandIcon brands={brands} /> : <Server aria-hidden />;
 }
 
 function SkillCredentialControl({
@@ -529,6 +549,10 @@ function SkillCredentialControl({
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   if (!credential) return null;
+  const storageLabel =
+    credential.storage === "protectedLocalFile"
+      ? "protected developer storage"
+      : "the operating system credential store";
 
   const save = async () => {
     if (!secret.trim() || busy) return;
@@ -552,7 +576,7 @@ function SkillCredentialControl({
     setMessage("");
     try {
       await bridge.clearIntegratorSkillCredential(credential.id);
-      setMessage("Removed from the operating system credential store.");
+      setMessage(`Removed from ${storageLabel}.`);
       onChanged();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : `Could not remove ${credential.label}.`);
@@ -570,7 +594,7 @@ function SkillCredentialControl({
           <small>
             {credential.available
               ? credential.configured
-                ? "Configured in the operating system credential store"
+                ? `Configured in ${storageLabel}`
                 : credential.required
                   ? "Required for this skill"
                   : "Optional — raises limits or unlocks additional data"
@@ -603,7 +627,12 @@ function SkillCredentialControl({
           {busy ? <LoaderCircle className="spin" /> : <KeyRound />} Save
         </button>
         {credential.configured ? (
-          <button className="ghost-button" type="button" disabled={busy} onClick={() => void clear()}>
+          <button
+            className="ghost-button"
+            type="button"
+            disabled={busy}
+            onClick={() => void clear()}
+          >
             Remove
           </button>
         ) : null}
@@ -629,27 +658,1744 @@ function SkillSettingsRow({
   enabled,
   onToggle,
   onCredentialChanged,
+  showNamespace = false,
+  onViewPlugin,
+  onOpenDetail,
+  expanded,
+  detailId,
 }: {
   skill: IntegratorSkillInfo;
   enabled: boolean;
   onToggle: (enabled: boolean) => void;
   onCredentialChanged: () => void;
+  showNamespace?: boolean;
+  onViewPlugin?: () => void;
+  /** Opens the skill's full body. The row becomes clickable for this; the
+   * switch, credential control, and origin chip keep acting on themselves. */
+  onOpenDetail?: () => void;
+  expanded?: boolean;
+  detailId?: string;
 }) {
-  const displayName = skill.name.includes(":") ? skill.name.split(":").slice(1).join(":") : skill.name;
+  const namespace = skill.name.includes(":") ? skill.name.split(":", 1)[0] : undefined;
+  const displayName =
+    !showNamespace && skill.name.includes(":")
+      ? skill.name.split(":").slice(1).join(":")
+      : skill.name;
   return (
-    <div className="setting-row skill-settings-row">
+    <div
+      className="setting-row skill-settings-row"
+      role={onOpenDetail ? "button" : undefined}
+      tabIndex={onOpenDetail ? 0 : undefined}
+      aria-expanded={onOpenDetail ? Boolean(expanded) : undefined}
+      aria-controls={onOpenDetail && detailId ? detailId : undefined}
+      onClick={onOpenDetail}
+      onKeyDown={
+        onOpenDetail
+          ? (event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                onOpenDetail();
+              }
+            }
+          : undefined
+      }
+    >
       <span>
-        <strong>{displayName}</strong>
+        <strong className="skill-settings-name">
+          <span>
+            {displayName}
+            {onViewPlugin && namespace ? (
+              <button
+                className="origin-chip"
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onViewPlugin();
+                }}
+                title={`View the ${namespace} plugin`}
+              >
+                {namespace}
+              </button>
+            ) : null}
+          </span>
+        </strong>
         <small>{skill.description}</small>
         <small className="skill-invocation-count">
-          {skill.invocationCount.toLocaleString()} {skill.invocationCount === 1 ? "invocation" : "invocations"}
+          {skill.invocationCount.toLocaleString()}{" "}
+          {skill.invocationCount === 1 ? "invocation" : "invocations"}
         </small>
       </span>
-      <div className="setting-control">
+      <div
+        className="setting-control disclosure-control-pair"
+        onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => event.stopPropagation()}
+      >
         <Switch checked={enabled} onChange={onToggle} label={`Enable ${skill.name}`} />
+        {onOpenDetail ? (
+          <button
+            className="disclosure-chevron-button"
+            type="button"
+            data-open={Boolean(expanded)}
+            aria-expanded={Boolean(expanded)}
+            aria-controls={detailId}
+            aria-label={`${expanded ? "Hide" : "Show"} ${skill.name} instructions`}
+            onClick={(event) => {
+              event.stopPropagation();
+              onOpenDetail();
+            }}
+          >
+            <ChevronDown aria-hidden />
+          </button>
+        ) : null}
       </div>
-      <SkillCredentialControl skill={skill} onChanged={onCredentialChanged} />
+      <div
+        className="credential-click-guard"
+        onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => event.stopPropagation()}
+      >
+        <SkillCredentialControl skill={skill} onChanged={onCredentialChanged} />
+      </div>
     </div>
+  );
+}
+
+function SkillCard({
+  skill,
+  enabled,
+  onToggle,
+  onCredentialChanged,
+  onViewPlugin,
+  onOpenDetail,
+}: {
+  skill: IntegratorSkillInfo;
+  enabled: boolean;
+  onToggle: (enabled: boolean) => void;
+  onCredentialChanged: () => void;
+  onViewPlugin?: () => void;
+  onOpenDetail: () => void;
+}) {
+  const namespace = skill.name.includes(":") ? skill.name.split(":", 1)[0] : undefined;
+  const displayName = namespace ? skill.name.split(":").slice(1).join(":") : skill.name;
+  const sourceLabel = SKILL_SOURCE_LABELS[skill.source] ?? skill.source;
+  const brands = namespace ? PLUGIN_GROUP_BRANDS[namespace] : undefined;
+  return (
+    <motion.div
+      layout="position"
+      role="button"
+      tabIndex={0}
+      aria-label={`Open ${skill.name}`}
+      className="capability-card capability-card--interactive skill-card"
+      data-active={enabled}
+      onClick={onOpenDetail}
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) return;
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onOpenDetail();
+        }
+      }}
+    >
+      <div className="capability-card-heading">
+        <span className="browse-card-tile" aria-hidden>
+          {brands ? <SkillBrandIcon brands={brands} /> : <Sparkles />}
+        </span>
+        <span>
+          <strong>
+            {displayName}
+            {namespace && onViewPlugin ? (
+              <button
+                className="origin-chip"
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onViewPlugin();
+                }}
+                title={`View the ${namespace} plugin`}
+              >
+                {namespace}
+              </button>
+            ) : null}
+          </strong>
+          <small>{sourceLabel}</small>
+        </span>
+      </div>
+      <p className="capability-card-description">{skill.description}</p>
+      <div className="capability-card-footer">
+        <span>
+          {skill.invocationCount.toLocaleString()}{" "}
+          {skill.invocationCount === 1 ? "invocation" : "invocations"}
+        </span>
+        <div
+          className="capability-card-action disclosure-control-pair"
+          onClick={(event) => event.stopPropagation()}
+          onKeyDown={(event) => event.stopPropagation()}
+        >
+          <Switch checked={enabled} onChange={onToggle} label={`Enable ${skill.name}`} />
+          <button
+            className="disclosure-chevron-button"
+            type="button"
+            aria-label={`Open ${skill.name} details`}
+            onClick={(event) => {
+              event.stopPropagation();
+              onOpenDetail();
+            }}
+          >
+            <ChevronRight aria-hidden />
+          </button>
+        </div>
+      </div>
+      <div
+        className="capability-card-detail"
+        onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => event.stopPropagation()}
+      >
+        <SkillCredentialControl skill={skill} onChanged={onCredentialChanged} />
+      </div>
+    </motion.div>
+  );
+}
+
+/** One plugin as a first-class capability card. Its master switch is ON only
+ * when every bundled skill and MCP server is active; the count pill carries
+ * partial state without pretending the whole plugin is enabled. */
+function PluginGroupCard({
+  group,
+  label,
+  brands,
+  mcpCount = 0,
+  enabledMcpCount = 0,
+  showSourceLabel = true,
+  isEnabled,
+  onToggleAll,
+  onOpenDetail,
+  busy = false,
+}: {
+  group: { title: string; source: string; skills: IntegratorSkillInfo[] };
+  label: string;
+  brands?: SkillBrand[];
+  mcpCount?: number;
+  enabledMcpCount?: number;
+  /** Suppressed inside a section where every card already shares one source
+   * (e.g. "Built into AI Integrator") — repeating it per card is noise. */
+  showSourceLabel?: boolean;
+  isEnabled: (skill: IntegratorSkillInfo) => boolean;
+  onToggleAll: (enabled: boolean) => void;
+  onOpenDetail: () => void;
+  busy?: boolean;
+}) {
+  const enabledCount = group.skills.filter(isEnabled).length + enabledMcpCount;
+  const total = group.skills.length + mcpCount;
+  const active = total > 0 && enabledCount === total;
+  const partial = enabledCount > 0 && !active;
+  const invocations = group.skills.reduce((sum, skill) => sum + skill.invocationCount, 0);
+  return (
+    // A real <button> cannot contain the master-switch <button> below
+    // (nested interactive controls are invalid HTML), so the clickable card
+    // is a div with button semantics instead.
+    <div
+      role="button"
+      tabIndex={0}
+      aria-label={label}
+      className="skills-plugin-card"
+      data-active={active}
+      onClick={onOpenDetail}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onOpenDetail();
+        }
+      }}
+    >
+      <span className="skills-plugin-tile" aria-hidden>
+        {group.title === "My skills" ? <Folder /> : <SkillBrandIcon brands={brands} />}
+      </span>
+      <span className="skills-plugin-title">
+        <strong>{label}</strong>
+        <small>
+          {showSourceLabel ? `${SKILL_SOURCE_LABELS[group.source] ?? group.source} · ` : ""}
+          {total} {total === 1 ? "skill" : "skills"}
+          {mcpCount > 0 ? ` · ${mcpCount} MCP` : ""} · {invocations.toLocaleString()} invoked
+        </small>
+      </span>
+      <span
+        className="skills-plugin-controls"
+        onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => event.stopPropagation()}
+      >
+        <AnimatePresence initial={false}>
+          {partial ? (
+            <motion.span
+              className="skills-count-pill"
+              initial={{ opacity: 0, scale: 0.85 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.85 }}
+              transition={{ duration: 0.14, ease: "easeOut" }}
+            >
+              {enabledCount} of {total} on
+            </motion.span>
+          ) : null}
+        </AnimatePresence>
+        <span className="disclosure-control-pair">
+          <Switch
+            checked={active}
+            onChange={onToggleAll}
+            label={`${active ? "Disable" : "Enable"} ${label}`}
+            disabled={busy}
+          />
+          <button
+            className="disclosure-chevron-button"
+            type="button"
+            aria-label={`Open ${label} details`}
+            onClick={(event) => {
+              event.stopPropagation();
+              onOpenDetail();
+            }}
+          >
+            <ChevronRight aria-hidden />
+          </button>
+        </span>
+      </span>
+    </div>
+  );
+}
+
+type CapabilityTab = "marketplace" | "plugins" | "skills" | "mcps";
+const TAB_ORDER: CapabilityTab[] = ["marketplace", "plugins", "skills", "mcps"];
+const capabilityTabSpring = { type: "spring" as const, stiffness: 390, damping: 34, mass: 0.82 };
+const capabilityPanelTransition = {
+  duration: 0.16,
+  ease: [0.22, 1, 0.36, 1] as const,
+};
+const marketplaceCardSpring = {
+  type: "spring" as const,
+  stiffness: 330,
+  damping: 32,
+  mass: 0.86,
+};
+
+const CAPABILITY_TABS: Array<{ id: CapabilityTab; label: string; icon: LucideIcon }> = [
+  { id: "marketplace", label: "Marketplace", icon: Package },
+  { id: "plugins", label: "Plugins", icon: Boxes },
+  { id: "skills", label: "Skills", icon: Sparkles },
+  { id: "mcps", label: "MCPs", icon: Server },
+];
+
+function CapabilityTabs({
+  active,
+  onSelect,
+}: {
+  active: CapabilityTab;
+  onSelect: (next: CapabilityTab) => void;
+}) {
+  const reduceMotion =
+    Boolean(useReducedMotion()) || document.documentElement.dataset.motion === "none";
+  return (
+    <div className="capability-tabs" role="tablist" aria-label="Capability views">
+      <LayoutGroup id="capability-tabs">
+        {CAPABILITY_TABS.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            role="tab"
+            aria-selected={active === tab.id}
+            data-active={active === tab.id}
+            onClick={() => onSelect(tab.id)}
+          >
+            {active === tab.id ? (
+              <motion.span
+                className="capability-tab-active"
+                layoutId={reduceMotion ? undefined : "capability-tab-active"}
+                transition={reduceMotion ? { duration: 0 } : capabilityTabSpring}
+                aria-hidden="true"
+              />
+            ) : null}
+            <tab.icon aria-hidden />
+            <span>{tab.label}</span>
+          </button>
+        ))}
+      </LayoutGroup>
+    </div>
+  );
+}
+
+/** Connect UI for one native credential slot (an env value written as
+ * `{{keychain}}` in the server file). The secret is resolved into the launch
+ * config per turn without entering the renderer again. */
+function McpCredentialControl({
+  server,
+  slot,
+  onChanged,
+}: {
+  server: string;
+  slot: {
+    key: string;
+    configured: boolean;
+    available: boolean;
+    storage: "protectedLocalFile" | "osCredentialStore";
+  };
+  onChanged: () => void;
+}) {
+  const [secret, setSecret] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const storageLabel =
+    slot.storage === "protectedLocalFile"
+      ? "protected developer storage"
+      : "the operating system credential store";
+  const save = async () => {
+    if (busy || !secret.trim()) return;
+    setBusy(true);
+    setMessage("");
+    try {
+      await bridge.setIntegratorMcpCredential(server, slot.key, secret.trim());
+      setSecret("");
+      setMessage(`Stored in ${storageLabel}.`);
+      onChanged();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : `Could not save ${slot.key}.`);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const clear = async () => {
+    if (busy) return;
+    setBusy(true);
+    setMessage("");
+    try {
+      await bridge.clearIntegratorMcpCredential(server, slot.key);
+      setMessage(`Removed from ${storageLabel}.`);
+      onChanged();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : `Could not remove ${slot.key}.`);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="skill-credential-control">
+      <span className="skill-credential-status">
+        <KeyRound aria-hidden />
+        <span>
+          <strong>{slot.key}</strong>
+          <small>
+            {slot.available
+              ? slot.configured
+                ? `Connected — stored in ${storageLabel}`
+                : "Not connected — paste a value to connect this server"
+              : "Native app required for secure storage"}
+          </small>
+        </span>
+      </span>
+      <label className="skill-credential-input">
+        <span className="sr-only">{slot.key}</span>
+        <input
+          type="password"
+          value={secret}
+          onChange={(event) => setSecret(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") void save();
+          }}
+          placeholder={slot.configured ? "Paste a replacement value" : "Paste value"}
+          autoComplete="off"
+          spellCheck={false}
+          disabled={!slot.available || busy}
+        />
+      </label>
+      <div className="skill-credential-actions">
+        <button
+          className="ghost-button"
+          type="button"
+          disabled={!slot.available || busy || !secret.trim()}
+          onClick={() => void save()}
+        >
+          {busy ? <LoaderCircle className="spin" /> : <KeyRound />} Connect
+        </button>
+        {slot.configured ? (
+          <button
+            className="ghost-button"
+            type="button"
+            disabled={busy}
+            onClick={() => void clear()}
+          >
+            Disconnect
+          </button>
+        ) : null}
+      </div>
+      {message ? (
+        <small className="skill-credential-message" role="status">
+          {message}
+        </small>
+      ) : null}
+    </div>
+  );
+}
+
+/** Browser OAuth for remote MCP servers. The native host performs discovery,
+ * PKCE, callback handling, refresh, and native credential storage; React receives
+ * only connection state. */
+function McpAuthorizationControl({
+  server,
+  onChanged,
+}: {
+  server: IntegratorMcpServer;
+  onChanged: () => void;
+}) {
+  const authorization = server.authorization ?? {
+    state: "notConnected" as const,
+    available: true,
+  };
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const connected = authorization.state === "connected";
+  const connect = async () => {
+    if (busy || !authorization.available) return;
+    const approved = window.confirm(
+      `Sign in to "${server.name}"?\n\nAI Integrator will open the provider's secure authorization page in your browser. Passwords and tokens never enter the chat or this settings page.`,
+    );
+    if (!approved) return;
+    setBusy(true);
+    setMessage("");
+    try {
+      await bridge.connectIntegratorMcp(server.name);
+      setMessage("Connected. Authorization is stored in the operating system credential store.");
+      onChanged();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not connect this MCP server.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const disconnect = async () => {
+    if (busy) return;
+    const approved = window.confirm(
+      `Disconnect "${server.name}"?\n\nThis removes its local authorization. The MCP server stays installed and keeps its current on/off setting.`,
+    );
+    if (!approved) return;
+    setBusy(true);
+    setMessage("");
+    try {
+      await bridge.disconnectIntegratorMcp(server.name);
+      setMessage("Disconnected. The MCP server remains installed.");
+      onChanged();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not disconnect this MCP server.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const status =
+    authorization.state === "connected"
+      ? "Connected"
+      : authorization.state === "needsAttention"
+        ? "Sign-in needs attention"
+        : "Sign in required";
+  return (
+    <div className="mcp-authorization-control" data-state={authorization.state}>
+      <span className="mcp-authorization-status">
+        {authorization.state === "connected" ? (
+          <ShieldCheck aria-hidden />
+        ) : authorization.state === "needsAttention" ? (
+          <TriangleAlert aria-hidden />
+        ) : (
+          <KeyRound aria-hidden />
+        )}
+        <span>
+          <strong>{status}</strong>
+          <small>
+            {authorization.available
+              ? connected
+                ? "Secure OAuth connection"
+                : "Continue in your browser"
+              : "Native credential storage is unavailable"}
+          </small>
+        </span>
+      </span>
+      <div className="mcp-authorization-actions">
+        {connected ? (
+          <button
+            className="text-button"
+            type="button"
+            disabled={busy}
+            onClick={() => void disconnect()}
+            aria-label={`Disconnect ${server.name}`}
+          >
+            {busy ? <LoaderCircle className="spin" /> : null}
+            Disconnect
+          </button>
+        ) : (
+          <button
+            className="ghost-button"
+            type="button"
+            disabled={busy || !authorization.available}
+            onClick={() => void connect()}
+            aria-label={`Sign in to ${server.name}`}
+          >
+            {busy ? <LoaderCircle className="spin" /> : <ExternalLink />}
+            {authorization.state === "needsAttention" ? "Reconnect" : "Sign in"}
+          </button>
+        )}
+      </div>
+      {message ? (
+        <small className="mcp-authorization-message" role="status">
+          {message}
+        </small>
+      ) : null}
+    </div>
+  );
+}
+
+/** One MCP server row, shared by the MCPs tab (full: origin chip, Remove for
+ * user files) and a plugin's detail modal (simplified: no origin chip since
+ * the view is already scoped to that plugin, no Remove — a plugin server
+ * goes away only when the whole plugin is uninstalled). */
+function McpServerRow({
+  server,
+  enabled,
+  onToggle,
+  onCredentialChanged,
+  onRemove,
+  onViewPlugin,
+  showOrigin = true,
+}: {
+  server: IntegratorMcpServer;
+  enabled: boolean;
+  onToggle: (value: boolean) => void;
+  onCredentialChanged: () => void;
+  onRemove?: () => void;
+  onViewPlugin?: (origin: string) => void;
+  showOrigin?: boolean;
+}) {
+  const subtitle = [
+    showOrigin ? (server.source === "user" ? server.origin : "Plugin server") : null,
+    server.transport === "remote" ? "Remote connector" : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return (
+    <div className="mcp-server-row">
+      <span className="skills-plugin-tile" aria-hidden>
+        <McpServerIcon server={server} />
+      </span>
+      <span className="mcp-server-title">
+        <strong>
+          {server.name}
+          {showOrigin && server.source !== "user" && onViewPlugin ? (
+            <button
+              className="origin-chip"
+              type="button"
+              onClick={() => onViewPlugin(server.origin)}
+              title={`View the ${server.origin} plugin`}
+            >
+              {server.origin}
+            </button>
+          ) : null}
+        </strong>
+        {subtitle ? <small>{subtitle}</small> : null}
+        <code>{mcpLaunchPreview(server)}</code>
+        {server.transport === "remote" && server.oauth ? (
+          <McpAuthorizationControl server={server} onChanged={onCredentialChanged} />
+        ) : null}
+        {(server.credentials ?? []).map((slot) => (
+          <McpCredentialControl
+            key={slot.key}
+            server={server.name}
+            slot={slot}
+            onChanged={onCredentialChanged}
+          />
+        ))}
+      </span>
+      <div className="mcp-server-actions">
+        {onRemove ? (
+          <button className="skills-uninstall-button" type="button" onClick={onRemove}>
+            <Trash2 /> Remove
+          </button>
+        ) : null}
+        <Switch checked={enabled} onChange={onToggle} label={`Enable ${server.name}`} />
+      </div>
+    </div>
+  );
+}
+
+function McpServerCard({
+  server,
+  enabled,
+  onToggle,
+  onCredentialChanged,
+  onRemove,
+  onViewPlugin,
+}: {
+  server: IntegratorMcpServer;
+  enabled: boolean;
+  onToggle: (value: boolean) => void;
+  onCredentialChanged: () => void;
+  onRemove?: () => void;
+  onViewPlugin?: (origin: string) => void;
+}) {
+  const subtitle =
+    server.transport === "remote"
+      ? "Remote connector"
+      : server.source === "user"
+        ? "Local connector"
+        : "Plugin connector";
+  return (
+    <motion.article layout="position" className="capability-card mcp-card" data-active={enabled}>
+      <div className="capability-card-heading">
+        <span className="browse-card-tile" aria-hidden>
+          <McpServerIcon server={server} />
+        </span>
+        <span>
+          <strong>
+            {server.name}
+            {server.source !== "user" && onViewPlugin ? (
+              <button
+                className="origin-chip"
+                type="button"
+                onClick={() => onViewPlugin(server.origin)}
+                title={`View the ${server.origin} plugin`}
+              >
+                {server.origin}
+              </button>
+            ) : null}
+          </strong>
+          <small>{subtitle}</small>
+        </span>
+      </div>
+      <code className="capability-card-command">{mcpLaunchPreview(server)}</code>
+      <div className="capability-card-detail">
+        {server.transport === "remote" && server.oauth ? (
+          <McpAuthorizationControl server={server} onChanged={onCredentialChanged} />
+        ) : null}
+        {(server.credentials ?? []).map((slot) => (
+          <McpCredentialControl
+            key={slot.key}
+            server={server.name}
+            slot={slot}
+            onChanged={onCredentialChanged}
+          />
+        ))}
+      </div>
+      <div className="capability-card-footer">
+        <span>{enabled ? "Enabled" : "Off until explicitly enabled"}</span>
+        <div className="capability-card-actions">
+          {onRemove ? (
+            <button className="skills-uninstall-button" type="button" onClick={onRemove}>
+              <Trash2 /> Remove
+            </button>
+          ) : null}
+          <Switch checked={enabled} onChange={onToggle} label={`Enable ${server.name}`} />
+        </div>
+      </div>
+    </motion.article>
+  );
+}
+
+function CuratedMcpCard({
+  entry,
+  added,
+  busy,
+  onAdd,
+}: {
+  entry: (typeof CURATED_MCP_SERVERS)[number];
+  added: boolean;
+  busy: boolean;
+  onAdd: () => void;
+}) {
+  const launch =
+    entry.config.url ?? [entry.config.command ?? "", ...(entry.config.args ?? [])].join(" ").trim();
+  return (
+    <motion.article layout="position" className="capability-card mcp-card" data-active={added}>
+      <div className="capability-card-heading">
+        <span className="browse-card-tile" aria-hidden>
+          <SkillBrandIcon brands={CURATED_INSTALL_BRANDS[entry.icon]} />
+        </span>
+        <span>
+          <strong>{entry.label}</strong>
+          <small>{entry.config.url ? "Remote connector" : "Local connector"}</small>
+        </span>
+      </div>
+      <p className="capability-card-description">{entry.description}</p>
+      <code className="capability-card-command">{launch}</code>
+      <div className="capability-card-footer">
+        <span>{added ? "Added · starts off" : "Official pinned configuration"}</span>
+        <button className="ghost-button" type="button" disabled={busy || added} onClick={onAdd}>
+          {added ? <Check /> : <Plus />}
+          {added ? "Added" : "Add"}
+        </button>
+      </div>
+    </motion.article>
+  );
+}
+
+/** The MCPs tab: servers from the user's MCPs folder and plugin bundles.
+ * Enabling is always explicit and always confirms the exact command or URL
+ * the next turn may launch — an MCP server is a process, not a document. */
+function McpSettings({
+  settings,
+  setSetting,
+  mcpOverview,
+  onMcpOverview,
+  onViewPlugin,
+}: {
+  settings: SettingsMap;
+  setSetting: (key: string, value: unknown) => void;
+  mcpOverview: IntegratorMcpOverview | null;
+  onMcpOverview: (overview: IntegratorMcpOverview) => void;
+  onViewPlugin?: (origin: string) => void;
+}) {
+  const overview = mcpOverview;
+  const setOverview = onMcpOverview;
+  const refreshServers = () => {
+    void bridge
+      .listIntegratorMcps()
+      .then(onMcpOverview)
+      .catch(() => undefined);
+  };
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [form, setForm] = useState({
+    name: "",
+    transport: "stdio" as "stdio" | "remote",
+    command: "",
+    args: "",
+    env: "",
+    url: "",
+    oauth: false,
+  });
+
+  const overrides = readSkillEnablement(settings[MCP_ENABLED_KEY]);
+  const isOn = (server: IntegratorMcpServer) => overrides[server.name] ?? server.enabled;
+  const toggleServer = (server: IntegratorMcpServer, value: boolean) => {
+    if (value) {
+      const approved = window.confirm(
+        `Enable "${server.name}"?\n\nThe next turn will be allowed to launch:\n${mcpLaunchPreview(server)}`,
+      );
+      if (!approved) return;
+    }
+    setSetting(MCP_ENABLED_KEY, withSkillEnablement(overrides, server.name, value));
+  };
+  const save = (name: string, config: IntegratorMcpConfig, note: string) => {
+    if (busy) return;
+    setBusy(true);
+    setMessage("");
+    void bridge
+      .saveIntegratorMcp(name, config)
+      .then((next) => {
+        setOverview(next);
+        setMessage(note);
+        setForm({
+          name: "",
+          transport: "stdio",
+          command: "",
+          args: "",
+          env: "",
+          url: "",
+          oauth: false,
+        });
+      })
+      .catch((error: unknown) => {
+        setMessage(error instanceof Error ? error.message : "Could not save this server.");
+      })
+      .finally(() => setBusy(false));
+  };
+  const submitForm = () => {
+    const name = form.name.trim();
+    if (!name) {
+      setMessage("Name the server first.");
+      return;
+    }
+    const parsed = parseMcpForm(form);
+    if (!parsed.config) {
+      setMessage(parsed.error ?? "Could not read the server form.");
+      return;
+    }
+    save(name, parsed.config, `Saved ${name} to your MCPs folder. It starts off.`);
+  };
+  const importAll = () => {
+    if (busy) return;
+    setBusy(true);
+    setMessage("");
+    void bridge
+      .importIntegratorMcps()
+      .then((result) => {
+        setOverview(result.overview);
+        const skipped =
+          result.skipped.length > 0 ? `; skipped ${result.skipped.length} already present` : "";
+        setMessage(
+          result.imported.length > 0
+            ? `Imported ${result.imported.join(", ")}${skipped}.`
+            : `Nothing new to import${skipped}.`,
+        );
+      })
+      .catch((error: unknown) => {
+        setMessage(error instanceof Error ? error.message : "Could not import servers.");
+      })
+      .finally(() => setBusy(false));
+  };
+  const remove = (name: string) => {
+    if (busy) return;
+    if (!window.confirm(`Remove "${name}" from your MCPs folder?`)) return;
+    setBusy(true);
+    void bridge
+      .removeIntegratorMcp(name)
+      .then((next) => {
+        setOverview(next);
+        setMessage(`Removed ${name}.`);
+      })
+      .catch((error: unknown) => {
+        setMessage(error instanceof Error ? error.message : "Could not remove this server.");
+      })
+      .finally(() => setBusy(false));
+  };
+
+  const servers = overview?.servers ?? [];
+  const savedNames = new Set(servers.map((server) => server.name));
+  return (
+    <>
+      <section className="settings-section">
+        <header>
+          <h2>MCP servers</h2>
+          <p>
+            External tools your agents can call. Enabled servers attach to the next Codex, Claude,
+            Antigravity, Cursor, or Grok session. If a provider cannot carry a server&apos;s
+            transport, the chat reports that incompatibility. Remote servers can be signed into
+            directly from their card. Every server starts off.
+          </p>
+        </header>
+        <SettingRow
+          label="MCPs folder"
+          description="One JSON file per server — hand-editing is always legal; this page is a convenience over it."
+        >
+          <code className="settings-path">{overview?.mcpsRoot ?? "…"}</code>
+        </SettingRow>
+        <SettingRow
+          label="Import existing servers"
+          description="Copies servers configured in Claude Code, Cursor, or Claude Desktop into your MCPs folder. Their configs are read, never written."
+        >
+          <button className="ghost-button" type="button" disabled={busy} onClick={importAll}>
+            {busy ? <LoaderCircle className="spin" /> : <Download />} Import
+          </button>
+        </SettingRow>
+        {servers.length > 0 ? (
+          <div className="capability-card-grid">
+            {servers.map((server) => (
+              <McpServerCard
+                key={server.name}
+                server={server}
+                enabled={isOn(server)}
+                onToggle={(value) => toggleServer(server, value)}
+                onCredentialChanged={refreshServers}
+                onViewPlugin={onViewPlugin}
+                onRemove={server.source === "user" ? () => remove(server.name) : undefined}
+              />
+            ))}
+          </div>
+        ) : null}
+        {servers.length === 0 ? (
+          <p className="skills-empty-state">
+            No MCP servers yet. Add one below, import your existing ones, or install a plugin that
+            bundles servers.
+          </p>
+        ) : null}
+        {message ? (
+          <p className="settings-action-message" role="status">
+            {message}
+          </p>
+        ) : null}
+      </section>
+      <section className="settings-section">
+        <header>
+          <h2>Common servers</h2>
+          <p>Official, pinned configurations — one click writes the file to your MCPs folder.</p>
+        </header>
+        <div className="capability-card-grid">
+          {CURATED_MCP_SERVERS.map((entry) => (
+            <CuratedMcpCard
+              key={entry.name}
+              entry={entry}
+              added={savedNames.has(entry.name)}
+              busy={busy}
+              onAdd={() => save(entry.name, entry.config, `Added ${entry.label}. It starts off.`)}
+            />
+          ))}
+        </div>
+      </section>
+      <section className="settings-section">
+        <header>
+          <h2>Add your own</h2>
+          <p>
+            A local command (one token per argument, no shell quoting) or a remote URL. Use a
+            keychain placeholder for local-server secrets so values never enter the JSON file.
+          </p>
+        </header>
+        <div className="mcp-form">
+          <input
+            className="settings-inline-input"
+            value={form.name}
+            placeholder="server-name"
+            onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))}
+          />
+          <Dropdown
+            className="compact-select"
+            aria-label="Transport"
+            value={form.transport}
+            options={[
+              { value: "stdio", label: "Local command" },
+              { value: "remote", label: "Remote URL" },
+            ]}
+            onChange={(value) =>
+              setForm((current) => ({ ...current, transport: value as "stdio" | "remote" }))
+            }
+          />
+          {form.transport === "stdio" ? (
+            <>
+              <input
+                className="settings-inline-input mcp-form-wide"
+                value={form.command}
+                placeholder="command (e.g. npx)"
+                onChange={(event) =>
+                  setForm((current) => ({ ...current, command: event.target.value }))
+                }
+              />
+              <input
+                className="settings-inline-input mcp-form-wide"
+                value={form.args}
+                placeholder="arguments (space separated)"
+                onChange={(event) =>
+                  setForm((current) => ({ ...current, args: event.target.value }))
+                }
+              />
+              <textarea
+                className="mcp-form-env"
+                value={form.env}
+                placeholder={
+                  "environment (KEY=value per line; use KEY={{keychain}} to store the secret in your OS keychain)"
+                }
+                rows={2}
+                onChange={(event) =>
+                  setForm((current) => ({ ...current, env: event.target.value }))
+                }
+              />
+            </>
+          ) : (
+            <>
+              <input
+                className="settings-inline-input mcp-form-wide"
+                value={form.url}
+                placeholder="https://example.com/mcp"
+                onChange={(event) =>
+                  setForm((current) => ({ ...current, url: event.target.value }))
+                }
+              />
+              <div className="mcp-form-auth">
+                <span>
+                  <strong>Browser sign-in</strong>
+                  <small>Enable when the server requires OAuth.</small>
+                </span>
+                <Switch
+                  checked={form.oauth}
+                  onChange={(oauth) => setForm((current) => ({ ...current, oauth }))}
+                  label="Requires browser sign-in"
+                />
+              </div>
+            </>
+          )}
+          <button
+            className="ghost-button"
+            type="button"
+            disabled={busy || !form.name.trim()}
+            onClick={submitForm}
+          >
+            {busy ? <LoaderCircle className="spin" /> : <Plus />} Save server
+          </button>
+        </div>
+      </section>
+    </>
+  );
+}
+
+/** What to read: a local (installed) skill by name, or one skill file from
+ * a not-yet-installed curated repository, fetched fresh from GitHub. */
+type SkillDetailTarget =
+  | { kind: "local"; name: string; description: string }
+  | { kind: "remote"; repository: string; path: string; name: string; description: string };
+
+type SkillBodyState =
+  | { status: "loading" }
+  | { status: "error"; message: string }
+  | { status: "ready"; body: string; truncated: boolean };
+
+function skillTargetKey(target: SkillDetailTarget): string {
+  return target.kind === "remote"
+    ? `remote:${target.repository}:${target.path}`
+    : `local:${target.name}`;
+}
+
+function readableSkillMarkdown(body: string): string {
+  const source = body.replace(/^\uFEFF/, "");
+  const withoutFrontmatter = source.replace(
+    /^---[^\S\r\n]*\r?\n[\s\S]*?\r?\n---[^\S\r\n]*(?:\r?\n|$)/,
+    "",
+  );
+  return withoutFrontmatter.trim() ? withoutFrontmatter : source;
+}
+
+function SkillMarkdownLink({
+  href,
+  children,
+  ...props
+}: AnchorHTMLAttributes<HTMLAnchorElement> & { node?: unknown }) {
+  const handleClick = (event: ReactMouseEvent<HTMLAnchorElement>) => {
+    if (!href || event.defaultPrevented || event.button !== 0) return;
+    event.preventDefault();
+    void openExternalLink(href).catch(() => {
+      // A rejected or unsupported URL must never navigate the app webview.
+    });
+  };
+
+  return (
+    <a {...props} href={href} target="_blank" rel="noopener noreferrer" onClick={handleClick}>
+      {children}
+    </a>
+  );
+}
+
+function SkillMarkdownImage({ alt }: { alt?: string }) {
+  return (
+    <span className="skill-markdown-image" role="note">
+      Image reference{alt ? ` · ${alt}` : ""}
+    </span>
+  );
+}
+
+const SKILL_MARKDOWN_COMPONENTS = {
+  a: SkillMarkdownLink,
+  img: SkillMarkdownImage,
+};
+
+function SkillMarkdown({ body }: { body: string }) {
+  return (
+    <div className="skill-markdown">
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={SKILL_MARKDOWN_COMPONENTS}>
+        {readableSkillMarkdown(body)}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+function InlineSkillDisclosure({ id, target }: { id: string; target: SkillDetailTarget }) {
+  const reduceMotion = useReducedMotion();
+  const [state, setState] = useState<SkillBodyState>({ status: "loading" });
+  const targetKey = skillTargetKey(target);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load: Promise<RemoteSkillBody | IntegratorSkillBody> =
+      target.kind === "remote"
+        ? bridge.previewSkillBody(target.repository, target.path)
+        : bridge.getIntegratorSkillBody(target.name);
+    void load
+      .then((result) => {
+        if (!cancelled) {
+          setState({ status: "ready", body: result.body, truncated: result.truncated });
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setState({
+            status: "error",
+            message: error instanceof Error ? error.message : "Could not read this skill.",
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+    // Target identity is captured by the stable key; the object is rebuilt
+    // during list renders and should not restart an in-flight read.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targetKey]);
+
+  return (
+    <motion.div
+      id={id}
+      className="skill-detail-disclosure"
+      role="region"
+      aria-label={`${target.name} instructions`}
+      initial={reduceMotion ? false : { height: 0, opacity: 0 }}
+      animate={{ height: "auto", opacity: 1 }}
+      exit={reduceMotion ? { opacity: 0 } : { height: 0, opacity: 0 }}
+      transition={
+        reduceMotion
+          ? { duration: 0 }
+          : {
+              height: { duration: 0.24, ease: [0.22, 1, 0.36, 1] },
+              opacity: { duration: 0.16, ease: "easeOut" },
+            }
+      }
+    >
+      <div className="skill-detail-disclosure-inner">
+        <span className="skill-detail-label">Skill instructions</span>
+        {state.status === "loading" ? (
+          <p className="plugin-modal-loading">
+            <LoaderCircle className="spin" aria-hidden />
+            Reading the skill…
+          </p>
+        ) : null}
+        {state.status === "error" ? (
+          <p className="plugin-modal-error" role="alert">
+            <TriangleAlert aria-hidden /> {state.message}
+          </p>
+        ) : null}
+        {state.status === "ready" ? (
+          <>
+            {state.truncated ? (
+              <p className="plugin-modal-truncated">
+                This file is unusually large — showing the first portion.
+              </p>
+            ) : null}
+            <SkillMarkdown body={state.body} />
+          </>
+        ) : null}
+      </div>
+    </motion.div>
+  );
+}
+
+/** First-class plugin view: what a plugin is, where it comes from, and the
+ * exact skills and MCP servers it ships — for curated catalog entries and
+ * installed plugins alike. Management (install / uninstall) lives here so
+ * the Skills and MCPs tabs never repeat whole plugin listings. */
+function PluginDetailModal({
+  folderId,
+  curated,
+  group,
+  servers,
+  isEnabled,
+  onToggleSkill,
+  isServerEnabled,
+  onToggleServer,
+  onCredentialChanged,
+  installBusy,
+  uninstalling,
+  onInstall,
+  onUninstall,
+  onClose,
+}: {
+  folderId: string;
+  curated?: (typeof CURATED_PLUGIN_INSTALLS)[number];
+  group?: { title: string; source: string; skills: IntegratorSkillInfo[] };
+  servers: IntegratorMcpServer[];
+  isEnabled: (skill: IntegratorSkillInfo) => boolean;
+  onToggleSkill: (skill: IntegratorSkillInfo, enabled: boolean) => void;
+  isServerEnabled: (server: IntegratorMcpServer) => boolean;
+  onToggleServer: (server: IntegratorMcpServer, enabled: boolean) => void;
+  onCredentialChanged: () => void;
+  installBusy: boolean;
+  uninstalling: string;
+  onInstall?: () => void;
+  onUninstall?: () => void;
+  onClose: () => void;
+}) {
+  const [openSkill, setOpenSkill] = useState<SkillDetailTarget | null>(null);
+  const openSkillKey = openSkill ? skillTargetKey(openSkill) : null;
+  const toggleSkillDetail = (target: SkillDetailTarget) => {
+    const key = skillTargetKey(target);
+    setOpenSkill((current) => (current && skillTargetKey(current) === key ? null : target));
+  };
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (openSkill) {
+        setOpenSkill(null);
+        return;
+      }
+      onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, openSkill]);
+  const label = curated?.label ?? group?.title ?? folderId;
+  const brands = curated ? CURATED_INSTALL_BRANDS[curated.icon] : PLUGIN_GROUP_BRANDS[folderId];
+  const installed = Boolean(group);
+
+  type PreviewState =
+    | { status: "loading" }
+    | { status: "error"; message: string }
+    | { status: "ready"; data: RemoteSkillsPreview };
+  const shouldPreview = !installed && Boolean(curated);
+  const [preview, setPreview] = useState<PreviewState | null>(
+    shouldPreview ? { status: "loading" } : null,
+  );
+  useEffect(() => {
+    if (!shouldPreview || !curated) return;
+    let cancelled = false;
+    void bridge
+      .previewCuratedPlugin(curated.repository)
+      .then((data) => {
+        if (!cancelled) setPreview({ status: "ready", data });
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setPreview({
+            status: "error",
+            message: error instanceof Error ? error.message : "Could not read skills from GitHub.",
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+    // Re-fetch only when the target repository changes, not on every
+    // `installed` recompute from unrelated state churn.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [curated?.repository, shouldPreview]);
+  return (
+    <motion.div
+      className="plugin-modal-backdrop"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.14 }}
+      onClick={onClose}
+    >
+      <motion.div
+        className="plugin-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label={label}
+        initial={{ opacity: 0, y: 14, scale: 0.98 }}
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        exit={{ opacity: 0, y: 10, scale: 0.98 }}
+        transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <header className="plugin-modal-header">
+          <span className="skills-plugin-tile plugin-modal-tile" aria-hidden>
+            <SkillBrandIcon brands={brands} />
+          </span>
+          <div>
+            <h2>{label}</h2>
+            <div className="plugin-modal-chips">
+              <span className="plugin-modal-chip" data-kind={installed ? "installed" : "missing"}>
+                {installed
+                  ? (SKILL_SOURCE_LABELS[group?.source ?? ""] ?? group?.source)
+                  : "Not installed"}
+              </span>
+              {curated ? (
+                <span className="plugin-modal-chip">
+                  {group ? group.skills.length : curated.skillCount}{" "}
+                  {(group ? group.skills.length : curated.skillCount) === 1 ? "skill" : "skills"}
+                </span>
+              ) : group ? (
+                <span className="plugin-modal-chip">
+                  {group.skills.length} {group.skills.length === 1 ? "skill" : "skills"}
+                </span>
+              ) : null}
+              {(curated?.mcpCount ?? 0) > 0 || servers.length > 0 ? (
+                <span className="plugin-modal-chip">
+                  {servers.length > 0 ? servers.length : curated?.mcpCount} MCP
+                </span>
+              ) : null}
+              {curated?.license ? (
+                <span className="plugin-modal-chip">{curated.license}</span>
+              ) : null}
+              {curated ? (
+                <button
+                  className="text-button"
+                  type="button"
+                  onClick={() => void openExternalLink(`https://github.com/${curated.repository}`)}
+                >
+                  {curated.repository} <ExternalLink />
+                </button>
+              ) : null}
+            </div>
+          </div>
+          <button className="ghost-button plugin-modal-close" type="button" onClick={onClose}>
+            <X /> Close
+          </button>
+        </header>
+        {curated ? <p className="plugin-modal-description">{curated.description}</p> : null}
+        <div className="plugin-modal-body">
+          {group ? (
+            <>
+              <h3>Skills · {group.skills.length}</h3>
+              <div className="plugin-modal-skills">
+                {group.skills.map((skill, index) => {
+                  const target: SkillDetailTarget = {
+                    kind: "local",
+                    name: skill.name,
+                    description: skill.description,
+                  };
+                  const targetKey = skillTargetKey(target);
+                  const expanded = openSkillKey === targetKey;
+                  const detailId = `plugin-skill-${index}`;
+                  return (
+                    <div
+                      className="plugin-skill-disclosure-item"
+                      data-expanded={expanded}
+                      key={skill.name}
+                    >
+                      <SkillSettingsRow
+                        skill={skill}
+                        enabled={isEnabled(skill)}
+                        onToggle={(value) => onToggleSkill(skill, value)}
+                        onCredentialChanged={onCredentialChanged}
+                        onOpenDetail={() => toggleSkillDetail(target)}
+                        expanded={expanded}
+                        detailId={detailId}
+                      />
+                      <AnimatePresence initial={false}>
+                        {expanded ? (
+                          <InlineSkillDisclosure id={detailId} target={target} key={targetKey} />
+                        ) : null}
+                      </AnimatePresence>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          ) : curated ? (
+            <>
+              {preview?.status === "loading" ? (
+                <p className="plugin-modal-loading">
+                  <LoaderCircle className="spin" aria-hidden />
+                  Reading skills from github.com/{curated.repository}…
+                </p>
+              ) : null}
+              {preview?.status === "ready" ? (
+                <>
+                  <h3>
+                    Skills · {preview.data.skills.length}
+                    {preview.data.truncated ? ` of ${preview.data.totalFound}` : ""}
+                  </h3>
+                  <ul className="plugin-modal-list">
+                    {preview.data.skills.map((skill, index) => {
+                      const target: SkillDetailTarget = {
+                        kind: "remote",
+                        repository: curated.repository,
+                        path: skill.path,
+                        name: skill.name,
+                        description: skill.description,
+                      };
+                      const targetKey = skillTargetKey(target);
+                      const expanded = openSkillKey === targetKey;
+                      const detailId = `plugin-remote-skill-${index}`;
+                      return (
+                        <li key={skill.path} data-expanded={expanded}>
+                          <div
+                            className="plugin-modal-list-trigger"
+                            role="button"
+                            tabIndex={0}
+                            aria-expanded={expanded}
+                            aria-controls={detailId}
+                            onClick={() => toggleSkillDetail(target)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter" || event.key === " ") {
+                                event.preventDefault();
+                                toggleSkillDetail(target);
+                              }
+                            }}
+                          >
+                            <span className="plugin-modal-list-name">
+                              <span className="plugin-modal-dot" aria-hidden />
+                              <strong>{skill.name}</strong>
+                              <ChevronDown data-open={expanded} aria-hidden />
+                            </span>
+                            <small>{skill.description}</small>
+                          </div>
+                          <AnimatePresence initial={false}>
+                            {expanded ? (
+                              <InlineSkillDisclosure
+                                id={detailId}
+                                target={target}
+                                key={targetKey}
+                              />
+                            ) : null}
+                          </AnimatePresence>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                  {preview.data.truncated ? (
+                    <p className="plugin-modal-truncated">
+                      Showing the first {preview.data.skills.length} of {preview.data.totalFound}{" "}
+                      skills.{" "}
+                      <button
+                        className="text-button"
+                        type="button"
+                        onClick={() =>
+                          void openExternalLink(`https://github.com/${curated.repository}`)
+                        }
+                      >
+                        View the rest on GitHub <ExternalLink />
+                      </button>
+                    </p>
+                  ) : null}
+                  {curated.mcpCount > 0 ? (
+                    <p className="plugin-modal-mcp-note">
+                      <Server aria-hidden /> Also ships {curated.mcpCount} MCP server{" "}
+                      {curated.mcpCount === 1 ? "config" : "configs"} — visible after install.
+                    </p>
+                  ) : null}
+                </>
+              ) : null}
+              {preview?.status === "error" ? (
+                <>
+                  <p className="plugin-modal-error" role="alert">
+                    <TriangleAlert aria-hidden /> {preview.message}
+                  </p>
+                  <h3>What you'll get</h3>
+                  <ul className="plugin-modal-facts">
+                    <li>
+                      <Sparkles aria-hidden />
+                      <span>
+                        <strong>
+                          {curated.skillCount} portable{" "}
+                          {curated.skillCount === 1 ? "skill" : "skills"}
+                        </strong>{" "}
+                        — verified against the repository. Every one starts off until you enable it.
+                      </span>
+                    </li>
+                    {curated.mcpCount > 0 ? (
+                      <li>
+                        <Server aria-hidden />
+                        <span>
+                          <strong>
+                            {curated.mcpCount} MCP server{" "}
+                            {curated.mcpCount === 1 ? "config" : "configs"}
+                          </strong>{" "}
+                          — each needs explicit enablement and confirms what it launches.
+                        </span>
+                      </li>
+                    ) : null}
+                    <li>
+                      <Download aria-hidden />
+                      <span>
+                        Cloned with the GitHub CLI from{" "}
+                        <strong>github.com/{curated.repository}</strong> — no other network access.
+                      </span>
+                    </li>
+                    <li>
+                      <Folder aria-hidden />
+                      <span>
+                        Lands in{" "}
+                        <strong>
+                          Documents/AI Integrator/Plugins/{curated.repository.replace("/", "-")}
+                        </strong>{" "}
+                        — a plain folder you can inspect or delete anytime.
+                      </span>
+                    </li>
+                  </ul>
+                </>
+              ) : null}
+            </>
+          ) : null}
+          {servers.length > 0 ? (
+            <>
+              <h3>MCP servers · {servers.length}</h3>
+              <div className="plugin-modal-skills">
+                {servers.map((server) => (
+                  <McpServerRow
+                    key={server.name}
+                    server={server}
+                    enabled={isServerEnabled(server)}
+                    onToggle={(value) => onToggleServer(server, value)}
+                    onCredentialChanged={onCredentialChanged}
+                    showOrigin={false}
+                  />
+                ))}
+              </div>
+            </>
+          ) : null}
+        </div>
+        <footer className="plugin-modal-footer">
+          {!installed && onInstall ? (
+            <button
+              className="ghost-button"
+              type="button"
+              disabled={installBusy}
+              onClick={onInstall}
+            >
+              {installBusy ? <LoaderCircle className="spin" /> : <Download />} Install
+            </button>
+          ) : null}
+          {installed && onUninstall ? (
+            <button
+              className="skills-uninstall-button"
+              type="button"
+              disabled={Boolean(uninstalling)}
+              onClick={onUninstall}
+            >
+              <Trash2 /> Uninstall
+            </button>
+          ) : null}
+        </footer>
+      </motion.div>
+    </motion.div>
+  );
+}
+
+/** Standalone-skill reader used from the flat Skills tab. Plugin-owned
+ * skills disclose inside their plugin modal instead. */
+function SkillDetailModal({ target, onClose }: { target: SkillDetailTarget; onClose: () => void }) {
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  type BodyState =
+    | { status: "loading" }
+    | { status: "error"; message: string }
+    | { status: "ready"; body: string; truncated: boolean };
+  const [state, setState] = useState<BodyState>({ status: "loading" });
+  const targetKey =
+    target.kind === "remote" ? `${target.repository}\0${target.path}` : `local:${target.name}`;
+  useEffect(() => {
+    let cancelled = false;
+    const load: Promise<RemoteSkillBody | IntegratorSkillBody> =
+      target.kind === "remote"
+        ? bridge.previewSkillBody(target.repository, target.path)
+        : bridge.getIntegratorSkillBody(target.name);
+    void load
+      .then((result) => {
+        if (!cancelled)
+          setState({ status: "ready", body: result.body, truncated: result.truncated });
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setState({
+            status: "error",
+            message: error instanceof Error ? error.message : "Could not read this skill.",
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targetKey]);
+
+  return (
+    <motion.div
+      className="plugin-modal-backdrop skill-modal-backdrop"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.14 }}
+      onClick={onClose}
+    >
+      <motion.div
+        className="plugin-modal skill-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label={target.name}
+        initial={{ opacity: 0, y: 14, scale: 0.98 }}
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        exit={{ opacity: 0, y: 10, scale: 0.98 }}
+        transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <header className="plugin-modal-header">
+          <div>
+            <h2>{target.name}</h2>
+            <p>{target.description}</p>
+          </div>
+          <button className="ghost-button plugin-modal-close" type="button" onClick={onClose}>
+            <X /> Close
+          </button>
+        </header>
+        <div className="plugin-modal-body">
+          {state.status === "loading" ? (
+            <p className="plugin-modal-loading">
+              <LoaderCircle className="spin" aria-hidden />
+              Reading the full skill…
+            </p>
+          ) : null}
+          {state.status === "error" ? (
+            <p className="plugin-modal-error" role="alert">
+              <TriangleAlert aria-hidden /> {state.message}
+            </p>
+          ) : null}
+          {state.status === "ready" ? (
+            <>
+              {state.truncated ? (
+                <p className="plugin-modal-truncated">
+                  This file is unusually large — showing the first portion.
+                </p>
+              ) : null}
+              <SkillMarkdown body={state.body} />
+            </>
+          ) : null}
+        </div>
+      </motion.div>
+    </motion.div>
+  );
+}
+
+function MarketplaceCard({
+  entry,
+  installed,
+  uninstalling,
+  reduceMotion,
+  onOpen,
+  onUninstall,
+}: {
+  entry: (typeof CURATED_PLUGIN_INSTALLS)[number];
+  installed: boolean;
+  uninstalling: boolean;
+  reduceMotion: boolean;
+  onOpen: () => void;
+  onUninstall: () => void;
+}) {
+  return (
+    <motion.div
+      layout={reduceMotion ? false : "position"}
+      layoutId={reduceMotion ? undefined : `marketplace-card-${entry.repository}`}
+      transition={reduceMotion ? { duration: 0 } : marketplaceCardSpring}
+      role="button"
+      tabIndex={0}
+      aria-label={entry.label}
+      className="browse-card marketplace-card"
+      data-installed={installed}
+      onClick={onOpen}
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) return;
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onOpen();
+        }
+      }}
+    >
+      <div className="marketplace-card-heading">
+        <span className="browse-card-tile" aria-hidden>
+          <SkillBrandIcon brands={CURATED_INSTALL_BRANDS[entry.icon]} />
+        </span>
+        <strong>{entry.label}</strong>
+      </div>
+      <small>{entry.description}</small>
+      <div className="browse-card-footer">
+        <span className="browse-card-state">{installed ? "Installed" : "View & install"}</span>
+        {installed ? (
+          <button
+            className="marketplace-uninstall-button"
+            type="button"
+            disabled={uninstalling}
+            onClick={(event) => {
+              event.stopPropagation();
+              onUninstall();
+            }}
+            aria-label={`Uninstall ${entry.label}`}
+          >
+            {uninstalling ? <LoaderCircle className="spin" /> : <Trash2 />}
+            Uninstall
+          </button>
+        ) : null}
+      </div>
+    </motion.div>
   );
 }
 
@@ -666,32 +2412,133 @@ function SkillsSettings({
   const [installBusy, setInstallBusy] = useState(false);
   const [installMessage, setInstallMessage] = useState("");
   const [uninstalling, setUninstalling] = useState("");
-  const [openCollections, setOpenCollections] = useState({
-    thirdParty: true,
-    installed: true,
-    integrator: true,
+  const [togglingPlugin, setTogglingPlugin] = useState("");
+  const reduceMotion =
+    Boolean(useReducedMotion()) || document.documentElement.dataset.motion === "none";
+  const [tab, setTab] = useState<CapabilityTab>("marketplace");
+  const [panel, setPanel] = useState<{ tab: CapabilityTab; direction: number }>({
+    tab: "marketplace",
+    direction: 0,
   });
+  const [, startTabTransition] = useTransition();
+  const selectTab = useCallback(
+    (next: CapabilityTab) => {
+      if (next === tab) return;
+      const from = TAB_ORDER.indexOf(tab);
+      const to = TAB_ORDER.indexOf(next);
+      const direction = to > from ? 1 : -1;
+      setTab(next);
+      startTabTransition(() => setPanel({ tab: next, direction }));
+    },
+    [tab],
+  );
+  const [skillQuery, setSkillQuery] = useState("");
+  const [mcpOverview, setMcpOverview] = useState<IntegratorMcpOverview | null>(null);
+  /** Plugin folder id whose first-class detail view is open. */
+  const [viewPlugin, setViewPlugin] = useState<string | null>(null);
+  /** Standalone skill whose full body is open from the flat Skills tab. */
+  const [viewSkill, setViewSkill] = useState<SkillDetailTarget | null>(null);
 
   const refresh = () => {
+    // Fetched independently: an MCP inventory hiccup (e.g. mid-rebuild)
+    // must never blank the skills and plugins views.
     void bridge
       .listIntegratorSkills()
       .then((next) => {
-        setOverview(next);
-        setLoadError("");
+        startTransition(() => {
+          setOverview(next);
+          setLoadError("");
+        });
       })
       .catch((error: unknown) => {
         setLoadError(
           error instanceof Error ? error.message : "Could not read the local skills inventory.",
         );
       });
+    void bridge
+      .listIntegratorMcps()
+      .then((next) => startTransition(() => setMcpOverview(next)))
+      .catch(() => setMcpOverview(null));
   };
   useEffect(refresh, []);
 
-  const overrides = readSkillEnablement(settings[SKILLS_ENABLED_KEY]);
+  const skillsEnabledSetting = settings[SKILLS_ENABLED_KEY];
+  const overrides = useMemo(
+    () => readSkillEnablement(skillsEnabledSetting),
+    [skillsEnabledSetting],
+  );
   const toggle = (skill: IntegratorSkillInfo, enabled: boolean) =>
     setSetting(SKILLS_ENABLED_KEY, withSkillEnablement(overrides, skill.name, enabled));
-  const toggleGroup = (skills: IntegratorSkillInfo[], enabled: boolean) =>
-    setSetting(SKILLS_ENABLED_KEY, withSkillsEnablement(overrides, skills, enabled));
+
+  // Mirrors McpSettings' own derivation of the same setting key — both read
+  // and write `settings`/`setSetting` from the single top-level source of
+  // truth, so the MCPs tab and this cascade/modal never disagree.
+  const mcpEnabledSetting = settings[MCP_ENABLED_KEY];
+  const mcpOverrides = useMemo(() => readSkillEnablement(mcpEnabledSetting), [mcpEnabledSetting]);
+  const isServerEnabled = (server: IntegratorMcpServer) =>
+    mcpOverrides[server.name] ?? server.enabled;
+  const setServerEnabled = (server: IntegratorMcpServer, enabled: boolean) => {
+    if (enabled) {
+      const approved = window.confirm(
+        `Enable "${server.name}"?\n\nThe next turn will be allowed to launch:\n${mcpLaunchPreview(server)}`,
+      );
+      if (!approved) return;
+    }
+    setSetting(MCP_ENABLED_KEY, withSkillEnablement(mcpOverrides, server.name, enabled));
+  };
+  const serversByOrigin = useMemo(() => {
+    const grouped = new Map<string, IntegratorMcpServer[]>();
+    for (const server of mcpOverview?.servers ?? []) {
+      const servers = grouped.get(server.origin) ?? [];
+      servers.push(server);
+      grouped.set(server.origin, servers);
+    }
+    return grouped;
+  }, [mcpOverview]);
+  const serversForOrigin = (origin: string) => serversByOrigin.get(origin) ?? [];
+
+  /** The plugin's master switch: on cascades to every skill and MCP server
+   * it owns; off silences them all. Individual switches (in the Skills tab,
+   * the MCPs tab, or this plugin's own detail modal) still refine the
+   * result afterward — the cascade is a starting point, not a lock. */
+  const toggleGroupAll = async (
+    group: { title: string; skills: IntegratorSkillInfo[] },
+    label: string,
+    enabled: boolean,
+  ) => {
+    if (togglingPlugin) return;
+    setTogglingPlugin(group.title);
+    setInstallMessage("");
+    try {
+      const latestMcpOverview = await bridge.listIntegratorMcps();
+      setMcpOverview(latestMcpOverview);
+      const servers = latestMcpOverview.servers.filter((server) => server.origin === group.title);
+      if (enabled && servers.length > 0) {
+        const lines = servers.map((server) => `• ${server.name}: ${mcpLaunchPreview(server)}`);
+        const approved = window.confirm(
+          `Enable "${label}"?\n\nThis turns on ${group.skills.length} ${
+            group.skills.length === 1 ? "skill" : "skills"
+          } and ${servers.length} MCP ${
+            servers.length === 1 ? "server" : "servers"
+          }. The MCP ${servers.length === 1 ? "server" : "servers"} will be allowed to launch:\n${lines.join("\n")}`,
+        );
+        if (!approved) return;
+      }
+      if (servers.length > 0) {
+        setSetting(MCP_ENABLED_KEY, withSkillsEnablement(mcpOverrides, servers, enabled));
+      }
+      setSetting(SKILLS_ENABLED_KEY, withSkillsEnablement(overrides, group.skills, enabled));
+    } catch (error) {
+      setInstallMessage(
+        error instanceof Error
+          ? `Could not verify the MCP servers bundled with ${label}: ${error.message}. Nothing changed.`
+          : `Could not verify the MCP servers bundled with ${label}. Nothing changed.`,
+      );
+    } finally {
+      setTogglingPlugin("");
+    }
+  };
+
   const install = (repository: string) => {
     const trimmed = repository.trim();
     if (!trimmed || installBusy) return;
@@ -703,6 +2550,10 @@ function SkillsSettings({
         setOverview(next);
         setInstallRepo("");
         setInstallMessage(`Installed ${trimmed}. Its skills start off; enable the ones you want.`);
+        void bridge
+          .listIntegratorMcps()
+          .then(setMcpOverview)
+          .catch(() => undefined);
       })
       .catch((error: unknown) => {
         setInstallMessage(
@@ -728,187 +2579,335 @@ function SkillsSettings({
       .then((next) => {
         setOverview(next);
         setInstallMessage(`Uninstalled ${label}.`);
+        void bridge
+          .listIntegratorMcps()
+          .then(setMcpOverview)
+          .catch(() => undefined);
       })
       .catch((error: unknown) => {
-        setInstallMessage(error instanceof Error ? error.message : "Could not uninstall this plugin.");
+        setInstallMessage(
+          error instanceof Error ? error.message : "Could not uninstall this plugin.",
+        );
       })
       .finally(() => setUninstalling(""));
   };
 
-  const groups = groupSkills(overview?.skills ?? []);
-  const installedGroups = groups.filter((group) => group.source !== "first-party");
-  const integratorGroups = groups.filter((group) => group.source === "first-party");
-  const installedPluginIds = new Set(
-    groups.filter((group) => group.source === "plugin").map((group) => group.title),
+  const {
+    groups,
+    mcpCountByOrigin,
+    installedGroups,
+    integratorGroups,
+    curatedByFolder,
+    installedMarketplaceEntries,
+    availableMarketplaceEntries,
+    nativeSkills,
+  } = useMemo(() => {
+    const nextGroups = groupSkills(overview?.skills ?? []);
+    const nextMcpCountByOrigin = new Map<string, number>();
+    for (const [origin, servers] of serversByOrigin) {
+      nextMcpCountByOrigin.set(origin, servers.length);
+    }
+    // A bundle earns its own plugin card only by actually bundling something:
+    // more than one skill, or at least one MCP server. A lone skill is just a
+    // skill — it belongs in the Skills tab, not dressed up as a plugin.
+    const isPluginWorthy = (group: (typeof nextGroups)[number]) =>
+      group.skills.length > 1 || (nextMcpCountByOrigin.get(group.title) ?? 0) > 0;
+    const pluginGroups = nextGroups.filter(isPluginWorthy);
+    const nextInstalledPluginIds = new Set(
+      nextGroups.filter((group) => group.source === "plugin").map((group) => group.title),
+    );
+    const nextCuratedByFolder = new Map(
+      CURATED_PLUGIN_INSTALLS.map((entry) => [entry.repository.replace("/", "-"), entry]),
+    );
+    const marketplaceEntries = CURATED_PLUGIN_INSTALLS.map((entry) => {
+      const folderId = entry.repository.replace("/", "-");
+      return { entry, folderId, installed: nextInstalledPluginIds.has(folderId) };
+    });
+    return {
+      groups: nextGroups,
+      mcpCountByOrigin: nextMcpCountByOrigin,
+      installedGroups: pluginGroups.filter((group) => group.source !== "first-party"),
+      integratorGroups: pluginGroups.filter((group) => group.source === "first-party"),
+      curatedByFolder: nextCuratedByFolder,
+      installedMarketplaceEntries: marketplaceEntries.filter((item) => item.installed),
+      availableMarketplaceEntries: marketplaceEntries.filter((item) => !item.installed),
+      // Everything that isn't plugin-worthy — regardless of source — is just
+      // a skill, and lives here instead of behind a one-skill plugin card.
+      nativeSkills: nextGroups
+        .filter((group) => !isPluginWorthy(group))
+        .flatMap((group) => group.skills),
+    };
+  }, [overview, serversByOrigin]);
+  const normalizedQuery = skillQuery.trim().toLowerCase();
+  const filteredSkills = useMemo(
+    () =>
+      normalizedQuery.length === 0
+        ? nativeSkills
+        : nativeSkills.filter((skill) =>
+            `${skill.name} ${skill.description}`.toLowerCase().includes(normalizedQuery),
+          ),
+    [nativeSkills, normalizedQuery],
   );
-  const curatedByFolder = new Map(
-    CURATED_PLUGIN_INSTALLS.map((entry) => [entry.repository.replace("/", "-"), entry]),
-  );
-  const toggleCollection = (key: keyof typeof openCollections) =>
-    setOpenCollections((current) => ({ ...current, [key]: !current[key] }));
 
-  const renderGroup = (group: (typeof groups)[number]) => {
-    const enabledCount = group.skills.filter((skill) => isSkillEnabled(overrides, skill)).length;
-    const groupEnabled = enabledCount === group.skills.length;
-    const groupMixed = enabledCount > 0 && !groupEnabled;
-    const invocations = group.skills.reduce((total, skill) => total + skill.invocationCount, 0);
+  const openSkill = (skill: IntegratorSkillInfo) =>
+    setViewSkill({ kind: "local", name: skill.name, description: skill.description });
+
+  const renderGroup = (group: (typeof groups)[number], showSourceLabel: boolean) => {
     const curated = curatedByFolder.get(group.title);
-    const label = curated?.label ?? (group.title === "My skills" ? group.title : group.title);
-    const brands = curated
-      ? CURATED_INSTALL_BRANDS[curated.icon]
-      : PLUGIN_GROUP_BRANDS[group.title];
+    const label = curated?.label ?? group.title;
     return (
-      <div className="skills-plugin-group" key={`${group.source}:${group.title}`}>
-        <header className="skills-group-header">
-          <div>
-            <h3 className="skills-group-heading">
-              {group.title === "My skills" ? <Folder aria-hidden /> : <SkillBrandIcon brands={brands} />}
-              {label}
-            </h3>
-            <p>
-              {SKILL_SOURCE_LABELS[group.source] ?? group.source} · {enabledCount} of {group.skills.length} enabled · {invocations.toLocaleString()} invoked
-            </p>
-          </div>
-          <div className="skills-group-actions">
-            {group.source === "plugin" ? (
-              <button
-                className="skills-uninstall-button"
-                type="button"
-                disabled={Boolean(uninstalling)}
-                onClick={() => uninstall(group.title, label)}
-              >
-                {uninstalling === group.title ? <LoaderCircle className="spin" /> : <Trash2 />}
-                Uninstall
-              </button>
-            ) : null}
-            <Switch
-              checked={groupEnabled}
-              mixed={groupMixed}
-              onChange={(value) => toggleGroup(group.skills, value)}
-              label={`${groupEnabled ? "Disable" : "Enable"} all skills in ${label}`}
-            />
-          </div>
-        </header>
-        {group.skills.map((skill) => (
-          <SkillSettingsRow
-            key={skill.name}
-            skill={skill}
-            enabled={isSkillEnabled(overrides, skill)}
-            onToggle={(value) => toggle(skill, value)}
-            onCredentialChanged={refresh}
-          />
-        ))}
-      </div>
+      <PluginGroupCard
+        key={`${group.source}:${group.title}`}
+        group={group}
+        label={label}
+        brands={curated ? CURATED_INSTALL_BRANDS[curated.icon] : PLUGIN_GROUP_BRANDS[group.title]}
+        mcpCount={mcpCountByOrigin.get(group.title) ?? 0}
+        enabledMcpCount={serversForOrigin(group.title).filter(isServerEnabled).length}
+        showSourceLabel={showSourceLabel}
+        isEnabled={(skill) => isSkillEnabled(overrides, skill)}
+        onToggleAll={(enabled) => void toggleGroupAll(group, label, enabled)}
+        onOpenDetail={() => setViewPlugin(group.title)}
+        busy={togglingPlugin === group.title}
+      />
     );
   };
 
+  const viewedGroup = viewPlugin ? groups.find((group) => group.title === viewPlugin) : undefined;
+  const viewedCurated = viewPlugin ? curatedByFolder.get(viewPlugin) : undefined;
+
   return (
     <>
-      <section className="settings-section">
-        <header>
-          <h2>Skills</h2>
-          <p>
-            Portable skills you own, available in every runtime. Drop a folder with a SKILL.md into
-            the Skills folder and it appears here. Claude loads enabled skills natively; Codex,
-            Antigravity, Cursor, and Grok receive a compact skill index each turn and read the skill
-            on demand, with explicit /skill invocations carried in full.
-          </p>
-        </header>
-        <SettingRow
-          label="Skills folder"
-          description="Standalone skills you author or copy in. Enabled by default."
+      <div className="settings-page-heading">
+        <span>
+          <Sparkles />
+        </span>
+        <div>
+          <h1>Skills and Plugins</h1>
+          <p>Discover, install, and manage portable capabilities from one local-first library.</p>
+        </div>
+      </div>
+      {loadError ? (
+        <p className="settings-action-message" role="status">
+          {loadError}
+        </p>
+      ) : null}
+      {installMessage ? (
+        <p className="settings-action-message" role="status">
+          {installMessage}
+        </p>
+      ) : null}
+      <CapabilityTabs active={tab} onSelect={selectTab} />
+      <div className="capability-panel-frame">
+        <motion.div
+          key={panel.tab}
+          className="capability-panel"
+          initial={reduceMotion ? { opacity: 1 } : { opacity: 0, x: panel.direction * 10 }}
+          animate={{ opacity: 1, x: 0 }}
+          transition={reduceMotion ? { duration: 0 } : capabilityPanelTransition}
         >
-          <code className="settings-path">{overview?.skillsRoot ?? "…"}</code>
-        </SettingRow>
-        <SettingRow
-          label="Plugins folder"
-          description="Installed plugin bundles. Their skills stay off until you enable them."
-        >
-          <code className="settings-path">{overview?.pluginsRoot ?? "…"}</code>
-        </SettingRow>
-        {loadError ? (
-          <p className="settings-action-message" role="status">
-            {loadError}
-          </p>
-        ) : null}
-      </section>
-      <SkillsCollection
-        title="Third Party Plugins"
-        description="Official and trusted skill catalogs you can install locally."
-        icon={Package}
-        open={openCollections.thirdParty}
-        onToggle={() => toggleCollection("thirdParty")}
-      >
-        {CURATED_PLUGIN_INSTALLS.map((entry) => {
-          const installed = installedPluginIds.has(entry.repository.replace("/", "-"));
-          return (
-            <SettingRow key={entry.repository} label={entry.label} description={entry.description}>
-              <button
-                className="ghost-button"
-                type="button"
-                disabled={installBusy || installed}
-                onClick={() => install(entry.repository)}
+          {panel.tab === "marketplace" ? (
+            <section className="settings-section">
+              <header>
+                <h2>Marketplace</h2>
+                <p>Official catalogs you can install. Click a card to see what it ships first.</p>
+              </header>
+              <LayoutGroup id="marketplace-catalog">
+                <motion.div
+                  className="marketplace-catalog"
+                  layout={!reduceMotion}
+                  transition={reduceMotion ? { duration: 0 } : marketplaceCardSpring}
+                >
+                  <AnimatePresence initial={false} mode="popLayout">
+                    {installedMarketplaceEntries.length > 0 ? (
+                      <motion.div
+                        key="installed-marketplace"
+                        className="marketplace-section"
+                        layout={!reduceMotion}
+                        initial={reduceMotion ? false : { opacity: 0, y: -6 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={reduceMotion ? { opacity: 0 } : { opacity: 0, y: -6 }}
+                        transition={
+                          reduceMotion
+                            ? { duration: 0 }
+                            : { duration: 0.18, ease: [0.22, 1, 0.36, 1] }
+                        }
+                      >
+                        <h3 className="skills-subsection-title">Installed</h3>
+                        <div className="browse-grid">
+                          {installedMarketplaceEntries.map(({ entry, folderId }) => (
+                            <MarketplaceCard
+                              key={entry.repository}
+                              entry={entry}
+                              installed
+                              uninstalling={uninstalling === folderId}
+                              reduceMotion={reduceMotion}
+                              onOpen={() => setViewPlugin(folderId)}
+                              onUninstall={() => uninstall(folderId, entry.label)}
+                            />
+                          ))}
+                        </div>
+                      </motion.div>
+                    ) : null}
+                  </AnimatePresence>
+                  <motion.div
+                    className="marketplace-section"
+                    layout={!reduceMotion}
+                    transition={reduceMotion ? { duration: 0 } : marketplaceCardSpring}
+                  >
+                    <h3 className="skills-subsection-title">Available</h3>
+                    <div className="browse-grid">
+                      {availableMarketplaceEntries.map(({ entry, folderId }) => (
+                        <MarketplaceCard
+                          key={entry.repository}
+                          entry={entry}
+                          installed={false}
+                          uninstalling={false}
+                          reduceMotion={reduceMotion}
+                          onOpen={() => setViewPlugin(folderId)}
+                          onUninstall={() => undefined}
+                        />
+                      ))}
+                    </div>
+                  </motion.div>
+                </motion.div>
+              </LayoutGroup>
+              <SettingRow
+                label="From GitHub"
+                description="Any repository containing skills/ directories, as owner/name."
               >
-                <SkillBrandIcon brands={CURATED_INSTALL_BRANDS[entry.icon]} />
-                {installed ? "Installed" : "Install"}
-              </button>
-            </SettingRow>
-          );
-        })}
-        <SettingRow
-          label="From GitHub"
-          description="Any repository containing skills/ directories, as owner/name."
-        >
-          <input
-            className="settings-inline-input"
-            value={installRepo}
-            placeholder="owner/name"
-            onChange={(event) => setInstallRepo(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") install(installRepo);
-            }}
+                <input
+                  className="settings-inline-input"
+                  value={installRepo}
+                  placeholder="owner/name"
+                  onChange={(event) => setInstallRepo(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") install(installRepo);
+                  }}
+                />
+                <button
+                  className="ghost-button"
+                  type="button"
+                  disabled={installBusy || !installRepo.trim()}
+                  onClick={() => install(installRepo)}
+                >
+                  {installBusy ? <LoaderCircle className="spin" /> : <Plus />} Install
+                </button>
+              </SettingRow>
+            </section>
+          ) : null}
+          {panel.tab === "plugins" ? (
+            <section className="settings-section">
+              <header>
+                <h2>Plugins</h2>
+                <p>Everything installed. Click a card to view, toggle, or uninstall it.</p>
+              </header>
+              <SettingRow
+                label="Skills folder"
+                description="Standalone skills you author or copy in. Enabled by default."
+              >
+                <code className="settings-path">{overview?.skillsRoot ?? "…"}</code>
+              </SettingRow>
+              <SettingRow
+                label="Plugins folder"
+                description="Installed plugin bundles. Their skills stay off until you enable them."
+              >
+                <code className="settings-path">{overview?.pluginsRoot ?? "…"}</code>
+              </SettingRow>
+              <h3 className="skills-subsection-title">Yours &amp; third-party</h3>
+              {installedGroups.length > 0 ? (
+                installedGroups.map((group) => renderGroup(group, true))
+              ) : (
+                <p className="skills-empty-state">
+                  No user skills or third-party plugins installed yet.
+                </p>
+              )}
+              <h3 className="skills-subsection-title">Built into AI Integrator</h3>
+              {integratorGroups.map((group) => renderGroup(group, false))}
+            </section>
+          ) : null}
+          {panel.tab === "skills" ? (
+            <section className="settings-section">
+              <header>
+                <h2>Skills</h2>
+                <p>What's yours — hand-authored, made with the skill creator, or built in.</p>
+              </header>
+              <label className="settings-search capability-search">
+                <Search />
+                <span className="sr-only">Search skills</span>
+                <input
+                  value={skillQuery}
+                  onChange={(event) => setSkillQuery(event.target.value)}
+                  placeholder={`Search ${nativeSkills.length} skills`}
+                />
+              </label>
+              {filteredSkills.length > 0 ? (
+                <div className="capability-card-grid">
+                  {filteredSkills.map((skill) => (
+                    <SkillCard
+                      key={skill.name}
+                      skill={skill}
+                      enabled={isSkillEnabled(overrides, skill)}
+                      onToggle={(value) => toggle(skill, value)}
+                      onCredentialChanged={refresh}
+                      onViewPlugin={
+                        skill.name.includes(":")
+                          ? () => setViewPlugin(skill.name.split(":", 1)[0])
+                          : undefined
+                      }
+                      onOpenDetail={() => openSkill(skill)}
+                    />
+                  ))}
+                </div>
+              ) : null}
+              {filteredSkills.length === 0 ? (
+                <p className="skills-empty-state">No skills match “{skillQuery.trim()}”.</p>
+              ) : null}
+            </section>
+          ) : null}
+          {panel.tab === "mcps" ? (
+            <McpSettings
+              settings={settings}
+              setSetting={setSetting}
+              mcpOverview={mcpOverview}
+              onMcpOverview={setMcpOverview}
+              onViewPlugin={(origin) => setViewPlugin(origin)}
+            />
+          ) : null}
+        </motion.div>
+      </div>
+      <AnimatePresence>
+        {viewPlugin && (viewedGroup || viewedCurated) ? (
+          <PluginDetailModal
+            key={viewPlugin}
+            folderId={viewPlugin}
+            curated={viewedCurated}
+            group={viewedGroup}
+            servers={(mcpOverview?.servers ?? []).filter((server) => server.origin === viewPlugin)}
+            isEnabled={(skill) => isSkillEnabled(overrides, skill)}
+            onToggleSkill={toggle}
+            isServerEnabled={isServerEnabled}
+            onToggleServer={setServerEnabled}
+            onCredentialChanged={refresh}
+            installBusy={installBusy}
+            uninstalling={uninstalling}
+            onInstall={viewedCurated ? () => install(viewedCurated.repository) : undefined}
+            onUninstall={
+              viewedGroup?.source === "plugin"
+                ? () => {
+                    uninstall(viewedGroup.title, viewedCurated?.label ?? viewedGroup.title);
+                    setViewPlugin(null);
+                  }
+                : undefined
+            }
+            onClose={() => setViewPlugin(null)}
           />
-          <button
-            className="ghost-button"
-            type="button"
-            disabled={installBusy || !installRepo.trim()}
-            onClick={() => install(installRepo)}
-          >
-            {installBusy ? <LoaderCircle className="spin" /> : <Plus />} Install
-          </button>
-        </SettingRow>
-        {installMessage ? (
-          <p className="settings-action-message" role="status">
-            {installMessage}
-          </p>
         ) : null}
-      </SkillsCollection>
-      <SkillsCollection
-        title="Installed Skills and Plugins"
-        description="Your standalone skills and locally installed plugin bundles."
-        icon={Folder}
-        open={openCollections.installed}
-        onToggle={() => toggleCollection("installed")}
-      >
-        {installedGroups.length > 0 ? (
-          installedGroups.map(renderGroup)
-        ) : (
-          <p className="skills-empty-state">No user skills or third-party plugins installed yet.</p>
-        )}
-      </SkillsCollection>
-      <SkillsCollection
-        title="AI Integrator Skills and Plugins"
-        description="Focused capabilities maintained and shipped with AI Integrator."
-        icon={Sparkles}
-        open={openCollections.integrator}
-        onToggle={() => toggleCollection("integrator")}
-      >
-        {integratorGroups.length > 0 ? (
-          integratorGroups.map(renderGroup)
-        ) : (
-          <p className="skills-empty-state">No bundled skills are available in this build.</p>
-        )}
-      </SkillsCollection>
+      </AnimatePresence>
+      <AnimatePresence>
+        {viewSkill ? (
+          <SkillDetailModal target={viewSkill} onClose={() => setViewSkill(null)} />
+        ) : null}
+      </AnimatePresence>
     </>
   );
 }
@@ -2055,7 +4054,7 @@ function ModelsAndRuntimesSettings({
           <Bot />
         </span>
         <div>
-          <h1>Models and Runtimes</h1>
+          <h1>Runtimes and Models</h1>
           <p>Manage local CLIs and the route each one should prefer.</p>
         </div>
         <button
@@ -3077,7 +5076,9 @@ function VoiceTypingSettings() {
       setStatus(next);
       setApiKey("");
       setMessage(
-        "Saved in the operating system credential store. The key is not exported or shown again.",
+        next.storage === "protected-local-file"
+          ? "Saved in protected developer storage. The key is not exported or shown again."
+          : "Saved in the operating system credential store. The key is not exported or shown again.",
       );
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Could not save the OpenAI API key.");
@@ -3096,7 +5097,11 @@ function VoiceTypingSettings() {
       }
       await bridge.clearVoiceTypingCredential();
       setStatus((current) => (current ? { ...current, configured: false } : current));
-      setMessage("Removed the OpenAI API key from the operating system credential store.");
+      setMessage(
+        status?.storage === "protected-local-file"
+          ? "Removed the OpenAI API key from protected developer storage."
+          : "Removed the OpenAI API key from the operating system credential store.",
+      );
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Could not remove the OpenAI API key.");
     } finally {
@@ -3105,6 +5110,7 @@ function VoiceTypingSettings() {
   };
 
   const nativeOnly = status?.storage === "native-only";
+  const protectedDevelopment = status?.storage === "protected-local-file";
   return (
     <section className="settings-section">
       <header>
@@ -3124,7 +5130,9 @@ function VoiceTypingSettings() {
           <small>
             {nativeOnly
               ? "Browser preview never stores BYOK secrets. Use the installed desktop app for OS credential storage."
-              : "The renderer never receives the saved key; audio is sent only while you hold an active voice-typing session."}
+              : protectedDevelopment
+                ? "Debug builds use permission-locked developer storage instead of macOS Keychain."
+                : "The renderer never receives the saved key; audio is sent only while you hold an active voice-typing session."}
           </small>
         </span>
       </div>
@@ -3247,7 +5255,9 @@ function ArchiveSettings({
 }: ArchiveSettingsProps) {
   const [filter, setFilter] = useState("");
   const ensureArchivedRef = useRef(onEnsureArchived);
-  ensureArchivedRef.current = onEnsureArchived;
+  useEffect(() => {
+    ensureArchivedRef.current = onEnsureArchived;
+  }, [onEnsureArchived]);
   useEffect(() => {
     ensureArchivedRef.current?.();
   }, []);
@@ -3287,7 +5297,7 @@ function ArchiveSettings({
           <Archive />
         </span>
         <div>
-          <h1>Archive</h1>
+          <h1>Archives</h1>
           <p>
             Everything you have archived, in one sortable place. The sidebar toggle shows the same
             data next to your chats.

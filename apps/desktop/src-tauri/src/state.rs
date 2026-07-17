@@ -7,13 +7,20 @@ use std::{
 
 use adapter_acp::AcpClient;
 use adapter_codex::CodexClient;
+use chrono::{DateTime, Utc};
 use directories::ProjectDirs;
 use integrator_core::{
-    DelegationPermission, IntegratorError, ProviderKind, Result, RuntimeBinding, TaskId,
+    DelegationPermission, IntegratorError, ProviderKind, ProviderStatus, Result, RuntimeBinding,
+    TaskId,
 };
-use integrator_runtime::{AuthorizedRepositoryCache, GitService, StructuredCliClient};
+use integrator_runtime::{
+    AuthorizedRepositoryCache, GitService, StructuredCliClient, discover_providers,
+};
 use session_store::LocalStore;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
+use zeroize::Zeroizing;
+
+use crate::repository_watch::{RepositoryWatchRegistry, RepositoryWatcher};
 
 /// One connected Codex app-server process plus the task/thread binding the
 /// projection pump uses to attribute events.
@@ -59,6 +66,11 @@ pub struct AcpSessionSpec {
     pub mcp_servers: Vec<serde_json::Value>,
 }
 
+#[derive(Clone, Debug)]
+pub struct AcpTurnSettlement {
+    pub failed: bool,
+}
+
 /// One connected ACP agent process (e.g. `cursor-agent acp`).
 #[derive(Clone)]
 pub struct AcpRuntime {
@@ -72,6 +84,13 @@ pub struct AcpRuntime {
     /// The client-generated id of the in-flight prompt; ACP has no provider
     /// turn identity, so this attributes streamed session updates.
     pub current_turn: Arc<std::sync::Mutex<Option<String>>>,
+    /// Captured with `current_turn` so the ordered prompt boundary can build
+    /// the terminal projection after every preceding stream update is stored.
+    pub current_turn_started_at: Arc<std::sync::Mutex<Option<DateTime<Utc>>>>,
+    /// Emitted by the projection pump only after it persists the ordered
+    /// prompt boundary and clears the active turn. Delegated-child lifecycle
+    /// watchers use this instead of racing the raw prompt future.
+    pub turn_settled: broadcast::Sender<AcpTurnSettlement>,
     pub permission_options: Arc<std::sync::Mutex<HashMap<String, Vec<AcpPermissionOption>>>>,
     /// Session mode state advertised by `session/new` and kept current by
     /// `current_mode_update` notifications / `session/set_mode` calls.
@@ -213,6 +232,25 @@ pub struct VoiceTypingSession {
     pub sender: tokio::sync::mpsc::Sender<VoiceTypingCommand>,
 }
 
+#[derive(Default)]
+struct NativeSecretCache {
+    values: HashMap<String, Zeroizing<String>>,
+}
+
+impl NativeSecretCache {
+    fn get(&self, id: &str) -> Option<Zeroizing<String>> {
+        self.values.get(id).cloned()
+    }
+
+    fn insert(&mut self, id: &str, secret: Zeroizing<String>) {
+        self.values.insert(id.to_owned(), secret);
+    }
+
+    fn remove(&mut self, id: &str) {
+        self.values.remove(id);
+    }
+}
+
 pub enum VoiceTypingCommand {
     Append(Vec<u8>),
     Stop(tokio::sync::oneshot::Sender<()>),
@@ -254,20 +292,28 @@ fn reserve_turn_launch(
     launches: &Arc<std::sync::Mutex<HashSet<TaskId>>>,
     task_id: TaskId,
 ) -> Option<TurnLaunchGuard> {
-    let inserted = launches
-        .lock()
-        .expect("turn launch lock")
-        .insert(task_id);
+    let inserted = launches.lock().expect("turn launch lock").insert(task_id);
     inserted.then(|| TurnLaunchGuard {
         launches: Arc::clone(launches),
         task_id,
     })
 }
 
+fn reusable_provider_statuses(
+    cached: &Option<Vec<ProviderStatus>>,
+    force: bool,
+) -> Option<Vec<ProviderStatus>> {
+    if force { None } else { cached.clone() }
+}
+
 pub struct AppState {
     pub store: Arc<LocalStore>,
     pub data_directory: PathBuf,
     pub git: Option<GitService>,
+    /// One sanitized runtime inventory for the whole native process. The first
+    /// window fills it during boot; secondary windows and task launches reuse
+    /// it until an explicit status refresh replaces it.
+    provider_status_cache: Mutex<Option<Vec<ProviderStatus>>>,
     /// Exact canonical repository/worktree identities that already passed the
     /// trusted-project boundary. Trust-changing commands serialize through
     /// this mutex and clear it before returning.
@@ -289,6 +335,10 @@ pub struct AppState {
     /// refresh for that provider/repository pair.
     pub native_action_handles:
         std::sync::Mutex<HashMap<String, crate::native_actions::NativeActionHandle>>,
+    /// Secrets saved for first-party data skills. Keychain remains the
+    /// persistent store; this zeroizing process-local cache prevents repeated
+    /// credential reads and never crosses the native command boundary.
+    skill_credentials: std::sync::Mutex<NativeSecretCache>,
     pub voice_typing: std::sync::Mutex<Option<VoiceTypingSession>>,
     pub terminals: std::sync::Mutex<HashMap<String, TerminalSession>>,
     /// Vendor setup/update PTYs. Each session is born from a native allowlisted
@@ -296,6 +346,9 @@ pub struct AppState {
     /// argv, cwd, or inherited environment.
     pub runtime_terminals:
         std::sync::Mutex<HashMap<String, crate::runtime_setup::RuntimeTerminalSession>>,
+    /// One authorized, debounced working-tree watcher per app window. The
+    /// renderer receives only an opaque invalidation signal, never file paths.
+    pub repository_watchers: std::sync::Mutex<RepositoryWatchRegistry<RepositoryWatcher>>,
     /// Live delegated subagents keyed by delegation id. Unlike the primary
     /// single-slot runtimes above, children run concurrently.
     pub delegation_children: Mutex<HashMap<String, Arc<crate::state::DelegationChild>>>,
@@ -321,6 +374,7 @@ impl AppState {
             store: Arc::new(store),
             data_directory,
             git: GitService::discover().ok(),
+            provider_status_cache: Mutex::new(None),
             git_authorizations: Arc::new(std::sync::Mutex::new(
                 AuthorizedRepositoryCache::default(),
             )),
@@ -331,9 +385,11 @@ impl AppState {
             structured: Mutex::new(HashMap::new()),
             turn_launches: Arc::new(std::sync::Mutex::new(HashSet::new())),
             native_action_handles: std::sync::Mutex::new(HashMap::new()),
+            skill_credentials: std::sync::Mutex::new(NativeSecretCache::default()),
             voice_typing: std::sync::Mutex::new(None),
             terminals: std::sync::Mutex::new(HashMap::new()),
             runtime_terminals: std::sync::Mutex::new(HashMap::new()),
+            repository_watchers: std::sync::Mutex::new(RepositoryWatchRegistry::default()),
             delegation_children: Mutex::new(HashMap::new()),
             broker: std::sync::Mutex::new(None),
         })
@@ -351,13 +407,78 @@ impl AppState {
             .expect("turn launch lock")
             .contains(&task_id)
     }
+
+    pub fn cached_skill_credential(&self, id: &str) -> Result<Option<Zeroizing<String>>> {
+        self.skill_credentials
+            .lock()
+            .map(|cache| cache.get(id))
+            .map_err(|_| IntegratorError::Unavailable("credential cache is unavailable".into()))
+    }
+
+    pub fn cache_skill_credential(&self, id: &str, secret: Zeroizing<String>) -> Result<()> {
+        self.skill_credentials
+            .lock()
+            .map(|mut cache| cache.insert(id, secret))
+            .map_err(|_| IntegratorError::Unavailable("credential cache is unavailable".into()))
+    }
+
+    pub fn forget_skill_credential(&self, id: &str) -> Result<()> {
+        self.skill_credentials
+            .lock()
+            .map(|mut cache| cache.remove(id))
+            .map_err(|_| IntegratorError::Unavailable("credential cache is unavailable".into()))
+    }
+
+    /// Discover installed runtimes once per app process. Holding the async
+    /// mutex through the worker call makes concurrent boot/catalog/task
+    /// requests single-flight without blocking unrelated native state.
+    pub async fn provider_statuses(&self, force: bool) -> Result<Vec<ProviderStatus>> {
+        let mut cached = self.provider_status_cache.lock().await;
+        if let Some(statuses) = reusable_provider_statuses(&cached, force) {
+            return Ok(statuses);
+        }
+        let statuses = tokio::task::spawn_blocking(discover_providers)
+            .await
+            .map_err(|_| IntegratorError::Unavailable("provider discovery worker failed".into()))?;
+        *cached = Some(statuses.clone());
+        Ok(statuses)
+    }
 }
 
 #[cfg(test)]
 mod task_runtime_registry_fixtures {
-    use super::{remove_task_runtime, replace_task_runtime, reserve_turn_launch};
+    use super::{
+        NativeSecretCache, remove_task_runtime, replace_task_runtime, reserve_turn_launch,
+        reusable_provider_statuses,
+    };
     use integrator_core::TaskId;
     use std::collections::HashMap;
+    use zeroize::Zeroizing;
+
+    #[test]
+    fn native_secret_cache_reuses_and_forgets_values() {
+        let mut cache = NativeSecretCache::default();
+        cache.insert("census-api-key", Zeroizing::new("first".to_owned()));
+        assert_eq!(
+            cache
+                .get("census-api-key")
+                .as_ref()
+                .map(|secret| secret.as_str()),
+            Some("first")
+        );
+
+        cache.insert("census-api-key", Zeroizing::new("second".to_owned()));
+        assert_eq!(
+            cache
+                .get("census-api-key")
+                .as_ref()
+                .map(|secret| secret.as_str()),
+            Some("second")
+        );
+
+        cache.remove("census-api-key");
+        assert!(cache.get("census-api-key").is_none());
+    }
 
     #[test]
     fn happy_two_chat_runs_coexist() {
@@ -428,5 +549,13 @@ mod task_runtime_registry_fixtures {
             reserve_turn_launch(&launches, second).expect("independent reservation");
         drop(first_guard);
         assert!(reserve_turn_launch(&launches, first).is_some());
+    }
+
+    #[test]
+    fn provider_inventory_is_reused_until_refresh_is_explicit() {
+        let cached = Some(Vec::new());
+        assert_eq!(reusable_provider_statuses(&cached, false), Some(Vec::new()));
+        assert_eq!(reusable_provider_statuses(&cached, true), None);
+        assert_eq!(reusable_provider_statuses(&None, false), None);
     }
 }

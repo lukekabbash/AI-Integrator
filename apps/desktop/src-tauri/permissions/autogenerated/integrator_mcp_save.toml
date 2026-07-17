@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-integrator-mcp-save"
+description = "Enables the integrator_mcp_save command without any pre-configured scope."
+commands.allow = ["integrator_mcp_save"]
+
+[[permission]]
+identifier = "deny-integrator-mcp-save"
+description = "Denies the integrator_mcp_save command without any pre-configured scope."
+commands.deny = ["integrator_mcp_save"]

@@ -6,12 +6,19 @@ mod chat_title;
 mod code_explain;
 mod commands;
 mod commit_message;
+mod credential_store;
 mod delegation;
 mod explain_context;
+mod harness_prompt;
+mod integrator_mcp;
 mod integrator_skills;
+mod mcp_oauth;
 mod native_actions;
+mod plugin_preview;
 mod provider_routing;
+mod repository_watch;
 mod runtime_setup;
+mod skill_api;
 mod state;
 
 use chat_title::task_generate_title;
@@ -22,10 +29,17 @@ use delegation::{
     delegation_approve, delegation_deny, delegation_list, delegation_send_message,
     delegation_stop_cmd,
 };
+use integrator_mcp::{
+    integrator_mcp_credential_clear, integrator_mcp_credential_set, integrator_mcp_import,
+    integrator_mcp_oauth_connect, integrator_mcp_oauth_disconnect, integrator_mcp_overview,
+    integrator_mcp_remove, integrator_mcp_save,
+};
 use integrator_skills::{
-    integrator_skill_credential_clear, integrator_skill_credential_set,
+    integrator_skill_body, integrator_skill_credential_clear, integrator_skill_credential_set,
     integrator_skills_install, integrator_skills_overview, integrator_skills_uninstall,
 };
+use plugin_preview::{integrator_skill_preview_body, integrator_skills_preview};
+use repository_watch::{repository_watch_start, repository_watch_stop};
 use runtime_setup::{
     runtime_action_plan_list, runtime_terminal_close, runtime_terminal_open,
     runtime_terminal_resize, runtime_terminal_write,
@@ -60,12 +74,27 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_dialog::init())
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                window
+                    .state::<AppState>()
+                    .repository_watchers
+                    .lock()
+                    .expect("repository watcher registry lock")
+                    .remove_window(window.label());
+            }
+        })
         .setup(|app| {
             let state = AppState::initialize().map_err(|error| {
                 let boxed: Box<dyn std::error::Error> = Box::new(error);
                 boxed
             })?;
+            integrator_mcp::ensure_configuration_revision(&state.store).map_err(|error| {
+                let boxed: Box<dyn std::error::Error> = Box::new(error);
+                boxed
+            })?;
             integrator_skills::prune_projections(&state.data_directory);
+            integrator_mcp::prune_projections(&state.data_directory);
             app.manage(state);
             if let Err(error) = integrator_skills::ensure_roots(app.handle()) {
                 eprintln!("skills root creation failed: {error}");
@@ -105,8 +134,19 @@ pub fn run() {
             integrator_skills_overview,
             integrator_skills_install,
             integrator_skills_uninstall,
+            integrator_skills_preview,
+            integrator_skill_preview_body,
+            integrator_skill_body,
             integrator_skill_credential_set,
             integrator_skill_credential_clear,
+            integrator_mcp_overview,
+            integrator_mcp_save,
+            integrator_mcp_remove,
+            integrator_mcp_import,
+            integrator_mcp_credential_set,
+            integrator_mcp_credential_clear,
+            integrator_mcp_oauth_connect,
+            integrator_mcp_oauth_disconnect,
             session_list,
             local_export,
             local_clear,
@@ -133,6 +173,8 @@ pub fn run() {
             project_file_read,
             project_file_write,
             project_file_rename,
+            repository_watch_start,
+            repository_watch_stop,
             selection_explain,
             selection_explain_preview,
             project_file_opener_list,

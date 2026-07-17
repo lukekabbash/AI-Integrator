@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { bridgeMock } = vi.hoisted(() => ({
   bridgeMock: {
@@ -10,7 +10,16 @@ const { bridgeMock } = vi.hoisted(() => ({
     listRuntimeActionPlans: vi.fn(),
     listModelCatalog: vi.fn(),
     listIntegratorSkills: vi.fn(),
+    listIntegratorMcps: vi.fn(),
     installIntegratorPlugin: vi.fn(),
+    uninstallIntegratorPlugin: vi.fn(),
+    previewCuratedPlugin: vi.fn(),
+    previewSkillBody: vi.fn(),
+    getIntegratorSkillBody: vi.fn(),
+    setIntegratorSkillCredential: vi.fn(),
+    clearIntegratorSkillCredential: vi.fn(),
+    connectIntegratorMcp: vi.fn(),
+    disconnectIntegratorMcp: vi.fn(),
     setSetting: vi.fn(),
     getStorageTotals: vi.fn(),
   },
@@ -86,6 +95,10 @@ const updatePlan = {
 };
 
 describe("Runtime Settings command disclosure", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   beforeEach(() => {
     for (const mock of Object.values(bridgeMock)) mock.mockReset();
     bridgeMock.listSettings.mockResolvedValue([]);
@@ -103,7 +116,19 @@ describe("Runtime Settings command disclosure", () => {
       bundledAvailable: true,
       skills: [],
     });
+    bridgeMock.listIntegratorMcps.mockResolvedValue({
+      mcpsRoot: "/tmp/AI Integrator/MCPs",
+      servers: [],
+    });
     bridgeMock.installIntegratorPlugin.mockRejectedValue(new Error("not used"));
+    bridgeMock.uninstallIntegratorPlugin.mockRejectedValue(new Error("not used"));
+    bridgeMock.previewCuratedPlugin.mockRejectedValue(new Error("not used"));
+    bridgeMock.previewSkillBody.mockRejectedValue(new Error("not used"));
+    bridgeMock.getIntegratorSkillBody.mockRejectedValue(new Error("not used"));
+    bridgeMock.setIntegratorSkillCredential.mockResolvedValue(undefined);
+    bridgeMock.clearIntegratorSkillCredential.mockResolvedValue(undefined);
+    bridgeMock.connectIntegratorMcp.mockRejectedValue(new Error("not used"));
+    bridgeMock.disconnectIntegratorMcp.mockRejectedValue(new Error("not used"));
     bridgeMock.setSetting.mockResolvedValue(undefined);
     bridgeMock.getStorageTotals.mockResolvedValue({
       totalBytes: 0,
@@ -152,25 +177,134 @@ describe("Runtime Settings command disclosure", () => {
     );
   });
 
-  it("toggles an entire skill plugin while preserving per-skill controls", async () => {
+  it("opens the capability library to Marketplace and moves cards between install sections", async () => {
     bridgeMock.listIntegratorSkills.mockResolvedValueOnce({
       skillsRoot: "/tmp/AI Integrator/Skills",
       pluginsRoot: "/tmp/AI Integrator/Plugins",
       bundledAvailable: true,
       skills: [
         {
-          name: "gov-data:fred",
-          description: "Fetch FRED series",
-          source: "first-party",
+          name: "anthropics-skills:document-skills",
+          description: "Create polished documents",
+          source: "plugin",
           enabled: false,
           defaultEnabled: false,
+          invocationCount: 0,
         },
+      ],
+    });
+    bridgeMock.uninstallIntegratorPlugin.mockResolvedValueOnce({
+      skillsRoot: "/tmp/AI Integrator/Skills",
+      pluginsRoot: "/tmp/AI Integrator/Plugins",
+      bundledAvailable: true,
+      skills: [],
+    });
+    bridgeMock.installIntegratorPlugin.mockResolvedValueOnce({
+      skillsRoot: "/tmp/AI Integrator/Skills",
+      pluginsRoot: "/tmp/AI Integrator/Plugins",
+      bundledAvailable: true,
+      skills: [
         {
-          name: "gov-data:bls",
-          description: "Fetch BLS series",
-          source: "first-party",
-          enabled: true,
+          name: "anthropics-skills:document-skills",
+          description: "Create polished documents",
+          source: "plugin",
+          enabled: false,
           defaultEnabled: false,
+          invocationCount: 0,
+        },
+      ],
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(
+      <SettingsView
+        preferences={DEFAULT_THEME_PREFERENCES}
+        runtimes={[claudeRuntime, runtime]}
+        usage={createEmptySnapshot().usage}
+        onChangePreferences={vi.fn()}
+        onResetPreferences={vi.fn()}
+        onBack={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Skills and Plugins" }));
+    expect(await screen.findByRole("tab", { name: "Marketplace" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+
+    const installedHeading = await screen.findByRole("heading", { name: "Installed" });
+    const availableHeading = screen.getByRole("heading", { name: "Available" });
+    expect(
+      installedHeading.compareDocumentPosition(availableHeading) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    const installedCard = screen.getByRole("button", { name: "Anthropic skills" });
+    const marketplaceHeading = within(installedCard)
+      .getByText("Anthropic skills")
+      .closest(".marketplace-card-heading");
+    expect(marketplaceHeading).not.toBeNull();
+    expect(marketplaceHeading?.querySelector(".browse-card-tile")).not.toBeNull();
+    const uninstallButton = within(installedCard).getByRole("button", {
+      name: "Uninstall Anthropic skills",
+    });
+    expect(uninstallButton).toBe(installedCard.querySelector(".marketplace-uninstall-button"));
+
+    fireEvent.click(uninstallButton);
+    await waitFor(() =>
+      expect(bridgeMock.uninstallIntegratorPlugin).toHaveBeenCalledWith("anthropics-skills"),
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole("heading", { name: "Installed" })).not.toBeInTheDocument(),
+    );
+    expect(
+      within(screen.getByRole("button", { name: "Anthropic skills" })).queryByRole("button", {
+        name: "Uninstall Anthropic skills",
+      }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Anthropic skills" }));
+    const dialog = await screen.findByRole("dialog", { name: "Anthropic skills" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Install" }));
+    await waitFor(() =>
+      expect(bridgeMock.installIntegratorPlugin).toHaveBeenCalledWith("anthropics/skills"),
+    );
+    expect(await screen.findByRole("heading", { name: "Installed" })).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("button", { name: "Anthropic skills" })).getByRole("button", {
+        name: "Uninstall Anthropic skills",
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it("presents standalone skills and MCP connectors as cards", async () => {
+    bridgeMock.listIntegratorSkills.mockResolvedValueOnce({
+      skillsRoot: "/tmp/AI Integrator/Skills",
+      pluginsRoot: "/tmp/AI Integrator/Plugins",
+      bundledAvailable: true,
+      skills: [
+        {
+          name: "release-notes",
+          description: "Draft concise release notes",
+          source: "integrator",
+          enabled: true,
+          defaultEnabled: true,
+          invocationCount: 4,
+        },
+      ],
+    });
+    bridgeMock.listIntegratorMcps.mockResolvedValueOnce({
+      mcpsRoot: "/tmp/AI Integrator/MCPs",
+      servers: [
+        {
+          name: "local-docs",
+          source: "user",
+          origin: "MCPs folder",
+          enabled: false,
+          transport: "stdio",
+          command: "npx",
+          args: ["-y", "local-docs-mcp"],
+          env: {},
         },
       ],
     });
@@ -186,15 +320,197 @@ describe("Runtime Settings command disclosure", () => {
       />,
     );
 
-    fireEvent.click(screen.getByText("Skills").closest("button") as HTMLButtonElement);
-    const heading = await screen.findByRole("heading", { name: "gov-data" });
-    const plugin = heading.closest("section") as HTMLElement;
+    fireEvent.click(screen.getByRole("button", { name: "Skills and Plugins" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "Skills" }));
+    const skillCard = await screen.findByRole("button", { name: "Open release-notes" });
+    expect(skillCard).toHaveClass("capability-card", "skill-card");
+    const skillSwitch = within(skillCard).getByRole("switch", { name: "Enable release-notes" });
+    const skillDisclosure = within(skillCard).getByRole("button", {
+      name: "Open release-notes details",
+    });
+    expect(skillSwitch.parentElement).toBe(skillDisclosure.parentElement);
+    expect(
+      skillSwitch.compareDocumentPosition(skillDisclosure) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("tab", { name: "MCPs" }));
+    const connectorCard = (await screen.findByText("local-docs")).closest(".capability-card");
+    expect(connectorCard).not.toBeNull();
+    expect(
+      within(connectorCard as HTMLElement).getByRole("switch", { name: "Enable local-docs" }),
+    ).toBeInTheDocument();
+    expect(connectorCard).toHaveTextContent("npx -y local-docs-mcp");
+  });
+
+  it("keeps a curated MCP icon visible after the server is enabled", async () => {
+    bridgeMock.listIntegratorMcps.mockResolvedValue({
+      mcpsRoot: "/tmp/AI Integrator/MCPs",
+      servers: [
+        {
+          name: "figma",
+          source: "user",
+          origin: "MCPs folder",
+          enabled: false,
+          transport: "remote",
+          url: "https://mcp.figma.com/mcp",
+        },
+      ],
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(
+      <SettingsView
+        preferences={DEFAULT_THEME_PREFERENCES}
+        runtimes={[claudeRuntime, runtime]}
+        usage={createEmptySnapshot().usage}
+        onChangePreferences={vi.fn()}
+        onResetPreferences={vi.fn()}
+        onBack={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Skills and Plugins" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "MCPs" }));
+    const card = (await screen.findByText("figma")).closest(".mcp-card");
+    expect(card).not.toBeNull();
+    const icon = card?.querySelector("img");
+    expect(icon).toHaveAttribute("src", "/brand/skills/figma.ico");
+
+    fireEvent.click(within(card as HTMLElement).getByRole("switch", { name: "Enable figma" }));
+    await waitFor(() =>
+      expect(
+        within(card as HTMLElement).getByRole("switch", { name: "Enable figma" }),
+      ).toHaveAttribute("aria-checked", "true"),
+    );
+    expect(card?.querySelector("img")).toHaveAttribute("src", "/brand/skills/figma.ico");
+  });
+
+  it("signs remote MCP servers in and out from their installed cards", async () => {
+    const disconnected = {
+      mcpsRoot: "/tmp/AI Integrator/MCPs",
+      servers: [
+        {
+          name: "figma",
+          source: "user",
+          origin: "MCPs folder",
+          enabled: false,
+          authorization: { state: "notConnected" as const, available: true },
+          oauth: true,
+          transport: "remote" as const,
+          url: "https://mcp.figma.com/mcp",
+        },
+      ],
+    };
+    const connected = {
+      ...disconnected,
+      servers: disconnected.servers.map((server) => ({
+        ...server,
+        authorization: { state: "connected" as const, available: true },
+      })),
+    };
+    bridgeMock.listIntegratorMcps.mockResolvedValueOnce(disconnected).mockResolvedValue(connected);
+    bridgeMock.connectIntegratorMcp.mockResolvedValue(connected);
+    bridgeMock.disconnectIntegratorMcp.mockResolvedValue(disconnected);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(
+      <SettingsView
+        preferences={DEFAULT_THEME_PREFERENCES}
+        runtimes={[claudeRuntime, runtime]}
+        usage={createEmptySnapshot().usage}
+        onChangePreferences={vi.fn()}
+        onResetPreferences={vi.fn()}
+        onBack={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Skills and Plugins" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "MCPs" }));
+    const card = (await screen.findByText("figma")).closest(".mcp-card") as HTMLElement;
+    fireEvent.click(within(card).getByRole("button", { name: "Sign in to figma" }));
+
+    await waitFor(() => expect(bridgeMock.connectIntegratorMcp).toHaveBeenCalledWith("figma"));
+    const disconnect = await within(card).findByRole("button", { name: "Disconnect figma" });
+    expect(card).toHaveTextContent("Connected");
+
+    bridgeMock.listIntegratorMcps.mockResolvedValue(disconnected);
+    fireEvent.click(disconnect);
+    await waitFor(() => expect(bridgeMock.disconnectIntegratorMcp).toHaveBeenCalledWith("figma"));
+    await within(card).findByRole("button", { name: "Sign in to figma" });
+  });
+
+  it("toggles an entire skill plugin while preserving per-skill controls", async () => {
+    bridgeMock.listIntegratorSkills.mockResolvedValueOnce({
+      skillsRoot: "/tmp/AI Integrator/Skills",
+      pluginsRoot: "/tmp/AI Integrator/Plugins",
+      bundledAvailable: true,
+      skills: [
+        {
+          name: "gov-data:fred",
+          description: "Fetch FRED series",
+          source: "first-party",
+          enabled: false,
+          defaultEnabled: false,
+          invocationCount: 2,
+        },
+        {
+          name: "gov-data:bls",
+          description: "Fetch BLS series",
+          source: "first-party",
+          enabled: true,
+          defaultEnabled: false,
+          invocationCount: 0,
+        },
+      ],
+    });
+    bridgeMock.listIntegratorMcps.mockResolvedValue({
+      mcpsRoot: "/tmp/AI Integrator/MCPs",
+      servers: [
+        {
+          name: "gov-data:data",
+          source: "first-party",
+          origin: "gov-data",
+          enabled: false,
+          transport: "remote",
+          url: "https://example.com/mcp",
+        },
+      ],
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(
+      <SettingsView
+        preferences={DEFAULT_THEME_PREFERENCES}
+        runtimes={[claudeRuntime, runtime]}
+        usage={createEmptySnapshot().usage}
+        onChangePreferences={vi.fn()}
+        onResetPreferences={vi.fn()}
+        onBack={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Skills and Plugins" }));
+    await waitFor(() => expect(bridgeMock.listIntegratorSkills).toHaveBeenCalled(), {
+      timeout: 3_000,
+    });
+    fireEvent.click(await screen.findByRole("tab", { name: "Plugins" }));
+    const plugin = await screen.findByRole("button", { name: "gov-data" }, { timeout: 3_000 });
     expect(plugin.querySelector("img")).toHaveAttribute("src", "/brand/skills/data-gov.ico");
+    await waitFor(() => expect(within(plugin).getByText("1 of 3 on")).toBeInTheDocument(), {
+      timeout: 3_000,
+    });
 
     const pluginSwitch = within(plugin).getByRole("switch", {
-      name: "Enable all skills in gov-data",
+      name: "Enable gov-data",
     });
-    expect(pluginSwitch).toHaveAttribute("data-mixed", "true");
+    const pluginDisclosure = within(plugin).getByRole("button", {
+      name: "Open gov-data details",
+    });
+    expect(pluginSwitch.parentElement).toBe(pluginDisclosure.parentElement);
+    expect(
+      pluginSwitch.compareDocumentPosition(pluginDisclosure) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(pluginSwitch).toHaveAttribute("aria-checked", "false");
     fireEvent.click(pluginSwitch);
     await waitFor(() =>
       expect(bridgeMock.setSetting).toHaveBeenCalledWith("settings.skills.integrator.enabled", {
@@ -202,14 +518,178 @@ describe("Runtime Settings command disclosure", () => {
         "gov-data:bls": true,
       }),
     );
+    expect(bridgeMock.setSetting).toHaveBeenCalledWith("settings.mcp.integrator.enabled", {
+      "gov-data:data": true,
+    });
+    await waitFor(() => expect(pluginSwitch).toHaveAttribute("aria-checked", "true"));
 
-    fireEvent.click(within(plugin).getByRole("switch", { name: "Enable gov-data:fred" }));
+    fireEvent.click(pluginDisclosure);
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("switch", { name: "Enable gov-data:fred" }));
     await waitFor(() =>
       expect(bridgeMock.setSetting).toHaveBeenCalledWith("settings.skills.integrator.enabled", {
         "gov-data:fred": false,
         "gov-data:bls": true,
       }),
     );
+  });
+
+  it("opens an installed plugin skill as inline rendered Markdown", async () => {
+    bridgeMock.listIntegratorSkills.mockResolvedValueOnce({
+      skillsRoot: "/tmp/AI Integrator/Skills",
+      pluginsRoot: "/tmp/AI Integrator/Plugins",
+      bundledAvailable: true,
+      skills: [
+        {
+          name: "gov-data:fred",
+          description: "Fetch FRED series",
+          source: "first-party",
+          enabled: true,
+          defaultEnabled: false,
+          invocationCount: 2,
+        },
+        {
+          name: "gov-data:bls",
+          description: "Fetch BLS series",
+          source: "first-party",
+          enabled: true,
+          defaultEnabled: false,
+          invocationCount: 0,
+        },
+      ],
+    });
+    bridgeMock.getIntegratorSkillBody.mockResolvedValueOnce({
+      name: "gov-data:fred",
+      description: "Fetch FRED series",
+      body: [
+        "---",
+        "name: gov-data:fred",
+        "description: Fetch FRED series",
+        "---",
+        "",
+        "# Purpose",
+        "",
+        "Use the API safely.",
+        "",
+        "- Read the requested series",
+        "- Cite the observation date",
+        "",
+        "```json",
+        '{"provider":"fred","path":"/fred/series/observations"}',
+        "```",
+      ].join("\n"),
+      truncated: false,
+    });
+
+    render(
+      <SettingsView
+        preferences={DEFAULT_THEME_PREFERENCES}
+        runtimes={[claudeRuntime, runtime]}
+        usage={createEmptySnapshot().usage}
+        onChangePreferences={vi.fn()}
+        onResetPreferences={vi.fn()}
+        onBack={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Skills and Plugins" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "Plugins" }));
+    const plugin = await screen.findByRole("button", { name: "gov-data" });
+    fireEvent.click(plugin);
+    const dialog = await screen.findByRole("dialog", { name: "gov-data" });
+    const skillRow = within(dialog).getByText("fred").closest(".skill-settings-row");
+    expect(skillRow).not.toBeNull();
+    const skillSwitch = within(skillRow as HTMLElement).getByRole("switch", {
+      name: "Enable gov-data:fred",
+    });
+    const showInstructions = within(skillRow as HTMLElement).getByRole("button", {
+      name: "Show gov-data:fred instructions",
+    });
+    expect(skillSwitch.parentElement).toBe(showInstructions.parentElement);
+    expect(
+      skillSwitch.compareDocumentPosition(showInstructions) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    fireEvent.click(showInstructions);
+    expect(skillRow).toHaveAttribute("aria-expanded", "true");
+    expect(bridgeMock.getIntegratorSkillBody).toHaveBeenCalledWith("gov-data:fred");
+
+    const disclosure = await within(dialog).findByRole("region", {
+      name: "gov-data:fred instructions",
+    });
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    expect(within(disclosure).getByRole("heading", { name: "Purpose" })).toBeInTheDocument();
+    expect(within(disclosure).getByText("Use the API safely.")).toBeInTheDocument();
+    expect(within(disclosure).getByText("Read the requested series")).toBeInTheDocument();
+    expect(
+      within(disclosure).getByText('{"provider":"fred","path":"/fred/series/observations"}'),
+    ).toBeInTheDocument();
+    expect(within(disclosure).queryByText("name: gov-data:fred")).not.toBeInTheDocument();
+
+    fireEvent.click(
+      within(skillRow as HTMLElement).getByRole("button", {
+        name: "Hide gov-data:fred instructions",
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        within(dialog).queryByRole("region", { name: "gov-data:fred instructions" }),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("opens a marketplace skill inside its plugin preview", async () => {
+    bridgeMock.previewCuratedPlugin.mockResolvedValueOnce({
+      skills: [
+        {
+          name: "document-skills",
+          description: "Create polished documents",
+          path: "skills/document-skills/SKILL.md",
+        },
+      ],
+      totalFound: 1,
+      truncated: false,
+    });
+    bridgeMock.previewSkillBody.mockResolvedValueOnce({
+      name: "document-skills",
+      body: "## Workflow\n\n1. Inspect the source\n2. Render the result",
+      truncated: false,
+    });
+
+    render(
+      <SettingsView
+        preferences={DEFAULT_THEME_PREFERENCES}
+        runtimes={[claudeRuntime, runtime]}
+        usage={createEmptySnapshot().usage}
+        onChangePreferences={vi.fn()}
+        onResetPreferences={vi.fn()}
+        onBack={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Skills and Plugins" }));
+    expect(await screen.findByRole("tab", { name: "Marketplace" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /Anthropic skills/ }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Anthropic skills" });
+    const skillTrigger = await within(dialog).findByRole("button", {
+      name: /document-skills/,
+    });
+    fireEvent.click(skillTrigger);
+
+    expect(bridgeMock.previewSkillBody).toHaveBeenCalledWith(
+      "anthropics/skills",
+      "skills/document-skills/SKILL.md",
+    );
+    const disclosure = await within(dialog).findByRole("region", {
+      name: "document-skills instructions",
+    });
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    expect(within(disclosure).getByRole("heading", { name: "Workflow" })).toBeInTheDocument();
+    expect(within(disclosure).getByText("Render the result")).toBeInTheDocument();
   });
 
   it("opens an error-routed update as review-only, then re-probes after terminal exit", async () => {
@@ -348,7 +828,7 @@ describe("Runtime Settings command disclosure", () => {
       />,
     );
 
-    fireEvent.click(screen.getByText("Models and Runtimes").closest("button") as HTMLButtonElement);
+    fireEvent.click(screen.getByText("Runtimes and Models").closest("button") as HTMLButtonElement);
     expect(await screen.findByRole("button", { name: "Favorite runtime" })).toBeInTheDocument();
     const runtimeRow = (await screen.findByText("Codex")).closest(".settings-runtime-row");
     expect(runtimeRow).not.toBeNull();
@@ -452,7 +932,7 @@ describe("Runtime Settings command disclosure", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Models and Runtimes" }));
+    fireEvent.click(screen.getByRole("button", { name: "Runtimes and Models" }));
     expect(await screen.findByRole("button", { name: "Favorite runtime" })).toHaveTextContent(
       "Last used",
     );
@@ -503,7 +983,7 @@ describe("Runtime Settings command disclosure", () => {
       />,
     );
 
-    fireEvent.click(await screen.findByRole("button", { name: "Models and Runtimes" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Runtimes and Models" }));
     const favoriteRuntime = await screen.findByRole("button", { name: "Favorite runtime" });
     expect(favoriteRuntime).toHaveTextContent("Codex");
     fireEvent.click(favoriteRuntime);

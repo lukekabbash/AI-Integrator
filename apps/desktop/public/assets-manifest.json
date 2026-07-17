@@ -164,6 +164,36 @@
       "notes": "Declared by Firebase's official developer site."
     },
     {
+      "path": "brand/skills/google.png",
+      "kind": "skill-publisher-mark",
+      "purpose": "Google first-party skill catalog identity in Skills settings",
+      "source": "https://www.gstatic.com/images/branding/product/2x/googleg_48dp.png",
+      "sha256": "3730780F82ACD51907C761BF0DA9429D18266A9C6B33A03A515C4DD06819A0D9",
+      "dimensions": "96x96",
+      "approved": true,
+      "notes": "Google's official multicolor G mark, served from gstatic."
+    },
+    {
+      "path": "brand/skills/google-drive.png",
+      "kind": "skill-publisher-mark",
+      "purpose": "Google Workspace skill catalog identity in Skills settings",
+      "source": "https://www.gstatic.com/images/branding/product/2x/drive_2020q4_48dp.png",
+      "sha256": "72EA8D2DE5E0568158CF48029CB9121564AB20C275465A65453776BAF1160EBD",
+      "dimensions": "96x96",
+      "approved": true,
+      "notes": "Google's official Drive product mark, used for the broader Workspace pack."
+    },
+    {
+      "path": "brand/skills/nvidia.ico",
+      "kind": "skill-publisher-favicon",
+      "purpose": "NVIDIA first-party skill catalog identity in Skills settings",
+      "source": "https://www.nvidia.com/favicon.ico",
+      "sha256": "BEDCB14E0470FF8ABE26405A630E9604AC4FA581B385A7CFB00420C22F541B6E",
+      "dimensions": "48x48",
+      "approved": true,
+      "notes": "Declared by NVIDIA's official website."
+    },
+    {
       "path": "brand/skills/supabase.ico",
       "kind": "skill-publisher-favicon",
       "purpose": "Supabase first-party skill identity in Skills settings",
@@ -212,6 +242,51 @@
       "dimensions": "48x48",
       "approved": true,
       "notes": "Declared by Alpha Vantage's official site."
+    },
+    {
+      "path": "brand/skills/notion.ico",
+      "kind": "provider-favicon",
+      "purpose": "Notion identity for curated MCP servers in Settings",
+      "source": "https://www.notion.so/images/favicon.ico",
+      "sha256": "541FC85F92E348BCF46F70944B95FD558D16ADBC5A0698EAA1239DCCD8C9E455",
+      "approved": true,
+      "notes": "Downloaded from the publisher's official favicon endpoint."
+    },
+    {
+      "path": "brand/skills/linear.ico",
+      "kind": "provider-favicon",
+      "purpose": "Linear identity for curated MCP servers in Settings",
+      "source": "https://linear.app/favicon.ico",
+      "sha256": "0E05C8B9F5A4A1B7EF3083D57DF0184185E748978F93CA5BD94509280F0E918E",
+      "approved": true,
+      "notes": "Downloaded from the publisher's official favicon endpoint."
+    },
+    {
+      "path": "brand/skills/figma.ico",
+      "kind": "provider-favicon",
+      "purpose": "Figma identity for curated MCP servers in Settings",
+      "source": "https://static.figma.com/app/icon/1/favicon.ico",
+      "sha256": "08CA858F2BE360DA7C69E39475DFE336AA605034E36B0943A044F2FB2992CC15",
+      "approved": true,
+      "notes": "Downloaded from the publisher's official favicon endpoint."
+    },
+    {
+      "path": "brand/skills/sentry.ico",
+      "kind": "provider-favicon",
+      "purpose": "Sentry identity for curated MCP servers in Settings",
+      "source": "https://sentry.io/favicon.ico",
+      "sha256": "49A1D2DB07116397FEFF5454872ECEC134DF7CAD81AA366C0CED3A2940F13355",
+      "approved": true,
+      "notes": "Downloaded from the publisher's official favicon endpoint."
+    },
+    {
+      "path": "brand/skills/blender.ico",
+      "kind": "provider-favicon",
+      "purpose": "Blender identity for curated MCP servers in Settings",
+      "source": "https://www.blender.org/favicon.ico",
+      "sha256": "583B9269453A03DED8BA3FBD49FF8A979C9C6117BDE271E899C3FA20B3E7381C",
+      "approved": true,
+      "notes": "Downloaded from the publisher's official favicon endpoint."
     }
   ]
 }

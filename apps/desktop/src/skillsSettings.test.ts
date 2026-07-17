@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { IntegratorSkillInfo } from "./bridge";
 import {
+  CURATED_PLUGIN_INSTALLS,
   groupSkills,
   isSkillEnabled,
   readSkillEnablement,
@@ -15,6 +16,7 @@ const skill = (patch: Partial<IntegratorSkillInfo>): IntegratorSkillInfo => ({
   source: "integrator",
   enabled: true,
   defaultEnabled: true,
+  invocationCount: 0,
   ...patch,
 });
 
@@ -66,5 +68,21 @@ describe("groupSkills", () => {
     ]);
     expect(groups.map((group) => group.title)).toEqual(["My skills", "vercel", "gov-data"]);
     expect(groups[2].skills).toHaveLength(2);
+  });
+});
+
+describe("curated plugin installs", () => {
+  it("features the official Google, Supabase, and NVIDIA catalogs", () => {
+    const repositories = CURATED_PLUGIN_INSTALLS.map((entry) => entry.repository);
+    expect(repositories).toEqual(
+      expect.arrayContaining([
+        "firebase/agent-skills",
+        "google/skills",
+        "googleworkspace/cli",
+        "supabase/agent-skills",
+        "nvidia/skills",
+      ]),
+    );
+    expect(new Set(repositories).size).toBe(repositories.length);
   });
 });

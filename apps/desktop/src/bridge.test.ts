@@ -400,6 +400,12 @@ describe("native trusted-project bridge", () => {
 
   afterEach(() => {
     Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+    bridge.invalidateModelCatalog("codex");
+    bridge.invalidateModelCatalog("claude");
+    bridge.invalidateModelCatalog("antigravity");
+    bridge.invalidateModelCatalog("cursor");
+    bridge.invalidateModelCatalog("grok");
+    bridge.invalidateModelCatalog("custom");
   });
 
   it("treats a cancelled native directory dialog as a no-op", async () => {
@@ -407,6 +413,49 @@ describe("native trusted-project bridge", () => {
 
     await expect(bridge.openProject()).resolves.toBeNull();
     expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("uses cached runtime discovery by default and forces only explicit refreshes", async () => {
+    invokeMock.mockResolvedValue([]);
+
+    await bridge.probeRuntimes();
+    await bridge.probeRuntimes({ force: true });
+
+    expect(invokeMock.mock.calls).toEqual([
+      ["provider_discover", { force: false }],
+      ["provider_discover", { force: true }],
+    ]);
+  });
+
+  it("shares one in-flight model lookup and exposes the warmed catalog synchronously", async () => {
+    bridge.invalidateModelCatalog("codex");
+    let resolveModels: ((value: unknown) => void) | undefined;
+    const models = new Promise<unknown>((resolve) => {
+      resolveModels = resolve;
+    });
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "codex_connect") return undefined;
+      if (command === "codex_list_models") return models;
+      return undefined;
+    });
+
+    const first = bridge.listModelCatalog("codex");
+    const second = bridge.listModelCatalog("codex");
+    await vi.waitFor(() =>
+      expect(
+        invokeMock.mock.calls.filter(([command]) => command === "codex_list_models"),
+      ).toHaveLength(1),
+    );
+    resolveModels?.({
+      data: [{ id: "gpt-5.6-luna", displayName: "GPT-5.6 Luna" }],
+    });
+
+    await expect(first).resolves.toEqual([{ id: "gpt-5.6-luna", label: "GPT-5.6 Luna" }]);
+    await expect(second).resolves.toEqual([{ id: "gpt-5.6-luna", label: "GPT-5.6 Luna" }]);
+    expect(bridge.getCachedModelCatalog("codex")).toEqual([
+      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
+    ]);
+    bridge.invalidateModelCatalog("codex");
   });
 
   it("uses the bounded local message-search command", async () => {
@@ -426,6 +475,43 @@ describe("native trusted-project bridge", () => {
       query: "archived hit",
       limit: 20,
       includeArchived: true,
+    });
+  });
+
+  it("keeps MCP OAuth behind narrow native connect and disconnect commands", async () => {
+    const connected = {
+      mcpsRoot: "/Users/test/Documents/AI Integrator/MCPs",
+      servers: [
+        {
+          name: "figma",
+          source: "user",
+          origin: "MCPs folder",
+          enabled: false,
+          authorization: { state: "connected", available: true },
+          oauth: true,
+          transport: "remote",
+          url: "https://mcp.figma.com/mcp",
+        },
+      ],
+    };
+    invokeMock.mockResolvedValueOnce(connected).mockResolvedValueOnce({
+      ...connected,
+      servers: connected.servers.map((server) => ({
+        ...server,
+        authorization: { state: "notConnected", available: true },
+      })),
+    });
+
+    await expect(bridge.connectIntegratorMcp("figma")).resolves.toEqual(connected);
+    await expect(bridge.disconnectIntegratorMcp("figma")).resolves.toMatchObject({
+      servers: [{ authorization: { state: "notConnected" } }],
+    });
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "integrator_mcp_oauth_connect", {
+      server: "figma",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "integrator_mcp_oauth_disconnect", {
+      server: "figma",
     });
   });
 
@@ -883,6 +969,7 @@ describe("native trusted-project bridge", () => {
       knownResetSeq: undefined,
       beforeSeq: undefined,
       limit: undefined,
+      skipRuntimeCheck: undefined,
     });
     expect(invokeMock).toHaveBeenNthCalledWith(2, "codex_respond_approval", {
       taskId: "task-1",
@@ -1240,6 +1327,185 @@ describe("native trusted-project bridge", () => {
     ]);
   });
 
+  it("starts a fresh provider session after MCP enablement changes", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "app_bootstrap") return { value: {} };
+      if (command === "local_export") {
+        return {
+          projects: [
+            {
+              id: "project-mcp-refresh",
+              displayName: "integrator-3",
+              repositoryRoot: "H:\\Code\\integrator-3",
+              gitCommonDirectory: "H:\\Code\\integrator-3\\.git",
+              createdAt: "2026-07-13T00:00:00Z",
+              lastOpenedAt: "2026-07-13T00:00:00Z",
+            },
+          ],
+          tasks: [
+            {
+              id: "task-mcp-refresh",
+              title: "Refresh MCP session",
+              repositoryPath: "H:\\Code\\integrator-3",
+              state: "ready",
+              pinned: false,
+              archived: false,
+              runtime: "codex",
+              model: "Provider default",
+              createdAt: "2026-07-13T00:00:00Z",
+              updatedAt: "2026-07-13T00:00:00Z",
+            },
+          ],
+          settings: [],
+          providerSessions: [
+            {
+              taskId: "task-mcp-refresh",
+              provider: "codex",
+              providerThreadId: "thread-before-mcp",
+            },
+          ],
+          providerResumeStates: [
+            {
+              taskId: "task-mcp-refresh",
+              provider: "codex",
+              sessionRef: "thread-before-mcp",
+              repositoryRoot: "H:\\Code\\integrator-3",
+              permission: "project-write",
+              delegation: "off",
+              updatedAt: "2026-07-13T00:00:00Z",
+            },
+          ],
+          runtimeSessions: [],
+        };
+      }
+      if (command === "codex_start_thread") return { thread: { id: "thread-after-mcp" } };
+      if (command === "codex_start_turn") return { turn: { id: "turn-mcp-refresh" } };
+      if (command === "setting_set") {
+        return {
+          key: "settings.mcp.integrator.enabled",
+          value: { "cloudflare-docs": true },
+          updatedAt: "2026-07-13T00:01:00Z",
+        };
+      }
+      return undefined;
+    });
+
+    await bridge.loadWorkspace();
+    const input = {
+      taskId: "task-mcp-refresh",
+      prompt: "Use the enabled docs server",
+      runtime: "codex" as const,
+      model: "Provider default",
+      permission: "project-write" as const,
+      delegation: "off" as const,
+    };
+    await bridge.sendTurn(input);
+    const settingUpdate = bridge.setSetting("settings.mcp.integrator.enabled", {
+      "cloudflare-docs": true,
+    });
+    const nextTurn = bridge.sendTurn(input);
+    await Promise.all([settingUpdate, nextTurn]);
+
+    expect(invokeMock).toHaveBeenCalledWith("codex_resume_thread", {
+      taskId: "task-mcp-refresh",
+      threadId: "thread-before-mcp",
+    });
+    expect(invokeMock).toHaveBeenCalledWith(
+      "codex_start_thread",
+      expect.objectContaining({ taskId: "task-mcp-refresh" }),
+    );
+    expect(
+      invokeMock.mock.calls
+        .filter(([command]) => command === "codex_start_turn")
+        .map(([, args]) => args?.threadId),
+    ).toEqual(["thread-before-mcp", "thread-after-mcp"]);
+  });
+
+  it("does not revive a provider session older than the persisted MCP revision", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "app_bootstrap") return { value: {} };
+      if (command === "local_export") {
+        return {
+          projects: [
+            {
+              id: "project-mcp-restart",
+              displayName: "integrator-3",
+              repositoryRoot: "H:\\Code\\integrator-3",
+              gitCommonDirectory: "H:\\Code\\integrator-3\\.git",
+              createdAt: "2026-07-13T00:00:00Z",
+              lastOpenedAt: "2026-07-13T00:00:00Z",
+            },
+          ],
+          tasks: [
+            {
+              id: "task-mcp-restart",
+              title: "Restart after MCP change",
+              repositoryPath: "H:\\Code\\integrator-3",
+              state: "ready",
+              pinned: false,
+              archived: false,
+              runtime: "codex",
+              model: "Provider default",
+              createdAt: "2026-07-13T00:00:00Z",
+              updatedAt: "2026-07-13T00:00:00Z",
+            },
+          ],
+          settings: [
+            {
+              key: "settings.mcp.integrator.revision",
+              value: "revision-1",
+              updatedAt: "2026-07-13T00:01:00Z",
+            },
+          ],
+          providerSessions: [
+            {
+              taskId: "task-mcp-restart",
+              provider: "codex",
+              providerThreadId: "thread-stale-mcp",
+            },
+          ],
+          providerResumeStates: [
+            {
+              taskId: "task-mcp-restart",
+              provider: "codex",
+              sessionRef: "thread-stale-mcp",
+              repositoryRoot: "H:\\Code\\integrator-3",
+              permission: "read-only",
+              delegation: "manual",
+              updatedAt: "2026-07-13T00:00:00Z",
+            },
+          ],
+          runtimeSessions: [],
+        };
+      }
+      if (command === "codex_start_thread") return { thread: { id: "thread-current-mcp" } };
+      if (command === "codex_start_turn") return { turn: { id: "turn-current-mcp" } };
+      return undefined;
+    });
+
+    await bridge.loadWorkspace();
+    await bridge.sendTurn({
+      taskId: "task-mcp-restart",
+      prompt: "Use the current MCP configuration",
+      runtime: "codex",
+      model: "Provider default",
+      permission: "project-write",
+      delegation: "off",
+    });
+
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "codex_resume_thread"),
+    ).toHaveLength(0);
+    expect(invokeMock).toHaveBeenCalledWith(
+      "codex_start_thread",
+      expect.objectContaining({
+        taskId: "task-mcp-restart",
+        permission: "project-write",
+        delegation: "off",
+      }),
+    );
+  });
+
   it("recreates a Grok ACP session when its broker delegation mode changes", async () => {
     invokeMock.mockImplementation(async (command: string) => {
       if (command === "app_bootstrap") return { value: {} };
@@ -1339,6 +1605,17 @@ describe("native trusted-project bridge", () => {
               taskId: "task-codex-recovery",
               provider: "codex",
               providerThreadId: "thread-missing-rollout",
+            },
+          ],
+          providerResumeStates: [
+            {
+              taskId: "task-codex-recovery",
+              provider: "codex",
+              sessionRef: "thread-missing-rollout",
+              repositoryRoot: "H:\\Code\\integrator-3",
+              permission: "project-write",
+              delegation: "off",
+              updatedAt: "2026-07-13T00:00:00Z",
             },
           ],
           runtimeSessions: [],

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-repository-watch-stop"
+description = "Enables the repository_watch_stop command without any pre-configured scope."
+commands.allow = ["repository_watch_stop"]
+
+[[permission]]
+identifier = "deny-repository-watch-stop"
+description = "Denies the repository_watch_stop command without any pre-configured scope."
+commands.deny = ["repository_watch_stop"]

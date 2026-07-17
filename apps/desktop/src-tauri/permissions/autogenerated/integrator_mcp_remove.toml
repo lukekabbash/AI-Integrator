@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-integrator-mcp-remove"
+description = "Enables the integrator_mcp_remove command without any pre-configured scope."
+commands.allow = ["integrator_mcp_remove"]
+
+[[permission]]
+identifier = "deny-integrator-mcp-remove"
+description = "Denies the integrator_mcp_remove command without any pre-configured scope."
+commands.deny = ["integrator_mcp_remove"]

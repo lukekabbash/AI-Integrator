@@ -134,6 +134,11 @@ import {
   readRuntimeRouteDefault,
   RUNTIME_ROUTE_DEFAULTS_SETTING,
 } from "./routingDefaults";
+import {
+  clearOptimisticMessageForTask,
+  isComposerTurnBusy,
+  type OptimisticUserMessage,
+} from "./appTurnState";
 import "./styles.css";
 
 const RightRail = lazy(() =>
@@ -172,8 +177,6 @@ type ComposerTurnInput = {
   nativeAction?: NativeActionReference;
   draftRevision?: number;
 };
-
-
 
 function queuedMessagePrompt(message: QueuedMessage): string {
   const prompt = message.prompt.trim();
@@ -1107,6 +1110,7 @@ function ConnectionNotice({
   runtime,
   resuming = false,
   quietReconciling = false,
+  showDisconnected = false,
 }: {
   state: RuntimeProjectionState["connection"];
   runtime: string;
@@ -1114,12 +1118,15 @@ function ConnectionNotice({
   resuming?: boolean;
   /** A fresh task has no persisted provider state to explain. */
   quietReconciling?: boolean;
+  /** An idle per-turn runtime being stopped is normal, not an alert. */
+  showDisconnected?: boolean;
 }) {
   const displayState: RuntimeProjectionState["connection"] = resuming
     ? { state: "connecting" }
     : state;
   const active =
     displayState.state !== "connected" &&
+    (displayState.state !== "disconnected" || showDisconnected) &&
     !(quietReconciling && displayState.state === "reconciling");
   const [visible, setVisible] = useState(false);
 
@@ -1137,6 +1144,7 @@ function ConnectionNotice({
   if (!active || !visible) return null;
   const shown = displayState;
   const labels = {
+    connected: `${runtime} is connected`,
     connecting: resuming ? "Resuming…" : `Connecting to ${runtime}…`,
     disconnected: `${runtime} is disconnected`,
     reconciling: "Reconciling persisted task state…",
@@ -1385,10 +1393,12 @@ export default function App() {
   const [composerError, setComposerError] = useState<ComposerErrorState | null>(null);
   const [operationStatus, setOperationStatus] = useState("");
   const [runtimeState, setRuntimeState] = useState<RuntimeProjectionState | null>(null);
-  const [optimisticUserMessage, setOptimisticUserMessage] = useState<{
-    taskId: string;
-    event: TranscriptEvent;
-  } | null>(null);
+  const [optimisticUserMessage, setOptimisticUserMessage] = useState<OptimisticUserMessage | null>(
+    null,
+  );
+  const clearOptimisticUserMessageForTask = useCallback((taskId: string) => {
+    setOptimisticUserMessage((current) => clearOptimisticMessageForTask(current, taskId));
+  }, []);
   const [freshTaskIds, setFreshTaskIds] = useState<ReadonlySet<string>>(() => new Set());
   const [composerDraftStore] = useState(() => new ComposerDraftStore());
   const draftPersistenceFailureShown = useRef(false);
@@ -1518,6 +1528,7 @@ export default function App() {
   const navigationGeneration = useRef(0);
   const taskProjectionCache = useRef(new Map<string, RuntimeProjectionState>());
   const activeTaskIdRef = useRef<string | undefined>(snapshot.activeTaskId);
+  const activeProjectIdRef = useRef<string | undefined>(snapshot.activeProjectId);
   const taskRuntimeByIdRef = useRef(
     new Map(snapshot.tasks.map((task) => [task.id, task.runtime] as const)),
   );
@@ -1527,6 +1538,7 @@ export default function App() {
   const taskGitGeneration = useRef(new Map<string, number>());
   const taskGitAppliedGeneration = useRef(new Map<string, number>());
   const scheduledTaskGitRefresh = useRef(new Map<string, number>());
+  const scheduledProjectGitRefresh = useRef(new Map<string, number>());
   const taskGitInvalidatedPaths = useRef(new Map<string, Set<string> | null>());
   const delegationLineageTaskIdsRef = useRef(
     new Set(snapshot.activeTaskId ? [snapshot.activeTaskId] : []),
@@ -1629,13 +1641,6 @@ export default function App() {
     taskGitGeneration.current.set(taskId, (taskGitGeneration.current.get(taskId) ?? 0) + 1);
   }, []);
 
-  const markTaskGitDirty = useCallback((taskId: string) => {
-    if (!taskGitInvalidatedPaths.current.has(taskId)) {
-      taskGitInvalidatedPaths.current.set(taskId, null);
-    }
-    taskGitGeneration.current.set(taskId, (taskGitGeneration.current.get(taskId) ?? 0) + 1);
-  }, []);
-
   const refreshInvalidatedTaskGit = useCallback(
     async (taskId: string): Promise<GitSnapshot | undefined> => {
       const invalidated = taskGitInvalidatedPaths.current.get(taskId);
@@ -1671,6 +1676,25 @@ export default function App() {
     [invalidateTaskGit, refreshInvalidatedTaskGit],
   );
 
+  const scheduleProjectGitRefresh = useCallback((projectId: string) => {
+    const pending = scheduledProjectGitRefresh.current.get(projectId);
+    if (pending !== undefined) window.clearTimeout(pending);
+    const timer = window.setTimeout(() => {
+      scheduledProjectGitRefresh.current.delete(projectId);
+      void bridge
+        .loadProjectGit(projectId)
+        .then((git) =>
+          setSnapshot((current) =>
+            current.activeProjectId === projectId && !current.activeTaskId
+              ? { ...current, git }
+              : current,
+          ),
+        )
+        .catch(() => undefined);
+    }, 250);
+    scheduledProjectGitRefresh.current.set(projectId, timer);
+  }, []);
+
   useEffect(() => {
     const timeout = window.setTimeout(
       () => window.localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(sidebarWidth)),
@@ -1695,6 +1719,19 @@ export default function App() {
     return () => window.clearTimeout(timeout);
   }, [subagentPaneRatio]);
 
+  const loadPersistedTaskProjection = useCallback(async (taskId: string) => {
+    const loaded = await bridge.loadTaskProjection(taskId, { skipRuntimeCheck: true });
+    const hydrate = loaded.hydrate ?? {
+      items: [],
+      plan: [],
+      planTruncated: false,
+      approvals: [],
+      firstSeen: {},
+      hasMoreOlder: false,
+    };
+    return hydrateRuntimeProjectionState(taskId, hydrate, loaded.watermarkSeq, loaded.resetSeq);
+  }, []);
+
   const reconcileTaskProjection = useCallback(
     async (
       taskId: string,
@@ -1706,19 +1743,26 @@ export default function App() {
       projectionTaskId.current = taskId;
       setReadyProjectionTaskId("");
       if (!preserveBufferedEvents) projectionBuffer.current = [];
-      setRuntimeState(cachedState ?? createRuntimeProjectionState(taskId));
+      setRuntimeState(cachedState ?? null);
+      let displayState = cachedState;
       try {
+        if (!displayState) {
+          displayState = await loadPersistedTaskProjection(taskId);
+          if (generation !== projectionGeneration.current) return;
+          taskProjectionCache.current.set(taskId, displayState);
+          setRuntimeState(displayState);
+        }
         const loaded = await bridge.loadTaskProjection(taskId, {
-          knownWatermark: cachedState?.lastSeq,
-          knownResetSeq: cachedState?.resetSeq,
+          knownWatermark: displayState.lastSeq,
+          knownResetSeq: displayState.resetSeq,
         });
         let next: RuntimeProjectionState;
-        if (loaded.cacheMatched && cachedState) {
+        if (loaded.cacheMatched) {
           // Watermark + reset epoch match: keep cached display state. Still
           // merge buffered live events and apply runtimeLive settlement below.
           next = {
-            ...cachedState,
-            lastSeq: Math.max(cachedState.lastSeq, loaded.watermarkSeq),
+            ...displayState,
+            lastSeq: Math.max(displayState.lastSeq, loaded.watermarkSeq),
             resetSeq: loaded.resetSeq,
           };
         } else {
@@ -1798,20 +1842,22 @@ export default function App() {
         setRuntimeState(next);
       } catch (error) {
         if (generation !== projectionGeneration.current) return;
-        projectionReady.current = true;
-        setReadyProjectionTaskId(taskId);
+        projectionReady.current = false;
+        setReadyProjectionTaskId("");
+        const reason = error instanceof Error ? error.message : "Could not restore task events";
         const failed = {
-          ...createRuntimeProjectionState(taskId),
+          ...(displayState ?? createRuntimeProjectionState(taskId)),
           connection: {
             state: "disconnected",
-            reason: error instanceof Error ? error.message : "Could not restore task events",
+            reason,
           },
         } satisfies RuntimeProjectionState;
         taskProjectionCache.current.set(taskId, failed);
         setRuntimeState(failed);
+        setOperationError(reason);
       }
     },
-    [],
+    [loadPersistedTaskProjection],
   );
 
   const loadOlderInFlightRef = useRef<string | null>(null);
@@ -1848,6 +1894,7 @@ export default function App() {
     let unlisten: (() => void) | undefined;
     let projectionFrame: number | undefined;
     const scheduledGitRefreshes = scheduledTaskGitRefresh.current;
+    const scheduledProjectRefreshes = scheduledProjectGitRefresh.current;
     const invalidatedGitPaths = taskGitInvalidatedPaths.current;
     const frameEvents: RuntimeProjectionEvent[] = [];
     const applyLiveProjectionBatch = (events: RuntimeProjectionEvent[]) => {
@@ -1950,16 +1997,10 @@ export default function App() {
                 persistedActivity.status === "failed" ||
                 persistedActivity.status === "stopped"
               ) {
-                markTaskGitDirty(event.taskId);
-                const pendingRefresh = scheduledTaskGitRefresh.current.get(event.taskId);
-                if (pendingRefresh !== undefined) window.clearTimeout(pendingRefresh);
-                scheduledTaskGitRefresh.current.delete(event.taskId);
                 void bridge
                   .setTaskStatus?.(event.taskId, persistedActivity.status)
                   .catch(() => undefined);
-                if (event.taskId === activeTaskIdRef.current) {
-                  void refreshInvalidatedTaskGit(event.taskId).catch(() => undefined);
-                }
+                scheduleTaskGitRefresh(event.taskId, []);
               }
             }
             if (event.taskId !== projectionTaskId.current) {
@@ -2047,9 +2088,25 @@ export default function App() {
         setActiveFileKey(
           (key) => key || (loaded.git.files[0] ? diffFileKey(loaded.git.files[0]) : ""),
         );
-        // The shell is useful as soon as local projects/tasks/settings exist.
-        // Provider discovery and transcript reconciliation are independent,
-        // read-only refreshes and must not gate that first paint.
+        let bootstrapRuntime: RuntimeProjectionState | undefined;
+        if (nativeHost && loaded.activeTaskId) {
+          const taskId = loaded.activeTaskId;
+          activeTaskIdRef.current = taskId;
+          projectionTaskId.current = taskId;
+          projectionReady.current = false;
+          setReadyProjectionTaskId("");
+          try {
+            bootstrapRuntime = await loadPersistedTaskProjection(taskId);
+            if (!active) return;
+            taskProjectionCache.current.set(taskId, bootstrapRuntime);
+            setRuntimeState(bootstrapRuntime);
+          } catch {
+            // The authoritative reconciliation below retries and surfaces a
+            // durable error without replacing any transcript we already have.
+          }
+        }
+        // First useful paint includes the durable active transcript. Provider
+        // discovery and runtime ownership checks continue independently.
         setWorkspaceLoading(false);
         // Badge count only — do not hydrate archived chat rows into the hot set.
         void bridge
@@ -2068,7 +2125,7 @@ export default function App() {
             .catch(() => undefined);
         }
         if (nativeHost && loaded.activeTaskId) {
-          void reconcileTaskProjection(loaded.activeTaskId, true);
+          void reconcileTaskProjection(loaded.activeTaskId, true, bootstrapRuntime);
           const taskId = loaded.activeTaskId;
           activeTaskIdRef.current = taskId;
           void refreshInvalidatedTaskGit(taskId)
@@ -2096,6 +2153,10 @@ export default function App() {
         window.clearTimeout(timer);
       }
       scheduledGitRefreshes.clear();
+      for (const timer of scheduledProjectRefreshes.values()) {
+        window.clearTimeout(timer);
+      }
+      scheduledProjectRefreshes.clear();
       invalidatedGitPaths.clear();
       if (projectionFrame !== undefined) window.cancelAnimationFrame(projectionFrame);
       unlisten?.();
@@ -2104,9 +2165,9 @@ export default function App() {
     applyVerifiedRuntimeHealth,
     composerDraftStore,
     nativeHost,
+    loadPersistedTaskProjection,
     reconcileTaskProjection,
     invalidateTaskGit,
-    markTaskGitDirty,
     refreshInvalidatedTaskGit,
     scheduleTaskGitRefresh,
   ]);
@@ -2121,10 +2182,11 @@ export default function App() {
   // are cheap notifications, so a full re-list keeps the panel authoritative.
   useEffect(() => {
     activeTaskIdRef.current = snapshot.activeTaskId;
+    activeProjectIdRef.current = snapshot.activeProjectId;
     delegationLineageTaskIdsRef.current = new Set(
       snapshot.activeTaskId ? [snapshot.activeTaskId] : [],
     );
-  }, [snapshot.activeTaskId]);
+  }, [snapshot.activeProjectId, snapshot.activeTaskId]);
   const refreshDelegations = useCallback(
     async (taskId: string | undefined) => {
       if (!nativeHost || !taskId) {
@@ -2212,6 +2274,8 @@ export default function App() {
   const activeTask =
     snapshot.tasks.find((task) => task.id === snapshot.activeTaskId) ??
     archivedTasks.find((task) => task.id === snapshot.activeTaskId);
+  const activeProjectionUnavailable =
+    nativeHost && Boolean(activeTask) && readyProjectionTaskId !== activeTask?.id;
   const rootTasks = useMemo(
     () => snapshot.tasks.filter((task) => !task.parentId && !task.archived),
     [snapshot.tasks],
@@ -2224,14 +2288,36 @@ export default function App() {
     snapshot.projects.find((project) => project.id === snapshot.activeProjectId) ??
     snapshot.projects.find((project) => project.id === activeTask?.projectId) ??
     snapshot.projects[0];
+  const activeCheckoutPath = activeTask?.worktree ?? activeProject?.path;
+  useEffect(() => {
+    if (!nativeHost || !activeCheckoutPath) return;
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    void bridge
+      .subscribeWorkingTreeChanges(activeCheckoutPath, () => {
+        if (!active) return;
+        const taskId = activeTaskIdRef.current;
+        if (taskId) return scheduleTaskGitRefresh(taskId, []);
+        const projectId = activeProjectIdRef.current;
+        if (projectId) scheduleProjectGitRefresh(projectId);
+      })
+      .then((stop) => {
+        if (active) unlisten = stop;
+        else stop();
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [activeCheckoutPath, nativeHost, scheduleProjectGitRefresh, scheduleTaskGitRefresh]);
   const deleteProjectTarget = deleteProjectId
     ? snapshot.projects.find((project) => project.id === deleteProjectId)
     : undefined;
-  const deleteTaskTarget =
-    deleteTaskId
-      ? (snapshot.tasks.find((task) => task.id === deleteTaskId) ??
-        archivedTasks.find((task) => task.id === deleteTaskId))
-      : undefined;
+  const deleteTaskTarget = deleteTaskId
+    ? (snapshot.tasks.find((task) => task.id === deleteTaskId) ??
+      archivedTasks.find((task) => task.id === deleteTaskId))
+    : undefined;
   const deleteArchivedChatsTarget = deleteArchivedChatsProjectId
     ? snapshot.projects.find((project) => project.id === deleteArchivedChatsProjectId)
     : undefined;
@@ -2481,7 +2567,7 @@ export default function App() {
   };
 
   const refreshRuntimes = useCallback(async () => {
-    const runtimes = await bridge.probeRuntimes();
+    const runtimes = await bridge.probeRuntimes({ force: true });
     setSnapshot((current) => ({ ...current, runtimes }));
     applyVerifiedRuntimeHealth(runtimes, snapshot.tasks);
     return runtimes;
@@ -2925,6 +3011,7 @@ export default function App() {
       setOperationError("Open a project before starting a task.");
       return false;
     }
+    const submittedAt = new Date().toISOString();
     setOperationError("");
     setComposerError(null);
     const isNewTask = !activeTask;
@@ -2943,38 +3030,10 @@ export default function App() {
         draft: submittedDraft?.revision === input.draftRevision ? submittedDraft : undefined,
       }));
     if (!targetTask) return false;
-    if (isNewTask) {
-      const commitMessageRoute = resolveCommitMessageRoute(
-        localSettings,
-        snapshot.runtimes
-          .filter((runtime) => runtime.status !== "not_installed")
-          .map((runtime) => runtime.id),
-      );
-      void bridge
-        .generateTaskTitle({
-          taskId: targetTask.id,
-          prompt: input.prompt,
-          runtime: input.runtime,
-          route: commitMessageRoute ?? { runtime: input.runtime, fallbacks: [] },
-        })
-        .then((metadata) => {
-          if (!metadata) return;
-          setSnapshot((current) => ({
-            ...current,
-            tasks: current.tasks.map((task) =>
-              task.id === targetTask.id && task.title === CHAT_TITLE_PLACEHOLDER
-                ? { ...task, title: metadata.title, updatedAt: metadata.updatedAt }
-                : task,
-            ),
-          }));
-        })
-        .catch(() => undefined);
-    }
     setTaskPermissions((current) => ({
       ...current,
       [targetTask.id]: input.permission,
     }));
-    const submittedAt = new Date().toISOString();
     setSnapshot((current) => ({
       ...current,
       tasks: current.tasks.map((task) =>
@@ -3012,7 +3071,7 @@ export default function App() {
             fromEventId: pendingEdit.eventId,
             saveContext: localSettings["general.saveContextOnEdit"] === true,
           });
-          setOptimisticUserMessage(null);
+          clearOptimisticUserMessageForTask(targetTask.id);
           if (nativeHost) {
             taskProjectionCache.current.delete(targetTask.id);
             await reconcileTaskProjection(targetTask.id);
@@ -3066,6 +3125,27 @@ export default function App() {
       if (!nativeHost && nativeAction?.kind === "skill") {
         event = { ...event, nativeSkill: nativeAction.name };
       }
+      if (isNewTask) {
+        void bridge
+          .generateTaskTitle({
+            taskId: targetTask.id,
+            prompt: input.prompt,
+            runtime: input.runtime,
+            route: { runtime: input.runtime, fallbacks: [] },
+          })
+          .then((metadata) => {
+            if (!metadata) return;
+            setSnapshot((current) => ({
+              ...current,
+              tasks: current.tasks.map((task) =>
+                task.id === targetTask.id && task.title === CHAT_TITLE_PLACEHOLDER
+                  ? { ...task, title: metadata.title, updatedAt: metadata.updatedAt }
+                  : task,
+              ),
+            }));
+          })
+          .catch(() => undefined);
+      }
     } catch (error) {
       composerNoticeSequence.current += 1;
       setComposerError({
@@ -3073,7 +3153,7 @@ export default function App() {
         taskId: targetTask.id,
         message: formatBridgeError(error, "The turn could not be started"),
       });
-      setOptimisticUserMessage(null);
+      clearOptimisticUserMessageForTask(targetTask.id);
       const failedAt = new Date().toISOString();
       setSnapshot((current) => ({
         ...current,
@@ -3177,7 +3257,7 @@ export default function App() {
   };
 
   const resumeInterruptedTurn = async (): Promise<boolean> => {
-    if (!activeTask || resumingTaskId) return false;
+    if (!activeTask || resumingTaskId || activeProjectionUnavailable) return false;
     // Stop is an intentional cancel; never resume (auto or manual) from it.
     const stoppedKey =
       runtimeState?.taskId === activeTask.id && runtimeState.turn
@@ -3210,9 +3290,7 @@ export default function App() {
     setResumingTaskId(activeTask.id);
     setRecoveryFailure(null);
     resumeWorkedForBaselineRef.current = new Set(
-      projectedTranscript
-        .filter((event) => event.title === "Worked for")
-        .map((event) => event.id),
+      projectedTranscript.filter((event) => event.title === "Worked for").map((event) => event.id),
     );
     const accepted = await sendTurn(
       {
@@ -3256,14 +3334,23 @@ export default function App() {
 
   const submitComposerTurn = async (input: ComposerTurnInput): Promise<boolean> => {
     const task = activeTask;
+    if (task && activeProjectionUnavailable) return false;
+    const projectedTurnActive =
+      runtimeState?.taskId === task?.id &&
+      (runtimeState?.turn?.status === "pending" || runtimeState?.turn?.status === "inProgress");
+    const queueBusyForTask = snapshot.queuedMessages.some(
+      (message) => message.taskId === task?.id && message.id === queueBusyIdRef.current,
+    );
     const turnBusy = Boolean(
       task &&
-      ((nativeHost &&
-        (!projectionReady.current ||
-          projectionTaskId.current !== task.id ||
-          readyProjectionTaskId !== task.id)) ||
-        (runtimeState?.taskId === task.id && runtimeState.turn?.status === "inProgress") ||
-        optimisticUserMessage?.taskId === task.id),
+      isComposerTurnBusy({
+        projectedTurnActive,
+        optimisticTurnStarting,
+        resuming: resumingTaskId === task.id,
+        queueBusy: queueBusyForTask,
+        queueAwaiting: queueAwaitingTurnRef.current?.taskId === task.id,
+        optimisticMessage: optimisticUserMessage?.taskId === task.id,
+      }),
     );
     if (!task || (!turnBusy && !queuePausedTaskIdsRef.current.has(task.id))) {
       return sendTurn(input);
@@ -3426,10 +3513,7 @@ export default function App() {
       if (projectId && lastTaskByProject[projectId] === taskId) {
         const replacement = current.tasks.find(
           (task) =>
-            task.id !== taskId &&
-            task.projectId === projectId &&
-            !task.archived &&
-            !task.parentId,
+            task.id !== taskId && task.projectId === projectId && !task.archived && !task.parentId,
         );
         if (replacement) lastTaskByProject[projectId] = replacement.id;
         else delete lastTaskByProject[projectId];
@@ -3642,9 +3726,7 @@ export default function App() {
     try {
       await bridge.setSetting(PROJECT_SIDEBAR_META_KEY, meta);
     } catch (error) {
-      setOperationError(
-        error instanceof Error ? error.message : "Could not update that project",
-      );
+      setOperationError(error instanceof Error ? error.message : "Could not update that project");
     }
     if (patch.archived && snapshot.activeProjectId === projectId) {
       const replacement = nextProjects.find((project) => !project.archived);
@@ -3715,9 +3797,9 @@ export default function App() {
   }, []);
   const handleSidebarDeleteArchivedChats = useCallback((projectId: string) => {
     setDeleteArchivedChatsError("");
-    void sidebarHandlersRef.current.ensureArchivedCatalog().then(() =>
-      setDeleteArchivedChatsProjectId(projectId),
-    );
+    void sidebarHandlersRef.current
+      .ensureArchivedCatalog()
+      .then(() => setDeleteArchivedChatsProjectId(projectId));
   }, []);
   const handleSidebarOpenProject = useCallback(() => setAddProjectOpen(true), []);
   const handleSidebarOpenSettings = useCallback(() => setScreen("settings"), []);
@@ -3754,9 +3836,8 @@ export default function App() {
           : snapshot.activeProjectId;
       const nextActiveTaskId = remainingTasks.some((task) => task.id === snapshot.activeTaskId)
         ? snapshot.activeTaskId
-        : (remainingTasks.find(
-            (task) => task.projectId === nextActiveProjectId && !task.archived,
-          )?.id ?? "");
+        : (remainingTasks.find((task) => task.projectId === nextActiveProjectId && !task.archived)
+            ?.id ?? "");
       const meta = projectSidebarMetaFromProjects(remainingProjects);
       setLocalSettings((settings) => ({ ...settings, [PROJECT_SIDEBAR_META_KEY]: meta }));
       void bridge.setSetting(PROJECT_SIDEBAR_META_KEY, meta).catch(() => undefined);
@@ -3874,9 +3955,7 @@ export default function App() {
         composerDrafts: current.composerDrafts.filter(
           (draft) => draft.owner.kind !== "task" || !removedIds.has(draft.owner.taskId),
         ),
-        queuedMessages: current.queuedMessages.filter(
-          (message) => !removedIds.has(message.taskId),
-        ),
+        queuedMessages: current.queuedMessages.filter((message) => !removedIds.has(message.taskId)),
       }));
       setArchivedTasks((current) => current.filter((task) => !removedIds.has(task.id)));
       setArchivedTotal((total) => Math.max(0, total - removedIds.size));
@@ -3916,7 +3995,11 @@ export default function App() {
     };
     const archiveMs = ARCHIVE_RETENTION_MS[readChoice("archive.autoArchiveAfter")];
     const deleteMs = ARCHIVE_RETENTION_MS[readChoice("archive.autoDeleteAfter")];
-    if (!archiveMs && !deleteMs && !Object.keys(readArchivedAtMap(localSettings[ARCHIVED_AT_SETTING_KEY])).length) {
+    if (
+      !archiveMs &&
+      !deleteMs &&
+      !Object.keys(readArchivedAtMap(localSettings[ARCHIVED_AT_SETTING_KEY])).length
+    ) {
       return;
     }
     retentionSweepBusy.current = true;
@@ -4012,9 +4095,7 @@ export default function App() {
               .map((task) => ({ ...task, archived: true as const })),
             ...current.filter((task) => !removedIds.has(task.id) && !archivedIds.has(task.id)),
           ]);
-          setArchivedTotal((total) =>
-            Math.max(0, total + archivedIds.size - removedIds.size),
-          );
+          setArchivedTotal((total) => Math.max(0, total + archivedIds.size - removedIds.size));
         }
         if (removedIds.size) {
           const prunedStamps = Object.fromEntries(
@@ -4190,17 +4271,7 @@ export default function App() {
     if (activeTask) {
       scheduleTaskGitRefresh(activeTask.id, [saved.path]);
     } else {
-      const projectId = activeProject.id;
-      void bridge
-        .loadProjectGit(projectId)
-        .then((git) =>
-          setSnapshot((current) =>
-            current.activeProjectId === projectId && !current.activeTaskId
-              ? { ...current, git }
-              : current,
-          ),
-        )
-        .catch(() => undefined);
+      scheduleProjectGitRefresh(activeProject.id);
     }
   };
 
@@ -4288,6 +4359,11 @@ export default function App() {
       setProjectFiles(files);
     } catch {
       // The rename succeeded; the stale list refreshes on the next project load.
+    }
+    if (activeTask) {
+      scheduleTaskGitRefresh(activeTask.id, [file.path, nextPath]);
+    } else {
+      scheduleProjectGitRefresh(activeProject.id);
     }
   };
 
@@ -4631,11 +4707,13 @@ export default function App() {
     reviewRetryVersion,
   ]);
 
-  const pendingApproval = runtimeState?.approvals.find(
-    (approval) =>
-      (approval.state === "pending" || approval.state === "responseFailed") &&
-      !isStaleApproval(approval),
-  );
+  const pendingApproval = activeProjectionUnavailable
+    ? undefined
+    : runtimeState?.approvals.find(
+        (approval) =>
+          (approval.state === "pending" || approval.state === "responseFailed") &&
+          !isStaleApproval(approval),
+      );
   const transcriptDensity: TranscriptDensity =
     localSettings["transcript.activityDensity"] === "summary" ||
     localSettings["transcript.activityDensity"] === "verbose"
@@ -4663,17 +4741,27 @@ export default function App() {
             Date.parse(optimisticForActiveTask.event.timestamp) - 1_000,
       )
     : false;
-  const nativeTurnRunning =
-    runtimeState?.taskId === activeTask?.id && runtimeState?.turn?.status === "inProgress";
+  const nativeTurnActive =
+    !activeProjectionUnavailable &&
+    runtimeState?.taskId === activeTask?.id &&
+    (runtimeState?.turn?.status === "pending" || runtimeState?.turn?.status === "inProgress");
+  const authoritativeTurnStartedAt =
+    runtimeState && runtimeState.taskId === activeTask?.id
+      ? runtimeState.turn?.startedAt
+      : undefined;
+  const optimisticTurnAccepted = Boolean(
+    optimisticForActiveTask &&
+    authoritativeTurnStartedAt &&
+    Date.parse(authoritativeTurnStartedAt) >= Date.parse(optimisticForActiveTask.event.timestamp),
+  );
   const projectedTranscript = useMemo(() => {
-    const events =
-      nativeHost
-        ? providerHasOptimisticMessage || !optimisticForActiveTask
-          ? nativeRuntimeEvents
-          : [...nativeRuntimeEvents, optimisticForActiveTask.event].sort(
-              (a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp),
-            )
-        : snapshot.transcript;
+    const events = nativeHost
+      ? providerHasOptimisticMessage || !optimisticForActiveTask
+        ? nativeRuntimeEvents
+        : [...nativeRuntimeEvents, optimisticForActiveTask.event].sort(
+            (a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp),
+          )
+      : snapshot.transcript;
     if (resumedWorkedForIdsRef.current.size === 0) return events;
     return events.map((event) =>
       event.title === "Worked for" && resumedWorkedForIdsRef.current.has(event.id)
@@ -4744,9 +4832,14 @@ export default function App() {
   // restores the draft instead. Resume has no user bubble — treat resuming
   // as the quiet “still starting” signal until the provider turn is live.
   const optimisticTurnStarting = Boolean(
-    (optimisticForActiveTask && !providerHasOptimisticMessage) ||
-      (activeTask && resumingTaskId === activeTask.id && !nativeTurnRunning),
+    (optimisticForActiveTask && !providerHasOptimisticMessage && !optimisticTurnAccepted) ||
+    (activeTask && resumingTaskId === activeTask.id && !nativeTurnActive),
   );
+  const taskStatusRunningSince = optimisticTurnStarting
+    ? optimisticForActiveTask?.event.timestamp
+    : nativeTurnActive
+      ? (authoritativeTurnStartedAt ?? optimisticForActiveTask?.event.timestamp)
+      : undefined;
   const activeQueuedMessages = useMemo(
     () =>
       activeTask
@@ -4840,16 +4933,15 @@ export default function App() {
       : `Plan usage not exposed to AI Integrator · ${usagePillTokens}`;
   const activeRuntimeState = runtimeState?.taskId === activeTask?.id ? runtimeState : undefined;
   const activeTurnStopKey =
-    activeTask && activeRuntimeState?.turn
-      ? `${activeTask.id}:${activeRuntimeState.turn.id}`
-      : "";
+    activeTask && activeRuntimeState?.turn ? `${activeTask.id}:${activeRuntimeState.turn.id}` : "";
   const recoverableTurn =
+    !activeProjectionUnavailable &&
     activeRuntimeState?.turn?.status === "interrupted" &&
     !activeRuntimeState.turn.stopRequested &&
     !(activeTurnStopKey && userStoppedTurnsRef.current.has(activeTurnStopKey))
       ? activeRuntimeState.turn
       : undefined;
-  const activeAgentCount = nativeTurnRunning
+  const activeAgentCount = nativeTurnActive
     ? 1 +
       (nativeHost
         ? delegations.filter((delegation) =>
@@ -4894,7 +4986,7 @@ export default function App() {
       : []),
   ];
   const respondToApproval = async (approval: ApprovalProjection, decision: ApprovalDecision) => {
-    if (!activeTask || respondingApprovalId) return;
+    if (!activeTask || respondingApprovalId || activeProjectionUnavailable) return;
     setRespondingApprovalId(approval.id);
     setOperationError("");
     try {
@@ -4982,7 +5074,7 @@ export default function App() {
   // Surface the control again if auto/manual resume failed.
   const showRecoveryControl = Boolean(
     recoverableTurn &&
-      ((!autoResumeEnabled && resumingTaskId !== activeTask?.id) || Boolean(recoveryError)),
+    ((!autoResumeEnabled && resumingTaskId !== activeTask?.id) || Boolean(recoveryError)),
   );
 
   useEffect(() => {
@@ -5124,10 +5216,9 @@ export default function App() {
   };
 
   const stopTurn = async (continueQueue = false) => {
-    if (!activeTask || stoppingTurn) return false;
+    if (!activeTask || stoppingTurn || activeProjectionUnavailable) return false;
     const taskId = activeTask.id;
-    const turnId =
-      runtimeState?.taskId === taskId && runtimeState.turn ? runtimeState.turn.id : "";
+    const turnId = runtimeState?.taskId === taskId && runtimeState.turn ? runtimeState.turn.id : "";
     if (turnId) userStoppedTurnsRef.current.add(`${taskId}:${turnId}`);
     // Mark Stop locally before the provider settles so auto-resume cannot treat
     // the coming interrupted status as a crash recovery.
@@ -5175,7 +5266,7 @@ export default function App() {
   const editUserMessage = async (eventId: string, body: string) => {
     if (!activeTask || !activeDraftOwner) return;
     const taskId = activeTask.id;
-    if (nativeTurnRunning || optimisticTurnStarting || stoppingTurn) {
+    if (nativeTurnActive || optimisticTurnStarting || stoppingTurn) {
       const stopped = await stopTurn();
       if (!stopped) return;
     }
@@ -5211,7 +5302,7 @@ export default function App() {
   };
 
   const dispatchQueuedMessage = async (message: QueuedMessage, sendNow = false) => {
-    if (!activeTask || message.taskId !== activeTask.id) return;
+    if (!activeTask || message.taskId !== activeTask.id || activeProjectionUnavailable) return;
     if (sendNow) queuePausedTaskIdsRef.current.delete(message.taskId);
     const continuingPriority =
       priorityQueueIdRef.current === message.id && queueBusyIdRef.current === message.id;
@@ -5311,13 +5402,16 @@ export default function App() {
     const awaitingTurn = queueAwaitingTurnRef.current;
     if (awaitingTurn?.taskId === activeTask.id) {
       const turn = runtimeState?.turn;
-      if (turn?.status === "inProgress" && turn.id !== awaitingTurn.previousTurnId) {
+      if (
+        (turn?.status === "pending" || turn?.status === "inProgress") &&
+        turn.id !== awaitingTurn.previousTurnId
+      ) {
         queueAwaitingTurnRef.current = undefined;
       } else {
         return;
       }
     }
-    if (nativeTurnRunning || optimisticTurnStarting) return;
+    if (nativeTurnActive || optimisticTurnStarting) return;
     const priorityId = priorityQueueIdRef.current;
     if (!priorityId && queuePausedTaskIdsRef.current.has(activeTask.id)) return;
     if (queueBusyIdRef.current && queueBusyIdRef.current !== priorityId) return;
@@ -5341,7 +5435,7 @@ export default function App() {
     activeQueuedMessages,
     activeTask?.id,
     nativeHost,
-    nativeTurnRunning,
+    nativeTurnActive,
     optimisticTurnStarting,
     readyProjectionTaskId,
     runtimeState?.taskId,
@@ -5561,733 +5655,764 @@ export default function App() {
           style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}
         >
           <AnimatePresence initial={false}>
-          {screen === "settings" ? (
-            <motion.div key="screen-settings" className="app-screen" {...screenFade}>
-            <Suspense
-              fallback={
-                <div className="route-loading" role="status" aria-live="polite">
-                  Loading Settings…
-                </div>
-              }
-            >
-              <SettingsView
-                preferences={preferences}
-                runtimes={snapshot.runtimes}
-                usage={displayedUsage}
-                projects={snapshot.projects}
-                tasks={sidebarTasks}
-                taskActionBusyId={taskActionBusyId}
-                onOpenTask={(taskId) => {
-                  setScreen("workspace");
-                  void selectTask(taskId);
-                }}
-                onUpdateTask={(taskId, patch) => void updateTaskMetadata(taskId, patch)}
-                onUpdateProject={(projectId, patch) =>
-                  void updateProjectMetadata(projectId, patch)
-                }
-                onDeleteTask={(taskId) => {
-                  setDeleteTaskError("");
-                  setDeleteTaskId(taskId);
-                }}
-                onDeleteProject={(projectId) => {
-                  setDeleteProjectError("");
-                  setDeleteProjectId(projectId);
-                }}
-                onDeleteArchivedChats={(projectId) => {
-                  setDeleteArchivedChatsError("");
-                  void ensureArchivedCatalog().then(() =>
-                    setDeleteArchivedChatsProjectId(projectId),
-                  );
-                }}
-                onEnsureArchived={() => void ensureArchivedCatalog()}
-                onLoadMoreArchived={() => void ensureArchivedCatalog({ more: true })}
-                archivedHasMore={Boolean(archivedNextCursor)}
-                archivedLoading={archivedLoading}
-                onChangePreferences={setTheme}
-                onResetPreferences={resetTheme}
-                runtimeActionRequest={runtimeActionRequest}
-                onRefreshRuntimes={refreshRuntimes}
-                onSettingChanged={(key, value) =>
-                  setLocalSettings((current) => ({ ...current, [key]: value }))
-                }
-                onBack={() => setScreen("workspace")}
-              />
-            </Suspense>
-            </motion.div>
-          ) : null}
-          {screen === "setup" ? (
-            <motion.div key="screen-setup" className="app-screen" {...screenFade}>
-            <Suspense
-              fallback={
-                <div className="route-loading" role="status" aria-live="polite">
-                  Loading Setup…
-                </div>
-              }
-            >
-              <SetupView
-                runtimes={snapshot.runtimes}
-                onBack={() => setScreen("workspace")}
-                onRuntimeAction={openRuntimeAction}
-                onCreateProject={() => {
-                  setScreen("workspace");
-                  setAddProjectOpen(true);
-                }}
-                onFinish={() => setScreen("workspace")}
-              />
-            </Suspense>
-            </motion.div>
-          ) : null}
-          {screen === "workspace" ? (
-            <motion.div key="screen-workspace" className="app-screen" {...screenFade}>
-            <main
-              className="app-shell"
-              id="main-content"
-              data-sidebar-collapsed={sidebarCollapsed}
-              data-rail-open={showRightRail}
-              style={
-                {
-                  "--right-rail-width": `${rightRailWidth}px`,
-                } as CSSProperties
-              }
-            >
-              {/* Collapsed means fully hidden; the header's corner button is the
+            {screen === "settings" ? (
+              <motion.div key="screen-settings" className="app-screen" {...screenFade}>
+                <Suspense
+                  fallback={
+                    <div className="route-loading" role="status" aria-live="polite">
+                      Loading Settings…
+                    </div>
+                  }
+                >
+                  <SettingsView
+                    preferences={preferences}
+                    runtimes={snapshot.runtimes}
+                    usage={displayedUsage}
+                    projects={snapshot.projects}
+                    tasks={sidebarTasks}
+                    taskActionBusyId={taskActionBusyId}
+                    onOpenTask={(taskId) => {
+                      setScreen("workspace");
+                      void selectTask(taskId);
+                    }}
+                    onUpdateTask={(taskId, patch) => void updateTaskMetadata(taskId, patch)}
+                    onUpdateProject={(projectId, patch) =>
+                      void updateProjectMetadata(projectId, patch)
+                    }
+                    onDeleteTask={(taskId) => {
+                      setDeleteTaskError("");
+                      setDeleteTaskId(taskId);
+                    }}
+                    onDeleteProject={(projectId) => {
+                      setDeleteProjectError("");
+                      setDeleteProjectId(projectId);
+                    }}
+                    onDeleteArchivedChats={(projectId) => {
+                      setDeleteArchivedChatsError("");
+                      void ensureArchivedCatalog().then(() =>
+                        setDeleteArchivedChatsProjectId(projectId),
+                      );
+                    }}
+                    onEnsureArchived={() => void ensureArchivedCatalog()}
+                    onLoadMoreArchived={() => void ensureArchivedCatalog({ more: true })}
+                    archivedHasMore={Boolean(archivedNextCursor)}
+                    archivedLoading={archivedLoading}
+                    onChangePreferences={setTheme}
+                    onResetPreferences={resetTheme}
+                    runtimeActionRequest={runtimeActionRequest}
+                    onRefreshRuntimes={refreshRuntimes}
+                    onSettingChanged={(key, value) =>
+                      setLocalSettings((current) => ({ ...current, [key]: value }))
+                    }
+                    onBack={() => setScreen("workspace")}
+                  />
+                </Suspense>
+              </motion.div>
+            ) : null}
+            {screen === "setup" ? (
+              <motion.div key="screen-setup" className="app-screen" {...screenFade}>
+                <Suspense
+                  fallback={
+                    <div className="route-loading" role="status" aria-live="polite">
+                      Loading Setup…
+                    </div>
+                  }
+                >
+                  <SetupView
+                    runtimes={snapshot.runtimes}
+                    onBack={() => setScreen("workspace")}
+                    onRuntimeAction={openRuntimeAction}
+                    onCreateProject={() => {
+                      setScreen("workspace");
+                      setAddProjectOpen(true);
+                    }}
+                    onFinish={() => setScreen("workspace")}
+                  />
+                </Suspense>
+              </motion.div>
+            ) : null}
+            {screen === "workspace" ? (
+              <motion.div key="screen-workspace" className="app-screen" {...screenFade}>
+                <main
+                  className="app-shell"
+                  id="main-content"
+                  data-sidebar-collapsed={sidebarCollapsed}
+                  data-rail-open={showRightRail}
+                  style={
+                    {
+                      "--right-rail-width": `${rightRailWidth}px`,
+                    } as CSSProperties
+                  }
+                >
+                  {/* Collapsed means fully hidden; the header's corner button is the
                 one control that opens it back up. The slot animates the reveal
                 while the sidebar keeps its full width, so content slides
                 instead of reflowing. */}
-              <AnimatePresence initial={false}>
-                {!sidebarCollapsed ? (
-                  <motion.div
-                    className="panel-slot panel-slot--left"
-                    key="chat-sidebar"
-                    initial={{ width: 0, opacity: 0 }}
-                    animate={{ width: "auto", opacity: 1 }}
-                    exit={{ width: 0, opacity: 0 }}
-                    transition={panelTransition}
-                  >
-                    <TaskSidebar
-                      projects={snapshot.projects}
-                      tasks={sidebarTasks}
-                      archivedTotal={archivedTotal}
-                      archivedLoading={archivedLoading}
-                      archivedHasMore={Boolean(archivedNextCursor)}
-                      onEnsureArchived={handleSidebarEnsureArchived}
-                      onLoadMoreArchived={handleSidebarLoadMoreArchived}
-                      activeProjectId={snapshot.activeProjectId}
-                      activeTaskId={snapshot.activeTaskId}
-                      metadataActionsEnabled={metadataActionsEnabled}
-                      taskActionBusyId={taskActionBusyId}
-                      onSearchMessages={handleSidebarSearchMessages}
-                      onSelectProject={handleSidebarSelectProject}
-                      onSelectTask={handleSidebarSelectTask}
-                      onNewTask={handleSidebarNewTask}
-                      onNewTaskInProject={handleSidebarNewTaskInProject}
-                      onOpenProject={handleSidebarOpenProject}
-                      openingProject={openingProject}
-                      onUpdateTask={handleSidebarUpdateTask}
-                      onCopyTask={handleSidebarCopyTask}
-                      onUpdateProject={handleSidebarUpdateProject}
-                      onDeleteProject={handleSidebarDeleteProject}
-                      onDeleteTask={handleSidebarDeleteTask}
-                      onDeleteArchivedChats={handleSidebarDeleteArchivedChats}
-                      onOpenSettings={handleSidebarOpenSettings}
-                      onResize={handleSidebarResize}
-                      sidebarMenuDirection={preferences.sidebarMenuDirection}
-                    />
-                  </motion.div>
-                ) : null}
-              </AnimatePresence>
-              <div
-                ref={conversationWorkspaceRef}
-                className="conversation-workspace"
-                data-subagent-open={Boolean(selectedDelegation)}
-              >
-                <section className="workspace-main">
-                  <div className="workspace-announcements">
-                    {operationError ? (
-                      <div className="operation-message operation-message--error" role="alert">
-                        <span className="operation-message-text">{operationError}</span>
-                        <button
-                          className="operation-message-dismiss"
-                          type="button"
-                          aria-label="Dismiss operation error"
-                          title="Dismiss error"
-                          onClick={() => setOperationError("")}
-                        >
-                          <X aria-hidden="true" />
-                        </button>
-                      </div>
-                    ) : null}
-                    {operationStatus ? (
-                      <div className="sr-only" role="status" aria-live="polite">
-                        {operationStatus}
-                      </div>
-                    ) : null}
-                  </div>
-                  <div className="workspace-content" aria-busy={Boolean(switchingTaskId)}>
-                    {workspaceLoading ? (
-                      <div className="route-loading" role="status" aria-live="polite">
-                        Loading your local workspace…
-                      </div>
-                    ) : !activeProject ? (
-                      <EmptyProjectState
-                        busy={openingProject}
-                        onOpenProject={() => setAddProjectOpen(true)}
-                      />
-                    ) : activeFileTabPath ? (
-                      activeFileTab ? (
-                        <FileWorkspace
-                          key={activeFileTab.path}
-                          file={activeFileTab}
-                          editable={nativeHost}
-                          onSave={(content) => saveFileTab(activeFileTab.path, content)}
-                          onExplainSelection={explainFileSelection}
-                          onAddComposerContext={addSelectionAsComposerContext}
-                          explainAgentLabel={runtimeLabel(explainRoute.runtime)}
+                  <AnimatePresence initial={false}>
+                    {!sidebarCollapsed ? (
+                      <motion.div
+                        className="panel-slot panel-slot--left"
+                        key="chat-sidebar"
+                        initial={{ width: 0, opacity: 0 }}
+                        animate={{ width: "auto", opacity: 1 }}
+                        exit={{ width: 0, opacity: 0 }}
+                        transition={panelTransition}
+                      >
+                        <TaskSidebar
+                          projects={snapshot.projects}
+                          tasks={sidebarTasks}
+                          archivedTotal={archivedTotal}
+                          archivedLoading={archivedLoading}
+                          archivedHasMore={Boolean(archivedNextCursor)}
+                          onEnsureArchived={handleSidebarEnsureArchived}
+                          onLoadMoreArchived={handleSidebarLoadMoreArchived}
+                          activeProjectId={snapshot.activeProjectId}
+                          activeTaskId={snapshot.activeTaskId}
+                          metadataActionsEnabled={metadataActionsEnabled}
+                          taskActionBusyId={taskActionBusyId}
+                          onSearchMessages={handleSidebarSearchMessages}
+                          onSelectProject={handleSidebarSelectProject}
+                          onSelectTask={handleSidebarSelectTask}
+                          onNewTask={handleSidebarNewTask}
+                          onNewTaskInProject={handleSidebarNewTaskInProject}
+                          onOpenProject={handleSidebarOpenProject}
+                          openingProject={openingProject}
+                          onUpdateTask={handleSidebarUpdateTask}
+                          onCopyTask={handleSidebarCopyTask}
+                          onUpdateProject={handleSidebarUpdateProject}
+                          onDeleteProject={handleSidebarDeleteProject}
+                          onDeleteTask={handleSidebarDeleteTask}
+                          onDeleteArchivedChats={handleSidebarDeleteArchivedChats}
+                          onOpenSettings={handleSidebarOpenSettings}
+                          onResize={handleSidebarResize}
+                          sidebarMenuDirection={preferences.sidebarMenuDirection}
                         />
-                      ) : (
-                        <div className="route-loading" role="status" aria-live="polite">
-                          Opening {activeFileTabPath.split("/").at(-1)}…
-                        </div>
-                      )
-                    ) : centerView === "task" ? (
-                      <>
-                        <div className="transcript-scroll" ref={transcriptScrollRef}>
-                          {nativeHost && runtimeState ? (
-                            <ConnectionNotice
-                              state={runtimeState.connection}
-                              runtime={runtimeLabel(activeTask?.runtime ?? settingsDefaultRuntime)}
-                              resuming={Boolean(
-                                activeTask && resumingTaskId === activeTask.id,
-                              )}
-                              quietReconciling={Boolean(
-                                activeTask && freshTaskIds.has(activeTask.id),
-                              )}
-                            />
-                          ) : null}
-                          {activeTask ? (
-                            <Suspense
-                              fallback={
-                                <div className="route-loading" role="status" aria-live="polite">
-                                  Loading task…
-                                </div>
-                              }
+                      </motion.div>
+                    ) : null}
+                  </AnimatePresence>
+                  <div
+                    ref={conversationWorkspaceRef}
+                    className="conversation-workspace"
+                    data-subagent-open={Boolean(selectedDelegation)}
+                  >
+                    <section className="workspace-main">
+                      <div className="workspace-announcements">
+                        {operationError ? (
+                          <div className="operation-message operation-message--error" role="alert">
+                            <span className="operation-message-text">{operationError}</span>
+                            <button
+                              className="operation-message-dismiss"
+                              type="button"
+                              aria-label="Dismiss operation error"
+                              title="Dismiss error"
+                              onClick={() => setOperationError("")}
                             >
-                              <Transcript
-                                key={activeTask?.id ?? "draft"}
-                                ownerKey={`task:${activeTask.id}`}
-                                events={projectedTranscript}
-                                scrollContainerRef={transcriptScrollRef}
-                                running={nativeTurnRunning || optimisticTurnStarting}
-                                hasMoreOlder={runtimeState?.hasMoreOlder}
-                                onLoadOlder={
-                                  activeTask
-                                    ? () => void loadOlderTaskProjection(activeTask.id)
-                                    : undefined
-                                }
-                                modelForEvent={
-                                  localSettings["transcript.showModel"] !== false
-                                    ? (event) =>
-                                        prettyModelLabel(
-                                          eventModels[event.id] ?? activeTask.model,
-                                        ) || undefined
-                                    : undefined
-                                }
-                                showTimestamps={
-                                  localSettings["transcript.showTimestamps"] !== false
-                                }
-                                onRegenerate={(eventId) => void regenerateFrom(eventId)}
-                                onBranch={(eventId) => void forkTask(activeTask.id, eventId)}
-                                onEditUserMessage={(eventId, body) =>
-                                  void editUserMessage(eventId, body)
-                                }
-                                onOpenFile={openTranscriptFile}
-                                onAddDiffSelection={(payload) =>
-                                  addSelectionToChat(payload, "diff")
-                                }
-                                isDiffApproved={(file) =>
-                                  Boolean(
-                                    activeTask &&
-                                      reviewedFiles[`${activeTask.id}:${diffFileKey(file)}`],
-                                  )
-                                }
-                                onApproveDiff={(file) => {
-                                  if (!activeTask) return;
-                                  setReviewedFiles((current) => ({
-                                    ...current,
-                                    [`${activeTask.id}:${diffFileKey(file)}`]: true,
-                                  }));
-                                  setOperationStatus(
-                                    `${file.path} marked reviewed for this session`,
-                                  );
-                                }}
-                                diffCommitState={diffCommitState}
-                              />
-                            </Suspense>
-                          ) : (
-                            <EmptyTaskState project={activeProject} />
-                          )}
-                        </div>
-                        {pendingApproval ? (
-                          <ApprovalControl
-                            approval={pendingApproval}
-                            busy={respondingApprovalId === pendingApproval.id}
-                            autoApproving={
-                              autoApproveActive && pendingApproval.approvalKind !== "planReview"
-                            }
-                            runtime={activeTask?.runtime}
-                            crowded={Boolean(
-                              activeTask &&
-                                (nativeTurnRunning ||
-                                  optimisticTurnStarting ||
-                                  visibleQueuedMessages.length > 0 ||
-                                  showRecoveryControl),
-                            )}
-                            onDecision={(decision) =>
-                              void respondToApproval(pendingApproval, decision)
-                            }
-                          />
+                              <X aria-hidden="true" />
+                            </button>
+                          </div>
                         ) : null}
-                        <AnimatePresence initial={false}>
-                          {activeTask &&
-                          (nativeTurnRunning ||
-                            optimisticTurnStarting ||
-                            visibleQueuedMessages.length > 0 ||
-                            Boolean(showRecoveryControl)) ? (
-                            <TaskStatusPill
-                              key="task-status-pill"
-                              runningSince={
-                                nativeTurnRunning || optimisticTurnStarting
-                                  ? (runtimeState?.turn?.startedAt ??
-                                    optimisticForActiveTask?.event.timestamp)
+                        {operationStatus ? (
+                          <div className="sr-only" role="status" aria-live="polite">
+                            {operationStatus}
+                          </div>
+                        ) : null}
+                      </div>
+                      <div className="workspace-content" aria-busy={Boolean(switchingTaskId)}>
+                        {workspaceLoading ? (
+                          <div className="route-loading" role="status" aria-live="polite">
+                            Loading your local workspace…
+                          </div>
+                        ) : !activeProject ? (
+                          <EmptyProjectState
+                            busy={openingProject}
+                            onOpenProject={() => setAddProjectOpen(true)}
+                          />
+                        ) : activeFileTabPath ? (
+                          activeFileTab ? (
+                            <FileWorkspace
+                              key={activeFileTab.path}
+                              file={activeFileTab}
+                              editable={nativeHost}
+                              onSave={(content) => saveFileTab(activeFileTab.path, content)}
+                              onExplainSelection={explainFileSelection}
+                              onAddComposerContext={addSelectionAsComposerContext}
+                              explainAgentLabel={runtimeLabel(explainRoute.runtime)}
+                            />
+                          ) : (
+                            <div className="route-loading" role="status" aria-live="polite">
+                              Opening {activeFileTabPath.split("/").at(-1)}…
+                            </div>
+                          )
+                        ) : centerView === "task" ? (
+                          <>
+                            <div className="transcript-scroll" ref={transcriptScrollRef}>
+                              {nativeHost && runtimeState && !activeProjectionUnavailable ? (
+                                <ConnectionNotice
+                                  state={runtimeState.connection}
+                                  runtime={runtimeLabel(
+                                    activeTask?.runtime ?? settingsDefaultRuntime,
+                                  )}
+                                  resuming={Boolean(activeTask && resumingTaskId === activeTask.id)}
+                                  quietReconciling={Boolean(
+                                    activeTask && freshTaskIds.has(activeTask.id),
+                                  )}
+                                  showDisconnected={nativeTurnActive || optimisticTurnStarting}
+                                />
+                              ) : null}
+                              {activeTask ? (
+                                <Suspense
+                                  fallback={
+                                    <div className="route-loading" role="status" aria-live="polite">
+                                      Loading task…
+                                    </div>
+                                  }
+                                >
+                                  <Transcript
+                                    key={activeTask?.id ?? "draft"}
+                                    ownerKey={`task:${activeTask.id}`}
+                                    events={projectedTranscript}
+                                    scrollContainerRef={transcriptScrollRef}
+                                    running={nativeTurnActive || optimisticTurnStarting}
+                                    hasMoreOlder={runtimeState?.hasMoreOlder}
+                                    onLoadOlder={
+                                      activeTask
+                                        ? () => void loadOlderTaskProjection(activeTask.id)
+                                        : undefined
+                                    }
+                                    modelForEvent={
+                                      localSettings["transcript.showModel"] !== false
+                                        ? (event) =>
+                                            prettyModelLabel(
+                                              eventModels[event.id] ?? activeTask.model,
+                                            ) || undefined
+                                        : undefined
+                                    }
+                                    showTimestamps={
+                                      localSettings["transcript.showTimestamps"] !== false
+                                    }
+                                    onRegenerate={
+                                      activeProjectionUnavailable
+                                        ? undefined
+                                        : (eventId) => void regenerateFrom(eventId)
+                                    }
+                                    onBranch={
+                                      activeProjectionUnavailable
+                                        ? undefined
+                                        : (eventId) => void forkTask(activeTask.id, eventId)
+                                    }
+                                    onEditUserMessage={
+                                      activeProjectionUnavailable
+                                        ? undefined
+                                        : (eventId, body) => void editUserMessage(eventId, body)
+                                    }
+                                    onOpenFile={openTranscriptFile}
+                                    onAddDiffSelection={(payload) =>
+                                      addSelectionToChat(payload, "diff")
+                                    }
+                                    isDiffApproved={(file) =>
+                                      Boolean(
+                                        activeTask &&
+                                        reviewedFiles[`${activeTask.id}:${diffFileKey(file)}`],
+                                      )
+                                    }
+                                    onApproveDiff={(file) => {
+                                      if (!activeTask) return;
+                                      setReviewedFiles((current) => ({
+                                        ...current,
+                                        [`${activeTask.id}:${diffFileKey(file)}`]: true,
+                                      }));
+                                      setOperationStatus(
+                                        `${file.path} marked reviewed for this session`,
+                                      );
+                                    }}
+                                    diffCommitState={diffCommitState}
+                                  />
+                                </Suspense>
+                              ) : (
+                                <EmptyTaskState project={activeProject} />
+                              )}
+                            </div>
+                            {pendingApproval ? (
+                              <ApprovalControl
+                                approval={pendingApproval}
+                                busy={respondingApprovalId === pendingApproval.id}
+                                autoApproving={
+                                  autoApproveActive && pendingApproval.approvalKind !== "planReview"
+                                }
+                                runtime={activeTask?.runtime}
+                                crowded={Boolean(
+                                  activeTask &&
+                                  (nativeTurnActive ||
+                                    optimisticTurnStarting ||
+                                    visibleQueuedMessages.length > 0 ||
+                                    showRecoveryControl),
+                                )}
+                                onDecision={(decision) =>
+                                  void respondToApproval(pendingApproval, decision)
+                                }
+                              />
+                            ) : null}
+                            <AnimatePresence initial={false}>
+                              {activeTask &&
+                              (nativeTurnActive ||
+                                optimisticTurnStarting ||
+                                visibleQueuedMessages.length > 0 ||
+                                Boolean(showRecoveryControl)) ? (
+                                <TaskStatusPill
+                                  key="task-status-pill"
+                                  runningSince={taskStatusRunningSince}
+                                  usage={runtimeUsage}
+                                  activeAgentCount={activeAgentCount}
+                                  recovery={
+                                    showRecoveryControl ? (
+                                      <div className="turn-recovery-control" role="status">
+                                        <span>
+                                          <strong>Response interrupted</strong>
+                                          <small>
+                                            {recoveryError ||
+                                              "The provider can continue from its last safe boundary."}
+                                          </small>
+                                        </span>
+                                        <button
+                                          type="button"
+                                          disabled={resumingTaskId === activeTask.id}
+                                          onClick={() => void resumeInterruptedTurn()}
+                                        >
+                                          {resumingTaskId === activeTask.id
+                                            ? "Resuming…"
+                                            : "Resume"}
+                                        </button>
+                                      </div>
+                                    ) : undefined
+                                  }
+                                  queue={
+                                    visibleQueuedMessages.length > 0 ? (
+                                      <QueuedMessages
+                                        messages={visibleQueuedMessages}
+                                        busyId={queueBusyId || undefined}
+                                        disabled={
+                                          Boolean(queueBusyId) || activeProjectionUnavailable
+                                        }
+                                        onSendNow={(messageId) => {
+                                          const message = visibleQueuedMessages.find(
+                                            (candidate) => candidate.id === messageId,
+                                          );
+                                          if (message) void dispatchQueuedMessage(message, true);
+                                        }}
+                                        onReturnToComposer={(messageId) =>
+                                          void restoreQueuedMessage(messageId)
+                                        }
+                                        onDelete={(messageId) =>
+                                          void deleteQueuedMessage(messageId)
+                                        }
+                                        onReorder={(orderedIds) =>
+                                          void reorderQueuedMessages(orderedIds)
+                                        }
+                                      />
+                                    ) : undefined
+                                  }
+                                />
+                              ) : null}
+                            </AnimatePresence>
+                            <Composer
+                              key={
+                                activeTask && promotingDraftTaskId !== activeTask.id
+                                  ? activeTask.id
+                                  : `draft-${activeProject.id}-${newChatDraftKey}`
+                              }
+                              runtimes={snapshot.runtimes}
+                              defaultRuntime={activeTask?.runtime ?? settingsDefaultRuntime}
+                              defaultModel={activeTask?.model ?? settingsDefaultModel}
+                              defaultEffort={activeTask?.effort ?? settingsDefaultRoute.effort}
+                              runtimeDefaults={composerRuntimeDefaults}
+                              defaultPermission={
+                                localSettings["permissions.defaultProfile"] === "read-only" ||
+                                localSettings["permissions.defaultProfile"] === "ask" ||
+                                localSettings["permissions.defaultProfile"] === "full-access"
+                                  ? localSettings["permissions.defaultProfile"]
+                                  : "project-write"
+                              }
+                              defaultDelegation={
+                                localSettings["delegation.defaultMode"] === "manual" ||
+                                localSettings["delegation.defaultMode"] === "balanced" ||
+                                localSettings["delegation.defaultMode"] === "budget-first"
+                                  ? localSettings["delegation.defaultMode"]
+                                  : "off"
+                              }
+                              enterToSend={localSettings["composer.enterToSend"] !== false}
+                              initialDraft={activeComposerDraft}
+                              onDraftChange={(value) => {
+                                updateActiveComposerDraft(value);
+                              }}
+                              onDraftSubmit={updateActiveComposerDraft}
+                              contextFiles={contextFilePaths}
+                              onRequestContextFiles={requestProjectFiles}
+                              workingDirectory={activeTask?.worktree ?? activeProject.path}
+                              insertRequest={composerInsert}
+                              onInsertHandled={(id) =>
+                                setComposerInsert((current) =>
+                                  current?.id === id ? null : current,
+                                )
+                              }
+                              attachmentRequest={composerAttachment}
+                              onAttachmentHandled={(id) =>
+                                setComposerAttachment((current) =>
+                                  current?.id === id ? null : current,
+                                )
+                              }
+                              restoreRequest={composerRestore}
+                              onRestoreHandled={(id) =>
+                                setComposerRestore((current) =>
+                                  current?.id === id ? null : current,
+                                )
+                              }
+                              notices={composerNotices}
+                              running={
+                                Boolean(activeTask) &&
+                                runtimeState?.taskId === activeTask?.id &&
+                                !activeProjectionUnavailable &&
+                                (runtimeState?.turn?.status === "pending" ||
+                                  runtimeState?.turn?.status === "inProgress")
+                              }
+                              stopping={stoppingTurn}
+                              onStop={() => void stopTurn()}
+                              sendDisabled={activeProjectionUnavailable}
+                              onSend={submitComposerTurn}
+                              sessionModes={
+                                !activeProjectionUnavailable && activeTask?.runtime === "cursor"
+                                  ? activeRuntimeState?.mode
                                   : undefined
                               }
-                              usage={runtimeUsage}
-                              activeAgentCount={activeAgentCount}
-                              recovery={
-                                showRecoveryControl ? (
-                                  <div className="turn-recovery-control" role="status">
-                                    <span>
-                                      <strong>Response interrupted</strong>
-                                      <small>
-                                        {recoveryError ||
-                                          "The provider can continue from its last safe boundary."}
-                                      </small>
-                                    </span>
-                                    <button
-                                      type="button"
-                                      disabled={resumingTaskId === activeTask.id}
-                                      onClick={() => void resumeInterruptedTurn()}
-                                    >
-                                      {resumingTaskId === activeTask.id ? "Resuming…" : "Resume"}
-                                    </button>
-                                  </div>
-                                ) : undefined
+                              onSessionModeChange={
+                                activeTask && !activeProjectionUnavailable
+                                  ? (modeId) =>
+                                      void bridge
+                                        .setSessionMode(activeTask.id, modeId)
+                                        .catch((error) => {
+                                          setOperationError(
+                                            error instanceof Error
+                                              ? error.message
+                                              : "Could not switch the agent mode",
+                                          );
+                                        })
+                                  : undefined
                               }
-                              queue={
-                                visibleQueuedMessages.length > 0 ? (
-                                  <QueuedMessages
-                                    messages={visibleQueuedMessages}
-                                    busyId={queueBusyId || undefined}
-                                    disabled={Boolean(queueBusyId)}
-                                    onSendNow={(messageId) => {
-                                      const message = visibleQueuedMessages.find(
-                                        (candidate) => candidate.id === messageId,
-                                      );
-                                      if (message) void dispatchQueuedMessage(message, true);
-                                    }}
-                                    onReturnToComposer={(messageId) =>
-                                      void restoreQueuedMessage(messageId)
+                              routingDisabled={activeProjectionUnavailable}
+                              permissionDisabled={activeProjectionUnavailable}
+                              delegationDisabled={activeProjectionUnavailable}
+                              permissionRequest={permissionRequest}
+                              onPermissionChange={
+                                activeTask
+                                  ? (permission) =>
+                                      setTaskPermissions((current) => ({
+                                        ...current,
+                                        [activeTask.id]: permission,
+                                      }))
+                                  : undefined
+                              }
+                              onRoutingChange={
+                                activeTask
+                                  ? (routing) => {
+                                      if (nativeTurnActive || optimisticTurnStarting) return;
+                                      setSnapshot((current) => ({
+                                        ...current,
+                                        tasks: current.tasks.map((task) =>
+                                          task.id === activeTask.id
+                                            ? {
+                                                ...task,
+                                                runtime: routing.runtime,
+                                                model: routing.model,
+                                                effort: routing.effort,
+                                              }
+                                            : task,
+                                        ),
+                                      }));
+                                      void bridge
+                                        .updateTaskRouting?.(activeTask.id, routing)
+                                        .catch(() => {
+                                          setOperationError(
+                                            "Could not save provider selection for this chat",
+                                          );
+                                        });
                                     }
-                                    onDelete={(messageId) => void deleteQueuedMessage(messageId)}
-                                    onReorder={(orderedIds) =>
-                                      void reorderQueuedMessages(orderedIds)
+                                  : undefined
+                              }
+                            />
+                          </>
+                        ) : reviewRefreshing && !activeFile ? (
+                          <div className="route-loading" role="status" aria-live="polite">
+                            Checking this worktree for changes…
+                          </div>
+                        ) : activeFile && reviewLoadError?.fileKey === diffFileKey(activeFile) ? (
+                          <ReviewLoadErrorState
+                            message={reviewLoadError.message}
+                            onRetry={() => {
+                              setReviewLoadError(null);
+                              setReviewRetryVersion((current) => current + 1);
+                            }}
+                          />
+                        ) : activeFile ? (
+                          <Suspense
+                            fallback={
+                              <div className="route-loading" role="status" aria-live="polite">
+                                Loading review…
+                              </div>
+                            }
+                          >
+                            <DiffView
+                              file={activeFile}
+                              viewMode={diffView}
+                              onViewModeChange={setDiffView}
+                              onRefresh={() => void refreshReview()}
+                              refreshing={reviewRefreshing}
+                              reviewed={Boolean(
+                                activeTask &&
+                                reviewedFiles[`${activeTask.id}:${diffFileKey(activeFile)}`],
+                              )}
+                              onMarkReviewed={() => {
+                                if (!activeTask) return;
+                                setReviewedFiles((current) => ({
+                                  ...current,
+                                  [`${activeTask.id}:${diffFileKey(activeFile)}`]: true,
+                                }));
+                                setOperationStatus(
+                                  `${activeFile.path} marked reviewed for this session`,
+                                );
+                              }}
+                              onAddSelection={(payload) => addSelectionToChat(payload, "diff")}
+                            />
+                          </Suspense>
+                        ) : (
+                          <ReviewEmptyState
+                            onBack={() => changeCenterView("task")}
+                            onRefresh={() => void refreshReview()}
+                            refreshing={reviewRefreshing}
+                          />
+                        )}
+                        {activeProject && terminalSurfaceActivated ? (
+                          <Suspense
+                            fallback={
+                              <div className="terminal-drawer terminal-loading" role="status">
+                                Loading terminal…
+                              </div>
+                            }
+                          >
+                            <TerminalDrawer
+                              key={activeProject.id}
+                              open={terminalOwner === "main"}
+                              project={activeProject}
+                              onClose={() => setTerminalOwner(null)}
+                              motionScale={motionScale}
+                            />
+                          </Suspense>
+                        ) : null}
+                      </div>
+                    </section>
+                    <AnimatePresence initial={false}>
+                      {selectedDelegation ? (
+                        <motion.div
+                          ref={subagentPaneRef}
+                          className="subagent-workspace-pane"
+                          key={selectedDelegation.id}
+                          style={{ width: `${subagentPaneRatio * 100}%` }}
+                          initial={{ opacity: 0 }}
+                          animate={{ opacity: 1 }}
+                          exit={{ opacity: 0 }}
+                          transition={panelTransition}
+                        >
+                          <ResizeHandle
+                            axis="horizontal"
+                            label="Resize subagent conversation"
+                            onResize={(delta) => {
+                              const width =
+                                conversationWorkspaceRef.current?.getBoundingClientRect().width;
+                              if (!width) return;
+                              setSubagentPaneRatio((current) =>
+                                clampDimension(current - delta / width, 0.3, 0.7),
+                              );
+                            }}
+                          />
+                          <Suspense
+                            fallback={
+                              <div className="route-loading" role="status" aria-live="polite">
+                                Loading subagent conversation…
+                              </div>
+                            }
+                          >
+                            <SubagentConversation
+                              delegation={selectedDelegation}
+                              headerTarget={subagentHeaderTarget}
+                              runtimes={snapshot.runtimes}
+                              contextFiles={contextFilePaths}
+                              onRequestContextFiles={requestProjectFiles}
+                              enterToSend={localSettings["composer.enterToSend"] !== false}
+                              autoResumeInterrupted={
+                                localSettings["general.autoResumeInterruptedTurns"] === true
+                              }
+                              rightRailOpen={rightRailOpen}
+                              terminalOpen={terminalOwner === selectedDelegation.id}
+                              onClose={() => {
+                                setSelectedDelegationId(undefined);
+                                setTerminalOwner((current) =>
+                                  current === selectedDelegation.id ? null : current,
+                                );
+                              }}
+                              onToggleRightRail={() => setRightRailOpen((value) => !value)}
+                              onToggleTerminal={() => toggleTerminal(selectedDelegation.id)}
+                              onSend={async (
+                                delegationId: string,
+                                message: string,
+                                routing: DelegationRouting,
+                              ) => {
+                                await bridge.sendDelegationMessage(delegationId, message, routing);
+                                await refreshDelegations(activeTaskIdRef.current);
+                              }}
+                              onStop={async (delegationId) => {
+                                await bridge.stopDelegation(delegationId);
+                                await refreshDelegations(activeTaskIdRef.current);
+                              }}
+                              terminal={
+                                activeProject && terminalSurfaceActivated ? (
+                                  <Suspense
+                                    fallback={
+                                      <div
+                                        className="terminal-drawer terminal-loading"
+                                        role="status"
+                                      >
+                                        Loading terminal…
+                                      </div>
                                     }
-                                  />
+                                  >
+                                    <TerminalDrawer
+                                      key={`${activeProject.id}:${selectedDelegation.id}`}
+                                      open={terminalOwner === selectedDelegation.id}
+                                      project={activeProject}
+                                      onClose={() => setTerminalOwner(null)}
+                                      motionScale={motionScale}
+                                    />
+                                  </Suspense>
                                 ) : undefined
                               }
                             />
-                          ) : null}
-                        </AnimatePresence>
-                        <Composer
-                          key={
-                            activeTask && promotingDraftTaskId !== activeTask.id
-                              ? activeTask.id
-                              : `draft-${activeProject.id}-${newChatDraftKey}`
-                          }
-                          runtimes={snapshot.runtimes}
-                          defaultRuntime={activeTask?.runtime ?? settingsDefaultRuntime}
-                          defaultModel={activeTask?.model ?? settingsDefaultModel}
-                          defaultEffort={activeTask?.effort ?? settingsDefaultRoute.effort}
-                          runtimeDefaults={composerRuntimeDefaults}
-                          defaultPermission={
-                            localSettings["permissions.defaultProfile"] === "read-only" ||
-                            localSettings["permissions.defaultProfile"] === "ask" ||
-                            localSettings["permissions.defaultProfile"] === "full-access"
-                              ? localSettings["permissions.defaultProfile"]
-                              : "project-write"
-                          }
-                          defaultDelegation={
-                            localSettings["delegation.defaultMode"] === "manual" ||
-                            localSettings["delegation.defaultMode"] === "balanced" ||
-                            localSettings["delegation.defaultMode"] === "budget-first"
-                              ? localSettings["delegation.defaultMode"]
-                              : "off"
-                          }
-                          enterToSend={localSettings["composer.enterToSend"] !== false}
-                          initialDraft={activeComposerDraft}
-                          onDraftChange={(value) => {
-                            updateActiveComposerDraft(value);
-                          }}
-                          onDraftSubmit={updateActiveComposerDraft}
-                          contextFiles={contextFilePaths}
-                          onRequestContextFiles={requestProjectFiles}
-                          workingDirectory={activeTask?.worktree ?? activeProject.path}
-                          insertRequest={composerInsert}
-                          onInsertHandled={(id) =>
-                            setComposerInsert((current) => (current?.id === id ? null : current))
-                          }
-                          attachmentRequest={composerAttachment}
-                          onAttachmentHandled={(id) =>
-                            setComposerAttachment((current) =>
-                              current?.id === id ? null : current,
-                            )
-                          }
-                          restoreRequest={composerRestore}
-                          onRestoreHandled={(id) =>
-                            setComposerRestore((current) => (current?.id === id ? null : current))
-                          }
-                          notices={composerNotices}
-                          running={
-                            Boolean(activeTask) &&
-                            runtimeState?.taskId === activeTask?.id &&
-                            runtimeState?.turn?.status === "inProgress"
-                          }
-                          stopping={stoppingTurn}
-                          onStop={() => void stopTurn()}
-                          onSend={submitComposerTurn}
-                          sessionModes={
-                            activeTask?.runtime === "cursor" ? activeRuntimeState?.mode : undefined
-                          }
-                          onSessionModeChange={
-                            activeTask
-                              ? (modeId) =>
-                                  void bridge
-                                    .setSessionMode(activeTask.id, modeId)
-                                    .catch((error) => {
-                                      setOperationError(
-                                        error instanceof Error
-                                          ? error.message
-                                          : "Could not switch the agent mode",
-                                      );
-                                    })
-                              : undefined
-                          }
-                          permissionRequest={permissionRequest}
-                          onPermissionChange={
-                            activeTask
-                              ? (permission) =>
-                                  setTaskPermissions((current) => ({
-                                    ...current,
-                                    [activeTask.id]: permission,
-                                  }))
-                              : undefined
-                          }
-                          onRoutingChange={
-                            activeTask
-                              ? (routing) => {
-                                  if (nativeTurnRunning || optimisticTurnStarting) return;
-                                  setSnapshot((current) => ({
-                                    ...current,
-                                    tasks: current.tasks.map((task) =>
-                                      task.id === activeTask.id
-                                        ? {
-                                            ...task,
-                                            runtime: routing.runtime,
-                                            model: routing.model,
-                                            effort: routing.effort,
-                                          }
-                                        : task,
-                                    ),
-                                  }));
-                                  void bridge
-                                    .updateTaskRouting?.(activeTask.id, routing)
-                                    .catch(() => {
-                                      setOperationError(
-                                        "Could not save provider selection for this chat",
-                                      );
-                                    });
-                                }
-                              : undefined
-                          }
-                        />
-                      </>
-                    ) : reviewRefreshing && !activeFile ? (
-                      <div className="route-loading" role="status" aria-live="polite">
-                        Checking this worktree for changes…
-                      </div>
-                    ) : activeFile && reviewLoadError?.fileKey === diffFileKey(activeFile) ? (
-                      <ReviewLoadErrorState
-                        message={reviewLoadError.message}
-                        onRetry={() => {
-                          setReviewLoadError(null);
-                          setReviewRetryVersion((current) => current + 1);
-                        }}
-                      />
-                    ) : activeFile ? (
-                      <Suspense
-                        fallback={
-                          <div className="route-loading" role="status" aria-live="polite">
-                            Loading review…
-                          </div>
-                        }
-                      >
-                        <DiffView
-                          file={activeFile}
-                          viewMode={diffView}
-                          onViewModeChange={setDiffView}
-                          onRefresh={() => void refreshReview()}
-                          refreshing={reviewRefreshing}
-                          reviewed={Boolean(
-                            activeTask &&
-                            reviewedFiles[`${activeTask.id}:${diffFileKey(activeFile)}`],
-                          )}
-                          onMarkReviewed={() => {
-                            if (!activeTask) return;
-                            setReviewedFiles((current) => ({
-                              ...current,
-                              [`${activeTask.id}:${diffFileKey(activeFile)}`]: true,
-                            }));
-                            setOperationStatus(
-                              `${activeFile.path} marked reviewed for this session`,
-                            );
-                          }}
-                          onAddSelection={(payload) => addSelectionToChat(payload, "diff")}
-                        />
-                      </Suspense>
-                    ) : (
-                      <ReviewEmptyState
-                        onBack={() => changeCenterView("task")}
-                        onRefresh={() => void refreshReview()}
-                        refreshing={reviewRefreshing}
-                      />
-                    )}
-                    {activeProject && terminalSurfaceActivated ? (
-                      <Suspense
-                        fallback={
-                          <div className="terminal-drawer terminal-loading" role="status">
-                            Loading terminal…
-                          </div>
-                        }
-                      >
-                        <TerminalDrawer
-                          key={activeProject.id}
-                          open={terminalOwner === "main"}
-                          project={activeProject}
-                          onClose={() => setTerminalOwner(null)}
-                          motionScale={motionScale}
-                        />
-                      </Suspense>
-                    ) : null}
+                          </Suspense>
+                        </motion.div>
+                      ) : null}
+                    </AnimatePresence>
                   </div>
-                </section>
-                <AnimatePresence initial={false}>
-                  {selectedDelegation ? (
-                    <motion.div
-                      ref={subagentPaneRef}
-                      className="subagent-workspace-pane"
-                      key={selectedDelegation.id}
-                      style={{ width: `${subagentPaneRatio * 100}%` }}
-                      initial={{ opacity: 0 }}
-                      animate={{ opacity: 1 }}
-                      exit={{ opacity: 0 }}
-                      transition={panelTransition}
-                    >
-                      <ResizeHandle
-                        axis="horizontal"
-                        label="Resize subagent conversation"
-                        onResize={(delta) => {
-                          const width =
-                            conversationWorkspaceRef.current?.getBoundingClientRect().width;
-                          if (!width) return;
-                          setSubagentPaneRatio((current) =>
-                            clampDimension(current - delta / width, 0.3, 0.7),
-                          );
-                        }}
-                      />
-                      <Suspense
-                        fallback={
-                          <div className="route-loading" role="status" aria-live="polite">
-                            Loading subagent conversation…
-                          </div>
-                        }
+                  <AnimatePresence initial={false}>
+                    {showRightRail ? (
+                      <motion.div
+                        className="panel-slot panel-slot--right"
+                        key="task-tools"
+                        initial={{ width: 0, opacity: 0 }}
+                        animate={{ width: "auto", opacity: 1 }}
+                        exit={{ width: 0, opacity: 0 }}
+                        transition={panelTransition}
                       >
-                        <SubagentConversation
-                          delegation={selectedDelegation}
-                          headerTarget={subagentHeaderTarget}
-                          runtimes={snapshot.runtimes}
-                          contextFiles={contextFilePaths}
-                          onRequestContextFiles={requestProjectFiles}
-                          enterToSend={localSettings["composer.enterToSend"] !== false}
-                          autoResumeInterrupted={
-                            localSettings["general.autoResumeInterruptedTurns"] === true
+                        <Suspense
+                          fallback={
+                            <aside
+                              className="right-rail rail-loading"
+                              aria-label="Task tools"
+                              aria-busy="true"
+                            >
+                              Loading task tools…
+                            </aside>
                           }
-                          rightRailOpen={rightRailOpen}
-                          terminalOpen={terminalOwner === selectedDelegation.id}
-                          onClose={() => {
-                            setSelectedDelegationId(undefined);
-                            setTerminalOwner((current) =>
-                              current === selectedDelegation.id ? null : current,
-                            );
-                          }}
-                          onToggleRightRail={() => setRightRailOpen((value) => !value)}
-                          onToggleTerminal={() => toggleTerminal(selectedDelegation.id)}
-                          onSend={async (
-                            delegationId: string,
-                            message: string,
-                            routing: DelegationRouting,
-                          ) => {
-                            await bridge.sendDelegationMessage(delegationId, message, routing);
-                            await refreshDelegations(activeTaskIdRef.current);
-                          }}
-                          onStop={async (delegationId) => {
-                            await bridge.stopDelegation(delegationId);
-                            await refreshDelegations(activeTaskIdRef.current);
-                          }}
-                          terminal={
-                            activeProject && terminalSurfaceActivated ? (
-                              <Suspense
-                                fallback={
-                                  <div className="terminal-drawer terminal-loading" role="status">
-                                    Loading terminal…
-                                  </div>
-                                }
-                              >
-                                <TerminalDrawer
-                                  key={`${activeProject.id}:${selectedDelegation.id}`}
-                                  open={terminalOwner === selectedDelegation.id}
-                                  project={activeProject}
-                                  onClose={() => setTerminalOwner(null)}
-                                  motionScale={motionScale}
-                                />
-                              </Suspense>
-                            ) : undefined
-                          }
-                        />
-                      </Suspense>
-                    </motion.div>
-                  ) : null}
-                </AnimatePresence>
-              </div>
-              <AnimatePresence initial={false}>
-                {showRightRail ? (
-                  <motion.div
-                    className="panel-slot panel-slot--right"
-                    key="task-tools"
-                    initial={{ width: 0, opacity: 0 }}
-                    animate={{ width: "auto", opacity: 1 }}
-                    exit={{ width: 0, opacity: 0 }}
-                    transition={panelTransition}
-                  >
-                    <Suspense
-                      fallback={
-                        <aside
-                          className="right-rail rail-loading"
-                          aria-label="Task tools"
-                          aria-busy="true"
                         >
-                          Loading task tools…
-                        </aside>
-                      }
-                    >
-                      <RightRail
-                        git={snapshot.git}
-                        gitLoading={gitLoading}
-                        children={snapshot.children}
-                        delegations={nativeHost ? delegations : undefined}
-                        selectedDelegationId={selectedDelegation?.id}
-                        onSelectDelegation={(delegationId) => {
-                          setSelectedDelegationId(delegationId);
-                          setTerminalOwner(null);
-                        }}
-                        onApproveDelegation={async (delegationId) => {
-                          await bridge.approveDelegation(delegationId);
-                          await refreshDelegations(activeTaskIdRef.current);
-                        }}
-                        onDenyDelegation={async (delegationId) => {
-                          await bridge.denyDelegation(delegationId);
-                          await refreshDelegations(activeTaskIdRef.current);
-                        }}
-                        onNudgeDelegation={async (delegationId, message) => {
-                          await bridge.sendDelegationMessage(delegationId, message);
-                          await refreshDelegations(activeTaskIdRef.current);
-                        }}
-                        onStopDelegation={async (delegationId) => {
-                          await bridge.stopDelegation(delegationId);
-                          await refreshDelegations(activeTaskIdRef.current);
-                        }}
-                        usage={displayedUsage}
-                        runtime={activeTask?.runtime}
-                        subscription={activeQuota}
-                        activeFile={activeFile}
-                        projectId={activeProject?.id}
-                        projectFiles={projectFiles}
-                        projectFilesState={projectFilesState}
-                        onRequestProjectFiles={requestProjectFiles}
-                        onSelectFile={selectFile}
-                        onOpenFile={(file) => void openFileInCanvas(file)}
-                        activeFilePath={activeFileTabPath}
-                        openingFilePath={fileTabOpeningPath}
-                        onRenameProjectFile={renameProjectFile}
-                        onMentionProjectFile={mentionProjectFile}
-                        onMentionProjectFolder={mentionProjectFolder}
-                        fileOpeners={projectFileOpeners}
-                        onOpenGitFileExternal={nativeHost ? openGitFileExternal : undefined}
-                        onRevealGitFile={nativeHost ? revealGitFile : undefined}
-                        onOpenProjectFileExternal={nativeHost ? openProjectPathExternal : undefined}
-                        onRevealProjectFile={nativeHost ? revealProjectPath : undefined}
-                        onStageFile={stageFile}
-                        onStageFiles={async (paths, staged) => {
-                          if (activeTask) {
-                            const git = await bridge.stageFiles(activeTask.id, paths, staged);
-                            applyTaskGitSnapshot(activeTask.id, git);
-                            return;
-                          }
-                          if (!activeProject) return;
-                          const projectId = activeProject.id;
-                          const git = await bridge.stageProjectFiles(projectId, paths, staged);
-                          setSnapshot((current) =>
-                            current.activeProjectId === projectId && !current.activeTaskId
-                              ? { ...current, git }
-                              : current,
-                          );
-                        }}
-                        onCommit={commit}
-                        onGenerateCommitMessage={
-                          nativeHost && activeTask ? generateCommitMessage : undefined
-                        }
-                        onPush={push}
-                        onReviewChanges={reviewChanges}
-                        onRefreshGit={refreshGit}
-                        onInitializeGit={initializeProjectGit}
-                        onAddRemote={addGitRemote}
-                        onUpdateRemote={updateGitRemote}
-                        onRemoveRemote={removeGitRemote}
-                        onFetch={fetchGit}
-                        onPull={pullGit}
-                        onPublishBranch={publishGitBranch}
-                        onPublishGithub={publishGithubRepository}
-                        onLoadMoreGitHistory={loadMoreGitHistory}
-                        onResize={(delta) =>
-                          setRightRailWidth((current) => clampDimension(current - delta, 300, 520))
-                        }
-                      />
-                    </Suspense>
-                  </motion.div>
-                ) : null}
-              </AnimatePresence>
-            </main>
-            </motion.div>
-          ) : null}
+                          <RightRail
+                            git={snapshot.git}
+                            gitLoading={gitLoading}
+                            children={snapshot.children}
+                            delegations={nativeHost ? delegations : undefined}
+                            selectedDelegationId={selectedDelegation?.id}
+                            onSelectDelegation={(delegationId) => {
+                              setSelectedDelegationId(delegationId);
+                              setTerminalOwner(null);
+                            }}
+                            onApproveDelegation={async (delegationId) => {
+                              await bridge.approveDelegation(delegationId);
+                              await refreshDelegations(activeTaskIdRef.current);
+                            }}
+                            onDenyDelegation={async (delegationId) => {
+                              await bridge.denyDelegation(delegationId);
+                              await refreshDelegations(activeTaskIdRef.current);
+                            }}
+                            onNudgeDelegation={async (delegationId, message) => {
+                              await bridge.sendDelegationMessage(delegationId, message);
+                              await refreshDelegations(activeTaskIdRef.current);
+                            }}
+                            onStopDelegation={async (delegationId) => {
+                              await bridge.stopDelegation(delegationId);
+                              await refreshDelegations(activeTaskIdRef.current);
+                            }}
+                            usage={displayedUsage}
+                            runtime={activeTask?.runtime}
+                            subscription={activeQuota}
+                            activeFile={activeFile}
+                            projectId={activeProject?.id}
+                            projectFiles={projectFiles}
+                            projectFilesState={projectFilesState}
+                            onRequestProjectFiles={requestProjectFiles}
+                            onSelectFile={selectFile}
+                            onOpenFile={(file) => void openFileInCanvas(file)}
+                            activeFilePath={activeFileTabPath}
+                            openingFilePath={fileTabOpeningPath}
+                            onRenameProjectFile={renameProjectFile}
+                            onMentionProjectFile={mentionProjectFile}
+                            onMentionProjectFolder={mentionProjectFolder}
+                            fileOpeners={projectFileOpeners}
+                            onOpenGitFileExternal={nativeHost ? openGitFileExternal : undefined}
+                            onRevealGitFile={nativeHost ? revealGitFile : undefined}
+                            onOpenProjectFileExternal={
+                              nativeHost ? openProjectPathExternal : undefined
+                            }
+                            onRevealProjectFile={nativeHost ? revealProjectPath : undefined}
+                            onStageFile={stageFile}
+                            onStageFiles={async (paths, staged) => {
+                              if (activeTask) {
+                                const git = await bridge.stageFiles(activeTask.id, paths, staged);
+                                applyTaskGitSnapshot(activeTask.id, git);
+                                return;
+                              }
+                              if (!activeProject) return;
+                              const projectId = activeProject.id;
+                              const git = await bridge.stageProjectFiles(projectId, paths, staged);
+                              setSnapshot((current) =>
+                                current.activeProjectId === projectId && !current.activeTaskId
+                                  ? { ...current, git }
+                                  : current,
+                              );
+                            }}
+                            onCommit={commit}
+                            onGenerateCommitMessage={
+                              nativeHost && activeTask ? generateCommitMessage : undefined
+                            }
+                            onPush={push}
+                            onReviewChanges={reviewChanges}
+                            onRefreshGit={refreshGit}
+                            onInitializeGit={initializeProjectGit}
+                            onAddRemote={addGitRemote}
+                            onUpdateRemote={updateGitRemote}
+                            onRemoveRemote={removeGitRemote}
+                            onFetch={fetchGit}
+                            onPull={pullGit}
+                            onPublishBranch={publishGitBranch}
+                            onPublishGithub={publishGithubRepository}
+                            onLoadMoreGitHistory={loadMoreGitHistory}
+                            onResize={(delta) =>
+                              setRightRailWidth((current) =>
+                                clampDimension(current - delta, 300, 520),
+                              )
+                            }
+                          />
+                        </Suspense>
+                      </motion.div>
+                    ) : null}
+                  </AnimatePresence>
+                </main>
+              </motion.div>
+            ) : null}
           </AnimatePresence>
         </div>
         {addProjectOpen ? (

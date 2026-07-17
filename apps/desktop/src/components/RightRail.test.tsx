@@ -302,6 +302,9 @@ describe("RightRail", () => {
     expect(glyphs[5]).toHaveAttribute("data-motion-family", "dormant");
     expect(glyphs[1]!.querySelector(".agent-glyph-orbit")).toBeInTheDocument();
     expect(glyphs[3]!.querySelector(".agent-glyph-state-mark")).toBeInTheDocument();
+    const bodyPath = glyphs[1]!.querySelector(".agent-glyph-body path")?.getAttribute("d") ?? "";
+    expect(bodyPath).not.toMatch(/[ACQ]/);
+    expect(bodyPath.split("L")).toHaveLength(16);
 
     const workingRow = screen.getByRole("treeitem", { name: /Agent 2/ });
     fireEvent.pointerEnter(workingRow);

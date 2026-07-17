@@ -5,10 +5,11 @@
   "description": "Local-first native control plane for coding agents",
   "packageManager": "npm@10.9.2",
   "scripts": {
-    "dev": "npm --prefix apps/desktop run tauri -- dev --no-watch",
-    "dev:watch": "npm --prefix apps/desktop run tauri -- dev",
+    "dev": "node scripts/tauri-dev.mjs",
+    "dev:watch": "node scripts/tauri-dev.mjs --watch",
     "dev:web": "npm --prefix apps/desktop run dev",
     "build": "npm --prefix apps/desktop run tauri -- build",
+    "build:release": "node scripts/tauri-build-release.mjs",
     "build:web": "npm --prefix apps/desktop run build",
     "check:bridge": "node scripts/check-bridge-contract.mjs",
     "check:docs": "node scripts/check-docs.mjs",

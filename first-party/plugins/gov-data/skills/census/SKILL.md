@@ -7,8 +7,9 @@ description: Query US Census Bureau APIs — ACS demographics (population, incom
 
 ## Requirements
 
-A free key from https://api.census.gov/data/key_signup.html set as
-`CENSUS_API_KEY`. Small volumes work keyless, but the key avoids IP blocks.
+A free key from https://api.census.gov/data/key_signup.html must be saved in
+AI Integrator Settings. Call `skill_data_request` on the `integrator` MCP
+server with provider `census`; never ask for, print, or inspect the key.
 
 ## Core pattern
 
@@ -17,7 +18,7 @@ Base: `https://api.census.gov/data/{year}/{dataset}`
 Most useful dataset: ACS 5-year (`acs/acs5`) — reliable down to tract level.
 
 ```
-https://api.census.gov/data/2023/acs/acs5?get=NAME,B01003_001E,B19013_001E&for=county:*&in=state:06&key=$CENSUS_API_KEY
+https://api.census.gov/data/2023/acs/acs5?get=NAME,B01003_001E,B19013_001E&for=county:*&in=state:06
 ```
 
 Response is a JSON array-of-arrays; first row is headers.

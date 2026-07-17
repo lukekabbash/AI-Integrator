@@ -703,13 +703,23 @@ fn read_action_file(
     })
 }
 
-fn parse_frontmatter(content: &str) -> HashMap<String, String> {
+/// Parses the bounded set of frontmatter keys this app reads. Handles plain
+/// `key: value` lines and YAML block scalars (`description: >-` / `|` with
+/// the real text on the following more-indented lines) — the latter is
+/// common in larger third-party catalogs (e.g. google/skills) and, without
+/// this, silently degraded every description to the literal `>-` marker.
+pub(crate) fn parse_frontmatter(content: &str) -> HashMap<String, String> {
     let mut values = HashMap::new();
-    let mut lines = content.lines();
+    let mut lines = content.lines().peekable();
     if lines.next().map(str::trim) != Some("---") {
         return values;
     }
-    for line in lines.take(128) {
+    let mut consumed = 0usize;
+    while let Some(line) = lines.next() {
+        consumed += 1;
+        if consumed > 128 {
+            break;
+        }
         if line.trim() == "---" {
             break;
         }
@@ -717,8 +727,36 @@ fn parse_frontmatter(content: &str) -> HashMap<String, String> {
             continue;
         };
         let key = key.trim().to_ascii_lowercase();
-        if matches!(key.as_str(), "name" | "description" | "user-invocable") {
-            values.insert(key, value.trim().trim_matches(['\'', '"']).to_owned());
+        if !matches!(key.as_str(), "name" | "description" | "user-invocable") {
+            continue;
+        }
+        let value = value.trim();
+        if matches!(value, ">" | ">-" | ">+" | "|" | "|-" | "|+") {
+            let mut block = String::new();
+            while let Some(next) = lines.peek() {
+                if next.trim().is_empty() {
+                    lines.next();
+                    consumed += 1;
+                    continue;
+                }
+                if next.len() - next.trim_start().len() == 0 {
+                    break;
+                }
+                if !block.is_empty() {
+                    block.push(' ');
+                }
+                block.push_str(next.trim());
+                lines.next();
+                consumed += 1;
+                if consumed > 128 {
+                    break;
+                }
+            }
+            if !block.is_empty() {
+                values.insert(key, block);
+            }
+        } else {
+            values.insert(key, value.trim_matches(['\'', '"']).to_owned());
         }
     }
     values
@@ -788,6 +826,22 @@ mod tests {
         let parsed = parse_frontmatter("---\nname: safe\ndescription: bounded\n---\nSECRET BODY");
         assert_eq!(parsed.get("name").map(String::as_str), Some("safe"));
         assert!(!parsed.values().any(|value| value.contains("SECRET")));
+    }
+
+    #[test]
+    fn frontmatter_parser_folds_yaml_block_scalar_descriptions() {
+        // Real shape from google/skills: a folded block scalar whose text
+        // lives on the following indented lines, not after the colon.
+        let content = "---\nname: data-manager-api-audience-ingestion\ndescription: >-\n  Guides developers through uploading audience members to Google products using\n  the Data Manager API. Use this skill when the user wants to upload audience\n  members.\nmetadata:\n  version: 1.1\n---\nBODY";
+        let parsed = parse_frontmatter(content);
+        assert_eq!(
+            parsed.get("name").map(String::as_str),
+            Some("data-manager-api-audience-ingestion")
+        );
+        let description = parsed.get("description").expect("description parsed");
+        assert!(!description.contains(">-"));
+        assert!(description.contains("Guides developers"));
+        assert!(description.contains("members."));
     }
 
     #[test]

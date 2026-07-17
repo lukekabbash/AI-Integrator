@@ -14,8 +14,9 @@ children can ask questions of / report to the orchestrator.
 
 ```
 ┌────────────── Tauri app (one process) ───────────────┐
-│ Broker host: TCP JSON-RPC on 127.0.0.1:<ephemeral>   │
+│ Local tools: TCP JSON-RPC on 127.0.0.1:<ephemeral>    │
 │  · token-authenticated, loopback only                │
+│  · shared tool: skill_data_request                    │
 │  · orchestrator tools: peers_list, delegate_start,   │
 │    delegation_status, delegation_message,            │
 │    delegation_result, delegation_stop                │
@@ -37,9 +38,16 @@ Env vars in the MCP config carry the broker address, an auth token, the role
 (`orchestrator` | `child`), and the scope id (parent task id, or delegation
 id for children). The bridge forwards `tools/call` to the broker host.
 
+The transport also hosts `skill_data_request`, a narrow first-party data
+request tool. It reads enabled skill credentials inside the running native
+process and injects them only into fixed official provider endpoints. The
+credential value never crosses MCP, enters a prompt, or appears in a child
+process environment.
+
 ## Delegation modes (composer dropdown, now functional)
 
-- `off` — no broker MCP injected, no delegation preamble. Default.
+- `off` — delegation tools and delegation preamble are disabled. The local MCP
+  remains injected with only `skill_data_request`. Default.
 - `manual` — tools injected; every `delegate_start` creates a delegation in
   `pending-approval`; the user approves/denies in the Agents rail panel.
 - `balanced` — model delegates freely within policy caps.
@@ -112,9 +120,11 @@ still produce results (digest capture on completion); they just can't ask
 questions mid-flight.
 
 ACP children (Cursor/Grok) run one long-lived agent process per child
-session. `session/prompt` resolves at turn end, so the delegation settles
-from the prompt future itself rather than a watcher. Because no one watches
-a child's approvals, the ACP pump answers `session/request_permission`
+session. The adapter converts the `session/prompt` response into an ordered
+`PromptFinished` boundary on the same event channel as streamed updates. The
+projection pump stores every preceding update before clearing the active turn,
+then an internal watcher advances the delegation lifecycle. Because no one
+watches a child's approvals, the ACP pump answers `session/request_permission`
 immediately (narrowest allow option; cancel if the request advertises no
 allow) and auto-accepts `cursor/create_plan` — the ACP analog of the Codex
 child's approval policy `never`. Cursor children are pinned to the Agent

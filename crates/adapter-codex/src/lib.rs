@@ -96,6 +96,12 @@ pub struct CodexLaunchOptions {
     pub client_version: String,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct CodexThreadOverrides {
+    pub config: Option<Value>,
+    pub developer_instructions: Option<String>,
+}
+
 /// A skill already resolved by the trusted native host from `skills/list`.
 /// The renderer never supplies the filesystem path directly.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -295,28 +301,29 @@ impl CodexClient {
         approval_policy: &str,
         sandbox: &str,
     ) -> Result<Value> {
-        self.start_thread_with_policies_and_config(
+        self.start_thread_with_policies_and_overrides(
             cwd,
             model,
             reasoning_effort,
             approval_policy,
             sandbox,
-            None,
+            CodexThreadOverrides::default(),
         )
         .await
     }
 
-    /// Starts a thread with an ephemeral config layer owned by the embedding
-    /// client. Integrator uses this for its task-scoped broker MCP server so
-    /// it never has to modify the user's global or project Codex config.
-    pub async fn start_thread_with_policies_and_config(
+    /// Starts a thread with ephemeral config and developer-instruction layers
+    /// owned by the embedding client. Integrator uses these for its
+    /// task-scoped broker and durable harness policy without modifying the
+    /// user's global or project Codex configuration.
+    pub async fn start_thread_with_policies_and_overrides(
         &self,
         cwd: &Path,
         model: Option<&str>,
         reasoning_effort: Option<&str>,
         approval_policy: &str,
         sandbox: &str,
-        config: Option<Value>,
+        overrides: CodexThreadOverrides,
     ) -> Result<Value> {
         if !matches!(
             approval_policy,
@@ -352,7 +359,7 @@ impl CodexClient {
         if let Some(effort) = reasoning_effort {
             params["reasoningEffort"] = Value::String(effort.into());
         }
-        if let Some(config) = config {
+        if let Some(config) = overrides.config {
             if !config.is_object() {
                 return Err(IntegratorError::InvalidInput(
                     "thread config must be an object".into(),
@@ -360,7 +367,26 @@ impl CodexClient {
             }
             params["config"] = config;
         }
+        if let Some(instructions) = overrides.developer_instructions {
+            params["developerInstructions"] = Value::String(instructions);
+        }
         self.request("thread/start", params).await
+    }
+
+    /// Read the effective Codex configuration for one working directory.
+    /// Integrator uses this to preserve user/project developer instructions
+    /// when it appends its own thread-scoped harness policy.
+    pub async fn read_config(&self, cwd: &Path) -> Result<Value> {
+        if !cwd.is_dir() {
+            return Err(IntegratorError::InvalidInput(
+                "configuration working directory does not exist".into(),
+            ));
+        }
+        self.request(
+            "config/read",
+            json!({ "cwd": cwd.to_string_lossy(), "includeLayers": false }),
+        )
+        .await
     }
 
     /// Starts a disposable, read-only helper thread that is excluded from
@@ -392,9 +418,21 @@ impl CodexClient {
     }
 
     pub async fn resume_thread(&self, thread_id: &str) -> Result<Value> {
-        validate_protocol_id(thread_id, "thread")?;
-        self.request("thread/resume", json!({ "threadId": thread_id }))
+        self.resume_thread_with_developer_instructions(thread_id, None)
             .await
+    }
+
+    pub async fn resume_thread_with_developer_instructions(
+        &self,
+        thread_id: &str,
+        developer_instructions: Option<&str>,
+    ) -> Result<Value> {
+        validate_protocol_id(thread_id, "thread")?;
+        let mut params = json!({ "threadId": thread_id });
+        if let Some(instructions) = developer_instructions {
+            params["developerInstructions"] = Value::String(instructions.into());
+        }
+        self.request("thread/resume", params).await
     }
 
     pub async fn start_turn(&self, thread_id: &str, prompt: &str) -> Result<Value> {

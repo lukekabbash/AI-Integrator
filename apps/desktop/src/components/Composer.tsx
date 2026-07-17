@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { AnimatePresence, m as motion } from "motion/react";
 import {
   ArrowUp,
@@ -110,6 +110,8 @@ interface ComposerProps {
   stopping?: boolean;
   /** Stops the in-progress turn from the send position. */
   onStop?: () => void;
+  /** Keeps the draft editable while temporarily preventing provider dispatch. */
+  sendDisabled?: boolean;
   /** Keeps provider/model/effort visible but immutable until the active turn settles. */
   routingDisabled?: boolean;
   permissionDisabled?: boolean;
@@ -296,16 +298,35 @@ function matchSkills(actions: NativeProviderAction[], query: string): Autocomple
     }));
 }
 
+const CODEX_GOAL_ACTION_ID = "builtin:codex:goal:v1";
+
+function leadingNativeActionName(prompt: string): string | undefined {
+  return /^\/([^\s]+)(?=\s|$)/.exec(prompt)?.[1];
+}
+
 function completedNativeAction(
   prompt: string,
   actions: NativeProviderAction[],
 ): NativeProviderAction | undefined {
-  const token = /^\/([^\s]+)(?=\s|$)/.exec(prompt)?.[1];
+  const token = leadingNativeActionName(prompt);
   if (!token) return undefined;
   return actions.find(
     (action) =>
       action.name === token && action.invocation === "direct" && action.id.trim().length > 0,
   );
+}
+
+function codexGoalAction(prompt: string, runtime: RuntimeId): NativeProviderAction | undefined {
+  if (runtime !== "codex" || leadingNativeActionName(prompt) !== "goal") return undefined;
+  return {
+    id: CODEX_GOAL_ACTION_ID,
+    name: "goal",
+    description: "Keep working until a completion condition is met",
+    source: "built-in",
+    kind: "command",
+    invocation: "direct",
+    inputHint: "completion condition",
+  };
 }
 
 export interface DraftSegment {
@@ -477,9 +498,7 @@ function readNativeActionCache(): Record<string, NativeProviderAction[]> {
 
 function writeNativeActionCache(cache: Record<string, NativeProviderAction[]>) {
   try {
-    const bounded = Object.fromEntries(
-      Object.entries(cache).slice(-NATIVE_ACTION_CACHE_LIMIT),
-    );
+    const bounded = Object.fromEntries(Object.entries(cache).slice(-NATIVE_ACTION_CACHE_LIMIT));
     window.localStorage?.setItem(NATIVE_ACTION_CACHE_KEY, JSON.stringify(bounded));
   } catch {
     // The cache is a warm-start optimization only.
@@ -517,6 +536,7 @@ export function Composer({
   running = false,
   stopping = false,
   onStop,
+  sendDisabled = false,
   routingDisabled = false,
   permissionDisabled = false,
   delegationDisabled = false,
@@ -554,11 +574,11 @@ export function Composer({
       : (initialDraft?.delegation ?? defaultDelegation ?? "off"),
   );
   const [sending, setSending] = useState(false);
+  const submittingRef = useRef(false);
   const [attachments, setAttachments] = useState<ComposerAttachment[]>(
     () => initialDraft?.attachments ?? [],
   );
   const [attachmentError, setAttachmentError] = useState("");
-  const [providerCatalogs, setProviderCatalogs] = useState<Record<string, ModelCatalogEntry[]>>({});
   const providerCatalogLoads = useRef(new Set<RuntimeId>());
   const [nativeActionsByKey, setNativeActionsByKey] = useState<
     Record<string, NativeProviderAction[]>
@@ -566,7 +586,8 @@ export function Composer({
   const [nativeActionsError, setNativeActionsError] = useState("");
   const [nativeActionsLoadingKey, setNativeActionsLoadingKey] = useState("");
   const [nativeActionRetry, setNativeActionRetry] = useState(0);
-  const nativeActionLoads = useRef(new Set<string>());
+  const nativeActionLoads = useRef(new Map<string, Promise<NativeProviderAction[]>>());
+  const authoritativeNativeActions = useRef(new Map<string, NativeProviderAction[]>());
   const nativeActionRefreshes = useRef(new Set<string>());
   const composerTextMirrorRef = useRef<HTMLDivElement>(null);
   const [voiceConfigured, setVoiceConfigured] = useState<boolean | null>(null);
@@ -599,12 +620,17 @@ export function Composer({
   const suppressDraftEmissionRef = useRef(false);
   const onDraftChangeRef = useRef(onDraftChange);
   const selectedRuntime = runtimes.find((item) => item.id === runtime) ?? runtimes[0];
-  const catalogLoaded = Object.hasOwn(providerCatalogs, runtime);
-  const runtimeCatalog =
+  const cachedCatalog = useSyncExternalStore(
+    bridge.subscribeModelCatalogs,
+    () => bridge.getCachedModelCatalog(runtime),
+    () => undefined,
+  );
+  const catalogLoaded = cachedCatalog !== undefined;
+  const runtimeCatalog: ModelCatalogEntry[] =
     selectedRuntime?.models
       .filter((id) => id !== PROVIDER_DEFAULT_MODEL)
       .map((id) => ({ id, label: resolveModelLabel(id) })) ?? [];
-  const catalog = (providerCatalogs[runtime] ?? runtimeCatalog).filter(
+  const catalog = (cachedCatalog ?? runtimeCatalog).filter(
     (entry) => entry.id !== PROVIDER_DEFAULT_MODEL,
   );
   const activeEntry = catalog.find((entry) => entry.id === model) ?? catalog[0];
@@ -618,9 +644,7 @@ export function Composer({
       : [
           {
             value: activeModel,
-            label: catalogLoaded
-              ? prettyModelLabel(activeModel) || activeModel
-              : "Checking model…",
+            label: catalogLoaded ? prettyModelLabel(activeModel) || activeModel : "Checking model…",
             disabled: true,
           },
         ];
@@ -716,6 +740,10 @@ export function Composer({
     if (wantsContextFiles) onRequestContextFiles?.();
   }, [onRequestContextFiles, wantsContextFiles]);
   const nativeActionKey = workingDirectory ? `${runtime}\u0000${workingDirectory}` : "";
+  const nativeActionKeyRef = useRef(nativeActionKey);
+  useEffect(() => {
+    nativeActionKeyRef.current = nativeActionKey;
+  }, [nativeActionKey]);
   const nativeActions = nativeActionsByKey[nativeActionKey] ?? [];
   const activeNativeAction = completedNativeAction(prompt, nativeActions);
   const activeNativeSkill = activeNativeAction?.kind === "skill" ? activeNativeAction : undefined;
@@ -727,43 +755,57 @@ export function Composer({
     [activeNativeSkillPrefix, contextIndex, prompt],
   );
   const mirrorActive = mirrorSegments.some((segment) => segment.token);
+  const loadNativeActions = useCallback(
+    (
+      key: string,
+      targetRuntime: RuntimeId,
+      repository: string,
+    ): Promise<NativeProviderAction[]> => {
+      const existing = nativeActionLoads.current.get(key);
+      if (existing) return existing;
+      if (nativeActionKeyRef.current === key) {
+        setNativeActionsLoadingKey(key);
+        setNativeActionsError("");
+      }
+      const request = bridge
+        .listNativeProviderActions(targetRuntime, repository)
+        .then((actions) => {
+          authoritativeNativeActions.current.set(key, actions);
+          setNativeActionsByKey((current) => {
+            const next = { ...current, [key]: actions };
+            writeNativeActionCache(next);
+            return next;
+          });
+          return actions;
+        })
+        .catch((error) => {
+          if (nativeActionKeyRef.current === key) {
+            setNativeActionsError(
+              error instanceof Error ? error.message : "Could not load provider skills",
+            );
+          }
+          throw error;
+        })
+        .finally(() => {
+          if (nativeActionLoads.current.get(key) === request) {
+            nativeActionLoads.current.delete(key);
+          }
+          setNativeActionsLoadingKey((current) => (current === key ? "" : current));
+        });
+      nativeActionLoads.current.set(key, request);
+      return request;
+    },
+    [],
+  );
   useEffect(() => {
     if (!workingDirectory || !nativeActionKey) return;
     // Cached actions render immediately; the authoritative list still
     // refreshes once per key (or again on explicit retry) in the background.
     const refreshKey = `${nativeActionKey}#${nativeActionRetry}`;
     if (nativeActionRefreshes.current.has(refreshKey)) return;
-    let cancelled = false;
     nativeActionRefreshes.current.add(refreshKey);
-    nativeActionLoads.current.add(nativeActionKey);
-    setNativeActionsLoadingKey(nativeActionKey);
-    setNativeActionsError("");
-    void bridge
-      .listNativeProviderActions(runtime, workingDirectory)
-      .then((actions) => {
-        if (!cancelled) {
-          setNativeActionsByKey((current) => {
-            const next = { ...current, [nativeActionKey]: actions };
-            writeNativeActionCache(next);
-            return next;
-          });
-        }
-      })
-      .catch((error) => {
-        if (!cancelled) {
-          setNativeActionsError(
-            error instanceof Error ? error.message : "Could not load provider skills",
-          );
-        }
-      })
-      .finally(() => {
-        nativeActionLoads.current.delete(nativeActionKey);
-        if (!cancelled) setNativeActionsLoadingKey("");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [nativeActionKey, nativeActionRetry, runtime, workingDirectory]);
+    void loadNativeActions(nativeActionKey, runtime, workingDirectory).catch(() => undefined);
+  }, [loadNativeActions, nativeActionKey, nativeActionRetry, runtime, workingDirectory]);
   const autocompleteMatches = useMemo(
     () =>
       !autocompleteToken
@@ -1262,6 +1304,7 @@ export function Composer({
   useEffect(
     () => () => {
       const capture = voiceCaptureRef.current;
+      const shouldStopVoiceSession = voiceSessionActiveRef.current || Boolean(capture);
       voiceCaptureRef.current = null;
       if (capture) {
         capture.processor.onaudioprocess = null;
@@ -1275,40 +1318,37 @@ export function Composer({
       if (voiceNoticeTimerRef.current !== undefined) {
         window.clearTimeout(voiceNoticeTimerRef.current);
       }
-      if (bridge.stopVoiceTyping) void bridge.stopVoiceTyping().catch(() => undefined);
+      if (shouldStopVoiceSession && bridge.stopVoiceTyping) {
+        void bridge.stopVoiceTyping().catch(() => undefined);
+      }
     },
     [],
   );
 
-  const loadProviderCatalog = useCallback(
-    (targetRuntime: RuntimeId) => {
-      if (providerCatalogs[targetRuntime] || providerCatalogLoads.current.has(targetRuntime))
-        return;
-      providerCatalogLoads.current.add(targetRuntime);
-      void bridge
-        .listModelCatalog?.(targetRuntime)
-        .then((entries) => {
-          setProviderCatalogs((current) => ({
-            ...current,
-            [targetRuntime]: (entries ?? []).filter((entry) => entry.id !== PROVIDER_DEFAULT_MODEL),
-          }));
-        })
-        .catch(() => undefined)
-        .finally(() => providerCatalogLoads.current.delete(targetRuntime));
-    },
-    [providerCatalogs],
-  );
+  const loadProviderCatalog = useCallback((targetRuntime: RuntimeId) => {
+    if (
+      bridge.getCachedModelCatalog(targetRuntime) !== undefined ||
+      providerCatalogLoads.current.has(targetRuntime)
+    ) {
+      return;
+    }
+    providerCatalogLoads.current.add(targetRuntime);
+    void bridge
+      .listModelCatalog(targetRuntime)
+      .catch(() => undefined)
+      .finally(() => providerCatalogLoads.current.delete(targetRuntime));
+  }, []);
 
   useEffect(() => {
     loadProviderCatalog(runtime);
-  }, [loadProviderCatalog, runtime]);
+  }, [cachedCatalog, loadProviderCatalog, runtime]);
 
   // A saved model can belong to a different runtime (for example after an
   // imported settings file or a runtime change from an older build). Once the
   // provider catalog resolves, select its first advertised model so the
   // default route is a real, sendable route rather than a stale id.
   useEffect(() => {
-    const resolvedCatalog = providerCatalogs[runtime];
+    const resolvedCatalog = cachedCatalog;
     if (!resolvedCatalog?.length || resolvedCatalog.some((entry) => entry.id === model)) return;
     const nextEntry = resolvedCatalog[0];
     if (!nextEntry) return;
@@ -1327,13 +1367,28 @@ export function Composer({
     return () => {
       cancelled = true;
     };
-  }, [model, onRoutingChange, preferredRuntimeEffort, providerCatalogs, runtime]);
+  }, [cachedCatalog, model, onRoutingChange, preferredRuntimeEffort, runtime]);
 
   const submit = async () => {
     const trimmed = prompt.trim();
-    if ((!trimmed && attachments.length === 0) || !activeModel || sending) return;
+    if (
+      (!trimmed && attachments.length === 0) ||
+      !activeModel ||
+      sendDisabled ||
+      sending ||
+      submittingRef.current
+    ) {
+      return;
+    }
+    submittingRef.current = true;
+    setSending(true);
     const submittedDraft = trimmed;
     const submittedAttachments = attachments;
+    let draftCleared = false;
+    const restoreDraft = () => {
+      setPrompt((current) => (current.trim() ? current : submittedDraft));
+      setAttachments((current) => (current.length > 0 ? current : submittedAttachments));
+    };
     // Picker attachments and committed @references share one plain-text
     // context block. Providers retain the same path context, while the
     // transcript can re-render the same compact cards after sending.
@@ -1367,21 +1422,40 @@ export function Composer({
         ? `${trimmed}\n\n${attachmentBlock}`
         : trimmed
       : attachmentBlock;
-    const nativeAction = completedNativeAction(trimmed, nativeActions);
-    const nativeActionId = nativeAction?.id;
-    const draftRevision = onDraftSubmit?.(draftValue);
-    setSending(true);
-    // Clear immediately so the composer feels like a send action, not a
-    // request that is waiting on provider/session startup. A rejected send
-    // puts this exact draft back below.
-    suppressDraftEmissionRef.current = true;
-    setPrompt("");
-    setAttachments([]);
-    const restoreDraft = () => {
-      setPrompt((current) => (current.trim() ? current : submittedDraft));
-      setAttachments((current) => (current.length > 0 ? current : submittedAttachments));
-    };
     try {
+      const cachedNativeAction = completedNativeAction(trimmed, nativeActions);
+      const builtInAction = codexGoalAction(trimmed, runtime);
+      let currentActions = authoritativeNativeActions.current.get(nativeActionKey);
+      if (
+        leadingNativeActionName(trimmed) &&
+        nativeActionKey &&
+        workingDirectory &&
+        !currentActions &&
+        !builtInAction
+      ) {
+        currentActions = await loadNativeActions(nativeActionKey, runtime, workingDirectory);
+      }
+      const nativeAction =
+        builtInAction ?? completedNativeAction(trimmed, currentActions ?? nativeActions);
+      if (
+        cachedNativeAction &&
+        (!nativeAction || (cachedNativeAction.id !== nativeAction.id && !builtInAction))
+      ) {
+        setNativeActionsError(
+          "This provider action changed; choose it again from the refreshed slash menu",
+        );
+        textareaRef.current?.focus();
+        return;
+      }
+      const nativeActionId = nativeAction?.id;
+      const draftRevision = onDraftSubmit?.(draftValue);
+      // Clear only after any cached native action has been checked against
+      // the current native catalog. A rejected refresh leaves the draft in
+      // place instead of sending a slash command as ordinary prose.
+      suppressDraftEmissionRef.current = true;
+      setPrompt("");
+      setAttachments([]);
+      draftCleared = true;
       const accepted = await onSend({
         prompt: outgoing,
         draftPrompt: submittedDraft,
@@ -1406,8 +1480,9 @@ export function Composer({
       textareaRef.current?.focus();
     } catch {
       suppressDraftEmissionRef.current = false;
-      restoreDraft();
+      if (draftCleared) restoreDraft();
     } finally {
+      submittingRef.current = false;
       setSending(false);
     }
   };
@@ -1532,7 +1607,7 @@ export function Composer({
                   ? "Project files & folders · ↑↓ to choose · Enter inserts, folders drill in · Esc to dismiss"
                   : "Provider native · ↑↓ to choose · Enter to insert · Esc to dismiss"}
               </p>
-              {autocompleteMatches.length === 0 && skillStatusVisible ? (
+              {skillStatusVisible ? (
                 <p
                   className="composer-autocomplete-status"
                   role={nativeActionsError ? "alert" : "status"}
@@ -1949,8 +2024,8 @@ export function Composer({
                 draftTouchedRef.current = true;
                 routingTouched.current = true;
                 const nextRuntime = next as RuntimeId;
-                const nextRuntimeCatalog =
-                  providerCatalogs[nextRuntime] ??
+                const nextRuntimeCatalog: ModelCatalogEntry[] =
+                  bridge.getCachedModelCatalog(nextRuntime) ??
                   (runtimes.find((item) => item.id === nextRuntime)?.models ?? [])
                     .filter((id) => id !== PROVIDER_DEFAULT_MODEL)
                     .map((id) => ({ id, label: id }));
@@ -2076,7 +2151,12 @@ export function Composer({
                   className="send-button"
                   type="button"
                   onClick={() => void submit()}
-                  disabled={(!prompt.trim() && attachments.length === 0) || !activeModel || sending}
+                  disabled={
+                    (!prompt.trim() && attachments.length === 0) ||
+                    !activeModel ||
+                    sendDisabled ||
+                    sending
+                  }
                   aria-label={sending ? "Sending" : sendLabel}
                   whileTap={motionDisabled ? undefined : { scale: 0.94 }}
                 >

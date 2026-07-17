@@ -1,7 +1,7 @@
 //! `integrator.exe --broker-mcp`: a thin stdio MCP server that provider CLIs
-//! spawn from injected MCP config. It exposes the delegation tool surface
-//! for its role (orchestrator or child) and forwards every `tools/call` to
-//! the app's loopback broker as one line-delimited JSON-RPC request.
+//! spawn from injected MCP config. It exposes task-scoped Integrator tools
+//! and forwards every `tools/call` to the app's loopback host as one
+//! line-delimited JSON-RPC request.
 //!
 //! Deliberately synchronous and dependency-light: one request in flight at a
 //! time, no Tauri, no tokio. If the app (and thus the broker) goes away the
@@ -101,6 +101,28 @@ fn broker_role() -> String {
     std::env::var("INTEGRATOR_BROKER_ROLE").unwrap_or_else(|_| "orchestrator".into())
 }
 
+fn broker_mode() -> String {
+    std::env::var("INTEGRATOR_BROKER_MODE").unwrap_or_else(|_| "off".into())
+}
+
+fn broker_instructions() -> Option<String> {
+    std::env::var("INTEGRATOR_BROKER_INSTRUCTIONS")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty() && value.len() <= 2_048)
+}
+
+fn initialize_result(protocol_version: &str) -> Value {
+    json!({
+        "protocolVersion": protocol_version,
+        "capabilities": { "tools": {} },
+        "serverInfo": {
+            "name": "integrator-local-tools",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+    })
+}
+
 fn text_schema(properties: Value, required: &[&str]) -> Value {
     json!({ "type": "object", "properties": properties, "required": required })
 }
@@ -113,9 +135,50 @@ fn tool_annotations(read_only: bool, destructive: bool) -> Value {
     })
 }
 
-fn tool_definitions(role: &str) -> Vec<Value> {
+fn skill_data_tool(harness_instructions: Option<&str>) -> Value {
+    let mut description = "Fetch read-only data from one allowlisted official provider using a \
+        credential saved in AI Integrator Settings. The credential stays inside the running \
+        native app. Provider values: fred, bls, census, eia, alpha-vantage. FRED, Census, and EIA \
+        require an official path; BLS takes a JSON body; Alpha Vantage uses its fixed /query path."
+        .to_owned();
+    if let Some(instructions) = harness_instructions {
+        description.push_str("\n\n");
+        description.push_str(instructions);
+    }
+    json!({
+        "name": "skill_data_request",
+        "description": description,
+        "annotations": {
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "openWorldHint": true,
+        },
+        "inputSchema": text_schema(json!({
+            "provider": {
+                "type": "string",
+                "enum": ["fred", "bls", "census", "eia", "alpha-vantage"]
+            },
+            "path": {
+                "type": "string",
+                "description": "Official provider path. Required for FRED, Census, and EIA; omit for BLS and Alpha Vantage."
+            },
+            "query": {
+                "type": "object",
+                "description": "Public query parameters. Credential parameter names are reserved and rejected."
+            },
+            "body": {
+                "type": "object",
+                "description": "Public JSON body for BLS. registrationkey is reserved and injected by AI Integrator."
+            }
+        }), &["provider"]),
+    })
+}
+
+fn tool_definitions(role: &str, mode: &str, harness_instructions: Option<&str>) -> Vec<Value> {
+    let data_tool = skill_data_tool(harness_instructions);
     match role {
         "child" => vec![
+            data_tool,
             json!({
                 "name": "task_complete",
                 "description": "Report that your delegated assignment is finished. The summary is your deliverable — include what you did, files touched, and caveats. Always call this exactly once when done.",
@@ -141,7 +204,9 @@ fn tool_definitions(role: &str) -> Vec<Value> {
                 }), &["message"]),
             }),
         ],
+        _ if mode == "off" => vec![data_tool],
         _ => vec![
+            data_tool,
             json!({
                 "name": "peers_list",
                 "description": "List the delegation profiles the user has enabled (other AI coding agents you may delegate subtasks to), with cost tiers and current concurrency headroom.",
@@ -217,6 +282,7 @@ pub fn run() -> i32 {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     let role = broker_role();
+    let mode = broker_mode();
     let mut link: Option<BrokerLink> = None;
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -246,21 +312,20 @@ pub fn run() -> i32 {
                     .get("protocolVersion")
                     .and_then(Value::as_str)
                     .unwrap_or(PROTOCOL_VERSION);
-                respond(
-                    &mut stdout,
-                    id,
-                    json!({
-                        "protocolVersion": requested,
-                        "capabilities": { "tools": {} },
-                        "serverInfo": {
-                            "name": "integrator-delegation-broker",
-                            "version": env!("CARGO_PKG_VERSION"),
-                        },
-                    }),
-                );
+                respond(&mut stdout, id, initialize_result(requested));
             }
             "ping" => respond(&mut stdout, id, json!({})),
-            "tools/list" => respond(&mut stdout, id, json!({ "tools": tool_definitions(&role) })),
+            "tools/list" => respond(
+                &mut stdout,
+                id,
+                json!({
+                    "tools": tool_definitions(
+                        &role,
+                        &mode,
+                        broker_instructions().as_deref(),
+                    )
+                }),
+            ),
             "tools/call" => {
                 let name = params
                     .get("name")
@@ -275,7 +340,7 @@ pub fn run() -> i32 {
                             respond(
                                 &mut stdout,
                                 id,
-                                tool_error(&format!("delegation broker unavailable: {error}")),
+                                tool_error(&format!("Integrator local tools unavailable: {error}")),
                             );
                             continue;
                         }
@@ -325,24 +390,40 @@ mod tests {
 
     #[test]
     fn tool_lists_are_role_scoped() {
-        let orchestrator: Vec<String> = tool_definitions("orchestrator")
+        let orchestrator: Vec<String> = tool_definitions("orchestrator", "balanced", None)
             .iter()
             .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned))
             .collect();
         assert!(orchestrator.contains(&"delegate_start".to_owned()));
+        assert!(orchestrator.contains(&"skill_data_request".to_owned()));
         assert!(!orchestrator.contains(&"task_complete".to_owned()));
 
-        let child: Vec<String> = tool_definitions("child")
+        let child: Vec<String> = tool_definitions("child", "off", None)
             .iter()
             .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned))
             .collect();
         assert!(child.contains(&"task_complete".to_owned()));
+        assert!(child.contains(&"skill_data_request".to_owned()));
         assert!(!child.contains(&"delegate_start".to_owned()));
+
+        let delegation_off: Vec<String> = tool_definitions("orchestrator", "off", None)
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        assert_eq!(delegation_off, vec!["skill_data_request"]);
+    }
+
+    #[test]
+    fn cursor_receives_harness_policy_in_the_always_present_tool_schema() {
+        let tools = tool_definitions("orchestrator", "off", Some("durable harness policy"));
+        let description = tools[0]["description"].as_str().expect("tool description");
+        assert!(description.contains("Fetch read-only data"));
+        assert!(description.contains("durable harness policy"));
     }
 
     #[test]
     fn tool_annotations_match_broker_side_effects() {
-        let orchestrator = tool_definitions("orchestrator");
+        let orchestrator = tool_definitions("orchestrator", "balanced", None);
         let annotation = |name: &str, key: &str| {
             orchestrator
                 .iter()
@@ -355,10 +436,10 @@ mod tests {
         assert_eq!(annotation("delegation_status", "readOnlyHint"), Some(false));
         assert_eq!(annotation("delegate_start", "readOnlyHint"), Some(false));
         assert_eq!(annotation("delegation_stop", "destructiveHint"), Some(true));
-        assert!(
-            orchestrator
-                .iter()
-                .all(|tool| { tool["annotations"]["openWorldHint"].as_bool() == Some(false) })
+        assert_eq!(
+            annotation("skill_data_request", "openWorldHint"),
+            Some(true)
         );
+        assert_eq!(annotation("peers_list", "openWorldHint"), Some(false));
     }
 }

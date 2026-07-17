@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bridge, type ComposerDraftValue, type RuntimeConnection } from "../bridge";
 import { Composer } from "./Composer";
@@ -79,5 +79,44 @@ describe("Composer draft lifecycle", () => {
     await waitFor(() =>
       expect(screen.getByRole("textbox", { name: "Task message" })).toHaveValue(draft.prompt),
     );
+  });
+
+  it("submits once when two send events land in the same render", async () => {
+    vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
+      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
+    ]);
+    const onSend = vi.fn(() => new Promise<boolean>(() => undefined));
+    render(
+      <Composer
+        runtimes={runtimes}
+        defaultRuntime="codex"
+        defaultModel="gpt-5.6-luna"
+        initialDraft={draft}
+        onSend={onSend}
+      />,
+    );
+
+    const send = screen.getByRole("button", { name: "Send message" });
+    act(() => {
+      send.click();
+      send.click();
+    });
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+  });
+
+  it("does not stop a voice session that was never started", () => {
+    const stopVoiceTyping = vi.spyOn(bridge, "stopVoiceTyping").mockResolvedValue(undefined);
+    const { unmount } = render(
+      <Composer
+        runtimes={runtimes}
+        defaultRuntime="codex"
+        defaultModel="gpt-5.6-luna"
+        onSend={vi.fn().mockResolvedValue(true)}
+      />,
+    );
+
+    unmount();
+    expect(stopVoiceTyping).not.toHaveBeenCalled();
   });
 });

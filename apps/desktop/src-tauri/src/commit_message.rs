@@ -6,7 +6,7 @@ use session_store::CommitMessageGenerationClaim;
 use tauri::State;
 
 use crate::{
-    chat_title::{HelperRoute, generate_isolated_provider_text_routed},
+    chat_title::{HelperRoute, generate_isolated_provider_text_routed, looks_like_provider_error},
     code_explain::ExplainRoute,
     commands::{CommandError, CommandResult, authorized_git},
     provider_routing::{is_worth_failing_over, provider_chain},
@@ -285,6 +285,7 @@ fn parse_commit_message(raw: &str) -> Option<String> {
         || message.chars().any(char::is_control)
         || message.starts_with(['#', '-', '*'])
         || message.ends_with(['!', '?', ':', ';'])
+        || looks_like_provider_error(message)
     {
         return None;
     }
@@ -362,6 +363,14 @@ mod tests {
         assert_eq!(parse_commit_message("fix: valid\nExplanation"), None);
         assert_eq!(parse_commit_message("- fix: markdown list"), None);
         assert_eq!(parse_commit_message("fix: terminal punctuation!"), None);
+        assert_eq!(
+            parse_commit_message("Error: RetriableError: [resource_exhausted] Error"),
+            None
+        );
+        assert_eq!(
+            parse_commit_message("fix: improve error handling"),
+            Some("fix: improve error handling".into())
+        );
     }
 
     #[test]
