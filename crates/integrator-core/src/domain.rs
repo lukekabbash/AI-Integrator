@@ -75,6 +75,7 @@ pub enum ProviderKind {
     Antigravity,
     Cursor,
     Grok,
+    Kimi,
     CustomAcp,
 }
 
@@ -87,6 +88,7 @@ impl ProviderKind {
             Self::Antigravity => "antigravity",
             Self::Cursor => "cursor",
             Self::Grok => "grok",
+            Self::Kimi => "kimi",
             Self::CustomAcp => "custom-acp",
         }
     }
@@ -108,6 +110,7 @@ impl FromStr for ProviderKind {
             "antigravity" | "gemini" => Ok(Self::Antigravity),
             "cursor" => Ok(Self::Cursor),
             "grok" => Ok(Self::Grok),
+            "kimi" => Ok(Self::Kimi),
             "custom-acp" => Ok(Self::CustomAcp),
             _ => Err(crate::IntegratorError::InvalidInput(format!(
                 "unknown provider kind: {value}"
@@ -616,6 +619,32 @@ impl FromStr for DelegationSender {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegationRoute {
+    pub runtime: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+/// The host-resolved specialist contract frozen when a delegation is
+/// requested. Existing children never reread the mutable Settings profile.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegationCapabilitySnapshot {
+    pub version: u32,
+    pub profile_id: String,
+    pub profile_label: String,
+    pub best_for: String,
+    pub working_guidance: String,
+    pub access_ceiling: DelegationPermission,
+    pub service_level: String,
+    pub routes: Vec<DelegationRoute>,
+    pub skill_ids: Vec<String>,
+    pub mcp_server_ids: Vec<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Delegation {
@@ -630,6 +659,11 @@ pub struct Delegation {
     pub runtime: String,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Budget, Standard, or Premium route selected for this child.
+    #[serde(default = "default_delegation_service_level")]
+    pub service_level: String,
+    /// Immutable specialist, route, access, and capability selection.
+    pub capability_snapshot: DelegationCapabilitySnapshot,
     #[serde(default)]
     pub permission: DelegationPermission,
     pub title: String,
@@ -644,6 +678,10 @@ pub struct Delegation {
     pub child_session_ref: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+fn default_delegation_service_level() -> String {
+    "standard".into()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -670,6 +708,10 @@ mod tests {
         assert_eq!(json, "\"custom-acp\"");
         let decoded: ProviderKind = serde_json::from_str(&json).expect("deserialize provider");
         assert_eq!(decoded, ProviderKind::CustomAcp);
+        assert_eq!(
+            ProviderKind::from_str("kimi").expect("Kimi provider wire id"),
+            ProviderKind::Kimi
+        );
     }
 
     #[test]

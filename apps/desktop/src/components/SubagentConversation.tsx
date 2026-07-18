@@ -102,7 +102,7 @@ export function SubagentConversation({
   const scrollRef = useRef<HTMLDivElement>(null);
   const autoResumeAttemptedRef = useRef(new Set<string>());
   // User/orchestrator Stop must never look like crash recovery on reopen.
-  const userStoppedTurnsRef = useRef(new Set<string>());
+  const [userStoppedTurns, setUserStoppedTurns] = useState<ReadonlySet<string>>(() => new Set());
   const childTaskId = delegation.childTaskId ?? undefined;
 
   useEffect(() => {
@@ -252,24 +252,18 @@ export function SubagentConversation({
     [projectedEvents, visibleOptimisticMessages],
   );
   const turnRunning = projection?.turn?.status === "inProgress" && activeStatus(delegation.status);
-  const turnStopKey =
-    childTaskId && projection?.turn ? `${childTaskId}:${projection.turn.id}` : "";
+  const turnStopKey = childTaskId && projection?.turn ? `${childTaskId}:${projection.turn.id}` : "";
   const intentionallyStopped =
     delegation.status === "stopped" ||
     Boolean(projection?.turn?.stopRequested) ||
-    (turnStopKey !== "" && userStoppedTurnsRef.current.has(turnStopKey));
+    (turnStopKey !== "" && userStoppedTurns.has(turnStopKey));
   // Only process-loss Interrupted is resumeable. Stopped (user or orchestrator)
   // and stopRequested turns stay idle when the pane opens — never auto-restart.
   const showResume =
-    Boolean(onSend) &&
-    !turnRunning &&
-    !intentionallyStopped &&
-    delegation.status === "interrupted";
+    Boolean(onSend) && !turnRunning && !intentionallyStopped && delegation.status === "interrupted";
   const showResumeControl =
     showResume && (!autoResumeInterrupted || Boolean(recoveryError)) && !resuming;
-  const recoveryKey = showResume
-    ? `${delegation.id}:${projection?.turn?.id ?? "status"}`
-    : "";
+  const recoveryKey = showResume ? `${delegation.id}:${projection?.turn?.id ?? "status"}` : "";
   const canMessage = Boolean(
     onSend &&
     childTaskId &&
@@ -277,13 +271,29 @@ export function SubagentConversation({
     delegation.status !== "denied" &&
     delegation.status !== "starting",
   );
-  const supportedRuntimes = useMemo(
-    () =>
-      runtimes.filter((runtime) =>
-        ["codex", "claude", "antigravity", "cursor", "grok"].includes(runtime.id),
-      ),
-    [runtimes],
-  );
+  const supportedRuntimes = useMemo(() => {
+    const frozenRoutes = delegation.capabilitySnapshot?.routes;
+    const allowed = new Set(
+      frozenRoutes?.map((route) => route.runtime) ?? [
+        "codex",
+        "claude",
+        "antigravity",
+        "cursor",
+        "grok",
+        "kimi",
+      ],
+    );
+    return runtimes
+      .filter((runtime) => allowed.has(runtime.id))
+      .map((runtime) => {
+        if (!frozenRoutes) return runtime;
+        const models = frozenRoutes
+          .filter((route) => route.runtime === runtime.id)
+          .map((route) => route.model)
+          .filter((model): model is string => Boolean(model));
+        return models.length > 0 ? { ...runtime, models: [...new Set(models)] } : runtime;
+      });
+  }, [delegation.capabilitySnapshot?.routes, runtimes]);
   const reviewFile =
     git?.files.find((file) => diffFileKey(file) === reviewFileKey) ?? git?.files[0];
   const totalTokens = projection?.usage?.totalTokens ?? 0;
@@ -397,7 +407,9 @@ export function SubagentConversation({
 
   const stop = async () => {
     if (!onStop || stopping) return;
-    if (turnStopKey) userStoppedTurnsRef.current.add(turnStopKey);
+    if (turnStopKey) {
+      setUserStoppedTurns((current) => new Set(current).add(turnStopKey));
+    }
     setProjection((current) => {
       if (!current?.turn || current.turn.stopRequested) return current;
       return {
@@ -410,7 +422,13 @@ export function SubagentConversation({
     try {
       await onStop(delegation.id);
     } catch (error) {
-      if (turnStopKey) userStoppedTurnsRef.current.delete(turnStopKey);
+      if (turnStopKey) {
+        setUserStoppedTurns((current) => {
+          const next = new Set(current);
+          next.delete(turnStopKey);
+          return next;
+        });
+      }
       setActionError(error instanceof Error ? error.message : "Could not stop this subagent");
     } finally {
       setStopping(false);
@@ -542,9 +560,7 @@ export function SubagentConversation({
             {turnRunning || showResumeControl || resuming ? (
               <TaskStatusPill
                 key="subagent-status-pill"
-                runningSince={
-                  turnRunning || resuming ? projection?.turn?.startedAt : undefined
-                }
+                runningSince={turnRunning || resuming ? projection?.turn?.startedAt : undefined}
                 usage={projection?.usage}
                 recovery={
                   showResumeControl ? (
@@ -582,7 +598,7 @@ export function SubagentConversation({
                 defaultRuntime={selectedRouting.runtime}
                 defaultModel={selectedRouting.model}
                 defaultEffort={selectedRouting.effort}
-                defaultPermission="project-write"
+                defaultPermission={delegation.permission ?? "read-only"}
                 defaultDelegation="off"
                 enterToSend={enterToSend}
                 contextFiles={contextFiles}

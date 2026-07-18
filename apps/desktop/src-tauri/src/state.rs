@@ -183,6 +183,9 @@ pub struct DelegationChild {
     /// disables sentinel routing so tooled children can quote the syntax
     /// safely (e.g. while working on Integrator's own source).
     pub sentinel_watermark: Option<Arc<std::sync::Mutex<i64>>>,
+    /// Exact selected-skill index for runtimes without native plugin loading.
+    /// Wire-only and repeated on each fresh turn/session continuation.
+    pub capability_index: Option<String>,
     pub driver: DelegationChildDriver,
 }
 
@@ -198,6 +201,7 @@ pub enum DelegationChildDriver {
         effort: Option<String>,
         permission: DelegationPermission,
         mcp_config: Option<PathBuf>,
+        plugin_dirs: Vec<PathBuf>,
         session_ref: Arc<std::sync::Mutex<Option<String>>>,
     },
     /// Codex app-server: one long-lived process per child thread.

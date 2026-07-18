@@ -28,9 +28,9 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use chrono::Utc;
 use integrator_core::{
-    Delegation, DelegationId, DelegationPermission, DelegationSender, DelegationStatus,
-    IntegratorError, ItemKind, ItemProjection, ItemStatus, ProviderKind, Result, RuntimeBinding,
-    TaskId, TurnStatus,
+    Delegation, DelegationCapabilitySnapshot, DelegationId, DelegationPermission, DelegationRoute,
+    DelegationSender, DelegationStatus, IntegratorError, ItemKind, ItemProjection, ItemStatus,
+    ProviderKind, Result, RuntimeBinding, TaskId, TurnStatus,
 };
 use integrator_runtime::{
     ProjectionMutation, ReducedProviderEvent, StructuredCliEventKind, StructuredCliLaunchOptions,
@@ -78,6 +78,9 @@ fn interrupted_resume_wire_prompt(interrupted_at: Option<chrono::DateTime<chrono
     )
 }
 const MAX_LINE_BYTES: usize = 256 * 1024;
+const MAX_SPECIALISTS: usize = 64;
+const MAX_SPECIALIST_CAPABILITIES: usize = 128;
+const MAX_SERVICE_FALLBACKS: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Settings-backed policy
@@ -88,19 +91,42 @@ const MAX_LINE_BYTES: usize = 256 * 1024;
 pub struct DelegationProfile {
     pub id: String,
     pub label: String,
-    pub runtime: String,
+    #[serde(default)]
+    pub best_for: String,
+    #[serde(default)]
+    pub working_guidance: String,
+    #[serde(default)]
+    pub access: Option<DelegationPermission>,
+    #[serde(default)]
+    pub service_levels: Vec<DelegationServiceLevel>,
+    #[serde(default)]
+    pub skill_ids: Vec<String>,
+    #[serde(default)]
+    pub mcp_server_ids: Vec<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    // Legacy fields are accepted only to migrate existing local settings.
+    #[serde(default, skip_serializing)]
+    pub runtime: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub instruction: Option<String>,
-    #[serde(default)]
-    pub preferred_child_profile_ids: Vec<String>,
-    #[serde(default = "default_cost_tier")]
-    pub cost_tier: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegationServiceLevel {
+    pub level: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    pub primary: DelegationRoute,
+    #[serde(default)]
+    pub fallbacks_enabled: bool,
+    #[serde(default)]
+    pub fallbacks: Vec<DelegationRoute>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -113,19 +139,33 @@ pub struct DelegationRoutingInput {
     pub effort: Option<String>,
 }
 
-fn default_cost_tier() -> String {
-    "medium".into()
-}
-
 const fn default_true() -> bool {
     true
 }
 
-fn cost_rank(tier: &str) -> u8 {
-    match tier {
-        "low" => 0,
-        "medium" => 1,
+fn service_rank(level: &str) -> u8 {
+    match level {
+        "budget" => 0,
+        "standard" => 1,
         _ => 2,
+    }
+}
+
+fn default_service_level(
+    runtime: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> DelegationServiceLevel {
+    DelegationServiceLevel {
+        level: "standard".into(),
+        enabled: true,
+        primary: DelegationRoute {
+            runtime: runtime.into(),
+            model: model.map(str::to_owned),
+            effort: effort.map(str::to_owned),
+        },
+        fallbacks_enabled: false,
+        fallbacks: Vec::new(),
     }
 }
 
@@ -137,56 +177,91 @@ fn default_profiles() -> Vec<DelegationProfile> {
         DelegationProfile {
             id: "codex-default".into(),
             label: "Codex (OpenAI)".into(),
-            runtime: "codex".into(),
+            best_for: "Implementation, tests, and careful repository work.".into(),
+            working_guidance: String::new(),
+            access: Some(DelegationPermission::ReadOnly),
+            service_levels: vec![default_service_level("codex", None, None)],
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+            runtime: None,
             model: None,
             effort: None,
             instruction: None,
-            preferred_child_profile_ids: Vec::new(),
-            cost_tier: "low".into(),
             enabled: true,
         },
         DelegationProfile {
             id: "claude-default".into(),
             label: "Claude".into(),
-            runtime: "claude".into(),
+            best_for: "Review, synthesis, and nuanced product reasoning.".into(),
+            working_guidance: String::new(),
+            access: Some(DelegationPermission::ReadOnly),
+            service_levels: vec![default_service_level("claude", None, None)],
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+            runtime: None,
             model: None,
             effort: None,
             instruction: None,
-            preferred_child_profile_ids: Vec::new(),
-            cost_tier: "high".into(),
             enabled: true,
         },
         DelegationProfile {
             id: "antigravity-default".into(),
             label: "Antigravity (Gemini)".into(),
-            runtime: "antigravity".into(),
+            best_for: "Broad exploration and alternate implementation approaches.".into(),
+            working_guidance: String::new(),
+            access: Some(DelegationPermission::ReadOnly),
+            service_levels: vec![default_service_level("antigravity", None, None)],
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+            runtime: None,
             model: None,
             effort: None,
             instruction: None,
-            preferred_child_profile_ids: Vec::new(),
-            cost_tier: "medium".into(),
             enabled: true,
         },
         DelegationProfile {
             id: "cursor-default".into(),
             label: "Cursor".into(),
-            runtime: "cursor".into(),
+            best_for: "Focused codebase navigation and implementation.".into(),
+            working_guidance: String::new(),
+            access: Some(DelegationPermission::ReadOnly),
+            service_levels: vec![default_service_level("cursor", None, None)],
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+            runtime: None,
             model: None,
             effort: None,
             instruction: None,
-            preferred_child_profile_ids: Vec::new(),
-            cost_tier: "medium".into(),
             enabled: true,
         },
         DelegationProfile {
             id: "grok-default".into(),
             label: "Grok Build".into(),
-            runtime: "grok".into(),
+            best_for: "Fast mechanical work and second-pass verification.".into(),
+            working_guidance: String::new(),
+            access: Some(DelegationPermission::ReadOnly),
+            service_levels: vec![default_service_level("grok", None, None)],
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+            runtime: None,
             model: None,
             effort: None,
             instruction: None,
-            preferred_child_profile_ids: Vec::new(),
-            cost_tier: "low".into(),
+            enabled: true,
+        },
+        DelegationProfile {
+            id: "kimi-default".into(),
+            label: "Kimi Code".into(),
+            best_for: "Long-context repository work and an independent coding pass.".into(),
+            working_guidance: String::new(),
+            access: Some(DelegationPermission::ReadOnly),
+            service_levels: vec![default_service_level("kimi", None, None)],
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+            runtime: None,
+            model: None,
+            effort: None,
+            instruction: None,
             enabled: true,
         },
     ]
@@ -205,9 +280,113 @@ fn read_setting(store: &LocalStore, key: &str) -> Option<Value> {
 /// means the user removed every profile on purpose. Only a missing or
 /// malformed setting falls back to the built-in defaults.
 pub fn delegation_profiles(store: &LocalStore) -> Vec<DelegationProfile> {
-    read_setting(store, "settings.delegation.profiles")
-        .and_then(|value| serde_json::from_value::<Vec<DelegationProfile>>(value).ok())
-        .unwrap_or_else(default_profiles)
+    let Some(value) = read_setting(store, "settings.delegation.profiles") else {
+        return default_profiles();
+    };
+    let Ok(profiles) = serde_json::from_value::<Vec<DelegationProfile>>(value) else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    profiles
+        .into_iter()
+        .take(MAX_SPECIALISTS)
+        .filter_map(normalize_profile)
+        .filter(|profile| seen.insert(profile.id.clone()))
+        .collect()
+}
+
+fn normalize_profile(mut profile: DelegationProfile) -> Option<DelegationProfile> {
+    profile.id = profile.id.trim().to_owned();
+    profile.label = profile.label.trim().to_owned();
+    if profile.id.is_empty()
+        || profile.label.is_empty()
+        || profile.id.len() > 128
+        || profile.label.chars().count() > 120
+    {
+        return None;
+    }
+    if profile.service_levels.is_empty() {
+        let runtime = profile.runtime.as_deref()?;
+        ProviderKind::from_str(runtime).ok()?;
+        profile.service_levels = vec![default_service_level(
+            runtime,
+            profile.model.as_deref(),
+            profile.effort.as_deref(),
+        )];
+        profile.working_guidance = profile.instruction.take().unwrap_or_default();
+        profile.access = Some(DelegationPermission::ProjectWrite);
+    }
+    let mut levels = std::collections::HashSet::new();
+    profile.service_levels = profile
+        .service_levels
+        .into_iter()
+        .filter_map(|mut service| {
+            service.level = service.level.trim().to_owned();
+            if !matches!(service.level.as_str(), "budget" | "standard" | "premium")
+                || !levels.insert(service.level.clone())
+            {
+                return None;
+            }
+            service.primary = normalize_route(service.primary)?;
+            let mut seen_routes = std::collections::HashSet::new();
+            seen_routes.insert(service.primary.clone());
+            service.fallbacks = service
+                .fallbacks
+                .into_iter()
+                .filter_map(normalize_route)
+                .filter(|route| seen_routes.insert(route.clone()))
+                .take(MAX_SERVICE_FALLBACKS)
+                .collect();
+            Some(service)
+        })
+        .collect();
+    if profile.service_levels.is_empty() {
+        return None;
+    }
+    profile.skill_ids = normalize_capability_ids(profile.skill_ids);
+    profile.mcp_server_ids = normalize_capability_ids(profile.mcp_server_ids);
+    profile.best_for = profile.best_for.trim().chars().take(2_000).collect();
+    profile.working_guidance = profile
+        .working_guidance
+        .trim()
+        .chars()
+        .take(64 * 1024)
+        .collect();
+    Some(profile)
+}
+
+fn normalize_route(mut route: DelegationRoute) -> Option<DelegationRoute> {
+    route.runtime = route.runtime.trim().to_owned();
+    let provider = ProviderKind::from_str(&route.runtime).ok()?;
+    if !matches!(
+        provider,
+        ProviderKind::Codex
+            | ProviderKind::Claude
+            | ProviderKind::Antigravity
+            | ProviderKind::Cursor
+            | ProviderKind::Grok
+            | ProviderKind::Kimi
+    ) {
+        return None;
+    }
+    route.model = normalized_optional_text(route.model, 256);
+    route.effort = normalized_optional_text(route.effort, 64);
+    Some(route)
+}
+
+fn normalized_optional_text(value: Option<String>, max_chars: usize) -> Option<String> {
+    value
+        .map(|value| value.trim().chars().take(max_chars).collect::<String>())
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_capability_ids(ids: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    ids.into_iter()
+        .map(|id| id.trim().chars().take(256).collect::<String>())
+        .filter(|id| !id.is_empty() && seen.insert(id.clone()))
+        .take(MAX_SPECIALIST_CAPABILITIES)
+        .collect()
 }
 
 fn enabled_profile(store: &LocalStore, profile_id: &str) -> Result<DelegationProfile> {
@@ -224,13 +403,60 @@ fn enabled_profile(store: &LocalStore, profile_id: &str) -> Result<DelegationPro
 fn max_concurrent(store: &LocalStore) -> u32 {
     read_setting(store, "settings.delegation.maxConcurrent")
         .and_then(|value| value.as_u64())
-        .map_or(3, |value| value.clamp(1, 16) as u32)
+        .map_or(3, |value| value.clamp(1, 4) as u32)
 }
 
 fn custom_instruction(store: &LocalStore) -> Option<String> {
     read_setting(store, "settings.delegation.instruction")
         .and_then(|value| value.as_str().map(str::to_owned))
         .filter(|value| !value.trim().is_empty())
+}
+
+fn select_service_level<'a>(
+    profile: &'a DelegationProfile,
+    requested: Option<&str>,
+    mode: &str,
+) -> Result<&'a DelegationServiceLevel> {
+    if let Some(requested) = requested {
+        if !matches!(requested, "budget" | "standard" | "premium") {
+            return Err(IntegratorError::InvalidInput(format!(
+                "unknown specialist service level '{requested}'"
+            )));
+        }
+        return profile
+            .service_levels
+            .iter()
+            .find(|service| service.enabled && service.level == requested)
+            .ok_or_else(|| {
+                IntegratorError::Unavailable(format!(
+                    "specialist '{}' does not offer the {requested} service level",
+                    profile.label
+                ))
+            });
+    }
+
+    let preferred = if mode == "budget-first" {
+        "budget"
+    } else {
+        "standard"
+    };
+    profile
+        .service_levels
+        .iter()
+        .find(|service| service.enabled && service.level == preferred)
+        .or_else(|| {
+            profile
+                .service_levels
+                .iter()
+                .filter(|service| service.enabled)
+                .min_by_key(|service| service_rank(&service.level))
+        })
+        .ok_or_else(|| {
+            IntegratorError::Unavailable(format!(
+                "specialist '{}' has no enabled service level",
+                profile.label
+            ))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -243,14 +469,14 @@ fn custom_instruction(store: &LocalStore) -> Option<String> {
 /// "Integrator delegation" works instead of just calling the tools.
 pub fn orchestrator_preamble(store: &LocalStore, mode: &str) -> String {
     let mut block = String::from(
-        "<delegation>\nYou can delegate subtasks to subagents running on other AI providers. The tools for this are already connected on the `integrator` MCP server: peers_list, delegate_start, delegation_status, delegation_message, delegation_result, delegation_stop. Call them directly — do not search this repository, read Integrator source code, or shell out to provider CLIs to figure out how delegation works. This block plus the tool descriptions are the complete contract.\n\nWorkflow:\n1. peers_list — see which delegation profiles the user has enabled (provider, cost tier, concurrency headroom). Only these profiles exist; there is no other peer discovery.\n2. delegate_start(profileId, title, brief, permission) — launch a subagent. It works in this same repository but sees only a short digest of recent conversation plus your brief, so the brief must stand alone: goal, constraints, relevant files, and the exact deliverable you expect back. Use permission \"read-only\" for research, audits, and repo orientation; \"project-write\" only when it must edit files.\n3. delegate_start returns a delegationId immediately and the subagent runs in the background. Do not block waiting on it — continue your own work, and launch several delegations in parallel when subtasks are independent.\n4. delegation_status — check progress when convenient and whenever a <delegation-update> block appears in your prompt. Subagents may queue questions or progress reports for you there; answer with delegation_message(delegationId, message).\n5. delegation_result(delegationId) — collect the finished deliverable (the subagent's summary plus a transcript digest) and integrate it. Verify delegated work before relying on it; your task is not done while delegations you still need are running.\n6. delegation_stop(delegationId) — stop a subagent you no longer need.\n",
+        "<delegation>\nYou can delegate subtasks to user-configured specialists running on other AI providers. The tools for this are already connected on the `integrator` MCP server: peers_list, delegate_start, delegation_status, delegation_message, delegation_thread, delegation_result, delegation_stop. Call them directly — do not search this repository, read Integrator source code, or shell out to provider CLIs to figure out how delegation works. This block plus the tool descriptions are the complete contract.\n\nWorkflow:\n1. peers_list — see which specialists the user enabled, what each is best for, its Budget/Standard/Premium service levels, access ceiling, capability counts, and concurrency headroom. Working guidance is child-only and is intentionally not shown to you.\n2. delegate_start(profileId, serviceLevel, title, brief, permission) — launch a specialist. Pick the specialist by Best for, then the cheapest service level adequate for the task. The child works in this repository but sees only a short digest of recent conversation plus your brief, so the brief must stand alone: goal, constraints, relevant files, and exact deliverable. Use permission \"read-only\" unless edits are necessary; the host rejects access above the specialist's ceiling.\n3. The selected profile, service route, fallbacks, guidance, access, Skills/Plugins, and MCP servers are frozen for that delegation. Fallbacks are tried in order only when an earlier runtime is unavailable before launch; they are not load balancing or mid-turn failover.\n4. delegate_start returns a delegationId immediately and the subagent runs in the background. Do not block waiting on it — continue your own work, and launch several delegations in parallel when subtasks are independent.\n5. delegation_status — check progress when convenient and whenever a <delegation-update> block appears in your prompt. Subagents may queue questions or progress reports mid-run; answer with delegation_message(delegationId, message). Use delegation_thread(delegationId) when you need the persisted child conversation rather than its compact status. The user can open the same transcript in the Agents rail.\n6. delegation_result(delegationId) — collect the finished deliverable (the subagent's summary plus a transcript digest) and integrate it. Verify delegated work before relying on it; your task is not done while delegations you still need are running.\n7. delegation_stop(delegationId) — stop a subagent you no longer need.\n",
     );
     match mode {
         "manual" => block.push_str(
             "Mode: manual — every delegate_start waits for the user to approve it in the task's Agents rail (right panel) before the subagent launches. Approving the tool call in chat is not the same thing; if a delegation stays pending-approval, tell the user to open the Agents rail and press Approve there.\n",
         ),
         "budget-first" => block.push_str(
-            "Mode: budget-first — prefer the cheapest profile capable of the subtask; peers_list is ordered cheapest first.\n",
+            "Mode: budget-first — prefer an enabled Budget service level on the best-matched specialist; the host falls back to its cheapest enabled level when Budget is unavailable.\n",
         ),
         _ => {}
     }
@@ -292,41 +518,26 @@ pub fn pending_updates_block(store: &LocalStore, parent_task_id: TaskId) -> Opti
     Some(block)
 }
 
-fn child_preamble(
-    delegation: &Delegation,
-    has_tools: bool,
-    profile: Option<&DelegationProfile>,
-    preferred_children: &[String],
-) -> String {
+fn child_preamble(delegation: &Delegation, has_tools: bool) -> String {
     let mut block = format!(
         "<subagent-brief>\nYou are a delegated subagent working on behalf of an orchestrator agent in this repository. Your assignment: {}\nWorkspace permission: {}. This boundary is enforced by the host; do not ask to widen it.\n\n{}\n",
         delegation.title,
         delegation.permission.as_str(),
         delegation.brief
     );
-    if let Some(instruction) = profile
-        .and_then(|profile| profile.instruction.as_deref())
-        .map(str::trim)
-        .filter(|instruction| !instruction.is_empty())
-    {
+    let instruction = delegation.capability_snapshot.working_guidance.trim();
+    if !instruction.is_empty() {
         block.push_str("\n<specialist-instructions>\n");
         block.push_str(&redact_and_bound(instruction, 64 * 1024).0);
         block.push_str("\n</specialist-instructions>\n");
     }
-    if !preferred_children.is_empty() {
-        block.push_str("\nPreferred downstream helper profiles: ");
-        block.push_str(&preferred_children.join(", "));
-        block.push_str(
-            ". Recursive launching is policy-gated; use this preference when proposing or reporting follow-up delegation.\n",
-        );
-    }
     if has_tools {
         block.push_str(
-            "\nReporting back: your orchestrator cannot see this transcript. The `integrator` MCP tools below are your only channel to it — use them instead of just printing text and stopping.\n- task_complete(summary): call this exactly once when your assignment is done. The summary is your entire deliverable — state what you did, files touched, key decisions, and caveats. Ending your final turn without calling task_complete leaves the orchestrator waiting on you.\n- orchestrator_ask(message): queue a question when you are blocked or the brief is ambiguous. Include enough context to answer without seeing your transcript. Delivery is asynchronous — keep making progress on anything that does not depend on the answer.\n- orchestrator_report(message): send short progress notes during long-running work; fire and forget.\n",
+            "\nReporting back: your orchestrator may inspect this transcript, but use the `integrator` MCP tools for active coordination so questions and progress are surfaced immediately.\n- task_complete(summary): call this exactly once when your assignment is done. The summary is your entire deliverable — state what you did, files touched, key decisions, and caveats. Ending your final turn without calling task_complete leaves the orchestrator waiting on you.\n- orchestrator_ask(message): queue a question when you are blocked or the brief is ambiguous. Include enough context to answer without opening your transcript. Delivery is asynchronous — keep making progress on anything that does not depend on the answer.\n- orchestrator_report(message): send short progress notes during long-running work; fire and forget.\n",
         );
     } else {
         block.push_str(
-            "\nReporting back: your orchestrator cannot see this transcript and you have no messaging tools. Instead, Integrator scans your replies for the following blocks and routes them to the orchestrator. Write each block as plain text on its own lines — never inside a code fence, and never as an example you do not mean.\n- <integrator:complete>…</integrator:complete> — emit exactly once, when your assignment is done. Its contents are recorded as your entire deliverable: what you did, files touched, key decisions, caveats.\n- <integrator:ask>…</integrator:ask> — when you are blocked or the brief is ambiguous. Include enough context to answer without seeing this transcript; the answer arrives in a later turn, so keep making progress on anything that does not depend on it.\n- <integrator:report>…</integrator:report> — short progress notes during long-running work; fire and forget.\nIf you finish without emitting <integrator:complete>, your final reply is captured as your deliverable instead — but prefer the block.\n",
+            "\nReporting back: your orchestrator may inspect this transcript, but this runtime has no live messaging tools. Instead, Integrator scans your replies for the following blocks and routes them to the orchestrator. Write each block as plain text on its own lines — never inside a code fence, and never as an example you do not mean.\n- <integrator:complete>…</integrator:complete> — emit exactly once, when your assignment is done. Its contents are recorded as your entire deliverable: what you did, files touched, key decisions, caveats.\n- <integrator:ask>…</integrator:ask> — when you are blocked or the brief is ambiguous. Include enough context to answer without requiring transcript inspection; the answer arrives in a later turn, so keep making progress on anything that does not depend on it.\n- <integrator:report>…</integrator:report> — short progress notes during long-running work; fire and forget.\nIf you finish without emitting <integrator:complete>, your final reply is captured as your deliverable instead — but prefer the block.\n",
         );
     }
     block.push_str("</subagent-brief>\n\n");
@@ -338,9 +549,25 @@ fn child_preamble(
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
+struct BrokerGrant {
+    role: String,
+    scope: String,
+    mode: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct BrokerInfo {
     pub port: u16,
-    pub token: String,
+    grants: Arc<std::sync::Mutex<HashMap<String, BrokerGrant>>>,
+}
+
+impl BrokerInfo {
+    fn new(port: u16) -> Self {
+        Self {
+            port,
+            grants: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 pub fn broker_env(
@@ -349,9 +576,18 @@ pub fn broker_env(
     scope: &str,
     mode: &str,
 ) -> Vec<(&'static str, String)> {
+    let token = uuid::Uuid::new_v4().to_string();
+    info.grants.lock().expect("broker grants lock").insert(
+        token.clone(),
+        BrokerGrant {
+            role: role.into(),
+            scope: scope.into(),
+            mode: mode.into(),
+        },
+    );
     vec![
         ("INTEGRATOR_BROKER_ADDR", format!("127.0.0.1:{}", info.port)),
-        ("INTEGRATOR_BROKER_TOKEN", info.token.clone()),
+        ("INTEGRATOR_BROKER_TOKEN", token),
         ("INTEGRATOR_BROKER_ROLE", role.into()),
         ("INTEGRATOR_BROKER_SCOPE", scope.into()),
         ("INTEGRATOR_BROKER_MODE", mode.into()),
@@ -381,6 +617,7 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "delegate_start",
             "delegation_status",
             "delegation_message",
+            "delegation_thread",
             "delegation_result",
             "delegation_stop",
         ]),
@@ -516,22 +753,19 @@ pub fn start_broker_host(app: AppHandle<tauri::Wry>) {
             Ok(addr) => addr.port(),
             Err(_) => return,
         };
-        let token = uuid::Uuid::new_v4().to_string();
+        let broker = BrokerInfo::new(port);
         {
             let state = app.state::<AppState>();
-            *state.broker.lock().expect("broker lock") = Some(BrokerInfo {
-                port,
-                token: token.clone(),
-            });
+            *state.broker.lock().expect("broker lock") = Some(broker.clone());
         }
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 continue;
             };
             let app = app.clone();
-            let token = token.clone();
+            let grants = Arc::clone(&broker.grants);
             tauri::async_runtime::spawn(async move {
-                let _ = serve_connection(app, token, stream).await;
+                let _ = serve_connection(app, grants, stream).await;
             });
         }
     });
@@ -545,7 +779,7 @@ struct BrokerSession {
 
 async fn serve_connection(
     app: AppHandle<tauri::Wry>,
-    token: String,
+    grants: Arc<std::sync::Mutex<HashMap<String, BrokerGrant>>>,
     stream: TcpStream,
 ) -> std::io::Result<()> {
     let (reader, mut writer) = stream.into_split();
@@ -570,11 +804,27 @@ async fn serve_connection(
         let params = request.get("params").cloned().unwrap_or(Value::Null);
 
         let response = if method == "hello" {
-            if params.get("token").and_then(Value::as_str) == Some(token.as_str()) {
+            let grant = params
+                .get("token")
+                .and_then(Value::as_str)
+                .and_then(|token| {
+                    grants
+                        .lock()
+                        .expect("broker grants lock")
+                        .get(token)
+                        .cloned()
+                });
+            let role = text_param(&params, "role").unwrap_or_default();
+            let scope = text_param(&params, "scope").unwrap_or_default();
+            let mode = text_param(&params, "mode").unwrap_or_else(|| "balanced".into());
+            if grant.as_ref().is_some_and(|grant| {
+                grant.role == role && grant.scope == scope && grant.mode == mode
+            }) {
+                let grant = grant.expect("grant checked above");
                 session = Some(BrokerSession {
-                    role: text_param(&params, "role").unwrap_or_default(),
-                    scope: text_param(&params, "scope").unwrap_or_default(),
-                    mode: text_param(&params, "mode").unwrap_or_else(|| "balanced".into()),
+                    role: grant.role,
+                    scope: grant.scope,
+                    mode: grant.mode,
                 });
                 json!({ "id": id, "result": { "ok": true } })
             } else {
@@ -615,7 +865,7 @@ async fn dispatch_tool(
 ) -> Result<Value> {
     match (session.role.as_str(), method) {
         ("orchestrator" | "child", "skill_data_request") => {
-            validate_skill_data_scope(app, session)?;
+            validate_skill_data_scope(app, session, params)?;
             let state = app.state::<AppState>();
             crate::skill_api::execute(app, &state, params).await
         }
@@ -644,6 +894,11 @@ async fn dispatch_tool(
                 None,
             )
             .await
+        }
+        ("orchestrator", "delegation_thread") => {
+            let task_id = orchestrator_scope(session)?;
+            let delegation = scoped_delegation(app, task_id, params)?;
+            delegation_thread(app, &delegation)
         }
         ("orchestrator", "delegation_result") => {
             let task_id = orchestrator_scope(session)?;
@@ -695,7 +950,11 @@ async fn dispatch_tool(
     }
 }
 
-fn validate_skill_data_scope(app: &AppHandle<tauri::Wry>, session: &BrokerSession) -> Result<()> {
+fn validate_skill_data_scope(
+    app: &AppHandle<tauri::Wry>,
+    session: &BrokerSession,
+    params: &Value,
+) -> Result<()> {
     let state = app.state::<AppState>();
     match session.role.as_str() {
         "orchestrator" => {
@@ -704,7 +963,30 @@ fn validate_skill_data_scope(app: &AppHandle<tauri::Wry>, session: &BrokerSessio
         }
         "child" => {
             let delegation_id = child_scope(session)?;
-            state.store.get_delegation(delegation_id)?;
+            let delegation = state.store.get_delegation(delegation_id)?;
+            let provider = text_param(params, "provider").unwrap_or_default();
+            let required_skill = match provider.as_str() {
+                "fred" => "gov-data:fred",
+                "bls" => "gov-data:bls",
+                "census" => "gov-data:census",
+                "eia" => "gov-data:eia",
+                "alpha-vantage" => "market-data:alpha-vantage",
+                _ => {
+                    return Err(IntegratorError::InvalidInput(
+                        "unknown secure data provider".into(),
+                    ));
+                }
+            };
+            if !delegation
+                .capability_snapshot
+                .skill_ids
+                .iter()
+                .any(|id| id == required_skill)
+            {
+                return Err(IntegratorError::Unauthorized(format!(
+                    "this specialist was not assigned the '{required_skill}' skill"
+                )));
+            }
         }
         _ => {
             return Err(IntegratorError::Unauthorized(
@@ -748,25 +1030,25 @@ fn scoped_delegation(
 
 fn peers_list(app: &AppHandle<tauri::Wry>, task_id: TaskId, mode: &str) -> Result<Value> {
     let state = app.state::<AppState>();
-    let mut profiles: Vec<DelegationProfile> = delegation_profiles(&state.store)
+    let profiles: Vec<DelegationProfile> = delegation_profiles(&state.store)
         .into_iter()
         .filter(|profile| profile.enabled)
         .collect();
-    if mode == "budget-first" {
-        profiles.sort_by_key(|profile| cost_rank(&profile.cost_tier));
-    }
     let active = state.store.active_delegation_count(task_id)?;
     let limit = max_concurrent(&state.store);
     Ok(json!({
         "peers": profiles.iter().map(|profile| json!({
             "profileId": profile.id,
             "label": profile.label,
-            "runtime": profile.runtime,
-            "model": profile.model,
-            "reasoningEffort": profile.effort,
-            "specialistInstruction": profile.instruction.as_deref().map(|value| redact_and_bound(value, 64 * 1024).0),
-            "preferredChildProfileIds": profile.preferred_child_profile_ids,
-            "costTier": profile.cost_tier,
+            "bestFor": profile.best_for,
+            "accessCeiling": profile.access.unwrap_or(DelegationPermission::ReadOnly).as_str(),
+            "skills": profile.skill_ids.len(),
+            "mcpServers": profile.mcp_server_ids.len(),
+            "serviceLevels": profile.service_levels.iter().filter(|service| service.enabled).map(|service| json!({
+                "level": service.level,
+                "primary": service.primary,
+                "fallbackCount": if service.fallbacks_enabled { service.fallbacks.len() } else { 0 },
+            })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "mode": mode,
         "activeDelegations": active,
@@ -786,13 +1068,39 @@ async fn delegate_start(
         .ok_or_else(|| IntegratorError::InvalidInput("title is required".into()))?;
     let brief = text_param(params, "brief")
         .ok_or_else(|| IntegratorError::InvalidInput("brief is required".into()))?;
+    let requested_service_level = text_param(params, "serviceLevel");
     let permission = text_param(params, "permission")
         .map(|value| DelegationPermission::from_str(&value))
         .transpose()?
-        .unwrap_or_default();
+        .unwrap_or(DelegationPermission::ReadOnly);
 
     let state = app.state::<AppState>();
     let profile = enabled_profile(&state.store, &profile_id)?;
+    let access_ceiling = profile.access.unwrap_or(DelegationPermission::ReadOnly);
+    if permission == DelegationPermission::ProjectWrite && access_ceiling.is_read_only() {
+        return Err(IntegratorError::Unauthorized(format!(
+            "specialist '{}' is limited to read-only access",
+            profile.label
+        )));
+    }
+    let service = select_service_level(&profile, requested_service_level.as_deref(), mode)?;
+    let mut routes = vec![service.primary.clone()];
+    if service.fallbacks_enabled {
+        routes.extend(service.fallbacks.clone());
+    }
+    let snapshot = DelegationCapabilitySnapshot {
+        version: 1,
+        profile_id: profile.id.clone(),
+        profile_label: profile.label.clone(),
+        best_for: profile.best_for.clone(),
+        working_guidance: profile.working_guidance.clone(),
+        access_ceiling,
+        service_level: service.level.clone(),
+        routes,
+        skill_ids: profile.skill_ids.clone(),
+        mcp_server_ids: profile.mcp_server_ids.clone(),
+        created_at: Utc::now(),
+    };
     let active = state.store.active_delegation_count(parent_task_id)?;
     let limit = max_concurrent(&state.store);
     if active >= limit {
@@ -800,14 +1108,27 @@ async fn delegate_start(
             "delegation limit reached ({active}/{limit} active); wait for a subagent to finish or stop one"
         )));
     }
+    if permission == DelegationPermission::ProjectWrite
+        && state
+            .store
+            .active_writing_delegation_count(parent_task_id)?
+            >= 1
+    {
+        return Err(IntegratorError::Unavailable(
+            "another project-writing subagent is already active; wait for it to finish or stop it before launching a second writer"
+                .into(),
+        ));
+    }
     let manual = mode == "manual";
     let delegation = state.store.create_delegation(NewDelegation {
         parent_task_id,
         profile_id: profile.id.clone(),
         profile_label: profile.label.clone(),
-        runtime: profile.runtime.clone(),
-        model: profile.model.clone(),
-        effort: profile.effort.clone(),
+        runtime: service.primary.runtime.clone(),
+        model: service.primary.model.clone(),
+        effort: service.primary.effort.clone(),
+        service_level: service.level.clone(),
+        capability_snapshot: snapshot,
         permission,
         title: requested_title.clone(),
         brief,
@@ -887,6 +1208,7 @@ fn delegation_status(
             "delegationId": delegation.id.to_string(),
             "title": delegation.title,
             "profile": delegation.profile_label,
+            "serviceLevel": delegation.service_level,
             "runtime": delegation.runtime,
             "permission": delegation.permission.as_str(),
             "status": delegation.status.as_str(),
@@ -907,6 +1229,27 @@ fn delegation_status(
     Ok(json!({ "delegations": rows }))
 }
 
+fn delegation_thread(app: &AppHandle<tauri::Wry>, delegation: &Delegation) -> Result<Value> {
+    let state = app.state::<AppState>();
+    let transcript = delegation.child_task_id.and_then(|task_id| {
+        state
+            .store
+            .task_handoff_digest(task_id, CHILD_DIGEST_OPTIONS)
+            .ok()
+            .flatten()
+            .map(|digest| digest.text)
+    });
+    Ok(json!({
+        "delegationId": delegation.id.to_string(),
+        "title": delegation.title,
+        "profile": delegation.profile_label,
+        "serviceLevel": delegation.service_level,
+        "runtime": delegation.runtime,
+        "status": delegation.status.as_str(),
+        "transcript": transcript,
+    }))
+}
+
 fn delegation_result(app: &AppHandle<tauri::Wry>, delegation: &Delegation) -> Result<Value> {
     let state = app.state::<AppState>();
     let digest = delegation.child_task_id.and_then(|task_id| {
@@ -919,6 +1262,7 @@ fn delegation_result(app: &AppHandle<tauri::Wry>, delegation: &Delegation) -> Re
     });
     Ok(json!({
         "delegationId": delegation.id.to_string(),
+        "serviceLevel": delegation.service_level,
         "permission": delegation.permission.as_str(),
         "status": delegation.status.as_str(),
         "result": delegation.result,
@@ -1124,7 +1468,7 @@ fn schedule_subagent_title_generation(
 /// process is up and the delegation is `running`.
 pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId) -> Result<()> {
     let state = app.state::<AppState>();
-    let delegation = state.store.get_delegation(delegation_id)?;
+    let mut delegation = state.store.get_delegation(delegation_id)?;
     let parent = state.store.get_task(delegation.parent_task_id)?;
     let cwd = parent
         .worktree_path
@@ -1136,25 +1480,51 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
             )
         })?;
 
-    let provider = ProviderKind::from_str(&delegation.runtime)?;
-    let configured_profiles = delegation_profiles(&state.store);
-    let profile = configured_profiles
+    let statuses = state.provider_statuses(false).await?;
+    let (route, provider, executable) = delegation
+        .capability_snapshot
+        .routes
         .iter()
-        .find(|profile| profile.id == delegation.profile_id);
-    let preferred_children = profile
-        .map(|profile| {
-            profile
-                .preferred_child_profile_ids
-                .iter()
-                .filter_map(|id| {
-                    configured_profiles
-                        .iter()
-                        .find(|candidate| candidate.id == *id && candidate.enabled)
-                        .map(|candidate| candidate.label.clone())
-                })
-                .collect::<Vec<_>>()
+        .find_map(|route| {
+            let provider = ProviderKind::from_str(&route.runtime).ok()?;
+            let executable = provider_executable(&statuses, provider)?;
+            Some((route.clone(), provider, executable))
         })
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            IntegratorError::Unavailable(format!(
+                "none of the {} {} routes are currently available",
+                delegation.profile_label, delegation.service_level
+            ))
+        })?;
+    if route.runtime != delegation.runtime
+        || route.model != delegation.model
+        || route.effort != delegation.effort
+    {
+        delegation = state.store.update_delegation_routing(
+            delegation_id,
+            &route.runtime,
+            route.model.as_deref(),
+            route.effort.as_deref(),
+        )?;
+    }
+    let selected_skills = crate::integrator_skills::selected_installed_skills(
+        &app,
+        &delegation.capability_snapshot.skill_ids,
+    )?;
+    let selected_mcp_servers = crate::integrator_mcp::selected_enabled_servers(
+        &app,
+        &state.store,
+        &delegation.capability_snapshot.mcp_server_ids,
+    )?;
+    let projection = crate::integrator_skills::write_projection(
+        &state.data_directory,
+        provider.as_str(),
+        &selected_skills,
+    )
+    .map_err(IntegratorError::from)?;
+    let capability_index = (provider != ProviderKind::Claude)
+        .then(|| crate::integrator_skills::skill_index_block(&projection.entries))
+        .flatten();
     let ordinal = delegation_ordinal(&state.store, &delegation)?;
     let initial_title = format_subagent_title(ordinal, &delegation.title);
     let child_task = state.store.create_task(integrator_core::NewTask {
@@ -1169,11 +1539,6 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
     state
         .store
         .attach_delegation_child(delegation_id, child_task.id)?;
-
-    let statuses = state.provider_statuses(false).await?;
-    let executable = provider_executable(&statuses, provider).ok_or_else(|| {
-        IntegratorError::Unavailable(format!("{} CLI is not installed", provider.as_str()))
-    })?;
 
     // Seed the child with the parent's recent conversation so the brief has
     // context, mirroring the cross-provider primer used for task handoff.
@@ -1197,15 +1562,10 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
     let broker = state.broker.lock().expect("broker lock").clone();
     let child = match provider {
         ProviderKind::Claude | ProviderKind::Antigravity => {
-            let has_tools = matches!(provider, ProviderKind::Claude) && broker.is_some();
-            preamble.push_str(&child_preamble(
-                &delegation,
-                has_tools,
-                profile,
-                &preferred_children,
-            ));
-            let mcp_config = match (&broker, provider) {
-                (Some(info), ProviderKind::Claude) => Some(write_mcp_config(
+            let has_tools = broker.is_some();
+            preamble.push_str(&child_preamble(&delegation, has_tools));
+            let broker_config = match &broker {
+                Some(info) => Some(write_mcp_config(
                     &app,
                     info,
                     "child",
@@ -1213,6 +1573,16 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
                     "off",
                 )?),
                 _ => None,
+            };
+            let mcp_config = if provider == ProviderKind::Claude {
+                crate::integrator_mcp::write_claude_mcp_config(
+                    &state.data_directory,
+                    &selected_mcp_servers,
+                    broker_config.as_deref(),
+                )
+                .map_err(IntegratorError::from)?
+            } else {
+                broker_config
             };
             spawn_structured_child(
                 &app,
@@ -1222,6 +1592,9 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
                 executable,
                 cwd,
                 mcp_config,
+                projection.plugin_dirs,
+                selected_mcp_servers,
+                capability_index,
             )
             .await?
         }
@@ -1229,20 +1602,13 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
             // Codex accepts the broker through `thread/start`'s ephemeral
             // config layer, the same injection the orchestrator path uses.
             let mcp_config = match &broker {
-                Some(info) => Some(codex_mcp_config(
-                    info,
-                    "child",
-                    &delegation_id.to_string(),
-                    "off",
-                )?),
+                Some(info) => Some(crate::integrator_mcp::merge_codex_mcp_config(
+                    codex_mcp_config(info, "child", &delegation_id.to_string(), "off")?,
+                    &selected_mcp_servers,
+                )),
                 None => None,
             };
-            preamble.push_str(&child_preamble(
-                &delegation,
-                mcp_config.is_some(),
-                profile,
-                &preferred_children,
-            ));
+            preamble.push_str(&child_preamble(&delegation, mcp_config.is_some()));
             spawn_codex_child(
                 &app,
                 &delegation,
@@ -1250,32 +1616,32 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
                 executable,
                 cwd,
                 mcp_config,
+                capability_index,
             )
             .await?
         }
-        ProviderKind::Cursor | ProviderKind::Grok => {
-            // Cursor accepts broker tools through ACP `session/new`
-            // `mcpServers`; Grok has no injection surface, so its results
-            // come from the transcript digest like Antigravity's.
-            let mcp_server = match (&broker, provider) {
-                (Some(info), ProviderKind::Cursor) => Some(acp_mcp_server_entry(
+        ProviderKind::Cursor | ProviderKind::Grok | ProviderKind::Kimi => {
+            // ACP runtimes accept broker tools through `session/new`'s
+            // `mcpServers` projection. Cursor also receives its harness
+            // prompt because it exposes that policy surface explicitly.
+            let mcp_server = match &broker {
+                Some(info) => Some(acp_mcp_server_entry(
                     info,
                     "child",
                     &delegation_id.to_string(),
                     "off",
-                    Some(&crate::harness_prompt::instructions(
-                        ProviderKind::Cursor,
-                        crate::harness_prompt::LocalToolsProjection::Projected,
-                    )),
+                    (provider == ProviderKind::Cursor)
+                        .then(|| {
+                            crate::harness_prompt::instructions(
+                                provider,
+                                crate::harness_prompt::LocalToolsProjection::Projected,
+                            )
+                        })
+                        .as_deref(),
                 )?),
                 _ => None,
             };
-            preamble.push_str(&child_preamble(
-                &delegation,
-                mcp_server.is_some(),
-                profile,
-                &preferred_children,
-            ));
+            preamble.push_str(&child_preamble(&delegation, mcp_server.is_some()));
             spawn_acp_child(
                 &app,
                 &delegation,
@@ -1284,6 +1650,8 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
                 executable,
                 cwd,
                 mcp_server,
+                selected_mcp_servers,
+                capability_index,
             )
             .await?
         }
@@ -1362,6 +1730,24 @@ async fn respawn_existing_child(
             )
         })?;
     let provider = ProviderKind::from_str(&delegation.runtime)?;
+    let selected_skills = crate::integrator_skills::selected_installed_skills(
+        app,
+        &delegation.capability_snapshot.skill_ids,
+    )?;
+    let selected_mcp_servers = crate::integrator_mcp::selected_enabled_servers(
+        app,
+        &state.store,
+        &delegation.capability_snapshot.mcp_server_ids,
+    )?;
+    let projection = crate::integrator_skills::write_projection(
+        &state.data_directory,
+        provider.as_str(),
+        &selected_skills,
+    )
+    .map_err(IntegratorError::from)?;
+    let capability_index = (provider != ProviderKind::Claude)
+        .then(|| crate::integrator_skills::skill_index_block(&projection.entries))
+        .flatten();
     let statuses = state.provider_statuses(false).await?;
     let executable = provider_executable(&statuses, provider).ok_or_else(|| {
         IntegratorError::Unavailable(format!("{} CLI is not installed", provider.as_str()))
@@ -1369,8 +1755,8 @@ async fn respawn_existing_child(
     let broker = state.broker.lock().expect("broker lock").clone();
     let child = match provider {
         ProviderKind::Claude | ProviderKind::Antigravity => {
-            let mcp_config = match (&broker, provider) {
-                (Some(info), ProviderKind::Claude) => Some(write_mcp_config(
+            let broker_config = match &broker {
+                Some(info) => Some(write_mcp_config(
                     app,
                     info,
                     "child",
@@ -1378,6 +1764,16 @@ async fn respawn_existing_child(
                     "off",
                 )?),
                 _ => None,
+            };
+            let mcp_config = if provider == ProviderKind::Claude {
+                crate::integrator_mcp::write_claude_mcp_config(
+                    &state.data_directory,
+                    &selected_mcp_servers,
+                    broker_config.as_deref(),
+                )
+                .map_err(IntegratorError::from)?
+            } else {
+                broker_config
             };
             spawn_structured_child(
                 app,
@@ -1387,32 +1783,46 @@ async fn respawn_existing_child(
                 executable,
                 cwd,
                 mcp_config,
+                projection.plugin_dirs,
+                selected_mcp_servers,
+                capability_index,
             )
             .await?
         }
         ProviderKind::Codex => {
             let mcp_config = match &broker {
-                Some(info) => Some(codex_mcp_config(
-                    info,
-                    "child",
-                    &delegation.id.to_string(),
-                    "off",
-                )?),
+                Some(info) => Some(crate::integrator_mcp::merge_codex_mcp_config(
+                    codex_mcp_config(info, "child", &delegation.id.to_string(), "off")?,
+                    &selected_mcp_servers,
+                )),
                 None => None,
             };
-            spawn_codex_child(app, delegation, child_task_id, executable, cwd, mcp_config).await?
+            spawn_codex_child(
+                app,
+                delegation,
+                child_task_id,
+                executable,
+                cwd,
+                mcp_config,
+                capability_index,
+            )
+            .await?
         }
-        ProviderKind::Cursor | ProviderKind::Grok => {
-            let mcp_server = match (&broker, provider) {
-                (Some(info), ProviderKind::Cursor) => Some(acp_mcp_server_entry(
+        ProviderKind::Cursor | ProviderKind::Grok | ProviderKind::Kimi => {
+            let mcp_server = match &broker {
+                Some(info) => Some(acp_mcp_server_entry(
                     info,
                     "child",
                     &delegation.id.to_string(),
                     "off",
-                    Some(&crate::harness_prompt::instructions(
-                        ProviderKind::Cursor,
-                        crate::harness_prompt::LocalToolsProjection::Projected,
-                    )),
+                    (provider == ProviderKind::Cursor)
+                        .then(|| {
+                            crate::harness_prompt::instructions(
+                                provider,
+                                crate::harness_prompt::LocalToolsProjection::Projected,
+                            )
+                        })
+                        .as_deref(),
                 )?),
                 _ => None,
             };
@@ -1424,6 +1834,8 @@ async fn respawn_existing_child(
                 executable,
                 cwd,
                 mcp_server,
+                selected_mcp_servers,
+                capability_index,
             )
             .await?
         }
@@ -1445,6 +1857,9 @@ async fn spawn_structured_child(
     executable: PathBuf,
     cwd: PathBuf,
     mcp_config: Option<PathBuf>,
+    plugin_dirs: Vec<PathBuf>,
+    selected_mcp_servers: Vec<crate::integrator_mcp::IntegratorMcpServer>,
+    capability_index: Option<String>,
 ) -> Result<DelegationChild> {
     let state = app.state::<AppState>();
     let client = integrator_runtime::StructuredCliClient::new();
@@ -1460,7 +1875,18 @@ async fn spawn_structured_child(
             &cwd,
             &process_id,
             permission_mode,
+            if mcp_config.is_some() {
+                crate::harness_prompt::LocalToolsProjection::Projected
+            } else {
+                crate::harness_prompt::LocalToolsProjection::Unavailable
+            },
         )?;
+        crate::integrator_mcp::write_antigravity_mcp_config_with_base(
+            &overlay.root,
+            &selected_mcp_servers,
+            mcp_config.as_deref(),
+        )
+        .map_err(IntegratorError::from)?;
         (Some(overlay.root), Some(overlay.event_log))
     } else {
         (None, None)
@@ -1500,6 +1926,7 @@ async fn spawn_structured_child(
             child_task_id,
             mcp_config.is_some(),
         ),
+        capability_index,
         driver: DelegationChildDriver::Structured {
             runtime,
             provider,
@@ -1509,6 +1936,7 @@ async fn spawn_structured_child(
             effort: delegation.effort.clone(),
             permission: delegation.permission,
             mcp_config,
+            plugin_dirs,
             session_ref,
         },
     };
@@ -1523,6 +1951,7 @@ async fn spawn_codex_child(
     executable: PathBuf,
     cwd: PathBuf,
     mcp_config: Option<Value>,
+    capability_index: Option<String>,
 ) -> Result<DelegationChild> {
     let state = app.state::<AppState>();
     let client = adapter_codex::CodexClient::spawn(adapter_codex::CodexLaunchOptions {
@@ -1626,24 +2055,27 @@ async fn spawn_codex_child(
         busy: Arc::new(std::sync::Mutex::new(false)),
         completed: Arc::new(std::sync::Mutex::new(false)),
         sentinel_watermark: sentinel_watermark_for(&state.store, child_task_id, has_tools),
+        capability_index,
         driver: DelegationChildDriver::Codex { runtime, thread_id },
     };
     watch_codex_child(app.clone(), &child, client);
     Ok(child)
 }
 
-/// Select the ACP mode matching the persisted child permission. Cursor's Ask
-/// mode is its read-only surface; writing children use Agent. Providers that
-/// do not advertise modes keep their provider default.
+/// Select the ACP mode matching the persisted child permission. ACP agents
+/// use different names for the same boundary (Ask/Plan and Agent/Default), so
+/// prefer the first advertised synonym and otherwise retain their default.
 fn acp_agent_mode_target(response: &Value, permission: DelegationPermission) -> Option<String> {
     let modes = parse_acp_mode_state(response)?;
     let requested = if permission.is_read_only() {
-        "ask"
+        &["ask", "plan"][..]
     } else {
-        "agent"
+        &["agent", "default"][..]
     };
-    let target = modes.available_modes.iter().find(|mode| {
-        mode.id.eq_ignore_ascii_case(requested) || mode.name.eq_ignore_ascii_case(requested)
+    let target = requested.iter().find_map(|requested| {
+        modes.available_modes.iter().find(|mode| {
+            mode.id.eq_ignore_ascii_case(requested) || mode.name.eq_ignore_ascii_case(requested)
+        })
     })?;
     (target.id != modes.current_mode_id).then(|| target.id.clone())
 }
@@ -1727,15 +2159,29 @@ async fn apply_acp_child_routing(
         return;
     };
     let resolved = resolved.to_owned();
-    if client
+    let Ok(selection_response) = client
         .set_config_option(session_id, &config_id, &resolved)
         .await
-        .is_err()
-    {
+    else {
         return;
-    }
+    };
     let Some(effort) = effort else { return };
     if provider != ProviderKind::Cursor {
+        let current = if selection_response.get("configOptions").is_some() {
+            &selection_response
+        } else {
+            session_response
+        };
+        if let Some((config_id, values)) = acp_session_config(
+            current,
+            "thought_level",
+            &["thinking", "effort", "reasoning"],
+        ) && values.iter().any(|value| value == effort)
+        {
+            let _ = client
+                .set_config_option(session_id, &config_id, effort)
+                .await;
+        }
         return;
     }
     // Thought level is per-model and only discoverable through the Cursor
@@ -1795,6 +2241,8 @@ async fn spawn_acp_child(
     executable: PathBuf,
     cwd: PathBuf,
     mcp_server: Option<Value>,
+    selected_mcp_servers: Vec<crate::integrator_mcp::IntegratorMcpServer>,
+    capability_index: Option<String>,
 ) -> Result<DelegationChild> {
     let state = app.state::<AppState>();
     let tools = if mcp_server.is_some() {
@@ -1815,9 +2263,13 @@ async fn spawn_acp_child(
         let _ = client.shutdown().await;
         return Err(IntegratorError::Unavailable(error.message));
     }
-    let mcp_servers: Vec<Value> = mcp_server.into_iter().collect();
-    let has_tools = !mcp_servers.is_empty();
     let capabilities = client.session_capabilities().await;
+    let mut mcp_servers: Vec<Value> = mcp_server.into_iter().collect();
+    let projected =
+        crate::integrator_mcp::acp_mcp_server_entries(&selected_mcp_servers, capabilities, &cwd)
+            .map_err(|error| IntegratorError::Unavailable(error.message))?;
+    mcp_servers.extend(projected);
+    let has_tools = !mcp_servers.is_empty();
     let response = match delegation.child_session_ref.as_deref() {
         Some(session_id) if capabilities.resume => {
             match client
@@ -1936,6 +2388,7 @@ async fn spawn_acp_child(
         busy: Arc::new(std::sync::Mutex::new(false)),
         completed: Arc::new(std::sync::Mutex::new(false)),
         sentinel_watermark: sentinel_watermark_for(&state.store, child_task_id, has_tools),
+        capability_index,
         driver: DelegationChildDriver::Acp {
             runtime: runtime.clone(),
             session_id,
@@ -1962,9 +2415,12 @@ struct ChildPrompt {
 async fn start_child_turn(
     app: &AppHandle<tauri::Wry>,
     child: &Arc<DelegationChild>,
-    prompt: ChildPrompt,
+    mut prompt: ChildPrompt,
 ) -> Result<()> {
     *child.busy.lock().expect("busy lock") = true;
+    if let Some(index) = &child.capability_index {
+        prompt.wire = format!("{index}{}", prompt.wire);
+    }
     let result: Result<()> = async {
         match &child.driver {
             DelegationChildDriver::Structured {
@@ -1976,6 +2432,7 @@ async fn start_child_turn(
                 effort,
                 permission,
                 mcp_config,
+                plugin_dirs,
                 session_ref,
             } => {
                 let structured_provider = match provider {
@@ -2006,7 +2463,7 @@ async fn start_child_turn(
                     },
                     mcp_config_path: mcp_config.clone(),
                     control_overlay: runtime.control_overlay.clone(),
-                    plugin_dirs: Vec::new(),
+                    plugin_dirs: plugin_dirs.clone(),
                 };
                 let hook_offset = runtime
                     .hook_event_log
@@ -2493,11 +2950,21 @@ pub async fn queue_message_to_child(
                 | ProviderKind::Antigravity
                 | ProviderKind::Cursor
                 | ProviderKind::Grok
+                | ProviderKind::Kimi
         ) {
             return Err(IntegratorError::InvalidInput(format!(
                 "{} is not a supported delegation target",
                 provider.as_str()
             )));
+        }
+        if !delegation.capability_snapshot.routes.iter().any(|allowed| {
+            allowed.runtime == route.runtime
+                && allowed.model.as_deref() == route.model.as_deref()
+                && allowed.effort.as_deref() == route.effort.as_deref()
+        }) {
+            return Err(IntegratorError::Unauthorized(
+                "this route is not part of the specialist's frozen service level".into(),
+            ));
         }
     }
     let route_changed = requested_route.as_ref().is_some_and(|route| {
@@ -2791,6 +3258,32 @@ pub async fn delegation_approve(
             delegation.status.as_str()
         ))));
     }
+    let active = state
+        .store
+        .active_delegation_count(delegation.parent_task_id)
+        .map_err(CommandError::from)?;
+    let limit = max_concurrent(&state.store);
+    if active >= limit {
+        return Err(CommandError::from(IntegratorError::Unavailable(format!(
+            "delegation limit reached ({active}/{limit} active); finish or stop a subagent before approving another"
+        ))));
+    }
+    if delegation.permission == DelegationPermission::ProjectWrite
+        && state
+            .store
+            .active_writing_delegation_count(delegation.parent_task_id)
+            .map_err(CommandError::from)?
+            >= 1
+    {
+        return Err(CommandError::from(IntegratorError::Unavailable(
+            "another project-writing subagent is already active; finish or stop it before approving a second writer"
+                .into(),
+        )));
+    }
+    state
+        .store
+        .update_delegation_status(delegation_id, DelegationStatus::Starting)
+        .map_err(CommandError::from)?;
     if let Err(error) = spawn_child(app.clone(), delegation_id).await {
         let _ = state.store.set_delegation_result(
             delegation_id,
@@ -2809,6 +3302,16 @@ pub async fn delegation_deny(
     state: tauri::State<'_, AppState>,
     delegation_id: DelegationId,
 ) -> CommandResult<()> {
+    let current = state
+        .store
+        .get_delegation(delegation_id)
+        .map_err(CommandError::from)?;
+    if current.status != DelegationStatus::PendingApproval {
+        return Err(CommandError::from(IntegratorError::InvalidInput(format!(
+            "delegation is {}; only pending delegations can be denied",
+            current.status.as_str()
+        ))));
+    }
     let delegation = state
         .store
         .update_delegation_status(delegation_id, DelegationStatus::Denied)
@@ -2880,10 +3383,7 @@ mod tests {
     #[test]
     fn codex_mcp_config_is_thread_scoped_and_required() {
         let config = codex_mcp_config(
-            &BrokerInfo {
-                port: 43123,
-                token: "ephemeral-test-token".into(),
-            },
+            &BrokerInfo::new(43123),
             "orchestrator",
             "task-1",
             "balanced",
@@ -2902,6 +3402,7 @@ mod tests {
                 "delegate_start",
                 "delegation_status",
                 "delegation_message",
+                "delegation_thread",
                 "delegation_result",
                 "delegation_stop",
             ])
@@ -2915,17 +3416,35 @@ mod tests {
     }
 
     #[test]
+    fn broker_grants_are_unique_and_bound_to_one_session_claim() {
+        let broker = BrokerInfo::new(43126);
+        let first = broker_env(&broker, "orchestrator", "task-1", "balanced");
+        let second = broker_env(&broker, "child", "delegation-2", "off");
+        let token = |env: &Vec<(&'static str, String)>| {
+            env.iter()
+                .find(|(name, _)| *name == "INTEGRATOR_BROKER_TOKEN")
+                .map(|(_, value)| value.clone())
+                .expect("broker token")
+        };
+        let first_token = token(&first);
+        let second_token = token(&second);
+        assert_ne!(first_token, second_token);
+
+        let grants = broker.grants.lock().expect("broker grants lock");
+        let first_grant = grants.get(&first_token).expect("orchestrator grant");
+        assert_eq!(first_grant.role, "orchestrator");
+        assert_eq!(first_grant.scope, "task-1");
+        assert_eq!(first_grant.mode, "balanced");
+        let second_grant = grants.get(&second_token).expect("child grant");
+        assert_eq!(second_grant.role, "child");
+        assert_eq!(second_grant.scope, "delegation-2");
+        assert_eq!(second_grant.mode, "off");
+    }
+
+    #[test]
     fn codex_local_tools_remain_available_when_delegation_is_off() {
-        let config = codex_mcp_config(
-            &BrokerInfo {
-                port: 43125,
-                token: "ephemeral-test-token".into(),
-            },
-            "orchestrator",
-            "task-3",
-            "off",
-        )
-        .expect("Codex MCP config");
+        let config = codex_mcp_config(&BrokerInfo::new(43125), "orchestrator", "task-3", "off")
+            .expect("Codex MCP config");
 
         assert_eq!(
             config["mcp_servers"]["integrator"]["enabled_tools"],
@@ -2936,10 +3455,7 @@ mod tests {
     #[test]
     fn cursor_mcp_entry_carries_scope_and_durable_harness_instructions() {
         let entry = acp_mcp_server_entry(
-            &BrokerInfo {
-                port: 43124,
-                token: "ephemeral-test-token".into(),
-            },
+            &BrokerInfo::new(43124),
             "orchestrator",
             "task-2",
             "manual",
@@ -2963,24 +3479,132 @@ mod tests {
     }
 
     #[test]
-    fn profiles_fall_back_to_defaults_and_sort_by_cost() {
+    fn profiles_fall_back_to_defaults_with_standard_service_levels() {
         let store = LocalStore::open_in_memory().expect("store");
-        let mut profiles = delegation_profiles(&store);
-        assert!(profiles.iter().any(|profile| profile.runtime == "codex"));
-        profiles.sort_by_key(|profile| cost_rank(&profile.cost_tier));
-        assert_eq!(profiles.first().map(|p| p.cost_tier.as_str()), Some("low"));
+        let profiles = delegation_profiles(&store);
+        assert!(profiles.iter().all(|profile| {
+            profile
+                .service_levels
+                .iter()
+                .any(|service| service.level == "standard")
+        }));
+    }
+
+    #[test]
+    fn configured_concurrency_never_exceeds_the_certified_cap() {
+        let store = LocalStore::open_in_memory().expect("store");
+        store
+            .set_setting("settings.delegation.maxConcurrent", json!(99))
+            .expect("set concurrency");
+        assert_eq!(max_concurrent(&store), 4);
     }
 
     #[test]
     fn default_profiles_cover_every_supported_child_runtime() {
         let store = LocalStore::open_in_memory().expect("store");
         let profiles = delegation_profiles(&store);
-        for runtime in ["codex", "claude", "antigravity", "cursor", "grok"] {
+        for runtime in ["codex", "claude", "antigravity", "cursor", "grok", "kimi"] {
             assert!(
-                profiles.iter().any(|profile| profile.runtime == runtime),
+                profiles.iter().any(|profile| {
+                    profile
+                        .service_levels
+                        .iter()
+                        .any(|service| service.primary.runtime == runtime)
+                }),
                 "missing built-in profile for {runtime}"
             );
         }
+    }
+
+    #[test]
+    fn explicit_service_levels_never_silently_downgrade() {
+        let mut profile = default_profiles().remove(0);
+        profile.service_levels = vec![
+            DelegationServiceLevel {
+                level: "budget".into(),
+                enabled: false,
+                primary: DelegationRoute {
+                    runtime: "grok".into(),
+                    model: None,
+                    effort: None,
+                },
+                fallbacks_enabled: false,
+                fallbacks: Vec::new(),
+            },
+            default_service_level("codex", Some("standard-model"), None),
+            DelegationServiceLevel {
+                level: "premium".into(),
+                enabled: true,
+                primary: DelegationRoute {
+                    runtime: "claude".into(),
+                    model: Some("premium-model".into()),
+                    effort: Some("high".into()),
+                },
+                fallbacks_enabled: false,
+                fallbacks: Vec::new(),
+            },
+        ];
+
+        assert_eq!(
+            select_service_level(&profile, Some("premium"), "balanced")
+                .expect("premium service")
+                .primary
+                .runtime,
+            "claude"
+        );
+        assert!(select_service_level(&profile, Some("budget"), "balanced").is_err());
+        assert!(select_service_level(&profile, Some("turbo"), "balanced").is_err());
+        assert_eq!(
+            select_service_level(&profile, None, "budget-first")
+                .expect("cheapest enabled service")
+                .level,
+            "standard"
+        );
+    }
+
+    #[test]
+    fn stored_specialists_bound_and_normalize_routes_and_capabilities() {
+        let store = LocalStore::open_in_memory().expect("store");
+        store
+            .set_setting(
+                "settings.delegation.profiles",
+                json!([{
+                    "id": "bounded",
+                    "label": "Bounded specialist",
+                    "access": "read-only",
+                    "serviceLevels": [{
+                        "level": "standard",
+                        "enabled": true,
+                        "primary": { "runtime": " codex ", "model": " provider-default " },
+                        "fallbacksEnabled": true,
+                        "fallbacks": [
+                            { "runtime": "codex", "model": "provider-default" },
+                            { "runtime": " claude " },
+                            { "runtime": "cursor" },
+                            { "runtime": "grok" },
+                            { "runtime": "antigravity" },
+                            { "runtime": "codex", "model": "other" }
+                        ]
+                    }],
+                    "skillIds": [" design-principles ", "design-principles", "documents:documents"],
+                    "mcpServerIds": [" figma ", "figma"]
+                }]),
+            )
+            .expect("set specialists");
+
+        let profiles = delegation_profiles(&store);
+        assert_eq!(profiles.len(), 1);
+        let profile = &profiles[0];
+        assert_eq!(
+            profile.skill_ids,
+            ["design-principles", "documents:documents"]
+        );
+        assert_eq!(profile.mcp_server_ids, ["figma"]);
+        let service = &profile.service_levels[0];
+        assert_eq!(service.primary.runtime, "codex");
+        assert_eq!(service.primary.model.as_deref(), Some("provider-default"));
+        assert_eq!(service.fallbacks.len(), MAX_SERVICE_FALLBACKS);
+        assert_eq!(service.fallbacks[0].runtime, "claude");
     }
 
     #[test]
@@ -3003,6 +3627,28 @@ mod tests {
         assert_eq!(
             acp_agent_mode_target(&planning, DelegationPermission::ReadOnly),
             Some("ask".into())
+        );
+
+        let kimi = json!({
+            "configOptions": [{
+                "id": "mode",
+                "category": "mode",
+                "currentValue": "default",
+                "options": [
+                    { "value": "default", "name": "Default" },
+                    { "value": "plan", "name": "Plan" },
+                    { "value": "auto", "name": "Auto" },
+                    { "value": "yolo", "name": "YOLO" }
+                ]
+            }]
+        });
+        assert_eq!(
+            acp_agent_mode_target(&kimi, DelegationPermission::ReadOnly),
+            Some("plan".into())
+        );
+        assert_eq!(
+            acp_agent_mode_target(&kimi, DelegationPermission::ProjectWrite),
+            None
         );
 
         let already_agent = json!({
@@ -3103,7 +3749,8 @@ mod tests {
     }
 
     #[test]
-    fn child_preamble_includes_specialist_and_downstream_preferences() {
+    fn child_preamble_uses_the_frozen_working_guidance() {
+        let now = Utc::now();
         let delegation = Delegation {
             id: DelegationId::new(),
             parent_task_id: TaskId::new(),
@@ -3113,34 +3760,40 @@ mod tests {
             runtime: "claude".into(),
             model: Some("claude-fable-5".into()),
             effort: Some("high".into()),
+            service_level: "premium".into(),
+            capability_snapshot: DelegationCapabilitySnapshot {
+                version: 1,
+                profile_id: "claude-ux".into(),
+                profile_label: "Claude UX".into(),
+                best_for: "UX review".into(),
+                working_guidance: "Test keyboard and reduced-motion behavior.".into(),
+                access_ceiling: DelegationPermission::ReadOnly,
+                service_level: "premium".into(),
+                routes: vec![DelegationRoute {
+                    runtime: "claude".into(),
+                    model: Some("claude-fable-5".into()),
+                    effort: Some("high".into()),
+                }],
+                skill_ids: Vec::new(),
+                mcp_server_ids: Vec::new(),
+                created_at: now,
+            },
             permission: DelegationPermission::ReadOnly,
             title: "Interaction audit".into(),
             brief: "Review the flow".into(),
             status: DelegationStatus::Starting,
             result: None,
             child_session_ref: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: now,
+            updated_at: now,
         };
-        let profile = DelegationProfile {
-            id: "claude-ux".into(),
-            label: "Claude UX".into(),
-            runtime: "claude".into(),
-            model: Some("claude-fable-5".into()),
-            effort: Some("high".into()),
-            instruction: Some("Test keyboard and reduced-motion behavior.".into()),
-            preferred_child_profile_ids: vec!["luna-explore".into()],
-            cost_tier: "high".into(),
-            enabled: true,
-        };
-        let prompt = child_preamble(&delegation, true, Some(&profile), &["Luna explorer".into()]);
+        let prompt = child_preamble(&delegation, true);
         assert!(prompt.contains("Test keyboard and reduced-motion behavior."));
-        assert!(prompt.contains("Luna explorer"));
         assert!(prompt.contains("task_complete"));
         assert!(prompt.contains("Workspace permission: read-only"));
-        assert!(prompt.contains("cannot see this transcript"));
+        assert!(prompt.contains("may inspect this transcript"));
 
-        let untooled = child_preamble(&delegation, false, None, &[]);
+        let untooled = child_preamble(&delegation, false);
         assert!(!untooled.contains("task_complete"));
         assert!(untooled.contains("<integrator:complete>"));
         assert!(untooled.contains("<integrator:ask>"));

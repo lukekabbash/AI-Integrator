@@ -1,8 +1,8 @@
 use chrono::{DateTime, TimeZone, Utc};
 use integrator_core::{
     ApprovalKind, ConnectionState, FileChangeKind, FileChangeProjection, ItemKind, ItemProjection,
-    ItemStatus, ModeOption, ModeProjection, PlanStep, PlanStepStatus, Result, TransportRequestId,
-    TurnProjection, TurnStatus, UsageProjection,
+    ItemStatus, ModeOption, ModeProjection, PlanStep, PlanStepStatus, QuestionOption, Result,
+    TransportRequestId, TurnProjection, TurnStatus, UsageProjection,
 };
 use serde_json::{Map, Value, json};
 
@@ -71,6 +71,8 @@ pub enum ProjectionMutation {
         cwd: Option<String>,
         /// Full plan document for `PlanReview` approvals; `None` otherwise.
         plan_markdown: Option<String>,
+        /// Answer choices for `Question` approvals; empty otherwise.
+        options: Vec<QuestionOption>,
     },
     /// Replaces the session's mode state (current mode + available modes).
     Mode(ModeProjection),
@@ -229,6 +231,7 @@ pub fn reduce_provider_event(input: ProviderEventInput) -> Result<Option<Reduced
                     .or_else(|| optional_string(&input.params, "grantRoot"))
                     .map(|cwd| bound_and_redact(&cwd, PATH_LIMIT).0),
                 plan_markdown: None,
+                options: Vec::new(),
             }
         }
         "serverRequest/resolved" => {
@@ -1266,6 +1269,12 @@ pub fn reduce_acp_permission_request(
         .pointer("/toolCall/title")
         .and_then(Value::as_str)
         .map(|text| bound_and_redact(text, TEXT_LIMIT).0);
+    let options = acp_question_options(params);
+    let approval_kind = if options.is_empty() {
+        ApprovalKind::CommandExecution
+    } else {
+        ApprovalKind::Question
+    };
     ReducedProviderEvent {
         method: "session/request_permission".into(),
         thread_id: session_id.to_owned(),
@@ -1274,16 +1283,57 @@ pub fn reduce_acp_permission_request(
         audit_truncated,
         mutation: ProjectionMutation::ApprovalRequested {
             request_id,
-            approval_kind: ApprovalKind::CommandExecution,
+            approval_kind,
             item_id: tool_call_id.to_owned(),
             approval_id: None,
             reason: title,
             command: None,
             cwd: None,
             plan_markdown: None,
+            options,
         },
         occurred_at,
     }
+}
+
+/// ACP has no elicitation method — `session/request_permission` is the only
+/// client-interaction channel, built to gate one command or file edit behind
+/// allow/reject. Its four option kinds (`allow_once`, `allow_always`,
+/// `reject_once`, `reject_always`) each mean one specific thing, so a
+/// legitimate command/file-edit gate never offers two options sharing a
+/// kind. When a kind repeats, the agent is using this channel to offer
+/// several distinct named answers instead — almost always a multiple-choice
+/// question (e.g. a coding CLI's own "ask the user" tool bridged onto ACP).
+/// Detect that shape and surface the real answer choices, keyed by the
+/// `optionId` the response must echo back.
+fn acp_question_options(params: &Value) -> Vec<QuestionOption> {
+    let raw = params
+        .get("options")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut kind_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for option in &raw {
+        let kind = option.get("kind").and_then(Value::as_str).unwrap_or("");
+        *kind_counts.entry(kind).or_insert(0) += 1;
+    }
+    if !kind_counts.values().any(|count| *count > 1) {
+        return Vec::new();
+    }
+    raw.iter()
+        .filter_map(|option| {
+            let option_id = option.get("optionId").and_then(Value::as_str)?;
+            let label = option
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(option_id);
+            Some(QuestionOption {
+                option_id: bound_and_redact(option_id, TEXT_LIMIT).0,
+                label: bound_and_redact(label, TEXT_LIMIT).0,
+            })
+        })
+        .collect()
 }
 
 /// Reduce a Cursor `cursor/create_plan` extension request into a plan-review
@@ -1332,6 +1382,7 @@ pub fn reduce_acp_plan_review_request(
             command: None,
             cwd: None,
             plan_markdown,
+            options: Vec::new(),
         },
         occurred_at,
     }
@@ -1358,41 +1409,63 @@ pub fn acp_mode_event(
     }
 }
 
-/// Parse the `modes` field of an ACP `session/new`/`session/load` response
-/// (`SessionModeState`). Returns `None` when the agent does not support
-/// session modes.
+/// Parse either ACP's legacy `modes` field or the current generic `mode`
+/// config option. Returns `None` when the agent does not advertise modes.
 pub fn parse_acp_mode_state(response: &Value) -> Option<ModeProjection> {
-    let modes = response.get("modes")?;
-    let current = modes.get("currentModeId").and_then(Value::as_str)?;
-    let available = modes
-        .get("availableModes")
+    if let Some(modes) = response.get("modes") {
+        let current = modes.get("currentModeId").and_then(Value::as_str)?;
+        let available = modes
+            .get("availableModes")
+            .and_then(Value::as_array)
+            .map(|entries| parse_acp_mode_options(entries, "id"))
+            .unwrap_or_default();
+        return Some(ModeProjection {
+            current_mode_id: current.to_owned(),
+            available_modes: available,
+        });
+    }
+
+    let option = response
+        .get("configOptions")
+        .or_else(|| response.get("config_options"))?
+        .as_array()
+        .and_then(|options| {
+            options.iter().find(|option| {
+                option.get("category").and_then(Value::as_str) == Some("mode")
+                    || option.get("id").and_then(Value::as_str) == Some("mode")
+            })
+        })?;
+    let current = option.get("currentValue").and_then(Value::as_str)?;
+    let available = option
+        .get("options")
         .and_then(Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|entry| {
-                    Some(ModeOption {
-                        id: entry.get("id").and_then(Value::as_str)?.to_owned(),
-                        name: entry
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or_else(|| {
-                                entry.get("id").and_then(Value::as_str).unwrap_or("")
-                            })
-                            .to_owned(),
-                        description: entry
-                            .get("description")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
+        .map(|entries| parse_acp_mode_options(entries, "value"))
         .unwrap_or_default();
     Some(ModeProjection {
         current_mode_id: current.to_owned(),
         available_modes: available,
     })
+}
+
+fn parse_acp_mode_options(entries: &[Value], id_key: &str) -> Vec<ModeOption> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let id = entry.get(id_key).and_then(Value::as_str)?;
+            Some(ModeOption {
+                id: id.to_owned(),
+                name: entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(id)
+                    .to_owned(),
+                description: entry
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+        })
+        .collect()
 }
 
 /// Build the terminal turn projection for a started or finished ACP prompt.
@@ -1701,6 +1774,29 @@ mod tests {
     }
 
     #[test]
+    fn acp_session_modes_parse_from_config_options() {
+        let mode = parse_acp_mode_state(&json!({
+            "sessionId": "sess-kimi",
+            "configOptions": [{
+                "type": "select",
+                "id": "mode",
+                "category": "mode",
+                "currentValue": "default",
+                "options": [
+                    {"value": "default", "name": "Default", "description": "Manual approvals"},
+                    {"value": "plan", "name": "Plan", "description": "Read-only planning"},
+                    {"value": "auto", "name": "Auto"},
+                    {"value": "yolo", "name": "YOLO"}
+                ]
+            }]
+        }))
+        .expect("mode config option");
+        assert_eq!(mode.current_mode_id, "default");
+        assert_eq!(mode.available_modes.len(), 4);
+        assert_eq!(mode.available_modes[1].id, "plan");
+    }
+
+    #[test]
     fn acp_session_modes_absent_or_malformed_yield_none() {
         assert!(parse_acp_mode_state(&json!({ "sessionId": "sess-1" })).is_none());
         assert!(parse_acp_mode_state(&json!({ "modes": { "availableModes": [] } })).is_none());
@@ -1803,6 +1899,110 @@ mod tests {
                 assert!(plan.ends_with("[truncated]"));
             }
             other => panic!("expected plan-review approval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn acp_permission_request_with_unique_option_kinds_stays_command_execution() {
+        let event = reduce_acp_permission_request(
+            "session-1",
+            "turn-1",
+            TransportRequestId::Number(1.into()),
+            &json!({
+                "toolCall": {"toolCallId": "call-1", "title": "rm -rf build/"},
+                "options": [
+                    {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                    {"optionId": "reject", "name": "Reject", "kind": "reject_once"},
+                ]
+            }),
+            Utc::now(),
+        );
+        match event.mutation {
+            ProjectionMutation::ApprovalRequested {
+                approval_kind,
+                options,
+                reason,
+                ..
+            } => {
+                assert_eq!(approval_kind, ApprovalKind::CommandExecution);
+                assert!(options.is_empty());
+                assert_eq!(reason.as_deref(), Some("rm -rf build/"));
+            }
+            other => panic!("expected command-execution approval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn acp_permission_request_with_repeated_option_kind_becomes_a_question() {
+        // A coding CLI's own "ask the user" tool, bridged onto ACP's only
+        // client-interaction channel: three distinct answers, all offered
+        // as `allow_once` because none of them reject anything.
+        let event = reduce_acp_permission_request(
+            "session-1",
+            "turn-1",
+            TransportRequestId::Number(2.into()),
+            &json!({
+                "toolCall": {"toolCallId": "call-2", "title": "Which frequency should I use?"},
+                "options": [
+                    {"optionId": "opt-monthly", "name": "Monthly", "kind": "allow_once"},
+                    {"optionId": "opt-quarterly", "name": "Quarterly", "kind": "allow_once"},
+                    {"optionId": "opt-skip", "name": "Skip this series", "kind": "allow_once"},
+                ]
+            }),
+            Utc::now(),
+        );
+        match event.mutation {
+            ProjectionMutation::ApprovalRequested {
+                approval_kind,
+                options,
+                reason,
+                ..
+            } => {
+                assert_eq!(approval_kind, ApprovalKind::Question);
+                assert_eq!(reason.as_deref(), Some("Which frequency should I use?"));
+                assert_eq!(
+                    options,
+                    vec![
+                        QuestionOption {
+                            option_id: "opt-monthly".into(),
+                            label: "Monthly".into()
+                        },
+                        QuestionOption {
+                            option_id: "opt-quarterly".into(),
+                            label: "Quarterly".into()
+                        },
+                        QuestionOption {
+                            option_id: "opt-skip".into(),
+                            label: "Skip this series".into()
+                        },
+                    ]
+                );
+            }
+            other => panic!("expected question approval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn acp_permission_request_falls_back_to_option_id_when_name_is_missing() {
+        let event = reduce_acp_permission_request(
+            "session-1",
+            "turn-1",
+            TransportRequestId::Number(3.into()),
+            &json!({
+                "toolCall": {"toolCallId": "call-3", "title": "Pick one"},
+                "options": [
+                    {"optionId": "a", "kind": "allow_once"},
+                    {"optionId": "b", "kind": "allow_once"},
+                ]
+            }),
+            Utc::now(),
+        );
+        match event.mutation {
+            ProjectionMutation::ApprovalRequested { options, .. } => {
+                assert_eq!(options[0].label, "a");
+                assert_eq!(options[1].label, "b");
+            }
+            other => panic!("expected question approval, got {other:?}"),
         }
     }
 

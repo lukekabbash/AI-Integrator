@@ -15,6 +15,7 @@ const MODEL_LABEL_WORDS: Record<string, string> = {
   claude: "Claude",
   gemini: "Gemini",
   grok: "Grok",
+  kimi: "Kimi",
   deepseek: "DeepSeek",
   codex: "Codex",
   composer: "Composer",
@@ -68,8 +69,16 @@ export function prettyModelLabel(modelId?: string | null): string {
   if (!modelId || modelId === "Provider default") return "";
 
   // Cursor session catalogs bracket config onto the id; drop that for display.
-  const plain = (modelId.split("[")[0] ?? modelId).trim();
+  const unqualified = modelId.split("/").at(-1) ?? modelId;
+  const plain = (unqualified.split("[")[0] ?? unqualified).trim();
   if (!plain) return "";
+
+  const kimiLabels: Record<string, string> = {
+    k3: "Kimi K3",
+    "kimi-for-coding": "Kimi K2.7 Code",
+    "kimi-for-coding-highspeed": "Kimi K2.7 Code Highspeed",
+  };
+  if (kimiLabels[plain]) return kimiLabels[plain];
 
   // Provider display names and Antigravity ids already look human.
   if (/\s/.test(plain) || /[A-Z]/.test(plain)) return plain;

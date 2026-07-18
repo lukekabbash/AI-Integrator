@@ -452,6 +452,24 @@ fn scan_plugin_dir(
                 // Claude-plugin layout: `skills/` also hosts bare `.md`
                 // skills that the SKILL.md walk above cannot represent.
                 scan_integrator_skill_root(&entry.path(), Some(namespace), source, output);
+                // Some catalogs (notably openai/skills) put their skill
+                // folders below categorization directories such as
+                // `skills/.curated/<name>/SKILL.md`. Preserve the shallow
+                // scan above for bare `.md` files, then continue walking
+                // directories that do not already own a SKILL.md.
+                if let Ok(nested) = fs::read_dir(entry.path()) {
+                    for child in nested.flatten().take(256) {
+                        let Ok(kind) = child.file_type() else {
+                            continue;
+                        };
+                        if kind.is_dir()
+                            && !kind.is_symlink()
+                            && !child.path().join("SKILL.md").is_file()
+                        {
+                            queue.push_back((child.path(), depth + 1));
+                        }
+                    }
+                }
             } else {
                 queue.push_back((entry.path(), depth + 1));
             }
@@ -971,6 +989,46 @@ mod tests {
         );
         assert!(!entries.iter().any(|entry| entry.name.contains("fake")));
         fs::remove_dir_all(root).expect("clean up catalog fixtures");
+    }
+
+    #[test]
+    fn integrator_plugin_scan_handles_categorized_skill_catalogs() {
+        let root = std::env::temp_dir().join(format!(
+            "integrator-categorized-catalog-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let plugins = root.join("Plugins");
+        let curated = plugins
+            .join("openai-skills")
+            .join("skills")
+            .join(".curated")
+            .join("pdf");
+        let system = plugins
+            .join("openai-skills")
+            .join("skills")
+            .join(".system")
+            .join("skill-installer");
+        fs::create_dir_all(&curated).expect("curated catalog fixture");
+        fs::create_dir_all(&system).expect("system catalog fixture");
+        fs::write(
+            curated.join("SKILL.md"),
+            "---\nname: pdf\ndescription: Work with PDFs\n---\nBODY",
+        )
+        .expect("curated skill");
+        fs::write(
+            system.join("SKILL.md"),
+            "---\nname: skill-installer\ndescription: Install skills\n---\nBODY",
+        )
+        .expect("system skill");
+
+        let entries = discover_integrator_skills(&root.join("Skills"), &plugins, None);
+        assert!(entries.iter().any(|entry| {
+            entry.name == "openai-skills:pdf" && entry.description == "Work with PDFs"
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.name == "openai-skills:skill-installer" && entry.description == "Install skills"
+        }));
+        fs::remove_dir_all(root).expect("clean up categorized catalog fixture");
     }
 
     #[test]

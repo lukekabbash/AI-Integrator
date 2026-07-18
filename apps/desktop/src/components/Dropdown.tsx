@@ -220,6 +220,7 @@ const PROVIDER_ICON_SOURCES: Record<string, string> = {
   // until Google publishes a distinct Antigravity mark.
   antigravity: "/brand/providers/gemini.png",
   grok: "/brand/providers/xai.ico",
+  kimi: "/brand/providers/kimi-code.png",
 };
 
 export function ProviderIcon({ provider, label }: { provider: string; label?: string }) {
@@ -228,5 +229,12 @@ export function ProviderIcon({ provider, label }: { provider: string; label?: st
     return (
       <span className="provider-icon provider-icon--fallback">{label?.slice(0, 1) ?? "?"}</span>
     );
-  return <img className="provider-icon" src={source} alt="" aria-hidden="true" />;
+  return (
+    <img
+      className={`provider-icon provider-icon--${provider}`}
+      src={source}
+      alt=""
+      aria-hidden="true"
+    />
+  );
 }

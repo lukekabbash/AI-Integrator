@@ -14,26 +14,28 @@ inspect the key.
 
 ## Core pattern (APIv2)
 
-Base: `https://api.eia.gov/v2/`
+Call `skill_data_request` with `provider: "eia"`, `path` set to the literal
+string below (leading slash, `/v2/` prefix included — it is NOT relative to a
+base URL), and the parameters in `query`, never appended to `path`.
 
 Data requests take the form:
 
-```
-https://api.eia.gov/v2/{route}/data/?frequency=monthly&data[0]=value&facets[...]=...&start=2020-01&sort[0][column]=period&sort[0][direction]=desc
-```
+`path: "/v2/{route}/data/"`,
+`query: {"frequency": "monthly", "data[0]": "value", "start": "2020-01", "sort[0][column]": "period", "sort[0][direction]": "desc", ...facets}`.
 
-Discover routes by walking the tree: a GET on any non-`/data` route returns
-its child routes and available facets/frequencies — start at the base URL and
-navigate rather than guessing deep paths.
+Discover routes by walking the tree: a request to any non-`/data` route (e.g.
+`path: "/v2/petroleum/pri/gnd"`) returns its child routes and available
+facets/frequencies — start at `/v2` and navigate rather than guessing deep
+paths.
 
 ## Routes you should know
 
-- Retail gasoline prices: `petroleum/pri/gnd`
-- Crude spot (WTI/Brent): `petroleum/pri/spt`
-- Electricity retail price by state: `electricity/retail-sales`
-- Generation by fuel: `electricity/electric-power-operational-data`
-- Natural gas prices: `natural-gas/pri/sum`
-- CO2 emissions: `co2-emissions/co2-emissions-aggregates`
+- Retail gasoline prices: `path: "/v2/petroleum/pri/gnd/data/"`
+- Crude spot (WTI/Brent): `path: "/v2/petroleum/pri/spt/data/"`
+- Electricity retail price by state: `path: "/v2/electricity/retail-sales/data/"`
+- Generation by fuel: `path: "/v2/electricity/electric-power-operational-data/data/"`
+- Natural gas prices: `path: "/v2/natural-gas/pri/sum/data/"`
+- CO2 emissions: `path: "/v2/co2-emissions/co2-emissions-aggregates/data/"`
 
 ## Method
 

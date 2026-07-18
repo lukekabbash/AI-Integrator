@@ -170,6 +170,38 @@ runtimes:
       command: [grok, --print, "{prompt}", --output-format, streaming-json]
       framing: ndjson
 
+  kimi_code:
+    display_name: Kimi Code
+    priority: launch
+    executable_candidates: [kimi, kimi.exe, kimi.cmd]
+    version_command: [kimi, --version]
+    transport:
+      kind: acp
+      command: [kimi, acp]
+      framing: jsonl
+      capabilities: negotiate
+    auth:
+      owner: vendor_command
+      login_command: [kimi, login]
+      acp_method: login
+      supports_status: false
+    discovery:
+      models: session_config_option
+      mode: session_config_option
+      thinking: session_config_option
+    capabilities:
+      sessions: [create, load, resume, list]
+      turns: [prompt, cancel]
+      modes: [default, plan, auto, yolo]
+      models: discover
+      thinking: discover
+      mcp_transports: [stdio, http, sse]
+      filesystem_reverse_rpc: true
+      terminal_reverse_rpc: false
+    claims:
+      cli_reasoning_levels_not_forwarded_without_acp_advertisement: true
+      usage: unavailable_until_reported
+
   github_copilot:
     display_name: GitHub Copilot
     priority: next

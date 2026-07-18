@@ -1,8 +1,15 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { Dropdown } from "./Dropdown";
+import { Dropdown, ProviderIcon } from "./Dropdown";
 
 describe("Dropdown", () => {
+  it("uses Kimi Code's official provider mark instead of the letter fallback", () => {
+    render(<ProviderIcon provider="kimi" label="Kimi Code" />);
+
+    expect(document.querySelector('img[src="/brand/providers/kimi-code.png"]')).toBeInTheDocument();
+    expect(document.querySelector(".provider-icon--fallback")).not.toBeInTheDocument();
+  });
+
   it("never stacks a leading glyph and the selected option's icon in the trigger", () => {
     render(
       <Dropdown

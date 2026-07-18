@@ -207,7 +207,7 @@ pub async fn provider_action_list(
     let repository = authorized_project_directory(&state, repository).await?;
     let mut resolved = match &provider {
         ProviderKind::Codex => codex_native_actions(&state, &repository).await?,
-        ProviderKind::Cursor | ProviderKind::Grok => {
+        ProviderKind::Cursor | ProviderKind::Grok | ProviderKind::Kimi => {
             if let Some(actions) = current_acp_actions(&state, &provider).await {
                 actions
                     .into_iter()
@@ -482,19 +482,22 @@ pub(crate) async fn authenticate_acp_provider(
     client: &adapter_acp::AcpClient,
     provider: &ProviderKind,
 ) -> CommandResult<()> {
-    if *provider != ProviderKind::Grok {
-        return Ok(());
-    }
     let initialization = client.initialization().await;
-    let cached_token = acp_has_auth_method(&initialization, "cached_token");
-    if !cached_token {
+    let (method, login_command, provider_name) = match provider {
+        ProviderKind::Grok => ("cached_token", "grok login", "Grok Build"),
+        ProviderKind::Kimi => ("login", "kimi login", "Kimi Code"),
+        _ => return Ok(()),
+    };
+    if !acp_has_auth_method(&initialization, method) {
         return Err(CommandError {
             code: "provider-login-required",
-            message: "Grok has no vendor-owned cached login; run `grok login` first".into(),
+            message: format!(
+                "{provider_name} has no vendor-owned cached login; run `{login_command}` first"
+            ),
         });
     }
     client
-        .authenticate("cached_token", true)
+        .authenticate(method, true)
         .await
         .map(|_| ())
         .map_err(CommandError::from)
@@ -1021,6 +1024,45 @@ pub struct SubscriptionWindow {
     resets_at: Option<i64>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionCredits {
+    has_credits: bool,
+    unlimited: bool,
+    #[serde(default)]
+    balance: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionSpendLimit {
+    limit: String,
+    used: String,
+    remaining_percent: f64,
+    resets_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionQuotaBucket {
+    #[serde(default)]
+    limit_id: Option<String>,
+    #[serde(default)]
+    limit_name: Option<String>,
+    #[serde(default)]
+    plan_type: Option<String>,
+    #[serde(default)]
+    primary: Option<SubscriptionWindow>,
+    #[serde(default)]
+    secondary: Option<SubscriptionWindow>,
+    #[serde(default)]
+    credits: Option<SubscriptionCredits>,
+    #[serde(default)]
+    individual_limit: Option<SubscriptionSpendLimit>,
+    #[serde(default)]
+    rate_limit_reached_type: Option<String>,
+}
+
 /// Provider-reported subscription quota. Never inferred: only providers that
 /// publish rate-limit windows (Codex today) populate this.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1033,7 +1075,42 @@ pub struct SubscriptionQuota {
     #[serde(default)]
     secondary: Option<SubscriptionWindow>,
     #[serde(default)]
+    buckets: Vec<SubscriptionQuotaBucket>,
+    #[serde(default)]
+    reset_credits_available: Option<u64>,
+    #[serde(default)]
     updated_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAccountUsageSummary {
+    #[serde(default)]
+    lifetime_tokens: Option<u64>,
+    #[serde(default)]
+    peak_daily_tokens: Option<u64>,
+    #[serde(default)]
+    longest_running_turn_sec: Option<u64>,
+    #[serde(default)]
+    current_streak_days: Option<u64>,
+    #[serde(default)]
+    longest_streak_days: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAccountUsageBucket {
+    start_date: String,
+    tokens: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAccountUsage {
+    summary: ProviderAccountUsageSummary,
+    #[serde(default)]
+    daily_usage_buckets: Vec<ProviderAccountUsageBucket>,
+    updated_at: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1055,6 +1132,9 @@ pub struct ProviderUsageSummary {
     /// Provider-reported subscription windows; absent when the provider does
     /// not expose quota (it is never inferred).
     subscription: Option<SubscriptionQuota>,
+    /// Account-wide provider activity, kept separate from Integrator-local
+    /// task history because it can include other Codex clients and devices.
+    account_usage: Option<ProviderAccountUsage>,
     provenance: &'static str,
     detail: String,
 }
@@ -1091,6 +1171,7 @@ pub fn storage_totals(state: State<'_, AppState>) -> CommandResult<StorageTotals
 
 #[tauri::command]
 pub async fn usage_summary(state: State<'_, AppState>) -> CommandResult<UsageSummary> {
+    refresh_codex_usage(&state).await;
     let store = Arc::clone(&state.store);
     let (rows, settings) = tauri::async_runtime::spawn_blocking(move || {
         let rows = store.provider_usage_rows()?;
@@ -1106,10 +1187,18 @@ pub async fn usage_summary(state: State<'_, AppState>) -> CommandResult<UsageSum
             .find(|setting| setting.key == key)
             .and_then(|setting| serde_json::from_value(setting.value.clone()).ok())
     };
-    let providers = rows
+    let account_usage_for = |provider: &str| -> Option<ProviderAccountUsage> {
+        let key = format!("provider-account-usage.{provider}");
+        settings
+            .iter()
+            .find(|setting| setting.key == key)
+            .and_then(|setting| serde_json::from_value(setting.value.clone()).ok())
+    };
+    let mut providers = rows
         .into_iter()
         .map(|(provider, task_count, turn_count, usage)| {
             let subscription = quota_for(&provider);
+            let account_usage = account_usage_for(&provider);
             ProviderUsageSummary {
                 provider,
                 task_count,
@@ -1124,6 +1213,7 @@ pub async fn usage_summary(state: State<'_, AppState>) -> CommandResult<UsageSum
                     .vendor_cost_micro_usd
                     .map(|micro| micro as f64 / 1_000_000.0),
                 subscription,
+                account_usage,
                 provenance: if usage.total_tokens > 0 {
                     "vendor_exact"
                 } else {
@@ -1136,11 +1226,95 @@ pub async fn usage_summary(state: State<'_, AppState>) -> CommandResult<UsageSum
                 },
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
+    if !providers.iter().any(|row| row.provider == "codex") {
+        let subscription = quota_for("codex");
+        let account_usage = account_usage_for("codex");
+        if subscription.is_some() || account_usage.is_some() {
+            providers.push(ProviderUsageSummary {
+                provider: "codex".into(),
+                task_count: 0,
+                turn_count: 0,
+                input_tokens: 0,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 0,
+                model_context_window: None,
+                estimated_cost_usd: None,
+                subscription,
+                account_usage,
+                provenance: "unavailable",
+                detail: "Codex account usage is available; no Integrator task tokens are recorded."
+                    .into(),
+            });
+        }
+    }
     Ok(UsageSummary {
         providers,
         measured_at: Utc::now(),
     })
+}
+
+/// Refreshes provider-owned account usage without starting a model turn. A
+/// connected app-server is reused when possible; otherwise a short-lived
+/// account-only client is opened and immediately shut down.
+async fn refresh_codex_usage(state: &State<'_, AppState>) {
+    let live_client = {
+        let runtimes = state.codex.lock().await;
+        runtimes
+            .values()
+            .find(|runtime| runtime.alive.load(Ordering::Acquire))
+            .map(|runtime| runtime.client.clone())
+    };
+    let live_client = match live_client {
+        Some(client) => Some(client),
+        None => state
+            .codex_catalog
+            .lock()
+            .await
+            .as_ref()
+            .filter(|runtime| runtime.alive.load(Ordering::Acquire))
+            .map(|runtime| runtime.client.clone()),
+    };
+    let (client, ephemeral) = match live_client {
+        Some(client) => (client, false),
+        None => {
+            let Ok(statuses) = state.provider_statuses(false).await else {
+                return;
+            };
+            let Some(executable) = provider_executable(&statuses, ProviderKind::Codex) else {
+                return;
+            };
+            let Ok(Ok(client)) = timeout(
+                Duration::from_secs(10),
+                adapter_codex::CodexClient::spawn(CodexLaunchOptions {
+                    executable,
+                    working_directory: None,
+                    client_version: env!("CARGO_PKG_VERSION").into(),
+                }),
+            )
+            .await
+            else {
+                return;
+            };
+            (client, true)
+        }
+    };
+
+    let (rate_limits, account_usage) = tokio::join!(
+        timeout(Duration::from_secs(10), client.read_rate_limits()),
+        timeout(Duration::from_secs(10), client.read_account_usage()),
+    );
+    if let Ok(Ok(response)) = rate_limits {
+        store_provider_quota(&state.store, ProviderKind::Codex, &response);
+    }
+    if let Ok(Ok(response)) = account_usage {
+        store_provider_account_usage(&state.store, ProviderKind::Codex, &response);
+    }
+    if ephemeral {
+        let _ = client.shutdown().await;
+    }
 }
 
 /// Persists provider-reported subscription windows from a rate-limit snapshot
@@ -1162,7 +1336,7 @@ fn store_provider_quota(store: &LocalStore, provider: ProviderKind, params: &Val
         snapshot
             .get(name)
             .filter(|window| window.get("usedPercent").is_some())
-            .cloned()
+            .map(sanitized_subscription_window)
             .unwrap_or_else(|| existing.get(name).cloned().unwrap_or(Value::Null))
     };
     let plan_type = snapshot
@@ -1170,12 +1344,125 @@ fn store_provider_quota(store: &LocalStore, provider: ProviderKind, params: &Val
         .and_then(Value::as_str)
         .or_else(|| existing.get("planType").and_then(Value::as_str))
         .map(str::to_owned);
+    let buckets = params
+        .get("rateLimitsByLimitId")
+        .and_then(Value::as_object)
+        .map(|entries| {
+            entries
+                .values()
+                .map(sanitized_rate_limit_snapshot)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            let mut buckets = existing
+                .get("buckets")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let next = sanitized_rate_limit_snapshot(snapshot);
+            let limit_id = next.get("limitId").and_then(Value::as_str);
+            if let Some(limit_id) = limit_id {
+                if let Some(index) = buckets.iter().position(|bucket| {
+                    bucket.get("limitId").and_then(Value::as_str) == Some(limit_id)
+                }) {
+                    buckets[index] = next;
+                } else {
+                    buckets.push(next);
+                }
+            }
+            buckets
+        });
+    let reset_credits_available = params
+        .pointer("/rateLimitResetCredits/availableCount")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            existing
+                .get("resetCreditsAvailable")
+                .and_then(Value::as_u64)
+        });
     let value = serde_json::json!({
         "planType": plan_type,
         "primary": window("primary"),
         "secondary": window("secondary"),
+        "buckets": buckets,
+        "resetCreditsAvailable": reset_credits_available,
         "updatedAt": Utc::now().to_rfc3339(),
     });
+    let _ = store.set_setting(&key, value);
+}
+
+fn sanitized_rate_limit_snapshot(snapshot: &Value) -> Value {
+    serde_json::json!({
+        "limitId": snapshot.get("limitId").and_then(Value::as_str),
+        "limitName": snapshot.get("limitName").and_then(Value::as_str),
+        "planType": snapshot.get("planType").and_then(Value::as_str),
+        "primary": snapshot
+            .get("primary")
+            .map(sanitized_subscription_window)
+            .unwrap_or(Value::Null),
+        "secondary": snapshot
+            .get("secondary")
+            .map(sanitized_subscription_window)
+            .unwrap_or(Value::Null),
+        "credits": snapshot.get("credits").map(|credits| serde_json::json!({
+            "hasCredits": credits.get("hasCredits").and_then(Value::as_bool),
+            "unlimited": credits.get("unlimited").and_then(Value::as_bool),
+            "balance": credits.get("balance").and_then(Value::as_str),
+        })).unwrap_or(Value::Null),
+        "individualLimit": snapshot.get("individualLimit").map(|limit| serde_json::json!({
+            "limit": limit.get("limit").and_then(Value::as_str),
+            "used": limit.get("used").and_then(Value::as_str),
+            "remainingPercent": limit.get("remainingPercent").and_then(Value::as_f64),
+            "resetsAt": limit.get("resetsAt").and_then(Value::as_i64),
+        })).unwrap_or(Value::Null),
+        "rateLimitReachedType": snapshot
+            .get("rateLimitReachedType")
+            .and_then(Value::as_str),
+    })
+}
+
+fn sanitized_subscription_window(window: &Value) -> Value {
+    serde_json::json!({
+        "usedPercent": window.get("usedPercent").and_then(Value::as_f64),
+        "windowDurationMins": window.get("windowDurationMins").and_then(Value::as_u64),
+        "resetsAt": window.get("resetsAt").and_then(Value::as_i64),
+    })
+}
+
+fn store_provider_account_usage(store: &LocalStore, provider: ProviderKind, params: &Value) {
+    let Some(summary) = params.get("summary") else {
+        return;
+    };
+    let daily_usage_buckets = params
+        .get("dailyUsageBuckets")
+        .and_then(Value::as_array)
+        .map(|buckets| {
+            buckets
+                .iter()
+                .filter_map(|bucket| {
+                    Some(serde_json::json!({
+                        "startDate": bucket.get("startDate")?.as_str()?,
+                        "tokens": bucket.get("tokens")?.as_u64()?,
+                    }))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let value = serde_json::json!({
+        "summary": {
+            "lifetimeTokens": summary.get("lifetimeTokens").cloned().unwrap_or(Value::Null),
+            "peakDailyTokens": summary.get("peakDailyTokens").cloned().unwrap_or(Value::Null),
+            "longestRunningTurnSec": summary
+                .get("longestRunningTurnSec")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "currentStreakDays": summary.get("currentStreakDays").cloned().unwrap_or(Value::Null),
+            "longestStreakDays": summary.get("longestStreakDays").cloned().unwrap_or(Value::Null),
+        },
+        "dailyUsageBuckets": daily_usage_buckets,
+        "updatedAt": Utc::now().to_rfc3339(),
+    });
+    let key = format!("provider-account-usage.{}", provider.as_str());
     let _ = store.set_setting(&key, value);
 }
 
@@ -2588,14 +2875,19 @@ pub async fn codex_connect(
         *runtime.binding.lock().expect("binding lock") = Some(binding);
     }
     spawn_projection_pump(app, Arc::clone(&state.store), runtime.clone());
-    // Snapshot subscription quota once per connect; rolling
-    // `account/rateLimits/updated` notifications keep it fresh afterwards.
+    // Snapshot account-level usage once per connect; rolling rate-limit
+    // notifications keep quota fresh afterwards.
     {
         let client = runtime.client.clone();
         let store = Arc::clone(&state.store);
         tauri::async_runtime::spawn(async move {
-            if let Ok(response) = client.read_rate_limits().await {
+            let (rate_limits, account_usage) =
+                tokio::join!(client.read_rate_limits(), client.read_account_usage());
+            if let Ok(response) = rate_limits {
                 store_provider_quota(&store, ProviderKind::Codex, &response);
+            }
+            if let Ok(response) = account_usage {
+                store_provider_account_usage(&store, ProviderKind::Codex, &response);
             }
         });
     }
@@ -2645,6 +2937,36 @@ pub(crate) fn spawn_projection_pump(
                     // rejected by the task-scoped reducer; persist it directly.
                     if method == "account/rateLimits/updated" {
                         store_provider_quota(&store, ProviderKind::Codex, &params);
+                        continue;
+                    }
+                    if method == "account/updated" {
+                        // Quota is account-scoped. Drop the previous account's
+                        // snapshot before asking the now-current login for a
+                        // replacement so stale headroom is never mislabeled.
+                        let _ = store.set_setting("provider-quota.codex", Value::Null);
+                        let _ = store.set_setting("provider-account-usage.codex", Value::Null);
+                        let client = runtime.client.clone();
+                        let refresh_store = Arc::clone(&store);
+                        tauri::async_runtime::spawn(async move {
+                            let (rate_limits, account_usage) = tokio::join!(
+                                timeout(Duration::from_secs(10), client.read_rate_limits()),
+                                timeout(Duration::from_secs(10), client.read_account_usage()),
+                            );
+                            if let Ok(Ok(response)) = rate_limits {
+                                store_provider_quota(
+                                    &refresh_store,
+                                    ProviderKind::Codex,
+                                    &response,
+                                );
+                            }
+                            if let Ok(Ok(response)) = account_usage {
+                                store_provider_account_usage(
+                                    &refresh_store,
+                                    ProviderKind::Codex,
+                                    &response,
+                                );
+                            }
+                        });
                         continue;
                     }
                     if method == "skills/changed" {
@@ -3160,11 +3482,9 @@ pub async fn codex_resume_thread(
         .store
         .provider_resume_state(task_id)
         .map_err(CommandError::from)?
-        .filter(|saved| {
-            saved.provider == ProviderKind::Codex
-                && saved.session_ref == thread_id
-                && crate::integrator_mcp::resume_state_is_current(&state.store, saved)
-        })
+        // A Codex thread owns its initial MCP surface. Later MCP changes are
+        // pending for new threads, not grounds to abandon this conversation.
+        .filter(|saved| saved.provider == ProviderKind::Codex && saved.session_ref == thread_id)
         .ok_or_else(|| CommandError {
             code: "not-found",
             message: "This Codex thread is no longer the active resumable session for the task"
@@ -3683,7 +4003,7 @@ pub async fn codex_respond_approval(
         .values()
         .find(|runtime| runtime.process_id == prepared.process_id)
         .cloned();
-    let result = if let Some(acp) = acp {
+    let (result, resolve_locally) = if let Some(acp) = acp {
         let request_id = acp_request_from_transport(&prepared.request_id)?;
         let is_plan_request = acp
             .plan_requests
@@ -3695,9 +4015,12 @@ pub async fn codex_respond_approval(
         } else {
             acp_permission_outcome(&acp, &prepared.request_id, decision)
         };
-        acp.client
-            .respond_to_server_request(&request_id, outcome)
-            .await
+        (
+            acp.client
+                .respond_to_server_request(&request_id, outcome)
+                .await,
+            true,
+        )
     } else if let Some(structured) = structured {
         let request_id = match &prepared.request_id {
             TransportRequestId::String(text) => text.clone(),
@@ -3709,20 +4032,26 @@ pub async fn codex_respond_approval(
             .expect("permission lock")
             .remove(&request_id);
         let response = structured_permission_response(decision, pending);
-        structured
-            .client
-            .respond_permission(&request_id, response)
-            .await
+        (
+            structured
+                .client
+                .respond_permission(&request_id, response)
+                .await,
+            true,
+        )
     } else {
         let runtime = codex_runtime_for_process(&state, &prepared.process_id).await?;
         let request_id = server_request_from_transport(&prepared.request_id)?;
-        runtime
-            .client
-            .respond_to_server_request(
-                &request_id,
-                serde_json::json!({ "decision": approval.decision.as_ref().map(ApprovalDecision::as_protocol_str) }),
-            )
-            .await
+        (
+            runtime
+                .client
+                .respond_to_server_request(
+                    &request_id,
+                    serde_json::json!({ "decision": approval.decision.as_ref().map(ApprovalDecision::as_protocol_str) }),
+                )
+                .await,
+            false,
+        )
     };
     if let Err(error) = result {
         let store = Arc::clone(&state.store);
@@ -3735,6 +4064,101 @@ pub async fn codex_respond_approval(
         }
         return Err(CommandError::from(error));
     }
+    if resolve_locally {
+        let store = Arc::clone(&state.store);
+        let event = tauri::async_runtime::spawn_blocking(move || {
+            store.mark_approval_response_resolved(&approval_id)
+        })
+        .await
+        .map_err(|_| worker_error())?
+        .map_err(CommandError::from)?;
+        let _ = app.emit("runtime://projection", &event);
+        let RuntimeProjection::ApprovalChanged { approval } = event.projection else {
+            unreachable!("resolved approval emits an approval projection");
+        };
+        return Ok(approval);
+    }
+    Ok(approval)
+}
+
+/// Answer a `Question` approval. Kept separate from `codex_respond_approval`
+/// because the caller already knows exactly which option the user picked —
+/// there is no accept/decline axis to route it through `acp_permission_outcome`
+/// with, and questions only ever arrive over ACP (Cursor/Grok/Kimi), the only
+/// client-interaction channel that protocol has.
+#[tauri::command]
+pub async fn acp_respond_question(
+    app: AppHandle<tauri::Wry>,
+    state: State<'_, AppState>,
+    task_id: TaskId,
+    approval_id: String,
+    option_id: String,
+) -> CommandResult<ApprovalProjection> {
+    let store = Arc::clone(&state.store);
+    let stored_approval_id = approval_id.clone();
+    let stored_option_id = option_id.clone();
+    let prepared = tauri::async_runtime::spawn_blocking(move || {
+        store.prepare_question_response(task_id, &stored_approval_id, &stored_option_id)
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(CommandError::from)?;
+    let _ = app.emit("runtime://projection", &prepared.event);
+
+    let acp = state
+        .acp
+        .lock()
+        .await
+        .values()
+        .find(|runtime| runtime.process_id == prepared.process_id)
+        .cloned();
+    let Some(acp) = acp else {
+        let store = Arc::clone(&state.store);
+        if let Ok(Ok(event)) = tauri::async_runtime::spawn_blocking(move || {
+            store.mark_approval_response_failed(&approval_id)
+        })
+        .await
+        {
+            let _ = app.emit("runtime://projection", event);
+        }
+        return Err(CommandError {
+            code: "provider-disconnected",
+            message: "the agent that asked this question is no longer running".into(),
+        });
+    };
+    acp.permission_options
+        .lock()
+        .expect("permission lock")
+        .remove(&transport_key(&prepared.request_id));
+    let request_id = acp_request_from_transport(&prepared.request_id)?;
+    let outcome =
+        serde_json::json!({ "outcome": { "outcome": "selected", "optionId": option_id } });
+    let result = acp
+        .client
+        .respond_to_server_request(&request_id, outcome)
+        .await;
+    if let Err(error) = result {
+        let store = Arc::clone(&state.store);
+        if let Ok(Ok(event)) = tauri::async_runtime::spawn_blocking(move || {
+            store.mark_approval_response_failed(&approval_id)
+        })
+        .await
+        {
+            let _ = app.emit("runtime://projection", event);
+        }
+        return Err(CommandError::from(error));
+    }
+    let store = Arc::clone(&state.store);
+    let event = tauri::async_runtime::spawn_blocking(move || {
+        store.mark_approval_response_resolved(&approval_id)
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(CommandError::from)?;
+    let _ = app.emit("runtime://projection", &event);
+    let RuntimeProjection::ApprovalChanged { approval } = event.projection else {
+        unreachable!("resolved approval emits an approval projection");
+    };
     Ok(approval)
 }
 
@@ -3931,6 +4355,7 @@ pub(crate) fn acp_launch_arguments(
 ) -> CommandResult<Vec<String>> {
     Ok(match provider {
         ProviderKind::Cursor => vec!["acp".into()],
+        ProviderKind::Kimi => vec!["acp".into()],
         // Scripted ACP starts disable implicit self-updates; the vendor CLI
         // and its vendor-owned cached login remain the authority.
         ProviderKind::Grok => {
@@ -4805,29 +5230,25 @@ pub async fn structured_cli_start_turn(
     // session, so the tool preamble and any pending subagent updates ride on
     // every wire prompt while delegation is active.
     let delegation_mode = delegation.as_deref().filter(|mode| *mode != "off");
-    let mut mcp_config_path = if matches!(structured_provider, StructuredCliProvider::Claude) {
-        let broker = state
-            .broker
-            .lock()
-            .expect("broker lock")
-            .clone()
-            .ok_or_else(|| CommandError {
-                code: "provider-unavailable",
-                message: "Integrator local tools are not ready; retry this chat".into(),
-            })?;
-        Some(
-            crate::delegation::write_mcp_config(
-                &app,
-                &broker,
-                "orchestrator",
-                &task_id.to_string(),
-                delegation.as_deref().unwrap_or("off"),
-            )
-            .map_err(CommandError::from)?,
+    let broker = state
+        .broker
+        .lock()
+        .expect("broker lock")
+        .clone()
+        .ok_or_else(|| CommandError {
+            code: "provider-unavailable",
+            message: "Integrator local tools are not ready; retry this chat".into(),
+        })?;
+    let mut mcp_config_path = Some(
+        crate::delegation::write_mcp_config(
+            &app,
+            &broker,
+            "orchestrator",
+            &task_id.to_string(),
+            delegation.as_deref().unwrap_or("off"),
         )
-    } else {
-        None
-    };
+        .map_err(CommandError::from)?,
+    );
     if let Some(mode) = delegation_mode {
         let store = Arc::clone(&state.store);
         let mut preface = crate::delegation::orchestrator_preamble(&store, mode);
@@ -4920,12 +5341,18 @@ pub async fn structured_cli_start_turn(
             &repository,
             scope,
             permission_mode,
+            crate::harness_prompt::LocalToolsProjection::Projected,
         )
         .map_err(CommandError::from)?;
         let overlay_root = overlay.root.clone();
         let servers = enabled_mcp_servers.clone();
+        let base_config = mcp_config_path.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            crate::integrator_mcp::write_antigravity_mcp_config(&overlay_root, &servers)
+            crate::integrator_mcp::write_antigravity_mcp_config_with_base(
+                &overlay_root,
+                &servers,
+                base_config.as_deref(),
+            )
         })
         .await
         .map_err(|_| worker_error())?
@@ -5391,6 +5818,7 @@ pub(crate) fn spawn_structured_cli_pump(
                         command,
                         cwd: None,
                         plan_markdown,
+                        options: Vec::new(),
                     })
                 }
                 StructuredCliEventKind::PermissionModeChanged { mode } => {
@@ -5710,11 +6138,11 @@ pub(crate) fn spawn_acp_pump(
                         continue;
                     }
                     // Mode changes are session metadata and can land between
-                    // turns (e.g. a set_mode echo), so they are handled before
+                    // turns, so both the legacy mode notification and the
+                    // generic ACP config-option snapshot are handled before
                     // the in-flight-turn guard below.
-                    if update.get("sessionUpdate").and_then(Value::as_str)
-                        == Some("current_mode_update")
-                    {
+                    let update_kind = update.get("sessionUpdate").and_then(Value::as_str);
+                    if update_kind == Some("current_mode_update") {
                         let Some(current) = update.get("currentModeId").and_then(Value::as_str)
                         else {
                             continue;
@@ -5727,6 +6155,16 @@ pub(crate) fn spawn_acp_pump(
                             state.current_mode_id = current.to_owned();
                             state.clone()
                         };
+                        let event =
+                            acp_mode_event(session_id, turn_id.as_deref(), mode, Utc::now());
+                        apply_and_emit(&app, &store, binding, &event);
+                        continue;
+                    }
+                    if update_kind == Some("config_option_update") {
+                        let Some(mode) = parse_acp_mode_state(update) else {
+                            continue;
+                        };
+                        *runtime.session_modes.lock().expect("modes lock") = Some(mode.clone());
                         let event =
                             acp_mode_event(session_id, turn_id.as_deref(), mode, Utc::now());
                         apply_and_emit(&app, &store, binding, &event);
@@ -6122,10 +6560,15 @@ fn structured_permission_response(
             }
             response
         }
-        ApprovalDecision::Decline | ApprovalDecision::Cancel => serde_json::json!({
-            "behavior": "deny",
-            "message": "The user declined this request.",
-        }),
+        // `Select` answers a `Question` approval and is routed through
+        // `acp_respond_question`, never through this structured-CLI path;
+        // deny defensively if it somehow arrives here anyway.
+        ApprovalDecision::Decline | ApprovalDecision::Cancel | ApprovalDecision::Select => {
+            serde_json::json!({
+                "behavior": "deny",
+                "message": "The user declined this request.",
+            })
+        }
     }
 }
 
@@ -6169,9 +6612,13 @@ fn acp_plan_review_result(decision: ApprovalDecision) -> Value {
         ApprovalDecision::Accept | ApprovalDecision::AcceptForSession => {
             serde_json::json!({ "result": { "success": {} } })
         }
-        ApprovalDecision::Decline | ApprovalDecision::Cancel => serde_json::json!({
-            "result": { "error": { "error": "The user rejected this plan. Stay in plan mode and revise it based on their feedback." } }
-        }),
+        // `Select` answers a `Question` approval, not a plan review; reject
+        // defensively if it somehow arrives here anyway.
+        ApprovalDecision::Decline | ApprovalDecision::Cancel | ApprovalDecision::Select => {
+            serde_json::json!({
+                "result": { "error": { "error": "The user rejected this plan. Stay in plan mode and revise it based on their feedback." } }
+            })
+        }
     }
 }
 
@@ -6195,7 +6642,9 @@ fn acp_permission_outcome(
         ApprovalDecision::Accept => &["allow_once", "allow_always"],
         ApprovalDecision::AcceptForSession => &["allow_always", "allow_once"],
         ApprovalDecision::Decline => &["reject_once", "reject_always"],
-        ApprovalDecision::Cancel => &[],
+        // `Cancel` short-circuits above; `Select` answers a `Question`
+        // approval through `acp_respond_question` instead of this path.
+        ApprovalDecision::Cancel | ApprovalDecision::Select => &[],
     };
     let selected = preferred
         .iter()
@@ -7513,6 +7962,10 @@ mod tests {
             acp_launch_arguments(&ProviderKind::Cursor, None).expect("Cursor ACP route"),
             vec!["acp"]
         );
+        assert_eq!(
+            acp_launch_arguments(&ProviderKind::Kimi, None).expect("Kimi ACP route"),
+            vec!["acp"]
+        );
         let grok = acp_launch_arguments(
             &ProviderKind::Grok,
             Some(crate::harness_prompt::LocalToolsProjection::Unavailable),
@@ -7552,7 +8005,7 @@ mod tests {
     }
 
     #[test]
-    fn grok_auth_selects_only_the_vendor_owned_cached_token_method() {
+    fn acp_auth_selects_only_vendor_advertised_cached_methods() {
         assert!(acp_has_auth_method(
             &serde_json::json!({ "authMethods": [{ "id": "cached_token" }, { "id": "xai.api_key" }] }),
             "cached_token"
@@ -7560,6 +8013,14 @@ mod tests {
         assert!(!acp_has_auth_method(
             &serde_json::json!({ "authMethods": [{ "id": "xai.api_key" }] }),
             "cached_token"
+        ));
+        assert!(acp_has_auth_method(
+            &serde_json::json!({ "authMethods": [{ "id": "login", "type": "terminal" }] }),
+            "login"
+        ));
+        assert!(!acp_has_auth_method(
+            &serde_json::json!({ "authMethods": [{ "id": "api-key" }] }),
+            "login"
         ));
     }
 
@@ -7972,5 +8433,25 @@ mod tests {
         assert!(resolve_project_file_reveal_target(&root, "../../outside.rs").is_err());
 
         fs::remove_dir_all(&root).expect("clean up reveal fixture");
+    }
+
+    #[test]
+    fn rate_limit_cache_keeps_only_displayable_provider_fields() {
+        let sanitized = sanitized_rate_limit_snapshot(&serde_json::json!({
+            "limitId": "codex",
+            "limitName": "GPT-5 Codex",
+            "secret": "must-not-persist",
+            "primary": {
+                "usedPercent": 20.0,
+                "windowDurationMins": 10_080,
+                "resetsAt": 1_900_000_000,
+                "opaqueToken": "must-not-persist",
+            },
+        }));
+
+        assert_eq!(sanitized["limitId"], "codex");
+        assert_eq!(sanitized["primary"]["usedPercent"], 20.0);
+        assert!(sanitized.get("secret").is_none());
+        assert!(sanitized["primary"].get("opaqueToken").is_none());
     }
 }

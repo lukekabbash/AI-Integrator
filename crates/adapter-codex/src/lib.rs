@@ -240,6 +240,12 @@ impl CodexClient {
         self.request("account/rateLimits/read", json!({})).await
     }
 
+    /// Returns provider-owned account token activity. This is account-wide
+    /// evidence (including Codex work outside Integrator), not task usage.
+    pub async fn read_account_usage(&self) -> Result<Value> {
+        self.request("account/usage/read", json!({})).await
+    }
+
     pub async fn list_threads(&self, cursor: Option<String>, limit: u32) -> Result<Value> {
         if !(1..=100).contains(&limit) {
             return Err(IntegratorError::InvalidInput(

@@ -303,9 +303,11 @@ fn prepare_request(
         || path.contains("://")
         || path.chars().any(char::is_control)
     {
-        return Err(IntegratorError::InvalidInput(
-            "the requested provider path is not allowed".into(),
-        ));
+        return Err(IntegratorError::InvalidInput(format!(
+            "the requested provider path is not allowed; {} paths must start with \"{}\"",
+            api.name(),
+            specification.path_prefix
+        )));
     }
     if request.query.len() > 128 || request.body.len() > 128 {
         return Err(IntegratorError::InvalidInput(

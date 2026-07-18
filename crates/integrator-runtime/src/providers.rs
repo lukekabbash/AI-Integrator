@@ -16,7 +16,20 @@ struct ProbeDefinition {
 }
 
 pub fn discover_providers() -> Vec<ProviderStatus> {
-    definitions().into_iter().map(discover_one).collect()
+    // Each probe boots the vendor's CLI (often a ~1s Node startup) up to
+    // three times; serially this took >10s of wall clock and gated the first
+    // turn after app launch. The probes are independent per provider, so run
+    // them concurrently while keeping the reported order stable.
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = definitions()
+            .into_iter()
+            .map(|definition| scope.spawn(move || discover_one(definition)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("provider probe thread"))
+            .collect()
+    })
 }
 
 pub fn discover_provider(provider: ProviderKind) -> Option<ProviderStatus> {
@@ -26,7 +39,7 @@ pub fn discover_provider(provider: ProviderKind) -> Option<ProviderStatus> {
         .map(discover_one)
 }
 
-fn definitions() -> [ProbeDefinition; 5] {
+fn definitions() -> [ProbeDefinition; 6] {
     [
         ProbeDefinition {
             provider: ProviderKind::Codex,
@@ -61,6 +74,12 @@ fn definitions() -> [ProbeDefinition; 5] {
             version_args: &["version"],
             transport: ProviderTransport::AcpStdio,
         },
+        ProbeDefinition {
+            provider: ProviderKind::Kimi,
+            executables: &["kimi"],
+            version_args: &["--version"],
+            transport: ProviderTransport::AcpStdio,
+        },
     ]
 }
 
@@ -93,12 +112,22 @@ fn discover_one(definition: ProbeDefinition) -> ProviderStatus {
         Err(_) => (None, Some("version-probe-unavailable".into())),
     };
     let compatibility_code = runtime_compatibility_code(&definition.provider, version.as_deref());
-    let (capabilities, certification, capability_code) = probe_capabilities(
-        &definition.provider,
-        &executable,
-        compatibility_code.is_none(),
-    );
-    let (authentication, auth_code) = authentication_status(&definition.provider, &executable);
+    // The capability and authentication probes each boot the CLI again and
+    // only depend on the version result above, not on each other — run them
+    // concurrently to halve this provider's probe chain.
+    let version_compatible = compatibility_code.is_none();
+    let ((capabilities, certification, capability_code), (authentication, auth_code)) =
+        std::thread::scope(|scope| {
+            let capability_probe = scope.spawn(|| {
+                probe_capabilities(&definition.provider, &executable, version_compatible)
+            });
+            let auth_probe =
+                scope.spawn(|| authentication_status(&definition.provider, &executable));
+            (
+                capability_probe.join().expect("capability probe thread"),
+                auth_probe.join().expect("authentication probe thread"),
+            )
+        });
 
     ProviderStatus {
         provider: definition.provider,
@@ -187,6 +216,15 @@ fn classify_help_capabilities(
             subscription_auth: true,
             skills: true,
         },
+        ProviderKind::Kimi => ProviderCapabilities {
+            session_resume: has("--session") || has("--resume"),
+            authoritative_history: false,
+            structured_tool_events: has("acp"),
+            hooks: false,
+            sandboxed_workspace: false,
+            subscription_auth: has("login"),
+            skills: has("skills") || has("plugin"),
+        },
         ProviderKind::CustomAcp => ProviderCapabilities::default(),
     };
     let all_required = match provider {
@@ -223,11 +261,15 @@ fn classify_help_capabilities(
                 && capabilities.skills
         }
         ProviderKind::Grok => capabilities.structured_tool_events && capabilities.subscription_auth,
+        ProviderKind::Kimi => capabilities.structured_tool_events && capabilities.subscription_auth,
         ProviderKind::CustomAcp => false,
     };
     let certification = if !all_required {
         ProviderCertification::Uncertified
-    } else if matches!(provider, ProviderKind::Cursor | ProviderKind::Grok) {
+    } else if matches!(
+        provider,
+        ProviderKind::Cursor | ProviderKind::Grok | ProviderKind::Kimi
+    ) {
         ProviderCertification::SessionProbeRequired
     } else {
         ProviderCertification::Certified
@@ -271,6 +313,21 @@ fn known_install_candidates(provider: &ProviderKind) -> Vec<PathBuf> {
                 root.join("agent.cmd"),
                 root.join("cursor-agent.cmd"),
                 root.join("dist-package").join("cursor-agent.cmd"),
+            ]
+        }
+        ProviderKind::Kimi => {
+            let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
+            else {
+                return Vec::new();
+            };
+            let home = PathBuf::from(home);
+            vec![
+                home.join(".local").join("bin").join("kimi"),
+                home.join(".local").join("bin").join("kimi.exe"),
+                home.join(".local").join("bin").join("kimi.cmd"),
+                home.join(".kimi-code").join("bin").join("kimi"),
+                home.join(".kimi-code").join("bin").join("kimi.exe"),
+                home.join(".kimi-code").join("bin").join("kimi.cmd"),
             ]
         }
         _ => Vec::new(),
@@ -347,6 +404,10 @@ fn authentication_status(
                 Some("auth-probe-failed".into()),
             ),
         },
+        ProviderKind::Kimi => (
+            AuthenticationState::Unknown,
+            Some("auth-probe-requires-acp".into()),
+        ),
         ProviderKind::Grok | ProviderKind::CustomAcp => {
             (AuthenticationState::Unknown, Some("auth-not-probed".into()))
         }
@@ -448,6 +509,7 @@ mod tests {
         assert!(providers.contains(&ProviderKind::Codex));
         assert!(providers.contains(&ProviderKind::Claude));
         assert!(providers.contains(&ProviderKind::Antigravity));
+        assert!(providers.contains(&ProviderKind::Kimi));
     }
 
     #[test]
@@ -470,6 +532,13 @@ mod tests {
             .find(|definition| definition.provider == ProviderKind::Grok)
             .expect("Grok Build definition");
         assert_eq!(grok.version_args, &["version"]);
+
+        let kimi = definitions()
+            .into_iter()
+            .find(|definition| definition.provider == ProviderKind::Kimi)
+            .expect("Kimi Code definition");
+        assert_eq!(kimi.executables, &["kimi"]);
+        assert_eq!(kimi.version_args, &["--version"]);
     }
 
     #[test]
@@ -506,6 +575,14 @@ mod tests {
         );
         assert_eq!(
             cursor_certification,
+            ProviderCertification::SessionProbeRequired
+        );
+
+        let (kimi, kimi_certification, _) =
+            classify_help_capabilities(&ProviderKind::Kimi, "--session acp login skills", true);
+        assert!(kimi.session_resume && kimi.structured_tool_events && kimi.skills);
+        assert_eq!(
+            kimi_certification,
             ProviderCertification::SessionProbeRequired
         );
 
@@ -558,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn non_cursor_providers_have_no_known_install_fallback() {
+    fn providers_without_documented_install_locations_have_no_fallback() {
         assert!(known_install_candidates(&ProviderKind::Codex).is_empty());
         assert!(known_install_candidates(&ProviderKind::Claude).is_empty());
     }

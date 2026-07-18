@@ -1,177 +1,222 @@
-# Delegation Broker v1 — async cross-provider subagents
+# Delegation broker — cross-provider specialists
 
-Status: Implemented (v1 slice of `broker-mcp-contract.md`)
+Status: Implemented
 
-## Goal
+## Outcome
 
-Give any orchestrator session a model-facing tool surface to delegate work to
-subagents running on _other_ providers, governed by a user-defined policy in
-settings. Delegation is fully asynchronous: it never blocks or interrupts the
-user's conversation. Orchestrators can check in on and nudge children;
-children can ask questions of / report to the orchestrator.
+AI Integrator exposes saved **Specialists** to an orchestrating runtime. A
+specialist is a durable routing and capability policy, not a second account or
+an unrestricted clone of the parent:
 
-## Architecture
-
-```
-┌────────────── Tauri app (one process) ───────────────┐
-│ Local tools: TCP JSON-RPC on 127.0.0.1:<ephemeral>    │
-│  · token-authenticated, loopback only                │
-│  · shared tool: skill_data_request                    │
-│  · orchestrator tools: peers_list, delegate_start,   │
-│    delegation_status, delegation_message,            │
-│    delegation_result, delegation_stop                │
-│  · child tools: orchestrator_ask, orchestrator_report,│
-│    task_complete                                     │
-│ Child runtimes: HashMap<delegation_id, ChildRuntime> │
-│  (structured CLI for claude/agy, app-server for      │
-│   codex, ACP for cursor/grok)                        │
-└──────────────▲───────────────────────────────────────┘
-               │ line-delimited JSON-RPC + token
-┌──────────────┴──────────────┐
-│ integrator.exe --broker-mcp │  ← stdio MCP server, spawned by the
-│ (thin bridge, no Tauri)     │    provider CLI from injected MCP config
-└─────────────────────────────┘
+```text
+Settings profile
+→ orchestrator selects profile ID + service level + access request
+→ host validates and freezes the effective specialist snapshot
+→ one supported child runtime launches asynchronously
+→ parent and child coordinate through the task-scoped local broker
+→ transcript, messages, route, and result remain recoverable in SQLite
 ```
 
-The provider CLI spawns `<current exe> --broker-mcp` as a stdio MCP server.
-Env vars in the MCP config carry the broker address, an auth token, the role
-(`orchestrator` | `child`), and the scope id (parent task id, or delegation
-id for children). The bridge forwards `tools/call` to the broker host.
+The renderer never launches a provider executable or constructs an MCP
+configuration. It edits typed settings; the native host resolves and enforces
+the launch.
 
-The transport also hosts `skill_data_request`, a narrow first-party data
-request tool. It reads enabled skill credentials inside the running native
-process and injects them only into fixed official provider endpoints. The
-credential value never crosses MCP, enters a prompt, or appears in a child
-process environment.
+## Specialist profile
 
-## Delegation modes (composer dropdown, now functional)
+`settings.delegation.profiles` stores a bounded array of profiles:
 
-- `off` — delegation tools and delegation preamble are disabled. The local MCP
-  remains injected with only `skill_data_request`. Default.
-- `manual` — tools injected; every `delegate_start` creates a delegation in
-  `pending-approval`; the user approves/denies in the Agents rail panel.
-- `balanced` — model delegates freely within policy caps.
-- `budget-first` — same, but `peers_list` orders profiles cheapest-first and
-  the preamble instructs the model to prefer the cheapest capable profile.
+```text
+id
+label
+enabled
+bestFor                 orchestrator-facing routing note
+workingGuidance         child-only standing instructions
+access                  read-only | project-write ceiling
+serviceLevels[]         Budget | Standard | Premium
+  enabled
+  primary               runtime + optional model + effort
+  fallbacksEnabled
+  fallbacks[]            ordered, maximum four
+skillIds[]               exact installed Skill/Plugin-skill identities
+mcpServerIds[]           exact enabled MCP server identities
+```
 
-The default mode comes from settings (`settings.delegation.defaultMode`) and
-seeds the composer dropdown; the per-turn value is forwarded to the turn
-commands.
+Profiles are normalized and bounded by the host (64 profiles, 128 identities
+per capability family, four fallbacks per service level). Legacy runtime,
+model, effort, and instruction fields migrate into the Standard service level
+and Working guidance.
 
-## Policy (user settings, "Subagents" settings section)
+`peers_list` reveals only enabled profiles, Best for, enabled service levels,
+access ceilings, and capability counts. Working guidance is deliberately
+child-only. `delegate_start` accepts a profile ID rather than arbitrary runtime
+or capability configuration.
 
-- `settings.delegation.defaultMode` — default composer mode.
-- `settings.delegation.maxConcurrent` — cap on concurrently running children
-  per parent task (default 3). Enforced by the broker, not the model.
-- `settings.delegation.instruction` — free-text user policy appended to the
-  orchestrator preamble (the "custom instruction").
-- `settings.delegation.profiles` — JSON array of delegation targets:
-  `{ id, label, runtime, model, effort?, instruction?, preferredChildProfileIds?, costTier: low|medium|high, enabled }`.
-  `peers_list` returns only enabled profiles; `delegate_start` validates the
-  profile id against this list. The model never picks raw runtime/model pairs.
-  A profile instruction is injected into the child preamble as that specialist's
-  standing role and quality bar. Preferred child profiles are exposed as
-  downstream planning metadata; recursive launching remains disabled by the
-  one-level v1 policy.
+## Service levels and fallbacks
 
-## Async message model
+Budget, Standard, and Premium describe the cost/quality tier the orchestrator
+should choose. Each enabled tier owns an independent primary route and ordered
+fallback list.
 
-Two queues per delegation (`delegation_messages`, sender = `orchestrator` |
-`child` | `user`):
+- An explicit requested tier must exist and be enabled; it never silently
+  downgrades.
+- With no explicit tier, Balanced prefers Standard and Budget-first prefers
+  Budget, then chooses from the remaining enabled tiers deterministically.
+- Fallbacks are attempted only when an earlier route is unavailable before a
+  child launches. They are not load balancing and do not replace a runtime
+  mid-turn.
+- Turning fallbacks off forces that tier to exactly one runtime/provider.
 
-- **To child** (orchestrator `delegation_message`, or user message from the
-  rail/conversation pane): queued; delivered as the child's next turn the
-  moment the child is idle (turn settled). Completed, failed, stopped, or
-  process-disconnected children can be reopened under the same durable child
-  task. Never interrupts a running child turn.
-- **To orchestrator** (`orchestrator_ask` / `orchestrator_report`): queued;
-  never interrupts the user's conversation. Delivered when (a) the
-  orchestrator calls `delegation_status`/`delegation_result`, or (b) the
-  user's next turn starts — undelivered child messages are prepended to the
-  wire prompt as a `<delegation-update>` block. They are also always visible
-  in the Agents rail.
+## Frozen launch contract
 
-## Child lifecycle
+Before manual approval or launch, the host persists a
+`DelegationCapabilitySnapshot` containing:
 
-`delegate_start` → policy check → child `Task` row (`parent_task_id` set,
-same repo/worktree as the parent) → child runtime spawned → first turn =
-child preamble + brief (+ parent conversation digest). Turn settles →
-deliver queued messages as next turn, else `waiting`. Child calls
-`task_complete(summary)` → `completed` with stored result. `delegation_stop`
-or user Stop → `stopped`. A new user message reopens that same child task and
-starts a fresh provider driver when necessary. Child provider events flow
-through the existing pumps, so child transcripts are real tasks: clicking a
-child in the rail opens its full transcript immediately left of the right rail,
-beside the orchestrator conversation. Child tasks are hidden from the task
-sidebar.
+- profile identity and label;
+- Best for and child-only Working guidance;
+- access ceiling and requested effective permission;
+- selected service level and ordered routes;
+- exact Skill/Plugin-skill and MCP server IDs;
+- snapshot version and timestamp.
 
-## Provider support matrix (v1)
+Running or resumed children read this snapshot, never the mutable Settings
+profile. Editing or deleting a specialist therefore changes only future
+delegations. Missing Skill identities and missing or disabled MCP selections
+fail closed with a user-visible diagnostic.
 
-| Provider    | As orchestrator (tools)                   | As child target                                                                         |
-| ----------- | ----------------------------------------- | --------------------------------------------------------------------------------------- |
-| Claude      | yes (`--mcp-config`)                      | yes (child tools too)                                                                   |
-| Cursor      | yes (ACP `mcpServers`)                    | yes (child tools via ACP `mcpServers`; Agent mode pinned; unattended auto-allow)        |
-| Codex       | yes (`thread/start` task-scoped `config`) | yes (approval policy `never`, no child tools — results captured from transcript digest) |
-| Antigravity | no (no safe per-session MCP config input) | yes (no child tools)                                                                    |
-| Grok        | yes (ACP `mcpServers`)                    | yes (no child tools; unattended auto-allow)                                             |
+## Local broker and tools
 
-Children without child tools still receive nudges (injected as turns) and
-still produce results (digest capture on completion); they just can't ask
-questions mid-flight.
+The Tauri process owns a loopback JSON-RPC broker. Each provider session gets a
+fresh random grant bound server-side to an exact role, scope, and delegation
+mode. The stdio MCP bridge receives the opaque grant and cannot choose a
+different task, child, role, or mode.
 
-ACP children (Cursor/Grok) run one long-lived agent process per child
-session. The adapter converts the `session/prompt` response into an ordered
-`PromptFinished` boundary on the same event channel as streamed updates. The
-projection pump stores every preceding update before clearing the active turn,
-then an internal watcher advances the delegation lifecycle. Because no one
-watches a child's approvals, the ACP pump answers `session/request_permission`
-immediately (narrowest allow option; cancel if the request advertises no
-allow) and auto-accepts `cursor/create_plan` — the ACP analog of the Codex
-child's approval policy `never`. Cursor children are pinned to the Agent
-session mode so a brief executes instead of being planned or answered
-read-only, and profile model/effort pins apply through the stable
-`session/set_config_option` surface (effort via the Cursor model-list
-extension); values the agent does not advertise are dropped, never failed.
+Orchestrator sessions receive:
 
-## Persistence (migration 6)
+- `peers_list`
+- `delegate_start`
+- `delegation_status`
+- `delegation_message`
+- `delegation_thread`
+- `delegation_result`
+- `delegation_stop`
 
-- `tasks.parent_task_id` (nullable, FK tasks.id)
-- `delegations` (id, parent_task_id, child_task_id, profile fields, title,
-  brief, status, result, child_session_ref, timestamps)
-- `delegation_messages` (id, delegation_id, sender, body, created_at,
-  delivered_at)
+Child sessions receive:
 
-## UI
+- `orchestrator_ask`
+- `orchestrator_report`
+- `task_complete`
 
-- Composer: dropdown default now driven by settings; value forwarded on
-  every turn.
-- Agents rail panel: live lineage from recursive `delegation_list` reads,
-  unread child questions, Approve/Deny (manual mode), Stop, and selection of a
-  half-width sibling conversation pane. The pane sits left of the persistent
-  right rail, so the two conversations are adjacent and the task-tool tabs
-  remain visible. Child projection events use the same transcript renderer and
-  the same Composer component as the orchestrator. At idle/terminal boundaries
-  the user can change among supported child providers, models, and efforts;
-  active turns must be stopped before rerouting. `delegation://update` Tauri
-  events trigger refresh.
-- Settings → Subagents: mode default, concurrency cap, custom instruction,
-  profile editor, per-specialist instructions, and preferred downstream helper
-  preferences.
+`delegation_thread` returns the recent persisted child transcript for the
+calling parent task. It uses the same broker scope check as status, messaging,
+result, and stop; an orchestrator cannot inspect another task's child by
+supplying an ID.
 
-## Security notes
+The broker also exposes `skill_data_request`, the narrow built-in read-only
+data connector. Its credentials are resolved in the native process and never
+returned through MCP.
 
-- Broker binds loopback only; every connection must present the per-app-run
-  random token before any tool dispatch.
-- Orchestrator tools are scoped to the task id baked into that session's MCP
-  env; child tools to their delegation id. No cross-task reach.
-- Delegated children run under the same trusted-project boundary as the
-  parent task (same repo/worktree paths already trusted by the user).
-- v1 runs children in the parent worktree; concurrent write conflicts are
-  possible if the orchestrator parallelizes overlapping edits. Worktree
-  leases are the planned follow-up (see `repo-coordination-protocol.md`).
+## Messaging and transcript behavior
 
-## Deferred (explicitly out of v1)
+Messages are durable rows with sender `orchestrator`, `child`, or `user`.
 
-Antigravity orchestrator tool injection; per-delegation worktree leases;
-cross-repo delegation; token budget metering per delegation. (Cursor/Grok
-children shipped post-v1 — see the support matrix.)
+- `orchestrator_ask` and `orchestrator_report` enqueue child-to-parent updates.
+  They appear in the Agents rail and are included in the parent's next prompt
+  as a delegation update; they never interrupt the user's active turn.
+- `delegation_message` and the child conversation composer enqueue
+  parent/user-to-child guidance. If the child is busy, delivery waits for its
+  current turn to settle. It never steers a half-finished child turn.
+- `delegation_thread` lets the parent model inspect the same persisted child
+  conversation the user can open beside the parent chat.
+- Terminal or disconnected children can be reopened under their existing
+  child task and provider session reference when the provider supports resume.
+
+The child must call `task_complete(summary)` for an explicit deliverable. The
+host also persists the real provider transcript, so a completed result can be
+paired with a bounded transcript digest.
+
+## Provider projection
+
+| Runtime | Parent broker | Child broker | Specialist Skills | Selected MCPs |
+| --- | --- | --- | --- | --- |
+| Codex | thread-start config | thread-start config | native skill projection | thread-start config |
+| Claude | merged `--mcp-config` | merged `--mcp-config` | per-session plugin dirs | merged config |
+| Antigravity | private control overlay | private control overlay | projected index + read scope | private overlay |
+| Cursor | ACP `mcpServers` | ACP `mcpServers` | bounded prompt projection | ACP `mcpServers` |
+| Grok | ACP `mcpServers` | ACP `mcpServers` | bounded prompt projection | ACP `mcpServers` |
+
+All five child paths receive the same coordination contract when the local
+broker is available. The legacy sentinel parser remains only as a degraded
+transport for a provider path that cannot load the broker; it is not the
+normal behavior advertised to a child.
+
+Skill and MCP projection is exact: a child receives only identities captured
+in its frozen snapshot and still available at launch. A plugin-level picker
+action expands to the plugin's currently installed Skill identities; newly
+installed sibling Skills are never inherited by an existing specialist.
+Plugin assignment is therefore a convenience for selecting exact components,
+not an indivisible or future-growing authority bundle.
+
+## Persistence and recovery
+
+Migration 20 adds `service_level` and `capability_snapshot_json` to
+`delegations` and backfills legacy rows with a version-zero Standard snapshot.
+The existing child task, message, status, result, provider-session reference,
+and parent/child relationship remain durable.
+
+On restart, active children are marked interrupted rather than falsely
+completed. The Agents rail retains their lineage and transcript. A user or
+parent message can resume the same durable child; it does not create a hidden
+replacement task.
+
+## Settings experience
+
+Settings → Subagents uses one continuous roster/editor surface:
+
+- compact global safeguards and optional delegation guidance;
+- one selected specialist at a time;
+- provider icons in the roster and runtime pickers;
+- Best for and collapsed child-only Working guidance;
+- Budget/Standard/Premium routes with optional ordered fallbacks;
+- read-only/project-write access ceiling;
+- a full-width **Equipped capabilities** section, grouped into whole
+  **Plugins**, individual **Skills**, and **MCP servers**, with counts,
+  readiness, search, and explicit removal;
+- a frozen-snapshot note at the bottom.
+
+Installed Skills and Plugins can be assigned even when they are off for normal
+orchestrator chats. Those enablement settings remain separate: ordinary chats
+receive the globally enabled inventory, while a specialist receives only its
+explicitly frozen Skill IDs. Removing a specialist assignment or uninstalling
+the Skill revokes it for future launches.
+
+Delegation mode remains in the composer. Settings does not duplicate that
+choice, and there are no Preferred helper or recursive-delegation controls.
+
+## Security boundary
+
+- Broker transport is loopback-only and every provider session has a unique,
+  server-bound grant.
+- Parent tools are task-scoped; child tools are delegation-scoped.
+- Access is a ceiling. The parent may request less, never more.
+- Capability IDs are host-resolved from installed Skill inventory and enabled
+  MCP inventory, then frozen before launch; the model cannot submit commands,
+  paths, secrets, or arbitrary MCP definitions in `delegate_start`.
+- The certified concurrency setting is clamped to four, and only one
+  project-writing child may be active for a parent task at a time. Read-only
+  specialists can still run in parallel within the configured cap.
+- Provider projection files live only in Integrator-owned app data with
+  owner-only permissions and are pruned on startup. Selected third-party MCP
+  servers may still receive their configured credentials and act with their
+  own external authority; assignment is therefore an explicit trust decision,
+  not an extension of the workspace sandbox.
+- Shared state is broker-owned and child scratch/transcripts are task-owned.
+
+## Deliberately deferred
+
+- recursive specialist delegation;
+- per-delegation token budgets or accounting contracts;
+- mid-turn automatic provider failover;
+- isolated worktree leases for concurrent writing children;
+- per-tool filtering inside an assigned third-party MCP server;
+- per-call approval and uncertain-outcome reconciliation for externally
+  mutating MCP tools.

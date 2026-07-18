@@ -13,6 +13,11 @@ describe("prettyModelLabel", () => {
 
     expect(prettyModelLabel("grok-4.5")).toBe("Grok 4.5");
     expect(prettyModelLabel("grok-build-0.1")).toBe("Grok Build 0.1");
+    expect(prettyModelLabel("kimi-code/k3")).toBe("Kimi K3");
+    expect(prettyModelLabel("kimi-code/kimi-for-coding")).toBe("Kimi K2.7 Code");
+    expect(prettyModelLabel("kimi-code/kimi-for-coding-highspeed")).toBe(
+      "Kimi K2.7 Code Highspeed",
+    );
 
     expect(prettyModelLabel("claude-haiku-4-5")).toBe("Claude Haiku 4.5");
     expect(prettyModelLabel("claude-opus-4-8")).toBe("Claude Opus 4.8");
@@ -31,17 +36,15 @@ describe("prettyModelLabel", () => {
     expect(prettyModelLabel("Gemini 3.1 Pro")).toBe("Gemini 3.1 Pro");
     expect(prettyModelLabel("GPT-5.4")).toBe("GPT-5.4");
     expect(prettyModelLabel("Composer 2.5")).toBe("Composer 2.5");
-    expect(prettyModelLabel("Claude Sonnet 4.6 (Thinking)")).toBe(
-      "Claude Sonnet 4.6 (Thinking)",
-    );
+    expect(prettyModelLabel("Claude Sonnet 4.6 (Thinking)")).toBe("Claude Sonnet 4.6 (Thinking)");
     expect(prettyModelLabel("GPT-OSS 120B")).toBe("GPT-OSS 120B");
   });
 
   it("strips Cursor bracketed config from display labels", () => {
     expect(prettyModelLabel("gpt-5.5[reasoning=medium,context=272k]")).toBe("GPT-5.5");
-    expect(
-      prettyModelLabel("claude-opus-4-8[thinking=true,context=300k,effort=high]"),
-    ).toBe("Claude Opus 4.8");
+    expect(prettyModelLabel("claude-opus-4-8[thinking=true,context=300k,effort=high]")).toBe(
+      "Claude Opus 4.8",
+    );
   });
 
   it("handles empty and placeholder values", () => {

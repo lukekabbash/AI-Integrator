@@ -18,16 +18,19 @@ export interface ComposerTurnBusyState {
   resuming: boolean;
   queueBusy: boolean;
   queueAwaiting: boolean;
-  optimisticMessage: boolean;
 }
 
+// Note: the raw presence of an optimistic user message must NOT feed this
+// check. That state lives until the next edit/failure for display dedup, so
+// counting it kept `busy` true after a successful send and routed every
+// follow-up message through the queue detour. `optimisticTurnStarting` is the
+// self-resolving "send accepted, turn not yet projected" signal.
 export function isComposerTurnBusy(state: ComposerTurnBusyState): boolean {
   return (
     state.projectedTurnActive ||
     state.optimisticTurnStarting ||
     state.resuming ||
     state.queueBusy ||
-    state.queueAwaiting ||
-    state.optimisticMessage
+    state.queueAwaiting
   );
 }

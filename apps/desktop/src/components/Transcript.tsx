@@ -976,9 +976,8 @@ export function Transcript({
   const currentActivityLabel = currentActivity
     ? describeCurrentActivity(currentActivity)
     : undefined;
-  // Connection wait stays generic — the live indicator already signals an
-  // active run, and naming the runtime here raced the connection banner.
-  const waitingLabel = "Connecting";
+  // Runtime-generic — naming the provider here raced the connection banner.
+  const waitingLabel = "Thinking";
   // Keying the narration on its visible text is what drives the ticker
   // transition: any wording change swaps the node through AnimatePresence.
   const narrationKey = liveActivity
@@ -1871,7 +1870,7 @@ export function Transcript({
                       </>
                     ) : (
                       <span className="task-now-label">
-                        Connecting
+                        {waitingLabel}
                         <span className="task-now-ellipsis" aria-hidden="true">
                           <span>.</span>
                           <span>.</span>

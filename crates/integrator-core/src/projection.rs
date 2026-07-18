@@ -221,6 +221,12 @@ pub enum ApprovalKind {
     /// the plan before implementation (Claude `ExitPlanMode`, Cursor
     /// `cursor/create_plan`).
     PlanReview,
+    /// The agent asked a multiple-choice question through ACP's
+    /// `session/request_permission` — the only client-interaction channel
+    /// the protocol offers, since it has no dedicated elicitation method.
+    /// `options` on the approval carries the real answer choices; the
+    /// chosen `optionId` rides straight back as the permission outcome.
+    Question,
 }
 
 impl ApprovalKind {
@@ -230,8 +236,18 @@ impl ApprovalKind {
             Self::CommandExecution => "command_execution",
             Self::FileChange => "file_change",
             Self::PlanReview => "plan_review",
+            Self::Question => "question",
         }
     }
+}
+
+/// One answer choice offered by a `Question` approval, sourced from the
+/// ACP permission request's own `options[].name`/`optionId`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionOption {
+    pub option_id: String,
+    pub label: String,
 }
 
 /// One agent-advertised session mode (ACP `SessionMode`), or a synthesized
@@ -288,6 +304,10 @@ pub enum ApprovalDecision {
     AcceptForSession,
     Decline,
     Cancel,
+    /// The user picked one of a `Question` approval's answer choices. The
+    /// chosen option lives in `ApprovalProjection::selected_option_id`, not
+    /// in this variant, so the string stays `'static`.
+    Select,
 }
 
 impl ApprovalDecision {
@@ -298,6 +318,7 @@ impl ApprovalDecision {
             Self::AcceptForSession => "acceptForSession",
             Self::Decline => "decline",
             Self::Cancel => "cancel",
+            Self::Select => "select",
         }
     }
 }
@@ -320,6 +341,15 @@ pub struct ApprovalProjection {
     /// keeps approvals persisted before this field deserializable.
     #[serde(default)]
     pub plan_markdown: Option<String>,
+    /// Answer choices for a `Question` approval. `default` keeps approvals
+    /// persisted before this field deserializable.
+    #[serde(default)]
+    pub options: Vec<QuestionOption>,
+    /// Which `options` entry the user picked, once a `Question` approval is
+    /// answered. `default` keeps approvals persisted before this field
+    /// deserializable.
+    #[serde(default)]
+    pub selected_option_id: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 

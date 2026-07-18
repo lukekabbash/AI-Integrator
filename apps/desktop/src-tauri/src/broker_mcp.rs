@@ -160,7 +160,10 @@ fn skill_data_tool(harness_instructions: Option<&str>) -> Value {
             },
             "path": {
                 "type": "string",
-                "description": "Official provider path. Required for FRED, Census, and EIA; omit for BLS and Alpha Vantage."
+                "description": "Official provider path. Required for FRED, Census, and EIA; omit for BLS and Alpha Vantage. \
+                    Must start with the provider's fixed prefix: fred -> \"/fred/\" (e.g. \"/fred/series/observations\"), \
+                    census -> \"/data/\" (e.g. \"/data/2023/acs/acs5\"), eia -> \"/v2/\" (e.g. \"/v2/petroleum/pri/gnd/data/\"). \
+                    Query parameters go in `query`, not appended to this string."
             },
             "query": {
                 "type": "object",
@@ -209,7 +212,7 @@ fn tool_definitions(role: &str, mode: &str, harness_instructions: Option<&str>) 
             data_tool,
             json!({
                 "name": "peers_list",
-                "description": "List the delegation profiles the user has enabled (other AI coding agents you may delegate subtasks to), with cost tiers and current concurrency headroom.",
+                "description": "List the specialists the user has enabled, what each is best for, its available Budget/Standard/Premium routes, capability counts, access ceiling, and current concurrency headroom.",
                 "annotations": tool_annotations(true, false),
                 "inputSchema": text_schema(json!({}), &[]),
             }),
@@ -219,9 +222,10 @@ fn tool_definitions(role: &str, mode: &str, harness_instructions: Option<&str>) 
                 "annotations": tool_annotations(false, false),
                 "inputSchema": text_schema(json!({
                     "profileId": { "type": "string", "description": "A profileId from peers_list." },
+                    "serviceLevel": { "type": "string", "enum": ["budget", "standard", "premium"], "description": "An enabled service level from this specialist. Omit to prefer Standard, or Budget in budget-first mode." },
                     "title": { "type": "string", "description": "Short provisional label for the subtask. The app applies its subagent-number convention and may replace this with an automatically generated chat name." },
                     "brief": { "type": "string", "description": "Complete standalone instructions: goal, constraints, files, and the deliverable you expect back." },
-                    "permission": { "type": "string", "enum": ["read-only", "project-write"], "default": "project-write", "description": "Enforced child workspace permission. Use read-only whenever edits are not required." }
+                    "permission": { "type": "string", "enum": ["read-only", "project-write"], "default": "read-only", "description": "Enforced child workspace permission. It may never exceed the specialist's access ceiling." }
                 }), &["profileId", "title", "brief"]),
             }),
             json!({
@@ -240,6 +244,14 @@ fn tool_definitions(role: &str, mode: &str, harness_instructions: Option<&str>) 
                     "delegationId": { "type": "string" },
                     "message": { "type": "string", "description": "Guidance or an answer to the subagent's question." }
                 }), &["delegationId", "message"]),
+            }),
+            json!({
+                "name": "delegation_thread",
+                "description": "Read the recent persisted transcript of one delegated subagent while it is running or after it settles. Use this when status updates are not enough and you need to inspect the child's actual conversation before responding.",
+                "annotations": tool_annotations(true, false),
+                "inputSchema": text_schema(json!({
+                    "delegationId": { "type": "string" }
+                }), &["delegationId"]),
             }),
             json!({
                 "name": "delegation_result",
@@ -432,6 +444,7 @@ mod tests {
         };
 
         assert_eq!(annotation("peers_list", "readOnlyHint"), Some(true));
+        assert_eq!(annotation("delegation_thread", "readOnlyHint"), Some(true));
         assert_eq!(annotation("delegation_result", "readOnlyHint"), Some(true));
         assert_eq!(annotation("delegation_status", "readOnlyHint"), Some(false));
         assert_eq!(annotation("delegate_start", "readOnlyHint"), Some(false));

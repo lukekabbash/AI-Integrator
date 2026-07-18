@@ -64,6 +64,17 @@
       "notes": "Downloaded from xAI's official favicon endpoint."
     },
     {
+      "path": "brand/providers/kimi-code.png",
+      "kind": "provider-mark",
+      "purpose": "Kimi Code provider identity in runtime and model selectors",
+      "source": "https://github.com/MoonshotAI/kimi-code/blob/7d393b56fb324773fad0af58c7da52b254365cb4/apps/vscode/resources/kimi-icon-storefront.png",
+      "sourceCommit": "7d393b56fb324773fad0af58c7da52b254365cb4",
+      "sha256": "DBD00E2AD61EA8832EF0B024662A4A8A5D1B66F0599D5D42E1C9688B9D4CFDF6",
+      "dimensions": "128x128",
+      "approved": true,
+      "notes": "Official Kimi Code extension storefront mark from MoonshotAI's source repository."
+    },
+    {
       "path": "brand/skills/openai.png",
       "kind": "skill-publisher-favicon",
       "purpose": "OpenAI skill publisher identity in Skills settings",

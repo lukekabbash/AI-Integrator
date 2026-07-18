@@ -2081,7 +2081,7 @@ export function Composer({
             {effortOptions.length > 0 ? (
               <Dropdown
                 className="compact-select effort-select"
-                aria-label="Reasoning effort"
+                aria-label={runtime === "kimi" ? "Thinking" : "Reasoning effort"}
                 disabled={routingDisabled}
                 leading={<Gauge />}
                 value={activeEffort}

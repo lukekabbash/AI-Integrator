@@ -74,6 +74,7 @@ import {
   type RuntimeId,
   type StorageTotals,
   type SubscriptionQuota,
+  type SubscriptionQuotaBucket,
   type SubscriptionWindow,
   type TaskSummary,
   type UsageSnapshot,
@@ -97,6 +98,8 @@ import { Tooltip } from "./Tooltip";
 import { Dropdown, ProviderIcon, type DropdownOption } from "./Dropdown";
 import { Slider } from "./Slider";
 import { RuntimeSetupTerminal } from "./RuntimeSetupTerminal";
+import { SubagentsSettings } from "./SubagentsSettings";
+import { DEFAULT_SPECIALISTS } from "../subagentSettings";
 import {
   normalizeRuntimeRouteDefaults,
   readRuntimeRouteDefault,
@@ -223,41 +226,6 @@ const settingsNav: Array<{ id: SettingsSection; label: string; hint: string; ico
 
 type SettingsMap = Record<string, unknown>;
 
-/** Kept in sync with the Rust broker's built-in fallbacks (delegation.rs). */
-interface DelegationProfileSetting {
-  id: string;
-  label: string;
-  runtime: string;
-  model?: string;
-  effort?: string;
-  /** Specialist prompt injected into every child launched with this profile. */
-  instruction?: string;
-  /** Profile ids preferred if this specialist may delegate downstream. */
-  preferredChildProfileIds?: string[];
-  costTier: "low" | "medium" | "high";
-  enabled: boolean;
-}
-
-const DEFAULT_DELEGATION_PROFILES: DelegationProfileSetting[] = [
-  {
-    id: "codex-default",
-    label: "Codex (OpenAI)",
-    runtime: "codex",
-    costTier: "low",
-    enabled: true,
-  },
-  { id: "claude-default", label: "Claude", runtime: "claude", costTier: "high", enabled: true },
-  {
-    id: "antigravity-default",
-    label: "Antigravity (Gemini)",
-    runtime: "antigravity",
-    costTier: "medium",
-    enabled: true,
-  },
-  { id: "cursor-default", label: "Cursor", runtime: "cursor", costTier: "medium", enabled: true },
-  { id: "grok-default", label: "Grok Build", runtime: "grok", costTier: "low", enabled: true },
-];
-
 /**
  * Every key here is consumed by real behavior: workspace restore and the
  * external-link confirmation live in the bridge, the composer defaults are
@@ -311,7 +279,7 @@ const DEFAULT_SETTINGS: SettingsMap = {
   "delegation.defaultMode": "off",
   "delegation.maxConcurrent": 3,
   "delegation.instruction": "",
-  "delegation.profiles": DEFAULT_DELEGATION_PROFILES,
+  "delegation.profiles": DEFAULT_SPECIALISTS,
 };
 
 function readSetting<T>(settings: SettingsMap, key: string, fallback: T): T {
@@ -372,48 +340,11 @@ function Switch({
   );
 }
 
-/** An explicitly stored array is respected verbatim (including empty — the
- * user may have removed every profile on purpose); only a missing or
- * malformed value falls back to the built-in defaults. */
-function normalizeDelegationProfiles(value: unknown): DelegationProfileSetting[] {
-  if (!Array.isArray(value)) return DEFAULT_DELEGATION_PROFILES;
-  return value.filter(
-    (item): item is DelegationProfileSetting =>
-      typeof item === "object" &&
-      item !== null &&
-      typeof (item as DelegationProfileSetting).id === "string" &&
-      typeof (item as DelegationProfileSetting).runtime === "string",
-  );
-}
-
 /**
  * Delegation policy for the native broker: which agents an orchestrator may
  * hand subtasks to, how many at once, and the user's standing instruction.
  * Every control here is read by the Rust side on `peers_list`/`delegate_start`.
  */
-/** Static effort choices when a provider catalog is unavailable; the Rust
- * side drops values a provider does not accept, so stale ids cannot fail a
- * delegated turn. */
-const FALLBACK_EFFORTS: Record<string, string[]> = {
-  claude: ["low", "medium", "high", "xhigh", "max"],
-  codex: ["minimal", "low", "medium", "high"],
-  antigravity: ["low", "medium", "high"],
-  // Cursor thought levels are per-model and only known from the live
-  // catalog; Grok advertises none. An empty list keeps the picker honest
-  // ("Default effort" only) instead of offering ids the agent would drop.
-  cursor: [],
-  grok: [],
-};
-
-/** Runtimes that can run as delegated subagents. */
-const DELEGATION_TARGETS: Array<{ runtime: string; label: string }> = [
-  { runtime: "codex", label: "Codex (OpenAI)" },
-  { runtime: "claude", label: "Claude" },
-  { runtime: "antigravity", label: "Antigravity (Gemini)" },
-  { runtime: "cursor", label: "Cursor" },
-  { runtime: "grok", label: "Grok Build" },
-];
-
 const SKILL_SOURCE_LABELS: Record<string, string> = {
   integrator: "My skills",
   plugin: "Installed plugin",
@@ -2912,339 +2843,6 @@ function SkillsSettings({
   );
 }
 
-function SubagentsSettings({
-  settings,
-  setSetting,
-  runtimes,
-}: {
-  settings: SettingsMap;
-  setSetting: (key: string, value: unknown) => void;
-  runtimes: RuntimeConnection[];
-}) {
-  const mode = readSetting<string>(settings, "delegation.defaultMode", "off");
-  const maxConcurrent = readSetting<number>(settings, "delegation.maxConcurrent", 3);
-  const instruction = readSetting<string>(settings, "delegation.instruction", "");
-  const profiles = normalizeDelegationProfiles(settings["delegation.profiles"]);
-  const [instructionDraft, setInstructionDraft] = useState(instruction);
-  const [catalogs, setCatalogs] = useState<Record<string, ModelCatalogEntry[]>>({});
-  const profileSequence = useRef(0);
-
-  // One catalog fetch per runtime present in the profile list. Failures fall
-  // back to the static effort ids without blocking the page.
-  const profileRuntimes = Array.from(new Set(profiles.map((profile) => profile.runtime))).join();
-  useEffect(() => {
-    let active = true;
-    for (const runtime of profileRuntimes.split(",").filter(Boolean)) {
-      if (catalogs[runtime]) continue;
-      void bridge
-        .listModelCatalog(runtime as RuntimeId)
-        .then((entries) => {
-          if (active && entries.length > 0) {
-            setCatalogs((current) => ({ ...current, [runtime]: entries }));
-          }
-        })
-        .catch(() => undefined);
-    }
-    return () => {
-      active = false;
-    };
-  }, [catalogs, profileRuntimes]);
-
-  const updateProfiles = (next: DelegationProfileSetting[]) =>
-    setSetting("delegation.profiles", next);
-  const updateProfile = (id: string, patch: Partial<DelegationProfileSetting>) =>
-    updateProfiles(
-      profiles.map((profile) => (profile.id === id ? { ...profile, ...patch } : profile)),
-    );
-  const addProfile = (target: { runtime: string; label: string }) => {
-    const suffix = profiles.filter((profile) => profile.runtime === target.runtime).length + 1;
-    updateProfiles([
-      ...profiles,
-      {
-        id: `${target.runtime}-local-${++profileSequence.current}`,
-        label: suffix > 1 ? `${target.label} ${suffix}` : target.label,
-        runtime: target.runtime,
-        instruction: "",
-        preferredChildProfileIds: [],
-        costTier: target.runtime === "codex" || target.runtime === "grok" ? "low" : "medium",
-        enabled: true,
-      },
-    ]);
-  };
-  const runtimeInstalled = (runtime: string) =>
-    runtimes.find((connection) => connection.id === runtime)?.status !== "not_installed";
-
-  return (
-    <>
-      <div className="settings-page-heading">
-        <span>
-          <Users />
-        </span>
-        <div>
-          <h1>Subagents</h1>
-          <p>
-            Delegate subtasks to agents on other providers, asynchronously. Everything here is
-            enforced by the local broker — orchestrators only ever see the profiles you enable.
-          </p>
-        </div>
-      </div>
-      <section className="settings-section">
-        <header>
-          <h2>Delegation policy</h2>
-          <p>The default delegation mode for new chats and a hard cap on concurrent subagents.</p>
-        </header>
-        <SettingRow
-          label="Default delegation mode"
-          description="Preselected in the composer for new chats. Manual queues every delegation for your approval in the task's Agents rail before anything launches."
-        >
-          <Dropdown
-            className="compact-select"
-            aria-label="Default delegation mode"
-            value={mode}
-            options={[
-              { value: "off", label: "No delegation" },
-              { value: "manual", label: "Manual approval" },
-              { value: "balanced", label: "Balanced" },
-              { value: "budget-first", label: "Budget first" },
-            ]}
-            onChange={(value) => setSetting("delegation.defaultMode", value)}
-          />
-        </SettingRow>
-        <SettingRow
-          label="Concurrent subagents"
-          description="Hard cap per task, enforced by the broker regardless of what the model asks for."
-        >
-          <input
-            className="subagent-number"
-            type="number"
-            min={1}
-            max={16}
-            aria-label="Concurrent subagents"
-            value={maxConcurrent}
-            onChange={(event) => {
-              const next = Number(event.target.value);
-              if (Number.isFinite(next))
-                setSetting("delegation.maxConcurrent", Math.min(16, Math.max(1, Math.round(next))));
-            }}
-          />
-        </SettingRow>
-        <SettingRow
-          label="Delegation instruction"
-          description="Your standing policy, injected into the orchestrator's prompt whenever delegation is active."
-        >
-          <textarea
-            className="subagent-instruction"
-            aria-label="Delegation instruction"
-            rows={3}
-            placeholder="e.g. Prefer Codex for mechanical refactors and test writing; keep review and design work yourself."
-            value={instructionDraft}
-            onChange={(event) => setInstructionDraft(event.target.value)}
-            onBlur={() => setSetting("delegation.instruction", instructionDraft.trim())}
-          />
-        </SettingRow>
-      </section>
-      <section className="settings-section">
-        <header>
-          <h2>Delegation profiles</h2>
-          <p>
-            The peer list shown to orchestrators, with your preferred model and reasoning effort
-            pinned per profile. Budget-first mode offers them cheapest tier first.
-          </p>
-        </header>
-        {profiles.length === 0 ? (
-          <p className="subagent-empty">
-            No profiles — orchestrators have nothing to delegate to. Add one below.
-          </p>
-        ) : null}
-        {profiles.map((profile) => {
-          const catalog = (catalogs[profile.runtime] ?? []).filter(
-            (entry) => entry.id !== "Provider default",
-          );
-          const entry = catalog.find((item) => item.id === profile.model);
-          const effortOptions = entry?.efforts?.length
-            ? entry.efforts.map((option) => ({
-                value: option.id,
-                label: option.label ?? option.id,
-              }))
-            : (FALLBACK_EFFORTS[profile.runtime] ?? ["low", "medium", "high"]).map((id) => ({
-                value: id,
-                label: id,
-              }));
-          return (
-            <article className="subagent-profile" key={profile.id} data-enabled={profile.enabled}>
-              <div className="subagent-profile-head">
-                <ProviderIcon provider={profile.runtime} label={profile.label} />
-                <input
-                  className="subagent-profile-name"
-                  aria-label={`Name for the ${profile.runtime} profile`}
-                  value={profile.label}
-                  onChange={(event) => updateProfile(profile.id, { label: event.target.value })}
-                />
-                {runtimeInstalled(profile.runtime) ? null : (
-                  <span className="subagent-profile-badge">CLI not installed</span>
-                )}
-                <Switch
-                  checked={profile.enabled}
-                  onChange={(value) => updateProfile(profile.id, { enabled: value })}
-                  label={`Enable delegation to ${profile.label}`}
-                />
-                <button
-                  type="button"
-                  className="subagent-profile-remove"
-                  aria-label={`Remove the ${profile.label} profile`}
-                  onClick={() => updateProfiles(profiles.filter((item) => item.id !== profile.id))}
-                >
-                  <Trash2 />
-                </button>
-              </div>
-              <div className="subagent-profile-grid">
-                <div className="subagent-field">
-                  <small>Model</small>
-                  {catalog.length > 0 ? (
-                    <Dropdown
-                      className="compact-select"
-                      aria-label={`Model for ${profile.label}`}
-                      value={entry?.id ?? catalog[0].id}
-                      options={catalog.map((item) => ({
-                        value: item.id,
-                        label: item.label || item.id,
-                      }))}
-                      onChange={(value) => {
-                        const nextEntry = catalog.find((item) => item.id === value);
-                        updateProfile(profile.id, {
-                          model: value || undefined,
-                          // Keep the effort only when the new model supports it.
-                          effort: value
-                            ? resolveModelEffort(nextEntry, profile.effort)
-                            : profile.effort,
-                        });
-                      }}
-                    />
-                  ) : (
-                    <input
-                      aria-label={`Model for ${profile.label}`}
-                      placeholder="Model ID"
-                      value={profile.model ?? ""}
-                      onChange={(event) =>
-                        updateProfile(profile.id, { model: event.target.value || undefined })
-                      }
-                    />
-                  )}
-                </div>
-                <div className="subagent-field">
-                  <small>Reasoning effort</small>
-                  <Dropdown
-                    className="compact-select"
-                    aria-label={`Reasoning effort for ${profile.label}`}
-                    value={profile.effort ?? ""}
-                    options={[{ value: "", label: "Default effort" }, ...effortOptions]}
-                    onChange={(value) => updateProfile(profile.id, { effort: value || undefined })}
-                  />
-                </div>
-                <div className="subagent-field">
-                  <small>Cost tier</small>
-                  <Dropdown
-                    className="compact-select"
-                    aria-label={`Cost tier for ${profile.label}`}
-                    value={profile.costTier}
-                    options={[
-                      { value: "low", label: "Low cost" },
-                      { value: "medium", label: "Medium cost" },
-                      { value: "high", label: "High cost" },
-                    ]}
-                    onChange={(value) =>
-                      updateProfile(profile.id, {
-                        costTier: value as DelegationProfileSetting["costTier"],
-                      })
-                    }
-                  />
-                </div>
-              </div>
-              <label className="subagent-profile-instruction">
-                <small>Specialist instructions</small>
-                <textarea
-                  rows={4}
-                  maxLength={65_536}
-                  aria-label={`Specialist instructions for ${profile.label}`}
-                  placeholder="Define this specialist's role, quality bar, workflow, and expected deliverables."
-                  value={profile.instruction ?? ""}
-                  onChange={(event) =>
-                    updateProfile(profile.id, { instruction: event.target.value })
-                  }
-                  onBlur={(event) =>
-                    updateProfile(profile.id, { instruction: event.target.value.trim() })
-                  }
-                />
-              </label>
-              <div className="subagent-downstream">
-                <span>
-                  <small>Preferred downstream helpers</small>
-                  <p>
-                    Ordered preferences for this specialist's future delegated research and
-                    exploration. Recursive launching remains gated by the current one-level policy.
-                  </p>
-                </span>
-                <div>
-                  {profiles
-                    .filter((candidate) => candidate.id !== profile.id)
-                    .map((candidate) => {
-                      const selected = (profile.preferredChildProfileIds ?? []).includes(
-                        candidate.id,
-                      );
-                      return (
-                        <button
-                          key={candidate.id}
-                          type="button"
-                          role="checkbox"
-                          aria-checked={selected}
-                          data-selected={selected}
-                          onClick={() =>
-                            updateProfile(profile.id, {
-                              preferredChildProfileIds: selected
-                                ? (profile.preferredChildProfileIds ?? []).filter(
-                                    (id) => id !== candidate.id,
-                                  )
-                                : [...(profile.preferredChildProfileIds ?? []), candidate.id],
-                            })
-                          }
-                        >
-                          <ProviderIcon provider={candidate.runtime} label={candidate.label} />
-                          {candidate.label}
-                        </button>
-                      );
-                    })}
-                  {profiles.length <= 1 ? (
-                    <small>Add another profile to choose a helper.</small>
-                  ) : null}
-                </div>
-              </div>
-            </article>
-          );
-        })}
-        <div className="subagent-add-row">
-          {DELEGATION_TARGETS.map((target) => (
-            <button
-              key={target.runtime}
-              type="button"
-              className="subagent-add"
-              onClick={() => addProfile(target)}
-            >
-              <ProviderIcon provider={target.runtime} label={target.label} />
-              Add {target.label}
-            </button>
-          ))}
-        </div>
-        <p className="subagent-footnote">
-          Orchestrator tools are injected for Claude and Cursor sessions; every listed provider can
-          run as a subagent. Claude and Cursor children get subagent tools; Codex, Antigravity, and
-          Grok report through their transcript digest. See docs/delegation-broker-v1.md for the
-          support matrix.
-        </p>
-      </section>
-    </>
-  );
-}
-
 function AppearanceSettings({
   preferences,
   onChange,
@@ -3670,6 +3268,7 @@ function runtimeConnectionForRequest(
         cursor: "Cursor",
         claude: "Claude Code",
         grok: "Grok Build",
+        kimi: "Kimi Code",
         antigravity: "Antigravity",
         custom: "Custom ACP",
       }[runtimeId],
@@ -4537,16 +4136,6 @@ function quotaWindowLabel(mins?: number): string {
   return `${Math.round(mins / 1440)}d`;
 }
 
-function formatSubscription(quota: SubscriptionQuota): string {
-  const windows = [quota.primary, quota.secondary]
-    .filter((window): window is SubscriptionWindow => window != null)
-    .map(
-      (window) =>
-        `${Math.round(window.usedPercent)}% of ${quotaWindowLabel(window.windowDurationMins)}`,
-    );
-  return windows.length > 0 ? windows.join(" · ") : "—";
-}
-
 function usageProvenanceLabel(provenance: ProviderUsageSummary["provenance"]): string {
   return {
     vendor_exact: "Vendor exact",
@@ -4554,6 +4143,75 @@ function usageProvenanceLabel(provenance: ProviderUsageSummary["provenance"]): s
     estimated: "Estimated",
     unavailable: "Unavailable",
   }[provenance];
+}
+
+function subscriptionBuckets(quota?: SubscriptionQuota): SubscriptionQuotaBucket[] {
+  if (!quota) return [];
+  const buckets = (quota.buckets ?? []).filter((bucket) => bucket.primary || bucket.secondary);
+  if (buckets.length > 0) return buckets;
+  if (!quota.primary && !quota.secondary) return [];
+  return [
+    {
+      limitId: "default",
+      planType: quota.planType,
+      primary: quota.primary,
+      secondary: quota.secondary,
+    },
+  ];
+}
+
+function quotaResetLabel(resetsAt?: number): string {
+  if (!resetsAt) return "Reset time unavailable";
+  const distance = resetsAt * 1_000 - Date.now();
+  if (distance <= 0) return "Reset pending";
+  const hours = Math.ceil(distance / 3_600_000);
+  if (hours < 24) return `Resets in ${hours}h`;
+  const days = Math.floor(hours / 24);
+  const remainder = hours % 24;
+  return `Resets in ${days}d${remainder ? ` ${remainder}h` : ""}`;
+}
+
+function runtimeUsageGuidance(runtime: RuntimeConnection): {
+  label: string;
+  detail: string;
+  action: string;
+} {
+  if (runtime.id === "claude")
+    return {
+      label: "Session and weekly limits",
+      detail: "Claude’s own /usage screen reports session, weekly, model, and credit limits.",
+      action: "Open /usage",
+    };
+  if (runtime.id === "grok")
+    return {
+      label: "Weekly limit and reset",
+      detail: "Grok’s own /usage screen reports its current weekly limit and reset time.",
+      action: "Open /usage",
+    };
+  if (runtime.id === "kimi")
+    return {
+      label: "Quota and context",
+      detail: "Kimi’s own /usage screen is the authority for account quota and context.",
+      action: "Open /usage",
+    };
+  if (runtime.id === "antigravity")
+    return {
+      label: "Per-model limits",
+      detail: "Antigravity exposes provider-owned limits through /usage or /quota after sign-in.",
+      action: "Open usage",
+    };
+  if (runtime.id === "cursor")
+    return {
+      label: "Activity and context",
+      detail:
+        "Cursor’s /usage is coding activity, not plan headroom; /context explains this session.",
+      action: "Open activity",
+    };
+  return {
+    label: "Session usage only",
+    detail: "This runtime has not exposed a safe account-quota query to Integrator.",
+    action: "Open runtime",
+  };
 }
 
 function StorageTotalsSettings() {
@@ -4626,6 +4284,20 @@ function UsageSettings({
 }) {
   const [summary, setSummary] = useState<UsageSummary | null>(null);
   const [message, setMessage] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
+  const [usagePlan, setUsagePlan] = useState<RuntimeActionPlan | null>(null);
+
+  const loadSummary = useCallback(async () => {
+    setRefreshing(true);
+    setMessage("");
+    try {
+      setSummary(await bridge.getUsageSummary());
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Provider usage unavailable.");
+    } finally {
+      setRefreshing(false);
+    }
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -4641,6 +4313,23 @@ function UsageSettings({
     return () => {
       active = false;
     };
+  }, []);
+
+  const openUsage = useCallback(async (runtime: RuntimeConnection) => {
+    setMessage("");
+    try {
+      const plans = await bridge.listRuntimeActionPlans(runtime.id, "usage");
+      const plan =
+        plans.find((candidate) => candidate.recommended && candidate.available) ??
+        plans.find((candidate) => candidate.available);
+      if (!plan) {
+        setMessage(`No safe usage terminal is available for ${runtime.name} on this computer.`);
+        return;
+      }
+      setUsagePlan(plan);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : `Could not open ${runtime.name} usage.`);
+    }
   }, []);
 
   const summaryByProvider = new Map(summary?.providers.map((row) => [row.provider, row]) ?? []);
@@ -4663,6 +4352,11 @@ function UsageSettings({
   for (const row of summary?.providers ?? []) {
     if (!providerRows.some((current) => current.provider === row.provider)) providerRows.push(row);
   }
+  const codexUsage = summaryByProvider.get("codex");
+  const codexBuckets = subscriptionBuckets(codexUsage?.subscription);
+  const accountUsage = codexUsage?.accountUsage;
+  const dailyUsage = accountUsage?.dailyUsageBuckets.slice(-28) ?? [];
+  const dailyMaximum = Math.max(1, ...dailyUsage.map((bucket) => bucket.tokens));
 
   return (
     <>
@@ -4672,33 +4366,193 @@ function UsageSettings({
         </span>
         <div>
           <h1>Usage and Budgets</h1>
-          <p>Token counts and cost estimates for the current task and each provider.</p>
+          <p>Live plan headroom, account activity, and the usage recorded by Integrator.</p>
         </div>
+        <button
+          className="secondary-button small usage-refresh-button"
+          type="button"
+          onClick={() => void loadSummary()}
+          disabled={refreshing}
+        >
+          <RefreshCw className={refreshing ? "spin" : ""} aria-hidden="true" />
+          {refreshing ? "Refreshing" : "Refresh"}
+        </button>
       </div>
       <section className="settings-section">
         <header>
-          <h2>Current task</h2>
-          <p>Token and cost figures for the open task, each labeled with where it comes from.</p>
+          <h2>Available now</h2>
+          <p>
+            Provider-owned limits where structured data exists, with a safe terminal path elsewhere.
+          </p>
         </header>
-        <div className="settings-usage-grid">
+        <div className="usage-headroom-list">
+          {runtimes.map((runtime) => {
+            const guidance = runtimeUsageGuidance(runtime);
+            const installed = runtime.status !== "not_installed" && runtime.status !== "probing";
+            const canOpen = installed && runtime.id !== "custom";
+            const isCodex = runtime.id === "codex";
+            return (
+              <article className="usage-headroom-row" key={runtime.id}>
+                <div className="usage-runtime-identity">
+                  <ProviderIcon provider={runtime.id} label={runtime.name} />
+                  <span>
+                    <strong>{runtime.name}</strong>
+                    <small>{runtime.status.replaceAll("_", " ")}</small>
+                  </span>
+                </div>
+                {isCodex && codexBuckets.length > 0 ? (
+                  <div className="usage-quota-buckets">
+                    {codexBuckets.map((bucket, bucketIndex) => (
+                      <div className="usage-quota-bucket" key={bucket.limitId ?? bucketIndex}>
+                        <strong>{bucket.limitName || "Codex"}</strong>
+                        {[bucket.primary, bucket.secondary]
+                          .filter((window): window is SubscriptionWindow => window != null)
+                          .map((window, windowIndex) => {
+                            const remaining = Math.max(0, Math.min(100, 100 - window.usedPercent));
+                            return (
+                              <div className="usage-quota-window" key={windowIndex}>
+                                <span>
+                                  <b>{Math.round(remaining)}% remaining</b>
+                                  <small>
+                                    {quotaWindowLabel(window.windowDurationMins)} ·{" "}
+                                    {quotaResetLabel(window.resetsAt)}
+                                  </small>
+                                </span>
+                                <div
+                                  className="usage-quota-track"
+                                  role="progressbar"
+                                  aria-label={`${bucket.limitName || "Codex"} ${quotaWindowLabel(window.windowDurationMins)} remaining`}
+                                  aria-valuemin={0}
+                                  aria-valuemax={100}
+                                  aria-valuenow={Math.round(remaining)}
+                                >
+                                  <i style={{ width: `${remaining}%` }} />
+                                </div>
+                              </div>
+                            );
+                          })}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="usage-runtime-guidance">
+                    <strong>{isCodex ? "Plan headroom unavailable" : guidance.label}</strong>
+                    <small>
+                      {isCodex
+                        ? "Refresh after signing into the installed Codex runtime."
+                        : guidance.detail}
+                    </small>
+                  </div>
+                )}
+                <div className="usage-runtime-action">
+                  {isCodex ? (
+                    <span>
+                      {codexUsage?.subscription?.resetCreditsAvailable != null
+                        ? `${codexUsage.subscription.resetCreditsAvailable} reset credits`
+                        : codexUsage?.subscription?.planType || "Structured query"}
+                    </span>
+                  ) : canOpen ? (
+                    <button
+                      className="secondary-button small"
+                      type="button"
+                      onClick={() => void openUsage(runtime)}
+                    >
+                      {guidance.action}
+                    </button>
+                  ) : (
+                    <span>
+                      {runtime.status === "login_required"
+                        ? "Sign in first"
+                        : runtime.status === "not_installed"
+                          ? "Install in Runtimes"
+                          : "Unavailable"}
+                    </span>
+                  )}
+                </div>
+              </article>
+            );
+          })}
+        </div>
+        {usagePlan ? (
+          <div className="usage-terminal-shell">
+            <p>{usagePlan.description}</p>
+            <RuntimeSetupTerminal
+              plan={usagePlan}
+              onClose={() => setUsagePlan(null)}
+              onExit={() => void loadSummary()}
+            />
+          </div>
+        ) : null}
+        {message ? (
+          <p className="settings-action-message" role="status">
+            {message}
+          </p>
+        ) : null}
+      </section>
+      {accountUsage ? (
+        <section className="settings-section">
+          <header>
+            <h2>Codex account activity</h2>
+            <p>Provider-reported activity across Codex clients and devices, not just Integrator.</p>
+          </header>
+          <div className="usage-account-summary">
+            <div>
+              <span>Lifetime tokens</span>
+              <strong>{formatTokens(accountUsage.summary.lifetimeTokens ?? 0)}</strong>
+            </div>
+            <div>
+              <span>Peak day</span>
+              <strong>{formatTokens(accountUsage.summary.peakDailyTokens ?? 0)}</strong>
+            </div>
+            <div>
+              <span>Current streak</span>
+              <strong>{accountUsage.summary.currentStreakDays ?? 0} days</strong>
+            </div>
+            <div>
+              <span>Longest streak</span>
+              <strong>{accountUsage.summary.longestStreakDays ?? 0} days</strong>
+            </div>
+          </div>
+          {dailyUsage.length > 0 ? (
+            <div className="usage-activity-chart" aria-label="Codex daily token activity">
+              {dailyUsage.map((bucket) => (
+                <i
+                  key={bucket.startDate}
+                  style={{ height: `${Math.max(4, (bucket.tokens / dailyMaximum) * 100)}%` }}
+                  title={`${new Date(bucket.startDate).toLocaleDateString()}: ${bucket.tokens.toLocaleString()} tokens`}
+                />
+              ))}
+            </div>
+          ) : null}
+          <p className="settings-measured-note">
+            Updated {new Date(accountUsage.updatedAt).toLocaleString()} · provider reported.
+          </p>
+        </section>
+      ) : null}
+      <section className="settings-section">
+        <header>
+          <h2>Current task</h2>
+          <p>Figures for the open task, each kept with its source and limits.</p>
+        </header>
+        <div className="settings-usage-list">
           {usage.metrics.map((metric) => (
             <div key={metric.label}>
               <span>
-                {metric.label}
-                <small>{metric.provenance.replace("_", " ")}</small>
+                <strong>{metric.label}</strong>
+                <small>{metric.detail}</small>
               </span>
-              <strong>{metric.value}</strong>
-              <p>{metric.detail}</p>
+              <b>{metric.value}</b>
+              <em>{metric.provenance.replace("_", " ")}</em>
             </div>
           ))}
         </div>
       </section>
       <section className="settings-section">
         <header>
-          <h2>Per-provider usage</h2>
+          <h2>Local history</h2>
           <p>
-            Persisted native projections are exact where a provider reports them; missing data stays
-            unavailable.
+            Usage persisted from Integrator tasks. It does not claim to be your provider bill or
+            remaining plan allowance.
           </p>
         </header>
         {providerRows.length > 0 ? (
@@ -4724,12 +4578,8 @@ function UsageSettings({
                   <strong>
                     {row.estimatedCostUsd != null && row.estimatedCostUsd > 0
                       ? formatEstimatedCost(row.estimatedCostUsd)
-                      : "—"}
+                      : "Not reported"}
                   </strong>
-                </div>
-                <div className="settings-provider-stat">
-                  <span>Subscription used</span>
-                  <strong>{row.subscription ? formatSubscription(row.subscription) : "—"}</strong>
                 </div>
                 <div className="settings-provider-breakdown">
                   <span>Input {formatTokens(row.inputTokens)}</span>
@@ -4750,12 +4600,7 @@ function UsageSettings({
         )}
         {summary ? (
           <p className="settings-measured-note">
-            Measured {new Date(summary.measuredAt).toLocaleString()} · Processed-token and plan
-            totals are never inferred.
-          </p>
-        ) : message ? (
-          <p className="settings-action-message" role="status">
-            {message}
+            Measured {new Date(summary.measuredAt).toLocaleString()} · missing totals stay missing.
           </p>
         ) : null}
       </section>
@@ -6206,6 +6051,7 @@ export function SettingsView(props: SettingsViewProps) {
   });
   const [actionMessage, setActionMessage] = useState("");
   const importRef = useRef<HTMLInputElement>(null);
+  const contentScrollRef = useRef<HTMLDivElement>(null);
   const visibleNav = useMemo(
     () =>
       settingsNav.filter((item) =>
@@ -6236,6 +6082,10 @@ export function SettingsView(props: SettingsViewProps) {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (contentScrollRef.current) contentScrollRef.current.scrollTop = 0;
+  }, [section]);
 
   const setSetting = (key: string, value: unknown) => {
     setSettings((current) => ({ ...current, [key]: value }));
@@ -6363,7 +6213,7 @@ export function SettingsView(props: SettingsViewProps) {
           </LayoutGroup>
         </nav>
       </aside>
-      <div className="settings-content-scroll">
+      <div className="settings-content-scroll" ref={contentScrollRef}>
         <div className="settings-content">
           {section === "appearance" ? (
             <AppearanceSettings

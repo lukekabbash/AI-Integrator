@@ -131,6 +131,37 @@ pub fn enabled_skills(app: &tauri::AppHandle, store: &LocalStore) -> Vec<Integra
         .collect()
 }
 
+fn select_installed_skills(
+    installed: &[IntegratorSkillEntry],
+    names: &[String],
+) -> integrator_core::Result<Vec<IntegratorSkillEntry>> {
+    let mut selected = Vec::with_capacity(names.len());
+    for name in names {
+        let entry = installed
+            .iter()
+            .find(|entry| entry.name == *name)
+            .cloned()
+            .ok_or_else(|| {
+                IntegratorError::Unavailable(format!(
+                    "assigned skill '{name}' is no longer installed; review the specialist before continuing"
+                ))
+            })?;
+        selected.push(entry);
+    }
+    Ok(selected)
+}
+
+/// Resolve a specialist snapshot's exact skill identities against installed
+/// inventory. Specialist assignment is its own explicit authority grant, so a
+/// skill may remain off for ordinary orchestrator chats while being equipped
+/// on this child. Uninstalled identities still fail closed.
+pub fn selected_installed_skills(
+    app: &tauri::AppHandle,
+    names: &[String],
+) -> integrator_core::Result<Vec<IntegratorSkillEntry>> {
+    select_installed_skills(&discover_all(app), names)
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IntegratorSkillInfo {
@@ -908,6 +939,28 @@ mod tests {
         assert!(default_enabled("integrator-authoring:skill-creator"));
         assert!(!default_enabled("gov-data:fred"));
         assert!(!default_enabled("integrator-authoring:plugin-packager"));
+    }
+
+    #[test]
+    fn specialist_selection_resolves_installed_skills_independent_of_main_chat_enablement() {
+        let installed = vec![IntegratorSkillEntry {
+            name: "documents:pdf".into(),
+            description: "Create and inspect PDFs".into(),
+            source: "plugin".into(),
+            path: PathBuf::from("/plugins/documents/skills/pdf"),
+        }];
+        let mut main_chat_overrides = serde_json::Map::new();
+        main_chat_overrides.insert("documents:pdf".into(), Value::Bool(false));
+        assert!(!is_enabled(&main_chat_overrides, "documents:pdf"));
+
+        let selected = select_installed_skills(&installed, &["documents:pdf".into()])
+            .expect("installed specialist skill");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "documents:pdf");
+
+        let missing = select_installed_skills(&installed, &["documents:spreadsheets".into()])
+            .expect_err("missing skills must fail closed");
+        assert!(missing.to_string().contains("no longer installed"));
     }
 
     #[test]

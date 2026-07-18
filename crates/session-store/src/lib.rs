@@ -744,6 +744,32 @@ const MIGRATIONS: &[(i64, &str)] = &[
           );
         "#,
     ),
+    (
+        20,
+        r#"
+        ALTER TABLE delegations ADD COLUMN service_level TEXT NOT NULL DEFAULT 'standard'
+            CHECK (service_level IN ('budget', 'standard', 'premium'));
+        ALTER TABLE delegations ADD COLUMN capability_snapshot_json TEXT NOT NULL DEFAULT '{}';
+        UPDATE delegations
+        SET capability_snapshot_json = json_object(
+            'version', 0,
+            'profileId', profile_id,
+            'profileLabel', profile_label,
+            'bestFor', '',
+            'workingGuidance', '',
+            'accessCeiling', permission,
+            'serviceLevel', 'standard',
+            'routes', json_array(json_object(
+                'runtime', runtime,
+                'model', model,
+                'effort', effort
+            )),
+            'skillIds', json_array(),
+            'mcpServerIds', json_array(),
+            'createdAt', created_at
+        );
+        "#,
+    ),
 ];
 
 pub struct LocalStore {
@@ -3546,6 +3572,62 @@ mod tests {
         let path = directory.path().join("integrator.sqlite3");
         LocalStore::open(&path).expect("first open");
         LocalStore::open(&path).expect("second open");
+    }
+
+    #[test]
+    fn legacy_delegations_gain_a_frozen_standard_snapshot() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("legacy-delegation.sqlite3");
+        let task_id = TaskId::new();
+        let delegation_id = integrator_core::DelegationId::new();
+        let now = Utc::now();
+        {
+            let mut connection = Connection::open(&path).expect("open v19 fixture");
+            LocalStore::configure(&connection).expect("configure fixture");
+            connection
+                .execute(
+                    "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+                    [],
+                )
+                .expect("create migration ledger");
+            for (version, sql) in MIGRATIONS.iter().filter(|(version, _)| *version < 20) {
+                let transaction = connection.transaction().expect("migration transaction");
+                transaction.execute_batch(sql).expect("apply v19 migration");
+                transaction
+                    .execute(
+                        "INSERT INTO schema_migrations(version,applied_at) VALUES (?1,?2)",
+                        params![version, now.to_rfc3339()],
+                    )
+                    .expect("record migration");
+                transaction.commit().expect("commit migration");
+            }
+            connection
+                .execute(
+                    "INSERT INTO tasks(id,title,state,created_at,updated_at) VALUES (?1,'Legacy parent','ready',?2,?2)",
+                    params![task_id.to_string(), now.to_rfc3339()],
+                )
+                .expect("insert parent task");
+            connection
+                .execute(
+                    "INSERT INTO delegations(id,parent_task_id,profile_id,profile_label,runtime,model,effort,permission,title,brief,status,created_at,updated_at) VALUES (?1,?2,'legacy-reviewer','Legacy reviewer','claude','sonnet','high','project-write','Review','Review the diff','completed',?3,?3)",
+                    params![delegation_id.to_string(), task_id.to_string(), now.to_rfc3339()],
+                )
+                .expect("insert legacy delegation");
+        }
+
+        let store = LocalStore::open(&path).expect("migrate legacy delegation");
+        let delegation = store
+            .get_delegation(delegation_id)
+            .expect("read migrated delegation");
+        assert_eq!(delegation.service_level, "standard");
+        assert_eq!(delegation.capability_snapshot.version, 0);
+        assert_eq!(delegation.capability_snapshot.profile_id, "legacy-reviewer");
+        assert_eq!(delegation.capability_snapshot.routes.len(), 1);
+        assert_eq!(delegation.capability_snapshot.routes[0].runtime, "claude");
+        assert_eq!(
+            delegation.capability_snapshot.access_ceiling,
+            integrator_core::DelegationPermission::ProjectWrite
+        );
     }
 
     #[test]

@@ -339,6 +339,15 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
       detail: "Install the vendor runtime, then return to this setup step.",
     },
     {
+      id: "kimi",
+      name: "Kimi Code",
+      command: "kimi acp",
+      status: "not_installed",
+      fidelity: "acp",
+      models: ["Kimi K3", "Kimi K2.7 Code", "Kimi K2.7 Code Highspeed"],
+      detail: "Install Kimi Code, then sign in with its vendor-owned device flow.",
+    },
+    {
       id: "antigravity",
       name: "Antigravity",
       command: "agy",

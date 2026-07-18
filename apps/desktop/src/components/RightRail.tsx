@@ -613,10 +613,6 @@ function GitPanel({
   const supportedFileOpeners = fileOpeners;
   const upstreamRemoteName = git.upstream.includes("/") ? git.upstream.split("/")[0] : "";
   const upstreamRemote = git.remotes.find((remote) => remote.name === upstreamRemoteName);
-  // Without an upstream the cloud tooltip still names the remote the history
-  // was compared against when there is exactly one candidate.
-  const syncRemote = upstreamRemote ?? (git.remotes.length === 1 ? git.remotes[0] : undefined);
-
   const runStage = async (file: DiffFile, nextStaged: boolean) => {
     setStagingPath(file.path);
     setActionError(null);
@@ -1853,6 +1849,8 @@ function providerLabel(runtime: string): string {
       return "Cursor";
     case "grok":
       return "Grok";
+    case "kimi":
+      return "Kimi Code";
     case "antigravity":
       return "Antigravity";
     default:
@@ -2209,7 +2207,9 @@ function DelegationRow({
           </span>
         </span>
         <Tooltip label={delegation.brief} markdown multiline placement="bottom-left">
-          <span className="agent-activity">{delegation.brief}</span>
+          <span className="agent-activity" title={delegation.brief}>
+            {delegation.brief}
+          </span>
         </Tooltip>
         <AgentRoute runtime={delegation.runtime} model={delegation.model} />
         {delegation.unreadFromChild > 0 ? (
@@ -2994,6 +2994,7 @@ const PLAN_USAGE_GUIDANCE: Record<RuntimeId, string> = {
   claude: "Open Claude Code and run /usage to see its plan limits.",
   cursor: "Open the Cursor dashboard to see included usage and token breakdowns.",
   grok: "Run /usage in Grok Build or open Settings → Usage on grok.com.",
+  kimi: "Open Kimi Code plan settings to see current quota and model availability.",
   antigravity: "Open Antigravity Settings to see baseline quota by model.",
   custom: "This ACP agent has not supplied a plan limit.",
 };
@@ -3019,6 +3020,7 @@ function usageRuntimeLabel(runtime?: RuntimeId): string {
     cursor: "Cursor",
     claude: "Claude Code",
     grok: "Grok Build",
+    kimi: "Kimi Code",
     antigravity: "Antigravity",
     custom: "Custom ACP",
   }[runtime];

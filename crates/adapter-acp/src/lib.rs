@@ -198,6 +198,14 @@ impl AcpClient {
 
         let mut command = launch_command(&options.executable, &options.arguments);
         suppress_windows_console(&mut command);
+        // Spawn-latency hygiene for vendor CLIs that run update/telemetry
+        // preflights on boot (measured >1s of Node startup already; kimi adds
+        // a network update check without this). Vendor-specific names are
+        // ignored by the other ACP CLIs, so setting them unconditionally is
+        // safe and keeps this transport-generic.
+        command
+            .env("KIMI_CODE_NO_AUTO_UPDATE", "1")
+            .env("KIMI_DISABLE_TELEMETRY", "1");
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -257,7 +265,8 @@ impl AcpClient {
     }
 
     /// Runs ACP's provider-owned authentication handshake. Integrator passes
-    /// only a method id the agent advertised (for Grok, `cached_token`) and
+    /// only a method id the agent advertised (for example, Grok's
+    /// `cached_token` or Kimi's `login`) and
     /// never transports API keys or token contents.
     pub async fn authenticate(&self, method_id: &str, headless: bool) -> Result<Value> {
         validate_short_token(method_id, "authentication method id")?;

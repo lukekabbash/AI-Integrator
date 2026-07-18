@@ -23,6 +23,7 @@ import {
   resolveModelEffort,
   runtimeAuthWarning,
 } from "./bridge";
+import { createDemoSnapshot } from "./demoData";
 
 describe("native Git diff parsing", () => {
   it("preserves hunk line numbers for the review workspace", () => {
@@ -207,6 +208,46 @@ describe("provider model catalogs", () => {
 
   it("degrades safely when an ACP agent does not advertise model options", () => {
     expect(extractAcpCatalog({ sessionId: "session-1", modes: {} })).toEqual([]);
+  });
+
+  it("reads Kimi models and its binary Thinking control from ACP", () => {
+    expect(
+      extractAcpCatalog(
+        {
+          configOptions: [
+            {
+              id: "model",
+              category: "model",
+              currentValue: "kimi-code/k3",
+              options: [
+                { value: "kimi-code/k3", name: "Kimi K3" },
+                { value: "kimi-code/kimi-for-coding", name: "Kimi K2.7 Code" },
+              ],
+            },
+            {
+              id: "thinking",
+              category: "thought_level",
+              currentValue: "on",
+              options: [{ value: "on", name: "Thinking On" }],
+            },
+          ],
+        },
+        "kimi",
+      ),
+    ).toEqual([
+      {
+        id: "kimi-code/k3",
+        label: "Kimi K3",
+        efforts: [{ id: "on", label: "Thinking On" }],
+        defaultEffort: "on",
+      },
+      {
+        id: "kimi-code/kimi-for-coding",
+        label: "Kimi K2.7 Code",
+        efforts: [{ id: "on", label: "Thinking On" }],
+        defaultEffort: "on",
+      },
+    ]);
   });
 
   it("places the ACP session's current model first", () => {
@@ -405,6 +446,7 @@ describe("native trusted-project bridge", () => {
     bridge.invalidateModelCatalog("antigravity");
     bridge.invalidateModelCatalog("cursor");
     bridge.invalidateModelCatalog("grok");
+    bridge.invalidateModelCatalog("kimi");
     bridge.invalidateModelCatalog("custom");
   });
 
@@ -1327,7 +1369,7 @@ describe("native trusted-project bridge", () => {
     ]);
   });
 
-  it("starts a fresh provider session after MCP enablement changes", async () => {
+  it("keeps a Codex conversation after MCP enablement changes", async () => {
     invokeMock.mockImplementation(async (command: string) => {
       if (command === "app_bootstrap") return { value: {} };
       if (command === "local_export") {
@@ -1410,18 +1452,17 @@ describe("native trusted-project bridge", () => {
       taskId: "task-mcp-refresh",
       threadId: "thread-before-mcp",
     });
-    expect(invokeMock).toHaveBeenCalledWith(
-      "codex_start_thread",
-      expect.objectContaining({ taskId: "task-mcp-refresh" }),
-    );
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "codex_start_thread"),
+    ).toHaveLength(0);
     expect(
       invokeMock.mock.calls
         .filter(([command]) => command === "codex_start_turn")
         .map(([, args]) => args?.threadId),
-    ).toEqual(["thread-before-mcp", "thread-after-mcp"]);
+    ).toEqual(["thread-before-mcp", "thread-before-mcp"]);
   });
 
-  it("does not revive a provider session older than the persisted MCP revision", async () => {
+  it("resumes a Codex conversation that predates the persisted MCP revision", async () => {
     invokeMock.mockImplementation(async (command: string) => {
       if (command === "app_bootstrap") return { value: {} };
       if (command === "local_export") {
@@ -1470,8 +1511,8 @@ describe("native trusted-project bridge", () => {
               provider: "codex",
               sessionRef: "thread-stale-mcp",
               repositoryRoot: "H:\\Code\\integrator-3",
-              permission: "read-only",
-              delegation: "manual",
+              permission: "project-write",
+              delegation: "off",
               updatedAt: "2026-07-13T00:00:00Z",
             },
           ],
@@ -1493,16 +1534,16 @@ describe("native trusted-project bridge", () => {
       delegation: "off",
     });
 
+    expect(invokeMock).toHaveBeenCalledWith("codex_resume_thread", {
+      taskId: "task-mcp-restart",
+      threadId: "thread-stale-mcp",
+    });
     expect(
-      invokeMock.mock.calls.filter(([command]) => command === "codex_resume_thread"),
+      invokeMock.mock.calls.filter(([command]) => command === "codex_start_thread"),
     ).toHaveLength(0);
     expect(invokeMock).toHaveBeenCalledWith(
-      "codex_start_thread",
-      expect.objectContaining({
-        taskId: "task-mcp-restart",
-        permission: "project-write",
-        delegation: "off",
-      }),
+      "codex_start_turn",
+      expect.objectContaining({ threadId: "thread-stale-mcp" }),
     );
   });
 
@@ -1568,6 +1609,104 @@ describe("native trusted-project bridge", () => {
         .filter(([command]) => command === "acp_send_turn")
         .map(([, args]) => args?.delegation),
     ).toEqual(["balanced", "balanced", "budget-first"]);
+  });
+
+  it("applies Kimi's negotiated model and Thinking controls before prompting", async () => {
+    const kimiConfig = (currentModel: string) => ({
+      sessionId: "kimi-session",
+      configOptions: [
+        {
+          id: "model",
+          category: "model",
+          currentValue: currentModel,
+          options: [
+            { value: "kimi-code/k3", name: "Kimi K3" },
+            { value: "kimi-code/kimi-for-coding", name: "Kimi K2.7 Code" },
+          ],
+        },
+        {
+          id: "thinking",
+          category: "thought_level",
+          currentValue: "on",
+          options: [
+            { value: "off", name: "Thinking Off" },
+            { value: "on", name: "Thinking On" },
+          ],
+        },
+      ],
+    });
+    invokeMock.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "app_bootstrap") return { value: {} };
+      if (command === "local_export") {
+        return {
+          projects: [
+            {
+              id: "project-kimi-routing",
+              displayName: "integrator-3",
+              repositoryRoot: "H:\\Code\\integrator-3",
+              gitCommonDirectory: "H:\\Code\\integrator-3\\.git",
+              createdAt: "2026-07-17T00:00:00Z",
+              lastOpenedAt: "2026-07-17T00:00:00Z",
+            },
+          ],
+          tasks: [
+            {
+              id: "task-kimi-routing",
+              title: "Kimi routing",
+              repositoryPath: "H:\\Code\\integrator-3",
+              state: "ready",
+              pinned: false,
+              archived: false,
+              runtime: "kimi",
+              model: "kimi-code/kimi-for-coding",
+              effort: "off",
+              createdAt: "2026-07-17T00:00:00Z",
+              updatedAt: "2026-07-17T00:00:00Z",
+            },
+          ],
+          settings: [],
+          providerSessions: [],
+          runtimeSessions: [],
+        };
+      }
+      if (command === "acp_session_capabilities") {
+        return { load: true, resume: true, mcpHttp: true, mcpSse: true };
+      }
+      if (command === "acp_start_session") return kimiConfig("kimi-code/k3");
+      if (command === "acp_set_config_option") {
+        return kimiConfig(
+          args?.configId === "model" && typeof args.value === "string"
+            ? args.value
+            : "kimi-code/kimi-for-coding",
+        );
+      }
+      if (command === "acp_send_turn") return { turnId: "kimi-turn" };
+      return undefined;
+    });
+
+    await bridge.loadWorkspace();
+    await bridge.sendTurn({
+      taskId: "task-kimi-routing",
+      prompt: "Use Kimi",
+      runtime: "kimi",
+      model: "kimi-code/kimi-for-coding",
+      effort: "off",
+      permission: "project-write",
+      delegation: "off",
+    });
+
+    expect(
+      invokeMock.mock.calls
+        .filter(([command]) => command === "acp_set_config_option")
+        .map(([, args]) => [args?.configId, args?.value]),
+    ).toEqual([
+      ["model", "kimi-code/kimi-for-coding"],
+      ["thinking", "off"],
+    ]);
+    expect(invokeMock).toHaveBeenCalledWith(
+      "acp_send_turn",
+      expect.objectContaining({ taskId: "task-kimi-routing", prompt: "Use Kimi" }),
+    );
   });
 
   it("replaces a persisted Codex thread that the provider no longer recognizes", async () => {
@@ -2012,6 +2151,23 @@ describe("browser fallback usage evidence", () => {
 
   afterEach(() => {
     window.localStorage.clear();
+  });
+
+  it("adds newly shipped runtimes to an existing browser snapshot in canonical order", async () => {
+    const snapshot = createDemoSnapshot();
+    snapshot.runtimes = snapshot.runtimes.filter((runtime) => runtime.id !== "kimi");
+    window.localStorage.setItem("aiintegrator.demo.workspace.v2", JSON.stringify(snapshot));
+
+    const hydrated = await bridge.loadWorkspace();
+
+    expect(hydrated.runtimes.map((runtime) => runtime.id)).toEqual([
+      "codex",
+      "cursor",
+      "claude",
+      "grok",
+      "kimi",
+      "antigravity",
+    ]);
   });
 
   it("records local turn evidence without inventing vendor plan telemetry", async () => {

@@ -6,12 +6,13 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use integrator_core::{
-    ApprovalDecision, ApprovalProjection, ApprovalState, IntegratorError, ItemProjection,
-    ItemStatus, NewTask, ProviderKind, ProviderSession, ProviderSessionId, Result, RuntimeBinding,
-    RuntimeProjection, RuntimeProjectionEvent, RuntimeSession, RuntimeSessionId, StopRequestResult,
-    TASK_PROJECTION_HYDRATE_TAIL, Task, TaskId, TaskProjectionConnectionHydrate,
-    TaskProjectionDiffHydrate, TaskProjectionErrorHydrate, TaskProjectionHydrate, TaskSnapshot,
-    TaskSnapshotQuery, TransportRequestId, TurnProjection, TurnStatus, UsageProjection,
+    ApprovalDecision, ApprovalKind, ApprovalProjection, ApprovalState, IntegratorError,
+    ItemProjection, ItemStatus, NewTask, ProviderKind, ProviderSession, ProviderSessionId, Result,
+    RuntimeBinding, RuntimeProjection, RuntimeProjectionEvent, RuntimeSession, RuntimeSessionId,
+    StopRequestResult, TASK_PROJECTION_HYDRATE_TAIL, Task, TaskId,
+    TaskProjectionConnectionHydrate, TaskProjectionDiffHydrate, TaskProjectionErrorHydrate,
+    TaskProjectionHydrate, TaskSnapshot, TaskSnapshotQuery, TransportRequestId, TurnProjection,
+    TurnStatus, UsageProjection,
 };
 use integrator_runtime::{
     ItemTextField, ProjectionMutation, ReducedProviderEvent, redact_and_bound,
@@ -85,6 +86,7 @@ pub struct HandoffDigest {
     pub image_paths: Vec<PathBuf>,
 }
 
+#[derive(Debug)]
 pub struct PreparedApprovalResponse {
     pub event: RuntimeProjectionEvent,
     pub request_id: TransportRequestId,
@@ -841,11 +843,94 @@ impl LocalStore {
         })
     }
 
+    /// Answer a `Question` approval with one of its offered options. Kept
+    /// separate from `prepare_approval_response` because the caller already
+    /// knows exactly which choice the user made — there is no accept/decline
+    /// axis to infer it from, and the chosen `optionId` must be validated
+    /// against what the agent actually offered before it rides back to the
+    /// agent as the permission outcome.
+    pub fn prepare_question_response(
+        &self,
+        task_id: TaskId,
+        approval_id: &str,
+        option_id: &str,
+    ) -> Result<PreparedApprovalResponse> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(storage_error)?;
+        let row = transaction.query_row(
+            "SELECT projection_json, request_kind, request_value, process_id, provider_session_id, runtime_session_id, thread_id, turn_id FROM codex_approvals WHERE id = ?1 AND task_id = ?2",
+            params![approval_id, task_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, Option<String>>(7)?)),
+        ).optional().map_err(storage_error)?.ok_or_else(|| IntegratorError::NotFound(format!("approval {approval_id}")))?;
+        let mut approval: ApprovalProjection = serde_json::from_str(&row.0)?;
+        if approval.state != ApprovalState::Pending
+            && approval.state != ApprovalState::ResponseFailed
+        {
+            return Err(IntegratorError::InvalidInput(
+                "approval is no longer pending".into(),
+            ));
+        }
+        if approval.approval_kind != ApprovalKind::Question {
+            return Err(IntegratorError::InvalidInput(
+                "this approval is not a question".into(),
+            ));
+        }
+        if !approval.options.iter().any(|option| option.option_id == option_id) {
+            return Err(IntegratorError::InvalidInput(
+                "that option was not offered for this question".into(),
+            ));
+        }
+        approval.state = ApprovalState::Responding;
+        approval.decision = Some(ApprovalDecision::Select);
+        approval.selected_option_id = Some(option_id.to_owned());
+        approval.updated_at = Utc::now();
+        let request_id = request_id_from_parts(&row.1, &row.2)?;
+        let audit_json = serde_json::json!({
+            "approvalId": approval.id.as_str(),
+            "decision": approval
+                .decision
+                .as_ref()
+                .map(ApprovalDecision::as_protocol_str),
+            "selectedOptionId": approval.selected_option_id.as_deref(),
+            "state": approval.state.as_str(),
+        })
+        .to_string();
+        transaction.execute("INSERT INTO codex_event_log(task_id, provider_session_id, runtime_session_id, process_id, thread_id, turn_id, method, audit_json, audit_truncated, occurred_at) VALUES (?1,?2,?3,?4,?5,?6,'client/approval/responding',?7,0,?8)", params![task_id.to_string(), row.4, row.5, row.3, row.6, row.7, audit_json, approval.updated_at.to_rfc3339()]).map_err(storage_error)?;
+        let seq = transaction.last_insert_rowid();
+        let event = RuntimeProjectionEvent {
+            seq,
+            task_id,
+            provider_session_id: ProviderSessionId::from_str(&row.4).map_err(invalid_stored)?,
+            provider: provider_for_session(&transaction, &row.4)?,
+            thread_id: row.6,
+            turn_id: row.7,
+            occurred_at: approval.updated_at,
+            projection: RuntimeProjection::ApprovalChanged {
+                approval: approval.clone(),
+            },
+        };
+        persist_snapshot_event(&transaction, &event)?;
+        transaction.execute("UPDATE codex_approvals SET state='responding', decision=?1, updated_at=?2, last_event_seq=?3, projection_json=?4 WHERE id=?5", params![approval.decision.as_ref().map(ApprovalDecision::as_protocol_str), approval.updated_at.to_rfc3339(), seq, serde_json::to_string(&approval)?, approval_id]).map_err(storage_error)?;
+        transaction.commit().map_err(storage_error)?;
+        Ok(PreparedApprovalResponse {
+            event,
+            request_id,
+            process_id: row.3,
+        })
+    }
+
     pub fn mark_approval_response_failed(
         &self,
         approval_id: &str,
     ) -> Result<RuntimeProjectionEvent> {
         self.transition_approval(approval_id, ApprovalState::ResponseFailed)
+    }
+
+    pub fn mark_approval_response_resolved(
+        &self,
+        approval_id: &str,
+    ) -> Result<RuntimeProjectionEvent> {
+        self.transition_approval(approval_id, ApprovalState::Resolved)
     }
 
     /// True when the task tip was cancelled by Stop (user or orchestrator).
@@ -1517,6 +1602,7 @@ impl LocalStore {
             .map_err(storage_error)?
             .ok_or_else(|| IntegratorError::NotFound(format!("approval {approval_id}")))?;
         let allowed = match &target {
+            ApprovalState::Resolved => row.7 == "responding",
             ApprovalState::ResponseFailed => row.7 == "responding",
             ApprovalState::Expired => {
                 matches!(row.7.as_str(), "pending" | "responding" | "response_failed")
@@ -1901,6 +1987,7 @@ fn apply_mutation(
             command,
             cwd,
             plan_markdown,
+            options,
         } => {
             let (request_kind, request_value) = request_id_parts(request_id);
             let existing=transaction.query_row("SELECT projection_json FROM codex_approvals WHERE runtime_session_id=?1 AND request_kind=?2 AND request_value=?3 AND approval_kind=?4 AND COALESCE(approval_id,'')=COALESCE(?5,'') ORDER BY updated_at DESC LIMIT 1",params![binding.runtime_session_id.to_string(),request_kind,request_value,approval_kind.as_str(),approval_id],|row|row.get::<_,String>(0)).optional().map_err(storage_error)?;
@@ -1926,11 +2013,19 @@ fn apply_mutation(
                     )?
                     .and_then(|item| item.file_changes),
                     plan_markdown: plan_markdown.clone(),
+                    options: options.clone(),
+                    selected_option_id: None,
                     updated_at: reduced.occurred_at,
                 }
             };
             approval.state = ApprovalState::Pending;
             approval.plan_markdown = plan_markdown.clone().or(approval.plan_markdown);
+            // A fresh request event supersedes whatever answer choices (and
+            // any prior answer) an earlier cycle for this same approval had.
+            if !options.is_empty() {
+                approval.options = options.clone();
+            }
+            approval.selected_option_id = None;
             approval.updated_at = reduced.occurred_at;
             let file_changes_json = approval
                 .file_changes
@@ -2668,6 +2763,85 @@ mod tests {
             .expect("count redundant event projections")
     }
 
+    fn request_command_approval(
+        store: &LocalStore,
+        binding: &RuntimeBinding,
+        request_id: &str,
+    ) -> ApprovalProjection {
+        let requested = store
+            .apply_reduced_event(
+                binding,
+                &ReducedProviderEvent {
+                    method: "item/commandExecution/requestApproval".into(),
+                    thread_id: "thread-fixture".into(),
+                    turn_id: Some("turn-approval".into()),
+                    audit_json: "{}".into(),
+                    audit_truncated: false,
+                    mutation: ProjectionMutation::ApprovalRequested {
+                        request_id: TransportRequestId::String(request_id.into()),
+                        approval_kind: ApprovalKind::CommandExecution,
+                        item_id: format!("command-{request_id}"),
+                        approval_id: Some(format!("provider-{request_id}")),
+                        reason: Some("run focused tests".into()),
+                        command: Some("cargo test -p session-store".into()),
+                        cwd: Some("fixture/integrator-3".into()),
+                        plan_markdown: None,
+                        options: Vec::new(),
+                    },
+                    occurred_at: Utc::now(),
+                },
+            )
+            .expect("persist approval request");
+        let RuntimeProjection::ApprovalChanged { approval } = requested.projection else {
+            panic!("expected approval projection");
+        };
+        approval
+    }
+
+    fn request_question_approval(
+        store: &LocalStore,
+        binding: &RuntimeBinding,
+        request_id: &str,
+    ) -> ApprovalProjection {
+        let requested = store
+            .apply_reduced_event(
+                binding,
+                &ReducedProviderEvent {
+                    method: "session/request_permission".into(),
+                    thread_id: "thread-fixture".into(),
+                    turn_id: Some("turn-approval".into()),
+                    audit_json: "{}".into(),
+                    audit_truncated: false,
+                    mutation: ProjectionMutation::ApprovalRequested {
+                        request_id: TransportRequestId::String(request_id.into()),
+                        approval_kind: ApprovalKind::Question,
+                        item_id: format!("question-{request_id}"),
+                        approval_id: Some(format!("provider-{request_id}")),
+                        reason: Some("Which frequency should I use?".into()),
+                        command: None,
+                        cwd: None,
+                        plan_markdown: None,
+                        options: vec![
+                            integrator_core::QuestionOption {
+                                option_id: "opt-monthly".into(),
+                                label: "Monthly".into(),
+                            },
+                            integrator_core::QuestionOption {
+                                option_id: "opt-quarterly".into(),
+                                label: "Quarterly".into(),
+                            },
+                        ],
+                    },
+                    occurred_at: Utc::now(),
+                },
+            )
+            .expect("persist question approval request");
+        let RuntimeProjection::ApprovalChanged { approval } = requested.projection else {
+            panic!("expected approval projection");
+        };
+        approval
+    }
+
     fn completed_message(
         provider_item_id: &str,
         kind: ItemKind,
@@ -3117,6 +3291,7 @@ mod tests {
                 command: Some("cargo test".into()),
                 cwd: Some("fixture/integrator-3".into()),
                 plan_markdown: None,
+                options: Vec::new(),
             },
             ProjectionMutation::TurnError {
                 message: "provider disconnected".into(),
@@ -3182,32 +3357,7 @@ mod tests {
     #[test]
     fn approval_client_events_keep_compact_audit_identity_without_projection_copies() {
         let (store, binding) = bound_store(ProviderKind::Codex);
-        let requested = store
-            .apply_reduced_event(
-                &binding,
-                &ReducedProviderEvent {
-                    method: "item/commandExecution/requestApproval".into(),
-                    thread_id: "thread-fixture".into(),
-                    turn_id: Some("turn-approval".into()),
-                    audit_json: "{}".into(),
-                    audit_truncated: false,
-                    mutation: ProjectionMutation::ApprovalRequested {
-                        request_id: TransportRequestId::String("request-approval".into()),
-                        approval_kind: ApprovalKind::CommandExecution,
-                        item_id: "command-approval".into(),
-                        approval_id: Some("provider-approval".into()),
-                        reason: Some("run focused tests".into()),
-                        command: Some("cargo test -p session-store".into()),
-                        cwd: Some("fixture/integrator-3".into()),
-                        plan_markdown: None,
-                    },
-                    occurred_at: Utc::now(),
-                },
-            )
-            .expect("persist approval request");
-        let RuntimeProjection::ApprovalChanged { approval } = requested.projection else {
-            panic!("expected approval projection");
-        };
+        let approval = request_command_approval(&store, &binding, "request-approval");
 
         store
             .prepare_approval_response(binding.task_id, &approval.id, ApprovalDecision::Accept)
@@ -3253,6 +3403,118 @@ mod tests {
             })
         );
         assert_eq!(redundant_event_projection_count(&store, binding.task_id), 0);
+    }
+
+    #[test]
+    fn successful_client_approval_response_resolves_durable_projection() {
+        let (store, binding) = bound_store(ProviderKind::Cursor);
+        let approval = request_command_approval(&store, &binding, "request-success");
+
+        store
+            .prepare_approval_response(
+                binding.task_id,
+                &approval.id,
+                ApprovalDecision::AcceptForSession,
+            )
+            .expect("prepare approval response");
+        let resolved = store
+            .mark_approval_response_resolved(&approval.id)
+            .expect("record successful provider response");
+
+        let RuntimeProjection::ApprovalChanged { approval: resolved } = resolved.projection else {
+            panic!("expected resolved approval projection");
+        };
+        assert_eq!(resolved.state, ApprovalState::Resolved);
+        assert_eq!(resolved.decision, Some(ApprovalDecision::AcceptForSession));
+
+        let snapshot = store.task_snapshot(binding.task_id).expect("load snapshot");
+        let hydrated = snapshot.hydrate.expect("hydrate snapshot");
+        assert_eq!(hydrated.approvals.len(), 1);
+        assert_eq!(hydrated.approvals[0].state, ApprovalState::Resolved);
+
+        let methods = {
+            let connection = store.connection.lock();
+            let mut statement = connection
+                .prepare(
+                    "SELECT method FROM codex_event_log WHERE task_id=?1 AND method LIKE 'client/approval/%' ORDER BY seq",
+                )
+                .expect("prepare approval audit query");
+            statement
+                .query_map([binding.task_id.to_string()], |row| row.get::<_, String>(0))
+                .expect("query approval audit")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("collect approval audit")
+        };
+        assert_eq!(
+            methods,
+            vec!["client/approval/responding", "client/approval/resolved"]
+        );
+        assert_eq!(redundant_event_projection_count(&store, binding.task_id), 0);
+    }
+
+    #[test]
+    fn question_approval_carries_its_offered_options() {
+        let (store, binding) = bound_store(ProviderKind::Kimi);
+        let approval = request_question_approval(&store, &binding, "request-question");
+        assert_eq!(approval.approval_kind, ApprovalKind::Question);
+        assert_eq!(approval.options.len(), 2);
+        assert_eq!(approval.options[0].label, "Monthly");
+        assert_eq!(approval.selected_option_id, None);
+    }
+
+    #[test]
+    fn answering_a_question_records_the_chosen_option_and_selects_it_over_acp() {
+        let (store, binding) = bound_store(ProviderKind::Kimi);
+        let approval = request_question_approval(&store, &binding, "request-answer");
+
+        let prepared = store
+            .prepare_question_response(binding.task_id, &approval.id, "opt-quarterly")
+            .expect("prepare question response");
+        let RuntimeProjection::ApprovalChanged { approval: responding } =
+            prepared.event.projection
+        else {
+            panic!("expected approval projection");
+        };
+        assert_eq!(responding.state, ApprovalState::Responding);
+        assert_eq!(responding.decision, Some(ApprovalDecision::Select));
+        assert_eq!(
+            responding.selected_option_id.as_deref(),
+            Some("opt-quarterly")
+        );
+
+        let resolved = store
+            .mark_approval_response_resolved(&approval.id)
+            .expect("record successful provider response");
+        let RuntimeProjection::ApprovalChanged { approval: resolved } = resolved.projection else {
+            panic!("expected resolved approval projection");
+        };
+        assert_eq!(resolved.state, ApprovalState::Resolved);
+        assert_eq!(
+            resolved.selected_option_id.as_deref(),
+            Some("opt-quarterly")
+        );
+    }
+
+    #[test]
+    fn answering_a_question_rejects_an_option_that_was_never_offered() {
+        let (store, binding) = bound_store(ProviderKind::Kimi);
+        let approval = request_question_approval(&store, &binding, "request-bad-option");
+
+        let error = store
+            .prepare_question_response(binding.task_id, &approval.id, "opt-annually")
+            .expect_err("an unoffered option must be rejected");
+        assert!(matches!(error, IntegratorError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn answering_a_question_rejects_non_question_approvals() {
+        let (store, binding) = bound_store(ProviderKind::Kimi);
+        let approval = request_command_approval(&store, &binding, "request-not-a-question");
+
+        let error = store
+            .prepare_question_response(binding.task_id, &approval.id, "allow")
+            .expect_err("a command-execution approval has no options to select");
+        assert!(matches!(error, IntegratorError::InvalidInput(_)));
     }
 
     #[test]

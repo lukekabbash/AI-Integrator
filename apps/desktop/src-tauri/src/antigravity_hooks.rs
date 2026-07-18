@@ -47,6 +47,7 @@ pub fn create_overlay(
     workspace: &Path,
     scope: &str,
     permission: StructuredPermissionMode,
+    local_tools: crate::harness_prompt::LocalToolsProjection,
 ) -> Result<AntigravityOverlay> {
     let root = data_directory.join("antigravity-control").join(scope);
     let agents = root.join(".agents");
@@ -98,7 +99,7 @@ pub fn create_overlay(
         &rules.join("ai-integrator.md"),
         &crate::harness_prompt::instructions(
             integrator_core::ProviderKind::Antigravity,
-            crate::harness_prompt::LocalToolsProjection::Unavailable,
+            local_tools,
         ),
     )?;
     Ok(AntigravityOverlay { root, event_log })
@@ -182,6 +183,17 @@ fn publish_record(client: &StructuredCliClient, turn_id: &str, record: HookRecor
                 id: item_id,
                 is_error: record.is_error,
                 content: record.message.unwrap_or_default(),
+            },
+        ),
+        // The model invocation has begun. Not user-visible on its own, but it
+        // updates the turn's diagnostic context so a turn that dies before
+        // its first tool call reports "accepted and working" instead of
+        // nothing. (Visible agy progress needs the brain-transcript tail.)
+        "PreInvocation" => client.emit_host_event(
+            turn_id,
+            session_id,
+            StructuredCliEventKind::Diagnostic {
+                message: "Antigravity accepted the request and is working".into(),
             },
         ),
         "Stop" if record.fully_idle == Some(false) => client.emit_host_event(
@@ -529,6 +541,7 @@ mod tests {
             workspace.path(),
             "scope-1",
             StructuredPermissionMode::AcceptEdits,
+            crate::harness_prompt::LocalToolsProjection::Unavailable,
         )
         .expect("create overlay");
 
@@ -553,6 +566,26 @@ mod tests {
         assert!(harness.contains("durable harness policy"));
         assert!(harness.contains("using the antigravity runtime"));
         assert!(harness.contains("delegation are unavailable"));
+    }
+
+    #[test]
+    fn overlay_harness_reports_projected_integrator_tools_truthfully() {
+        let data = tempfile::tempdir().expect("app data");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let overlay = create_overlay(
+            data.path(),
+            workspace.path(),
+            "scope-tools",
+            StructuredPermissionMode::ReadOnly,
+            crate::harness_prompt::LocalToolsProjection::Projected,
+        )
+        .expect("create overlay");
+
+        let harness = std::fs::read_to_string(overlay.root.join(".agents/rules/ai-integrator.md"))
+            .expect("read harness rule");
+        assert!(harness.contains("task-scoped MCP server named `integrator`"));
+        assert!(harness.contains("call them directly"));
+        assert!(!harness.contains("delegation are unavailable"));
     }
 
     #[test]

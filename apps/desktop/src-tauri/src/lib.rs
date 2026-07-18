@@ -220,6 +220,7 @@ pub fn run() {
             codex_steer_turn,
             task_snapshot,
             codex_respond_approval,
+            acp_respond_question,
             codex_stop_turn,
             acp_connect,
             acp_start_session,

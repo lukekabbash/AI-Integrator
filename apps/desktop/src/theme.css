@@ -36,6 +36,7 @@
   --color-provider-claude: #d69a75;
   --color-provider-cursor: #8faec9;
   --color-provider-grok: #c0c3cc;
+  --color-provider-kimi: #8fa8df;
   --color-provider-antigravity: #9fa7d8;
   --color-provider-custom: var(--color-accent-primary);
   --color-diff-added: #17211b;

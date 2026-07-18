@@ -498,6 +498,19 @@ fn spawn_structured_child(options: &StructuredCliLaunchOptions) -> Result<Child>
         ] {
             command.env_remove(name);
         }
+        // Documented switch: skips the background updater/lock-file check on
+        // every spawn. These processes are per-turn, so the check otherwise
+        // taxes every message; updates stay owned by the runtime-setup flow.
+        command.env("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
+    }
+    if matches!(options.provider, StructuredCliProvider::Claude) {
+        // Turn-start latency hygiene: every turn boots a fresh CLI, so
+        // update checks and other non-essential network calls tax every
+        // message. CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is the
+        // documented umbrella switch; DISABLE_AUTOUPDATER is the
+        // long-standing updater-specific name kept for older CLIs.
+        command.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+        command.env("DISABLE_AUTOUPDATER", "1");
     }
     #[cfg(unix)]
     {
@@ -844,6 +857,27 @@ fn parse_claude_event(value: &Value) -> Vec<ParsedEvent> {
             Some(ParsedEvent {
                 session_id,
                 event: StructuredCliEventKind::PermissionModeChanged { mode },
+            })
+        }
+        // Claude emits api_retry while backing off a failed or rate-limited
+        // API call. Without surfacing it the stream simply goes silent for
+        // the whole backoff window and reads as a frozen turn.
+        "system" if value.get("subtype").and_then(Value::as_str) == Some("api_retry") => {
+            let mut message = String::from("Provider is retrying the request");
+            if let (Some(attempt), Some(max_attempts)) = (
+                value.get("attempt").and_then(Value::as_u64),
+                value.get("max_attempts").and_then(Value::as_u64),
+            ) {
+                message.push_str(&format!(" (attempt {attempt} of {max_attempts})"));
+            }
+            if let Some(detail) = string_at(value, "error").or_else(|| string_at(value, "message"))
+            {
+                message.push_str(": ");
+                message.push_str(&redact_and_bound(&detail, DIAGNOSTIC_LIMIT).0);
+            }
+            Some(ParsedEvent {
+                session_id,
+                event: StructuredCliEventKind::Diagnostic { message },
             })
         }
         "stream_event" => {
@@ -1292,6 +1326,17 @@ mod tests {
     fn parses_claude_permission_mode_status() {
         // Observed live: the CLI reports mode transitions (e.g. after an
         // approved ExitPlanMode) as system/status with a permissionMode.
+        let retry = r#"{"type":"system","subtype":"api_retry","attempt":2,"max_attempts":10,"error":"overloaded_error","session_id":"sess-1"}"#;
+        let events = parse_provider_line(StructuredCliProvider::Claude, retry);
+        assert_eq!(events.len(), 1);
+        match &events[0].event {
+            StructuredCliEventKind::Diagnostic { message } => {
+                assert!(message.contains("attempt 2 of 10"), "got: {message}");
+                assert!(message.contains("overloaded_error"), "got: {message}");
+            }
+            other => panic!("expected Diagnostic, got {other:?}"),
+        }
+
         let line = r#"{"type":"system","subtype":"status","status":null,"permissionMode":"acceptEdits","session_id":"sess-1"}"#;
         let events = parse_provider_line(StructuredCliProvider::Claude, line);
         assert_eq!(events.len(), 1);

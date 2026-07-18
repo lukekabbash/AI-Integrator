@@ -1304,6 +1304,57 @@ describe("native runtime recovery UI", () => {
     expect(screen.getByRole("button", { name: "Stop turn" })).toBeInTheDocument();
   });
 
+  it("clears a transient composer error when reopening a chat", async () => {
+    const workspace = createEmptySnapshot();
+    workspace.projects = [
+      {
+        id: "project-1",
+        name: "sample",
+        path: "H:\\Code\\sample",
+        branch: "main",
+        dirtyFiles: 0,
+        expanded: true,
+      },
+    ];
+    workspace.tasks = [
+      {
+        id: "task-1",
+        projectId: "project-1",
+        title: "Foreground task",
+        status: "completed",
+        runtime: "codex",
+        model: "Provider default",
+        updatedAt: "2026-07-10T16:00:00Z",
+      },
+      {
+        id: "task-2",
+        projectId: "project-1",
+        title: "Background task",
+        status: "completed",
+        runtime: "codex",
+        model: "Provider default",
+        updatedAt: "2026-07-10T15:00:00Z",
+      },
+    ];
+    workspace.activeProjectId = "project-1";
+    workspace.activeTaskId = "task-1";
+    bridgeMock.loadWorkspace.mockResolvedValue(workspace);
+    bridgeMock.loadTaskProjection.mockImplementation((taskId: string) =>
+      projectionSnapshot({ taskId, watermarkSeq: 0, runtimeLive: false, events: [] }),
+    );
+    bridgeMock.sendTurn.mockRejectedValue(new Error("stale turn error"));
+
+    render(<App />);
+    const composer = await screen.findByRole("textbox", { name: "Task message" });
+    fireEvent.change(composer, { target: { value: "Try again" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    expect(await screen.findByText("stale turn error")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Background task/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /Foreground task/i }));
+    expect(screen.queryByText("stale turn error")).not.toBeInTheDocument();
+  });
+
   it("keeps a background chat projection current while another chat is selected", async () => {
     const workspace = createEmptySnapshot();
     workspace.projects = [

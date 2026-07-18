@@ -14,15 +14,18 @@ is missing, tell the user how to get one — do not scrape.
 
 ## Core endpoints
 
-Base: `https://api.stlouisfed.org/fred/`
+Call `skill_data_request` with `provider: "fred"`, `path` set to the literal
+string below (leading slash, `/fred/` prefix included — it is NOT relative to
+a base URL), and the parameters in `query`, never appended to `path`.
 
-- Observations (the data):
-  `series/observations?series_id=GDP&file_type=json`
-  Optional: `observation_start=YYYY-MM-DD`, `observation_end`, `units`
-  (`pc1` = % change from year ago, `pch` = % change), `frequency` (`q`, `a`).
-- Search for a series id:
-  `series/search?search_text=median+home+price&file_type=json`
-- Series metadata: `series?series_id=CPIAUCSL&...`
+- Observations (the data): `path: "/fred/series/observations"`,
+  `query: {"series_id": "GDP", "file_type": "json"}`.
+  Optional query keys: `observation_start` (`YYYY-MM-DD`), `observation_end`,
+  `units` (`pc1` = % change from year ago, `pch` = % change), `frequency`
+  (`q`, `a`).
+- Search for a series id: `path: "/fred/series/search"`,
+  `query: {"search_text": "median home price", "file_type": "json"}`.
+- Series metadata: `path: "/fred/series"`, `query: {"series_id": "CPIAUCSL"}`.
 
 ## Series ids you should know
 

@@ -839,7 +839,7 @@ describe("Transcript", () => {
       <Transcript events={[event("user-1", "user", "Start the task")]} running />,
     );
 
-    expect(screen.getByText(/Connecting/)).toBeInTheDocument();
+    expect(screen.getByText(/Thinking/)).toBeInTheDocument();
     rerender(
       <Transcript
         events={[
@@ -853,16 +853,7 @@ describe("Transcript", () => {
       />,
     );
 
-    expect(screen.getByText(/Connecting/)).toBeInTheDocument();
-  });
-
-  it("shows Connecting without inventing reasoning activity", () => {
-    render(
-      <Transcript events={[event("user-1", "user", "Start the task")]} running />,
-    );
-
-    expect(screen.getByText(/Connecting/)).toBeInTheDocument();
-    expect(screen.queryByText("Thinking…")).not.toBeInTheDocument();
+    expect(screen.getByText(/Thinking/)).toBeInTheDocument();
   });
 
   it("shows the current command in the live narration line", () => {

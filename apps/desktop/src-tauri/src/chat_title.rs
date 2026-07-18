@@ -189,7 +189,7 @@ pub(crate) async fn generate_isolated_provider_text_streamed(
     })?;
     let result = match provider {
         ProviderKind::Codex => generate_codex_title(&scratch, prompt, route, on_delta).await,
-        ProviderKind::Cursor | ProviderKind::Grok => {
+        ProviderKind::Cursor | ProviderKind::Grok | ProviderKind::Kimi => {
             generate_acp_title(provider, &scratch, prompt, route, on_delta).await
         }
         ProviderKind::Claude | ProviderKind::Antigravity => {
@@ -772,6 +772,10 @@ fn cheap_model_score(value: &str) -> u8 {
     [
         "cursor-small",
         "grok-build",
+        // Kimi's cheap/fast tier (kimi-for-coding-highspeed): none of the
+        // generic markers below match Kimi's naming, which silently left
+        // helper turns on the flagship default.
+        "highspeed",
         "nano",
         "codex-mini",
         "mini",

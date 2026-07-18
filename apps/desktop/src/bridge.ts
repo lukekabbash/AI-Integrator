@@ -7,7 +7,7 @@ import {
 } from "./demoData";
 import { resolveModelLabel } from "./modelLabel";
 
-export type RuntimeId = "codex" | "cursor" | "claude" | "grok" | "antigravity" | "custom";
+export type RuntimeId = "codex" | "cursor" | "claude" | "grok" | "kimi" | "antigravity" | "custom";
 export type TaskStatus =
   "draft" | "starting" | "running" | "waiting" | "completed" | "failed" | "stopped";
 export type UsageProvenance = "vendor_exact" | "local_observed" | "estimated" | "unavailable";
@@ -265,7 +265,22 @@ export interface DelegationView {
   runtime: string;
   model?: string | null;
   effort?: string | null;
-  permission: "read-only" | "project-write";
+  serviceLevel?: "budget" | "standard" | "premium";
+  capabilitySnapshot?: {
+    version: number;
+    profileId: string;
+    profileLabel: string;
+    bestFor: string;
+    workingGuidance: string;
+    accessCeiling: "read-only" | "project-write";
+    serviceLevel: "budget" | "standard" | "premium";
+    routes: Array<{ runtime: string; model?: string | null; effort?: string | null }>;
+    skillIds: string[];
+    mcpServerIds: string[];
+    createdAt: string;
+  };
+  /** Present on current native rows; older local/export fixtures default read-only. */
+  permission?: "read-only" | "project-write";
   title: string;
   brief: string;
   status: DelegationStatus;
@@ -348,6 +363,9 @@ export interface ProviderUsageSummary {
   /** Provider-reported subscription windows; only providers that publish
    * quota (Codex) populate it. Never inferred. */
   subscription?: SubscriptionQuota;
+  /** Provider-owned account activity. This can include usage outside
+   * Integrator and therefore remains separate from local task history. */
+  accountUsage?: ProviderAccountUsage;
   provenance: UsageProvenance;
   detail: string;
 }
@@ -359,11 +377,51 @@ export interface SubscriptionWindow {
   resetsAt?: number;
 }
 
+export interface SubscriptionCredits {
+  hasCredits: boolean;
+  unlimited: boolean;
+  balance?: string | null;
+}
+
+export interface SubscriptionSpendLimit {
+  limit: string;
+  used: string;
+  remainingPercent: number;
+  resetsAt: number;
+}
+
+export interface SubscriptionQuotaBucket {
+  limitId?: string | null;
+  limitName?: string | null;
+  planType?: string | null;
+  primary?: SubscriptionWindow | null;
+  secondary?: SubscriptionWindow | null;
+  credits?: SubscriptionCredits | null;
+  individualLimit?: SubscriptionSpendLimit | null;
+  rateLimitReachedType?: string | null;
+}
+
 export interface SubscriptionQuota {
   planType?: string;
   primary?: SubscriptionWindow;
   secondary?: SubscriptionWindow;
+  buckets?: SubscriptionQuotaBucket[];
+  resetCreditsAvailable?: number;
   updatedAt?: string;
+}
+
+export interface ProviderAccountUsageSummary {
+  lifetimeTokens?: number | null;
+  peakDailyTokens?: number | null;
+  longestRunningTurnSec?: number | null;
+  currentStreakDays?: number | null;
+  longestStreakDays?: number | null;
+}
+
+export interface ProviderAccountUsage {
+  summary: ProviderAccountUsageSummary;
+  dailyUsageBuckets: Array<{ startDate: string; tokens: number }>;
+  updatedAt: string;
 }
 
 export interface UsageSummary {
@@ -769,13 +827,19 @@ export interface RuntimeUsageProjection {
   vendorCostMicroUsd?: number;
 }
 
+/** One answer choice offered by a "question" approval. */
+export interface QuestionOption {
+  optionId: string;
+  label: string;
+}
+
 export interface ApprovalProjection {
   id: string;
   requestId: { kind: "number"; value: number } | { kind: "string"; value: string };
-  approvalKind: "commandExecution" | "fileChange" | "planReview";
+  approvalKind: "commandExecution" | "fileChange" | "planReview" | "question";
   state:
     "pending" | "responding" | "resolved" | "declined" | "cancelled" | "expired" | "responseFailed";
-  decision?: "accept" | "acceptForSession" | "decline" | "cancel";
+  decision?: "accept" | "acceptForSession" | "decline" | "cancel" | "select";
   itemId?: string;
   approvalId?: string;
   reason?: string;
@@ -784,6 +848,11 @@ export interface ApprovalProjection {
   fileChanges?: ItemProjection["fileChanges"];
   /** Full plan document (markdown) for planReview approvals. */
   planMarkdown?: string;
+  /** Answer choices for a "question" approval (ACP has no elicitation
+   *  method, so the agent asked through the permission channel instead). */
+  options?: QuestionOption[];
+  /** Which `options` entry the user picked, once answered. */
+  selectedOptionId?: string;
   updatedAt: string;
 }
 
@@ -827,7 +896,7 @@ export interface RuntimeProjectionEvent {
   seq: number;
   taskId: string;
   providerSessionId: string;
-  provider: "codex" | "cursor" | "claude" | "antigravity" | "grok" | "custom-acp";
+  provider: "codex" | "cursor" | "claude" | "antigravity" | "grok" | "kimi" | "custom-acp";
   threadId: string;
   turnId?: string;
   occurredAt: string;
@@ -888,7 +957,7 @@ export interface TerminalOutputEvent {
   exitCode?: number | null;
 }
 
-export type RuntimeActionKind = "install" | "update" | "login";
+export type RuntimeActionKind = "install" | "update" | "login" | "usage";
 
 export interface RuntimeActionPlan {
   /** Native-resolved identifier; execution re-resolves it instead of trusting renderer argv. */
@@ -1191,6 +1260,12 @@ export interface AppBridge {
     approvalId: string,
     decision: ApprovalDecision,
   ): Promise<ApprovalProjection>;
+  /** Answer a "question" approval with one of its offered options. */
+  respondToQuestion(
+    taskId: string,
+    approvalId: string,
+    optionId: string,
+  ): Promise<ApprovalProjection>;
   /** Switch the live agent session's mode (e.g. Cursor Agent/Plan/Ask). */
   setSessionMode(taskId: string, modeId: string): Promise<void>;
   stopTurn(taskId: string): Promise<{
@@ -1360,7 +1435,7 @@ interface NativeTask {
 }
 
 interface NativeProviderStatus {
-  provider: "codex" | "claude" | "antigravity" | "cursor" | "grok" | "custom-acp";
+  provider: "codex" | "claude" | "antigravity" | "cursor" | "grok" | "kimi" | "custom-acp";
   installed: boolean;
   executable?: string;
   version?: string;
@@ -1539,6 +1614,8 @@ function reconcileRuntimeFingerprints(statuses: NativeProviderStatus[]): void {
 const cursorEffortConfigByModel = new Map<string, string>();
 /** Cursor only: the ACP config option id used for model selection. */
 let cursorModelConfigId: string | undefined;
+const kimiEffortConfigByModel = new Map<string, string>();
+let kimiModelConfigId: string | undefined;
 const FALLBACK_MODELS: Partial<Record<RuntimeId, string[]>> = {
   claude: ["claude-opus-4-8", "claude-fable-5", "claude-sonnet-5", "claude-haiku-4-5"],
   antigravity: [
@@ -1552,6 +1629,8 @@ const FALLBACK_MODELS: Partial<Record<RuntimeId, string[]>> = {
   // catalog replaces them with the models available to the signed-in account.
   cursor: ["composer-2.5", "cursor-small", "deepseek-v3.1", "deepseek-r1", "auto"],
   grok: ["grok-4.5", "grok-build-0.1"],
+  // Kimi replaces this with the account's negotiated ACP catalog on first use.
+  kimi: ["kimi-code/k3", "kimi-code/kimi-for-coding", "kimi-code/kimi-for-coding-highspeed"],
   custom: [],
 };
 
@@ -1724,7 +1803,10 @@ function acpConfigOptions(response: unknown): AcpConfigOption[] {
  * Composer, frontier-provider, and open-weight models here; do not replace
  * this with a hand-maintained model list or a vendor extension RPC.
  */
-export function extractAcpCatalog(response: unknown): ModelCatalogEntry[] {
+export function extractAcpCatalog(
+  response: unknown,
+  runtime: "cursor" | "kimi" = "cursor",
+): ModelCatalogEntry[] {
   const options = acpConfigOptions(response);
   const modelOption =
     options.find((option) => option.category === "model") ??
@@ -1733,8 +1815,13 @@ export function extractAcpCatalog(response: unknown): ModelCatalogEntry[] {
   const modelValues = acpConfigValues(modelOption.options);
   if (modelValues.length === 0) return [];
 
-  cursorModelConfigId = modelOption.id;
-  cursorEffortConfigByModel.clear();
+  if (runtime === "cursor") {
+    cursorModelConfigId = modelOption.id;
+    cursorEffortConfigByModel.clear();
+  } else {
+    kimiModelConfigId = modelOption.id;
+    kimiEffortConfigByModel.clear();
+  }
   const thoughtOption = options.find((option) => option.category === "thought_level");
   const efforts = thoughtOption ? acpConfigValues(thoughtOption.options) : [];
   const defaultEffort =
@@ -1753,7 +1840,9 @@ export function extractAcpCatalog(response: unknown): ModelCatalogEntry[] {
       label: resolveModelLabel(model.value, model.name),
     };
     if (thoughtOption && typeof thoughtOption.id === "string") {
-      cursorEffortConfigByModel.set(item.id, thoughtOption.id);
+      const effortConfigs =
+        runtime === "cursor" ? cursorEffortConfigByModel : kimiEffortConfigByModel;
+      effortConfigs.set(item.id, thoughtOption.id);
       const uniqueEfforts = efforts.filter(
         (effort, index) =>
           efforts.findIndex((candidate) => candidate.value === effort.value) === index,
@@ -1925,6 +2014,16 @@ function readDemoSnapshot(): WorkspaceSnapshot {
     const stored = window.localStorage.getItem(DEMO_STORAGE_KEY);
     if (!stored) return createDemoSnapshot();
     const parsed = JSON.parse(stored) as WorkspaceSnapshot;
+    const current = createDemoSnapshot();
+    const storedRuntimes = new Map(parsed.runtimes.map((runtime) => [runtime.id, runtime]));
+    const currentRuntimeIds = new Set(current.runtimes.map((runtime) => runtime.id));
+    const runtimes = [
+      ...current.runtimes.map((runtime) => ({
+        ...runtime,
+        ...storedRuntimes.get(runtime.id),
+      })),
+      ...parsed.runtimes.filter((runtime) => !currentRuntimeIds.has(runtime.id)),
+    ];
     const activeContext = parsed.activeTaskId
       ? {
           [parsed.activeTaskId]: {
@@ -1937,6 +2036,7 @@ function readDemoSnapshot(): WorkspaceSnapshot {
       : {};
     return {
       ...parsed,
+      runtimes,
       taskContexts: parsed.taskContexts ?? activeContext,
       lastTaskByProject: parsed.lastTaskByProject ?? {},
       centerViewByTask: parsed.centerViewByTask ?? {},
@@ -2177,6 +2277,7 @@ function mapRuntime(status: NativeProviderStatus): RuntimeConnection {
     cursor: "Cursor",
     claude: "Claude Code",
     grok: "Grok Build",
+    kimi: "Kimi Code",
     antigravity: "Antigravity",
     custom: "Custom ACP",
   };
@@ -2187,7 +2288,11 @@ function mapRuntime(status: NativeProviderStatus): RuntimeConnection {
     id,
     name: names[id],
     command:
-      status.provider === "grok" ? "grok agent stdio" : (status.executable ?? status.provider),
+      status.provider === "grok"
+        ? "grok agent stdio"
+        : status.provider === "kimi"
+          ? "kimi acp"
+          : (status.executable ?? status.provider),
     version: status.version,
     account: connected ? "Vendor CLI session" : undefined,
     status: !status.installed
@@ -2305,6 +2410,7 @@ function mapStoredRuntime(value: string | undefined): RuntimeId | undefined {
     value === "cursor" ||
     value === "claude" ||
     value === "grok" ||
+    value === "kimi" ||
     value === "antigravity" ||
     value === "custom"
   ) {
@@ -2345,7 +2451,14 @@ async function loadNativeWorkspace(): Promise<WorkspaceSnapshot> {
   )?.updatedAt;
   for (const resume of local.providerResumeStates ?? []) {
     providerRouteByTask.set(resume.taskId, resume);
-    const isCurrent = !mcpRevisionAt || Date.parse(resume.updatedAt) >= Date.parse(mcpRevisionAt);
+    // Codex keeps the MCP surface it started with for the life of a thread.
+    // A newer MCP revision is therefore pending for that conversation, not a
+    // reason to discard its provider history. ACP sessions instead receive
+    // their MCP configuration on resume, so they remain revision-bound.
+    const isCurrent =
+      resume.provider === "codex" ||
+      !mcpRevisionAt ||
+      Date.parse(resume.updatedAt) >= Date.parse(mcpRevisionAt);
     if (isCurrent) providerResumeByTask.set(resume.taskId, resume);
     if (isCurrent && resume.provider === "codex") {
       codexDelegationByTask.set(resume.taskId, resume.delegation);
@@ -2500,11 +2613,28 @@ const cursorDelegationByTask = new Map<string, StartTaskInput["delegation"]>();
 /** The model and effort last applied to each Cursor session, to skip redundant protocol calls. */
 const cursorAppliedSelection = new Map<string, { model?: string; effort?: string }>();
 const cursorConnectedTasks = new Set<string>();
-const activeAcpProviderByTask = new Map<string, "cursor" | "grok">();
+type AcpRuntimeId = "cursor" | "grok" | "kimi";
+type StandardAcpRuntimeId = Exclude<AcpRuntimeId, "cursor">;
+interface StandardAcpState {
+  sessions: Set<string>;
+  delegations: Map<string, StartTaskInput["delegation"]>;
+  selections: Map<string, { model?: string; effort?: string }>;
+  connections: Set<string>;
+  queue: Promise<void>;
+}
+const activeAcpProviderByTask = new Map<string, AcpRuntimeId>();
 let cursorCatalogConnected = false;
-const grokSessionByTask = new Set<string>();
-const grokDelegationByTask = new Map<string, StartTaskInput["delegation"]>();
-const grokConnectedTasks = new Set<string>();
+const createStandardAcpState = (): StandardAcpState => ({
+  sessions: new Set(),
+  delegations: new Map(),
+  selections: new Map(),
+  connections: new Set(),
+  queue: Promise.resolve(),
+});
+const standardAcpState: Record<StandardAcpRuntimeId, StandardAcpState> = {
+  grok: createStandardAcpState(),
+  kimi: createStandardAcpState(),
+};
 // Model discovery and Send can ask for the same ACP session at nearly the
 // same time. Serialize those transitions so a second `acp_connect` cannot
 // replace and shut down the process whose `session/new` is still in flight.
@@ -2543,29 +2673,41 @@ function resetCursorConnectionState(taskId?: string): void {
   clearCursorSessionCaches();
 }
 
-function resetGrokConnectionState(taskId?: string): void {
+function resetStandardAcpConnectionState(runtime: StandardAcpRuntimeId, taskId?: string): void {
+  const state = standardAcpState[runtime];
   if (taskId) {
-    grokConnectedTasks.delete(taskId);
-    grokSessionByTask.delete(taskId);
-    grokDelegationByTask.delete(taskId);
-    if (activeAcpProviderByTask.get(taskId) === "grok") activeAcpProviderByTask.delete(taskId);
+    state.connections.delete(taskId);
+    state.sessions.delete(taskId);
+    state.delegations.delete(taskId);
+    state.selections.delete(taskId);
+    if (activeAcpProviderByTask.get(taskId) === runtime) activeAcpProviderByTask.delete(taskId);
     return;
   }
-  grokConnectedTasks.clear();
-  grokSessionByTask.clear();
-  grokDelegationByTask.clear();
+  state.connections.clear();
+  state.sessions.clear();
+  state.delegations.clear();
+  state.selections.clear();
   for (const [task, provider] of activeAcpProviderByTask) {
-    if (provider === "grok") activeAcpProviderByTask.delete(task);
+    if (provider === runtime) activeAcpProviderByTask.delete(task);
+  }
+  if (runtime === "kimi") {
+    kimiModelConfigId = undefined;
+    kimiEffortConfigByModel.clear();
+    invalidateModelCatalog("kimi");
   }
 }
 
 function invalidateMcpSessionCaches(): void {
-  providerResumeByTask.clear();
-  codexThreadByTask.clear();
-  activeCodexThreads.clear();
-  codexDelegationByTask.clear();
+  // Codex cannot swap its MCP configuration in place. Keep its current
+  // threads on their existing, known-good tool surface; the next new Codex
+  // chat gets the revised configuration. Clearing these bindings here used
+  // to turn an unrelated settings change into a fresh provider conversation.
+  for (const [taskId, resume] of providerResumeByTask) {
+    if (resume.provider !== "codex") providerResumeByTask.delete(taskId);
+  }
   resetCursorConnectionState();
-  resetGrokConnectionState();
+  resetStandardAcpConnectionState("grok");
+  resetStandardAcpConnectionState("kimi");
 }
 
 function updateCursorCatalog(response: unknown): ModelCatalogEntry[] {
@@ -2574,6 +2716,12 @@ function updateCursorCatalog(response: unknown): ModelCatalogEntry[] {
   if (catalog.length > 0) {
     cacheModelCatalog("cursor", catalog);
   }
+  return catalog;
+}
+
+function updateKimiCatalog(response: unknown): ModelCatalogEntry[] {
+  const catalog = extractAcpCatalog(response, "kimi");
+  if (catalog.length > 0) cacheModelCatalog("kimi", catalog);
   return catalog;
 }
 
@@ -2595,7 +2743,7 @@ async function refreshCursorModelParams(taskId?: string): Promise<void> {
   }
 }
 
-async function certifyAcpSession(taskId: string, runtime: "cursor" | "grok"): Promise<void> {
+async function certifyAcpSession(taskId: string, runtime: AcpRuntimeId): Promise<void> {
   try {
     const capabilities = await nativeInvoke<NativeAcpSessionCapabilities>(
       "acp_session_capabilities",
@@ -2688,7 +2836,8 @@ async function ensureCursorConnectionUnlocked(nativeTaskId: string, cwd: string)
     taskId: nativeTaskId,
   });
   await certifyAcpSession(nativeTaskId, "cursor");
-  resetGrokConnectionState(nativeTaskId);
+  resetStandardAcpConnectionState("grok", nativeTaskId);
+  resetStandardAcpConnectionState("kimi", nativeTaskId);
   cursorConnectedTasks.add(nativeTaskId);
   activeAcpProviderByTask.set(nativeTaskId, "cursor");
   clearCursorSessionCaches(nativeTaskId);
@@ -2713,31 +2862,38 @@ async function ensureCursorSession(input: SendTurnInput): Promise<string> {
   return ensureCursorSessionForTask(input.taskId, input.delegation, input.permission);
 }
 
-async function ensureGrokSession(input: SendTurnInput): Promise<string> {
+async function ensureStandardAcpSessionUnlocked(
+  input: SendTurnInput,
+  runtime: StandardAcpRuntimeId,
+): Promise<string> {
   const nativeTaskId = await ensureNativeTask(input.taskId);
   const cwd = repositoryForTask(input.taskId);
+  const state = standardAcpState[runtime];
   if (
-    !grokConnectedTasks.has(nativeTaskId) ||
-    activeAcpProviderByTask.get(nativeTaskId) !== "grok"
+    !state.connections.has(nativeTaskId) ||
+    activeAcpProviderByTask.get(nativeTaskId) !== runtime
   ) {
     await nativeInvoke("acp_connect", {
-      provider: "grok",
+      provider: runtime,
       workingDirectory: cwd,
       taskId: nativeTaskId,
     });
-    await certifyAcpSession(nativeTaskId, "grok");
+    await certifyAcpSession(nativeTaskId, runtime);
     resetCursorConnectionState(nativeTaskId);
-    grokConnectedTasks.add(nativeTaskId);
-    activeAcpProviderByTask.set(nativeTaskId, "grok");
-    grokSessionByTask.delete(nativeTaskId);
+    for (const candidate of ["grok", "kimi"] as const) {
+      if (candidate !== runtime) resetStandardAcpConnectionState(candidate, nativeTaskId);
+    }
+    state.connections.add(nativeTaskId);
+    activeAcpProviderByTask.set(nativeTaskId, runtime);
+    state.sessions.delete(nativeTaskId);
   }
   if (
-    !grokSessionByTask.has(nativeTaskId) ||
-    grokDelegationByTask.get(nativeTaskId) !== input.delegation
+    !state.sessions.has(nativeTaskId) ||
+    state.delegations.get(nativeTaskId) !== input.delegation
   ) {
     const saved = providerResumeByTask.get(nativeTaskId);
     const resumable =
-      saved?.provider === "grok" &&
+      saved?.provider === runtime &&
       saved.repositoryRoot === cwd &&
       saved.delegation === input.delegation;
     const startSession = () =>
@@ -2766,7 +2922,7 @@ async function ensureGrokSession(input: SendTurnInput): Promise<string> {
     if (sessionId) {
       providerResumeByTask.set(nativeTaskId, {
         taskId: nativeTaskId,
-        provider: "grok",
+        provider: runtime,
         sessionRef: sessionId,
         repositoryRoot: cwd,
         permission: input.permission,
@@ -2774,10 +2930,25 @@ async function ensureGrokSession(input: SendTurnInput): Promise<string> {
         updatedAt: new Date().toISOString(),
       });
     }
-    grokSessionByTask.add(nativeTaskId);
-    grokDelegationByTask.set(nativeTaskId, input.delegation);
+    state.sessions.add(nativeTaskId);
+    state.delegations.set(nativeTaskId, input.delegation);
+    state.selections.delete(nativeTaskId);
+    if (runtime === "kimi") updateKimiCatalog(session);
   }
   return nativeTaskId;
+}
+
+async function ensureStandardAcpSession(
+  input: SendTurnInput,
+  runtime: StandardAcpRuntimeId,
+): Promise<string> {
+  const state = standardAcpState[runtime];
+  const operation = state.queue.then(() => ensureStandardAcpSessionUnlocked(input, runtime));
+  state.queue = operation.then(
+    () => undefined,
+    () => undefined,
+  );
+  return operation;
 }
 
 /// A model id from the picker that can be forwarded to a provider verbatim.
@@ -2829,6 +3000,46 @@ async function applyCursorSelection(nativeTaskId: string, input: SendTurnInput):
     applied.effort = input.effort;
   }
   cursorAppliedSelection.set(nativeTaskId, applied);
+}
+
+async function applyKimiSelection(nativeTaskId: string, input: SendTurnInput): Promise<void> {
+  const state = standardAcpState.kimi;
+  const applied = state.selections.get(nativeTaskId) ?? {};
+  const model = realModelId(input.model);
+  if (model && applied.model !== model) {
+    if (!kimiModelConfigId) {
+      throw new Error("Kimi Code did not advertise an ACP model selector for this session");
+    }
+    try {
+      const response = await nativeInvoke<unknown>("acp_set_config_option", {
+        taskId: nativeTaskId,
+        configId: kimiModelConfigId,
+        value: model,
+      });
+      updateKimiCatalog(response);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Kimi Code could not switch to model "${model}": ${message}`);
+    }
+    applied.model = model;
+    applied.effort = undefined;
+  }
+  const configId = model ? kimiEffortConfigByModel.get(model) : undefined;
+  if (input.effort && configId && applied.effort !== input.effort) {
+    try {
+      const response = await nativeInvoke<unknown>("acp_set_config_option", {
+        taskId: nativeTaskId,
+        configId,
+        value: input.effort,
+      });
+      updateKimiCatalog(response);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Kimi Code could not set Thinking to "${input.effort}": ${message}`);
+    }
+    applied.effort = input.effort;
+  }
+  state.selections.set(nativeTaskId, applied);
 }
 
 /**
@@ -2942,6 +3153,30 @@ async function discoverModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEnt
     } catch {
       cursorCatalogConnected = false;
       // Cursor unavailable or logged out; fall through to the static catalog.
+    }
+  }
+  if (isTauri() && runtime === "kimi") {
+    try {
+      const snapshot = cachedWorkspace ?? readDemoSnapshot();
+      const activeTask = snapshot.tasks.find((task) => task.id === snapshot.activeTaskId);
+      if (activeTask) {
+        await ensureStandardAcpSession(
+          {
+            taskId: activeTask.id,
+            prompt: "",
+            runtime: "kimi",
+            model: activeTask.model,
+            effort: activeTask.effort,
+            permission: "project-write",
+            delegation: "off",
+          },
+          "kimi",
+        );
+        const catalog = modelCatalogCache.get("kimi");
+        if (catalog?.length) return catalog;
+      }
+    } catch {
+      // Kimi unavailable or logged out; the install/login surfaces remain actionable.
     }
   }
   if (!isTauri()) {
@@ -4957,7 +5192,9 @@ export const bridge: AppBridge = {
         ? `Install ${runtime} with its official installer`
         : kind === "login"
           ? `${current?.command ?? runtime} login`
-          : `${current?.command ?? runtime} update`;
+          : kind === "usage"
+            ? `${current?.command ?? runtime}`
+            : `${current?.command ?? runtime} update`;
     return [
       {
         id: `${runtime}:${kind}:preview`,
@@ -5246,9 +5483,11 @@ export const bridge: AppBridge = {
           invalidateModelCatalog("cursor");
           throw error;
         }
-      } else if (routedInput.runtime === "grok") {
+      } else if (routedInput.runtime === "grok" || routedInput.runtime === "kimi") {
+        const runtime = routedInput.runtime;
         try {
-          const taskId = await ensureGrokSession(routedInput);
+          const taskId = await ensureStandardAcpSession(routedInput, runtime);
+          if (runtime === "kimi") await applyKimiSelection(taskId, routedInput);
           await nativeInvoke("acp_send_turn", {
             taskId,
             prompt: routedInput.prompt,
@@ -5257,8 +5496,11 @@ export const bridge: AppBridge = {
             resumeInterrupted: routedInput.resumeInterrupted,
           });
         } catch (error) {
-          resetGrokConnectionState(routedInput.taskId);
-          invalidateModelCatalog("grok");
+          resetStandardAcpConnectionState(
+            runtime,
+            nativeTaskIds.get(routedInput.taskId) ?? routedInput.taskId,
+          );
+          invalidateModelCatalog(runtime);
           throw error;
         }
       } else if (routedInput.runtime === "claude" || routedInput.runtime === "antigravity") {
@@ -5413,6 +5655,17 @@ export const bridge: AppBridge = {
       taskId,
       approvalId,
       decision,
+    });
+  },
+
+  respondToQuestion: async (taskId, approvalId, optionId) => {
+    if (!isTauri()) {
+      throw new Error("Approvals are only available during a native provider run");
+    }
+    return nativeInvoke<ApprovalProjection>("acp_respond_question", {
+      taskId,
+      approvalId,
+      optionId,
     });
   },
 

@@ -370,6 +370,30 @@ pub fn enabled_servers(app: &tauri::AppHandle, store: &LocalStore) -> Vec<Integr
         .collect()
 }
 
+/// Resolve only the MCP servers named by a delegation snapshot. Globally
+/// disabling or removing one revokes future launches/resumes for that child.
+pub fn selected_enabled_servers(
+    app: &tauri::AppHandle,
+    store: &LocalStore,
+    names: &[String],
+) -> integrator_core::Result<Vec<IntegratorMcpServer>> {
+    let enabled = enabled_servers(app, store);
+    let mut selected = Vec::with_capacity(names.len());
+    for name in names {
+        let server = enabled
+            .iter()
+            .find(|server| server.name == *name)
+            .cloned()
+            .ok_or_else(|| {
+                integrator_core::IntegratorError::Unavailable(format!(
+                    "assigned MCP server '{name}' is missing or disabled; review the specialist before continuing"
+                ))
+            })?;
+        selected.push(server);
+    }
+    Ok(selected)
+}
+
 pub fn mark_configuration_changed(store: &LocalStore) -> integrator_core::Result<()> {
     store
         .set_setting(
@@ -963,14 +987,25 @@ pub fn write_claude_mcp_config(
 /// Antigravity discovers workspace customizations from every `--add-dir`
 /// root. Its Integrator-owned control overlay therefore carries the enabled
 /// MCP set without touching the repository or the user's global Gemini data.
+#[cfg(test)]
 pub fn write_antigravity_mcp_config(
     overlay_root: &Path,
     servers: &[IntegratorMcpServer],
 ) -> io::Result<Option<PathBuf>> {
+    write_antigravity_mcp_config_with_base(overlay_root, servers, None)
+}
+
+/// Merge selected servers with an optional Integrator broker config so
+/// Antigravity children get the same reporting channel as every other child.
+pub fn write_antigravity_mcp_config_with_base(
+    overlay_root: &Path,
+    servers: &[IntegratorMcpServer],
+    base_config: Option<&Path>,
+) -> io::Result<Option<PathBuf>> {
     let agents = overlay_root.join(".agents");
     ensure_private_directory(&agents)?;
     let path = agents.join("mcp_config.json");
-    if servers.is_empty() {
+    if servers.is_empty() && base_config.is_none() {
         if let Err(error) = fs::remove_file(&path)
             && error.kind() != io::ErrorKind::NotFound
         {
@@ -978,7 +1013,15 @@ pub fn write_antigravity_mcp_config(
         }
         return Ok(None);
     }
-    let mcp_servers = servers
+    let mut document = match base_config {
+        Some(path) => serde_json::from_str::<Value>(&fs::read_to_string(path)?)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        None => serde_json::json!({}),
+    };
+    if !document.is_object() {
+        document = serde_json::json!({});
+    }
+    let selected = servers
         .iter()
         .map(|server| {
             let config = match &server.transport {
@@ -996,12 +1039,19 @@ pub fn write_antigravity_mcp_config(
             (projection_name(&server.name), config)
         })
         .collect::<serde_json::Map<_, _>>();
-    write_private_json(
-        &path,
-        &serde_json::json!({
-            "mcpServers": mcp_servers,
-        }),
-    )?;
+    let mcp_servers = document
+        .as_object_mut()
+        .expect("Antigravity MCP config is an object")
+        .entry("mcpServers")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !mcp_servers.is_object() {
+        *mcp_servers = Value::Object(serde_json::Map::new());
+    }
+    mcp_servers
+        .as_object_mut()
+        .expect("mcpServers is an object")
+        .extend(selected);
+    write_private_json(&path, &document)?;
     Ok(Some(path))
 }
 

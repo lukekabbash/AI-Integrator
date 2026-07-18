@@ -2,8 +2,8 @@ use std::str::FromStr;
 
 use chrono::Utc;
 use integrator_core::{
-    Delegation, DelegationId, DelegationMessage, DelegationPermission, DelegationSender,
-    DelegationStatus, IntegratorError, Result, TaskId,
+    Delegation, DelegationCapabilitySnapshot, DelegationId, DelegationMessage,
+    DelegationPermission, DelegationSender, DelegationStatus, IntegratorError, Result, TaskId,
 };
 use rusqlite::{OptionalExtension, params};
 
@@ -20,6 +20,8 @@ pub struct NewDelegation {
     pub runtime: String,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub service_level: String,
+    pub capability_snapshot: DelegationCapabilitySnapshot,
     pub permission: DelegationPermission,
     pub title: String,
     pub brief: String,
@@ -37,7 +39,7 @@ fn bounded(value: &str, limit: usize) -> String {
     format!("{}…[truncated]", &value[..end])
 }
 
-const DELEGATION_COLUMNS: &str = "id, parent_task_id, child_task_id, profile_id, profile_label, runtime, model, effort, permission, title, brief, status, result, child_session_ref, created_at, updated_at";
+const DELEGATION_COLUMNS: &str = "id, parent_task_id, child_task_id, profile_id, profile_label, runtime, model, effort, service_level, capability_snapshot_json, permission, title, brief, status, result, child_session_ref, created_at, updated_at";
 
 impl LocalStore {
     pub fn create_delegation(&self, input: NewDelegation) -> Result<Delegation> {
@@ -58,6 +60,8 @@ impl LocalStore {
             runtime: input.runtime,
             model: input.model,
             effort: input.effort,
+            service_level: input.service_level,
+            capability_snapshot: input.capability_snapshot,
             permission: input.permission,
             title: title.to_owned(),
             brief: bounded(input.brief.trim(), BRIEF_LIMIT),
@@ -70,7 +74,7 @@ impl LocalStore {
         self.connection
             .lock()
             .execute(
-                "INSERT INTO delegations(id, parent_task_id, child_task_id, profile_id, profile_label, runtime, model, effort, permission, title, brief, status, result, child_session_ref, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                "INSERT INTO delegations(id, parent_task_id, child_task_id, profile_id, profile_label, runtime, model, effort, service_level, capability_snapshot_json, permission, title, brief, status, result, child_session_ref, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
                 params![
                     delegation.id.to_string(),
                     delegation.parent_task_id.to_string(),
@@ -80,6 +84,8 @@ impl LocalStore {
                     delegation.runtime,
                     delegation.model,
                     delegation.effort,
+                    delegation.service_level,
+                    serde_json::to_string(&delegation.capability_snapshot)?,
                     delegation.permission.as_str(),
                     delegation.title,
                     delegation.brief,
@@ -167,6 +173,19 @@ impl LocalStore {
             .lock()
             .query_row(
                 "SELECT COUNT(*) FROM delegations WHERE parent_task_id = ?1 AND status IN ('starting', 'running', 'waiting')",
+                [parent_task_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(storage_error)
+    }
+
+    /// Writing children share the parent's worktree in v1, so only one may
+    /// hold an active slot for a parent task at a time.
+    pub fn active_writing_delegation_count(&self, parent_task_id: TaskId) -> Result<u32> {
+        self.connection
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM delegations WHERE parent_task_id = ?1 AND permission = 'project-write' AND status IN ('starting', 'running', 'waiting')",
                 [parent_task_id.to_string()],
                 |row| row.get(0),
             )
@@ -629,6 +648,8 @@ type DelegationRow = (
     String,
     String,
     String,
+    String,
+    String,
     Option<String>,
     Option<String>,
     String,
@@ -653,6 +674,8 @@ fn parse_delegation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Dele
         row.get(13)?,
         row.get(14)?,
         row.get(15)?,
+        row.get(16)?,
+        row.get(17)?,
     );
     Ok(build_delegation(raw))
 }
@@ -667,6 +690,8 @@ fn build_delegation(raw: DelegationRow) -> Result<Delegation> {
         runtime,
         model,
         effort,
+        service_level,
+        capability_snapshot,
         permission,
         title,
         brief,
@@ -689,6 +714,8 @@ fn build_delegation(raw: DelegationRow) -> Result<Delegation> {
         runtime,
         model,
         effort,
+        service_level,
+        capability_snapshot: serde_json::from_str(&capability_snapshot).map_err(invalid_stored)?,
         permission: DelegationPermission::from_str(&permission)?,
         title,
         brief,
@@ -722,7 +749,7 @@ fn parse_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Delegat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use integrator_core::NewTask;
+    use integrator_core::{DelegationRoute, NewTask};
 
     fn store_with_task() -> (LocalStore, TaskId) {
         let store = LocalStore::open_in_memory().expect("open store");
@@ -748,6 +775,24 @@ mod tests {
             runtime: "codex".into(),
             model: Some("gpt-5.6-codex".into()),
             effort: Some("low".into()),
+            service_level: "budget".into(),
+            capability_snapshot: DelegationCapabilitySnapshot {
+                version: 1,
+                profile_id: "codex-cheap".into(),
+                profile_label: "Codex (budget)".into(),
+                best_for: "Mechanical work".into(),
+                working_guidance: "Keep changes focused.".into(),
+                access_ceiling: DelegationPermission::ReadOnly,
+                service_level: "budget".into(),
+                routes: vec![DelegationRoute {
+                    runtime: "codex".into(),
+                    model: Some("gpt-5.6-codex".into()),
+                    effort: Some("low".into()),
+                }],
+                skill_ids: Vec::new(),
+                mcp_server_ids: Vec::new(),
+                created_at: Utc::now(),
+            },
             permission: DelegationPermission::ReadOnly,
             title: "Refactor tests".into(),
             brief: "Move helpers into a shared module".into(),
@@ -851,6 +896,31 @@ mod tests {
                 .result
                 .as_deref(),
             Some("done")
+        );
+    }
+
+    #[test]
+    fn only_active_project_writers_hold_the_single_writer_slot() {
+        let (store, parent) = store_with_task();
+        let mut input = new_delegation(parent);
+        input.permission = DelegationPermission::ProjectWrite;
+        input.capability_snapshot.access_ceiling = DelegationPermission::ProjectWrite;
+        let delegation = store.create_delegation(input).expect("create writer");
+
+        assert_eq!(
+            store
+                .active_writing_delegation_count(parent)
+                .expect("active writers"),
+            1
+        );
+        store
+            .update_delegation_status(delegation.id, DelegationStatus::Completed)
+            .expect("complete writer");
+        assert_eq!(
+            store
+                .active_writing_delegation_count(parent)
+                .expect("settled writers"),
+            0
         );
     }
 

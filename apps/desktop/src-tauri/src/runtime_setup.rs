@@ -29,6 +29,7 @@ pub enum RuntimeActionKind {
     Install,
     Update,
     Login,
+    Usage,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -377,6 +378,7 @@ fn plan_route(plan_id: &str) -> Option<(ProviderKind, RuntimeActionKind)> {
         "cursor" => ProviderKind::Cursor,
         "claude" => ProviderKind::Claude,
         "grok" => ProviderKind::Grok,
+        "kimi" => ProviderKind::Kimi,
         "antigravity" => ProviderKind::Antigravity,
         _ => return None,
     };
@@ -384,6 +386,7 @@ fn plan_route(plan_id: &str) -> Option<(ProviderKind, RuntimeActionKind)> {
         "install" => RuntimeActionKind::Install,
         "update" => RuntimeActionKind::Update,
         "login" => RuntimeActionKind::Login,
+        "usage" => RuntimeActionKind::Usage,
         _ => return None,
     };
     parts.next()?;
@@ -393,10 +396,12 @@ fn plan_route(plan_id: &str) -> Option<(ProviderKind, RuntimeActionKind)> {
 fn resolve_plans(provider: ProviderKind, kind: RuntimeActionKind) -> Vec<ResolvedPlan> {
     match kind {
         RuntimeActionKind::Install => install_plans(provider),
-        RuntimeActionKind::Update | RuntimeActionKind::Login => discover_provider(provider)
-            .and_then(|status| status.executable)
-            .map(|executable| vec![installed_action(provider, kind, executable)])
-            .unwrap_or_default(),
+        RuntimeActionKind::Update | RuntimeActionKind::Login | RuntimeActionKind::Usage => {
+            discover_provider(provider)
+                .and_then(|status| status.executable)
+                .map(|executable| vec![installed_action(provider, kind, executable)])
+                .unwrap_or_default()
+        }
     }
 }
 
@@ -411,13 +416,28 @@ fn installed_action(
         }
         (ProviderKind::Antigravity, RuntimeActionKind::Login) => Vec::new(),
         (_, RuntimeActionKind::Login) => vec![OsString::from("login")],
+        (ProviderKind::Kimi, RuntimeActionKind::Update) => vec![OsString::from("upgrade")],
         (_, RuntimeActionKind::Update) => vec![OsString::from("update")],
+        (ProviderKind::Codex, RuntimeActionKind::Usage) => ["--no-alt-screen", "-s", "read-only"]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+        (ProviderKind::Claude, RuntimeActionKind::Usage) => ["--safe-mode", "--ax-screen-reader"]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+        (ProviderKind::Cursor, RuntimeActionKind::Usage) => {
+            ["--mode", "ask"].into_iter().map(OsString::from).collect()
+        }
+        (ProviderKind::Grok, RuntimeActionKind::Usage) => vec![OsString::from("--no-alt-screen")],
+        (_, RuntimeActionKind::Usage) => Vec::new(),
         _ => Vec::new(),
     };
     let action = match kind {
         RuntimeActionKind::Update => "update",
         RuntimeActionKind::Login => "sign in",
         RuntimeActionKind::Install => "install",
+        RuntimeActionKind::Usage => "view usage",
     };
     let command = display_command(&executable, &args);
     ResolvedPlan {
@@ -426,7 +446,9 @@ fn installed_action(
             provider,
             kind,
             method: "Vendor CLI".into(),
-            label: if provider == ProviderKind::Antigravity && kind == RuntimeActionKind::Login {
+            label: if kind == RuntimeActionKind::Usage {
+                format!("Open {} usage", title_case(provider.as_str()))
+            } else if provider == ProviderKind::Antigravity && kind == RuntimeActionKind::Login {
                 "Open Antigravity interactive setup".into()
             } else {
                 format!("{} with the installed CLI", title_case(action))
@@ -445,6 +467,16 @@ fn installed_action(
                     }
                 }
                 RuntimeActionKind::Install => String::new(),
+                RuntimeActionKind::Usage => match provider {
+                    ProviderKind::Cursor =>
+                        "Opens Cursor Agent. Run `/usage` for activity or `/context` for this session's context breakdown. Cursor does not expose plan headroom here."
+                            .into(),
+                    ProviderKind::Antigravity =>
+                        "Opens Antigravity. Run `/usage` or `/quota` to view its provider-owned model limits."
+                            .into(),
+                    _ => "Opens the installed vendor CLI. Run `/usage` to view its provider-owned usage screen."
+                        .into(),
+                },
             },
             source_url: provider_source(provider).into(),
             available: true,
@@ -501,6 +533,17 @@ fn install_plans(provider: ProviderKind) -> Vec<ResolvedPlan> {
             which::which("brew").ok(),
             vec!["install".into(), "--cask".into(), "codex".into()],
             "brew install --cask codex".into(),
+            provider_source(provider),
+            plans.is_empty(),
+        ));
+    }
+    if provider == ProviderKind::Kimi && cfg!(target_os = "macos") {
+        plans.push(direct_install_plan(
+            provider,
+            "Homebrew",
+            which::which("brew").ok(),
+            vec!["install".into(), "kimi-code".into()],
+            "brew install kimi-code".into(),
             provider_source(provider),
             plans.is_empty(),
         ));
@@ -616,6 +659,10 @@ fn unix_installer(provider: ProviderKind) -> Option<(&'static str, &'static str)
             "curl -fsSL https://x.ai/cli/install.sh | bash",
             "https://docs.x.ai/build/overview",
         )),
+        ProviderKind::Kimi => Some((
+            "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
+            "https://www.kimi.com/code/docs/en/",
+        )),
         ProviderKind::Antigravity => Some((
             "curl -fsSL https://antigravity.google/cli/install.sh | bash",
             "https://antigravity.google/docs/cli-getting-started",
@@ -634,6 +681,10 @@ fn windows_installer(provider: ProviderKind) -> Option<(&'static str, &'static s
             "irm https://antigravity.google/cli/install.ps1 | iex",
             "https://antigravity.google/docs/cli-getting-started",
         )),
+        ProviderKind::Kimi => Some((
+            "irm https://code.kimi.com/kimi-code/install.ps1 | iex",
+            "https://www.kimi.com/code/docs/en/",
+        )),
         _ => None,
     }
 }
@@ -643,6 +694,7 @@ fn npm_package(provider: ProviderKind) -> Option<&'static str> {
         ProviderKind::Codex => Some("@openai/codex@latest"),
         ProviderKind::Claude => Some("@anthropic-ai/claude-code@latest"),
         ProviderKind::Grok => Some("@xai-official/grok@latest"),
+        ProviderKind::Kimi => Some("@moonshot-ai/kimi-code@latest"),
         _ => None,
     }
 }
@@ -653,6 +705,7 @@ fn provider_source(provider: ProviderKind) -> &'static str {
         ProviderKind::Cursor => "https://docs.cursor.com/en/cli/installation",
         ProviderKind::Claude => "https://docs.anthropic.com/en/docs/claude-code/getting-started",
         ProviderKind::Grok => "https://docs.x.ai/build/cli/reference",
+        ProviderKind::Kimi => "https://www.kimi.com/code/docs/en/",
         ProviderKind::Antigravity => "https://antigravity.google/docs/cli-getting-started",
         ProviderKind::CustomAcp => "",
     }
@@ -686,6 +739,7 @@ fn action_id(kind: RuntimeActionKind) -> &'static str {
         RuntimeActionKind::Install => "install",
         RuntimeActionKind::Update => "update",
         RuntimeActionKind::Login => "login",
+        RuntimeActionKind::Usage => "usage",
     }
 }
 
@@ -740,6 +794,18 @@ mod tests {
             PathBuf::from("claude"),
         );
         assert_eq!(claude.public.command, "claude auth login");
+        let kimi = installed_action(
+            ProviderKind::Kimi,
+            RuntimeActionKind::Login,
+            PathBuf::from("kimi"),
+        );
+        assert_eq!(kimi.public.command, "kimi login");
+        let kimi_update = installed_action(
+            ProviderKind::Kimi,
+            RuntimeActionKind::Update,
+            PathBuf::from("kimi"),
+        );
+        assert_eq!(kimi_update.public.command, "kimi upgrade");
         let antigravity = installed_action(
             ProviderKind::Antigravity,
             RuntimeActionKind::Login,
@@ -755,12 +821,31 @@ mod tests {
     }
 
     #[test]
+    fn usage_actions_open_provider_owned_interactive_screens() {
+        let claude = installed_action(
+            ProviderKind::Claude,
+            RuntimeActionKind::Usage,
+            PathBuf::from("claude"),
+        );
+        assert_eq!(
+            claude.public.command,
+            "claude --safe-mode --ax-screen-reader"
+        );
+        assert!(claude.public.description.contains("`/usage`"));
+        assert_eq!(
+            plan_route("grok:usage:vendor-cli"),
+            Some((ProviderKind::Grok, RuntimeActionKind::Usage))
+        );
+    }
+
+    #[test]
     fn every_supported_provider_has_a_disclosed_installer() {
         for provider in [
             ProviderKind::Codex,
             ProviderKind::Cursor,
             ProviderKind::Claude,
             ProviderKind::Grok,
+            ProviderKind::Kimi,
             ProviderKind::Antigravity,
         ] {
             let plans = install_plans(provider);
@@ -793,6 +878,10 @@ mod tests {
         assert_eq!(
             plan_route("antigravity:login:vendor-cli"),
             Some((ProviderKind::Antigravity, RuntimeActionKind::Login))
+        );
+        assert_eq!(
+            plan_route("kimi:update:vendor-cli"),
+            Some((ProviderKind::Kimi, RuntimeActionKind::Update))
         );
         assert!(plan_route("antigravity:login:vendor-cli:extra").is_none());
         assert!(plan_route("custom-acp:login:vendor-cli").is_none());

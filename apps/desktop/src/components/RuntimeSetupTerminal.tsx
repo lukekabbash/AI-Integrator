@@ -145,7 +145,10 @@ export function RuntimeSetupTerminal({
   }, [plan]);
 
   return (
-    <section className="runtime-setup-terminal" aria-label={`${plan.provider} setup terminal`}>
+    <section
+      className="runtime-setup-terminal"
+      aria-label={`${plan.provider} ${plan.kind} terminal`}
+    >
       <header>
         <span>
           <strong>{plan.label}</strong>
@@ -173,7 +176,7 @@ export function RuntimeSetupTerminal({
           className="icon-button"
           type="button"
           onClick={onClose}
-          aria-label="Close setup terminal"
+          aria-label="Close runtime terminal"
         >
           <X aria-hidden="true" />
         </button>

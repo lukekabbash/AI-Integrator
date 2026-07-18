@@ -173,6 +173,58 @@ describe("AI Integrator desktop workspace", () => {
   });
 
   it("opens Settings as a full replacement view and applies a theme preset", async () => {
+    vi.spyOn(bridge, "getUsageSummary").mockResolvedValue({
+      measuredAt: "2026-07-17T18:00:00Z",
+      providers: [
+        {
+          provider: "codex",
+          taskCount: 2,
+          turnCount: 8,
+          inputTokens: 120_000,
+          cachedInputTokens: 70_000,
+          outputTokens: 20_000,
+          reasoningOutputTokens: 5_000,
+          totalTokens: 215_000,
+          provenance: "vendor_exact",
+          detail: "Provider-reported token usage from the persisted native projection.",
+          subscription: {
+            planType: "pro",
+            resetCreditsAvailable: 3,
+            updatedAt: "2026-07-17T18:00:00Z",
+            buckets: [
+              {
+                limitId: "codex",
+                limitName: "GPT-5 Codex",
+                primary: {
+                  usedPercent: 20,
+                  windowDurationMins: 10_080,
+                  resetsAt: 1_900_000_000,
+                },
+              },
+              {
+                limitId: "codex-spark",
+                limitName: "GPT-5 Codex Spark",
+                primary: {
+                  usedPercent: 0,
+                  windowDurationMins: 10_080,
+                  resetsAt: 1_900_000_000,
+                },
+              },
+            ],
+          },
+          accountUsage: {
+            summary: {
+              lifetimeTokens: 4_200_000,
+              peakDailyTokens: 550_000,
+              currentStreakDays: 4,
+              longestStreakDays: 12,
+            },
+            dailyUsageBuckets: [{ startDate: "2026-07-17", tokens: 42_000 }],
+            updatedAt: "2026-07-17T18:00:00Z",
+          },
+        },
+      ],
+    });
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Open Settings" }));
     expect(
@@ -298,9 +350,17 @@ describe("AI Integrator desktop workspace", () => {
     fireEvent.click(screen.getByRole("button", { name: "Back" }));
     expect(screen.getByRole("button", { name: "Favorite runtime" })).toHaveTextContent("Last used");
 
+    const settingsScroll = document.querySelector<HTMLElement>(".settings-content-scroll");
+    expect(settingsScroll).not.toBeNull();
+    if (settingsScroll) settingsScroll.scrollTop = 500;
     fireEvent.click(screen.getByRole("button", { name: /Usage and Budgets/i }));
-    expect(await screen.findByRole("heading", { name: "Per-provider usage" })).toBeInTheDocument();
-    expect(screen.getByText("Codex")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Available now" })).toBeInTheDocument();
+    await waitFor(() => expect(settingsScroll).toHaveProperty("scrollTop", 0));
+    expect(await screen.findByText("80% remaining")).toBeInTheDocument();
+    expect(screen.getByText("GPT-5 Codex Spark")).toBeInTheDocument();
+    expect(screen.getByText("3 reset credits")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Codex account activity" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Local history" })).toBeInTheDocument();
   });
 
   it("manages archived chats from the Archives settings section", async () => {

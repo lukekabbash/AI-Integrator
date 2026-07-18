@@ -28,6 +28,7 @@ import {
   FolderOpen,
   FolderPlus,
   Github,
+  HelpCircle,
   Minus,
   PanelLeftClose,
   PanelLeftOpen,
@@ -62,6 +63,7 @@ import {
   type ProjectFileEntry,
   type ProjectFileOpener,
   type ProjectSummary,
+  type QuestionOption,
   recordLocalTurnUsage,
   type RuntimeConnection,
   type RuntimeId,
@@ -193,6 +195,7 @@ function runtimeLabel(runtime: RuntimeId): string {
     cursor: "Cursor",
     claude: "Claude Code",
     grok: "Grok Build",
+    kimi: "Kimi Code",
     antigravity: "Antigravity",
     custom: "Custom ACP",
   }[runtime];
@@ -1221,6 +1224,7 @@ function ApprovalControl({
   runtime,
   crowded,
   onDecision,
+  onSelectOption,
 }: {
   approval: ApprovalProjection;
   busy: boolean;
@@ -1231,11 +1235,19 @@ function ApprovalControl({
    *  composer at the same time — pull back to clear it. */
   crowded?: boolean;
   onDecision: (decision: ApprovalDecision) => void;
+  /** Answer a "question" approval with one of its offered options. ACP has
+   *  no elicitation method, so the agent asked through the same permission
+   *  channel a command/file-edit gate uses — this is a distinct approval
+   *  kind rather than another onDecision value because the answer is one of
+   *  N labeled choices, not a binary allow/reject. */
+  onSelectOption: (option: QuestionOption) => void;
 }) {
   const isCommand = approval.approvalKind === "commandExecution";
   const isPlan = approval.approvalKind === "planReview";
+  const isQuestion = approval.approvalKind === "question";
   const failed = approval.state === "responseFailed";
   const changedPaths = approval.fileChanges?.map((change) => change.path) ?? [];
+  const options = approval.options ?? [];
   // Cursor builds the approved plan in Agent mode right away, so the accept
   // action is the build action. Claude's accept exits plan mode and keeps
   // per-edit prompts; accept-for-session additionally auto-accepts the edits.
@@ -1249,23 +1261,35 @@ function ApprovalControl({
     >
       <header className="approval-header">
         <div className="approval-icon" aria-hidden="true">
-          {isPlan ? <ClipboardList /> : isCommand ? <TerminalSquare /> : <FileDiff />}
+          {isQuestion ? (
+            <HelpCircle />
+          ) : isPlan ? (
+            <ClipboardList />
+          ) : isCommand ? (
+            <TerminalSquare />
+          ) : (
+            <FileDiff />
+          )}
         </div>
         <div className="approval-heading">
           <span className="approval-kicker">
             {autoApproving ? "Auto-approving — full access is on" : "Approval required"}
           </span>
           <h3 id={`approval-${approval.id}`}>
-            {isPlan
-              ? "Approve this plan?"
-              : isCommand
-                ? "Run this command?"
-                : "Apply these file changes?"}
+            {isQuestion
+              ? "The agent has a question"
+              : isPlan
+                ? "Approve this plan?"
+                : isCommand
+                  ? "Run this command?"
+                  : "Apply these file changes?"}
           </h3>
         </div>
       </header>
       <div className="approval-body">
-        {isPlan ? (
+        {isQuestion ? (
+          <p>{approval.reason ?? "The agent is waiting for an answer."}</p>
+        ) : isPlan ? (
           <>
             {approval.reason ? <p>{approval.reason}</p> : null}
             {approval.planMarkdown ? (
@@ -1303,6 +1327,28 @@ function ApprovalControl({
           <span className="approval-auto-note" aria-live="polite">
             Approving…
           </span>
+        ) : isQuestion ? (
+          <>
+            <button
+              type="button"
+              className="secondary-button approval-decline"
+              onClick={() => onDecision("cancel")}
+              disabled={busy}
+            >
+              Skip
+            </button>
+            {options.map((option) => (
+              <button
+                key={option.optionId}
+                type="button"
+                className="secondary-button approval-question-option"
+                onClick={() => onSelectOption(option)}
+                disabled={busy}
+              >
+                {option.label}
+              </button>
+            ))}
+          </>
         ) : (
           <>
             <button
@@ -2599,6 +2645,7 @@ export default function App() {
         tasks: [...current.tasks, targetTask],
       }));
     }
+    setComposerError(null);
     if (taskId === snapshot.activeTaskId) {
       setScreen("workspace");
       return;
@@ -3126,13 +3173,20 @@ export default function App() {
         event = { ...event, nativeSkill: nativeAction.name };
       }
       if (isNewTask) {
-        void bridge
-          .generateTaskTitle({
-            taskId: targetTask.id,
-            prompt: input.prompt,
-            runtime: input.runtime,
-            route: { runtime: input.runtime, fallbacks: [] },
-          })
+        // Staggered: the title helper boots its own cold provider process,
+        // and starting it in the same instant as the real turn's spawn makes
+        // the two cold starts contend for CPU/network right when
+        // time-to-first-token matters most.
+        const TITLE_GENERATION_STAGGER_MS = 2500;
+        void new Promise((resolve) => setTimeout(resolve, TITLE_GENERATION_STAGGER_MS))
+          .then(() =>
+            bridge.generateTaskTitle({
+              taskId: targetTask.id,
+              prompt: input.prompt,
+              runtime: input.runtime,
+              route: { runtime: input.runtime, fallbacks: [] },
+            }),
+          )
           .then((metadata) => {
             if (!metadata) return;
             setSnapshot((current) => ({
@@ -3349,7 +3403,6 @@ export default function App() {
         resuming: resumingTaskId === task.id,
         queueBusy: queueBusyForTask,
         queueAwaiting: queueAwaitingTurnRef.current?.taskId === task.id,
-        optimisticMessage: optimisticUserMessage?.taskId === task.id,
       }),
     );
     if (!task || (!turnBusy && !queuePausedTaskIdsRef.current.has(task.id))) {
@@ -5014,16 +5067,34 @@ export default function App() {
     }
   };
 
+  const respondToQuestion = async (approval: ApprovalProjection, option: QuestionOption) => {
+    if (!activeTask || respondingApprovalId || activeProjectionUnavailable) return;
+    setRespondingApprovalId(approval.id);
+    setOperationError("");
+    try {
+      await bridge.respondToQuestion(activeTask.id, approval.id, option.optionId);
+    } catch (error) {
+      setOperationError(error instanceof Error ? error.message : "Could not send that answer");
+    } finally {
+      setRespondingApprovalId("");
+    }
+  };
+
   const autoApproveActive = Boolean(activeTask && taskPermissions[activeTask.id] === "full-access");
 
   // Full access selected mid-run means "stop asking": answer each new
   // approval once, automatically, instead of parking the turn on a prompt.
   // Plan reviews stay manual: the user chose plan mode to read the plan
   // before anything is built, so full access must not skip that gate.
+  // Questions stay manual too: there is no way to synthesize a correct
+  // answer to an open multiple-choice question, and auto-accepting one
+  // through the binary accept/decline path would silently pick whichever
+  // option the agent happened to list first.
   useEffect(() => {
     if (!autoApproveActive || !activeTask || !pendingApproval) return;
     if (pendingApproval.state !== "pending") return;
-    if (pendingApproval.approvalKind === "planReview") return;
+    if (pendingApproval.approvalKind === "planReview" || pendingApproval.approvalKind === "question")
+      return;
     if (respondingApprovalId) return;
     if (autoApprovedIdsRef.current.has(pendingApproval.id)) return;
     autoApprovedIdsRef.current.add(pendingApproval.id);
@@ -5947,7 +6018,8 @@ export default function App() {
                                   busy={respondingApprovalId === pendingApproval.id}
                                   autoApproving={
                                     autoApproveActive &&
-                                    pendingApproval.approvalKind !== "planReview"
+                                    pendingApproval.approvalKind !== "planReview" &&
+                                    pendingApproval.approvalKind !== "question"
                                   }
                                   runtime={activeTask?.runtime}
                                   crowded={Boolean(
@@ -5959,6 +6031,9 @@ export default function App() {
                                   )}
                                   onDecision={(decision) =>
                                     void respondToApproval(pendingApproval, decision)
+                                  }
+                                  onSelectOption={(option) =>
+                                    void respondToQuestion(pendingApproval, option)
                                   }
                                 />
                               ) : null}
