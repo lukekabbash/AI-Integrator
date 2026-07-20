@@ -500,6 +500,46 @@ describe("native trusted-project bridge", () => {
     bridge.invalidateModelCatalog("codex");
   });
 
+  it("sends bounded model catalogs with specialist generation", async () => {
+    const generated = { id: "specialist-ai-test", enabled: false };
+    invokeMock.mockResolvedValue(generated);
+    const modelCatalogs = [
+      {
+        runtime: "codex" as const,
+        models: [
+          {
+            id: "gpt-5.6",
+            label: "GPT-5.6",
+            efforts: [{ id: "high", label: "High" }],
+            defaultEffort: "high",
+          },
+        ],
+      },
+      {
+        runtime: "claude" as const,
+        models: [{ id: "claude-opus", label: "Claude Opus" }],
+      },
+    ];
+
+    await expect(
+      bridge.generateSpecialist(
+        "A careful security reviewer",
+        { runtime: "codex", fallbacks: ["claude"] },
+        modelCatalogs,
+      ),
+    ).resolves.toBe(generated);
+    expect(invokeMock).toHaveBeenCalledWith("specialist_generate", {
+      description: "A careful security reviewer",
+      route: {
+        provider: "codex",
+        model: null,
+        effort: null,
+        fallbacks: ["claude"],
+      },
+      modelCatalogs,
+    });
+  });
+
   it("uses the bounded local message-search command", async () => {
     invokeMock.mockResolvedValue([{ taskId: "task-1", snippet: "matching local message" }]);
 
@@ -1609,6 +1649,99 @@ describe("native trusted-project bridge", () => {
         .filter(([command]) => command === "acp_send_turn")
         .map(([, args]) => args?.delegation),
     ).toEqual(["balanced", "balanced", "budget-first"]);
+  });
+
+  it("routes projectless Chat turns through every certified runtime", async () => {
+    const runtimes = ["codex", "cursor", "grok", "kimi", "claude", "antigravity"] as const;
+    invokeMock.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "app_bootstrap") return { value: {} };
+      if (command === "local_export") {
+        return {
+          projects: [],
+          tasks: runtimes.map((runtime) => ({
+            id: `chat-${runtime}`,
+            kind: "chat",
+            title: `${runtime} chat`,
+            state: "ready",
+            pinned: false,
+            archived: false,
+            runtime,
+            model: "Provider default",
+            createdAt: "2026-07-19T00:00:00Z",
+            updatedAt: "2026-07-19T00:00:00Z",
+          })),
+          settings: [],
+          providerSessions: [],
+          providerResumeStates: [],
+          runtimeSessions: [],
+        };
+      }
+      if (command === "codex_start_thread") return { thread: { id: "chat-codex-thread" } };
+      if (command === "codex_start_turn") return { turn: { id: "chat-codex-turn" } };
+      if (command === "acp_start_session") {
+        return { sessionId: `${String(args?.taskId)}-session` };
+      }
+      if (command === "acp_session_capabilities") {
+        return { load: true, resume: true, mcpHttp: true, mcpSse: true };
+      }
+      if (command === "acp_send_turn") return { turnId: `${String(args?.taskId)}-turn` };
+      if (command === "structured_cli_start_turn") return { turnId: "structured-chat-turn" };
+      return undefined;
+    });
+
+    await bridge.loadWorkspace();
+    for (const runtime of runtimes) {
+      await bridge.sendTurn({
+        taskId: `chat-${runtime}`,
+        prompt: `Ask ${runtime}`,
+        attachments: [
+          {
+            path: `/app/chat-attachments/chat-${runtime}/screenshot.png`,
+            name: "screenshot.png",
+            kind: "image",
+          },
+        ],
+        runtime,
+        model: "Provider default",
+        permission: "read-only",
+        delegation: "off",
+        contextReferences: [
+          { id: `ref-${runtime}`, sourceTaskId: "source-chat", sourceTitle: "Research" },
+        ],
+      });
+    }
+
+    expect(invokeMock).toHaveBeenCalledWith(
+      "codex_start_turn",
+      expect.objectContaining({
+        taskId: "chat-codex",
+        attachments: [expect.objectContaining({ name: "screenshot.png", kind: "image" })],
+        contextReferences: [expect.any(Object)],
+      }),
+    );
+    for (const runtime of ["cursor", "grok", "kimi"] as const) {
+      expect(invokeMock).toHaveBeenCalledWith(
+        "acp_send_turn",
+        expect.objectContaining({
+          taskId: `chat-${runtime}`,
+          attachments: [expect.objectContaining({ name: "screenshot.png", kind: "image" })],
+          contextReferences: [expect.any(Object)],
+        }),
+      );
+    }
+    for (const runtime of ["claude", "antigravity"] as const) {
+      expect(invokeMock).toHaveBeenCalledWith(
+        "structured_cli_start_turn",
+        expect.objectContaining({
+          taskId: `chat-${runtime}`,
+          provider: runtime,
+          attachments: [expect.objectContaining({ name: "screenshot.png", kind: "image" })],
+          permission: "read-only",
+          delegation: "off",
+          contextReferences: [expect.any(Object)],
+        }),
+      );
+    }
   });
 
   it("applies Kimi's negotiated model and Thinking controls before prompting", async () => {

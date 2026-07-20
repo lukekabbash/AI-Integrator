@@ -14,15 +14,19 @@ import remarkGfm from "remark-gfm";
 import { AnimatePresence, m as motion, useReducedMotion } from "motion/react";
 import {
   BookOpen,
+  Clock3,
   Check,
   ChevronDown,
   ChevronUp,
   Circle,
+  CircleAlert,
+  CirclePlay,
   Copy,
   CornerDownLeft,
   GitBranch,
   Info,
   Layers,
+  LoaderCircle,
   MessageCircleQuestion,
   Pencil,
   RefreshCw,
@@ -40,6 +44,7 @@ import {
 } from "../bridge";
 import { DiffView, type DiffCommitState, type DiffSelectionPayload } from "./DiffView";
 import { FileIcon } from "./FileIcon";
+import { parseProjectFileHref, type ProjectFileLocation } from "./fileViewSupport";
 import { Tooltip } from "./Tooltip";
 import { splitAttachmentBlock } from "./conversationFormatting";
 import {
@@ -90,7 +95,7 @@ interface TranscriptProps {
    */
   onEditUserMessage?: (eventId: string, body: string) => void;
   /** Opens an observable file in the Files tab of the right rail. */
-  onOpenFile?: (path: string) => void;
+  onOpenFile?: (location: ProjectFileLocation) => void;
   /** Selection-to-chat from transcript-embedded diffs. */
   onAddDiffSelection?: (payload: DiffSelectionPayload) => void;
   /** Marks the file an inline edit diff touches reviewed for this task. */
@@ -108,6 +113,8 @@ interface TranscriptProps {
    * actions. Returning undefined keeps the action pair.
    */
   diffCommitState?: (file: DiffFile) => DiffCommitState | undefined;
+  /** Cancels an Integrator-owned scheduled continuation from its stream receipt. */
+  onCancelScheduledTask?: (automationId: string) => void;
 }
 
 const LOAD_OLDER_THRESHOLD_PX = 96;
@@ -160,15 +167,40 @@ function scrollToLatest(container: HTMLDivElement, behavior: ScrollBehavior = "a
 function MarkdownLink({
   href,
   children,
+  onOpenFile,
   ...props
-}: React.AnchorHTMLAttributes<HTMLAnchorElement> & { node?: unknown }) {
+}: React.AnchorHTMLAttributes<HTMLAnchorElement> & {
+  node?: unknown;
+  onOpenFile?: (location: ProjectFileLocation) => void;
+}) {
+  const fileLocation = href ? parseProjectFileHref(href) : undefined;
   const handleClick = (event: React.MouseEvent<HTMLAnchorElement>) => {
     if (!href || event.defaultPrevented || event.button !== 0) return;
     event.preventDefault();
+    if (fileLocation) {
+      onOpenFile?.(fileLocation);
+      return;
+    }
     void openExternalLink(href).catch(() => {
       // Keep a failed external open from navigating the workspace away.
     });
   };
+
+  if (fileLocation) {
+    return (
+      <a
+        {...props}
+        className="assistant-file-link"
+        href={href}
+        title={fileLocation.path}
+        aria-disabled={onOpenFile ? undefined : true}
+        onClick={handleClick}
+      >
+        <FileIcon fileName={fileLocation.path} />
+        <span>{children}</span>
+      </a>
+    );
+  }
 
   return (
     <a {...props} href={href} target="_blank" rel="noopener noreferrer" onClick={handleClick}>
@@ -178,22 +210,31 @@ function MarkdownLink({
 }
 
 const MARKDOWN_REMARK_PLUGINS = [remarkGfm];
-const MARKDOWN_COMPONENTS = { a: MarkdownLink };
 
 const MarkdownBody = memo(function MarkdownBody({
   body,
   streaming = false,
+  onOpenFile,
 }: {
   body: string;
   /** When true, also hold thematic-break candidates until the stream settles. */
   streaming?: boolean;
+  onOpenFile?: (location: ProjectFileLocation) => void;
 }) {
   const source = stabilizeStreamingMarkdown(
     repairStreamedTables(normalizeStreamedMarkdown(body)),
     streaming,
   );
+  const components = useMemo(
+    () => ({
+      a: (props: React.AnchorHTMLAttributes<HTMLAnchorElement> & { node?: unknown }) => (
+        <MarkdownLink {...props} onOpenFile={onOpenFile} />
+      ),
+    }),
+    [onOpenFile],
+  );
   return (
-    <ReactMarkdown remarkPlugins={MARKDOWN_REMARK_PLUGINS} components={MARKDOWN_COMPONENTS}>
+    <ReactMarkdown remarkPlugins={MARKDOWN_REMARK_PLUGINS} components={components}>
       {source}
     </ReactMarkdown>
   );
@@ -331,9 +372,7 @@ const UserMessage = memo(function UserMessage({
         <div className="message-actions">
           <Tooltip
             placement="bottom"
-            label={
-              copyFailed ? "Clipboard unavailable" : copied ? "Copied" : "Copy message"
-            }
+            label={copyFailed ? "Clipboard unavailable" : copied ? "Copied" : "Copy message"}
           >
             <button
               type="button"
@@ -350,11 +389,7 @@ const UserMessage = memo(function UserMessage({
               label="Edit"
               hint="Return to composer and continue from here"
             >
-              <button
-                type="button"
-                onClick={() => onEdit(id, body)}
-                aria-label="Edit this message"
-              >
+              <button type="button" onClick={() => onEdit(id, body)} aria-label="Edit this message">
                 <CornerDownLeft aria-hidden="true" />
               </button>
             </Tooltip>
@@ -382,6 +417,7 @@ const AssistantMessage = memo(function AssistantMessage({
   onRegenerate,
   onBranch,
   onAskAbout,
+  onOpenFile,
 }: {
   id: string;
   body: string;
@@ -400,6 +436,7 @@ const AssistantMessage = memo(function AssistantMessage({
   onRegenerate: (id: string) => void;
   onBranch: (id: string) => void;
   onAskAbout: (body: string) => void;
+  onOpenFile?: (location: ProjectFileLocation) => void;
 }) {
   const clock = !interim && showTimestamp ? formatClock(timestamp) : "";
   const showTurnActions = !interim && canBranch;
@@ -416,15 +453,13 @@ const AssistantMessage = memo(function AssistantMessage({
           <span className="turn-attribution-model">{modelLabel}</span>
         </header>
       ) : null}
-      <MarkdownBody body={body} streaming={running} />
+      <MarkdownBody body={body} streaming={running} onOpenFile={onOpenFile} />
       {!interim ? (
         <div className="message-footer message-footer--assistant">
           <div className="message-actions">
             <Tooltip
               placement="bottom"
-              label={
-                copyFailed ? "Clipboard unavailable" : copied ? "Copied" : "Copy response"
-              }
+              label={copyFailed ? "Clipboard unavailable" : copied ? "Copied" : "Copy response"}
             >
               <button
                 type="button"
@@ -436,11 +471,7 @@ const AssistantMessage = memo(function AssistantMessage({
               </button>
             </Tooltip>
             {showTurnActions ? (
-              <Tooltip
-                placement="bottom"
-                label="Branch"
-                hint="Continue in a copy that ends here"
-              >
+              <Tooltip placement="bottom" label="Branch" hint="Continue in a copy that ends here">
                 <button
                   type="button"
                   onClick={() => onBranch(id)}
@@ -508,13 +539,93 @@ const NoticeMessage = memo(function NoticeMessage({
   );
 });
 
+const SchedulingMessage = memo(function SchedulingMessage({
+  event,
+  onCancel,
+}: {
+  event: TranscriptEvent;
+  onCancel?: (automationId: string) => void;
+}) {
+  const scheduling = event.scheduling;
+  const countdownAt = scheduling?.countdownAt;
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const target = countdownAt ? Date.parse(countdownAt) : Number.NaN;
+    if (!Number.isFinite(target) || target <= Date.now()) return;
+    const timer = window.setInterval(() => {
+      const current = Date.now();
+      setNow(current);
+      if (current >= target) window.clearInterval(timer);
+    }, 1_000);
+    return () => window.clearInterval(timer);
+  }, [countdownAt]);
+  if (!scheduling) return null;
+  const prompt = scheduling.phase === "prompt";
+  const target = countdownAt ? Date.parse(countdownAt) : Number.NaN;
+  const remainingSeconds = Number.isFinite(target)
+    ? Math.max(0, Math.ceil((target - now) / 1_000))
+    : undefined;
+  const countdown =
+    remainingSeconds === undefined
+      ? undefined
+      : remainingSeconds === 0
+        ? "Waking up now"
+        : `Waking up in ${Math.floor(remainingSeconds / 60) > 0 ? `${Math.floor(remainingSeconds / 60)}m ` : ""}${remainingSeconds % 60}s`;
+  const title = countdown ?? event.title;
+  const SchedulingIcon =
+    scheduling.phase === "prompt"
+      ? CirclePlay
+      : scheduling.phase === "failed"
+        ? CircleAlert
+        : scheduling.phase === "starting"
+          ? LoaderCircle
+          : Clock3;
+  return (
+    <section
+      className="scheduling-message"
+      data-event-id={event.id}
+      data-phase={scheduling.phase}
+      aria-label={title ?? "Scheduling"}
+    >
+      <span className="scheduling-message-icon-shell" aria-hidden="true">
+        <SchedulingIcon className="scheduling-message-icon" />
+      </span>
+      <div className="scheduling-message-copy">
+        <strong>{title}</strong>
+        {event.meta ? <small title={event.meta}>{event.meta}</small> : null}
+        <p className={prompt ? "scheduling-message-prompt" : undefined} title={event.body}>
+          {event.body}
+        </p>
+      </div>
+      {scheduling.canCancel && onCancel ? (
+        <button type="button" onClick={() => onCancel(scheduling.automationId)}>
+          Cancel
+        </button>
+      ) : null}
+    </section>
+  );
+});
+
 function activityGlyphKind(
   event: TranscriptEvent,
-): "edit" | "read" | "search" | "command" | "tool" | "activity" | "approval" | "reasoning" | "other" {
+):
+  | "edit"
+  | "read"
+  | "search"
+  | "command"
+  | "tool"
+  | "activity"
+  | "approval"
+  | "reasoning"
+  | "other" {
   const title = event.title ?? "";
   if (/^(Read|Reads|Reading)\b/i.test(title)) return "read";
   if (/^(Search|Searches|Searching|Searched)\b/i.test(title)) return "search";
-  if (/^(Edit|Edits|Editing|Edited|Creat|Creating|Created|Added|Deleted|Renamed|Changed)\b/i.test(title)) {
+  if (
+    /^(Edit|Edits|Editing|Edited|Creat|Creating|Created|Added|Deleted|Renamed|Changed)\b/i.test(
+      title,
+    )
+  ) {
     return "edit";
   }
   if (event.activityType === "file") return "edit";
@@ -590,7 +701,7 @@ interface ActivityEventProps {
   nested?: boolean;
   isExpanded: (event: TranscriptEvent) => boolean;
   onExpandedChange: (eventId: string, expanded: boolean) => void;
-  onOpenFile?: (path: string) => void;
+  onOpenFile?: (location: ProjectFileLocation) => void;
   onAddDiffSelection?: (payload: DiffSelectionPayload) => void;
   onApproveDiff?: (file: DiffFile) => void;
   isDiffApproved?: (file: DiffFile) => boolean;
@@ -619,9 +730,9 @@ const ActivityEvent = memo(function ActivityEventRow({
   const pathOnlyBody = Boolean(filePath && event.body === filePath);
   const hasLongBody = Boolean(
     event.title &&
-      event.body &&
-      !pathOnlyBody &&
-      (event.body.length > 96 || event.body.includes("\n")),
+    event.body &&
+    !pathOnlyBody &&
+    (event.body.length > 96 || event.body.includes("\n")),
   );
   const expandable = hasChildren || hasDetails || hasLongBody || hasDiff;
   const canOpenFile = Boolean(filePath && onOpenFile && event.title);
@@ -663,7 +774,7 @@ const ActivityEvent = memo(function ActivityEventRow({
                 aria-label={`Open ${filePath} in Files`}
                 onClick={(clickEvent) => {
                   clickEvent.stopPropagation();
-                  onOpenFile(filePath);
+                  onOpenFile({ path: filePath });
                 }}
                 onKeyDown={(keyboardEvent) => keyboardEvent.stopPropagation()}
               >
@@ -697,9 +808,7 @@ const ActivityEvent = memo(function ActivityEventRow({
             aria-hidden="true"
           >
             {expandable ? (
-              <ChevronDown
-                className={expanded ? "disclosure disclosure--open" : "disclosure"}
-              />
+              <ChevronDown className={expanded ? "disclosure disclosure--open" : "disclosure"} />
             ) : null}
           </span>
         </div>
@@ -748,7 +857,7 @@ const ActivityEvent = memo(function ActivityEventRow({
                   key={child.id}
                   aria-label="Agent response"
                 >
-                  <MarkdownBody body={child.body} streaming={false} />
+                  <MarkdownBody body={child.body} streaming={false} onOpenFile={onOpenFile} />
                 </section>
               ) : (
                 <ActivityEvent
@@ -799,6 +908,7 @@ interface RowMargins {
 }
 
 function transcriptRowMargins(event: TranscriptEvent): RowMargins {
+  if (event.scheduling) return { top: 6, bottom: 12 };
   if (event.kind === "assistant") return { top: 10, bottom: 18 };
   if (event.kind === "user") return { top: 0, bottom: 16 };
   if (event.kind === "notice") return { top: 10, bottom: 10 };
@@ -818,6 +928,7 @@ function estimateTranscriptRowSize(event: TranscriptEvent): number {
   const explicitLines = event.body.split("\n").length;
   const wrappedLines = Math.ceil(event.body.length / 82);
   const lines = Math.max(explicitLines, wrappedLines);
+  if (event.scheduling) return 30;
   if (event.kind === "assistant") return Math.min(520, 54 + lines * 21);
   if (event.kind === "user") return Math.min(320, 34 + lines * 20);
   if (event.kind === "notice") return Math.min(220, 38 + lines * 18);
@@ -864,6 +975,7 @@ export function Transcript({
   onRegenerate,
   onBranch,
   onEditUserMessage,
+  onCancelScheduledTask,
   onOpenFile,
   onAddDiffSelection,
   onApproveDiff,
@@ -902,9 +1014,7 @@ export function Transcript({
   eventsRef.current = events;
   const renderedEventCountRef = useRef(events.length);
   const openIntentRef = useRef<"follow" | "restore">(
-    initialViewportState?.following === false && initialViewportState.anchor
-      ? "restore"
-      : "follow",
+    initialViewportState?.following === false && initialViewportState.anchor ? "restore" : "follow",
   );
   const openSettledRef = useRef(false);
   const sawNonEmptyRef = useRef(events.length > 0);
@@ -1370,8 +1480,7 @@ export function Transcript({
       const node = scrollContainerRef?.current;
       if (!node || pendingPrependAnchorRef.current !== pending) return;
       pendingPrependAnchorRef.current = null;
-      node.scrollTop =
-        pending.scrollTop + Math.max(0, node.scrollHeight - pending.scrollHeight);
+      node.scrollTop = pending.scrollTop + Math.max(0, node.scrollHeight - pending.scrollHeight);
     };
 
     if (prependAnchorFrameRef.current !== undefined) {
@@ -1492,11 +1601,7 @@ export function Transcript({
     previousRunningRef.current = running;
     previousLatestUserIdRef.current = latestUserId;
 
-    if (
-      treatAsInitialOpen &&
-      openIntentRef.current === "restore" &&
-      initialViewportState?.anchor
-    ) {
+    if (treatAsInitialOpen && openIntentRef.current === "restore" && initialViewportState?.anchor) {
       if (restoreAnchor(initialViewportState.anchor)) {
         setHasNewContent(false);
         markOpenSettled();
@@ -1602,11 +1707,11 @@ export function Transcript({
   const askAbout = useCallback((body: string) => askAboutRef.current?.(body), []);
   const regenerate = useCallback((eventId: string) => regenerateRef.current?.(eventId), []);
   const branch = useCallback((id: string) => branchRef.current?.(id), []);
-  const editUser = useCallback(
-    (id: string, body: string) => editUserRef.current?.(id, body),
+  const editUser = useCallback((id: string, body: string) => editUserRef.current?.(id, body), []);
+  const openFile = useCallback(
+    (location: ProjectFileLocation) => openFileRef.current?.(location),
     [],
   );
-  const openFile = useCallback((path: string) => openFileRef.current?.(path), []);
   const addDiffSelection = useCallback(
     (payload: DiffSelectionPayload) => addDiffSelectionRef.current?.(payload),
     [],
@@ -1615,6 +1720,9 @@ export function Transcript({
   const revertDiff = useCallback((file: DiffFile) => revertDiffRef.current?.(file), []);
 
   const renderTranscriptEvent = (event: TranscriptEvent) => {
+    if (event.scheduling) {
+      return <SchedulingMessage event={event} onCancel={onCancelScheduledTask} />;
+    }
     if (event.kind === "user") {
       return (
         <UserMessage
@@ -1639,8 +1747,7 @@ export function Transcript({
         ? events.findIndex((candidate) => candidate.id === latestUserId)
         : -1;
       const assistantIndex = events.findIndex((candidate) => candidate.id === event.id);
-      const inOpenTurn =
-        openTurnIndex < 0 ? true : assistantIndex > openTurnIndex;
+      const inOpenTurn = openTurnIndex < 0 ? true : assistantIndex > openTurnIndex;
       // Live tip of the open turn — Branch/Regenerate stay withheld until settle
       // even when phase marks the text as the final answer (so it can stream
       // non-italic with chrome while actions wait for the turn to finish).
@@ -1664,6 +1771,7 @@ export function Transcript({
           onRegenerate={regenerate}
           onBranch={branch}
           onAskAbout={askAbout}
+          onOpenFile={onOpenFile ? openFile : undefined}
         />
       );
     }
@@ -1835,94 +1943,94 @@ export function Transcript({
             transition={foldTransition}
             style={{ overflow: "hidden" }}
           >
-          <Tooltip
-            label={
-              liveStreamOpen ? "Hide the live activity stream" : "Show the live activity stream"
-            }
-            disabled={!liveActivity}
-          >
-            <button
-              className="task-now-toggle"
-              type="button"
-              onClick={() =>
-                liveActivity && setLiveStream((current) => ({ ...current, open: !current.open }))
+            <Tooltip
+              label={
+                liveStreamOpen ? "Hide the live activity stream" : "Show the live activity stream"
               }
-              aria-expanded={liveActivity ? liveStreamOpen : undefined}
               disabled={!liveActivity}
             >
-              <span className="live-indicator" aria-hidden="true" />
-              <span className="task-now-line" role="status" aria-live="polite">
-                <AnimatePresence initial={false}>
-                  <motion.span
-                    className="task-now-text"
-                    key={narrationKey}
-                    initial={{ opacity: 0, y: 14, filter: "blur(2px)" }}
-                    animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
-                    exit={{ opacity: 0, y: -14, filter: "blur(2px)" }}
-                    transition={{ duration: 0.32, ease: [0.32, 0.72, 0.24, 1] }}
-                  >
-                    {currentActivityLabel ? (
-                      <span className="task-now-label">{currentActivityLabel}</span>
-                    ) : liveActivity ? (
-                      <>
-                        <strong className="task-now-label">Activity</strong>
-                        <span className="task-now-summary">{firstLine(liveActivity.body)}</span>
-                      </>
-                    ) : (
-                      <span className="task-now-label">
-                        {waitingLabel}
-                        <span className="task-now-ellipsis" aria-hidden="true">
-                          <span>.</span>
-                          <span>.</span>
-                          <span>.</span>
-                        </span>
-                      </span>
-                    )}
-                  </motion.span>
-                </AnimatePresence>
-              </span>
-              {liveActivity ? (
-                <ChevronDown
-                  className={liveStreamOpen ? "disclosure disclosure--open" : "disclosure"}
-                />
-              ) : null}
-            </button>
-          </Tooltip>
-          <AnimatePresence initial={false}>
-            {liveStreamOpen && liveActivity ? (
-              <motion.div
-                className="task-now-stream"
-                initial={{ height: 0, opacity: 0 }}
-                animate={{ height: "auto", opacity: 1 }}
-                exit={{ height: 0, opacity: 0 }}
-                transition={{ duration: reduceMotion ? 0.01 : 0.22 }}
+              <button
+                className="task-now-toggle"
+                type="button"
+                onClick={() =>
+                  liveActivity && setLiveStream((current) => ({ ...current, open: !current.open }))
+                }
+                aria-expanded={liveActivity ? liveStreamOpen : undefined}
+                disabled={!liveActivity}
               >
-                {(liveActivity.children?.length ? liveActivity.children : [liveActivity]).map(
-                  (child) => (
-                    <motion.div
-                      key={child.id}
-                      initial={{ opacity: 0, y: 8 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      transition={{ duration: 0.24, ease: [0.32, 0.72, 0.24, 1] }}
+                <span className="live-indicator" aria-hidden="true" />
+                <span className="task-now-line" role="status" aria-live="polite">
+                  <AnimatePresence initial={false}>
+                    <motion.span
+                      className="task-now-text"
+                      key={narrationKey}
+                      initial={{ opacity: 0, y: 14, filter: "blur(2px)" }}
+                      animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                      exit={{ opacity: 0, y: -14, filter: "blur(2px)" }}
+                      transition={{ duration: 0.32, ease: [0.32, 0.72, 0.24, 1] }}
                     >
-                      <ActivityEvent
-                        event={child}
-                        nested
-                        isExpanded={isActivityExpanded}
-                        onExpandedChange={setActivityExpanded}
-                        onOpenFile={onOpenFile ? openFile : undefined}
-                        onAddDiffSelection={onAddDiffSelection ? addDiffSelection : undefined}
-                        onApproveDiff={onApproveDiff ? approveDiff : undefined}
-                        isDiffApproved={isDiffApproved}
-                        onRevertDiff={onRevertDiff ? revertDiff : undefined}
-                        diffCommitState={diffCommitState}
-                      />
-                    </motion.div>
-                  ),
-                )}
-              </motion.div>
-            ) : null}
-          </AnimatePresence>
+                      {currentActivityLabel ? (
+                        <span className="task-now-label">{currentActivityLabel}</span>
+                      ) : liveActivity ? (
+                        <>
+                          <strong className="task-now-label">Activity</strong>
+                          <span className="task-now-summary">{firstLine(liveActivity.body)}</span>
+                        </>
+                      ) : (
+                        <span className="task-now-label">
+                          {waitingLabel}
+                          <span className="task-now-ellipsis" aria-hidden="true">
+                            <span>.</span>
+                            <span>.</span>
+                            <span>.</span>
+                          </span>
+                        </span>
+                      )}
+                    </motion.span>
+                  </AnimatePresence>
+                </span>
+                {liveActivity ? (
+                  <ChevronDown
+                    className={liveStreamOpen ? "disclosure disclosure--open" : "disclosure"}
+                  />
+                ) : null}
+              </button>
+            </Tooltip>
+            <AnimatePresence initial={false}>
+              {liveStreamOpen && liveActivity ? (
+                <motion.div
+                  className="task-now-stream"
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: "auto", opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
+                  transition={{ duration: reduceMotion ? 0.01 : 0.22 }}
+                >
+                  {(liveActivity.children?.length ? liveActivity.children : [liveActivity]).map(
+                    (child) => (
+                      <motion.div
+                        key={child.id}
+                        initial={{ opacity: 0, y: 8 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        transition={{ duration: 0.24, ease: [0.32, 0.72, 0.24, 1] }}
+                      >
+                        <ActivityEvent
+                          event={child}
+                          nested
+                          isExpanded={isActivityExpanded}
+                          onExpandedChange={setActivityExpanded}
+                          onOpenFile={onOpenFile ? openFile : undefined}
+                          onAddDiffSelection={onAddDiffSelection ? addDiffSelection : undefined}
+                          onApproveDiff={onApproveDiff ? approveDiff : undefined}
+                          isDiffApproved={isDiffApproved}
+                          onRevertDiff={onRevertDiff ? revertDiff : undefined}
+                          diffCommitState={diffCommitState}
+                        />
+                      </motion.div>
+                    ),
+                  )}
+                </motion.div>
+              ) : null}
+            </AnimatePresence>
           </motion.div>
         ) : null}
       </AnimatePresence>
@@ -2198,10 +2306,7 @@ function progressiveActivityVerb(event: TranscriptEvent): string {
 function describeCurrentActivity(event: TranscriptEvent): string {
   const title = (event.title ?? "").trim();
   // Integrator / provider sentence titles are already complete live copy.
-  if (
-    /^(Checking|Starting|Sending|Collecting|Stopping)\b/i.test(title) &&
-    title.includes(" ")
-  ) {
+  if (/^(Checking|Starting|Sending|Collecting|Stopping)\b/i.test(title) && title.includes(" ")) {
     return title;
   }
 

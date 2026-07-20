@@ -469,6 +469,9 @@ const INTEGRATOR_TOOL_COPY: Readonly<Record<string, readonly [string, string]>> 
   delegation_message: ["Sending guidance to a subagent", "Sent guidance to a subagent"],
   delegation_result: ["Collecting the subagent result", "Collected the subagent result"],
   delegation_stop: ["Stopping a subagent", "Stopped a subagent"],
+  schedule_wakeup: ["Scheduling a wake-up", "Wake-up scheduled"],
+  schedule_recurring: ["Scheduling a recurring task", "Recurring task scheduled"],
+  automation_cancel: ["Cancelling a scheduled task", "Scheduled task cancelled"],
 };
 
 const PROVIDER_TOOL_COPY: Readonly<Record<string, readonly [string, string]>> = {

@@ -6,6 +6,7 @@ import {
   Folder,
   Gauge,
   Mic,
+  MessageCircle,
   Plus,
   ShieldCheck,
   SlidersHorizontal,
@@ -22,12 +23,14 @@ import {
   resolveModelEffort,
   type ComposerDraftAttachment,
   type ComposerDraftValue,
+  type ChatContextReference,
   type ModeProjection,
   type ModelCatalogEntry,
   type NativeActionReference,
   type NativeProviderAction,
   type RuntimeConnection,
   type RuntimeId,
+  type TaskSummary,
 } from "../bridge";
 import type { ComposerNotice } from "../composerNotices";
 import { prettyModelLabel, resolveModelLabel } from "../modelLabel";
@@ -36,6 +39,10 @@ import { Dropdown, ProviderIcon } from "./Dropdown";
 import { insertVoiceText } from "./voiceTyping";
 
 interface ComposerProps {
+  /** General Chat removes coding authority controls while retaining provider routing. */
+  chatMode?: boolean;
+  /** Existing Chat task that owns app-managed uploads. */
+  taskId?: string;
   runtimes: RuntimeConnection[];
   defaultRuntime: RuntimeId;
   defaultModel: string;
@@ -59,6 +66,7 @@ interface ComposerProps {
     prompt: string;
     draftPrompt: string;
     attachments: ComposerDraftAttachment[];
+    contextReferences?: ChatContextReference[];
     runtime: RuntimeId;
     model: string;
     effort?: string;
@@ -87,6 +95,8 @@ interface ComposerProps {
   } | null;
   /** Project-relative file paths offered by the @-mention autocomplete. */
   contextFiles?: string[];
+  /** General Chats available as durable @ context in either Chat or code mode. */
+  contextChats?: TaskSummary[];
   /** Requests the bounded project scan the first time an @-token is typed,
    * so mention suggestions work before the Files tab has ever been opened.
    * Owners keep this idempotent and cached. */
@@ -178,6 +188,7 @@ interface AutocompleteMatch {
   actionId?: string;
   kind?: NativeProviderAction["kind"];
   invocation?: NativeProviderAction["invocation"];
+  chatTaskId?: string;
 }
 
 /** Folder structure derived from the flat project file list, so @-mention
@@ -308,6 +319,19 @@ function matchSkills(actions: NativeProviderAction[], query: string): Autocomple
       actionId: action.id,
       kind: action.kind,
       invocation: action.invocation,
+    }));
+}
+
+function matchChats(chats: TaskSummary[], query: string): AutocompleteMatch[] {
+  const normalized = query.trim().toLocaleLowerCase();
+  return chats
+    .filter((chat) => !normalized || chat.title.toLocaleLowerCase().includes(normalized))
+    .slice(0, CONTEXT_MATCH_LIMIT)
+    .map((chat) => ({
+      value: chat.title,
+      label: chat.title,
+      detail: "Chat transcript",
+      chatTaskId: chat.id,
     }));
 }
 
@@ -538,6 +562,8 @@ function writeNativeActionCache(cache: Record<string, NativeProviderAction[]>) {
 }
 
 export function Composer({
+  chatMode = false,
+  taskId,
   runtimes,
   defaultRuntime,
   defaultModel,
@@ -557,6 +583,7 @@ export function Composer({
   onSessionModeChange,
   permissionRequest = null,
   contextFiles = [],
+  contextChats = [],
   onRequestContextFiles,
   insertRequest = null,
   onInsertHandled,
@@ -610,6 +637,9 @@ export function Composer({
   const [attachments, setAttachments] = useState<ComposerAttachment[]>(
     () => initialDraft?.attachments ?? [],
   );
+  const [contextReferences, setContextReferences] = useState<ChatContextReference[]>(
+    () => initialDraft?.contextReferences ?? [],
+  );
   const [attachmentError, setAttachmentError] = useState("");
   const providerCatalogLoads = useRef(new Set<RuntimeId>());
   const [nativeActionsByKey, setNativeActionsByKey] = useState<
@@ -657,8 +687,11 @@ export function Composer({
   // Antigravity's print-mode process has no control channel for approval
   // prompts. Keep stale settings/drafts safe when a user routes a composer to
   // Antigravity after choosing Ask as needed on another provider.
-  const effectivePermission =
-    antigravityPromptUnsupported && permission === "ask" ? "project-write" : permission;
+  const effectivePermission = chatMode
+    ? "read-only"
+    : antigravityPromptUnsupported && permission === "ask"
+      ? "project-write"
+      : permission;
   const cachedCatalog = useSyncExternalStore(
     bridge.subscribeModelCatalogs,
     () => bridge.getCachedModelCatalog(runtime),
@@ -692,11 +725,12 @@ export function Composer({
   const preferredRuntimeEffort = runtimeDefaults?.[runtime]?.effort ?? defaultEffort;
   const delegationAvailable = runtime !== "antigravity" && runtime !== "custom";
   const delegationControlDisabled = delegationDisabled || !delegationAvailable;
-  const effectiveDelegation = delegationAvailable ? delegation : "off";
+  const effectiveDelegation = chatMode ? "off" : delegationAvailable ? delegation : "off";
   const draftValue = useMemo<ComposerDraftValue>(
     () => ({
       prompt,
       attachments: attachments.map(persistableComposerAttachment),
+      contextReferences,
       runtime,
       model: activeModel,
       effort,
@@ -709,6 +743,7 @@ export function Composer({
       activeModel,
       attachments,
       caret,
+      contextReferences,
       effectiveDelegation,
       effectivePermission,
       effort,
@@ -728,7 +763,8 @@ export function Composer({
     typeof document !== "undefined" &&
     (document.documentElement.dataset.motion === "none" ||
       window.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
-  const draftPresent = Boolean(prompt.trim()) || attachments.length > 0;
+  const draftPresent =
+    Boolean(prompt.trim()) || attachments.length > 0 || contextReferences.length > 0;
 
   useEffect(() => {
     onDraftChangeRef.current = onDraftChange;
@@ -740,10 +776,20 @@ export function Composer({
       if (!draftTouchedRef.current) return;
     }
     if (suppressDraftEmissionRef.current) {
-      if (!draftValue.prompt && draftValue.attachments.length === 0) return;
+      if (
+        !draftValue.prompt &&
+        draftValue.attachments.length === 0 &&
+        !draftValue.contextReferences?.length
+      )
+        return;
       suppressDraftEmissionRef.current = false;
     }
-    if (!draftTouchedRef.current && !draftValue.prompt && draftValue.attachments.length === 0) {
+    if (
+      !draftTouchedRef.current &&
+      !draftValue.prompt &&
+      draftValue.attachments.length === 0 &&
+      !draftValue.contextReferences?.length
+    ) {
       return;
     }
     onDraftChangeRef.current?.(draftValue);
@@ -860,9 +906,21 @@ export function Composer({
       !autocompleteToken
         ? []
         : autocompleteToken.kind === "file"
-          ? matchContext(contextIndex, autocompleteToken.query)
-          : matchSkills(nativeActions, autocompleteToken.query),
-    [autocompleteToken?.kind, autocompleteToken?.query, contextIndex, nativeActions], // eslint-disable-line react-hooks/exhaustive-deps
+          ? [
+              ...matchChats(contextChats, autocompleteToken.query),
+              ...matchContext(contextIndex, autocompleteToken.query),
+            ].slice(0, CONTEXT_MATCH_LIMIT)
+          : chatMode
+            ? []
+            : matchSkills(nativeActions, autocompleteToken.query),
+    [
+      autocompleteToken?.kind,
+      autocompleteToken?.query,
+      chatMode,
+      contextChats,
+      contextIndex,
+      nativeActions,
+    ], // eslint-disable-line react-hooks/exhaustive-deps
   );
   // Dismissal (Escape) sticks to the trigger position; the highlight resets
   // whenever the query under that trigger changes.
@@ -897,7 +955,7 @@ export function Composer({
     if (!pick) return;
     setAttachmentError("");
     try {
-      const picked = await pick();
+      const picked = chatMode ? await pick(taskId) : await pick();
       if (!picked?.length) return;
       draftTouchedRef.current = true;
       setAttachments((current) => appendUniqueAttachments(current, picked));
@@ -915,7 +973,13 @@ export function Composer({
     if (!save || files.length === 0) return;
     setAttachmentError("");
     try {
-      const saved = await Promise.all(files.map((file) => save(file, file.name || undefined)));
+      const saved = await Promise.all(
+        files.map((file) =>
+          chatMode
+            ? save(file, file.name || undefined, taskId)
+            : save(file, file.name || undefined),
+        ),
+      );
       draftTouchedRef.current = true;
       setAttachments((current) => appendUniqueAttachments(current, saved));
     } catch (error) {
@@ -932,6 +996,32 @@ export function Composer({
     if (!token) return;
     if (token.kind === "skill" && match.invocation === "interactiveOnly") return;
     draftTouchedRef.current = true;
+    if (token.kind === "file" && match.chatTaskId) {
+      const before = prompt.slice(0, token.start);
+      let after = prompt.slice(caret);
+      if ((!before || /\s$/.test(before)) && /^\s/.test(after)) after = after.slice(1);
+      const next = before + after;
+      const position = before.length;
+      setContextReferences((current) =>
+        current.some((reference) => reference.sourceTaskId === match.chatTaskId)
+          ? current
+          : [
+              ...current,
+              {
+                id: crypto.randomUUID(),
+                sourceTaskId: match.chatTaskId!,
+                sourceTitle: match.value,
+              },
+            ],
+      );
+      setPrompt(next);
+      setCaret(position);
+      requestAnimationFrame(() => {
+        textareaRef.current?.focus();
+        textareaRef.current?.setSelectionRange(position, position);
+      });
+      return;
+    }
     if (token.kind === "file" && match.entry === "file") {
       const attachment = projectAttachment(match.value, "file");
       const before = prompt.slice(0, token.start);
@@ -1025,6 +1115,7 @@ export function Composer({
     suppressDraftEmissionRef.current = true;
     setPrompt(value.prompt);
     setAttachments(value.attachments);
+    setContextReferences(value.contextReferences ?? []);
     const restoredRuntime = normalizeRuntime(runtimes, value.runtime);
     setRuntime(restoredRuntime);
     setModel(value.model);
@@ -1445,7 +1536,7 @@ export function Composer({
   const submit = async () => {
     const trimmed = prompt.trim();
     if (
-      (!trimmed && attachments.length === 0) ||
+      (!trimmed && attachments.length === 0 && contextReferences.length === 0) ||
       !activeModel ||
       sendDisabled ||
       sending ||
@@ -1457,10 +1548,14 @@ export function Composer({
     setSending(true);
     const submittedDraft = trimmed;
     const submittedAttachments = attachments;
+    const submittedContextReferences = contextReferences;
     let draftCleared = false;
     const restoreDraft = () => {
       setPrompt((current) => (current.trim() ? current : submittedDraft));
       setAttachments((current) => (current.length > 0 ? current : submittedAttachments));
+      setContextReferences((current) =>
+        current.length > 0 ? current : submittedContextReferences,
+      );
     };
     // Picker attachments and committed @references share one plain-text
     // context block. Providers retain the same path context, while the
@@ -1490,11 +1585,12 @@ export function Composer({
             ...selectionBlocks,
           ].join("\n\n")
         : "";
-    const outgoing = trimmed
-      ? attachmentBlock
-        ? `${trimmed}\n\n${attachmentBlock}`
-        : trimmed
-      : attachmentBlock;
+    const chatReferenceBlock = submittedContextReferences.length
+      ? `Referenced chats:\n${submittedContextReferences
+          .map((reference) => `- @${reference.sourceTitle}`)
+          .join("\n")}`
+      : "";
+    const outgoing = [trimmed, attachmentBlock, chatReferenceBlock].filter(Boolean).join("\n\n");
     try {
       const cachedNativeAction = completedNativeAction(trimmed, nativeActions);
       const builtInAction = codexGoalAction(trimmed, runtime);
@@ -1528,11 +1624,15 @@ export function Composer({
       suppressDraftEmissionRef.current = true;
       setPrompt("");
       setAttachments([]);
+      setContextReferences([]);
       draftCleared = true;
       const accepted = await onSend({
         prompt: outgoing,
         draftPrompt: submittedDraft,
         attachments: submittedAttachments.map(persistableComposerAttachment),
+        ...(submittedContextReferences.length > 0
+          ? { contextReferences: submittedContextReferences }
+          : {}),
         runtime,
         model: activeModel,
         effort: effortOptions.length > 0 ? activeEffort : undefined,
@@ -1704,7 +1804,7 @@ export function Composer({
               className="composer-autocomplete"
               role="listbox"
               aria-label={
-                autocompleteToken?.kind === "file" ? "File suggestions" : "Skill suggestions"
+                autocompleteToken?.kind === "file" ? "Context suggestions" : "Skill suggestions"
               }
               initial={{ opacity: 0, y: 6 }}
               animate={{ opacity: 1, y: 0 }}
@@ -1713,7 +1813,9 @@ export function Composer({
             >
               <p className="composer-autocomplete-hint">
                 {autocompleteToken?.kind === "file"
-                  ? "Project files & folders · ↑↓ to choose · Enter inserts, folders drill in · Esc to dismiss"
+                  ? chatMode
+                    ? "Chats · ↑↓ to choose · Enter adds context · Esc to dismiss"
+                    : "Chats, files & folders · ↑↓ to choose · Enter adds context · Esc to dismiss"
                   : "Provider native · ↑↓ to choose · Enter to insert · Esc to dismiss"}
               </p>
               {skillStatusVisible ? (
@@ -1744,7 +1846,9 @@ export function Composer({
                   onClick={() => acceptAutocomplete(match)}
                 >
                   {autocompleteToken?.kind === "file" ? (
-                    match.entry === "folder" ? (
+                    match.chatTaskId ? (
+                      <MessageCircle aria-hidden="true" />
+                    ) : match.entry === "folder" ? (
                       <Folder aria-hidden="true" />
                     ) : (
                       <FileIcon fileName={match.value} />
@@ -1857,13 +1961,37 @@ export function Composer({
               }
             }}
             rows={2}
-            placeholder="Ask, build, review… use / for skills and @ for context"
+            placeholder={
+              chatMode
+                ? "Message… use @ for chat context"
+                : "Ask, build, review… use / for skills and @ for context"
+            }
             aria-label={messageLabel}
             autoFocus
           />
         </div>
-        {attachments.length > 0 || attachmentError ? (
+        {attachments.length > 0 || contextReferences.length > 0 || attachmentError ? (
           <div className="composer-attachments" aria-label="Attached context">
+            {contextReferences.map((reference) => (
+              <div className="composer-attachment composer-chat-reference" key={reference.id}>
+                <MessageCircle className="file-type-icon" aria-hidden="true" />
+                <span>{reference.sourceTitle}</span>
+                <button
+                  className="composer-attachment-remove"
+                  type="button"
+                  aria-label={`Remove ${reference.sourceTitle}`}
+                  title="Remove chat context"
+                  onClick={() => {
+                    draftTouchedRef.current = true;
+                    setContextReferences((current) =>
+                      current.filter((item) => item.id !== reference.id),
+                    );
+                  }}
+                >
+                  <X aria-hidden="true" />
+                </button>
+              </div>
+            ))}
             {attachments.map((attachment) => (
               <div
                 className={`composer-attachment${
@@ -1918,164 +2046,169 @@ export function Composer({
                 <Plus aria-hidden="true" />
               </button>
             ) : null}
-            <div className="composer-controls-optional">
-              {sessionModes && sessionModes.availableModes.length > 1 ? (
+            {!chatMode ? (
+              <div className="composer-controls-optional">
+                {sessionModes && sessionModes.availableModes.length > 1 ? (
+                  <Dropdown
+                    className="compact-select mode-select"
+                    aria-label="Agent mode"
+                    leading={<Compass />}
+                    value={sessionModes.currentModeId}
+                    onChange={(next) => onSessionModeChange?.(next)}
+                    options={modeOptions}
+                    compact
+                  />
+                ) : null}
                 <Dropdown
-                  className="compact-select mode-select"
-                  aria-label="Agent mode"
-                  leading={<Compass />}
-                  value={sessionModes.currentModeId}
-                  onChange={(next) => onSessionModeChange?.(next)}
-                  options={modeOptions}
+                  className="compact-select"
+                  aria-label="Permission"
+                  disabled={permissionDisabled}
+                  leading={<ShieldCheck />}
+                  value={effectivePermission}
+                  onChange={changePermission}
+                  options={permissionOptions}
                   compact
                 />
-              ) : null}
-              <Dropdown
-                className="compact-select"
-                aria-label="Permission"
-                disabled={permissionDisabled}
-                leading={<ShieldCheck />}
-                value={effectivePermission}
-                onChange={changePermission}
-                options={permissionOptions}
-                compact
-              />
-              <Dropdown
-                className="compact-select"
-                aria-label={
-                  delegationAvailable ? "Delegation" : "Delegation unavailable for this runtime"
-                }
-                disabled={delegationControlDisabled}
-                leading={<Users />}
-                value={effectiveDelegation}
-                onChange={changeDelegation}
-                options={delegationOptions}
-                compact
-              />
-            </div>
-            <div className="composer-overflow-controls" ref={controlsMenuRef}>
-              <button
-                ref={controlsMenuButtonRef}
-                className="dropdown-trigger composer-overflow-trigger"
-                type="button"
-                aria-label="More composer controls"
-                title="Mode, permission, delegation"
-                aria-haspopup="menu"
-                aria-expanded={controlsMenuOpen}
-                onClick={() => {
-                  setControlsSubmenu(null);
-                  setControlsMenuOpen((open) => !open);
-                }}
-              >
-                <SlidersHorizontal aria-hidden="true" />
-              </button>
-              <AnimatePresence>
-                {controlsMenuOpen ? (
-                  <motion.div
-                    className="composer-overflow-menu"
-                    role="menu"
-                    aria-label="Composer controls"
-                    initial={{ opacity: 0, y: 5, scale: 0.98 }}
-                    animate={{ opacity: 1, y: 0, scale: 1 }}
-                    exit={{ opacity: 0, y: 4, scale: 0.98 }}
-                    transition={{ duration: 0.14, ease: [0.2, 0, 0, 1] }}
-                  >
-                    {sessionModes && modeOptions.length > 1 ? (
+                <Dropdown
+                  className="compact-select"
+                  aria-label={
+                    delegationAvailable ? "Delegation" : "Delegation unavailable for this runtime"
+                  }
+                  disabled={delegationControlDisabled}
+                  leading={<Users />}
+                  value={effectiveDelegation}
+                  onChange={changeDelegation}
+                  options={delegationOptions}
+                  compact
+                />
+              </div>
+            ) : null}
+            {!chatMode ? (
+              <div className="composer-overflow-controls" ref={controlsMenuRef}>
+                <button
+                  ref={controlsMenuButtonRef}
+                  className="dropdown-trigger composer-overflow-trigger"
+                  type="button"
+                  aria-label="More composer controls"
+                  title="Mode, permission, delegation"
+                  aria-haspopup="menu"
+                  aria-expanded={controlsMenuOpen}
+                  onClick={() => {
+                    setControlsSubmenu(null);
+                    setControlsMenuOpen((open) => !open);
+                  }}
+                >
+                  <SlidersHorizontal aria-hidden="true" />
+                </button>
+                <AnimatePresence>
+                  {controlsMenuOpen ? (
+                    <motion.div
+                      className="composer-overflow-menu"
+                      role="menu"
+                      aria-label="Composer controls"
+                      initial={{ opacity: 0, y: 5, scale: 0.98 }}
+                      animate={{ opacity: 1, y: 0, scale: 1 }}
+                      exit={{ opacity: 0, y: 4, scale: 0.98 }}
+                      transition={{ duration: 0.14, ease: [0.2, 0, 0, 1] }}
+                    >
+                      {sessionModes && modeOptions.length > 1 ? (
+                        <button
+                          className="composer-overflow-row"
+                          type="button"
+                          role="menuitem"
+                          aria-haspopup="menu"
+                          aria-expanded={controlsSubmenu === "mode"}
+                          onPointerEnter={() => setControlsSubmenu("mode")}
+                          onFocus={() => setControlsSubmenu("mode")}
+                          onClick={() => setControlsSubmenu("mode")}
+                          onKeyDown={(event) => {
+                            if (event.key === "ArrowRight") setControlsSubmenu("mode");
+                          }}
+                        >
+                          <span>Mode</span>
+                          <small>
+                            {modeOptions.find(
+                              (option) => option.value === sessionModes.currentModeId,
+                            )?.label ?? sessionModes.currentModeId}
+                          </small>
+                        </button>
+                      ) : null}
                       <button
                         className="composer-overflow-row"
                         type="button"
                         role="menuitem"
                         aria-haspopup="menu"
-                        aria-expanded={controlsSubmenu === "mode"}
-                        onPointerEnter={() => setControlsSubmenu("mode")}
-                        onFocus={() => setControlsSubmenu("mode")}
-                        onClick={() => setControlsSubmenu("mode")}
+                        aria-expanded={controlsSubmenu === "permission"}
+                        disabled={permissionDisabled}
+                        onPointerEnter={() => setControlsSubmenu("permission")}
+                        onFocus={() => setControlsSubmenu("permission")}
+                        onClick={() => setControlsSubmenu("permission")}
                         onKeyDown={(event) => {
-                          if (event.key === "ArrowRight") setControlsSubmenu("mode");
+                          if (event.key === "ArrowRight") setControlsSubmenu("permission");
                         }}
                       >
-                        <span>Mode</span>
+                        <span>Permission</span>
                         <small>
-                          {modeOptions.find((option) => option.value === sessionModes.currentModeId)
-                            ?.label ?? sessionModes.currentModeId}
+                          {permissionOptions.find((option) => option.value === permission)?.label ??
+                            permission}
                         </small>
                       </button>
-                    ) : null}
-                    <button
-                      className="composer-overflow-row"
-                      type="button"
-                      role="menuitem"
-                      aria-haspopup="menu"
-                      aria-expanded={controlsSubmenu === "permission"}
-                      disabled={permissionDisabled}
-                      onPointerEnter={() => setControlsSubmenu("permission")}
-                      onFocus={() => setControlsSubmenu("permission")}
-                      onClick={() => setControlsSubmenu("permission")}
-                      onKeyDown={(event) => {
-                        if (event.key === "ArrowRight") setControlsSubmenu("permission");
-                      }}
-                    >
-                      <span>Permission</span>
-                      <small>
-                        {permissionOptions.find((option) => option.value === permission)?.label ??
-                          permission}
-                      </small>
-                    </button>
-                    <button
-                      className="composer-overflow-row"
-                      type="button"
-                      role="menuitem"
-                      aria-haspopup="menu"
-                      aria-expanded={controlsSubmenu === "delegation"}
-                      disabled={delegationControlDisabled}
-                      onPointerEnter={() => setControlsSubmenu("delegation")}
-                      onFocus={() => setControlsSubmenu("delegation")}
-                      onClick={() => setControlsSubmenu("delegation")}
-                      onKeyDown={(event) => {
-                        if (event.key === "ArrowRight") setControlsSubmenu("delegation");
-                      }}
-                    >
-                      <span>Delegation</span>
-                      <small>
-                        {delegationOptions.find((option) => option.value === effectiveDelegation)
-                          ?.label ?? effectiveDelegation}
-                      </small>
-                    </button>
-                    <AnimatePresence>
-                      {controlsSubmenu ? (
-                        <motion.div
-                          className="composer-overflow-submenu"
-                          role="menu"
-                          aria-label={`${controlsSubmenu} options`}
-                          initial={{ opacity: 0, x: -4, scale: 0.98 }}
-                          animate={{ opacity: 1, x: 0, scale: 1 }}
-                          exit={{ opacity: 0, x: -3, scale: 0.98 }}
-                          transition={{ duration: 0.12, ease: [0.2, 0, 0, 1] }}
-                        >
-                          {compactControlOptions.map((option) => (
-                            <button
-                              type="button"
-                              role="menuitemradio"
-                              aria-checked={option.value === compactControlValue}
-                              data-selected={option.value === compactControlValue}
-                              key={option.value}
-                              disabled={
-                                controlsSubmenu === "permission" &&
-                                option.value === "ask" &&
-                                antigravityPromptUnsupported
-                              }
-                              onClick={() => chooseCompactControl(option.value)}
-                            >
-                              {option.label}
-                            </button>
-                          ))}
-                        </motion.div>
-                      ) : null}
-                    </AnimatePresence>
-                  </motion.div>
-                ) : null}
-              </AnimatePresence>
-            </div>
+                      <button
+                        className="composer-overflow-row"
+                        type="button"
+                        role="menuitem"
+                        aria-haspopup="menu"
+                        aria-expanded={controlsSubmenu === "delegation"}
+                        disabled={delegationControlDisabled}
+                        onPointerEnter={() => setControlsSubmenu("delegation")}
+                        onFocus={() => setControlsSubmenu("delegation")}
+                        onClick={() => setControlsSubmenu("delegation")}
+                        onKeyDown={(event) => {
+                          if (event.key === "ArrowRight") setControlsSubmenu("delegation");
+                        }}
+                      >
+                        <span>Delegation</span>
+                        <small>
+                          {delegationOptions.find((option) => option.value === effectiveDelegation)
+                            ?.label ?? effectiveDelegation}
+                        </small>
+                      </button>
+                      <AnimatePresence>
+                        {controlsSubmenu ? (
+                          <motion.div
+                            className="composer-overflow-submenu"
+                            role="menu"
+                            aria-label={`${controlsSubmenu} options`}
+                            initial={{ opacity: 0, x: -4, scale: 0.98 }}
+                            animate={{ opacity: 1, x: 0, scale: 1 }}
+                            exit={{ opacity: 0, x: -3, scale: 0.98 }}
+                            transition={{ duration: 0.12, ease: [0.2, 0, 0, 1] }}
+                          >
+                            {compactControlOptions.map((option) => (
+                              <button
+                                type="button"
+                                role="menuitemradio"
+                                aria-checked={option.value === compactControlValue}
+                                data-selected={option.value === compactControlValue}
+                                key={option.value}
+                                disabled={
+                                  controlsSubmenu === "permission" &&
+                                  option.value === "ask" &&
+                                  antigravityPromptUnsupported
+                                }
+                                onClick={() => chooseCompactControl(option.value)}
+                              >
+                                {option.label}
+                              </button>
+                            ))}
+                          </motion.div>
+                        ) : null}
+                      </AnimatePresence>
+                    </motion.div>
+                  ) : null}
+                </AnimatePresence>
+              </div>
+            ) : null}
           </div>
           <div className="composer-controls-right">
             {effortOptions.length > 0 ? (
@@ -2123,41 +2256,41 @@ export function Composer({
               disabled={routingDisabled}
               value={runtime}
               onChange={(next) => {
-                draftTouchedRef.current = true;
-                routingTouched.current = true;
-                const nextRuntime = next as RuntimeId;
-                const nextRuntimeCatalog: ModelCatalogEntry[] =
-                  bridge.getCachedModelCatalog(nextRuntime) ??
-                  (runtimes.find((item) => item.id === nextRuntime)?.models ?? [])
-                    .filter((id) => id !== PROVIDER_DEFAULT_MODEL)
-                    .map((id) => ({ id, label: id }));
-                const preferredRoute = runtimeDefaults?.[nextRuntime];
-                const nextModel = nextRuntimeCatalog.some(
-                  (entry) => entry.id === preferredRoute?.model,
-                )
-                  ? (preferredRoute?.model ?? PROVIDER_DEFAULT_MODEL)
-                  : (nextRuntimeCatalog.find((entry) => entry.id !== PROVIDER_DEFAULT_MODEL)?.id ??
-                    PROVIDER_DEFAULT_MODEL);
-                const nextEntry = nextRuntimeCatalog.find((entry) => entry.id === nextModel);
-                const nextEfforts = nextEntry?.efforts ?? [];
-                const nextEffort =
-                  nextEfforts.length > 0
-                    ? resolveModelEffort(nextEntry, preferredRoute?.effort)
-                    : preferredRoute?.effort;
-                setRuntime(nextRuntime);
-                setModel(nextModel);
-                setEffort(nextEffort);
-                if (nextRuntime === "antigravity" || nextRuntime === "custom") {
-                  setDelegation("off");
-                }
-                loadProviderCatalog(nextRuntime);
-                if (nextModel) {
-                  emitRoutingChange(
-                    nextRuntime,
-                    nextModel,
-                    nextEfforts.length > 0 ? nextEffort : undefined,
-                  );
-                }
+                  draftTouchedRef.current = true;
+                  routingTouched.current = true;
+                  const nextRuntime = next as RuntimeId;
+                  const nextRuntimeCatalog: ModelCatalogEntry[] =
+                    bridge.getCachedModelCatalog(nextRuntime) ??
+                    (runtimes.find((item) => item.id === nextRuntime)?.models ?? [])
+                      .filter((id) => id !== PROVIDER_DEFAULT_MODEL)
+                      .map((id) => ({ id, label: id }));
+                  const preferredRoute = runtimeDefaults?.[nextRuntime];
+                  const nextModel = nextRuntimeCatalog.some(
+                    (entry) => entry.id === preferredRoute?.model,
+                  )
+                    ? (preferredRoute?.model ?? PROVIDER_DEFAULT_MODEL)
+                    : (nextRuntimeCatalog.find((entry) => entry.id !== PROVIDER_DEFAULT_MODEL)
+                        ?.id ?? PROVIDER_DEFAULT_MODEL);
+                  const nextEntry = nextRuntimeCatalog.find((entry) => entry.id === nextModel);
+                  const nextEfforts = nextEntry?.efforts ?? [];
+                  const nextEffort =
+                    nextEfforts.length > 0
+                      ? resolveModelEffort(nextEntry, preferredRoute?.effort)
+                      : preferredRoute?.effort;
+                  setRuntime(nextRuntime);
+                  setModel(nextModel);
+                  setEffort(nextEffort);
+                  if (nextRuntime === "antigravity" || nextRuntime === "custom") {
+                    setDelegation("off");
+                  }
+                  loadProviderCatalog(nextRuntime);
+                  if (nextModel) {
+                    emitRoutingChange(
+                      nextRuntime,
+                      nextModel,
+                      nextEfforts.length > 0 ? nextEffort : undefined,
+                    );
+                  }
               }}
               options={runtimes.map((item) => ({
                 value: item.id,
@@ -2270,7 +2403,9 @@ export function Composer({
                   type="button"
                   onClick={() => void submit()}
                   disabled={
-                    (!prompt.trim() && attachments.length === 0) ||
+                    (!prompt.trim() &&
+                      attachments.length === 0 &&
+                      contextReferences.length === 0) ||
                     !activeModel ||
                     sendDisabled ||
                     sending
@@ -2285,7 +2420,11 @@ export function Composer({
           </div>
         </div>
       </div>
-      <p className="composer-footnote">Agents can make mistakes; review changes</p>
+      <p className="composer-footnote">
+        {chatMode
+          ? "AI can make mistakes; check important information"
+          : "Agents can make mistakes; review changes"}
+      </p>
       {voiceNotice || voiceError ? (
         // Absolutely positioned so transient status lines never change the
         // composer's height or push it up while typing.

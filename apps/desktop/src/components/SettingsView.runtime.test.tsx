@@ -20,6 +20,11 @@ const { bridgeMock } = vi.hoisted(() => ({
     clearIntegratorSkillCredential: vi.fn(),
     connectIntegratorMcp: vi.fn(),
     disconnectIntegratorMcp: vi.fn(),
+    listMemories: vi.fn(),
+    createMemory: vi.fn(),
+    updateMemory: vi.fn(),
+    setMemoryEnabled: vi.fn(),
+    deleteMemory: vi.fn(),
     setSetting: vi.fn(),
     getStorageTotals: vi.fn(),
   },
@@ -129,6 +134,11 @@ describe("Runtime Settings command disclosure", () => {
     bridgeMock.clearIntegratorSkillCredential.mockResolvedValue(undefined);
     bridgeMock.connectIntegratorMcp.mockRejectedValue(new Error("not used"));
     bridgeMock.disconnectIntegratorMcp.mockRejectedValue(new Error("not used"));
+    bridgeMock.listMemories.mockResolvedValue([]);
+    bridgeMock.createMemory.mockRejectedValue(new Error("not used"));
+    bridgeMock.updateMemory.mockRejectedValue(new Error("not used"));
+    bridgeMock.setMemoryEnabled.mockRejectedValue(new Error("not used"));
+    bridgeMock.deleteMemory.mockRejectedValue(new Error("not used"));
     bridgeMock.setSetting.mockResolvedValue(undefined);
     bridgeMock.getStorageTotals.mockResolvedValue({
       totalBytes: 0,
@@ -175,6 +185,44 @@ describe("Runtime Settings command disclosure", () => {
         "verbose",
       ),
     );
+  });
+
+  it("keeps memory opt-in and exposes its editable local scratchpad", async () => {
+    const saved = {
+      id: "memory-1",
+      text: "Prefers concise release notes",
+      state: "active" as const,
+      creator: "user" as const,
+      createdAt: "2026-07-19T12:00:00Z",
+      updatedAt: "2026-07-19T12:00:00Z",
+    };
+    bridgeMock.listMemories.mockResolvedValueOnce([]).mockResolvedValue([saved]);
+    bridgeMock.createMemory.mockResolvedValue(saved);
+
+    render(
+      <SettingsView
+        preferences={DEFAULT_THEME_PREFERENCES}
+        runtimes={[runtime]}
+        usage={createEmptySnapshot().usage}
+        onChangePreferences={vi.fn()}
+        onResetPreferences={vi.fn()}
+        onBack={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Memory" }));
+    const memoryToggle = await screen.findByRole("switch", { name: "Use memory in Chats" });
+    expect(memoryToggle).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(memoryToggle);
+    expect(bridgeMock.setSetting).toHaveBeenCalledWith("settings.memory.enabled", true);
+
+    fireEvent.change(screen.getByRole("textbox", { name: "New memory" }), {
+      target: { value: saved.text },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    await waitFor(() => expect(bridgeMock.createMemory).toHaveBeenCalledWith(saved.text));
+    expect(await screen.findByDisplayValue(saved.text)).toBeInTheDocument();
+    expect(screen.getByText("1 of 20 active")).toBeInTheDocument();
   });
 
   it("opens the capability library to Marketplace and moves cards between install sections", async () => {

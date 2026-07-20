@@ -122,6 +122,9 @@ pub enum AcpPromptOutcome {
 pub struct AcpLaunchOptions {
     pub executable: PathBuf,
     pub arguments: Vec<String>,
+    /// Narrow process-local overrides supplied by the native host. Values are
+    /// never persisted or included in diagnostics.
+    pub environment: Vec<(String, String)>,
     pub working_directory: Option<PathBuf>,
     pub client_version: String,
 }
@@ -206,6 +209,7 @@ impl AcpClient {
         command
             .env("KIMI_CODE_NO_AUTO_UPDATE", "1")
             .env("KIMI_DISABLE_TELEMETRY", "1");
+        command.envs(options.environment);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

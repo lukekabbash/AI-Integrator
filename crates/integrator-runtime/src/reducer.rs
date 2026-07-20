@@ -1312,8 +1312,7 @@ fn acp_question_options(params: &Value) -> Vec<QuestionOption> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let mut kind_counts: std::collections::HashMap<&str, usize> =
-        std::collections::HashMap::new();
+    let mut kind_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for option in &raw {
         let kind = option.get("kind").and_then(Value::as_str).unwrap_or("");
         *kind_counts.entry(kind).or_insert(0) += 1;

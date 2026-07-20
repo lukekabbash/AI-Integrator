@@ -323,12 +323,7 @@ describe("DiffView", () => {
 
   it("disables revert until a caller can actually undo the edit", () => {
     render(
-      <DiffView
-        file={file}
-        variant="inline"
-        showReviewActions={false}
-        onMarkReviewed={vi.fn()}
-      />,
+      <DiffView file={file} variant="inline" showReviewActions={false} onMarkReviewed={vi.fn()} />,
     );
 
     expect(screen.getByRole("button", { name: /Revert/i })).toBeDisabled();

@@ -34,9 +34,7 @@ describe("commit decoration", () => {
       coAuthor: true,
       commitPrefixEnabled: true,
     });
-    expect(decorated).toBe(
-      `${DEFAULT_COMMIT_PREFIX} fix the parser panic\n\n${CO_AUTHOR_TRAILER}`,
-    );
+    expect(decorated).toBe(`${DEFAULT_COMMIT_PREFIX} fix the parser panic\n\n${CO_AUTHOR_TRAILER}`);
   });
 
   it("separates the trailer from a subject that is itself trailer-shaped", () => {

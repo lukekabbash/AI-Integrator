@@ -9,6 +9,7 @@ import {
   type CSSProperties,
   type FormEvent,
   type KeyboardEvent,
+  type ReactNode,
 } from "react";
 import { AnimatePresence, LayoutGroup, m as motion, useReducedMotion } from "motion/react";
 import {
@@ -3143,6 +3144,103 @@ function UsagePanel({
   );
 }
 
+export interface RightRailTabDefinition {
+  id: string;
+  label: string;
+  icon: typeof GitBranch;
+  count?: number;
+  panel: ReactNode;
+}
+
+export function RightRailShell({
+  tabs,
+  initialTab,
+  label,
+  onResize,
+  onTabChange,
+  conversationOpen,
+}: {
+  tabs: RightRailTabDefinition[];
+  initialTab: string;
+  label: string;
+  onResize?: (delta: number) => void;
+  onTabChange?: (tab: string) => void;
+  conversationOpen?: boolean;
+}) {
+  const [tab, setTab] = useState(initialTab);
+  const activeTab = tabs.some((candidate) => candidate.id === tab) ? tab : initialTab;
+
+  const selectTab = (next: string) => {
+    setTab(next);
+    onTabChange?.(next);
+  };
+
+  const moveTabFocus = (event: KeyboardEvent<HTMLButtonElement>, currentIndex: number) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const nextIndex =
+      event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? tabs.length - 1
+          : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    const nextTab = tabs[nextIndex];
+    selectTab(nextTab.id);
+    document.getElementById(`task-tools-tab-${nextTab.id}`)?.focus();
+  };
+
+  return (
+    <aside
+      className="right-rail"
+      aria-label={label}
+      data-conversation-open={conversationOpen || undefined}
+    >
+      {onResize ? (
+        <ResizeHandle
+          axis="horizontal"
+          label={`Resize ${label.toLowerCase()}`}
+          onResize={(delta) => onResize(delta)}
+        />
+      ) : null}
+      <div
+        className="rail-tabs"
+        role="tablist"
+        aria-label={label}
+        style={{ "--rail-tab-count": tabs.length } as CSSProperties}
+      >
+        {tabs.map((item, index) => (
+          <button
+            key={item.id}
+            id={`task-tools-tab-${item.id}`}
+            type="button"
+            role="tab"
+            aria-selected={activeTab === item.id}
+            aria-controls={`task-tools-panel-${item.id}`}
+            tabIndex={activeTab === item.id ? 0 : -1}
+            data-active={activeTab === item.id}
+            onClick={() => selectTab(item.id)}
+            onKeyDown={(event) => moveTabFocus(event, index)}
+          >
+            {activeTab === item.id ? (
+              <SlidingTabIndicator layoutId={`${label}-tab-indicator`} />
+            ) : null}
+            <item.icon />
+            <span>{item.label}</span>
+            {item.count !== undefined ? <small>{item.count}</small> : null}
+          </button>
+        ))}
+      </div>
+      <div
+        id={`task-tools-panel-${activeTab}`}
+        role="tabpanel"
+        aria-labelledby={`task-tools-tab-${activeTab}`}
+      >
+        {tabs.find((item) => item.id === activeTab)?.panel}
+      </div>
+    </aside>
+  );
+}
+
 export function RightRail(props: RightRailProps) {
   const [tab, setTab] = useState<RailTab>("git");
   const { onRequestProjectFiles } = props;
@@ -3156,116 +3254,74 @@ export function RightRail(props: RightRailProps) {
   useEffect(() => {
     if (tab === "files") onRequestProjectFiles?.();
   }, [onRequestProjectFiles, tab]);
-  const tabs: Array<{
-    id: RailTab;
-    label: string;
-    icon: typeof GitBranch;
-    count?: number;
-  }> = [
+  const tabs: RightRailTabDefinition[] = [
     {
       id: "git",
       label: "Git",
       icon: GitBranch,
       count: normalizedGit.kind === "repository" ? normalizedGit.files.length : undefined,
+      panel: <GitPanel {...props} git={normalizedGit} />,
     },
     {
       id: "agents",
       label: "Agents",
       icon: Users,
       count: props.delegations ? props.delegations.length : props.children.length,
-    },
-    { id: "files", label: "Files", icon: FileText },
-    { id: "usage", label: "Usage", icon: Radio },
-  ];
-
-  const moveTabFocus = (event: KeyboardEvent<HTMLButtonElement>, currentIndex: number) => {
-    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
-    event.preventDefault();
-    const nextIndex =
-      event.key === "Home"
-        ? 0
-        : event.key === "End"
-          ? tabs.length - 1
-          : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
-    const nextTab = tabs[nextIndex];
-    setTab(nextTab.id);
-    document.getElementById(`task-tools-tab-${nextTab.id}`)?.focus();
-  };
-
-  return (
-    <aside
-      className="right-rail"
-      aria-label="Task tools"
-      data-conversation-open={Boolean(props.selectedDelegationId)}
-    >
-      {props.onResize ? (
-        <ResizeHandle
-          axis="horizontal"
-          label="Resize task tools sidebar"
-          onResize={(delta) => props.onResize?.(delta)}
+      panel: (
+        <AgentPanel
+          agents={props.children}
+          delegations={props.delegations}
+          onApprove={props.onApproveDelegation}
+          onDeny={props.onDenyDelegation}
+          onNudge={props.onNudgeDelegation}
+          onStop={props.onStopDelegation}
+          selectedDelegationId={props.selectedDelegationId}
+          onSelectDelegation={props.onSelectDelegation ?? (() => undefined)}
         />
-      ) : null}
-      <div className="rail-tabs" role="tablist" aria-label="Task tools">
-        {tabs.map((item, index) => (
-          <button
-            key={item.id}
-            id={`task-tools-tab-${item.id}`}
-            type="button"
-            role="tab"
-            aria-selected={tab === item.id}
-            aria-controls={`task-tools-panel-${item.id}`}
-            tabIndex={tab === item.id ? 0 : -1}
-            data-active={tab === item.id}
-            onClick={() => setTab(item.id)}
-            onKeyDown={(event) => moveTabFocus(event, index)}
-          >
-            {tab === item.id ? <SlidingTabIndicator layoutId="task-tools-tab-indicator" /> : null}
-            <item.icon />
-            <span>{item.label}</span>
-            {item.count !== undefined ? <small>{item.count}</small> : null}
-          </button>
-        ))}
-      </div>
-      <div id={`task-tools-panel-${tab}`} role="tabpanel" aria-labelledby={`task-tools-tab-${tab}`}>
-        {tab === "git" ? <GitPanel {...props} git={normalizedGit} /> : null}
-        {tab === "agents" ? (
-          <AgentPanel
-            agents={props.children}
-            delegations={props.delegations}
-            onApprove={props.onApproveDelegation}
-            onDeny={props.onDenyDelegation}
-            onNudge={props.onNudgeDelegation}
-            onStop={props.onStopDelegation}
-            selectedDelegationId={props.selectedDelegationId}
-            onSelectDelegation={props.onSelectDelegation ?? (() => undefined)}
-          />
-        ) : null}
-        {tab === "files" ? (
-          // Keyed by project so filter and folder state reset naturally when
-          // the selected project changes.
-          <FilePanel
-            key={props.projectId ?? "no-project"}
-            projectFiles={props.projectFiles}
-            projectFilesState={props.projectFilesState}
-            onOpenFile={props.onOpenFile}
-            activeFilePath={props.activeFilePath}
-            openingFilePath={props.openingFilePath}
-            onRenameProjectFile={props.onRenameProjectFile}
-            onMentionProjectFile={props.onMentionProjectFile}
-            onMentionProjectFolder={props.onMentionProjectFolder}
-            fileOpeners={props.fileOpeners}
-            onOpenProjectFileExternal={props.onOpenProjectFileExternal}
-            onRevealProjectFile={props.onRevealProjectFile}
-          />
-        ) : null}
-        {tab === "usage" ? (
-          <UsagePanel
-            usage={props.usage}
-            runtime={props.runtime}
-            subscription={props.subscription}
-          />
-        ) : null}
-      </div>
-    </aside>
+      ),
+    },
+    {
+      id: "files",
+      label: "Files",
+      icon: FileText,
+      panel: (
+        <FilePanel
+          key={props.projectId ?? "no-project"}
+          projectFiles={props.projectFiles}
+          projectFilesState={props.projectFilesState}
+          onOpenFile={props.onOpenFile}
+          activeFilePath={props.activeFilePath}
+          openingFilePath={props.openingFilePath}
+          onRenameProjectFile={props.onRenameProjectFile}
+          onMentionProjectFile={props.onMentionProjectFile}
+          onMentionProjectFolder={props.onMentionProjectFolder}
+          fileOpeners={props.fileOpeners}
+          onOpenProjectFileExternal={props.onOpenProjectFileExternal}
+          onRevealProjectFile={props.onRevealProjectFile}
+        />
+      ),
+    },
+    {
+      id: "usage",
+      label: "Usage",
+      icon: Radio,
+      panel: (
+        <UsagePanel
+          usage={props.usage}
+          runtime={props.runtime}
+          subscription={props.subscription}
+        />
+      ),
+    },
+  ];
+  return (
+    <RightRailShell
+      tabs={tabs}
+      initialTab="git"
+      label="Task tools"
+      onResize={props.onResize}
+      onTabChange={(next) => setTab(next as RailTab)}
+      conversationOpen={Boolean(props.selectedDelegationId)}
+    />
   );
 }

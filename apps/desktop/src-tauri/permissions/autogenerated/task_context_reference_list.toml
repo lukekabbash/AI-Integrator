@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-task-context-reference-list"
+description = "Enables the task_context_reference_list command without any pre-configured scope."
+commands.allow = ["task_context_reference_list"]
+
+[[permission]]
+identifier = "deny-task-context-reference-list"
+description = "Denies the task_context_reference_list command without any pre-configured scope."
+commands.deny = ["task_context_reference_list"]

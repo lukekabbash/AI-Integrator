@@ -1,4 +1,10 @@
-import type { CustomArchetype, ExplainArchetype, ExplainConfig, ExplainRoute, RuntimeId } from "./bridge";
+import type {
+  CustomArchetype,
+  ExplainArchetype,
+  ExplainConfig,
+  ExplainRoute,
+  RuntimeId,
+} from "./bridge";
 
 /** Stored explainer keys. The values live in the same untyped settings bag as
  * everything else, so every read goes through the normalizers below. */
@@ -20,11 +26,27 @@ export interface BuiltInArchetype {
 }
 
 export const BUILT_IN_ARCHETYPES: BuiltInArchetype[] = [
-  { id: "explanation", label: "Explanation", hint: "What it does, how it works, what is easy to misread" },
-  { id: "socratic", label: "Socratic", hint: "Questions that lead you to the answer instead of stating it" },
-  { id: "optimization", label: "Optimization", hint: "Complexity, allocation, IO, and wasted work" },
+  {
+    id: "explanation",
+    label: "Explanation",
+    hint: "What it does, how it works, what is easy to misread",
+  },
+  {
+    id: "socratic",
+    label: "Socratic",
+    hint: "Questions that lead you to the answer instead of stating it",
+  },
+  {
+    id: "optimization",
+    label: "Optimization",
+    hint: "Complexity, allocation, IO, and wasted work",
+  },
   { id: "critique", label: "Critique", hint: "Bugs and unhandled edges, most severe first" },
-  { id: "security", label: "Security", hint: "Attacker-controlled input and the concrete consequence" },
+  {
+    id: "security",
+    label: "Security",
+    hint: "Attacker-controlled input and the concrete consequence",
+  },
 ];
 
 /** Sentinel for the dropdown's trailing "New archetype" row. Never stored: it
@@ -123,7 +145,9 @@ export function resolveExplainRoute(
 ): ExplainRoute {
   const stored = settings[EXPLAIN_SETTINGS.runtime];
   const pinned =
-    typeof stored === "string" && stored !== INHERIT_RUNTIME && (available as string[]).includes(stored)
+    typeof stored === "string" &&
+    stored !== INHERIT_RUNTIME &&
+    (available as string[]).includes(stored)
       ? (stored as RuntimeId)
       : null;
   if (!pinned) {
@@ -176,6 +200,7 @@ export function technicalityLabel(value: number): string {
 export function contextSummary(verbosity: number): string {
   if (verbosity < 30) return "Sends the selection alone.";
   if (verbosity < 60) return "Adds the lines around the selection.";
-  if (verbosity < 80) return "Adds surrounding lines, plus definitions from up to 3 imported files.";
+  if (verbosity < 80)
+    return "Adds surrounding lines, plus definitions from up to 3 imported files.";
   return "Adds surrounding lines, plus definitions from up to 6 imported files.";
 }

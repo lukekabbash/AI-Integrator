@@ -3715,6 +3715,7 @@ dependencies = [
  "parking_lot",
  "rusqlite",
  "serde_json",
+ "sha2",
  "tempfile",
  "uuid",
 ]

@@ -42,11 +42,14 @@ import {
 import {
   bridge,
   CHAT_TITLE_PLACEHOLDER,
+  GENERAL_CHAT_TITLE_PLACEHOLDER,
   diffFileKey,
   draftOwnerKey,
   formatBridgeError,
   type ApprovalDecision,
   type ApprovalProjection,
+  type AutomationDispatch,
+  type AutomationTimelineEntry,
   type ComposerDraft,
   type ComposerDraftOwner,
   type ComposerDraftValue,
@@ -74,6 +77,8 @@ import {
   type TaskSummary,
   type TranscriptEvent,
 } from "./bridge";
+import { mergeSchedulingTranscript } from "./automationTranscript";
+import { automationTurnPrompt } from "./automationTurnPrompt";
 import {
   composerNoticeExpiry,
   isRuntimeHealthError,
@@ -83,7 +88,7 @@ import {
 import { prettyModelLabel } from "./modelLabel";
 import { ComposerDraftStore } from "./composerDraftStore";
 import { nextForkTitle } from "./forkTitle";
-import type { RuntimeActionRequest } from "./components/SettingsView";
+import type { RuntimeActionRequest, SettingsSection } from "./components/SettingsView";
 import type { DiffCommitState } from "./components/DiffView";
 import { createDemoSnapshot, createEmptySnapshot, type WorkspaceSnapshot } from "./demoData";
 import { reconcileGitSnapshot } from "./gitSnapshot";
@@ -111,7 +116,7 @@ import { resolveExplainConfig, resolveExplainRoute } from "./explainSettings";
 import { resolveCommitMessageRoute } from "./commitMessageSettings";
 import { decorateCommitMessage, readGitDecorationSettings, readPushForce } from "./gitDecoration";
 import { TitlebarFileTabs } from "./components/TitlebarFileTabs";
-import { resolveRequestedFile } from "./components/fileViewSupport";
+import { resolveRequestedFile, type ProjectFileLocation } from "./components/fileViewSupport";
 import { TaskStatusPill } from "./components/TaskStatusPill";
 import { QueuedMessages } from "./components/QueuedMessages";
 import { formatCompactTokenCount } from "./components/conversationFormatting";
@@ -141,6 +146,7 @@ import {
   isComposerTurnBusy,
   type OptimisticUserMessage,
 } from "./appTurnState";
+import { SlidingPanelSlot } from "./components/SlidingPanelSlot";
 import "./styles.css";
 
 const RightRail = lazy(() =>
@@ -170,6 +176,7 @@ type ComposerTurnInput = {
   prompt: string;
   draftPrompt?: string;
   attachments?: QueuedMessage["attachments"];
+  contextReferences?: QueuedMessage["contextReferences"];
   runtime: RuntimeId;
   model: string;
   effort?: string;
@@ -186,7 +193,12 @@ function queuedMessagePrompt(message: QueuedMessage): string {
     message.attachments.length > 0
       ? `Attached files:\n${message.attachments.map((attachment) => `- ${attachment.path}`).join("\n")}`
       : "";
-  return prompt ? (attachmentBlock ? `${prompt}\n\n${attachmentBlock}` : prompt) : attachmentBlock;
+  const chatReferenceBlock = message.contextReferences?.length
+    ? `Referenced chats:\n${message.contextReferences
+        .map((reference) => `- @${reference.sourceTitle}`)
+        .join("\n")}`
+    : "";
+  return [prompt, attachmentBlock, chatReferenceBlock].filter(Boolean).join("\n\n");
 }
 
 function runtimeLabel(runtime: RuntimeId): string {
@@ -201,9 +213,41 @@ function runtimeLabel(runtime: RuntimeId): string {
   }[runtime];
 }
 
+function sameAutomationTimeline(
+  left: AutomationTimelineEntry[],
+  right: AutomationTimelineEntry[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((entry, index) => {
+      const candidate = right[index];
+      return (
+        candidate?.automation.id === entry.automation.id &&
+        candidate.automation.updatedAt === entry.automation.updatedAt &&
+        entry.runs.length === candidate.runs.length &&
+        entry.runs.every((run, runIndex) => {
+          const other = candidate.runs[runIndex];
+          return (
+            other?.id === run.id &&
+            other.status === run.status &&
+            other.dispatchRef === run.dispatchRef &&
+            other.error === run.error &&
+            other.finishedAt === run.finishedAt
+          );
+        })
+      );
+    })
+  );
+}
+
 const SettingsView = lazy(() =>
   import("./components/SettingsView").then((module) => ({
     default: module.SettingsView,
+  })),
+);
+const ScheduledView = lazy(() =>
+  import("./components/ScheduledView").then((module) => ({
+    default: module.ScheduledView,
   })),
 );
 const SetupView = lazy(() =>
@@ -217,7 +261,7 @@ const Transcript = lazy(() =>
   })),
 );
 
-type Screen = "workspace" | "settings" | "setup";
+type Screen = "workspace" | "scheduled" | "settings" | "setup";
 type CenterView = "task" | "review";
 
 function ReviewEmptyState({
@@ -390,7 +434,7 @@ function initialSnapshot(): WorkspaceSnapshot {
 function initialScreen(): Screen {
   if (typeof window === "undefined") return "workspace";
   const value = new URLSearchParams(window.location.search).get("screen");
-  return value === "settings" || value === "setup" ? value : "workspace";
+  return value === "scheduled" || value === "settings" || value === "setup" ? value : "workspace";
 }
 
 function initialCenterView(): CenterView {
@@ -1451,6 +1495,7 @@ export default function App() {
   const pendingDraftWrites = useRef(new Map<string, ComposerDraft>());
   const draftWriterRunning = useRef(false);
   const [delegations, setDelegations] = useState<DelegationView[]>([]);
+  const [automationTimeline, setAutomationTimeline] = useState<AutomationTimelineEntry[]>([]);
   const [selectedDelegationId, setSelectedDelegationId] = useState<string | undefined>();
   // Provider-reported subscription quota keyed by runtime (Codex today).
   // Refreshed per active-task switch; never inferred when a provider is silent.
@@ -1491,8 +1536,10 @@ export default function App() {
   const queueAwaitingTurnRef = useRef<{ taskId: string; previousTurnId?: string } | undefined>(
     undefined,
   );
+  const automationDispatchingRef = useRef(new Set<string>());
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
   const [screen, setScreen] = useState<Screen>(initialScreen);
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>("appearance");
   const [runtimeActionRequest, setRuntimeActionRequest] = useState<RuntimeActionRequest | null>(
     null,
   );
@@ -1506,14 +1553,16 @@ export default function App() {
   const [rightRailOpen, setRightRailOpen] = useState(
     () => !window.matchMedia?.("(max-width: 980px)").matches,
   );
-  const [openProjectFileRequest, setOpenProjectFileRequest] = useState<{
-    path: string;
-    id: number;
-  } | null>(null);
+  const [scheduledRailOpen, setScheduledRailOpen] = useState(false);
+  const [scheduledCreateRequest, setScheduledCreateRequest] = useState(0);
+  const [openProjectFileRequest, setOpenProjectFileRequest] = useState<
+    (ProjectFileLocation & { id: number }) | null
+  >(null);
   // First-class canvas file tabs, shown beside the chat title. Contents live
   // here; per-task paths persist through snapshot.openFilesByTask.
   const [openFileTabs, setOpenFileTabs] = useState<ProjectFileContent[]>([]);
   const [activeFileTabPath, setActiveFileTabPath] = useState("");
+  const [activeFileLocation, setActiveFileLocation] = useState<ProjectFileLocation | null>(null);
   const [fileTabOpeningPath, setFileTabOpeningPath] = useState("");
   const fileTabsCache = useRef(new Map<string, { tabs: ProjectFileContent[]; active: string }>());
   const handledFileRequestRef = useRef<number | null>(null);
@@ -2317,9 +2366,146 @@ export default function App() {
     };
   }, [nativeHost, refreshDelegations]);
 
+  useEffect(() => {
+    if (!nativeHost) return;
+    let active = true;
+    let unlisten: (() => void) | undefined;
+
+    const dispatchAutomation = async (dispatch: AutomationDispatch) => {
+      if (!active || automationDispatchingRef.current.has(dispatch.run.id)) return;
+      automationDispatchingRef.current.add(dispatch.run.id);
+      let dispatchRef: string | undefined;
+      let dispatchError: string | undefined;
+      try {
+        const { automation } = dispatch;
+        if (automation.target.kind === "delegation") {
+          await bridge.sendDelegationMessage(
+            automation.target.delegationId,
+            automation.prompt,
+            automation.route,
+          );
+          dispatchRef = `delegation:${automation.target.delegationId}`;
+        } else {
+          const prompt = automationTurnPrompt(automation);
+          const { fallbacks, ...primary } = automation.route;
+          const routes = [
+            primary,
+            ...(fallbacks ?? []).map((fallback) => ({ ...primary, ...fallback })),
+          ];
+          let lastError: unknown;
+          for (const route of routes) {
+            try {
+              await bridge.sendTurn({
+                taskId: automation.taskId,
+                prompt,
+                ...route,
+              });
+              dispatchRef = `task:${automation.taskId}`;
+              break;
+            } catch (error) {
+              const message = formatBridgeError(error, "The scheduled task could not start");
+              const busy = /turn.active|already (running|starting)|turn-active/i.test(message);
+              if (busy) {
+                const queued = await bridge.enqueueMessage({
+                  taskId: automation.taskId,
+                  prompt,
+                  attachments: [],
+                  ...primary,
+                });
+                dispatchRef = `queue:${queued.id}`;
+                break;
+              }
+              lastError = error;
+            }
+          }
+          if (!dispatchRef) throw lastError ?? new Error("No scheduled runtime was available");
+        }
+      } catch (error) {
+        dispatchError = formatBridgeError(error, "The scheduled task could not be dispatched");
+      }
+      await bridge
+        .finishAutomationRun(dispatch.run.id, {
+          dispatchRef,
+          error: dispatchError,
+        })
+        .catch(() => undefined);
+      automationDispatchingRef.current.delete(dispatch.run.id);
+    };
+
+    void (async () => {
+      unlisten = await bridge.subscribeAutomationDue((dispatch) => {
+        void dispatchAutomation(dispatch);
+      });
+      if (!active) {
+        unlisten?.();
+        return;
+      }
+      const pending = await bridge.pendingAutomationDispatches();
+      for (const dispatch of pending) void dispatchAutomation(dispatch);
+    })().catch(() => undefined);
+
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [nativeHost]);
+
   const activeTask =
     snapshot.tasks.find((task) => task.id === snapshot.activeTaskId) ??
     archivedTasks.find((task) => task.id === snapshot.activeTaskId);
+  const refreshAutomationTimeline = useCallback(
+    async (taskId = activeTaskIdRef.current) => {
+      if (!nativeHost || !taskId) {
+        setAutomationTimeline((current) => (current.length > 0 ? [] : current));
+        return;
+      }
+      const timeline = await bridge.automationTimeline(taskId);
+      if (activeTaskIdRef.current === taskId) {
+        setAutomationTimeline((current) =>
+          sameAutomationTimeline(current, timeline) ? current : timeline,
+        );
+      }
+    },
+    [nativeHost],
+  );
+  useEffect(() => {
+    void refreshAutomationTimeline(activeTask?.id).catch(() =>
+      setAutomationTimeline((current) => (current.length > 0 ? [] : current)),
+    );
+  }, [activeTask?.id, refreshAutomationTimeline]);
+  useEffect(() => {
+    if (!nativeHost) return;
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    void bridge
+      .subscribeAutomationChanges((change) => {
+        if (active && change.taskId === activeTaskIdRef.current) {
+          void refreshAutomationTimeline(change.taskId);
+        }
+      })
+      .then((stop) => {
+        if (active) unlisten = stop;
+        else stop();
+      });
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [nativeHost, refreshAutomationTimeline]);
+
+  const cancelScheduledTask = useCallback(
+    async (automationId: string) => {
+      setOperationError("");
+      try {
+        await bridge.cancelAutomation(automationId);
+        await refreshAutomationTimeline();
+        setOperationStatus("Scheduled task cancelled");
+      } catch (error) {
+        setOperationError(formatBridgeError(error, "The scheduled task could not be cancelled"));
+      }
+    },
+    [refreshAutomationTimeline],
+  );
   const activeProjectionUnavailable =
     nativeHost && Boolean(activeTask) && readyProjectionTaskId !== activeTask?.id;
   const rootTasks = useMemo(
@@ -2331,9 +2517,11 @@ export default function App() {
     [archivedTasks, rootTasks],
   );
   const activeProject =
-    snapshot.projects.find((project) => project.id === snapshot.activeProjectId) ??
-    snapshot.projects.find((project) => project.id === activeTask?.projectId) ??
-    snapshot.projects[0];
+    activeTask?.kind === "chat"
+      ? undefined
+      : (snapshot.projects.find((project) => project.id === snapshot.activeProjectId) ??
+        snapshot.projects.find((project) => project.id === activeTask?.projectId) ??
+        snapshot.projects[0]);
   const activeCheckoutPath = activeTask?.worktree ?? activeProject?.path;
   useEffect(() => {
     if (!nativeHost || !activeCheckoutPath) return;
@@ -2594,9 +2782,11 @@ export default function App() {
   const titleContext =
     screen === "settings"
       ? "Settings"
-      : screen === "setup"
-        ? "Setup"
-        : `${activeProject?.name ?? "Workspace"} · ${activeTask?.title ?? "New chat"}`;
+      : screen === "scheduled"
+        ? "Scheduled"
+        : screen === "setup"
+          ? "Setup"
+          : `${activeTask?.kind === "chat" ? "Chat" : (activeProject?.name ?? "Workspace")} · ${activeTask?.title ?? "New chat"}`;
 
   const setTheme = (patch: ThemePreferencePatch) => {
     setPreferences((current) => {
@@ -2651,7 +2841,10 @@ export default function App() {
       return;
     }
     const generation = ++navigationGeneration.current;
-    const restoredView = snapshot.centerViewByTask[taskId] === "review" ? "review" : "task";
+    const restoredView =
+      targetTask.kind !== "chat" && snapshot.centerViewByTask[taskId] === "review"
+        ? "review"
+        : "task";
     const empty = createEmptySnapshot();
     const cached = nativeHost ? undefined : snapshot.taskContexts[taskId];
     const cachedRuntime = nativeHost ? taskProjectionCache.current.get(taskId) : undefined;
@@ -2669,6 +2862,7 @@ export default function App() {
     const taskGitIsDirty = taskGitInvalidatedPaths.current.has(taskId);
     const refreshTaskGit =
       nativeHost &&
+      targetTask.kind !== "chat" &&
       (taskGitIsDirty ||
         (!sharesActiveRepository &&
           (!taskCachedGit || Date.now() - gitRefreshedAt >= GIT_CACHE_TTL_MS)));
@@ -2710,10 +2904,10 @@ export default function App() {
         ...current,
         activeTaskId: taskId,
         activeProjectId: targetTask.projectId,
-        lastTaskByProject: {
-          ...current.lastTaskByProject,
-          [targetTask.projectId]: taskId,
-        },
+        lastTaskByProject:
+          targetTask.kind === "chat"
+            ? current.lastTaskByProject
+            : { ...current.lastTaskByProject, [targetTask.projectId]: taskId },
         centerViewByTask: {
           ...current.centerViewByTask,
           ...(current.activeTaskId ? { [current.activeTaskId]: centerView } : {}),
@@ -2901,19 +3095,24 @@ export default function App() {
 
   const appendTask = (task: TaskSummary) => {
     const empty = createEmptySnapshot();
-    const git = snapshot.activeProjectId === task.projectId ? snapshot.git : empty.git;
+    const git =
+      task.kind !== "chat" && snapshot.activeProjectId === task.projectId
+        ? snapshot.git
+        : empty.git;
     setFreshTaskIds((current) => new Set(current).add(task.id));
     activeTaskIdRef.current = task.id;
-    taskGitCache.current.set(task.id, git);
-    taskGitRefreshedAt.current.set(task.id, Date.now());
+    if (task.kind !== "chat") {
+      taskGitCache.current.set(task.id, git);
+      taskGitRefreshedAt.current.set(task.id, Date.now());
+    }
     setSnapshot((current) => ({
       ...current,
       activeTaskId: task.id,
       activeProjectId: task.projectId,
-      lastTaskByProject: {
-        ...current.lastTaskByProject,
-        [task.projectId]: task.id,
-      },
+      lastTaskByProject:
+        task.kind === "chat"
+          ? current.lastTaskByProject
+          : { ...current.lastTaskByProject, [task.projectId]: task.id },
       centerViewByTask: { ...current.centerViewByTask, [task.id]: "task" },
       tasks: [task, ...current.tasks.filter((item) => item.id !== task.id)],
       transcript: [],
@@ -2983,10 +3182,33 @@ export default function App() {
   };
 
   const newTask = async (projectId?: string) => {
+    if (!projectId) {
+      if (creatingTask) return;
+      setCreatingTask(true);
+      setOperationError("");
+      try {
+        const task = await bridge.createChat({
+          runtime: settingsDefaultRuntime,
+          model: settingsDefaultModel,
+          ...(settingsDefaultRoute.effort ? { effort: settingsDefaultRoute.effort } : {}),
+        });
+        ++navigationGeneration.current;
+        setSelectedDelegationId(undefined);
+        setScreen("workspace");
+        appendTask(task);
+        window.setTimeout(
+          () => document.querySelector<HTMLTextAreaElement>(".composer textarea")?.focus(),
+          0,
+        );
+      } catch (error) {
+        setOperationError(formatBridgeError(error, "Could not create the chat"));
+      } finally {
+        setCreatingTask(false);
+      }
+      return;
+    }
     const project =
-      (projectId ? snapshot.projects.find((item) => item.id === projectId) : undefined) ??
-      activeProject ??
-      (await openProject());
+      snapshot.projects.find((item) => item.id === projectId) ?? (await openProject());
     if (!project) return;
     ++navigationGeneration.current;
     const empty = createEmptySnapshot();
@@ -3054,10 +3276,20 @@ export default function App() {
     options?: { resumeInterrupted?: boolean },
   ): Promise<boolean> => {
     const project = activeProject;
-    if (!project) {
+    const isChat = activeTask?.kind === "chat";
+    if (!project && !isChat) {
       setOperationError("Open a project before starting a task.");
       return false;
     }
+    const routedInput: ComposerTurnInput = isChat
+      ? {
+          ...input,
+          permission: "read-only",
+          delegation: "off",
+          nativeAction: undefined,
+          nativeActionId: undefined,
+        }
+      : input;
     const submittedAt = new Date().toISOString();
     setOperationError("");
     setComposerError(null);
@@ -3068,18 +3300,19 @@ export default function App() {
         : undefined;
     const targetTask =
       activeTask ??
-      (await createTask(project, input.prompt, {
-        runtime: input.runtime,
-        model: input.model,
-        effort: input.effort,
-        permission: input.permission,
-        delegation: input.delegation,
-        draft: submittedDraft?.revision === input.draftRevision ? submittedDraft : undefined,
-      }));
+      (project &&
+        (await createTask(project, routedInput.prompt, {
+          runtime: routedInput.runtime,
+          model: routedInput.model,
+          effort: routedInput.effort,
+          permission: routedInput.permission,
+          delegation: routedInput.delegation,
+          draft: submittedDraft?.revision === input.draftRevision ? submittedDraft : undefined,
+        })));
     if (!targetTask) return false;
     setTaskPermissions((current) => ({
       ...current,
-      [targetTask.id]: input.permission,
+      [targetTask.id]: routedInput.permission,
     }));
     setSnapshot((current) => ({
       ...current,
@@ -3157,22 +3390,29 @@ export default function App() {
           throw error;
         }
       }
-      const { nativeAction } = input;
+      const { nativeAction } = routedInput;
       const turnInput = {
-        prompt: input.prompt,
-        runtime: input.runtime,
-        model: input.model,
-        effort: input.effort,
-        permission: input.permission,
-        delegation: input.delegation,
-        nativeActionId: input.nativeActionId,
+        prompt: routedInput.prompt,
+        attachments: routedInput.attachments,
+        runtime: routedInput.runtime,
+        model: routedInput.model,
+        effort: routedInput.effort,
+        permission: routedInput.permission,
+        delegation: routedInput.delegation,
+        nativeActionId: routedInput.nativeActionId,
+        contextReferences: routedInput.contextReferences,
         resumeInterrupted: options?.resumeInterrupted,
       };
       event = await bridge.sendTurn({ ...turnInput, taskId: targetTask.id });
       if (!nativeHost && nativeAction?.kind === "skill") {
         event = { ...event, nativeSkill: nativeAction.name };
       }
-      if (isNewTask) {
+      if (
+        isNewTask ||
+        targetTask.title === CHAT_TITLE_PLACEHOLDER ||
+        targetTask.title === GENERAL_CHAT_TITLE_PLACEHOLDER
+      ) {
+        const titlePrompt = routedInput.draftPrompt?.trim() || routedInput.prompt;
         // Staggered: the title helper boots its own cold provider process,
         // and starting it in the same instant as the real turn's spawn makes
         // the two cold starts contend for CPU/network right when
@@ -3182,9 +3422,9 @@ export default function App() {
           .then(() =>
             bridge.generateTaskTitle({
               taskId: targetTask.id,
-              prompt: input.prompt,
-              runtime: input.runtime,
-              route: { runtime: input.runtime, fallbacks: [] },
+              prompt: titlePrompt,
+              runtime: routedInput.runtime,
+              route: { runtime: routedInput.runtime, fallbacks: [] },
             }),
           )
           .then((metadata) => {
@@ -3192,7 +3432,9 @@ export default function App() {
             setSnapshot((current) => ({
               ...current,
               tasks: current.tasks.map((task) =>
-                task.id === targetTask.id && task.title === CHAT_TITLE_PLACEHOLDER
+                task.id === targetTask.id &&
+                (task.title === CHAT_TITLE_PLACEHOLDER ||
+                  task.title === GENERAL_CHAT_TITLE_PLACEHOLDER)
                   ? { ...task, title: metadata.title, updatedAt: metadata.updatedAt }
                   : task,
               ),
@@ -3228,8 +3470,10 @@ export default function App() {
       setPromotingDraftTaskId((current) => (current === targetTask.id ? "" : current));
       return false;
     }
-    setLocalSettings((current) => ({ ...current, "models.lastRuntime": input.runtime }));
-    void bridge.setSetting("settings.models.lastRuntime", input.runtime).catch(() => undefined);
+    setLocalSettings((current) => ({ ...current, "models.lastRuntime": routedInput.runtime }));
+    void bridge
+      .setSetting("settings.models.lastRuntime", routedInput.runtime)
+      .catch(() => undefined);
     if (input.draftRevision !== undefined) {
       const cleared = composerDraftStore.clear(
         { kind: "task", taskId: targetTask.id },
@@ -3241,9 +3485,9 @@ export default function App() {
     try {
       if (bridge.updateTaskRouting) {
         await bridge.updateTaskRouting(targetTask.id, {
-          runtime: input.runtime,
-          model: input.model,
-          effort: input.effort,
+          runtime: routedInput.runtime,
+          model: routedInput.model,
+          effort: routedInput.effort,
         });
       }
     } catch {
@@ -3255,9 +3499,9 @@ export default function App() {
         task.id === targetTask.id
           ? {
               ...task,
-              runtime: input.runtime,
-              model: input.model,
-              effort: input.effort,
+              runtime: routedInput.runtime,
+              model: routedInput.model,
+              effort: routedInput.effort,
               status: task.status === "starting" ? "running" : task.status,
               updatedAt: new Date().toISOString(),
             }
@@ -3269,7 +3513,7 @@ export default function App() {
       id: `activity-${Date.now()}`,
       kind: "activity",
       title: "Queued for execution",
-      body: `${input.runtime} · ${input.model} · ${input.delegation}`,
+      body: `${routedInput.runtime} · ${routedInput.model} · ${routedInput.delegation}`,
       timestamp: new Date().toISOString(),
       status: "running",
     };
@@ -3278,7 +3522,7 @@ export default function App() {
       const usage = recordLocalTurnUsage(current.usage, {
         eventId: event.id,
         timestamp: event.timestamp,
-        prompt: input.prompt,
+        prompt: routedInput.prompt,
       });
       return {
         ...current,
@@ -3298,9 +3542,9 @@ export default function App() {
             ? {
                 ...task,
                 status: "running",
-                runtime: input.runtime,
-                model: input.model,
-                effort: input.effort,
+                runtime: routedInput.runtime,
+                model: routedInput.model,
+                effort: routedInput.effort,
                 updatedAt: new Date().toISOString(),
               }
             : task,
@@ -3414,12 +3658,13 @@ export default function App() {
         taskId: task.id,
         prompt: input.draftPrompt ?? input.prompt,
         attachments: input.attachments ?? [],
+        contextReferences: input.contextReferences,
         runtime: input.runtime,
         model: input.model,
         effort: input.effort,
-        permission: input.permission,
-        delegation: input.delegation,
-        nativeActionId: input.nativeActionId,
+        permission: task.kind === "chat" ? "read-only" : input.permission,
+        delegation: task.kind === "chat" ? "off" : input.delegation,
+        nativeActionId: task.kind === "chat" ? undefined : input.nativeActionId,
       });
       setSnapshot((current) => ({
         ...current,
@@ -3478,6 +3723,7 @@ export default function App() {
           taskId,
           prompt: currentDraft.prompt,
           attachments: currentDraft.attachments,
+          contextReferences: currentDraft.contextReferences,
           runtime: currentDraft.runtime,
           model: currentDraft.model,
           effort: currentDraft.effort,
@@ -3498,6 +3744,7 @@ export default function App() {
       const value: ComposerDraftValue = {
         prompt: message.prompt,
         attachments: message.attachments,
+        contextReferences: message.contextReferences,
         runtime: message.runtime,
         model: message.model,
         effort: message.effort,
@@ -3856,6 +4103,14 @@ export default function App() {
   }, []);
   const handleSidebarOpenProject = useCallback(() => setAddProjectOpen(true), []);
   const handleSidebarOpenSettings = useCallback(() => setScreen("settings"), []);
+  const handleSidebarOpenSettingsSection = useCallback((section: SettingsSection) => {
+    setSettingsSection(section);
+    setScreen("settings");
+  }, []);
+  const handleSidebarOpenScheduled = useCallback(() => {
+    setScheduledRailOpen(false);
+    setScreen("scheduled");
+  }, []);
   const handleSidebarSearchMessages = useCallback(
     (query: string, options?: { includeArchived?: boolean }) =>
       bridge.searchTaskMessages(query, 40, options),
@@ -4172,8 +4427,8 @@ export default function App() {
   };
 
   /** A transcript file action opens the file as a first-class canvas tab. */
-  const openTranscriptFile = (path: string) => {
-    setOpenProjectFileRequest({ path, id: Date.now() });
+  const openTranscriptFile = (location: ProjectFileLocation) => {
+    setOpenProjectFileRequest({ ...location, id: Date.now() });
   };
 
   /** Tabs belong to the active task, or to the project while drafting a new
@@ -4190,13 +4445,14 @@ export default function App() {
     : undefined;
 
   const openFileInCanvas = useCallback(
-    async (file: Pick<ProjectFileEntry, "path">) => {
+    async (file: Pick<ProjectFileEntry, "path">, location?: ProjectFileLocation) => {
       const project = activeProject;
       if (!project) return;
       setOperationError("");
       const existing = openFileTabs.find((tab) => tab.path === file.path);
       if (existing) {
         setActiveFileTabPath(existing.path);
+        setActiveFileLocation(location ? { ...location, path: existing.path } : null);
         return;
       }
       setFileTabOpeningPath(file.path);
@@ -4207,6 +4463,7 @@ export default function App() {
           content,
         ]);
         setActiveFileTabPath(content.path);
+        setActiveFileLocation(location ? { ...location, path: content.path } : null);
       } catch (error) {
         setOperationError(
           error instanceof Error ? error.message : "Could not open that project file.",
@@ -4215,13 +4472,14 @@ export default function App() {
         setFileTabOpeningPath("");
       }
     },
-    [activeProject, openFileTabs],
+    [activeProject, openFileTabs, setActiveFileLocation, setActiveFileTabPath],
   );
 
   const closeFileTab = (path: string) => {
     const closingIndex = openFileTabs.findIndex((tab) => tab.path === path);
     const next = openFileTabs.filter((tab) => tab.path !== path);
     setOpenFileTabs(next);
+    if (activeFileLocation?.path === path) setActiveFileLocation(null);
     if (activeFileTabPath === path) {
       setActiveFileTabPath(next[closingIndex]?.path ?? next[closingIndex - 1]?.path ?? "");
     }
@@ -4238,6 +4496,7 @@ export default function App() {
     fileTabOwnerRef.current = fileTabOwnerKey;
     const generation = ++fileTabRestoreGeneration.current;
     setFileTabOpeningPath("");
+    setActiveFileLocation(null);
     const cached = fileTabsCache.current.get(fileTabOwnerKey);
     if (cached) {
       setOpenFileTabs(cached.tabs);
@@ -4304,7 +4563,7 @@ export default function App() {
         setOperationError(`Could not find ${openProjectFileRequest.path} in the project files.`);
         return;
       }
-      void openFileInCanvas(file);
+      void openFileInCanvas(file, openProjectFileRequest);
     }, 0);
     return () => window.clearTimeout(timer);
   }, [
@@ -4808,13 +5067,16 @@ export default function App() {
     Date.parse(authoritativeTurnStartedAt) >= Date.parse(optimisticForActiveTask.event.timestamp),
   );
   const projectedTranscript = useMemo(() => {
-    const events = nativeHost
+    const providerEvents = nativeHost
       ? providerHasOptimisticMessage || !optimisticForActiveTask
         ? nativeRuntimeEvents
         : [...nativeRuntimeEvents, optimisticForActiveTask.event].sort(
             (a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp),
           )
       : snapshot.transcript;
+    const events = nativeHost
+      ? mergeSchedulingTranscript(providerEvents, automationTimeline)
+      : providerEvents;
     if (resumedWorkedForIdsRef.current.size === 0) return events;
     return events.map((event) =>
       event.title === "Worked for" && resumedWorkedForIdsRef.current.has(event.id)
@@ -4828,6 +5090,7 @@ export default function App() {
     providerHasOptimisticMessage,
     resumedWorkedForVersion,
     snapshot.transcript,
+    automationTimeline,
   ]);
   // Transcript edits caption "Committed"/"Pushed" once Git owns them. Git status
   // already lists untracked files, so a path in neither the working tree nor the
@@ -5093,7 +5356,10 @@ export default function App() {
   useEffect(() => {
     if (!autoApproveActive || !activeTask || !pendingApproval) return;
     if (pendingApproval.state !== "pending") return;
-    if (pendingApproval.approvalKind === "planReview" || pendingApproval.approvalKind === "question")
+    if (
+      pendingApproval.approvalKind === "planReview" ||
+      pendingApproval.approvalKind === "question"
+    )
       return;
     if (respondingApprovalId) return;
     if (autoApprovedIdsRef.current.has(pendingApproval.id)) return;
@@ -5397,7 +5663,7 @@ export default function App() {
 
       const turn = runtimeState?.taskId === activeTask.id ? runtimeState.turn : undefined;
       if (sendNow && turn?.status === "inProgress") {
-        if (!message.nativeActionId) {
+        if (!message.nativeActionId && !message.contextReferences?.length) {
           const steered = await bridge.steerTurn(
             activeTask.id,
             turn.id,
@@ -5420,12 +5686,14 @@ export default function App() {
       priorityQueueIdRef.current = "";
       const accepted = await sendTurn({
         prompt: queuedMessagePrompt(message),
+        attachments: message.attachments,
         runtime: message.runtime,
         model: message.model,
         effort: message.effort,
         permission: message.permission,
         delegation: message.delegation,
         nativeActionId: message.nativeActionId,
+        contextReferences: message.contextReferences,
       });
       if (!accepted) throw new Error("The queued turn could not be started");
       if (nativeHost) {
@@ -5579,14 +5847,62 @@ export default function App() {
     setTerminalSurfaceActivated(true);
     setTerminalOpen((current) => !current);
   };
+  const primarySidebar = (activeDestination: "chats" | "scheduled") => (
+    <motion.div
+      className="panel-slot panel-slot--left"
+      key="chat-sidebar"
+      initial={{ width: 0, opacity: 0 }}
+      animate={{ width: "auto", opacity: 1 }}
+      exit={{ width: 0, opacity: 0 }}
+      transition={panelTransition}
+    >
+      <TaskSidebar
+        projects={snapshot.projects}
+        tasks={sidebarTasks}
+        archivedTotal={archivedTotal}
+        archivedLoading={archivedLoading}
+        archivedHasMore={Boolean(archivedNextCursor)}
+        onEnsureArchived={handleSidebarEnsureArchived}
+        onLoadMoreArchived={handleSidebarLoadMoreArchived}
+        activeProjectId={snapshot.activeProjectId}
+        activeTaskId={snapshot.activeTaskId}
+        metadataActionsEnabled={metadataActionsEnabled}
+        taskActionBusyId={taskActionBusyId}
+        onSearchMessages={handleSidebarSearchMessages}
+        onSelectProject={handleSidebarSelectProject}
+        onSelectTask={handleSidebarSelectTask}
+        onNewTask={handleSidebarNewTask}
+        onNewTaskInProject={handleSidebarNewTaskInProject}
+        onOpenProject={handleSidebarOpenProject}
+        openingProject={openingProject}
+        onUpdateTask={handleSidebarUpdateTask}
+        onCopyTask={handleSidebarCopyTask}
+        onUpdateProject={handleSidebarUpdateProject}
+        onDeleteProject={handleSidebarDeleteProject}
+        onDeleteTask={handleSidebarDeleteTask}
+        onDeleteArchivedChats={handleSidebarDeleteArchivedChats}
+        onOpenSettings={handleSidebarOpenSettings}
+        onOpenScheduled={handleSidebarOpenScheduled}
+        onOpenCapabilities={() => handleSidebarOpenSettingsSection("skills")}
+        onOpenSubagents={() => handleSidebarOpenSettingsSection("subagents")}
+        activeDestination={activeDestination}
+        onResize={handleSidebarResize}
+        sidebarMenuDirection={preferences.sidebarMenuDirection}
+      />
+    </motion.div>
+  );
 
   return (
     <LazyMotion features={domMax} strict>
       <div
         ref={appRootRef}
         className="app-root"
-        data-sidebar-visible={screen === "workspace" && !sidebarCollapsed}
-        data-rail-visible={screen === "workspace" && showRightRail}
+        data-sidebar-visible={
+          (screen === "workspace" || screen === "scheduled") && !sidebarCollapsed
+        }
+        data-rail-visible={
+          (screen === "workspace" && showRightRail) || (screen === "scheduled" && scheduledRailOpen)
+        }
         data-subagent-visible={screen === "workspace" && Boolean(selectedDelegation)}
         data-file-active={screen === "workspace" && Boolean(activeFileTab)}
         style={
@@ -5601,12 +5917,19 @@ export default function App() {
         </a>
         <NativeTitlebar
           context={titleContext}
-          title={screen === "workspace" ? (activeTask?.title ?? "New chat") : undefined}
-          titleActive={!activeFileTab}
+          title={
+            screen === "workspace"
+              ? (activeTask?.title ?? "New chat")
+              : screen === "scheduled"
+                ? "Scheduled"
+                : undefined
+          }
+          titleActive={screen === "scheduled" || !activeFileTab}
           onTitleSelect={
             screen === "workspace"
               ? () => {
                   setActiveFileTabPath("");
+                  setActiveFileLocation(null);
                   changeCenterView("task");
                 }
               : undefined
@@ -5616,7 +5939,10 @@ export default function App() {
               <TitlebarFileTabs
                 tabs={openFileTabs}
                 activePath={activeFileTab?.path ?? ""}
-                onSelect={setActiveFileTabPath}
+                onSelect={(path) => {
+                  setActiveFileTabPath(path);
+                  setActiveFileLocation(null);
+                }}
                 onClose={closeFileTab}
               />
             ) : undefined
@@ -5628,10 +5954,12 @@ export default function App() {
               <>
                 {activeProject.name} · {snapshot.git.branch}
               </>
+            ) : screen === "scheduled" ? (
+              <>Runs locally while Integrator is open</>
             ) : undefined
           }
           leading={
-            screen === "workspace" ? (
+            screen === "workspace" || screen === "scheduled" ? (
               <button
                 className="icon-button subtle"
                 type="button"
@@ -5643,7 +5971,7 @@ export default function App() {
             ) : undefined
           }
           tabs={
-            screen === "workspace" && !selectedDelegation ? (
+            screen === "workspace" && !selectedDelegation && activeTask?.kind !== "chat" ? (
               <div className="titlebar-view-tabs" role="tablist" aria-label="Task view">
                 <button
                   type="button"
@@ -5674,7 +6002,30 @@ export default function App() {
             ) : undefined
           }
           trailing={
-            screen === "workspace" && !selectedDelegation ? (
+            screen === "scheduled" ? (
+              <>
+                <button
+                  className="scheduled-titlebar-new"
+                  type="button"
+                  onClick={() => setScheduledCreateRequest((current) => current + 1)}
+                >
+                  New
+                </button>
+                <button
+                  className="icon-button subtle"
+                  type="button"
+                  onClick={() => setScheduledRailOpen((open) => !open)}
+                  aria-label={
+                    scheduledRailOpen
+                      ? "Close scheduled task details"
+                      : "Open scheduled task details"
+                  }
+                  aria-pressed={scheduledRailOpen}
+                >
+                  {scheduledRailOpen ? <PanelRightClose /> : <PanelRightOpen />}
+                </button>
+              </>
+            ) : screen === "workspace" && !selectedDelegation ? (
               <>
                 <button className="usage-compact" type="button" title={usagePillTitle}>
                   {usagePillPercent !== undefined ? (
@@ -5683,24 +6034,28 @@ export default function App() {
                   <span>{formatCompactTokenCount(displayedUsage.tokens)}</span>
                   <span className="sr-only"> tokens</span>
                 </button>
-                <button
-                  className="icon-button subtle"
-                  type="button"
-                  onClick={toggleTerminal}
-                  aria-label="Toggle terminal"
-                  aria-pressed={terminalOpen}
-                >
-                  <TerminalSquare />
-                </button>
-                <button
-                  className="icon-button subtle"
-                  type="button"
-                  onClick={() => setRightRailOpen((value) => !value)}
-                  aria-label={rightRailOpen ? "Close task tools" : "Open task tools"}
-                  aria-pressed={rightRailOpen}
-                >
-                  {rightRailOpen ? <PanelRightClose /> : <PanelRightOpen />}
-                </button>
+                {activeTask?.kind !== "chat" ? (
+                  <>
+                    <button
+                      className="icon-button subtle"
+                      type="button"
+                      onClick={toggleTerminal}
+                      aria-label="Toggle terminal"
+                      aria-pressed={terminalOpen}
+                    >
+                      <TerminalSquare />
+                    </button>
+                    <button
+                      className="icon-button subtle"
+                      type="button"
+                      onClick={() => setRightRailOpen((value) => !value)}
+                      aria-label={rightRailOpen ? "Close task tools" : "Open task tools"}
+                      aria-pressed={rightRailOpen}
+                    >
+                      {rightRailOpen ? <PanelRightClose /> : <PanelRightOpen />}
+                    </button>
+                  </>
+                ) : null}
               </>
             ) : undefined
           }
@@ -5709,7 +6064,13 @@ export default function App() {
           onFocusComposer={focusComposer}
           onCopyConversation={() => void copyConversation()}
           onToggleSidebar={() => setSidebarCollapsed((value) => !value)}
-          onToggleTaskTools={() => setRightRailOpen((value) => !value)}
+          onToggleTaskTools={() => {
+            if (screen === "scheduled") {
+              setScheduledRailOpen((value) => !value);
+              return;
+            }
+            setRightRailOpen((value) => !value);
+          }}
           onToggleTerminal={() => {
             toggleTerminal();
           }}
@@ -5770,6 +6131,7 @@ export default function App() {
                     onChangePreferences={setTheme}
                     onResetPreferences={resetTheme}
                     runtimeActionRequest={runtimeActionRequest}
+                    initialSection={settingsSection}
                     onRefreshRuntimes={refreshRuntimes}
                     onSettingChanged={(key, value) =>
                       setLocalSettings((current) => ({ ...current, [key]: value }))
@@ -5777,6 +6139,51 @@ export default function App() {
                     onBack={() => setScreen("workspace")}
                   />
                 </Suspense>
+              </motion.div>
+            ) : null}
+            {screen === "scheduled" ? (
+              <motion.div key="screen-scheduled" className="app-screen" {...screenFade}>
+                <main
+                  className="app-shell"
+                  id="main-content"
+                  data-sidebar-collapsed={sidebarCollapsed}
+                  data-rail-open={scheduledRailOpen}
+                  style={
+                    {
+                      "--right-rail-width": `${rightRailWidth}px`,
+                    } as CSSProperties
+                  }
+                >
+                  <AnimatePresence initial={false}>
+                    {!sidebarCollapsed ? primarySidebar("scheduled") : null}
+                  </AnimatePresence>
+                  <Suspense
+                    fallback={
+                      <div className="route-loading" role="status" aria-live="polite">
+                        Loading Scheduled…
+                      </div>
+                    }
+                  >
+                    <ScheduledView
+                      createRequest={scheduledCreateRequest}
+                      railOpen={scheduledRailOpen}
+                      onRailOpenChange={setScheduledRailOpen}
+                      rightRailWidth={rightRailWidth}
+                      onResizeRail={(delta) =>
+                        setRightRailWidth((current) => clampDimension(current - delta, 300, 520))
+                      }
+                      motionScale={motionScale}
+                      projects={snapshot.projects}
+                      tasks={snapshot.tasks}
+                      runtimes={snapshot.runtimes}
+                      activeTaskId={snapshot.activeTaskId}
+                      onOpenTask={(taskId) => {
+                        setScreen("workspace");
+                        void selectTask(taskId);
+                      }}
+                    />
+                  </Suspense>
+                </main>
               </motion.div>
             ) : null}
             {screen === "setup" ? (
@@ -5819,46 +6226,7 @@ export default function App() {
                 while the sidebar keeps its full width, so content slides
                 instead of reflowing. */}
                   <AnimatePresence initial={false}>
-                    {!sidebarCollapsed ? (
-                      <motion.div
-                        className="panel-slot panel-slot--left"
-                        key="chat-sidebar"
-                        initial={{ width: 0, opacity: 0 }}
-                        animate={{ width: "auto", opacity: 1 }}
-                        exit={{ width: 0, opacity: 0 }}
-                        transition={panelTransition}
-                      >
-                        <TaskSidebar
-                          projects={snapshot.projects}
-                          tasks={sidebarTasks}
-                          archivedTotal={archivedTotal}
-                          archivedLoading={archivedLoading}
-                          archivedHasMore={Boolean(archivedNextCursor)}
-                          onEnsureArchived={handleSidebarEnsureArchived}
-                          onLoadMoreArchived={handleSidebarLoadMoreArchived}
-                          activeProjectId={snapshot.activeProjectId}
-                          activeTaskId={snapshot.activeTaskId}
-                          metadataActionsEnabled={metadataActionsEnabled}
-                          taskActionBusyId={taskActionBusyId}
-                          onSearchMessages={handleSidebarSearchMessages}
-                          onSelectProject={handleSidebarSelectProject}
-                          onSelectTask={handleSidebarSelectTask}
-                          onNewTask={handleSidebarNewTask}
-                          onNewTaskInProject={handleSidebarNewTaskInProject}
-                          onOpenProject={handleSidebarOpenProject}
-                          openingProject={openingProject}
-                          onUpdateTask={handleSidebarUpdateTask}
-                          onCopyTask={handleSidebarCopyTask}
-                          onUpdateProject={handleSidebarUpdateProject}
-                          onDeleteProject={handleSidebarDeleteProject}
-                          onDeleteTask={handleSidebarDeleteTask}
-                          onDeleteArchivedChats={handleSidebarDeleteArchivedChats}
-                          onOpenSettings={handleSidebarOpenSettings}
-                          onResize={handleSidebarResize}
-                          sidebarMenuDirection={preferences.sidebarMenuDirection}
-                        />
-                      </motion.div>
-                    ) : null}
+                    {!sidebarCollapsed ? primarySidebar("chats") : null}
                   </AnimatePresence>
                   <div
                     ref={conversationWorkspaceRef}
@@ -5896,7 +6264,7 @@ export default function App() {
                             <div className="route-loading" role="status" aria-live="polite">
                               Loading your local workspace…
                             </div>
-                          ) : !activeProject ? (
+                          ) : !activeProject && !activeTask ? (
                             <EmptyProjectState
                               busy={openingProject}
                               onOpenProject={() => setAddProjectOpen(true)}
@@ -5906,6 +6274,11 @@ export default function App() {
                               <FileWorkspace
                                 key={activeFileTab.path}
                                 file={activeFileTab}
+                                target={
+                                  activeFileLocation?.path === activeFileTab.path
+                                    ? activeFileLocation
+                                    : undefined
+                                }
                                 editable={nativeHost}
                                 onSave={(content) => saveFileTab(activeFileTab.path, content)}
                                 onExplainSelection={explainFileSelection}
@@ -5985,6 +6358,9 @@ export default function App() {
                                           ? undefined
                                           : (eventId, body) => void editUserMessage(eventId, body)
                                       }
+                                      onCancelScheduledTask={(automationId) =>
+                                        void cancelScheduledTask(automationId)
+                                      }
                                       onOpenFile={openTranscriptFile}
                                       onAddDiffSelection={(payload) =>
                                         addSelectionToChat(payload, "diff")
@@ -6008,9 +6384,9 @@ export default function App() {
                                       diffCommitState={diffCommitState}
                                     />
                                   </Suspense>
-                                ) : (
+                                ) : activeProject ? (
                                   <EmptyTaskState project={activeProject} />
-                                )}
+                                ) : null}
                               </div>
                               {pendingApproval ? (
                                 <ApprovalControl
@@ -6103,8 +6479,10 @@ export default function App() {
                                 key={
                                   activeTask && promotingDraftTaskId !== activeTask.id
                                     ? activeTask.id
-                                    : `draft-${activeProject.id}-${newChatDraftKey}`
+                                    : `draft-${activeProject?.id ?? "chat"}-${newChatDraftKey}`
                                 }
+                                chatMode={activeTask?.kind === "chat"}
+                                taskId={activeTask?.id}
                                 runtimes={snapshot.runtimes}
                                 defaultRuntime={activeTask?.runtime ?? settingsDefaultRuntime}
                                 defaultModel={activeTask?.model ?? settingsDefaultModel}
@@ -6130,9 +6508,17 @@ export default function App() {
                                   updateActiveComposerDraft(value);
                                 }}
                                 onDraftSubmit={updateActiveComposerDraft}
-                                contextFiles={contextFilePaths}
-                                onRequestContextFiles={requestProjectFiles}
-                                workingDirectory={activeTask?.worktree ?? activeProject.path}
+                                contextFiles={activeTask?.kind === "chat" ? [] : contextFilePaths}
+                                contextChats={snapshot.tasks.filter(
+                                  (task) =>
+                                    task.kind === "chat" &&
+                                    !task.archived &&
+                                    task.id !== activeTask?.id,
+                                )}
+                                onRequestContextFiles={
+                                  activeTask?.kind === "chat" ? undefined : requestProjectFiles
+                                }
+                                workingDirectory={activeTask?.worktree ?? activeProject?.path ?? ""}
                                 insertRequest={composerInsert}
                                 onInsertHandled={(id) =>
                                   setComposerInsert((current) =>
@@ -6164,7 +6550,9 @@ export default function App() {
                                 sendDisabled={activeProjectionUnavailable}
                                 onSend={submitComposerTurn}
                                 sessionModes={
-                                  !activeProjectionUnavailable && activeTask?.runtime === "cursor"
+                                  activeTask?.kind !== "chat" &&
+                                  !activeProjectionUnavailable &&
+                                  activeTask?.runtime === "cursor"
                                     ? activeRuntimeState?.mode
                                     : undefined
                                 }
@@ -6183,8 +6571,12 @@ export default function App() {
                                     : undefined
                                 }
                                 routingDisabled={activeProjectionUnavailable}
-                                permissionDisabled={activeProjectionUnavailable}
-                                delegationDisabled={activeProjectionUnavailable}
+                                permissionDisabled={
+                                  activeProjectionUnavailable || activeTask?.kind === "chat"
+                                }
+                                delegationDisabled={
+                                  activeProjectionUnavailable || activeTask?.kind === "chat"
+                                }
                                 permissionRequest={permissionRequest}
                                 onPermissionChange={
                                   activeTask
@@ -6364,116 +6756,105 @@ export default function App() {
                       </Suspense>
                     ) : null}
                   </div>
-                  <AnimatePresence initial={false}>
-                    {showRightRail ? (
-                      <motion.div
-                        className="panel-slot panel-slot--right"
-                        key="task-tools"
-                        initial={{ width: 0, opacity: 0 }}
-                        animate={{ width: "auto", opacity: 1 }}
-                        exit={{ width: 0, opacity: 0 }}
-                        transition={panelTransition}
-                      >
-                        <Suspense
-                          fallback={
-                            <aside
-                              className="right-rail rail-loading"
-                              aria-label="Task tools"
-                              aria-busy="true"
-                            >
-                              Loading task tools…
-                            </aside>
-                          }
+                  <SlidingPanelSlot
+                    open={showRightRail}
+                    motionScale={motionScale}
+                    slotKey="task-tools"
+                  >
+                    <Suspense
+                      fallback={
+                        <aside
+                          className="right-rail rail-loading"
+                          aria-label="Task tools"
+                          aria-busy="true"
                         >
-                          <RightRail
-                            git={snapshot.git}
-                            gitLoading={gitLoading}
-                            children={snapshot.children}
-                            delegations={nativeHost ? delegations : undefined}
-                            selectedDelegationId={selectedDelegation?.id}
-                            onSelectDelegation={(delegationId) => {
-                              setSelectedDelegationId(delegationId);
-                            }}
-                            onApproveDelegation={async (delegationId) => {
-                              await bridge.approveDelegation(delegationId);
-                              await refreshDelegations(activeTaskIdRef.current);
-                            }}
-                            onDenyDelegation={async (delegationId) => {
-                              await bridge.denyDelegation(delegationId);
-                              await refreshDelegations(activeTaskIdRef.current);
-                            }}
-                            onNudgeDelegation={async (delegationId, message) => {
-                              await bridge.sendDelegationMessage(delegationId, message);
-                              await refreshDelegations(activeTaskIdRef.current);
-                            }}
-                            onStopDelegation={async (delegationId) => {
-                              await bridge.stopDelegation(delegationId);
-                              await refreshDelegations(activeTaskIdRef.current);
-                            }}
-                            usage={displayedUsage}
-                            runtime={activeTask?.runtime}
-                            subscription={activeQuota}
-                            activeFile={activeFile}
-                            projectId={activeProject?.id}
-                            projectFiles={projectFiles}
-                            projectFilesState={projectFilesState}
-                            onRequestProjectFiles={requestProjectFiles}
-                            onSelectFile={selectFile}
-                            onOpenFile={(file) => void openFileInCanvas(file)}
-                            activeFilePath={activeFileTabPath}
-                            openingFilePath={fileTabOpeningPath}
-                            onRenameProjectFile={renameProjectFile}
-                            onMentionProjectFile={mentionProjectFile}
-                            onMentionProjectFolder={mentionProjectFolder}
-                            fileOpeners={projectFileOpeners}
-                            onOpenGitFileExternal={nativeHost ? openGitFileExternal : undefined}
-                            onRevealGitFile={nativeHost ? revealGitFile : undefined}
-                            onOpenProjectFileExternal={
-                              nativeHost ? openProjectPathExternal : undefined
-                            }
-                            onRevealProjectFile={nativeHost ? revealProjectPath : undefined}
-                            onStageFile={stageFile}
-                            onStageFiles={async (paths, staged) => {
-                              if (activeTask) {
-                                const git = await bridge.stageFiles(activeTask.id, paths, staged);
-                                applyTaskGitSnapshot(activeTask.id, git);
-                                return;
-                              }
-                              if (!activeProject) return;
-                              const projectId = activeProject.id;
-                              const git = await bridge.stageProjectFiles(projectId, paths, staged);
-                              setSnapshot((current) =>
-                                current.activeProjectId === projectId && !current.activeTaskId
-                                  ? { ...current, git }
-                                  : current,
-                              );
-                            }}
-                            onCommit={commit}
-                            onGenerateCommitMessage={
-                              nativeHost && activeTask ? generateCommitMessage : undefined
-                            }
-                            onPush={push}
-                            onReviewChanges={reviewChanges}
-                            onRefreshGit={refreshGit}
-                            onInitializeGit={initializeProjectGit}
-                            onAddRemote={addGitRemote}
-                            onUpdateRemote={updateGitRemote}
-                            onRemoveRemote={removeGitRemote}
-                            onFetch={fetchGit}
-                            onPull={pullGit}
-                            onPublishBranch={publishGitBranch}
-                            onPublishGithub={publishGithubRepository}
-                            onLoadMoreGitHistory={loadMoreGitHistory}
-                            onResize={(delta) =>
-                              setRightRailWidth((current) =>
-                                clampDimension(current - delta, 300, 520),
-                              )
-                            }
-                          />
-                        </Suspense>
-                      </motion.div>
-                    ) : null}
-                  </AnimatePresence>
+                          Loading task tools…
+                        </aside>
+                      }
+                    >
+                      <RightRail
+                        git={snapshot.git}
+                        gitLoading={gitLoading}
+                        children={snapshot.children}
+                        delegations={nativeHost ? delegations : undefined}
+                        selectedDelegationId={selectedDelegation?.id}
+                        onSelectDelegation={(delegationId) => {
+                          setSelectedDelegationId(delegationId);
+                        }}
+                        onApproveDelegation={async (delegationId) => {
+                          await bridge.approveDelegation(delegationId);
+                          await refreshDelegations(activeTaskIdRef.current);
+                        }}
+                        onDenyDelegation={async (delegationId) => {
+                          await bridge.denyDelegation(delegationId);
+                          await refreshDelegations(activeTaskIdRef.current);
+                        }}
+                        onNudgeDelegation={async (delegationId, message) => {
+                          await bridge.sendDelegationMessage(delegationId, message);
+                          await refreshDelegations(activeTaskIdRef.current);
+                        }}
+                        onStopDelegation={async (delegationId) => {
+                          await bridge.stopDelegation(delegationId);
+                          await refreshDelegations(activeTaskIdRef.current);
+                        }}
+                        usage={displayedUsage}
+                        runtime={activeTask?.runtime}
+                        subscription={activeQuota}
+                        activeFile={activeFile}
+                        projectId={activeProject?.id}
+                        projectFiles={projectFiles}
+                        projectFilesState={projectFilesState}
+                        onRequestProjectFiles={requestProjectFiles}
+                        onSelectFile={selectFile}
+                        onOpenFile={(file) => void openFileInCanvas(file)}
+                        activeFilePath={activeFileTabPath}
+                        openingFilePath={fileTabOpeningPath}
+                        onRenameProjectFile={renameProjectFile}
+                        onMentionProjectFile={mentionProjectFile}
+                        onMentionProjectFolder={mentionProjectFolder}
+                        fileOpeners={projectFileOpeners}
+                        onOpenGitFileExternal={nativeHost ? openGitFileExternal : undefined}
+                        onRevealGitFile={nativeHost ? revealGitFile : undefined}
+                        onOpenProjectFileExternal={nativeHost ? openProjectPathExternal : undefined}
+                        onRevealProjectFile={nativeHost ? revealProjectPath : undefined}
+                        onStageFile={stageFile}
+                        onStageFiles={async (paths, staged) => {
+                          if (activeTask) {
+                            const git = await bridge.stageFiles(activeTask.id, paths, staged);
+                            applyTaskGitSnapshot(activeTask.id, git);
+                            return;
+                          }
+                          if (!activeProject) return;
+                          const projectId = activeProject.id;
+                          const git = await bridge.stageProjectFiles(projectId, paths, staged);
+                          setSnapshot((current) =>
+                            current.activeProjectId === projectId && !current.activeTaskId
+                              ? { ...current, git }
+                              : current,
+                          );
+                        }}
+                        onCommit={commit}
+                        onGenerateCommitMessage={
+                          nativeHost && activeTask ? generateCommitMessage : undefined
+                        }
+                        onPush={push}
+                        onReviewChanges={reviewChanges}
+                        onRefreshGit={refreshGit}
+                        onInitializeGit={initializeProjectGit}
+                        onAddRemote={addGitRemote}
+                        onUpdateRemote={updateGitRemote}
+                        onRemoveRemote={removeGitRemote}
+                        onFetch={fetchGit}
+                        onPull={pullGit}
+                        onPublishBranch={publishGitBranch}
+                        onPublishGithub={publishGithubRepository}
+                        onLoadMoreGitHistory={loadMoreGitHistory}
+                        onResize={(delta) =>
+                          setRightRailWidth((current) => clampDimension(current - delta, 300, 520))
+                        }
+                      />
+                    </Suspense>
+                  </SlidingPanelSlot>
                 </main>
               </motion.div>
             ) : null}

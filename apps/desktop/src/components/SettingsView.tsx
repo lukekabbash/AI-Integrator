@@ -17,6 +17,7 @@ import {
   ArchiveRestore,
   ArrowLeft,
   Bot,
+  Brain,
   Boxes,
   Braces,
   Folder,
@@ -65,6 +66,7 @@ import {
   type IntegratorSkillInfo,
   type IntegratorSkillsOverview,
   type LocalAppInfo,
+  type MemoryEntry,
   type ModelCatalogEntry,
   type ProjectSummary,
   type ProviderUsageSummary,
@@ -148,8 +150,9 @@ import {
   parseMcpForm,
 } from "../mcpSettings";
 
-type SettingsSection =
+export type SettingsSection =
   | "general"
+  | "memory"
   | "appearance"
   | "composer"
   | "explain"
@@ -183,6 +186,7 @@ interface SettingsViewProps {
   onChangePreferences: (patch: ThemePreferencePatch) => void;
   onResetPreferences: () => void;
   runtimeActionRequest?: RuntimeActionRequest | null;
+  initialSection?: SettingsSection;
   onRefreshRuntimes?: () => Promise<RuntimeConnection[]>;
   /** Mirrors each persisted change into the workspace immediately. */
   onSettingChanged?: (key: string, value: unknown) => void;
@@ -197,6 +201,7 @@ export interface RuntimeActionRequest {
 
 const settingsNav: Array<{ id: SettingsSection; label: string; hint: string; icon: LucideIcon }> = [
   { id: "general", label: "General", hint: "Local app and data", icon: MonitorCog },
+  { id: "memory", label: "Memory", hint: "Optional saved facts and preferences", icon: Brain },
   { id: "appearance", label: "Appearance", hint: "Themes, type, motion", icon: Palette },
   { id: "composer", label: "Composer", hint: "Send behavior", icon: Braces },
   {
@@ -237,6 +242,7 @@ const DEFAULT_SETTINGS: SettingsMap = {
   "general.autoResumeInterruptedTurns": false,
   "general.confirmExternalActions": true,
   "general.saveContextOnEdit": false,
+  "memory.enabled": false,
   "composer.enterToSend": true,
   "transcript.showModel": true,
   "transcript.showTimestamps": true,
@@ -4608,6 +4614,159 @@ function UsageSettings({
   );
 }
 
+function MemorySettings({
+  settings,
+  setSetting,
+}: {
+  settings: SettingsMap;
+  setSetting: (key: string, value: unknown) => void;
+}) {
+  const [memories, setMemories] = useState<MemoryEntry[]>([]);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [newText, setNewText] = useState("");
+  const [busyId, setBusyId] = useState("");
+  const [message, setMessage] = useState("");
+  const enabled = readSetting(settings, "memory.enabled", false);
+
+  const refresh = useCallback(async () => {
+    const entries = await bridge.listMemories();
+    setMemories(entries);
+    setDrafts(Object.fromEntries(entries.map((entry) => [entry.id, entry.text])));
+  }, []);
+
+  useEffect(() => {
+    void refresh().catch((error: unknown) =>
+      setMessage(error instanceof Error ? error.message : "Could not load memory."),
+    );
+  }, [refresh]);
+
+  const run = async (id: string, action: () => Promise<unknown>) => {
+    setBusyId(id);
+    setMessage("");
+    try {
+      await action();
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Memory could not be updated.");
+    } finally {
+      setBusyId("");
+    }
+  };
+
+  return (
+    <>
+      <div className="settings-page-heading">
+        <span>
+          <Brain />
+        </span>
+        <div>
+          <h1>Memory</h1>
+          <p>A small, transparent scratchpad of facts and preferences you control.</p>
+        </div>
+      </div>
+      <section className="settings-section memory-settings">
+        <header>
+          <h2>Saved memory</h2>
+          <p>
+            Disabled by default. When enabled, up to 20 active entries are supplied to general
+            Chats; no embeddings or API key are used.
+          </p>
+        </header>
+        <SettingRow
+          label="Use memory in Chats"
+          description="Allow qualifying Chat sessions to read this list and save explicit durable preferences through the bounded Integrator memory tool."
+        >
+          <Switch
+            checked={enabled}
+            onChange={(value) => setSetting("memory.enabled", value)}
+            label="Use memory in Chats"
+          />
+        </SettingRow>
+        <form
+          className="memory-add-row"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const text = newText.trim();
+            if (!text) return;
+            void run("new", async () => {
+              await bridge.createMemory(text);
+              setNewText("");
+            });
+          }}
+        >
+          <input
+            value={newText}
+            maxLength={500}
+            onChange={(event) => setNewText(event.target.value)}
+            placeholder="Add a preference or stable fact"
+            aria-label="New memory"
+          />
+          <button type="submit" disabled={!newText.trim() || Boolean(busyId)}>
+            <Plus /> Add
+          </button>
+        </form>
+        <div className="memory-list" aria-label="Saved memories">
+          {memories.map((memory) => (
+            <div className="memory-row" key={memory.id} data-disabled={memory.state === "disabled"}>
+              <textarea
+                value={drafts[memory.id] ?? memory.text}
+                maxLength={500}
+                rows={2}
+                aria-label="Memory text"
+                onChange={(event) =>
+                  setDrafts((current) => ({ ...current, [memory.id]: event.target.value }))
+                }
+                onBlur={() => {
+                  const text = (drafts[memory.id] ?? memory.text).trim();
+                  if (text && text !== memory.text) {
+                    void run(memory.id, () => bridge.updateMemory(memory.id, text));
+                  }
+                }}
+              />
+              <small>
+                {memory.creator === "agent" ? "Saved from Chat" : "Added by you"}
+                {memory.state === "disabled" ? " · Disabled" : ""}
+              </small>
+              <div className="memory-row-actions">
+                <button
+                  type="button"
+                  disabled={Boolean(busyId)}
+                  onClick={() =>
+                    void run(memory.id, () =>
+                      bridge.setMemoryEnabled(memory.id, memory.state !== "active"),
+                    )
+                  }
+                >
+                  {memory.state === "active" ? "Disable" : "Enable"}
+                </button>
+                <button
+                  type="button"
+                  className="danger-text-button"
+                  disabled={Boolean(busyId)}
+                  onClick={() => void run(memory.id, () => bridge.deleteMemory(memory.id))}
+                >
+                  <Trash2 /> Delete
+                </button>
+              </div>
+            </div>
+          ))}
+          {memories.length === 0 ? (
+            <p className="settings-empty">No memories saved. Chats do not infer a profile.</p>
+          ) : null}
+        </div>
+        <p className="settings-measured-note">
+          {memories.filter((memory) => memory.state === "active").length} of 20 active
+        </p>
+        {message ? (
+          <p className="settings-inline-warning" role="alert">
+            {message}
+          </p>
+        ) : null}
+      </section>
+    </>
+  );
+}
+
 interface PolicySettingsProps {
   section: "general" | "composer" | "permissions";
   settings: SettingsMap;
@@ -6039,7 +6198,7 @@ export function SettingsView(props: SettingsViewProps) {
   const reduceMotion =
     Boolean(useReducedMotion()) || document.documentElement.dataset.motion === "none";
   const [section, setSection] = useState<SettingsSection>(
-    props.runtimeActionRequest ? "models-runtimes" : "appearance",
+    props.runtimeActionRequest ? "models-runtimes" : (props.initialSection ?? "appearance"),
   );
   const [query, setQuery] = useState("");
   const [settings, setSettings] = useState<SettingsMap>(DEFAULT_SETTINGS);
@@ -6255,6 +6414,9 @@ export function SettingsView(props: SettingsViewProps) {
           ) : null}
           {section === "usage" ? (
             <UsageSettings usage={props.usage} runtimes={props.runtimes} />
+          ) : null}
+          {section === "memory" ? (
+            <MemorySettings settings={settings} setSetting={setSetting} />
           ) : null}
           {section === "archive" ? (
             <ArchiveSettings

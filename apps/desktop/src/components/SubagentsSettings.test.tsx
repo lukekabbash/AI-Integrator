@@ -8,6 +8,7 @@ const { bridgeMock } = vi.hoisted(() => ({
     listModelCatalog: vi.fn(),
     listIntegratorSkills: vi.fn(),
     listIntegratorMcps: vi.fn(),
+    generateSpecialist: vi.fn(),
   },
 }));
 
@@ -44,7 +45,14 @@ const runtimes: RuntimeConnection[] = [
 describe("Subagents settings", () => {
   beforeEach(() => {
     for (const mock of Object.values(bridgeMock)) mock.mockReset();
-    bridgeMock.listModelCatalog.mockResolvedValue([]);
+    bridgeMock.listModelCatalog.mockImplementation(async (runtime: string) => [
+      {
+        id: `${runtime}-model`,
+        label: `${runtime} model`,
+        efforts: [{ id: "high", label: "High" }],
+        defaultEffort: "high",
+      },
+    ]);
     bridgeMock.listIntegratorSkills.mockResolvedValue({
       skillsRoot: "/tmp/Skills",
       pluginsRoot: "/tmp/Plugins",
@@ -88,6 +96,39 @@ describe("Subagents settings", () => {
         },
       ],
     });
+    bridgeMock.generateSpecialist.mockResolvedValue({
+      id: "specialist-ai-security",
+      label: "Security Auditor",
+      bestFor: "Authentication and authorization review.",
+      workingGuidance: "Inspect boundaries and report concrete findings.",
+      access: "read-only",
+      serviceLevels: [
+        {
+          level: "budget",
+          enabled: false,
+          primary: { runtime: "claude", model: "claude-model", effort: "high" },
+          fallbacksEnabled: true,
+          fallbacks: [{ runtime: "codex", model: "codex-model", effort: "high" }],
+        },
+        {
+          level: "standard",
+          enabled: true,
+          primary: { runtime: "claude", model: "claude-model", effort: "high" },
+          fallbacksEnabled: true,
+          fallbacks: [{ runtime: "codex", model: "codex-model", effort: "high" }],
+        },
+        {
+          level: "premium",
+          enabled: false,
+          primary: { runtime: "claude", model: "claude-model", effort: "high" },
+          fallbacksEnabled: true,
+          fallbacks: [{ runtime: "codex", model: "codex-model", effort: "high" }],
+        },
+      ],
+      skillIds: ["design-principles"],
+      mcpServerIds: ["figma"],
+      enabled: false,
+    });
   });
 
   function renderSettings(setSetting = vi.fn()) {
@@ -127,6 +168,25 @@ describe("Subagents settings", () => {
     expect(screen.queryByText(/cost tier/i)).not.toBeInTheDocument();
   });
 
+  it("makes delegation guidance explicit and animated without hiding the prompt", async () => {
+    const setSetting = renderSettings();
+    await waitFor(() => expect(bridgeMock.listIntegratorMcps).toHaveBeenCalledOnce());
+    const trigger = screen.getByRole("button", { name: /Delegation guidance/i });
+    const guidance = screen.getByLabelText("Instructions for the lead agent");
+
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    expect(guidance).toHaveAttribute(
+      "placeholder",
+      expect.stringContaining("use read-only specialists"),
+    );
+
+    fireEvent.change(guidance, { target: { value: "Ask for exact evidence." } });
+    expect(setSetting).toHaveBeenLastCalledWith(
+      "delegation.instruction",
+      "Ask for exact evidence.",
+    );
+  });
+
   it("gives equipped Skills, Plugin skills, and MCP servers a legible hierarchy", async () => {
     renderSettings();
 
@@ -149,6 +209,61 @@ describe("Subagents settings", () => {
     expect(screen.getByRole("heading", { name: /Plugins\s*1/ })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /Individual Skills\s*3/ })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /MCP servers\s*1/ })).toBeInTheDocument();
+  });
+
+  it("creates a complete generated specialist in the disabled state", async () => {
+    const setSetting = renderSettings();
+
+    fireEvent.change(screen.getByLabelText("Describe a specialist"), {
+      target: { value: "A security reviewer with design and Figma context." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create specialist from description" }));
+
+    await waitFor(() =>
+      expect(bridgeMock.generateSpecialist).toHaveBeenCalledWith(
+        "A security reviewer with design and Figma context.",
+        { runtime: "codex", fallbacks: ["claude"] },
+        [
+          {
+            runtime: "codex",
+            models: [
+              {
+                id: "codex-model",
+                label: "codex model",
+                efforts: [{ id: "high", label: "High" }],
+                defaultEffort: "high",
+              },
+            ],
+          },
+          {
+            runtime: "claude",
+            models: [
+              {
+                id: "claude-model",
+                label: "claude model",
+                efforts: [{ id: "high", label: "High" }],
+                defaultEffort: "high",
+              },
+            ],
+          },
+        ],
+      ),
+    );
+    expect(setSetting).toHaveBeenLastCalledWith(
+      "delegation.profiles",
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "specialist-ai-security",
+          label: "Security Auditor",
+          skillIds: ["design-principles"],
+          mcpServerIds: ["figma"],
+          enabled: false,
+        }),
+      ]),
+    );
+    expect(
+      await screen.findByText("Security Auditor was created disabled. Review it, then enable it."),
+    ).toBeInTheDocument();
   });
 
   it("assigns a whole plugin as an exact snapshot of its current skills", async () => {

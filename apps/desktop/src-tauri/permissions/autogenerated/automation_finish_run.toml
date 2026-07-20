@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-automation-finish-run"
+description = "Enables the automation_finish_run command without any pre-configured scope."
+commands.allow = ["automation_finish_run"]
+
+[[permission]]
+identifier = "deny-automation-finish-run"
+description = "Denies the automation_finish_run command without any pre-configured scope."
+commands.deny = ["automation_finish_run"]

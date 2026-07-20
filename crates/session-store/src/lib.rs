@@ -8,18 +8,22 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use integrator_core::{
-    ArchivedTaskPage, ComposerDraft, ComposerDraftAttachment, ComposerDraftOwner, IntegratorError,
-    LocalExport, NewQueuedMessage, NewTask, ProjectId, ProviderKind, ProviderResumeState,
-    ProviderSession, ProviderSessionId, QueuedMessage, QueuedMessageId, QueuedMessageState, Result,
-    RuntimeSession, RuntimeSessionId, Setting, Task, TaskId, TaskState, TrustedProject,
-    UsageProjection,
+    ArchivedTaskPage, ChatContextReference, ComposerDraft, ComposerDraftAttachment,
+    ComposerDraftOwner, ContextReferenceId, IntegratorError, LocalExport, MemoryCreator,
+    MemoryEntry, MemoryId, MemoryState, NewMemoryEntry, NewQueuedMessage, NewTask, ProjectId,
+    ProviderKind, ProviderResumeState, ProviderSession, ProviderSessionId, QueuedMessage,
+    QueuedMessageId, QueuedMessageState, Result, RuntimeSession, RuntimeSessionId, Setting, Task,
+    TaskContextReference, TaskId, TaskKind, TaskState, TrustedProject, UsageProjection,
 };
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
+mod automation_store;
 mod delegation_store;
 mod projection_store;
+pub use automation_store::{NewAutomation, UpdateAutomation};
 pub use delegation_store::NewDelegation;
 pub use projection_store::{
     HANDOFF_CHILD_MAX_TOKENS, HANDOFF_DEFAULT_MAX_IMAGES, HANDOFF_DEFAULT_MAX_TOKENS,
@@ -770,6 +774,199 @@ const MIGRATIONS: &[(i64, &str)] = &[
         );
         "#,
     ),
+    (
+        21,
+        r#"
+        CREATE TABLE automations (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            target_json TEXT NOT NULL,
+            trigger_json TEXT NOT NULL,
+            route_json TEXT NOT NULL,
+            source TEXT NOT NULL CHECK (source IN ('user', 'agent')),
+            recurrence_user_request TEXT,
+            status TEXT NOT NULL CHECK (status IN (
+                'active', 'paused', 'running', 'completed', 'needs-attention', 'cancelled'
+            )),
+            next_run_at TEXT,
+            last_run_at TEXT,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX automations_task_idx ON automations(task_id, created_at DESC);
+        CREATE INDEX automations_pending_idx ON automations(status, next_run_at)
+            WHERE status = 'active';
+
+        CREATE TABLE automation_runs (
+            id TEXT PRIMARY KEY,
+            automation_id TEXT NOT NULL REFERENCES automations(id) ON DELETE CASCADE,
+            scheduled_for TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('claimed', 'dispatched', 'failed')),
+            dispatch_ref TEXT,
+            error TEXT,
+            claimed_at TEXT NOT NULL,
+            finished_at TEXT
+        );
+        CREATE INDEX automation_runs_automation_idx
+            ON automation_runs(automation_id, claimed_at DESC);
+        "#,
+    ),
+    (
+        22,
+        r#"
+        DROP TRIGGER codex_items_fts_insert;
+        DROP TRIGGER codex_items_fts_delete;
+        DROP TRIGGER codex_items_fts_update_delete;
+        DROP TRIGGER codex_items_fts_update_insert;
+        DROP TABLE codex_items_fts;
+
+        DROP INDEX codex_approvals_transport_idx;
+        DROP INDEX codex_event_task_seq_idx;
+        DROP INDEX codex_turns_task_snapshot_idx;
+        DROP INDEX codex_items_task_snapshot_idx;
+        DROP INDEX codex_approvals_task_snapshot_idx;
+        DROP INDEX codex_items_provider_stable_seq_idx;
+        DROP INDEX codex_approvals_active_process_idx;
+        DROP INDEX codex_items_native_skill_idx;
+
+        ALTER TABLE codex_turns RENAME TO integrator_turns;
+        ALTER TABLE codex_items RENAME TO integrator_items;
+        ALTER TABLE codex_approvals RENAME TO integrator_approvals;
+        ALTER TABLE codex_task_projection RENAME TO integrator_task_projection;
+        ALTER TABLE codex_event_log RENAME TO integrator_event_log;
+
+        CREATE INDEX integrator_approvals_transport_idx
+            ON integrator_approvals(runtime_session_id, request_kind, request_value);
+        CREATE INDEX integrator_event_task_seq_idx
+            ON integrator_event_log(task_id, seq);
+        CREATE INDEX integrator_turns_task_snapshot_idx
+            ON integrator_turns(task_id, last_event_seq);
+        CREATE INDEX integrator_items_task_snapshot_idx
+            ON integrator_items(task_id, last_event_seq);
+        CREATE INDEX integrator_approvals_task_snapshot_idx
+            ON integrator_approvals(task_id, last_event_seq);
+        CREATE INDEX integrator_items_provider_stable_seq_idx
+            ON integrator_items(provider_session_id, stable_id, last_event_seq DESC);
+        CREATE INDEX integrator_approvals_active_process_idx
+            ON integrator_approvals(process_id)
+            WHERE state IN ('pending', 'responding', 'response_failed');
+        CREATE INDEX integrator_items_native_skill_idx
+            ON integrator_items(native_skill)
+            WHERE native_skill IS NOT NULL;
+
+        CREATE VIRTUAL TABLE integrator_items_fts USING fts5(
+            body,
+            task_id UNINDEXED,
+            item_id UNINDEXED,
+            content='integrator_items',
+            content_rowid='rowid',
+            tokenize='unicode61 remove_diacritics 2'
+        );
+        INSERT INTO integrator_items_fts(rowid, body, task_id, item_id)
+            SELECT rowid, body, task_id, item_id
+            FROM integrator_items
+            WHERE kind IN ('user_message', 'agent_message')
+              AND status IN ('completed', 'failed', 'declined')
+              AND body IS NOT NULL
+              AND trim(body) <> '';
+
+        CREATE TRIGGER integrator_items_fts_insert AFTER INSERT ON integrator_items
+        WHEN new.kind IN ('user_message', 'agent_message')
+          AND new.status IN ('completed', 'failed', 'declined')
+          AND new.body IS NOT NULL
+          AND trim(new.body) <> ''
+        BEGIN
+            INSERT INTO integrator_items_fts(rowid, body, task_id, item_id)
+            VALUES (new.rowid, new.body, new.task_id, new.item_id);
+        END;
+
+        CREATE TRIGGER integrator_items_fts_delete AFTER DELETE ON integrator_items
+        WHEN old.kind IN ('user_message', 'agent_message')
+          AND old.status IN ('completed', 'failed', 'declined')
+          AND old.body IS NOT NULL
+          AND trim(old.body) <> ''
+        BEGIN
+            INSERT INTO integrator_items_fts(integrator_items_fts, rowid, body, task_id, item_id)
+            VALUES ('delete', old.rowid, old.body, old.task_id, old.item_id);
+        END;
+
+        CREATE TRIGGER integrator_items_fts_update_delete BEFORE UPDATE ON integrator_items
+        WHEN old.kind IN ('user_message', 'agent_message')
+          AND old.status IN ('completed', 'failed', 'declined')
+          AND old.body IS NOT NULL
+          AND trim(old.body) <> ''
+        BEGIN
+            INSERT INTO integrator_items_fts(integrator_items_fts, rowid, body, task_id, item_id)
+            VALUES ('delete', old.rowid, old.body, old.task_id, old.item_id);
+        END;
+
+        CREATE TRIGGER integrator_items_fts_update_insert AFTER UPDATE ON integrator_items
+        WHEN new.kind IN ('user_message', 'agent_message')
+          AND new.status IN ('completed', 'failed', 'declined')
+          AND new.body IS NOT NULL
+          AND trim(new.body) <> ''
+        BEGIN
+            INSERT INTO integrator_items_fts(rowid, body, task_id, item_id)
+            VALUES (new.rowid, new.body, new.task_id, new.item_id);
+        END;
+        "#,
+    ),
+    (
+        23,
+        r#"
+        ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'code'
+            CHECK (kind IN ('code', 'chat'));
+        CREATE INDEX tasks_kind_updated_at_idx
+            ON tasks(kind, archived, pinned DESC, updated_at DESC);
+
+        ALTER TABLE composer_drafts ADD COLUMN context_references_json TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE queued_messages ADD COLUMN context_references_json TEXT NOT NULL DEFAULT '[]';
+
+        CREATE TABLE task_context_references (
+            id TEXT PRIMARY KEY,
+            target_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            source_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+            source_title TEXT NOT NULL,
+            source_watermark INTEGER NOT NULL,
+            message_count INTEGER NOT NULL,
+            rendered_chars INTEGER NOT NULL,
+            rendered_sha256 TEXT NOT NULL,
+            rendered_markdown TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX task_context_references_target_idx
+            ON task_context_references(target_task_id, created_at DESC);
+        CREATE INDEX task_context_references_source_idx
+            ON task_context_references(source_task_id)
+            WHERE source_task_id IS NOT NULL;
+
+        CREATE TABLE memories (
+            id TEXT PRIMARY KEY,
+            text TEXT NOT NULL,
+            normalized_text TEXT NOT NULL UNIQUE,
+            state TEXT NOT NULL CHECK (state IN ('active', 'disabled')),
+            creator TEXT NOT NULL CHECK (creator IN ('user', 'agent')),
+            source_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+            source_item_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_used_at TEXT
+        );
+        CREATE INDEX memories_state_updated_at_idx
+            ON memories(state, updated_at DESC, id);
+        "#,
+    ),
+    (
+        24,
+        r#"
+        ALTER TABLE automations ADD COLUMN iteration_notes INTEGER NOT NULL DEFAULT 0
+            CHECK (iteration_notes IN (0, 1));
+        ALTER TABLE automations ADD COLUMN next_run_note TEXT;
+        "#,
+    ),
 ];
 
 pub struct LocalStore {
@@ -849,15 +1046,19 @@ impl LocalStore {
         let transaction = connection.transaction().map_err(storage_error)?;
         transaction
             .execute_batch(
-                "DELETE FROM queued_messages;
+                "DELETE FROM automation_runs;
+                 DELETE FROM automations;
+                 DELETE FROM task_context_references;
+                 DELETE FROM memories;
+                 DELETE FROM queued_messages;
                  DELETE FROM composer_drafts;
                  DELETE FROM delegation_messages;
                  DELETE FROM delegations;
-                 DELETE FROM codex_event_log;
-                 DELETE FROM codex_approvals;
-                 DELETE FROM codex_items;
-                 DELETE FROM codex_turns;
-                 DELETE FROM codex_task_projection;
+                 DELETE FROM integrator_event_log;
+                 DELETE FROM integrator_approvals;
+                 DELETE FROM integrator_items;
+                 DELETE FROM integrator_turns;
+                 DELETE FROM integrator_task_projection;
                  DELETE FROM commit_message_jobs;
                  DELETE FROM task_title_jobs;
                  DELETE FROM runtime_sessions;
@@ -879,12 +1080,12 @@ impl LocalStore {
             .prepare(
                 r#"
                 SELECT COALESCE(tasks.runtime, 'unknown'),
-                       COUNT(DISTINCT codex_turns.turn_id),
-                       codex_task_projection.usage_json
+                       COUNT(DISTINCT integrator_turns.turn_id),
+                       integrator_task_projection.usage_json
                 FROM tasks
-                LEFT JOIN codex_turns ON codex_turns.task_id = tasks.id
-                LEFT JOIN codex_task_projection ON codex_task_projection.task_id = tasks.id
-                GROUP BY tasks.id, tasks.runtime, codex_task_projection.usage_json
+                LEFT JOIN integrator_turns ON integrator_turns.task_id = tasks.id
+                LEFT JOIN integrator_task_projection ON integrator_task_projection.task_id = tasks.id
+                GROUP BY tasks.id, tasks.runtime, integrator_task_projection.usage_json
                 "#,
             )
             .map_err(storage_error)?;
@@ -939,7 +1140,7 @@ impl LocalStore {
         let connection = self.connection.lock();
         let mut statement = connection
             .prepare(
-                "SELECT native_skill, COUNT(DISTINCT stable_id) FROM codex_items \
+                "SELECT native_skill, COUNT(DISTINCT stable_id) FROM integrator_items \
                  WHERE native_skill IS NOT NULL GROUP BY native_skill",
             )
             .map_err(storage_error)?;
@@ -1005,6 +1206,7 @@ impl LocalStore {
         let mut project_tombstone = draft;
         project_tombstone.prompt.clear();
         project_tombstone.attachments.clear();
+        project_tombstone.context_references.clear();
         project_tombstone.selection_start = 0;
         project_tombstone.selection_end = 0;
         let (project_draft_key, _, _) = draft_identity(&project_tombstone.owner);
@@ -1031,7 +1233,7 @@ impl LocalStore {
         let connection = self.connection.lock();
         let mut statement = connection
             .prepare(
-                "SELECT project_id, task_id, prompt, attachments_json, runtime, model, effort, permission, delegation, selection_start, selection_end, revision, updated_at FROM composer_drafts ORDER BY updated_at DESC",
+                "SELECT project_id, task_id, prompt, attachments_json, context_references_json, runtime, model, effort, permission, delegation, selection_start, selection_end, revision, updated_at FROM composer_drafts ORDER BY updated_at DESC",
             )
             .map_err(storage_error)?;
         let rows = statement
@@ -1043,13 +1245,14 @@ impl LocalStore {
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                     row.get::<_, String>(8)?,
-                    row.get::<_, i64>(9)?,
+                    row.get::<_, String>(9)?,
                     row.get::<_, i64>(10)?,
                     row.get::<_, i64>(11)?,
-                    row.get::<_, String>(12)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, String>(13)?,
                 ))
             })
             .map_err(storage_error)?;
@@ -1059,6 +1262,7 @@ impl LocalStore {
                 task_id,
                 prompt,
                 attachments,
+                context_references,
                 runtime,
                 model,
                 effort,
@@ -1083,6 +1287,10 @@ impl LocalStore {
                 prompt,
                 attachments: serde_json::from_str::<Vec<ComposerDraftAttachment>>(&attachments)
                     .map_err(invalid_stored)?,
+                context_references: serde_json::from_str::<Vec<ChatContextReference>>(
+                    &context_references,
+                )
+                .map_err(invalid_stored)?,
                 runtime,
                 model,
                 effort,
@@ -1284,7 +1492,7 @@ impl LocalStore {
     /// Live navigation set: non-archived tasks ordered for the sidebar.
     pub fn list_tasks(&self) -> Result<Vec<Task>> {
         self.query_tasks(
-            "SELECT id, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at FROM tasks WHERE archived = 0 ORDER BY pinned DESC, updated_at DESC",
+            "SELECT id, kind, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at FROM tasks WHERE archived = 0 ORDER BY pinned DESC, updated_at DESC",
             [],
         )
     }
@@ -1293,7 +1501,7 @@ impl LocalStore {
     /// workspace bootstrap and `task_list` stay on [`Self::list_tasks`].
     pub fn list_all_tasks(&self) -> Result<Vec<Task>> {
         self.query_tasks(
-            "SELECT id, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at FROM tasks ORDER BY pinned DESC, updated_at DESC",
+            "SELECT id, kind, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at FROM tasks ORDER BY pinned DESC, updated_at DESC",
             [],
         )
     }
@@ -1319,7 +1527,7 @@ impl LocalStore {
             let (updated_at, id) = parse_archived_cursor(cursor)?;
             let mut statement = connection
                 .prepare(
-                    "SELECT id, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at FROM tasks WHERE archived = 1 AND parent_task_id IS NULL AND (updated_at < ?1 OR (updated_at = ?1 AND id < ?2)) ORDER BY updated_at DESC, id DESC LIMIT ?3",
+                    "SELECT id, kind, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at FROM tasks WHERE archived = 1 AND parent_task_id IS NULL AND (updated_at < ?1 OR (updated_at = ?1 AND id < ?2)) ORDER BY updated_at DESC, id DESC LIMIT ?3",
                 )
                 .map_err(storage_error)?;
             let mapped = statement
@@ -1327,17 +1535,18 @@ impl LocalStore {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(2)?,
                         row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, bool>(5)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
                         row.get::<_, bool>(6)?,
-                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, bool>(7)?,
                         row.get::<_, Option<String>>(8)?,
                         row.get::<_, Option<String>>(9)?,
                         row.get::<_, Option<String>>(10)?,
-                        row.get::<_, String>(11)?,
+                        row.get::<_, Option<String>>(11)?,
                         row.get::<_, String>(12)?,
+                        row.get::<_, String>(13)?,
                     ))
                 })
                 .map_err(storage_error)?;
@@ -1347,7 +1556,7 @@ impl LocalStore {
         } else {
             let mut statement = connection
                 .prepare(
-                    "SELECT id, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at FROM tasks WHERE archived = 1 AND parent_task_id IS NULL ORDER BY updated_at DESC, id DESC LIMIT ?1",
+                    "SELECT id, kind, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at FROM tasks WHERE archived = 1 AND parent_task_id IS NULL ORDER BY updated_at DESC, id DESC LIMIT ?1",
                 )
                 .map_err(storage_error)?;
             let mapped = statement
@@ -1355,17 +1564,18 @@ impl LocalStore {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(2)?,
                         row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, bool>(5)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
                         row.get::<_, bool>(6)?,
-                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, bool>(7)?,
                         row.get::<_, Option<String>>(8)?,
                         row.get::<_, Option<String>>(9)?,
                         row.get::<_, Option<String>>(10)?,
-                        row.get::<_, String>(11)?,
+                        row.get::<_, Option<String>>(11)?,
                         row.get::<_, String>(12)?,
+                        row.get::<_, String>(13)?,
                     ))
                 })
                 .map_err(storage_error)?;
@@ -1395,17 +1605,18 @@ impl LocalStore {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, bool>(5)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
                     row.get::<_, bool>(6)?,
-                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, bool>(7)?,
                     row.get::<_, Option<String>>(8)?,
                     row.get::<_, Option<String>>(9)?,
                     row.get::<_, Option<String>>(10)?,
-                    row.get::<_, String>(11)?,
+                    row.get::<_, Option<String>>(11)?,
                     row.get::<_, String>(12)?,
+                    row.get::<_, String>(13)?,
                 ))
             })
             .map_err(storage_error)?;
@@ -1444,6 +1655,7 @@ impl LocalStore {
             task_id: input.task_id,
             prompt: input.prompt,
             attachments: input.attachments,
+            context_references: input.context_references,
             runtime: input.runtime,
             model: input.model,
             effort: input.effort,
@@ -1465,7 +1677,7 @@ impl LocalStore {
         ensure_task_exists(&connection, task_id)?;
         let mut statement = connection
             .prepare(
-                "SELECT id, task_id, prompt, attachments_json, runtime, model, effort, permission, delegation, native_action_id, position, state, created_at, updated_at FROM queued_messages WHERE task_id = ?1 ORDER BY position, created_at",
+                "SELECT id, task_id, prompt, attachments_json, context_references_json, runtime, model, effort, permission, delegation, native_action_id, position, state, created_at, updated_at FROM queued_messages WHERE task_id = ?1 ORDER BY position, created_at",
             )
             .map_err(storage_error)?;
         let rows = statement
@@ -1536,7 +1748,7 @@ impl LocalStore {
         let transaction = connection.transaction().map_err(storage_error)?;
         let row = transaction
             .query_row(
-                "SELECT id, task_id, prompt, attachments_json, runtime, model, effort, permission, delegation, native_action_id, position, state, created_at, updated_at FROM queued_messages WHERE task_id = ?1 AND id = ?2",
+                "SELECT id, task_id, prompt, attachments_json, context_references_json, runtime, model, effort, permission, delegation, native_action_id, position, state, created_at, updated_at FROM queued_messages WHERE task_id = ?1 AND id = ?2",
                 params![task_id.to_string(), message_id.to_string()],
                 parse_queued_message_row,
             )
@@ -1579,7 +1791,7 @@ impl LocalStore {
         }
         let row = connection
             .query_row(
-                "SELECT id, task_id, prompt, attachments_json, runtime, model, effort, permission, delegation, native_action_id, position, state, created_at, updated_at FROM queued_messages WHERE task_id = ?1 AND id = ?2",
+                "SELECT id, task_id, prompt, attachments_json, context_references_json, runtime, model, effort, permission, delegation, native_action_id, position, state, created_at, updated_at FROM queued_messages WHERE task_id = ?1 AND id = ?2",
                 params![task_id.to_string(), message_id.to_string()],
                 parse_queued_message_row,
             )
@@ -1866,9 +2078,8 @@ impl LocalStore {
             .ok_or_else(|| IntegratorError::InvalidInput("model is required".into()))?;
         let effort = normalize_optional_text(effort.map(str::to_owned), 64)?;
         let now = Utc::now();
-        let changed = self
-            .connection
-            .lock()
+        let connection = self.connection.lock();
+        let changed = connection
             .execute(
                 "UPDATE tasks SET runtime = ?1, model = ?2, effort = ?3, updated_at = ?4 WHERE id = ?5",
                 params![
@@ -1883,6 +2094,7 @@ impl LocalStore {
         if changed == 0 {
             return Err(IntegratorError::NotFound(format!("task {task_id}")));
         }
+        drop(connection);
         self.get_task(task_id)
     }
 
@@ -1890,23 +2102,24 @@ impl LocalStore {
         let connection = self.connection.lock();
         let row = connection
             .query_row(
-                "SELECT id, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at FROM tasks WHERE id = ?1",
+                "SELECT id, kind, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at FROM tasks WHERE id = ?1",
                 [task_id.to_string()],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(2)?,
                         row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, bool>(5)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
                         row.get::<_, bool>(6)?,
-                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, bool>(7)?,
                         row.get::<_, Option<String>>(8)?,
                         row.get::<_, Option<String>>(9)?,
                         row.get::<_, Option<String>>(10)?,
-                        row.get::<_, String>(11)?,
+                        row.get::<_, Option<String>>(11)?,
                         row.get::<_, String>(12)?,
+                        row.get::<_, String>(13)?,
                     ))
                 },
             )
@@ -1987,6 +2200,309 @@ impl LocalStore {
         .collect()
     }
 
+    /// Resolve one renderer-selected Chat reference inside the native store
+    /// and persist the exact bounded Markdown snapshot supplied to the target.
+    pub fn resolve_chat_context_reference(
+        &self,
+        target_task_id: TaskId,
+        reference: &ChatContextReference,
+    ) -> Result<TaskContextReference> {
+        const MAX_RENDERED_CHARS: usize = 64 * 1024;
+        const MAX_MESSAGES: usize = 500;
+
+        if target_task_id == reference.source_task_id {
+            return Err(IntegratorError::InvalidInput(
+                "a chat cannot reference itself".into(),
+            ));
+        }
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(storage_error)?;
+        ensure_task_exists(&transaction, target_task_id)?;
+        let (source_kind, source_title) = transaction
+            .query_row(
+                "SELECT kind, title FROM tasks WHERE id = ?1",
+                [reference.source_task_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| {
+                IntegratorError::NotFound(format!("task {}", reference.source_task_id))
+            })?;
+        if TaskKind::from_str(&source_kind)? != TaskKind::Chat {
+            return Err(IntegratorError::InvalidInput(
+                "only Chat tasks can be used as chat context".into(),
+            ));
+        }
+
+        let mut statement = transaction
+            .prepare(
+                "SELECT kind, body, last_event_seq FROM integrator_items \
+                 WHERE task_id = ?1 AND kind IN ('user_message', 'agent_message') \
+                   AND status = 'completed' AND body IS NOT NULL AND trim(body) <> '' \
+                 ORDER BY CASE WHEN first_event_seq = 0 THEN last_event_seq ELSE first_event_seq END, last_event_seq",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([reference.source_task_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(storage_error)?;
+        let mut messages = Vec::new();
+        for row in rows {
+            if messages.len() == MAX_MESSAGES {
+                return Err(IntegratorError::InvalidInput(
+                    "chat context is too large; select a smaller chat or wait for range controls"
+                        .into(),
+                ));
+            }
+            messages.push(row.map_err(storage_error)?);
+        }
+        drop(statement);
+        if messages.is_empty() {
+            return Err(IntegratorError::InvalidInput(
+                "chat context has no completed messages".into(),
+            ));
+        }
+
+        let mut markdown = format!("# Chat: {}\n", source_title.trim());
+        let mut watermark = 0_i64;
+        for (kind, body, seq) in &messages {
+            let speaker = if kind == "user_message" {
+                "User"
+            } else {
+                "Assistant"
+            };
+            markdown.push_str("\n## ");
+            markdown.push_str(speaker);
+            markdown.push_str("\n\n");
+            markdown.push_str(body.trim());
+            markdown.push('\n');
+            watermark = watermark.max(*seq);
+            if markdown.chars().count() > MAX_RENDERED_CHARS {
+                return Err(IntegratorError::InvalidInput(
+                    "chat context is too large; select a smaller chat or wait for range controls"
+                        .into(),
+                ));
+            }
+        }
+        let rendered_chars = markdown.chars().count();
+        let digest = format!("{:x}", Sha256::digest(markdown.as_bytes()));
+        let created_at = Utc::now();
+        transaction
+            .execute(
+                "INSERT INTO task_context_references(id, target_task_id, source_task_id, source_title, source_watermark, message_count, rendered_chars, rendered_sha256, rendered_markdown, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(id) DO NOTHING",
+                params![
+                    reference.id.to_string(),
+                    target_task_id.to_string(),
+                    reference.source_task_id.to_string(),
+                    source_title,
+                    watermark,
+                    messages.len() as i64,
+                    rendered_chars as i64,
+                    digest,
+                    markdown,
+                    created_at.to_rfc3339(),
+                ],
+            )
+            .map_err(storage_error)?;
+        let stored = query_context_reference(&transaction, reference.id)?;
+        if stored.target_task_id != target_task_id
+            || stored.source_task_id != Some(reference.source_task_id)
+        {
+            return Err(IntegratorError::InvalidInput(
+                "context reference id is already bound to another task".into(),
+            ));
+        }
+        transaction.commit().map_err(storage_error)?;
+        Ok(stored)
+    }
+
+    pub fn list_context_references(
+        &self,
+        target_task_id: TaskId,
+    ) -> Result<Vec<TaskContextReference>> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT id, target_task_id, source_task_id, source_title, source_watermark, message_count, rendered_chars, rendered_sha256, rendered_markdown, created_at \
+                 FROM task_context_references WHERE target_task_id = ?1 ORDER BY created_at, id",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([target_task_id.to_string()], parse_context_reference_row)
+            .map_err(storage_error)?;
+        rows.map(|row| parse_context_reference(row.map_err(storage_error)?))
+            .collect()
+    }
+
+    pub fn create_memory(&self, input: NewMemoryEntry) -> Result<MemoryEntry> {
+        let text = normalize_memory_text(&input.text)?;
+        let normalized = normalized_memory_key(&text);
+        let source_item_id = normalize_optional_text(input.source_item_id, 512)?;
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(storage_error)?;
+        if let Some(task_id) = input.source_task_id {
+            ensure_task_exists(&transaction, task_id)?;
+        }
+        ensure_memory_capacity(&transaction, None)?;
+        let now = Utc::now();
+        let memory = MemoryEntry {
+            id: MemoryId::new(),
+            text,
+            state: MemoryState::Active,
+            creator: input.creator,
+            source_task_id: input.source_task_id,
+            source_item_id,
+            created_at: now,
+            updated_at: now,
+            last_used_at: None,
+        };
+        transaction
+            .execute(
+                "INSERT INTO memories(id, text, normalized_text, state, creator, source_task_id, source_item_id, created_at, updated_at, last_used_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+                params![
+                    memory.id.to_string(),
+                    &memory.text,
+                    normalized,
+                    memory.state.as_str(),
+                    memory.creator.as_str(),
+                    memory.source_task_id.map(|id| id.to_string()),
+                    &memory.source_item_id,
+                    memory.created_at.to_rfc3339(),
+                    memory.updated_at.to_rfc3339(),
+                ],
+            )
+            .map_err(|error| map_memory_write_error(error, "memory already exists"))?;
+        transaction.commit().map_err(storage_error)?;
+        Ok(memory)
+    }
+
+    pub fn list_memories(&self) -> Result<Vec<MemoryEntry>> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT id, text, state, creator, source_task_id, source_item_id, created_at, updated_at, last_used_at \
+                 FROM memories ORDER BY CASE state WHEN 'active' THEN 0 ELSE 1 END, updated_at DESC, id",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([], parse_memory_row)
+            .map_err(storage_error)?;
+        rows.map(|row| parse_memory(row.map_err(storage_error)?))
+            .collect()
+    }
+
+    pub fn update_memory_text(&self, memory_id: MemoryId, text: &str) -> Result<MemoryEntry> {
+        let text = normalize_memory_text(text)?;
+        let normalized = normalized_memory_key(&text);
+        let changed = self
+            .connection
+            .lock()
+            .execute(
+                "UPDATE memories SET text = ?1, normalized_text = ?2, updated_at = ?3 WHERE id = ?4",
+                params![text, normalized, Utc::now().to_rfc3339(), memory_id.to_string()],
+            )
+            .map_err(|error| map_memory_write_error(error, "memory already exists"))?;
+        if changed == 0 {
+            return Err(IntegratorError::NotFound(format!("memory {memory_id}")));
+        }
+        self.get_memory(memory_id)
+    }
+
+    pub fn set_memory_state(&self, memory_id: MemoryId, state: MemoryState) -> Result<MemoryEntry> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(storage_error)?;
+        if state == MemoryState::Active {
+            ensure_memory_capacity(&transaction, Some(memory_id))?;
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE memories SET state = ?1, updated_at = ?2 WHERE id = ?3",
+                params![
+                    state.as_str(),
+                    Utc::now().to_rfc3339(),
+                    memory_id.to_string()
+                ],
+            )
+            .map_err(storage_error)?;
+        if changed == 0 {
+            return Err(IntegratorError::NotFound(format!("memory {memory_id}")));
+        }
+        let memory = query_memory(&transaction, memory_id)?;
+        transaction.commit().map_err(storage_error)?;
+        Ok(memory)
+    }
+
+    pub fn delete_memory(&self, memory_id: MemoryId) -> Result<()> {
+        let changed = self
+            .connection
+            .lock()
+            .execute(
+                "DELETE FROM memories WHERE id = ?1",
+                [memory_id.to_string()],
+            )
+            .map_err(storage_error)?;
+        if changed == 0 {
+            return Err(IntegratorError::NotFound(format!("memory {memory_id}")));
+        }
+        Ok(())
+    }
+
+    pub fn active_memories_for_injection(&self) -> Result<Vec<MemoryEntry>> {
+        const TOTAL_CHAR_LIMIT: usize = 8_000;
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT id, text, state, creator, source_task_id, source_item_id, created_at, updated_at, last_used_at \
+                 FROM memories WHERE state = 'active' ORDER BY updated_at DESC, id LIMIT 20",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([], parse_memory_row)
+            .map_err(storage_error)?;
+        let mut included = Vec::new();
+        let mut used = 0;
+        for row in rows {
+            let memory = parse_memory(row.map_err(storage_error)?)?;
+            let chars = memory.text.chars().count();
+            if used + chars > TOTAL_CHAR_LIMIT {
+                break;
+            }
+            used += chars;
+            included.push(memory);
+        }
+        Ok(included)
+    }
+
+    pub fn mark_memories_used(&self, memory_ids: &[MemoryId]) -> Result<()> {
+        if memory_ids.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(storage_error)?;
+        let now = Utc::now().to_rfc3339();
+        for memory_id in memory_ids {
+            transaction
+                .execute(
+                    "UPDATE memories SET last_used_at = ?1 WHERE id = ?2 AND state = 'active'",
+                    params![&now, memory_id.to_string()],
+                )
+                .map_err(storage_error)?;
+        }
+        transaction.commit().map_err(storage_error)
+    }
+
+    fn get_memory(&self, memory_id: MemoryId) -> Result<MemoryEntry> {
+        query_memory(&self.connection.lock(), memory_id)
+    }
+
     pub fn upsert_provider_session(&self, session: &ProviderSession) -> Result<()> {
         if session.provider_thread_id.trim().is_empty() {
             return Err(IntegratorError::InvalidInput(
@@ -2045,6 +2561,8 @@ impl LocalStore {
             provider_resume_states: self.list_provider_resume_states()?,
             composer_drafts: self.list_composer_drafts()?,
             queued_messages: self.list_all_queued_messages()?,
+            context_references: self.list_all_context_references()?,
+            memories: self.list_memories()?,
         })
     }
 
@@ -2171,13 +2689,27 @@ impl LocalStore {
         let connection = self.connection.lock();
         let mut statement = connection
             .prepare(
-                "SELECT id, task_id, prompt, attachments_json, runtime, model, effort, permission, delegation, native_action_id, position, state, created_at, updated_at FROM queued_messages ORDER BY task_id, position, created_at",
+                "SELECT id, task_id, prompt, attachments_json, context_references_json, runtime, model, effort, permission, delegation, native_action_id, position, state, created_at, updated_at FROM queued_messages ORDER BY task_id, position, created_at",
             )
             .map_err(storage_error)?;
         let rows = statement
             .query_map([], parse_queued_message_row)
             .map_err(storage_error)?;
         rows.map(|row| parse_queued_message(row.map_err(storage_error)?))
+            .collect()
+    }
+
+    fn list_all_context_references(&self) -> Result<Vec<TaskContextReference>> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT id, target_task_id, source_task_id, source_title, source_watermark, message_count, rendered_chars, rendered_sha256, rendered_markdown, created_at FROM task_context_references ORDER BY created_at, id",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([], parse_context_reference_row)
+            .map_err(storage_error)?;
+        rows.map(|row| parse_context_reference(row.map_err(storage_error)?))
             .collect()
     }
 
@@ -2270,6 +2802,7 @@ fn parse_task_row(
     row: (
         String,
         String,
+        String,
         Option<String>,
         Option<String>,
         String,
@@ -2285,6 +2818,7 @@ fn parse_task_row(
 ) -> Result<Task> {
     let (
         id,
+        kind,
         title,
         repository,
         worktree,
@@ -2300,6 +2834,7 @@ fn parse_task_row(
     ) = row;
     Ok(Task {
         id: TaskId::from_str(&id).map_err(invalid_stored)?,
+        kind: TaskKind::from_str(&kind)?,
         title,
         repository_path: repository.map(Into::into),
         worktree_path: worktree.map(Into::into),
@@ -2326,9 +2861,20 @@ fn build_task(input: NewTask) -> Result<Task> {
             "task title must contain 1 to 240 characters".into(),
         ));
     }
+    if input.kind == TaskKind::Chat {
+        if input.repository_path.is_some()
+            || input.worktree_path.is_some()
+            || input.parent_task_id.is_some()
+        {
+            return Err(IntegratorError::InvalidInput(
+                "Chat tasks cannot own a repository, worktree, or parent task".into(),
+            ));
+        }
+    }
     let now = Utc::now();
     Ok(Task {
         id: TaskId::new(),
+        kind: input.kind,
         title: title.to_owned(),
         repository_path: input.repository_path,
         worktree_path: input.worktree_path,
@@ -2347,9 +2893,10 @@ fn build_task(input: NewTask) -> Result<Task> {
 fn insert_task_row(connection: &Connection, task: &Task) -> Result<()> {
     connection
         .execute(
-            "INSERT INTO tasks(id, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO tasks(id, kind, title, repository_path, worktree_path, state, pinned, archived, runtime, model, effort, parent_task_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 task.id.to_string(),
+                task.kind.as_str(),
                 &task.title,
                 path_text(task.repository_path.as_deref()),
                 path_text(task.worktree_path.as_deref()),
@@ -2381,6 +2928,7 @@ fn normalize_composer_draft(mut draft: ComposerDraft) -> Result<ComposerDraft> {
             "composer draft must not contain more than {ATTACHMENT_LIMIT} attachments"
         )));
     }
+    validate_context_references(&draft.context_references)?;
     for attachment in &draft.attachments {
         if attachment.path.is_empty()
             || attachment.path.chars().count() > 32_768
@@ -2465,6 +3013,7 @@ fn normalize_queued_message(mut input: NewQueuedMessage) -> Result<NewQueuedMess
             "queued message must not contain more than {ATTACHMENT_LIMIT} attachments"
         )));
     }
+    validate_context_references(&input.context_references)?;
     for attachment in &input.attachments {
         if attachment.path.is_empty()
             || attachment.path.chars().count() > 32_768
@@ -2533,16 +3082,45 @@ fn ensure_task_exists(connection: &Connection, task_id: TaskId) -> Result<()> {
     }
 }
 
+fn validate_context_references(references: &[ChatContextReference]) -> Result<()> {
+    const REFERENCE_LIMIT: usize = 8;
+    if references.len() > REFERENCE_LIMIT {
+        return Err(IntegratorError::InvalidInput(format!(
+            "a message cannot contain more than {REFERENCE_LIMIT} chat references"
+        )));
+    }
+    let mut ids = references
+        .iter()
+        .map(|reference| reference.id)
+        .collect::<Vec<_>>();
+    ids.sort_unstable_by_key(ToString::to_string);
+    ids.dedup();
+    if ids.len() != references.len()
+        || references.iter().any(|reference| {
+            reference.source_title.trim().is_empty()
+                || reference.source_title.chars().count() > 240
+                || reference.source_title.contains('\0')
+        })
+    {
+        return Err(IntegratorError::InvalidInput(
+            "message contains an invalid chat reference".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn insert_queued_message(connection: &Connection, message: &QueuedMessage) -> Result<()> {
     let attachments = serde_json::to_string(&message.attachments)?;
+    let context_references = serde_json::to_string(&message.context_references)?;
     connection
         .execute(
-            "INSERT INTO queued_messages(id, task_id, prompt, attachments_json, runtime, model, effort, permission, delegation, native_action_id, position, state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO queued_messages(id, task_id, prompt, attachments_json, context_references_json, runtime, model, effort, permission, delegation, native_action_id, position, state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 message.id.to_string(),
                 message.task_id.to_string(),
                 &message.prompt,
                 attachments,
+                context_references,
                 &message.runtime,
                 &message.model,
                 &message.effort,
@@ -2560,6 +3138,7 @@ fn insert_queued_message(connection: &Connection, message: &QueuedMessage) -> Re
 }
 
 type QueuedMessageRow = (
+    String,
     String,
     String,
     String,
@@ -2592,6 +3171,7 @@ fn parse_queued_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedM
         row.get(11)?,
         row.get(12)?,
         row.get(13)?,
+        row.get(14)?,
     ))
 }
 
@@ -2601,6 +3181,7 @@ fn parse_queued_message(row: QueuedMessageRow) -> Result<QueuedMessage> {
         task_id,
         prompt,
         attachments,
+        context_references,
         runtime,
         model,
         effort,
@@ -2617,6 +3198,7 @@ fn parse_queued_message(row: QueuedMessageRow) -> Result<QueuedMessage> {
         task_id: TaskId::from_str(&task_id).map_err(invalid_stored)?,
         prompt,
         attachments: serde_json::from_str(&attachments)?,
+        context_references: serde_json::from_str(&context_references)?,
         runtime,
         model,
         effort,
@@ -2675,18 +3257,21 @@ fn ensure_draft_owner(connection: &Connection, owner: &ComposerDraftOwner) -> Re
 fn write_composer_draft(connection: &Connection, draft: &ComposerDraft) -> Result<()> {
     let (draft_key, project_id, task_id) = draft_identity(&draft.owner);
     let attachments = serde_json::to_string(&draft.attachments)?;
+    let context_references = serde_json::to_string(&draft.context_references)?;
     connection
         .execute(
             r#"
             INSERT INTO composer_drafts(
-                draft_key, project_id, task_id, prompt, attachments_json, runtime, model,
-                effort, permission, delegation, selection_start, selection_end, revision, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                draft_key, project_id, task_id, prompt, attachments_json, context_references_json,
+                runtime, model, effort, permission, delegation, selection_start, selection_end,
+                revision, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
             ON CONFLICT(draft_key) DO UPDATE SET
                 project_id=excluded.project_id,
                 task_id=excluded.task_id,
                 prompt=excluded.prompt,
                 attachments_json=excluded.attachments_json,
+                context_references_json=excluded.context_references_json,
                 runtime=excluded.runtime,
                 model=excluded.model,
                 effort=excluded.effort,
@@ -2704,6 +3289,7 @@ fn write_composer_draft(connection: &Connection, draft: &ComposerDraft) -> Resul
                 task_id,
                 &draft.prompt,
                 attachments,
+                context_references,
                 &draft.runtime,
                 &draft.model,
                 &draft.effort,
@@ -2717,6 +3303,243 @@ fn write_composer_draft(connection: &Connection, draft: &ComposerDraft) -> Resul
         )
         .map_err(storage_error)?;
     Ok(())
+}
+
+type ContextReferenceRow = (
+    String,
+    String,
+    Option<String>,
+    String,
+    i64,
+    i64,
+    i64,
+    String,
+    String,
+    String,
+);
+
+fn parse_context_reference_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContextReferenceRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+    ))
+}
+
+fn parse_context_reference(row: ContextReferenceRow) -> Result<TaskContextReference> {
+    let (
+        id,
+        target_task_id,
+        source_task_id,
+        source_title,
+        source_watermark,
+        message_count,
+        rendered_chars,
+        rendered_sha256,
+        rendered_markdown,
+        created_at,
+    ) = row;
+    Ok(TaskContextReference {
+        id: ContextReferenceId::from_str(&id).map_err(invalid_stored)?,
+        target_task_id: TaskId::from_str(&target_task_id).map_err(invalid_stored)?,
+        source_task_id: source_task_id
+            .as_deref()
+            .map(TaskId::from_str)
+            .transpose()
+            .map_err(invalid_stored)?,
+        source_title,
+        source_watermark: u64::try_from(source_watermark).map_err(invalid_stored)?,
+        message_count: u32::try_from(message_count).map_err(invalid_stored)?,
+        rendered_chars: u32::try_from(rendered_chars).map_err(invalid_stored)?,
+        rendered_sha256,
+        rendered_markdown,
+        created_at: parse_time(&created_at)?,
+    })
+}
+
+fn query_context_reference(
+    connection: &Connection,
+    reference_id: ContextReferenceId,
+) -> Result<TaskContextReference> {
+    let row = connection
+        .query_row(
+            "SELECT id, target_task_id, source_task_id, source_title, source_watermark, message_count, rendered_chars, rendered_sha256, rendered_markdown, created_at \
+             FROM task_context_references WHERE id = ?1",
+            [reference_id.to_string()],
+            parse_context_reference_row,
+        )
+        .optional()
+        .map_err(storage_error)?
+        .ok_or_else(|| IntegratorError::NotFound(format!("context reference {reference_id}")))?;
+    parse_context_reference(row)
+}
+
+type MemoryRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+);
+
+fn parse_memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+    ))
+}
+
+fn parse_memory(row: MemoryRow) -> Result<MemoryEntry> {
+    let (
+        id,
+        text,
+        state,
+        creator,
+        source_task_id,
+        source_item_id,
+        created_at,
+        updated_at,
+        last_used_at,
+    ) = row;
+    Ok(MemoryEntry {
+        id: MemoryId::from_str(&id).map_err(invalid_stored)?,
+        text,
+        state: MemoryState::from_str(&state)?,
+        creator: MemoryCreator::from_str(&creator)?,
+        source_task_id: source_task_id
+            .as_deref()
+            .map(TaskId::from_str)
+            .transpose()
+            .map_err(invalid_stored)?,
+        source_item_id,
+        created_at: parse_time(&created_at)?,
+        updated_at: parse_time(&updated_at)?,
+        last_used_at: last_used_at.map(|value| parse_time(&value)).transpose()?,
+    })
+}
+
+fn query_memory(connection: &Connection, memory_id: MemoryId) -> Result<MemoryEntry> {
+    let row = connection
+        .query_row(
+            "SELECT id, text, state, creator, source_task_id, source_item_id, created_at, updated_at, last_used_at FROM memories WHERE id = ?1",
+            [memory_id.to_string()],
+            parse_memory_row,
+        )
+        .optional()
+        .map_err(storage_error)?
+        .ok_or_else(|| IntegratorError::NotFound(format!("memory {memory_id}")))?;
+    parse_memory(row)
+}
+
+fn normalize_memory_text(value: &str) -> Result<String> {
+    let text = value.trim();
+    if text.is_empty() || text.chars().count() > 500 || text.contains('\0') {
+        return Err(IntegratorError::InvalidInput(
+            "memory must contain 1 to 500 characters".into(),
+        ));
+    }
+    if looks_like_memory_secret(text) {
+        return Err(IntegratorError::InvalidInput(
+            "memory looks like a credential or secret and was not saved".into(),
+        ));
+    }
+    Ok(text.to_owned())
+}
+
+fn normalized_memory_key(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn looks_like_memory_secret(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let labeled_secret = [
+        "api_key",
+        "api key:",
+        "apikey=",
+        "password:",
+        "password=",
+        "secret:",
+        "secret=",
+        "access_token",
+        "refresh_token",
+        "authorization: bearer",
+        "-----begin private key-----",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    let openai_style_key = lower.split_whitespace().any(|word| {
+        let token = word.trim_matches(|character: char| {
+            !character.is_ascii_alphanumeric() && character != '-' && character != '_'
+        });
+        token
+            .strip_prefix("sk-")
+            .is_some_and(|suffix| suffix.len() >= 16)
+    });
+    labeled_secret || openai_style_key
+}
+
+fn ensure_memory_capacity(connection: &Connection, excluding: Option<MemoryId>) -> Result<()> {
+    let count = match excluding {
+        Some(memory_id) => connection
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE state = 'active' AND id <> ?1",
+                [memory_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(storage_error)?,
+        None => connection
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE state = 'active'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(storage_error)?,
+    };
+    if count >= 20 {
+        return Err(IntegratorError::InvalidInput(
+            "memory is full; disable or delete an entry before saving another".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn map_memory_write_error(error: rusqlite::Error, duplicate_message: &str) -> IntegratorError {
+    if matches!(
+        error,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::ConstraintViolation,
+                ..
+            },
+            _
+        )
+    ) {
+        IntegratorError::InvalidInput(duplicate_message.into())
+    } else {
+        storage_error(error)
+    }
 }
 
 fn normalize_optional_text(value: Option<String>, max_chars: usize) -> Result<Option<String>> {
@@ -2870,9 +3693,39 @@ mod tests {
             .collect()
     }
 
+    fn legacy_database_before(path: &Path, next_version: i64) -> Connection {
+        let mut connection = Connection::open(path).expect("open legacy fixture");
+        LocalStore::configure(&connection).expect("configure legacy fixture");
+        connection
+            .execute(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+                [],
+            )
+            .expect("create migration ledger");
+        let applied_at = Utc::now().to_rfc3339();
+        for (version, sql) in MIGRATIONS
+            .iter()
+            .filter(|(version, _)| *version < next_version)
+        {
+            let transaction = connection.transaction().expect("migration transaction");
+            transaction
+                .execute_batch(sql)
+                .expect("apply legacy migration");
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES (?1,?2)",
+                    params![version, applied_at],
+                )
+                .expect("record legacy migration");
+            transaction.commit().expect("commit legacy migration");
+        }
+        connection
+    }
+
     fn fork_source(store: &LocalStore) -> Task {
         store
             .create_task(NewTask {
+                kind: TaskKind::Code,
                 title: "Port the parser".into(),
                 repository_path: Some(PathBuf::from("/repo")),
                 worktree_path: None,
@@ -3199,6 +4052,7 @@ mod tests {
     fn create_naming_task(store: &LocalStore) -> Task {
         store
             .create_task(NewTask {
+                kind: TaskKind::Code,
                 title: "Coding session".into(),
                 repository_path: None,
                 worktree_path: None,
@@ -3393,6 +4247,7 @@ mod tests {
         let store = LocalStore::open_in_memory().expect("open store");
         let task = store
             .create_task(NewTask {
+                kind: TaskKind::Code,
                 title: "Implement adapter".into(),
                 repository_path: Some("C:/repo".into()),
                 worktree_path: Some("C:/worktree".into()),
@@ -3474,6 +4329,7 @@ mod tests {
         let store = LocalStore::open_in_memory().expect("open store");
         let task = store
             .create_task(NewTask {
+                kind: TaskKind::Code,
                 title: "Clearable task".into(),
                 repository_path: None,
                 worktree_path: None,
@@ -3543,6 +4399,7 @@ mod tests {
 
         store
             .create_task(NewTask {
+                kind: TaskKind::Code,
                 title: "Schema remains usable".into(),
                 repository_path: None,
                 worktree_path: None,
@@ -3572,6 +4429,232 @@ mod tests {
         let path = directory.path().join("integrator.sqlite3");
         LocalStore::open(&path).expect("first open");
         LocalStore::open(&path).expect("second open");
+    }
+
+    #[test]
+    fn provider_neutral_schema_migration_preserves_legacy_projects_and_transcripts() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("legacy-v21.sqlite3");
+        let repository = directory.path().join("legacy-project");
+        std::fs::create_dir(&repository).expect("create legacy project folder");
+        let project_id = ProjectId::new();
+        let task_id = TaskId::new();
+        let provider_session_id = ProviderSessionId::new();
+        let runtime_session_id = RuntimeSessionId::new();
+        let now = Utc::now();
+        let item = ItemProjection {
+            id: "legacy-stable-message".into(),
+            provider_item_id: "legacy-provider-message".into(),
+            kind: ItemKind::UserMessage,
+            status: ItemStatus::Completed,
+            title: None,
+            body: Some("migrationkeepsproject transcript survives".into()),
+            native_skill: None,
+            phase: None,
+            command: None,
+            cwd: None,
+            output: None,
+            exit_code: None,
+            file_changes: None,
+            mcp_server: None,
+            mcp_tool: None,
+            tool_input: None,
+            truncated: false,
+            updated_at: now,
+        };
+        let snapshot_event = RuntimeProjectionEvent {
+            seq: 1,
+            task_id,
+            provider_session_id,
+            provider: "codex".into(),
+            thread_id: "legacy-thread".into(),
+            turn_id: Some("legacy-turn".into()),
+            occurred_at: now,
+            projection: RuntimeProjection::ItemChanged { item: item.clone() },
+        };
+
+        {
+            let connection = legacy_database_before(&path, 22);
+            connection.execute(
+                "INSERT INTO trusted_projects(id,display_name,repository_root,git_common_directory,created_at,last_opened_at) VALUES (?1,'Legacy project',?2,?3,?4,?4)",
+                params![project_id.to_string(), repository.to_string_lossy(), repository.join(".git").to_string_lossy(), now.to_rfc3339()],
+            ).expect("insert legacy project");
+            connection.execute(
+                "INSERT INTO project_git_repositories(project_id,repository_root,git_common_directory) VALUES (?1,?2,?3)",
+                params![project_id.to_string(), repository.to_string_lossy(), repository.join(".git").to_string_lossy()],
+            ).expect("insert legacy project git identity");
+            connection.execute(
+                "INSERT INTO tasks(id,title,repository_path,state,runtime,created_at,updated_at) VALUES (?1,'Legacy research',?2,'ready','codex',?3,?3)",
+                params![task_id.to_string(), repository.to_string_lossy(), now.to_rfc3339()],
+            ).expect("insert legacy task");
+            connection.execute(
+                "INSERT INTO provider_sessions(id,task_id,provider,provider_thread_id,created_at,updated_at) VALUES (?1,?2,'codex','legacy-thread',?3,?3)",
+                params![provider_session_id.to_string(), task_id.to_string(), now.to_rfc3339()],
+            ).expect("insert legacy provider session");
+            connection.execute(
+                "INSERT INTO runtime_sessions(id,task_id,provider_session_id,status,started_at,ended_at,process_id) VALUES (?1,?2,?3,'completed',?4,?4,'legacy-process')",
+                params![runtime_session_id.to_string(), task_id.to_string(), provider_session_id.to_string(), now.to_rfc3339()],
+            ).expect("insert legacy runtime session");
+            connection.execute(
+                "INSERT INTO codex_task_projection(task_id,provider_session_id,thread_id,current_turn_id,process_id,last_event_seq) VALUES (?1,?2,'legacy-thread','legacy-turn','legacy-process',1)",
+                params![task_id.to_string(), provider_session_id.to_string()],
+            ).expect("insert legacy task projection");
+            connection.execute(
+                "INSERT INTO codex_items(provider_session_id,task_id,thread_id,turn_id,item_id,stable_id,kind,status,body,updated_at,projection_json,last_event_seq,first_event_seq,first_occurred_at,snapshot_event_json) VALUES (?1,?2,'legacy-thread','legacy-turn',?3,?4,'user_message','completed',?5,?6,?7,1,1,?6,?8)",
+                params![provider_session_id.to_string(), task_id.to_string(), item.provider_item_id, item.id, item.body, now.to_rfc3339(), serde_json::to_string(&item).expect("serialize item"), serde_json::to_string(&snapshot_event).expect("serialize snapshot event")],
+            ).expect("insert legacy transcript item");
+            connection.execute(
+                "INSERT INTO codex_event_log(seq,task_id,provider_session_id,runtime_session_id,process_id,thread_id,turn_id,method,audit_json,audit_truncated,projection_json,occurred_at) VALUES (1,?1,?2,?3,'legacy-process','legacy-thread','legacy-turn','item/completed','{}',0,?4,?5)",
+                params![task_id.to_string(), provider_session_id.to_string(), runtime_session_id.to_string(), serde_json::to_string(&snapshot_event).expect("serialize event"), now.to_rfc3339()],
+            ).expect("insert legacy event");
+        }
+
+        let store = LocalStore::open(&path).expect("migrate populated legacy database");
+        let connection = store.connection.lock();
+        for old_name in [
+            "codex_turns",
+            "codex_items",
+            "codex_approvals",
+            "codex_task_projection",
+            "codex_event_log",
+            "codex_items_fts",
+        ] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name=?1",
+                    [old_name],
+                    |row| row.get(0),
+                )
+                .expect("inspect legacy schema name");
+            assert_eq!(count, 0, "legacy schema object remains: {old_name}");
+        }
+        let foreign_key_failures: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .expect("check migrated foreign keys");
+        assert_eq!(foreign_key_failures, 0);
+        drop(connection);
+
+        assert_eq!(
+            store.list_trusted_projects().expect("list projects").len(),
+            1
+        );
+        assert_eq!(store.list_tasks().expect("list tasks")[0].id, task_id);
+        assert_eq!(
+            store
+                .list_provider_sessions()
+                .expect("list providers")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.list_runtime_sessions().expect("list runtimes").len(),
+            1
+        );
+        assert_eq!(
+            item_bodies(&store, task_id),
+            vec!["migrationkeepsproject transcript survives"]
+        );
+        let search = store
+            .search_task_messages("migrationkeepsproject", 10, false)
+            .expect("search migrated transcript");
+        assert_eq!(search.len(), 1);
+        assert_eq!(search[0].0, task_id);
+        drop(store);
+
+        let reopened = LocalStore::open(&path).expect("reopen migrated database");
+        assert_eq!(
+            reopened.list_tasks().expect("list reopened tasks")[0].id,
+            task_id
+        );
+        reopened.remove_task(task_id).expect("remove migrated task");
+        let connection = reopened.connection.lock();
+        for table in [
+            "integrator_turns",
+            "integrator_items",
+            "integrator_approvals",
+            "integrator_task_projection",
+            "integrator_event_log",
+        ] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("check task cascade");
+            assert_eq!(count, 0, "task rows remain in {table}");
+        }
+        drop(connection);
+        assert_eq!(
+            reopened
+                .list_trusted_projects()
+                .expect("project survives task removal")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn provider_neutral_schema_migration_rolls_back_as_one_unit() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("blocked-v21.sqlite3");
+        let task_id = TaskId::new();
+        let provider_session_id = ProviderSessionId::new();
+        let now = Utc::now().to_rfc3339();
+        {
+            let connection = legacy_database_before(&path, 22);
+            connection.execute(
+                "INSERT INTO tasks(id,title,state,created_at,updated_at) VALUES (?1,'Rollback fixture','ready',?2,?2)",
+                params![task_id.to_string(), now],
+            ).expect("insert rollback task");
+            connection.execute(
+                "INSERT INTO provider_sessions(id,task_id,provider,provider_thread_id,created_at,updated_at) VALUES (?1,?2,'codex','rollback-thread',?3,?3)",
+                params![provider_session_id.to_string(), task_id.to_string(), now],
+            ).expect("insert rollback provider session");
+            connection.execute(
+                "INSERT INTO codex_items(provider_session_id,task_id,thread_id,turn_id,item_id,stable_id,kind,status,body,updated_at,projection_json,last_event_seq) VALUES (?1,?2,'rollback-thread','rollback-turn','rollback-item','rollback-stable','user_message','completed','rollback needle',?3,'{}',1)",
+                params![provider_session_id.to_string(), task_id.to_string(), now],
+            ).expect("insert rollback item");
+            connection
+                .execute("CREATE TABLE integrator_items(blocker TEXT)", [])
+                .expect("create deliberate rename conflict");
+        }
+
+        assert!(
+            LocalStore::open(&path).is_err(),
+            "the deliberate schema conflict must reject migration 22"
+        );
+        let connection = Connection::open(&path).expect("inspect rolled-back database");
+        let migration_recorded: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version=22",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read migration ledger");
+        assert_eq!(migration_recorded, 0);
+        for old_name in ["codex_turns", "codex_items", "codex_items_fts"] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name=?1",
+                    [old_name],
+                    |row| row.get(0),
+                )
+                .expect("inspect rolled-back object");
+            assert_eq!(count, 1, "migration partially removed {old_name}");
+        }
+        let trigger_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='codex_items_fts_insert'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect rolled-back trigger");
+        assert_eq!(trigger_count, 1);
+        let item_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM codex_items", [], |row| row.get(0))
+            .expect("read rolled-back item");
+        assert_eq!(item_count, 1);
     }
 
     #[test]
@@ -3775,7 +4858,7 @@ mod tests {
         let connection = store.connection.lock();
         let remaining = connection
             .prepare(
-                "SELECT turn_id,item_id FROM codex_items
+                "SELECT turn_id,item_id FROM integrator_items
                  WHERE provider_session_id=?1 ORDER BY first_event_seq",
             )
             .expect("prepare remaining items")
@@ -3804,7 +4887,7 @@ mod tests {
         {
             let connection = store.connection.lock();
             let columns = connection
-                .prepare("PRAGMA table_info(codex_task_projection)")
+                .prepare("PRAGMA table_info(integrator_task_projection)")
                 .expect("projection columns")
                 .query_map([], |row| row.get::<_, String>(1))
                 .expect("query columns")
@@ -3822,22 +4905,22 @@ mod tests {
                 assert!(columns.contains(column), "missing {column}");
             }
             let item_indexes = connection
-                .prepare("PRAGMA index_list(codex_items)")
+                .prepare("PRAGMA index_list(integrator_items)")
                 .expect("item indexes")
                 .query_map([], |row| row.get::<_, String>(1))
                 .expect("query indexes")
                 .collect::<std::result::Result<std::collections::HashSet<_>, _>>()
                 .expect("collect indexes");
-            assert!(item_indexes.contains("codex_items_task_snapshot_idx"));
-            assert!(item_indexes.contains("codex_items_provider_stable_seq_idx"));
+            assert!(item_indexes.contains("integrator_items_task_snapshot_idx"));
+            assert!(item_indexes.contains("integrator_items_provider_stable_seq_idx"));
             let approval_indexes = connection
-                .prepare("PRAGMA index_list(codex_approvals)")
+                .prepare("PRAGMA index_list(integrator_approvals)")
                 .expect("approval indexes")
                 .query_map([], |row| row.get::<_, String>(1))
                 .expect("query approval indexes")
                 .collect::<std::result::Result<std::collections::HashSet<_>, _>>()
                 .expect("collect approval indexes");
-            assert!(approval_indexes.contains("codex_approvals_active_process_idx"));
+            assert!(approval_indexes.contains("integrator_approvals_active_process_idx"));
         }
         drop(store);
         LocalStore::open(&path).expect("idempotent reopen");
@@ -3969,7 +5052,7 @@ mod tests {
             let connection = migrated.connection.lock();
             let projection_copy: Option<String> = connection
                 .query_row(
-                    "SELECT projection_json FROM codex_event_log WHERE seq=?1",
+                    "SELECT projection_json FROM integrator_event_log WHERE seq=?1",
                     [appended.seq],
                     |row| row.get(0),
                 )
@@ -4004,6 +5087,7 @@ mod tests {
         let store = LocalStore::open_in_memory().expect("open store");
         let task = store
             .create_task(NewTask {
+                kind: TaskKind::Code,
                 title: "Persist a provider session".into(),
                 repository_path: None,
                 worktree_path: None,
@@ -4071,6 +5155,7 @@ mod tests {
         let store = LocalStore::open_in_memory().expect("open store");
         let task = store
             .create_task(NewTask {
+                kind: TaskKind::Code,
                 title: "Runtime reconciliation".into(),
                 repository_path: None,
                 worktree_path: None,
@@ -4139,6 +5224,7 @@ mod tests {
             owner,
             prompt: prompt.into(),
             attachments: Vec::new(),
+            context_references: Vec::new(),
             runtime: "codex".into(),
             model: "gpt-5.6-luna".into(),
             effort: Some("high".into()),
@@ -4156,6 +5242,7 @@ mod tests {
             task_id,
             prompt: prompt.into(),
             attachments: Vec::new(),
+            context_references: Vec::new(),
             runtime: "codex".into(),
             model: "gpt-5.6-luna".into(),
             effort: Some("high".into()),
@@ -4181,6 +5268,7 @@ mod tests {
         let project = register_draft_project(&store, &directory);
         let task = store
             .create_task(NewTask {
+                kind: TaskKind::Code,
                 title: "Existing conversation".into(),
                 repository_path: Some(project.repository_root.clone()),
                 worktree_path: None,
@@ -4290,6 +5378,7 @@ mod tests {
         let task = store
             .create_task_with_project_draft(
                 NewTask {
+                    kind: TaskKind::Code,
                     title: "Promoted chat".into(),
                     repository_path: Some(project.repository_root),
                     worktree_path: None,
@@ -4328,6 +5417,7 @@ mod tests {
         let project = register_draft_project(&store, &directory);
         let task = store
             .create_task(NewTask {
+                kind: TaskKind::Code,
                 title: "Cancellation race".into(),
                 repository_path: Some(project.repository_root),
                 worktree_path: None,
@@ -4392,6 +5482,7 @@ mod tests {
             let store = LocalStore::open(&database).expect("open store");
             let task = store
                 .create_task(NewTask {
+                    kind: TaskKind::Code,
                     title: "Queued conversation".into(),
                     repository_path: None,
                     worktree_path: None,
@@ -4403,6 +5494,7 @@ mod tests {
                 .expect("create task");
             let other = store
                 .create_task(NewTask {
+                    kind: TaskKind::Code,
                     title: "Other conversation".into(),
                     repository_path: None,
                     worktree_path: None,
@@ -4469,6 +5561,7 @@ mod tests {
         let store = LocalStore::open_in_memory().expect("open store");
         let task = store
             .create_task(NewTask {
+                kind: TaskKind::Code,
                 title: "Queue recovery".into(),
                 repository_path: None,
                 worktree_path: None,
@@ -4537,6 +5630,7 @@ mod tests {
         assert_eq!(reopened.export().expect("export").projects, projects);
         let _ = reopened
             .create_task(NewTask {
+                kind: TaskKind::Code,
                 title: "Project chat".into(),
                 repository_path: Some(repository.clone()),
                 worktree_path: None,
@@ -4576,6 +5670,7 @@ mod tests {
         let store = LocalStore::open_in_memory().expect("open store");
         let live = store
             .create_task(NewTask {
+                kind: TaskKind::Code,
                 title: "Live chat".into(),
                 repository_path: None,
                 worktree_path: None,
@@ -4587,6 +5682,7 @@ mod tests {
             .expect("create live");
         let archived = store
             .create_task(NewTask {
+                kind: TaskKind::Code,
                 title: "Archived chat".into(),
                 repository_path: None,
                 worktree_path: None,
@@ -4632,6 +5728,7 @@ mod tests {
             .expect("register project");
         let keep = store
             .create_task(NewTask {
+                kind: TaskKind::Code,
                 title: "Keep me".into(),
                 repository_path: Some(repository.clone()),
                 worktree_path: None,
@@ -4643,6 +5740,7 @@ mod tests {
             .expect("create kept task");
         let remove = store
             .create_task(NewTask {
+                kind: TaskKind::Code,
                 title: "Delete me".into(),
                 repository_path: Some(repository.clone()),
                 worktree_path: None,
@@ -4686,5 +5784,265 @@ mod tests {
             store.list_trusted_projects().expect("list projects"),
             vec![project]
         );
+    }
+
+    #[test]
+    fn chat_kind_round_trips_without_repository_identity() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let task = store
+            .create_task(NewTask {
+                kind: TaskKind::Chat,
+                title: "Research chat".into(),
+                repository_path: None,
+                worktree_path: None,
+                runtime: Some("codex".into()),
+                model: None,
+                effort: None,
+                parent_task_id: None,
+            })
+            .expect("create Chat task");
+
+        assert_eq!(task.kind, TaskKind::Chat);
+        assert_eq!(
+            store.get_task(task.id).expect("reload Chat").kind,
+            TaskKind::Chat
+        );
+        assert_eq!(
+            store.export().expect("export").tasks[0].kind,
+            TaskKind::Chat
+        );
+        let rerouted = store
+            .update_task_routing(task.id, "cursor", "composer", None)
+            .expect("reroute Chat task");
+        assert_eq!(rerouted.runtime.as_deref(), Some("cursor"));
+        assert!(matches!(
+            store.create_task(NewTask {
+                kind: TaskKind::Chat,
+                title: "Unsafe Chat".into(),
+                repository_path: Some(PathBuf::from("/tmp/project")),
+                worktree_path: None,
+                runtime: Some("cursor".into()),
+                model: None,
+                effort: None,
+                parent_task_id: None,
+            }),
+            Err(IntegratorError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn chat_context_is_a_bounded_native_markdown_snapshot() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let source = store
+            .create_task(NewTask {
+                kind: TaskKind::Chat,
+                title: "Parser research".into(),
+                repository_path: None,
+                worktree_path: None,
+                runtime: Some("codex".into()),
+                model: None,
+                effort: None,
+                parent_task_id: None,
+            })
+            .expect("create source Chat");
+        let target = store
+            .create_task(NewTask {
+                kind: TaskKind::Code,
+                title: "Implement parser".into(),
+                repository_path: None,
+                worktree_path: None,
+                runtime: Some("codex".into()),
+                model: None,
+                effort: None,
+                parent_task_id: None,
+            })
+            .expect("create target task");
+        seed_conversation(&store, source.id);
+        let input = ChatContextReference {
+            id: ContextReferenceId::new(),
+            source_task_id: source.id,
+            source_title: "renderer cannot override this".into(),
+        };
+
+        let snapshot = store
+            .resolve_chat_context_reference(target.id, &input)
+            .expect("resolve Chat context");
+        assert_eq!(snapshot.source_title, "Parser research");
+        assert_eq!(snapshot.message_count, 4);
+        assert!(
+            snapshot
+                .rendered_markdown
+                .starts_with("# Chat: Parser research\n")
+        );
+        assert!(
+            snapshot
+                .rendered_markdown
+                .contains("## User\n\nport the parser")
+        );
+        assert!(
+            snapshot
+                .rendered_markdown
+                .contains("## Assistant\n\nhere is the port")
+        );
+        assert_eq!(snapshot.rendered_sha256.len(), 64);
+
+        store.remove_task(source.id).expect("delete source Chat");
+        let persisted = store
+            .list_context_references(target.id)
+            .expect("list target context")
+            .pop()
+            .expect("persisted reference");
+        assert_eq!(persisted.source_task_id, None);
+        assert_eq!(persisted.rendered_markdown, snapshot.rendered_markdown);
+        assert_eq!(persisted.rendered_sha256, snapshot.rendered_sha256);
+    }
+
+    #[test]
+    fn chat_context_rejects_code_sources_and_self_references() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let code = store
+            .create_task(NewTask {
+                kind: TaskKind::Code,
+                title: "Code task".into(),
+                repository_path: None,
+                worktree_path: None,
+                runtime: Some("codex".into()),
+                model: None,
+                effort: None,
+                parent_task_id: None,
+            })
+            .expect("create code task");
+        seed_conversation(&store, code.id);
+        let reference = ChatContextReference {
+            id: ContextReferenceId::new(),
+            source_task_id: code.id,
+            source_title: code.title.clone(),
+        };
+        assert!(matches!(
+            store.resolve_chat_context_reference(TaskId::new(), &reference),
+            Err(IntegratorError::NotFound(_))
+        ));
+        assert!(matches!(
+            store.resolve_chat_context_reference(code.id, &reference),
+            Err(IntegratorError::InvalidInput(_))
+        ));
+
+        let target = store
+            .create_task(NewTask {
+                kind: TaskKind::Chat,
+                title: "Target".into(),
+                repository_path: None,
+                worktree_path: None,
+                runtime: Some("codex".into()),
+                model: None,
+                effort: None,
+                parent_task_id: None,
+            })
+            .expect("create target");
+        assert!(matches!(
+            store.resolve_chat_context_reference(target.id, &reference),
+            Err(IntegratorError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn memory_is_transparent_deduplicated_bounded_and_secret_averse() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let first = store
+            .create_memory(NewMemoryEntry {
+                text: "Prefers concise release notes".into(),
+                creator: MemoryCreator::User,
+                source_task_id: None,
+                source_item_id: None,
+            })
+            .expect("create memory");
+        assert!(matches!(
+            store.create_memory(NewMemoryEntry {
+                text: "  PREFERS   concise release notes  ".into(),
+                creator: MemoryCreator::Agent,
+                source_task_id: None,
+                source_item_id: None,
+            }),
+            Err(IntegratorError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            store.create_memory(NewMemoryEntry {
+                text: "API key: sk-proj-12345678901234567890".into(),
+                creator: MemoryCreator::User,
+                source_task_id: None,
+                source_item_id: None,
+            }),
+            Err(IntegratorError::InvalidInput(_))
+        ));
+        let harmless = store
+            .create_memory(NewMemoryEntry {
+                text: "Likes task-based, risk-aware plans".into(),
+                creator: MemoryCreator::User,
+                source_task_id: None,
+                source_item_id: None,
+            })
+            .expect("do not reject ordinary sk- text");
+
+        store
+            .set_memory_state(first.id, MemoryState::Disabled)
+            .expect("disable memory");
+        let injected = store
+            .active_memories_for_injection()
+            .expect("list injectable memories");
+        assert_eq!(
+            injected.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![harmless.id]
+        );
+        store
+            .mark_memories_used(&[harmless.id])
+            .expect("mark memory used");
+        assert!(
+            store
+                .list_memories()
+                .expect("list memories")
+                .into_iter()
+                .find(|entry| entry.id == harmless.id)
+                .expect("used memory")
+                .last_used_at
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn memory_enforces_twenty_active_entry_limit() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let mut memories = Vec::new();
+        for index in 0..20 {
+            memories.push(
+                store
+                    .create_memory(NewMemoryEntry {
+                        text: format!("Stable preference {index}"),
+                        creator: MemoryCreator::User,
+                        source_task_id: None,
+                        source_item_id: None,
+                    })
+                    .expect("fill memory"),
+            );
+        }
+        assert!(matches!(
+            store.create_memory(NewMemoryEntry {
+                text: "One too many".into(),
+                creator: MemoryCreator::User,
+                source_task_id: None,
+                source_item_id: None,
+            }),
+            Err(IntegratorError::InvalidInput(_))
+        ));
+        store
+            .set_memory_state(memories[0].id, MemoryState::Disabled)
+            .expect("free capacity");
+        store
+            .create_memory(NewMemoryEntry {
+                text: "Replacement preference".into(),
+                creator: MemoryCreator::User,
+                source_task_id: None,
+                source_item_id: None,
+            })
+            .expect("reuse capacity");
     }
 }

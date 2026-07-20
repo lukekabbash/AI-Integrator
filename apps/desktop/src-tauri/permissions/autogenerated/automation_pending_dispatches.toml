@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-automation-pending-dispatches"
+description = "Enables the automation_pending_dispatches command without any pre-configured scope."
+commands.allow = ["automation_pending_dispatches"]
+
+[[permission]]
+identifier = "deny-automation-pending-dispatches"
+description = "Denies the automation_pending_dispatches command without any pre-configured scope."
+commands.deny = ["automation_pending_dispatches"]

@@ -411,6 +411,22 @@ impl CodexClient {
         model: Option<&str>,
         reasoning_effort: Option<&str>,
     ) -> Result<Value> {
+        self.start_ephemeral_read_only_thread_with_overrides(
+            cwd,
+            model,
+            reasoning_effort,
+            CodexThreadOverrides::default(),
+        )
+        .await
+    }
+
+    pub async fn start_ephemeral_read_only_thread_with_overrides(
+        &self,
+        cwd: &Path,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+        overrides: CodexThreadOverrides,
+    ) -> Result<Value> {
         if !cwd.is_dir() {
             return Err(IntegratorError::InvalidInput(
                 "thread working directory does not exist".into(),
@@ -427,6 +443,17 @@ impl CodexClient {
         }
         if let Some(effort) = reasoning_effort {
             params["reasoningEffort"] = Value::String(effort.into());
+        }
+        if let Some(config) = overrides.config {
+            if !config.is_object() {
+                return Err(IntegratorError::InvalidInput(
+                    "thread config must be an object".into(),
+                ));
+            }
+            params["config"] = config;
+        }
+        if let Some(instructions) = overrides.developer_instructions {
+            params["developerInstructions"] = Value::String(instructions);
         }
         self.request("thread/start", params).await
     }

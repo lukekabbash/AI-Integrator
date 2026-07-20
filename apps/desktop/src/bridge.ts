@@ -6,6 +6,7 @@ import {
   demoGitHistoryArchive,
 } from "./demoData";
 import { resolveModelLabel } from "./modelLabel";
+import type { SpecialistSetting } from "./subagentSettings";
 
 export type RuntimeId = "codex" | "cursor" | "claude" | "grok" | "kimi" | "antigravity" | "custom";
 export type TaskStatus =
@@ -158,6 +159,8 @@ export interface ProjectSummary {
 export interface TaskSummary {
   id: string;
   projectId: string;
+  /** Persisted natively; omitted only by older browser-preview fixtures (code). */
+  kind?: "code" | "chat";
   title: string;
   status: TaskStatus;
   runtime: RuntimeId;
@@ -210,6 +213,15 @@ export interface TranscriptEvent {
   body: string;
   /** Present only when the native host verified that this user message invoked a real skill. */
   nativeSkill?: string;
+  /** Integrator-owned scheduling provenance; rendered as quiet stream activity. */
+  scheduling?: {
+    automationId: string;
+    runId?: string;
+    phase: "created" | "starting" | "prompt" | "failed";
+    canCancel?: boolean;
+    /** Fixed near-term wake time displayed as a live countdown. */
+    countdownAt?: string;
+  };
   /**
    * Codex (and compatible hosts) classify assistant text as mid-turn commentary
    * or the turn's final answer. Absent when the runtime does not emit a phase.
@@ -510,9 +522,29 @@ export interface ComposerDraftAttachment extends ContextAttachment {
   selection?: { startLine?: number; endLine?: number; text: string };
 }
 
+export interface ChatContextReference {
+  id: string;
+  sourceTaskId: string;
+  sourceTitle: string;
+}
+
+export interface TaskContextReference {
+  id: string;
+  targetTaskId: string;
+  sourceTaskId?: string;
+  sourceTitle: string;
+  sourceWatermark: number;
+  messageCount: number;
+  renderedChars: number;
+  renderedSha256: string;
+  renderedMarkdown: string;
+  createdAt: string;
+}
+
 export interface ComposerDraftValue {
   prompt: string;
   attachments: ComposerDraftAttachment[];
+  contextReferences?: ChatContextReference[];
   runtime: RuntimeId;
   model: string;
   effort?: string;
@@ -532,6 +564,7 @@ export interface QueueMessageInput {
   taskId: string;
   prompt: string;
   attachments: ComposerDraftAttachment[];
+  contextReferences?: ChatContextReference[];
   runtime: RuntimeId;
   model: string;
   effort?: string;
@@ -721,6 +754,20 @@ export interface StartTaskInput {
   draft?: ComposerDraft;
 }
 
+export type CreateChatInput = Pick<StartTaskInput, "runtime" | "model" | "effort">;
+
+export interface MemoryEntry {
+  id: string;
+  text: string;
+  state: "active" | "disabled";
+  creator: "user" | "agent";
+  sourceTaskId?: string;
+  sourceItemId?: string;
+  createdAt: string;
+  updatedAt: string;
+  lastUsedAt?: string;
+}
+
 export interface GenerateTaskTitleInput {
   taskId: string;
   prompt: string;
@@ -742,6 +789,11 @@ export interface ModelCatalogEntry {
   defaultEffort?: string;
 }
 
+export interface SpecialistRuntimeCatalog {
+  runtime: RuntimeId;
+  models: ModelCatalogEntry[];
+}
+
 /**
  * Resolve a saved effort against the selected model's advertised capability.
  * Provider catalogs are authoritative; a saved value is only reused when the
@@ -761,10 +813,98 @@ export function resolveModelEffort(
 
 export interface SendTurnInput extends Omit<StartTaskInput, "projectId"> {
   taskId: string;
+  attachments?: ComposerDraftAttachment[];
+  contextReferences?: ChatContextReference[];
   /** Opaque selection returned by listNativeProviderActions. */
   nativeActionId?: string;
   /** Continue a transport-interrupted turn from its provider-owned session. */
   resumeInterrupted?: boolean;
+}
+
+export interface AutomationRoute {
+  runtime: RuntimeId;
+  model: string;
+  effort?: string;
+  fallbacks: AutomationFallback[];
+  permission: ComposerDraftValue["permission"];
+  delegation: ComposerDraftValue["delegation"];
+}
+
+export interface AutomationFallback {
+  runtime: RuntimeId;
+  model: string;
+  effort?: string;
+}
+
+export type AutomationTarget = { kind: "task" } | { kind: "delegation"; delegationId: string };
+
+export type AutomationTrigger =
+  | { kind: "at"; runAt: string }
+  | { kind: "interval"; everySeconds: number; anchorAt: string; endAt?: string }
+  | {
+      kind: "delegationsSettled";
+      delegationIds: string[];
+      requireAll: boolean;
+      timeoutAt?: string;
+    };
+
+export interface Automation {
+  id: string;
+  taskId: string;
+  title: string;
+  prompt: string;
+  target: AutomationTarget;
+  trigger: AutomationTrigger;
+  route: AutomationRoute;
+  source: "user" | "agent";
+  recurrenceUserRequest?: string;
+  iterationNotes?: boolean;
+  nextRunNote?: string;
+  status: "active" | "paused" | "running" | "completed" | "needs-attention" | "cancelled";
+  nextRunAt?: string;
+  lastRunAt?: string;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AutomationRun {
+  id: string;
+  automationId: string;
+  scheduledFor: string;
+  status: "claimed" | "dispatched" | "failed";
+  dispatchRef?: string;
+  error?: string;
+  claimedAt: string;
+  finishedAt?: string;
+}
+
+export interface AutomationDispatch {
+  automation: Automation;
+  run: AutomationRun;
+}
+
+export interface AutomationTimelineEntry {
+  automation: Automation;
+  runs: AutomationRun[];
+}
+
+export interface AutomationWriteInput {
+  title: string;
+  prompt: string;
+  trigger: AutomationTrigger;
+  route: AutomationRoute;
+  recurrenceUserRequest?: string;
+  iterationNotes: boolean;
+}
+
+export interface AutomationCreateInput extends AutomationWriteInput {
+  taskId: string;
+  target: AutomationTarget;
+}
+
+export interface AutomationChanged {
+  taskId: string;
 }
 
 export interface TurnProjection {
@@ -1064,9 +1204,13 @@ export interface AppBridge {
   transcribeVoiceClip?(pcmBase64: string, sampleRate: number): Promise<string>;
   /** Native file picker for composer context attachments (any file on disk).
    * Images arrive with an inline preview data URL; null means cancelled. */
-  pickContextAttachments?(): Promise<ContextAttachment[] | null>;
+  pickContextAttachments?(chatTaskId?: string): Promise<ContextAttachment[] | null>;
   /** Persists a clipboard image and returns a composer-ready attachment. */
-  savePastedImageAttachment?(file: Blob, fileName?: string): Promise<ContextAttachment>;
+  savePastedImageAttachment?(
+    file: Blob,
+    fileName?: string,
+    chatTaskId?: string,
+  ): Promise<ContextAttachment>;
   /** Loads an inline preview for an image path referenced by a chat message. */
   readAttachmentPreview?(path: string): Promise<string | null>;
   exportLocalData(): Promise<unknown>;
@@ -1094,6 +1238,14 @@ export interface AppBridge {
   probeRuntimes(options?: { force?: boolean }): Promise<RuntimeConnection[]>;
   beginRuntimeLogin(runtime: RuntimeId): Promise<RuntimeConnection>;
   startTask(input: StartTaskInput): Promise<TaskSummary>;
+  /** Create a durable, projectless Chat immediately so its empty draft is crash-safe. */
+  createChat(input: CreateChatInput): Promise<TaskSummary>;
+  listTaskContextReferences(taskId: string): Promise<TaskContextReference[]>;
+  listMemories(): Promise<MemoryEntry[]>;
+  createMemory(text: string): Promise<MemoryEntry>;
+  updateMemory(memoryId: string, text: string): Promise<MemoryEntry>;
+  setMemoryEnabled(memoryId: string, enabled: boolean): Promise<MemoryEntry>;
+  deleteMemory(memoryId: string): Promise<void>;
   /**
    * Copy a chat into a new one. `throughEventId` keeps the transcript up to and
    * including that assistant reply and drops the rest; omitting it copies the
@@ -1205,6 +1357,7 @@ export interface AppBridge {
   writeTerminal(sessionId: string, data: string): Promise<void>;
   resizeTerminal(sessionId: string, dimensions: { cols: number; rows: number }): Promise<void>;
   interruptTerminal(sessionId: string): Promise<void>;
+  terminalHasForegroundProcess(sessionId: string): Promise<boolean>;
   closeTerminal(sessionId: string): Promise<void>;
   subscribeTerminalOutput(listener: (event: TerminalOutputEvent) => void): Promise<() => void>;
   listRuntimeActionPlans(runtime: RuntimeId, kind: RuntimeActionKind): Promise<RuntimeActionPlan[]>;
@@ -1236,6 +1389,21 @@ export interface AppBridge {
   /** Opens (or focuses) a second window mirroring this chat; task events broadcast to both. */
   openTaskWindow?(taskId: string): Promise<void>;
   sendTurn(input: SendTurnInput): Promise<TranscriptEvent>;
+  listAutomations(taskId?: string): Promise<Automation[]>;
+  createAutomation(input: AutomationCreateInput): Promise<Automation>;
+  updateAutomation(automationId: string, input: AutomationWriteInput): Promise<Automation>;
+  listAutomationRuns(automationId: string): Promise<AutomationRun[]>;
+  automationTimeline(taskId: string): Promise<AutomationTimelineEntry[]>;
+  pendingAutomationDispatches(): Promise<AutomationDispatch[]>;
+  setAutomationPaused(automationId: string, paused: boolean): Promise<Automation>;
+  cancelAutomation(automationId: string): Promise<Automation>;
+  runAutomationNow(automationId: string): Promise<Automation>;
+  finishAutomationRun(
+    runId: string,
+    outcome: { dispatchRef?: string; error?: string },
+  ): Promise<Automation>;
+  subscribeAutomationDue(listener: (dispatch: AutomationDispatch) => void): Promise<() => void>;
+  subscribeAutomationChanges(listener: (change: AutomationChanged) => void): Promise<() => void>;
   /** Delegated subagents of a task (native delegation broker; empty in browser mode). */
   listDelegations(taskId: string): Promise<DelegationView[]>;
   approveDelegation(delegationId: string): Promise<void>;
@@ -1304,6 +1472,14 @@ export interface AppBridge {
   /** The Integrator-plane skill inventory: user Documents roots plus bundled
    * first-party plugins, with enablement state. */
   listIntegratorSkills(): Promise<IntegratorSkillsOverview>;
+  /** Build one complete, disabled specialist from a semantic description.
+   * Native discovery supplies the exact Skill and MCP inventory; generated
+   * identities are filtered against it before this method returns. */
+  generateSpecialist(
+    description: string,
+    route: ExplainRoute,
+    modelCatalogs: SpecialistRuntimeCatalog[],
+  ): Promise<SpecialistSetting>;
   /** Clone one GitHub plugin repository (owner/name) into the user's Plugins
    * root via the GitHub CLI. Installed skills start disabled. */
   installIntegratorPlugin(repository: string): Promise<IntegratorSkillsOverview>;
@@ -1420,6 +1596,7 @@ type TauriWindow = Window & { __TAURI_INTERNALS__?: unknown };
 
 interface NativeTask {
   id: string;
+  kind: "code" | "chat";
   title: string;
   repositoryPath?: string;
   worktreePath?: string;
@@ -1467,6 +1644,8 @@ interface NativeExport {
   providerResumeStates?: NativeProviderResumeState[];
   composerDrafts?: ComposerDraft[];
   queuedMessages?: QueuedMessage[];
+  contextReferences?: TaskContextReference[];
+  memories?: MemoryEntry[];
 }
 
 interface NativeProviderResumeState {
@@ -1535,6 +1714,7 @@ interface NativeGitOverview {
 }
 
 const nativeTaskIds = new Map<string, string>();
+const nativeTaskKinds = new Map<string, "code" | "chat">();
 const repositoryByTaskId = new Map<string, string>();
 const repositoryByProjectId = new Map<string, string>();
 const nativeProjectById = new Map<string, ProjectSummary>();
@@ -1543,6 +1723,7 @@ const codexThreadByTask = new Map<string, string>();
 const activeCodexThreads = new Set<string>();
 const codexConnectedTasks = new Set<string>();
 const codexDelegationByTask = new Map<string, StartTaskInput["delegation"]>();
+const codexMemoryEnabledByTask = new Map<string, boolean>();
 const providerResumeByTask = new Map<string, NativeProviderResumeState>();
 const providerRouteByTask = new Map<
   string,
@@ -1553,6 +1734,7 @@ let cachedWorkspace: WorkspaceSnapshot | undefined;
 let cachedNativeSettings: LocalSetting[] | undefined;
 let codexCatalogConnected = false;
 let pendingMcpConfiguration: Promise<void> = Promise.resolve();
+let memoryEnabled = false;
 const MCP_REVISION_SETTING_KEY = "settings.mcp.integrator.revision";
 
 function trackMcpConfiguration<T>(operation: Promise<T>): Promise<T> {
@@ -1636,6 +1818,8 @@ const FALLBACK_MODELS: Partial<Record<RuntimeId, string[]>> = {
 
 const CHAT_TITLE_MAX_LENGTH = 54;
 export const CHAT_TITLE_PLACEHOLDER = "Coding session";
+export const GENERAL_CHAT_TITLE_PLACEHOLDER = "New chat";
+export const CHAT_PROJECT_ID = "__integrator_chats__";
 
 /**
  * Keep a new chat's label useful in the rail without copying an entire prompt
@@ -2351,11 +2535,13 @@ function mapNativeTaskSummary(
   runtimeFallback: RuntimeId = "codex",
 ): TaskSummary {
   nativeTaskIds.set(task.id, task.id);
+  nativeTaskKinds.set(task.id, task.kind);
   const reviewRoot = task.worktreePath ?? task.repositoryPath;
   if (reviewRoot) repositoryByTaskId.set(task.id, reviewRoot);
   return {
     id: task.id,
     projectId,
+    kind: task.kind,
     title: task.title,
     status: mapTaskStatus(task.state),
     runtime: mapStoredRuntime(task.runtime) ?? runtimeFallback,
@@ -2437,6 +2623,7 @@ async function loadNativeWorkspace(): Promise<WorkspaceSnapshot> {
   }, 0);
   const snapshot = createEmptySnapshot();
   nativeProjectById.clear();
+  nativeTaskKinds.clear();
   repositoryByProjectId.clear();
   const projects: ProjectSummary[] = (local.projects ?? []).map(mapProject);
   const projectByPath = new Map(projects.map((project) => [project.path, project]));
@@ -2444,8 +2631,12 @@ async function loadNativeWorkspace(): Promise<WorkspaceSnapshot> {
   codexThreadByTask.clear();
   activeCodexThreads.clear();
   codexDelegationByTask.clear();
+  codexMemoryEnabledByTask.clear();
   providerResumeByTask.clear();
   providerRouteByTask.clear();
+  memoryEnabled =
+    (local.settings ?? []).find((setting) => setting.key === "settings.memory.enabled")?.value ===
+    true;
   const mcpRevisionAt = (local.settings ?? []).find(
     (setting) => setting.key === MCP_REVISION_SETTING_KEY,
   )?.updatedAt;
@@ -2469,6 +2660,9 @@ async function loadNativeWorkspace(): Promise<WorkspaceSnapshot> {
     if (mapped) runtimeByTask.set(session.taskId, mapped);
   }
   const tasks = local.tasks.map((task) => {
+    if (task.kind === "chat") {
+      return mapNativeTaskSummary(task, CHAT_PROJECT_ID, runtimeByTask.get(task.id) ?? "codex");
+    }
     const projectPath = task.repositoryPath ?? "Local workspace";
     let project = projectByPath.get(projectPath);
     if (!project) {
@@ -2481,13 +2675,17 @@ async function loadNativeWorkspace(): Promise<WorkspaceSnapshot> {
     return mapNativeTaskSummary(task, project.id, runtimeByTask.get(task.id) ?? ("codex" as const));
   });
   const lastTaskByProject: Record<string, string> = {};
-  for (const task of tasks) lastTaskByProject[task.projectId] ??= task.id;
+  for (const task of tasks) {
+    if (task.kind === "code") lastTaskByProject[task.projectId] ??= task.id;
+  }
+  const kindByTaskId = new Map(local.tasks.map((task) => [task.id, task.kind]));
   for (const session of local.providerSessions) {
     const resume = providerResumeByTask.get(session.taskId);
     if (
       session.provider === "codex" &&
       resume?.provider === "codex" &&
-      resume.sessionRef === session.providerThreadId
+      resume.sessionRef === session.providerThreadId &&
+      kindByTaskId.get(session.taskId) !== "chat"
     ) {
       codexThreadByTask.set(session.taskId, session.providerThreadId);
     }
@@ -2537,10 +2735,12 @@ async function loadNativeWorkspace(): Promise<WorkspaceSnapshot> {
 }
 
 function repositoryForTask(taskId: string): string {
+  if (nativeTaskKinds.get(taskId) === "chat") return "";
   const knownRepository = repositoryByTaskId.get(taskId);
   if (knownRepository) return knownRepository;
   const snapshot = cachedWorkspace ?? readDemoSnapshot();
   const task = snapshot.tasks.find((item) => item.id === taskId);
+  if (task?.kind === "chat") return "";
   const project = snapshot.projects.find((item) => item.id === task?.projectId);
   if (!project?.path) throw new Error(`Task ${taskId} is not paired with a repository`);
   return project.path;
@@ -2583,8 +2783,9 @@ async function ensureNativeTask(taskId: string): Promise<string> {
   const repositoryPath = repositoryForTask(taskId);
   const created = await nativeInvoke<NativeTask>("task_create", {
     input: {
+      kind: task.kind,
       title: task.title,
-      repositoryPath,
+      repositoryPath: task.kind === "chat" ? undefined : repositoryPath,
       worktreePath: undefined,
       runtime: task.runtime,
       model: task.model,
@@ -3237,12 +3438,16 @@ async function ensureCodexThread(input: SendTurnInput): Promise<string> {
   }
   if (existing) {
     const configuredDelegation = codexDelegationByTask.get(nativeTaskId);
+    const chatMemoryChanged =
+      nativeTaskKinds.get(nativeTaskId) === "chat" &&
+      codexMemoryEnabledByTask.get(nativeTaskId) !== memoryEnabled;
     // MCP configuration is fixed when a Codex thread starts. A fresh thread
     // keeps delegation changes truthful, and the task digest carries the
     // conversation across without mutating global Codex settings.
     if (
-      configuredDelegation !== input.delegation &&
-      (configuredDelegation !== undefined || input.delegation !== "off")
+      chatMemoryChanged ||
+      (configuredDelegation !== input.delegation &&
+        (configuredDelegation !== undefined || input.delegation !== "off"))
     ) {
       return startNewCodexThread(input, nativeTaskId, cwd);
     }
@@ -3292,6 +3497,8 @@ function forgetCodexThread(taskId: string, nativeTaskId: string, threadId: strin
   if (codexThreadByTask.get(nativeTaskId) === threadId) codexThreadByTask.delete(nativeTaskId);
   codexDelegationByTask.delete(taskId);
   codexDelegationByTask.delete(nativeTaskId);
+  codexMemoryEnabledByTask.delete(taskId);
+  codexMemoryEnabledByTask.delete(nativeTaskId);
   activeCodexThreads.delete(threadId);
 }
 
@@ -3318,6 +3525,10 @@ async function startNewCodexThread(
   codexThreadByTask.set(input.taskId, threadId);
   codexDelegationByTask.set(nativeTaskId, input.delegation);
   codexDelegationByTask.set(input.taskId, input.delegation);
+  if (nativeTaskKinds.get(nativeTaskId) === "chat") {
+    codexMemoryEnabledByTask.set(nativeTaskId, memoryEnabled);
+    codexMemoryEnabledByTask.set(input.taskId, memoryEnabled);
+  }
   activeCodexThreads.add(threadId);
   const resumeState: NativeProviderResumeState = {
     taskId: nativeTaskId,
@@ -3682,6 +3893,10 @@ export const bridge: AppBridge = {
     if (isTauri()) {
       const update = async () => {
         const setting = await nativeInvoke<LocalSetting>("setting_set", { key, value });
+        if (key === "settings.memory.enabled") {
+          memoryEnabled = value === true;
+          invalidateMcpSessionCaches();
+        }
         if (key === "settings.mcp.integrator.enabled") invalidateMcpSessionCaches();
         if (cachedNativeSettings) {
           cachedNativeSettings = [
@@ -3692,6 +3907,10 @@ export const bridge: AppBridge = {
         return setting;
       };
       return key === "settings.mcp.integrator.enabled" ? trackMcpConfiguration(update()) : update();
+    }
+    if (key === "settings.memory.enabled") {
+      memoryEnabled = value === true;
+      invalidateMcpSessionCaches();
     }
     return writeBrowserSetting(key, value);
   },
@@ -3758,6 +3977,8 @@ export const bridge: AppBridge = {
       cachedNativeSettings = undefined;
       cachedWorkspace = undefined;
       nativeProjectById.clear();
+      nativeTaskKinds.clear();
+      codexMemoryEnabledByTask.clear();
       repositoryByProjectId.clear();
       return;
     }
@@ -3805,6 +4026,7 @@ export const bridge: AppBridge = {
       const workspace = cachedWorkspace ?? createEmptySnapshot();
       const projectByPath = new Map(workspace.projects.map((project) => [project.path, project]));
       const tasks = page.tasks.map((task) => {
+        if (task.kind === "chat") return mapNativeTaskSummary(task, CHAT_PROJECT_ID);
         const projectPath = task.repositoryPath ?? "Local workspace";
         let project = projectByPath.get(projectPath);
         if (!project) {
@@ -4010,8 +4232,11 @@ export const bridge: AppBridge = {
     void deleteFiles;
   },
 
-  pickContextAttachments: async () => {
+  pickContextAttachments: async (chatTaskId) => {
     if (isTauri()) {
+      if (chatTaskId) {
+        return nativeInvoke<ContextAttachment[] | null>("chat_attachment_pick", { chatTaskId });
+      }
       const { open } = await import("@tauri-apps/plugin-dialog");
       const selected = await open({
         multiple: true,
@@ -4069,7 +4294,7 @@ export const bridge: AppBridge = {
     });
   },
 
-  savePastedImageAttachment: async (file, fileName) => {
+  savePastedImageAttachment: async (file, fileName, chatTaskId) => {
     const mimeType = file.type || "image/png";
     const extension = mimeType.split("/")[1]?.split("+")[0] || "png";
     const name =
@@ -4090,6 +4315,7 @@ export const bridge: AppBridge = {
       }>("attachment_save_paste", {
         bytesBase64: btoa(binary),
         mimeType,
+        chatTaskId,
       });
       return {
         path: saved.path,
@@ -4184,6 +4410,25 @@ export const bridge: AppBridge = {
         },
       ],
     };
+  },
+
+  generateSpecialist: async (description, route, modelCatalogs) => {
+    if (!isTauri()) {
+      throw new Error("Specialist creation is available only in the native desktop app");
+    }
+    return nativeInvoke<SpecialistSetting>("specialist_generate", {
+      description,
+      route: {
+        provider: wireProvider(route.runtime),
+        model: route.model ?? null,
+        effort: route.effort ?? null,
+        fallbacks: route.fallbacks.map(wireProvider),
+      },
+      modelCatalogs: modelCatalogs.map((catalog) => ({
+        runtime: wireProvider(catalog.runtime),
+        models: catalog.models,
+      })),
+    });
   },
 
   installIntegratorPlugin: async (repository) => {
@@ -4433,6 +4678,7 @@ export const bridge: AppBridge = {
       if (!project) throw new Error(`Unknown project: ${input.projectId}`);
       const task = await nativeInvoke<NativeTask>("task_create", {
         input: {
+          kind: "code",
           title: CHAT_TITLE_PLACEHOLDER,
           repositoryPath: project.path,
           worktreePath: undefined,
@@ -4443,10 +4689,12 @@ export const bridge: AppBridge = {
         draft: input.draft,
       });
       nativeTaskIds.set(task.id, task.id);
+      nativeTaskKinds.set(task.id, "code");
       repositoryByTaskId.set(task.id, project.path);
       return {
         id: task.id,
         projectId: input.projectId,
+        kind: "code",
         title: task.title,
         status: mapTaskStatus(task.state),
         runtime: mapStoredRuntime(task.runtime) ?? input.runtime,
@@ -4458,6 +4706,7 @@ export const bridge: AppBridge = {
     return {
       id: `task-${Date.now()}`,
       projectId: input.projectId,
+      kind: "code",
       title: CHAT_TITLE_PLACEHOLDER,
       status: "running",
       runtime: input.runtime,
@@ -4467,6 +4716,65 @@ export const bridge: AppBridge = {
       unread: false,
       worktree: `ai/${new Date().toISOString().slice(0, 10)}`,
     };
+  },
+
+  createChat: async (input) => {
+    if (isTauri()) {
+      const task = await nativeInvoke<NativeTask>("task_create", {
+        input: {
+          kind: "chat",
+          title: GENERAL_CHAT_TITLE_PLACEHOLDER,
+          repositoryPath: undefined,
+          worktreePath: undefined,
+          runtime: input.runtime,
+          model: input.model,
+          effort: input.effort,
+        },
+      });
+      nativeTaskIds.set(task.id, task.id);
+      nativeTaskKinds.set(task.id, "chat");
+      return mapNativeTaskSummary(task, CHAT_PROJECT_ID, input.runtime);
+    }
+    return {
+      id: `chat-${Date.now()}`,
+      projectId: CHAT_PROJECT_ID,
+      kind: "chat",
+      title: GENERAL_CHAT_TITLE_PLACEHOLDER,
+      status: "draft",
+      runtime: input.runtime,
+      model: input.model,
+      effort: input.effort,
+      updatedAt: new Date().toISOString(),
+    };
+  },
+
+  listTaskContextReferences: async (taskId) =>
+    isTauri()
+      ? nativeInvoke<TaskContextReference[]>("task_context_reference_list", {
+          taskId: nativeTaskIds.get(taskId) ?? taskId,
+        })
+      : [],
+
+  listMemories: async () => (isTauri() ? nativeInvoke<MemoryEntry[]>("memory_list") : []),
+
+  createMemory: async (text) => {
+    if (!isTauri()) throw new Error("Memory is available in the desktop app.");
+    return nativeInvoke<MemoryEntry>("memory_create", { text });
+  },
+
+  updateMemory: async (memoryId, text) => {
+    if (!isTauri()) throw new Error("Memory is available in the desktop app.");
+    return nativeInvoke<MemoryEntry>("memory_update", { memoryId, text });
+  },
+
+  setMemoryEnabled: async (memoryId, enabled) => {
+    if (!isTauri()) throw new Error("Memory is available in the desktop app.");
+    return nativeInvoke<MemoryEntry>("memory_set_enabled", { memoryId, enabled });
+  },
+
+  deleteMemory: async (memoryId) => {
+    if (!isTauri()) throw new Error("Memory is available in the desktop app.");
+    await nativeInvoke("memory_delete", { memoryId });
   },
 
   forkTask: async (input) => {
@@ -5165,6 +5473,11 @@ export const bridge: AppBridge = {
     await nativeInvoke("terminal_interrupt", { sessionId });
   },
 
+  terminalHasForegroundProcess: async (sessionId) => {
+    if (!isTauri()) return false;
+    return nativeInvoke<boolean>("terminal_has_foreground_process", { sessionId });
+  },
+
   closeTerminal: async (sessionId) => {
     if (!isTauri()) return;
     await nativeInvoke("terminal_close", { sessionId });
@@ -5436,6 +5749,8 @@ export const bridge: AppBridge = {
               delegation: savedRoute.delegation,
             }
           : input;
+      const attachments = routedInput.attachments?.map(persistableComposerAttachment);
+      const attachmentArgs = attachments?.length ? { attachments } : {};
       if (routedInput.runtime === "codex") {
         const nativeTaskId = await ensureNativeTask(routedInput.taskId);
         let threadId: string | undefined;
@@ -5447,7 +5762,9 @@ export const bridge: AppBridge = {
             repository: repositoryForTask(routedInput.taskId),
             nativeActionId: routedInput.nativeActionId,
             delegation: routedInput.delegation,
+            contextReferences: routedInput.contextReferences,
             resumeInterrupted: routedInput.resumeInterrupted,
+            ...attachmentArgs,
           });
         try {
           threadId = await ensureCodexThread(routedInput);
@@ -5476,7 +5793,9 @@ export const bridge: AppBridge = {
             prompt: routedInput.prompt,
             delegation: routedInput.delegation,
             nativeActionId: routedInput.nativeActionId,
+            contextReferences: routedInput.contextReferences,
             resumeInterrupted: routedInput.resumeInterrupted,
+            ...attachmentArgs,
           });
         } catch (error) {
           resetCursorConnectionState(routedInput.taskId);
@@ -5493,7 +5812,9 @@ export const bridge: AppBridge = {
             prompt: routedInput.prompt,
             delegation: routedInput.delegation,
             nativeActionId: routedInput.nativeActionId,
+            contextReferences: routedInput.contextReferences,
             resumeInterrupted: routedInput.resumeInterrupted,
+            ...attachmentArgs,
           });
         } catch (error) {
           resetStandardAcpConnectionState(
@@ -5515,7 +5836,9 @@ export const bridge: AppBridge = {
           prompt: routedInput.prompt,
           delegation: routedInput.delegation,
           nativeActionId: routedInput.nativeActionId,
+          contextReferences: routedInput.contextReferences,
           resumeInterrupted: routedInput.resumeInterrupted,
+          ...attachmentArgs,
         });
       } else {
         throw new Error(
@@ -5562,6 +5885,83 @@ export const bridge: AppBridge = {
       writeDemoSnapshot(next);
     }
     return event;
+  },
+
+  listAutomations: async (taskId) => {
+    if (!isTauri()) return [];
+    return nativeInvoke<Automation[]>("automation_list", {
+      taskId: taskId ? (nativeTaskIds.get(taskId) ?? taskId) : undefined,
+    });
+  },
+
+  createAutomation: async (input) => {
+    if (!isTauri()) throw new Error("Automations require the native app");
+    return nativeInvoke<Automation>("automation_create", {
+      ...input,
+      taskId: nativeTaskIds.get(input.taskId) ?? input.taskId,
+    });
+  },
+
+  updateAutomation: async (automationId, input) => {
+    if (!isTauri()) throw new Error("Automations require the native app");
+    return nativeInvoke<Automation>("automation_update", { automationId, ...input });
+  },
+
+  listAutomationRuns: async (automationId) => {
+    if (!isTauri()) return [];
+    return nativeInvoke<AutomationRun[]>("automation_run_list", { automationId });
+  },
+
+  automationTimeline: async (taskId) => {
+    if (!isTauri()) return [];
+    return nativeInvoke<AutomationTimelineEntry[]>("automation_timeline", {
+      taskId: nativeTaskIds.get(taskId) ?? taskId,
+    });
+  },
+
+  pendingAutomationDispatches: async () => {
+    if (!isTauri()) return [];
+    return nativeInvoke<AutomationDispatch[]>("automation_pending_dispatches");
+  },
+
+  setAutomationPaused: async (automationId, paused) => {
+    if (!isTauri()) throw new Error("Automations require the native app");
+    return nativeInvoke<Automation>("automation_set_paused", { automationId, paused });
+  },
+
+  cancelAutomation: async (automationId) => {
+    if (!isTauri()) throw new Error("Automations require the native app");
+    return nativeInvoke<Automation>("automation_cancel", { automationId });
+  },
+
+  runAutomationNow: async (automationId) => {
+    if (!isTauri()) throw new Error("Automations require the native app");
+    return nativeInvoke<Automation>("automation_run_now", { automationId });
+  },
+
+  finishAutomationRun: async (runId, outcome) => {
+    if (!isTauri()) throw new Error("Automations require the native app");
+    return nativeInvoke<Automation>("automation_finish_run", {
+      runId,
+      dispatchRef: outcome.dispatchRef,
+      error: outcome.error,
+    });
+  },
+
+  subscribeAutomationDue: async (listener) => {
+    if (!isTauri()) return () => undefined;
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<AutomationDispatch>("automation://due", (event) => {
+      listener(event.payload);
+    });
+  },
+
+  subscribeAutomationChanges: async (listener) => {
+    if (!isTauri()) return () => undefined;
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<AutomationChanged>("automation://changed", (event) => {
+      listener(event.payload);
+    });
   },
 
   listDelegations: async (taskId) => {

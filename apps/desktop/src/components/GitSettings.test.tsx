@@ -135,10 +135,9 @@ describe("Git settings", () => {
 
   it("keeps every git decoration off until it is asked for", async () => {
     await openSection();
-    expect(screen.getByRole("switch", { name: "Credit AI Integrator as co-author" })).toHaveAttribute(
-      "aria-checked",
-      "false",
-    );
+    expect(
+      screen.getByRole("switch", { name: "Credit AI Integrator as co-author" }),
+    ).toHaveAttribute("aria-checked", "false");
     expect(screen.getByRole("switch", { name: "Prefix commit subjects" })).toHaveAttribute(
       "aria-checked",
       "false",

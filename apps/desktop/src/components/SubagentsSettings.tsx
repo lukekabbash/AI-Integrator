@@ -1,5 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
+import { AnimatePresence, m as motion, useReducedMotion } from "motion/react";
 import {
+  ArrowUp,
   ChevronDown,
   ChevronRight,
   CircleHelp,
@@ -22,6 +24,7 @@ import {
   type ModelCatalogEntry,
   type RuntimeConnection,
   type RuntimeId,
+  type SpecialistRuntimeCatalog,
 } from "../bridge";
 import {
   createSpecialist,
@@ -107,6 +110,36 @@ function serviceSummary(service: SpecialistService): string {
     : `${fallbackCount} fallback${fallbackCount === 1 ? "" : "s"}`;
 }
 
+function SpecialistRouteIcons({ specialist }: { specialist: SpecialistSetting }) {
+  const enabledRuntimes = [
+    ...new Set(
+      specialist.serviceLevels
+        .filter((service) => service.enabled)
+        .map((service) => service.primary.runtime),
+    ),
+  ];
+  const runtimes = enabledRuntimes.length
+    ? enabledRuntimes
+    : [
+        specialist.serviceLevels.find((service) => service.level === "standard")?.primary.runtime,
+      ].filter((runtime): runtime is string => Boolean(runtime));
+  const labels = runtimes.map(
+    (runtime) => TARGETS.find((target) => target.runtime === runtime)?.label ?? runtime,
+  );
+  return (
+    <span className="specialist-route-icons" aria-label={`Routes: ${labels.join(", ")}`}>
+      {runtimes.slice(0, 3).map((runtime) => (
+        <ProviderIcon
+          key={runtime}
+          provider={runtime}
+          label={TARGETS.find((target) => target.runtime === runtime)?.label ?? runtime}
+        />
+      ))}
+      {runtimes.length > 3 ? <small>+{runtimes.length - 3}</small> : null}
+    </span>
+  );
+}
+
 function skillPluginId(source: string, name: string): string | null {
   if (source === "integrator" || source === "missing" || !name.includes(":")) return null;
   return name.split(":")[0] ?? null;
@@ -177,6 +210,7 @@ function RouteEditor({
       <span className="specialist-route-kind">{label}</span>
       <Dropdown
         compact
+        placement="up"
         aria-label={`${label} runtime`}
         value={route.runtime}
         options={runtimeOptions}
@@ -184,6 +218,7 @@ function RouteEditor({
       />
       <Dropdown
         compact
+        placement="up"
         aria-label={`${label} model`}
         value={route.model ?? ""}
         options={modelOptions}
@@ -198,6 +233,7 @@ function RouteEditor({
       />
       <Dropdown
         compact
+        placement="up"
         aria-label={`${label} reasoning effort`}
         value={route.effort ?? ""}
         options={[
@@ -348,6 +384,11 @@ export function SubagentsSettings({
     typeof settings["delegation.instruction"] === "string"
       ? (settings["delegation.instruction"] as string)
       : "";
+  const prefersReducedMotion = useReducedMotion();
+  const guidanceMotionDisabled =
+    prefersReducedMotion ||
+    (typeof document !== "undefined" && document.documentElement.dataset.motion === "none");
+  const [guidanceOpen, setGuidanceOpen] = useState(true);
   const [selectedId, setSelectedId] = useState(specialists[0]?.id ?? "");
   const [expandedLevel, setExpandedLevel] = useState<SpecialistServiceLevel>("standard");
   const [catalogs, setCatalogs] = useState<Record<string, ModelCatalogEntry[]>>({});
@@ -356,6 +397,27 @@ export function SubagentsSettings({
   const [inventoryError, setInventoryError] = useState("");
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerSearch, setPickerSearch] = useState("");
+  const [specialistDescription, setSpecialistDescription] = useState("");
+  const [generating, setGenerating] = useState(false);
+  const [generationMessage, setGenerationMessage] = useState("");
+  const usableTargets = TARGETS.filter((target) =>
+    runtimes.some(
+      (connection) => connection.id === target.runtime && connection.status !== "not_installed",
+    ),
+  );
+  const preferredRuntime = settings["models.defaultRuntime"];
+  const [creatorRuntime, setCreatorRuntime] = useState<RuntimeId>(() => {
+    if (
+      typeof preferredRuntime === "string" &&
+      usableTargets.some((target) => target.runtime === preferredRuntime)
+    ) {
+      return preferredRuntime as RuntimeId;
+    }
+    return usableTargets[0]?.runtime ?? "codex";
+  });
+  const resolvedCreatorRuntime = usableTargets.some((target) => target.runtime === creatorRuntime)
+    ? creatorRuntime
+    : (usableTargets[0]?.runtime ?? "codex");
   const sequence = useRef(0);
 
   const selected = specialists.find((specialist) => specialist.id === selectedId) ?? specialists[0];
@@ -415,6 +477,57 @@ export function SubagentsSettings({
     save([...specialists, specialist]);
     setSelectedId(specialist.id);
     setExpandedLevel("standard");
+  };
+  const generateSpecialist = async (event: FormEvent) => {
+    event.preventDefault();
+    const description = specialistDescription.trim();
+    if (!description || generating) return;
+    if (!usableTargets.length) {
+      setGenerationMessage("Connect a runtime before creating a specialist.");
+      return;
+    }
+    setGenerating(true);
+    setGenerationMessage("");
+    try {
+      const modelCatalogs = (
+        await Promise.all(
+          usableTargets.map(async (target): Promise<SpecialistRuntimeCatalog> => ({
+            runtime: target.runtime,
+            models: (await bridge.listModelCatalog(target.runtime)).filter(
+              (entry) => entry.id.trim() && entry.id !== "Provider default",
+            ),
+          })),
+        )
+      ).filter((catalog) => catalog.models.length > 0);
+      if (modelCatalogs.length < 2) {
+        throw new Error(
+          "Connect two runtimes with available models so the specialist can have a primary route and fallback.",
+        );
+      }
+      const generatorFallback = modelCatalogs.find(
+        (catalog) => catalog.runtime !== resolvedCreatorRuntime,
+      );
+      const generated = await bridge.generateSpecialist(
+        description,
+        {
+          runtime: resolvedCreatorRuntime,
+          fallbacks: generatorFallback ? [generatorFallback.runtime] : [],
+        },
+        modelCatalogs,
+      );
+      const specialist = { ...generated, enabled: false };
+      save([...specialists, specialist]);
+      setSelectedId(specialist.id);
+      setExpandedLevel("standard");
+      setSpecialistDescription("");
+      setGenerationMessage(`${specialist.label} was created disabled. Review it, then enable it.`);
+    } catch (error) {
+      setGenerationMessage(
+        error instanceof Error ? error.message : "The specialist could not be created.",
+      );
+    } finally {
+      setGenerating(false);
+    }
   };
   const removeSelected = () => {
     if (!selected) return;
@@ -491,7 +604,9 @@ export function SubagentsSettings({
       .filter((service) => service.enabled)
       .map((service) => serviceLabel(service.level)) ?? [];
   const runtimeInstalled = (runtime: string) =>
-    runtimes.find((connection) => connection.id === runtime)?.status !== "not_installed";
+    runtimes.some(
+      (connection) => connection.id === runtime && connection.status !== "not_installed",
+    );
 
   return (
     <>
@@ -529,20 +644,68 @@ export function SubagentsSettings({
               }}
             />
           </label>
-          <details className="specialist-guidance">
-            <summary>
-              Delegation guidance <ChevronDown />
-            </summary>
-            <label>
-              <span>Standing guidance for orchestrators</span>
-              <textarea
-                rows={3}
-                value={delegationGuidance}
-                placeholder="Optional guidance for choosing and briefing specialists."
-                onChange={(event) => setSetting("delegation.instruction", event.target.value)}
-              />
-            </label>
-          </details>
+          <div className="specialist-guidance" data-open={guidanceOpen}>
+            <button
+              className="specialist-guidance-trigger"
+              type="button"
+              aria-expanded={guidanceOpen}
+              aria-controls="delegation-guidance-panel"
+              onClick={() => setGuidanceOpen((open) => !open)}
+            >
+              <span>
+                <strong>Delegation guidance</strong>
+                <small>How the lead chooses, briefs, and hears back from specialists.</small>
+              </span>
+              <motion.span
+                className="specialist-guidance-chevron"
+                animate={{ rotate: guidanceOpen ? 180 : 0 }}
+                transition={
+                  guidanceMotionDisabled
+                    ? { duration: 0 }
+                    : { type: "spring", stiffness: 520, damping: 34, mass: 0.7 }
+                }
+              >
+                <ChevronDown />
+              </motion.span>
+            </button>
+            <AnimatePresence initial={false}>
+              {guidanceOpen ? (
+                <motion.div
+                  id="delegation-guidance-panel"
+                  className="specialist-guidance-panel"
+                  initial={{ height: 0, opacity: 0, y: guidanceMotionDisabled ? 0 : -6 }}
+                  animate={{ height: "auto", opacity: 1, y: 0 }}
+                  exit={{ height: 0, opacity: 0, y: guidanceMotionDisabled ? 0 : -4 }}
+                  transition={
+                    guidanceMotionDisabled
+                      ? { duration: 0 }
+                      : {
+                          height: { duration: 0.24, ease: [0.2, 0, 0, 1] },
+                          opacity: { duration: 0.16, ease: "easeOut" },
+                          y: { duration: 0.2, ease: [0.2, 0, 0, 1] },
+                        }
+                  }
+                >
+                  <label>
+                    <span>
+                      <strong>Instructions for the lead agent</strong>
+                      <small>
+                        Set a standing rule for when to delegate, what evidence to request, and how
+                        work should be handed back.
+                      </small>
+                    </span>
+                    <textarea
+                      aria-label="Instructions for the lead agent"
+                      rows={4}
+                      value={delegationGuidance}
+                      placeholder="For example: use read-only specialists for investigations, ask for exact evidence, and keep handoffs concise."
+                      onChange={(event) => setSetting("delegation.instruction", event.target.value)}
+                    />
+                  </label>
+                </motion.div>
+              ) : null}
+            </AnimatePresence>
+          </div>
         </div>
       </section>
 
@@ -551,6 +714,51 @@ export function SubagentsSettings({
           <h2 id="specialists-title">Specialists</h2>
           <p>Choose when each specialist should be used and what it is equipped to access.</p>
         </header>
+        <form className="specialist-generator" onSubmit={generateSpecialist}>
+          <textarea
+            aria-label="Describe a specialist"
+            value={specialistDescription}
+            maxLength={6_000}
+            rows={3}
+            placeholder="Describe the work you want a specialist to own, how it should work, and what it may need."
+            onChange={(event) => setSpecialistDescription(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                event.preventDefault();
+                event.currentTarget.form?.requestSubmit();
+              }
+            }}
+          />
+          <div className="specialist-generator-controls">
+            <span>
+              <Sparkles /> Chooses models, fallback, and capabilities · starts disabled
+            </span>
+            <Dropdown
+              compact
+              placement="up"
+              aria-label="Specialist creator runtime"
+              value={resolvedCreatorRuntime}
+              options={usableTargets.map((target) => ({
+                value: target.runtime,
+                label: target.label,
+                icon: <ProviderIcon provider={target.runtime} label={target.label} />,
+              }))}
+              onChange={(runtime) => setCreatorRuntime(runtime as RuntimeId)}
+            />
+            <button
+              type="submit"
+              aria-label={generating ? "Creating specialist" : "Create specialist from description"}
+              disabled={generating || !specialistDescription.trim() || !usableTargets.length}
+            >
+              {generating ? <span aria-hidden="true">•••</span> : <ArrowUp />}
+            </button>
+          </div>
+        </form>
+        {generationMessage ? (
+          <p className="specialist-generator-message" role="status" aria-live="polite">
+            {generationMessage}
+          </p>
+        ) : null}
         <div className="specialist-workbench">
           <aside className="specialist-roster" aria-label="Specialists">
             <div
@@ -579,7 +787,7 @@ export function SubagentsSettings({
                       }
                     }}
                   >
-                    <ProviderIcon provider={primaryRuntime} label={specialist.label} />
+                    <SpecialistRouteIcons specialist={specialist} />
                     <span>
                       <strong>{specialist.label}</strong>
                       <small>

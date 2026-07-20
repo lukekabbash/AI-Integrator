@@ -42,6 +42,7 @@ const terminalMock = vi.hoisted(() => {
     writeTerminal: vi.fn(),
     resizeTerminal: vi.fn(),
     interruptTerminal: vi.fn(),
+    terminalHasForegroundProcess: vi.fn(),
     closeTerminal: vi.fn(),
     subscribeTerminalOutput: vi.fn(),
   };
@@ -59,6 +60,7 @@ vi.mock("../bridge", async (importOriginal) => {
       writeTerminal: terminalMock.writeTerminal,
       resizeTerminal: terminalMock.resizeTerminal,
       interruptTerminal: terminalMock.interruptTerminal,
+      terminalHasForegroundProcess: terminalMock.terminalHasForegroundProcess,
       closeTerminal: terminalMock.closeTerminal,
       subscribeTerminalOutput: terminalMock.subscribeTerminalOutput,
     },
@@ -97,6 +99,7 @@ describe("TerminalDrawer", () => {
     terminalMock.writeTerminal.mockReset().mockResolvedValue(undefined);
     terminalMock.resizeTerminal.mockReset().mockResolvedValue(undefined);
     terminalMock.interruptTerminal.mockReset().mockResolvedValue(undefined);
+    terminalMock.terminalHasForegroundProcess.mockReset().mockResolvedValue(false);
     terminalMock.closeTerminal.mockReset().mockResolvedValue(undefined);
     terminalMock.subscribeTerminalOutput
       .mockReset()
@@ -248,6 +251,25 @@ describe("TerminalDrawer", () => {
     fireEvent.click(screen.getByRole("button", { name: "Restart" }));
     await waitFor(() => expect(terminalMock.openTerminal).toHaveBeenCalledTimes(2));
     expect(terminalMock.closeTerminal).toHaveBeenCalledWith("term-1");
+  });
+
+  it("hides the stop button while the terminal sits at an idle prompt", async () => {
+    render(<TerminalDrawer open project={project} onClose={() => undefined} />);
+    await waitFor(() => expect(terminalMock.openTerminal).toHaveBeenCalled());
+
+    await waitFor(() =>
+      expect(terminalMock.terminalHasForegroundProcess).toHaveBeenCalledWith("term-1"),
+    );
+    expect(screen.queryByRole("button", { name: "Interrupt Terminal 1" })).not.toBeInTheDocument();
+  });
+
+  it("shows the stop button while a foreground process runs and interrupts it", async () => {
+    terminalMock.terminalHasForegroundProcess.mockResolvedValue(true);
+    render(<TerminalDrawer open project={project} onClose={() => undefined} />);
+    await waitFor(() => expect(terminalMock.openTerminal).toHaveBeenCalled());
+
+    fireEvent.click(await screen.findByRole("button", { name: "Interrupt Terminal 1" }));
+    expect(terminalMock.interruptTerminal).toHaveBeenCalledWith("term-1");
   });
 
   it("updates xterm colors when the app theme changes", async () => {

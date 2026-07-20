@@ -20,6 +20,7 @@ interface DropdownProps {
   leading?: ReactNode;
   compact?: boolean;
   disabled?: boolean;
+  placement?: "auto" | "down" | "up";
 }
 
 export function Dropdown({
@@ -33,10 +34,13 @@ export function Dropdown({
   leading,
   compact = false,
   disabled = false,
+  placement: preferredPlacement = "auto",
 }: DropdownProps) {
   const [internalValue, setInternalValue] = useState(defaultValue ?? options[0]?.value ?? "");
   const [open, setOpen] = useState(false);
-  const [placement, setPlacement] = useState<"down" | "up">("down");
+  const [placement, setPlacement] = useState<"down" | "up">(
+    preferredPlacement === "auto" ? "down" : preferredPlacement,
+  );
   const [highlighted, setHighlighted] = useState(0);
   const rootRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
@@ -83,8 +87,11 @@ export function Dropdown({
 
   const openMenu = () => {
     onOpen?.();
+    if (preferredPlacement !== "auto") {
+      setPlacement(preferredPlacement);
+    }
     const triggerRect = buttonRef.current?.getBoundingClientRect();
-    if (triggerRect && typeof window !== "undefined") {
+    if (preferredPlacement === "auto" && triggerRect && typeof window !== "undefined") {
       const estimatedMenuHeight = Math.min(options.length * 30 + 12, 320);
       const roomBelow = window.innerHeight - triggerRect.bottom - 12;
       const roomAbove = triggerRect.top - 12;

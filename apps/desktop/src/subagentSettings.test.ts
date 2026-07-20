@@ -13,10 +13,30 @@ describe("subagent specialist settings", () => {
     expect(DEFAULT_SPECIALISTS.every((specialist) => specialist.serviceLevels.length === 3)).toBe(
       true,
     );
+    expect(DEFAULT_SPECIALISTS.map((specialist) => specialist.label)).toEqual([
+      "Repository Engineer",
+      "Product & Code Critic",
+      "Research Explorer",
+      "Codebase Navigator",
+      "Verification Runner",
+      "Long-Context Analyst",
+    ]);
   });
 
   it("preserves an explicitly empty specialist roster", () => {
     expect(normalizeSpecialists([])).toEqual([]);
+  });
+
+  it("migrates only exact legacy built-in runtime labels", () => {
+    const specialists = normalizeSpecialists([
+      { id: "codex-default", label: "Codex (OpenAI)", runtime: "codex" },
+      { id: "claude-default", label: "My Claude specialist", runtime: "claude" },
+    ]);
+
+    expect(specialists.map((specialist) => specialist.label)).toEqual([
+      "Repository Engineer",
+      "My Claude specialist",
+    ]);
   });
 
   it("migrates a legacy provider profile into one Standard service", () => {

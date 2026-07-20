@@ -8,10 +8,7 @@ describe("resolveCommitMessageRoute", () => {
   it("returns null until both a runtime and a model are chosen", () => {
     expect(resolveCommitMessageRoute({}, AVAILABLE)).toBeNull();
     expect(
-      resolveCommitMessageRoute(
-        { [COMMIT_MESSAGE_SETTINGS.runtime]: "codex" },
-        AVAILABLE,
-      ),
+      resolveCommitMessageRoute({ [COMMIT_MESSAGE_SETTINGS.runtime]: "codex" }, AVAILABLE),
     ).toBeNull();
     expect(
       resolveCommitMessageRoute(

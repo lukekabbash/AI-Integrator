@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -26,6 +27,7 @@ import { highlightCodeLine } from "./codeHighlight";
 import {
   FILE_TAB_SIZE,
   indentGuideCountsForLines,
+  type ProjectFileLocation,
 } from "./fileViewSupport";
 import type { ProjectFileContent } from "../bridge";
 
@@ -51,6 +53,7 @@ function FileHighlightLine({
   guideCount,
   showNewline,
   showLineNumber,
+  targeted,
 }: {
   path: string;
   line: string;
@@ -58,9 +61,14 @@ function FileHighlightLine({
   guideCount: number;
   showNewline: boolean;
   showLineNumber: boolean;
+  targeted: boolean;
 }) {
   return (
-    <span className="file-code-editor-line">
+    <span
+      className="file-code-editor-line"
+      data-line={lineNumber}
+      data-target={targeted || undefined}
+    >
       {[
         showLineNumber ? (
           <span
@@ -369,8 +377,7 @@ function SelectionAskPanel({
         ref={bodyRef}
         onScroll={(event) => {
           const body = event.currentTarget;
-          pinnedToBottom.current =
-            body.scrollHeight - body.scrollTop - body.clientHeight < 48;
+          pinnedToBottom.current = body.scrollHeight - body.scrollTop - body.clientHeight < 48;
         }}
       >
         {state.exchanges.map((exchange, index) => (
@@ -548,6 +555,7 @@ function SelectionContextMenu({
  * treatment, with no diff or review chrome. */
 export function FileWorkspace({
   file,
+  target,
   editable = false,
   onSave,
   onExplainSelection,
@@ -555,6 +563,8 @@ export function FileWorkspace({
   explainAgentLabel = "your agent",
 }: {
   file: ProjectFileContent;
+  /** Optional transcript destination to reveal after the file opens. */
+  target?: ProjectFileLocation;
   /** True when the native host can write edits back to this file. */
   editable?: boolean;
   onSave?: (content: string) => Promise<void>;
@@ -588,18 +598,53 @@ export function FileWorkspace({
   const lastQueuedContentRef = useRef(file.content);
   const saveQueueRef = useRef(Promise.resolve());
   const saveRevisionRef = useRef(0);
-  const visibleLines = lines.slice(0, lineLimit);
   const canEdit = editable && Boolean(onSave) && !file.isBinary && !file.imageDataUrl;
   const dirty = canEdit && draft !== file.content;
   const editorLines = useMemo(() => draft.split("\n"), [draft]);
-  const editorGuideCounts = useMemo(
-    () => indentGuideCountsForLines(editorLines),
-    [editorLines],
-  );
+  const editorGuideCounts = useMemo(() => indentGuideCountsForLines(editorLines), [editorLines]);
+  const navigableLineCount = canEdit ? editorLines.length : lines.length;
+  const targetStartLine = target?.startLine
+    ? Math.min(target.startLine, navigableLineCount)
+    : undefined;
+  const targetEndLine = targetStartLine
+    ? Math.min(Math.max(target?.endLine ?? targetStartLine, targetStartLine), navigableLineCount)
+    : undefined;
+  const effectiveLineLimit = targetEndLine
+    ? Math.max(
+        lineLimit,
+        Math.min(lines.length, Math.ceil(targetEndLine / FILE_LINE_CHUNK) * FILE_LINE_CHUNK),
+      )
+    : lineLimit;
+  const visibleLines = lines.slice(0, effectiveLineLimit);
   const readerGuideCounts = useMemo(
-    () => indentGuideCountsForLines(lines.slice(0, lineLimit)),
-    [lines, lineLimit],
+    () => indentGuideCountsForLines(lines.slice(0, effectiveLineLimit)),
+    [effectiveLineLimit, lines],
   );
+
+  useLayoutEffect(() => {
+    if (!targetStartLine || !targetEndLine) return;
+    if (canEdit) {
+      const editor = editorRef.current;
+      const highlight = highlightRef.current;
+      if (!editor || !highlight) return;
+      const startOffset = editorLines
+        .slice(0, targetStartLine - 1)
+        .reduce((offset, line) => offset + line.length + 1, 0);
+      const endOffset =
+        editorLines.slice(0, targetEndLine).reduce((offset, line) => offset + line.length + 1, 0) -
+        1;
+      editor.focus({ preventScroll: true });
+      editor.setSelectionRange(startOffset, Math.max(startOffset, endOffset));
+      const targetLine = highlight.querySelector<HTMLElement>(`[data-line="${targetStartLine}"]`);
+      const scrollTop = Math.max(0, (targetLine?.offsetTop ?? 0) - editor.clientHeight * 0.35);
+      editor.scrollTop = scrollTop;
+      highlight.scrollTop = scrollTop;
+      return;
+    }
+    linesRef.current
+      ?.querySelector<HTMLElement>(`li[data-line="${targetStartLine}"]`)
+      ?.scrollIntoView?.({ block: "center" });
+  }, [canEdit, editorLines, effectiveLineLimit, targetEndLine, targetStartLine]);
 
   useEffect(() => {
     draftRef.current = draft;
@@ -902,6 +947,12 @@ export function FileWorkspace({
                   guideCount={editorGuideCounts[lineIndex] ?? 0}
                   showNewline={lineIndex < editorLines.length - 1}
                   showLineNumber
+                  targeted={Boolean(
+                    targetStartLine &&
+                    targetEndLine &&
+                    lineIndex + 1 >= targetStartLine &&
+                    lineIndex + 1 <= targetEndLine,
+                  )}
                 />
               ))}
             </pre>
@@ -937,7 +988,18 @@ export function FileWorkspace({
             }}
           >
             {visibleLines.map((line, index) => (
-              <li key={`${file.path}-${index}`} data-line={index + 1}>
+              <li
+                key={`${file.path}-${index}`}
+                data-line={index + 1}
+                data-target={
+                  targetStartLine &&
+                  targetEndLine &&
+                  index + 1 >= targetStartLine &&
+                  index + 1 <= targetEndLine
+                    ? true
+                    : undefined
+                }
+              >
                 <code>
                   {[
                     <IndentGuides key="g" count={readerGuideCounts[index] ?? 0} />,
@@ -956,7 +1018,7 @@ export function FileWorkspace({
             total={lines.length}
             noun="lines"
             chunk={FILE_LINE_CHUNK}
-            onShowMore={() => setLineLimit((current) => current + FILE_LINE_CHUNK)}
+            onShowMore={() => setLineLimit(effectiveLineLimit + FILE_LINE_CHUNK)}
             onShowAll={() => setLineLimit(lines.length)}
           />
         </div>

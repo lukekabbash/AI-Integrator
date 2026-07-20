@@ -27,6 +27,12 @@ pub struct AntigravityOverlay {
     pub event_log: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum AntigravityOverlayPolicy {
+    Harness(crate::harness_prompt::LocalToolsProjection),
+    Chat { memory_enabled: bool },
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HookRecord {
@@ -47,7 +53,7 @@ pub fn create_overlay(
     workspace: &Path,
     scope: &str,
     permission: StructuredPermissionMode,
-    local_tools: crate::harness_prompt::LocalToolsProjection,
+    policy: AntigravityOverlayPolicy,
 ) -> Result<AntigravityOverlay> {
     let root = data_directory.join("antigravity-control").join(scope);
     let agents = root.join(".agents");
@@ -67,6 +73,15 @@ pub fn create_overlay(
     let event_log = root.join("events.jsonl");
     secure_file(&event_log)?;
     let executable = std::env::current_exe().map_err(IntegratorError::from)?;
+    let hook_permission = match policy {
+        AntigravityOverlayPolicy::Chat {
+            memory_enabled: true,
+        } => "chat-memory",
+        AntigravityOverlayPolicy::Chat {
+            memory_enabled: false,
+        } => "chat",
+        AntigravityOverlayPolicy::Harness(_) => permission_name(permission),
+    };
     let command = |phase: &str| {
         [
             shell_arg(&executable.to_string_lossy()),
@@ -75,7 +90,7 @@ pub fn create_overlay(
             shell_arg(&event_log.to_string_lossy()),
             shell_arg(&workspace.to_string_lossy()),
             shell_arg(&root.to_string_lossy()),
-            shell_arg(permission_name(permission)),
+            shell_arg(hook_permission),
         ]
         .join(" ")
     };
@@ -95,13 +110,16 @@ pub fn create_overlay(
         }
     });
     write_private_json(&agents.join("hooks.json"), &config)?;
-    write_private_text(
-        &rules.join("ai-integrator.md"),
-        &crate::harness_prompt::instructions(
+    let instructions = match policy {
+        AntigravityOverlayPolicy::Harness(local_tools) => crate::harness_prompt::instructions(
             integrator_core::ProviderKind::Antigravity,
             local_tools,
         ),
-    )?;
+        AntigravityOverlayPolicy::Chat { memory_enabled } => {
+            crate::harness_prompt::chat_developer_instructions(memory_enabled)
+        }
+    };
+    write_private_text(&rules.join("ai-integrator.md"), &instructions)?;
     Ok(AntigravityOverlay { root, event_log })
 }
 
@@ -328,6 +346,12 @@ fn hook_decision<'a>(
         .and_then(|call| call.get("args"))
         .unwrap_or(&Value::Null);
 
+    if permission.starts_with("chat")
+        && !is_chat_scheduling_tool(name)
+        && !(permission == "chat-memory" && is_chat_memory_tool(name))
+    {
+        return ("deny", Some("Tools are unavailable in AI Integrator Chat"));
+    }
     if permission == "read-only" && is_mutating_tool(name) {
         return ("deny", Some("This task is read-only"));
     }
@@ -353,6 +377,28 @@ fn hook_decision<'a>(
         return ("deny", Some("Integrator control files cannot be modified"));
     }
     ("allow", None)
+}
+
+fn is_chat_memory_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "memory_save" | "integrator__memory_save" | "mcp__integrator__memory_save"
+    )
+}
+
+fn is_chat_scheduling_tool(name: &str) -> bool {
+    let name = name
+        .strip_prefix("mcp__integrator__")
+        .or_else(|| name.strip_prefix("integrator__"))
+        .unwrap_or(name);
+    matches!(
+        name,
+        "schedule_wakeup"
+            | "schedule_recurring"
+            | "automation_list"
+            | "automation_leave_note"
+            | "automation_cancel"
+    )
 }
 
 fn is_mutating_tool(name: &str) -> bool {
@@ -477,6 +523,7 @@ fn permission_name(permission: StructuredPermissionMode) -> &'static str {
     match permission {
         StructuredPermissionMode::Prompt => "ask",
         StructuredPermissionMode::ReadOnly => "read-only",
+        StructuredPermissionMode::Chat => "chat",
         StructuredPermissionMode::AcceptEdits => "project-write",
         StructuredPermissionMode::BypassPermissions => "full-access",
     }
@@ -517,6 +564,32 @@ mod tests {
                 Some("This action is outside the selected workspace")
             )
         );
+
+        let read = json!({
+            "toolCall": { "name": "view_file", "args": { "AbsolutePath": root.path().join("ok.txt") } }
+        });
+        assert_eq!(
+            hook_decision(&read, root.path(), overlay.path(), "chat"),
+            ("deny", Some("Tools are unavailable in AI Integrator Chat"))
+        );
+        let memory = json!({
+            "toolCall": { "name": "mcp__integrator__memory_save", "args": { "text": "Prefers concise replies" } }
+        });
+        assert_eq!(
+            hook_decision(&memory, root.path(), overlay.path(), "chat-memory"),
+            ("allow", None)
+        );
+        let schedule = json!({
+            "toolCall": { "name": "mcp__integrator__schedule_recurring", "args": {} }
+        });
+        assert_eq!(
+            hook_decision(&schedule, root.path(), overlay.path(), "chat"),
+            ("allow", None)
+        );
+        assert_eq!(
+            hook_decision(&read, root.path(), overlay.path(), "chat-memory"),
+            ("deny", Some("Tools are unavailable in AI Integrator Chat"))
+        );
     }
 
     #[test]
@@ -541,7 +614,9 @@ mod tests {
             workspace.path(),
             "scope-1",
             StructuredPermissionMode::AcceptEdits,
-            crate::harness_prompt::LocalToolsProjection::Unavailable,
+            AntigravityOverlayPolicy::Harness(
+                crate::harness_prompt::LocalToolsProjection::Unavailable,
+            ),
         )
         .expect("create overlay");
 
@@ -577,7 +652,9 @@ mod tests {
             workspace.path(),
             "scope-tools",
             StructuredPermissionMode::ReadOnly,
-            crate::harness_prompt::LocalToolsProjection::Projected,
+            AntigravityOverlayPolicy::Harness(
+                crate::harness_prompt::LocalToolsProjection::Projected,
+            ),
         )
         .expect("create overlay");
 
@@ -586,6 +663,31 @@ mod tests {
         assert!(harness.contains("task-scoped MCP server named `integrator`"));
         assert!(harness.contains("call them directly"));
         assert!(!harness.contains("delegation are unavailable"));
+    }
+
+    #[test]
+    fn chat_overlay_installs_the_conversational_rule_and_denies_general_tools() {
+        let data = tempfile::tempdir().expect("app data");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let overlay = create_overlay(
+            data.path(),
+            workspace.path(),
+            "chat-scope",
+            StructuredPermissionMode::Chat,
+            AntigravityOverlayPolicy::Chat {
+                memory_enabled: true,
+            },
+        )
+        .expect("create Chat overlay");
+
+        let rule = std::fs::read_to_string(overlay.root.join(".agents/rules/ai-integrator.md"))
+            .expect("read Chat rule");
+        assert!(rule.contains("This is not a coding-agent session"));
+        assert!(rule.contains("`memory_save`"));
+        assert!(rule.contains("schedule_recurring"));
+        let hooks = std::fs::read_to_string(overlay.root.join(".agents/hooks.json"))
+            .expect("read Chat hooks");
+        assert!(hooks.contains("chat-memory"));
     }
 
     #[test]

@@ -12,6 +12,7 @@ integrator-runtime = { path = "../integrator-runtime" }
 parking_lot.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

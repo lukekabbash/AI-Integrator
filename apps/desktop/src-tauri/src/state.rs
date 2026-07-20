@@ -19,7 +19,7 @@ use integrator_runtime::{
 };
 use portable_pty::{ChildKiller, MasterPty};
 use session_store::LocalStore;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, Notify, broadcast};
 use zeroize::Zeroizing;
 
 use crate::repository_watch::{RepositoryWatchRegistry, RepositoryWatcher};
@@ -224,6 +224,29 @@ pub struct TerminalSession {
     pub master: Box<dyn MasterPty + Send>,
     pub writer: Box<dyn Write + Send>,
     pub killer: Box<dyn ChildKiller + Send + Sync>,
+    /// Process id of the PTY session leader (the shell). Compared against
+    /// the terminal's foreground process group to tell a foreground job
+    /// apart from an idle prompt.
+    pub shell_pid: Option<u32>,
+}
+
+impl TerminalSession {
+    /// True when the terminal's foreground process group is a job the shell
+    /// spawned rather than the shell itself. Platforms without a cheap
+    /// foreground-group query report a process as always running.
+    pub fn has_foreground_process(&self) -> bool {
+        #[cfg(unix)]
+        {
+            crate::commands::foreground_process_active(
+                self.master.process_group_leader(),
+                self.shell_pid,
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
 }
 
 #[derive(Default)]
@@ -343,6 +366,8 @@ pub struct AppState {
     /// Loopback address + token of the delegation broker, set once its
     /// listener binds at startup.
     pub broker: std::sync::Mutex<Option<crate::delegation::BrokerInfo>>,
+    /// Wakes the single native automation timer after schedules change.
+    pub automation_notify: Notify,
 }
 
 impl AppState {
@@ -379,6 +404,7 @@ impl AppState {
             repository_watchers: std::sync::Mutex::new(RepositoryWatchRegistry::default()),
             delegation_children: Mutex::new(HashMap::new()),
             broker: std::sync::Mutex::new(None),
+            automation_notify: Notify::new(),
         })
     }
 

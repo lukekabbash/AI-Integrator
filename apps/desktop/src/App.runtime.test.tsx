@@ -21,6 +21,7 @@ const { bridgeMock } = vi.hoisted(() => ({
     openProject: vi.fn(),
     registerProject: vi.fn(),
     listProjects: vi.fn(),
+    createChat: vi.fn(),
     startTask: vi.fn(),
     generateTaskTitle: vi.fn(),
     loadTaskGit: vi.fn(),
@@ -33,6 +34,8 @@ const { bridgeMock } = vi.hoisted(() => ({
     listProjectFileOpeners: vi.fn(),
     openProjectFileExternal: vi.fn(),
     revealProjectFile: vi.fn(),
+    pickContextAttachments: vi.fn(),
+    savePastedImageAttachment: vi.fn(),
     listNativeProviderActions: vi.fn(),
     searchTaskMessages: vi.fn(),
     listArchivedTasks: vi.fn(),
@@ -56,6 +59,12 @@ const { bridgeMock } = vi.hoisted(() => ({
     subscribeDelegationUpdates: vi.fn(),
     sendDelegationMessage: vi.fn(),
     stopDelegation: vi.fn(),
+    automationTimeline: vi.fn(),
+    subscribeAutomationChanges: vi.fn(),
+    subscribeAutomationDue: vi.fn(),
+    pendingAutomationDispatches: vi.fn(),
+    finishAutomationRun: vi.fn(),
+    cancelAutomation: vi.fn(),
     stageFiles: vi.fn(),
     stageProjectFiles: vi.fn(),
     commit: vi.fn(),
@@ -175,6 +184,7 @@ describe("native runtime recovery UI", () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
     for (const value of Object.values(bridgeMock)) value.mockReset();
     bridgeMock.listProjectFileOpeners.mockResolvedValue([]);
+    bridgeMock.pickContextAttachments.mockResolvedValue(null);
     runtimeListener = undefined;
     delegationListener = undefined;
     workingTreeListener = undefined;
@@ -191,12 +201,27 @@ describe("native runtime recovery UI", () => {
     bridgeMock.listArchivedTasks.mockResolvedValue({ tasks: [], total: 0 });
     bridgeMock.listNativeProviderActions.mockResolvedValue([]);
     bridgeMock.listDelegations.mockResolvedValue([]);
+    bridgeMock.automationTimeline.mockResolvedValue([]);
+    bridgeMock.subscribeAutomationChanges.mockResolvedValue(vi.fn());
+    bridgeMock.subscribeAutomationDue.mockResolvedValue(vi.fn());
+    bridgeMock.pendingAutomationDispatches.mockResolvedValue([]);
     bridgeMock.listModelCatalog.mockResolvedValue([]);
     bridgeMock.getCachedModelCatalog.mockReturnValue(undefined);
     bridgeMock.subscribeModelCatalogs.mockReturnValue(vi.fn());
     bridgeMock.listSettings.mockResolvedValue([]);
     bridgeMock.setSetting.mockResolvedValue(undefined);
+    bridgeMock.updateTaskRouting.mockResolvedValue(undefined);
     bridgeMock.generateTaskTitle.mockResolvedValue(null);
+    bridgeMock.createChat.mockResolvedValue({
+      id: "general-chat-1",
+      projectId: "__integrator_chats__",
+      kind: "chat",
+      title: "New chat",
+      status: "draft",
+      runtime: "codex",
+      model: "Provider default",
+      updatedAt: "2026-07-19T19:00:00Z",
+    });
     bridgeMock.listQueuedMessages.mockResolvedValue([]);
     bridgeMock.steerTurn.mockResolvedValue(false);
     bridgeMock.enqueueMessage.mockImplementation(async (input) => ({
@@ -331,6 +356,128 @@ describe("native runtime recovery UI", () => {
   afterEach(() => {
     cleanup();
     Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+  });
+
+  it("creates the global New chat directly in the durable Chat lane", async () => {
+    render(<App />);
+
+    const sidebar = await screen.findByRole("complementary", { name: "Chat navigation" });
+    const newChatButton = within(sidebar).getByRole("button", { name: /^New chat.*N$/ });
+    fireEvent.click(newChatButton);
+
+    await waitFor(() =>
+      expect(bridgeMock.createChat).toHaveBeenCalledWith({
+        runtime: "codex",
+        model: "Provider default",
+      }),
+    );
+    expect(screen.getAllByRole("button", { name: /New chat/ }).length).toBeGreaterThan(1);
+    expect(screen.queryByRole("tab", { name: "Review" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Permission" })).not.toBeInTheDocument();
+  });
+
+  it("sends Chat through the selected runtime without relaxing its safety route", async () => {
+    const workspace = createEmptySnapshot();
+    workspace.tasks = [
+      {
+        id: "chat-route-1",
+        projectId: "__integrator_chats__",
+        kind: "chat",
+        title: "New chat",
+        status: "draft",
+        runtime: "codex",
+        model: "gpt-5.6-luna",
+        updatedAt: "2026-07-19T19:00:00Z",
+      },
+    ];
+    workspace.activeTaskId = "chat-route-1";
+    workspace.runtimes = [
+      {
+        id: "codex",
+        name: "Codex",
+        command: "codex",
+        status: "connected",
+        fidelity: "native",
+        models: ["gpt-5.6-luna"],
+        detail: "Ready",
+      },
+      {
+        id: "claude",
+        name: "Claude Code",
+        command: "claude",
+        status: "connected",
+        fidelity: "structured",
+        models: ["claude-sonnet-4-6"],
+        detail: "Ready",
+      },
+    ];
+    bridgeMock.loadWorkspace.mockResolvedValue(workspace);
+    bridgeMock.loadTaskProjection.mockResolvedValue(
+      projectionSnapshot({ watermarkSeq: 0, runtimeLive: false, taskId: "chat-route-1" }),
+    );
+    bridgeMock.listModelCatalog.mockImplementation(async (runtime) =>
+      runtime === "claude"
+        ? [{ id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" }]
+        : [{ id: "gpt-5.6-luna", label: "GPT-5.6 Luna" }],
+    );
+    bridgeMock.sendTurn.mockResolvedValue({
+      id: "chat-route-user",
+      kind: "user",
+      body: "Compare these ideas",
+      timestamp: "2026-07-19T19:01:00Z",
+      status: "neutral",
+    });
+    bridgeMock.pickContextAttachments.mockResolvedValue([
+      {
+        path: "/app/chat-attachments/chat-route-1/notes.txt",
+        name: "notes.txt",
+        kind: "file",
+      },
+    ]);
+
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: "New chat" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Runtime" }));
+    fireEvent.click(screen.getByRole("option", { name: "Claude Code" }));
+    await waitFor(() =>
+      expect(bridgeMock.updateTaskRouting).toHaveBeenCalledWith(
+        "chat-route-1",
+        expect.objectContaining({ runtime: "claude" }),
+      ),
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Attach files or images from your computer" }),
+    );
+    expect(await screen.findByText("notes.txt")).toBeVisible();
+    expect(bridgeMock.pickContextAttachments).toHaveBeenCalledWith("chat-route-1");
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Task message" }), {
+      target: { value: "Compare these ideas" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(bridgeMock.sendTurn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          taskId: "chat-route-1",
+          attachments: [expect.objectContaining({ name: "notes.txt", kind: "file" })],
+          runtime: "claude",
+          permission: "read-only",
+          delegation: "off",
+        }),
+      ),
+    );
+    await waitFor(
+      () =>
+        expect(bridgeMock.generateTaskTitle).toHaveBeenCalledWith({
+          taskId: "chat-route-1",
+          prompt: "Compare these ideas",
+          runtime: "claude",
+          route: { runtime: "claude", fallbacks: [] },
+        }),
+      { timeout: 4_000 },
+    );
   });
 
   it("keeps a backend-attested live turn running across snapshot recovery", async () => {
@@ -2425,13 +2572,15 @@ describe("native runtime recovery UI", () => {
     );
     expect(bridgeMock.generateTaskTitle).not.toHaveBeenCalled();
     act(() => resolveSend(undefined));
-    await waitFor(() =>
-      expect(bridgeMock.generateTaskTitle).toHaveBeenCalledWith({
-        taskId: "task-first-send",
-        prompt: "Start cleanly",
-        runtime: "codex",
-        route: { runtime: "codex", fallbacks: [] },
-      }),
+    await waitFor(
+      () =>
+        expect(bridgeMock.generateTaskTitle).toHaveBeenCalledWith({
+          taskId: "task-first-send",
+          prompt: "Start cleanly",
+          runtime: "codex",
+          route: { runtime: "codex", fallbacks: [] },
+        }),
+      { timeout: 4_000 },
     );
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 900));

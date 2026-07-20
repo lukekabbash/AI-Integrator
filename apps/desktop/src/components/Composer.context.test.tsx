@@ -54,6 +54,55 @@ afterEach(() => {
 });
 
 describe("@-mention context suggestions", () => {
+  it("attaches a durable Chat reference in code mode", async () => {
+    const onSend = vi.fn().mockResolvedValue(true);
+    render(
+      <LazyMotion features={domAnimation} strict>
+        <Composer
+          runtimes={[codex]}
+          defaultRuntime="codex"
+          defaultModel="gpt-5.3-codex"
+          contextFiles={contextFiles}
+          contextChats={[
+            {
+              id: "research-chat",
+              projectId: "__integrator_chats__",
+              kind: "chat",
+              title: "Parser research",
+              status: "completed",
+              runtime: "codex",
+              model: "gpt-5.3-codex",
+              updatedAt: "2026-07-19T12:00:00Z",
+            },
+          ]}
+          onSend={onSend}
+        />
+      </LazyMotion>,
+    );
+    const textbox = screen.getByRole("textbox", { name: "Task message" });
+    fireEvent.change(textbox, { target: { value: "@parser", selectionStart: 7 } });
+    fireEvent.click(await screen.findByRole("option", { name: /Parser research/ }));
+
+    expect(textbox).toHaveValue("");
+    expect(screen.getByRole("button", { name: "Remove Parser research" })).toBeInTheDocument();
+    const send = screen.getByRole("button", { name: "Send message" });
+    expect(send).toBeEnabled();
+    fireEvent.click(send);
+    await waitFor(() =>
+      expect(onSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          prompt: "Referenced chats:\n- @Parser research",
+          contextReferences: [
+            expect.objectContaining({
+              sourceTaskId: "research-chat",
+              sourceTitle: "Parser research",
+            }),
+          ],
+        }),
+      ),
+    );
+  });
+
   it("browses the project root with folders before files on a bare @", async () => {
     const { textbox } = renderComposer();
     fireEvent.change(textbox, { target: { value: "@", selectionStart: 1 } });
@@ -225,6 +274,76 @@ describe("composer attachments", () => {
     );
     expect(save).toHaveBeenCalledWith(file, "screenshot.png");
     expect(textbox).toHaveValue("");
+  });
+
+  it("persists pasted images into the owning Chat attachment scope", async () => {
+    const pasted: ContextAttachment = {
+      path: "/app/chat-attachments/chat-1/pasted-image.png",
+      name: "pasted-image.png",
+      kind: "image",
+      dataUrl: "data:image/png;base64,aGk=",
+    };
+    const save = vi.fn().mockResolvedValue(pasted);
+    vi.spyOn(bridge, "savePastedImageAttachment").mockImplementation(save);
+    render(
+      <LazyMotion features={domAnimation} strict>
+        <Composer
+          chatMode
+          taskId="chat-1"
+          runtimes={[codex]}
+          defaultRuntime="codex"
+          defaultModel="gpt-5.3-codex"
+          onSend={vi.fn().mockResolvedValue(true)}
+        />
+      </LazyMotion>,
+    );
+    const textbox = screen.getByRole("textbox", { name: "Task message" });
+    const file = new File([new Uint8Array([1, 2, 3])], "screenshot.png", {
+      type: "image/png",
+    });
+
+    fireEvent.paste(textbox, {
+      clipboardData: {
+        files: [file],
+        items: [],
+      },
+    });
+
+    expect(await screen.findByText("pasted-image.png")).toBeVisible();
+    expect(screen.getByAltText("pasted-image.png")).toHaveAttribute(
+      "src",
+      "data:image/png;base64,aGk=",
+    );
+    expect(save).toHaveBeenCalledWith(file, "screenshot.png", "chat-1");
+  });
+
+  it("opens the task-scoped native picker from Chat", async () => {
+    const pick = vi.spyOn(bridge, "pickContextAttachments").mockResolvedValue([
+      {
+        path: "/app/chat-attachments/chat-1/notes.txt",
+        name: "notes.txt",
+        kind: "file",
+      },
+    ]);
+    render(
+      <LazyMotion features={domAnimation} strict>
+        <Composer
+          chatMode
+          taskId="chat-1"
+          runtimes={[codex]}
+          defaultRuntime="codex"
+          defaultModel="gpt-5.3-codex"
+          onSend={vi.fn().mockResolvedValue(true)}
+        />
+      </LazyMotion>,
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Attach files or images from your computer" }),
+    );
+
+    expect(await screen.findByText("notes.txt")).toBeVisible();
+    expect(pick).toHaveBeenCalledWith("chat-1");
   });
 
   it("leaves ordinary text pastes alone", async () => {

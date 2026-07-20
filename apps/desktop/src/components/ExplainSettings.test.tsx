@@ -147,10 +147,7 @@ describe("Explain settings", () => {
     );
     expect(written?.[1]).toHaveLength(1);
     // The sentinel is an action, not a value: it must never be stored.
-    expect(bridgeMock.setSetting).not.toHaveBeenCalledWith(
-      "settings.explain.archetype",
-      "__new__",
-    );
+    expect(bridgeMock.setSetting).not.toHaveBeenCalledWith("settings.explain.archetype", "__new__");
 
     // The new archetype opens its editor with a starter mission to edit.
     const mission = await screen.findByRole("textbox", { name: "Archetype mission" });

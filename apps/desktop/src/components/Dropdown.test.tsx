@@ -69,4 +69,20 @@ describe("Dropdown", () => {
       expect(screen.queryByRole("listbox", { name: "Provider" })).not.toBeInTheDocument(),
     );
   });
+
+  it("can be directed to open upward", async () => {
+    render(
+      <Dropdown
+        aria-label="Upward runtime"
+        placement="up"
+        defaultValue="codex"
+        options={[{ value: "codex", label: "Codex" }]}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Upward runtime" }));
+    expect(await screen.findByRole("listbox", { name: "Upward runtime" })).toHaveClass(
+      "dropdown-menu--up",
+    );
+  });
 });

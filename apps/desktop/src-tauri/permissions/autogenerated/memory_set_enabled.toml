@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-memory-set-enabled"
+description = "Enables the memory_set_enabled command without any pre-configured scope."
+commands.allow = ["memory_set_enabled"]
+
+[[permission]]
+identifier = "deny-memory-set-enabled"
+description = "Denies the memory_set_enabled command without any pre-configured scope."
+commands.deny = ["memory_set_enabled"]

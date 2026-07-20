@@ -9,6 +9,7 @@ import {
   indentGuideCount,
   indentGuideCountsForLines,
   leadingIndentColumns,
+  parseProjectFileHref,
   resolveRequestedFile,
 } from "./fileViewSupport";
 
@@ -37,6 +38,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
   delete document.documentElement.dataset.motion;
   vi.restoreAllMocks();
 });
@@ -78,6 +80,27 @@ describe("FileWorkspace", () => {
     expect(reader).toHaveTextContent("canvas-line-1199");
   });
 
+  it("reveals and marks a transcript-linked range beyond the initial reader window", () => {
+    const content = Array.from({ length: 800 }, (_, index) => `canvas-line-${index + 1}`).join(
+      "\n",
+    );
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: scrollIntoView,
+    });
+
+    renderWorkspace({
+      file: { ...textFile, content },
+      target: { path: textFile.path, startLine: 450, endLine: 452 },
+    });
+
+    const reader = screen.getByRole("list", { name: "Contents of src/App.tsx" });
+    expect(reader.querySelectorAll("li")).toHaveLength(800);
+    expect(reader.querySelectorAll('li[data-target="true"]')).toHaveLength(3);
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "center" });
+  });
+
   it("opens in a stable highlighted editor and autosaves through the host boundary", async () => {
     vi.useFakeTimers();
     const onSave = vi.fn().mockResolvedValue(undefined);
@@ -117,11 +140,27 @@ describe("FileWorkspace", () => {
     expect(screen.getByRole("textbox", { name: "Edit src/App.tsx" })).toBe(editor);
   });
 
+  it("focuses the exact transcript-linked lines in the editable surface", () => {
+    renderWorkspace({
+      editable: true,
+      onSave: vi.fn(),
+      target: { path: textFile.path, startLine: 2, endLine: 2 },
+    });
+
+    const editor = screen.getByRole("textbox", { name: "Edit src/App.tsx" });
+    expect(editor).toHaveFocus();
+    expect(editor).toHaveProperty("selectionStart", textFile.content.indexOf("function"));
+    expect(editor).toHaveProperty(
+      "selectionEnd",
+      textFile.content.indexOf("function") + "function run() {}".length,
+    );
+    expect(document.querySelectorAll('.file-code-editor-line[data-target="true"]')).toHaveLength(1);
+  });
+
   it("keeps highlight text (including newlines) aligned with the textarea after edits", () => {
     renderWorkspace({ editable: true, onSave: vi.fn() });
     const editor = screen.getByRole("textbox", { name: "Edit src/App.tsx" });
-    const nested =
-      "export function run() {\n  const value = 1;\n\n    return value;\n}\n";
+    const nested = "export function run() {\n  const value = 1;\n\n    return value;\n}\n";
     fireEvent.change(editor, { target: { value: nested } });
 
     const highlight = document.querySelector(".file-code-editor-highlight");
@@ -134,9 +173,7 @@ describe("FileWorkspace", () => {
     const nested = "export function run() {\n  const value = 1;\n    return value;\n}\n";
     renderWorkspace({ file: { ...textFile, content: nested } });
 
-    const readerGuides = document.querySelectorAll(
-      ".file-reader-lines .file-indent-guide",
-    );
+    const readerGuides = document.querySelectorAll(".file-reader-lines .file-indent-guide");
     expect(readerGuides.length).toBeGreaterThanOrEqual(3);
 
     cleanup();
@@ -145,9 +182,9 @@ describe("FileWorkspace", () => {
       onSave: vi.fn(),
       file: { ...textFile, content: nested },
     });
-    expect(document.querySelectorAll(".file-code-editor-highlight .file-code-line-number")).toHaveLength(
-      5,
-    );
+    expect(
+      document.querySelectorAll(".file-code-editor-highlight .file-code-line-number"),
+    ).toHaveLength(5);
     expect(
       document.querySelectorAll(".file-code-editor-highlight .file-indent-guide").length,
     ).toBeGreaterThanOrEqual(3);
@@ -332,7 +369,11 @@ describe("FileWorkspace", () => {
   });
 
   it("streams the answer into the panel as deltas arrive", async () => {
-    let sendDelta!: (delta: { kind: "attempt" | "delta"; text: string; agentLabel: string }) => void;
+    let sendDelta!: (delta: {
+      kind: "attempt" | "delta";
+      text: string;
+      agentLabel: string;
+    }) => void;
     let finish!: (result: { text: string; agentLabel: string; usedFallback: boolean }) => void;
     const onExplainSelection = vi.fn().mockImplementation((_payload, onDelta) => {
       sendDelta = onDelta;
@@ -503,6 +544,33 @@ describe("resolveRequestedFile", () => {
   });
 });
 
+describe("parseProjectFileHref", () => {
+  it("accepts project links with exact lines and ranges", () => {
+    expect(parseProjectFileHref("./src/App.tsx#L12")).toEqual({
+      path: "src/App.tsx",
+      startLine: 12,
+      endLine: 12,
+    });
+    expect(parseProjectFileHref("./src/App.tsx#L12-L18")).toEqual({
+      path: "src/App.tsx",
+      startLine: 12,
+      endLine: 18,
+    });
+    expect(parseProjectFileHref("/Users/dev/project/src/App.tsx:24")).toEqual({
+      path: "/Users/dev/project/src/App.tsx",
+      startLine: 24,
+      endLine: 24,
+    });
+  });
+
+  it("leaves web links and unsafe local paths alone", () => {
+    expect(parseProjectFileHref("https://example.com/src/App.tsx#L12")).toBeUndefined();
+    expect(parseProjectFileHref("./../secrets.txt#L1")).toBeUndefined();
+    expect(parseProjectFileHref("./src/App.tsx#section-name")).toBeUndefined();
+    expect(parseProjectFileHref("./src/App.tsx#L18-L12")).toBeUndefined();
+  });
+});
+
 describe("file indent guides", () => {
   it("counts leading columns and guide stops for spaces and tabs", () => {
     expect(leadingIndentColumns("code")).toBe(0);
@@ -516,8 +584,8 @@ describe("file indent guides", () => {
   });
 
   it("carries guide counts across blank lines", () => {
-    expect(
-      indentGuideCountsForLines(["fn() {", "  a();", "", "  b();", "}"]),
-    ).toEqual([0, 1, 1, 1, 0]);
+    expect(indentGuideCountsForLines(["fn() {", "  a();", "", "  b();", "}"])).toEqual([
+      0, 1, 1, 1, 0,
+    ]);
   });
 });

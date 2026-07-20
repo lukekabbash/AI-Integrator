@@ -42,7 +42,7 @@ function service(level: SpecialistServiceLevel, runtime: string): SpecialistServ
 export const DEFAULT_SPECIALISTS: SpecialistSetting[] = [
   {
     id: "codex-default",
-    label: "Codex (OpenAI)",
+    label: "Repository Engineer",
     bestFor: "Implementation, tests, and careful repository work.",
     workingGuidance: "",
     access: "read-only",
@@ -53,7 +53,7 @@ export const DEFAULT_SPECIALISTS: SpecialistSetting[] = [
   },
   {
     id: "claude-default",
-    label: "Claude",
+    label: "Product & Code Critic",
     bestFor: "Review, synthesis, and nuanced product reasoning.",
     workingGuidance: "",
     access: "read-only",
@@ -64,7 +64,7 @@ export const DEFAULT_SPECIALISTS: SpecialistSetting[] = [
   },
   {
     id: "antigravity-default",
-    label: "Antigravity (Gemini)",
+    label: "Research Explorer",
     bestFor: "Broad exploration and alternate implementation approaches.",
     workingGuidance: "",
     access: "read-only",
@@ -75,7 +75,7 @@ export const DEFAULT_SPECIALISTS: SpecialistSetting[] = [
   },
   {
     id: "cursor-default",
-    label: "Cursor",
+    label: "Codebase Navigator",
     bestFor: "Focused codebase navigation and implementation.",
     workingGuidance: "",
     access: "read-only",
@@ -86,7 +86,7 @@ export const DEFAULT_SPECIALISTS: SpecialistSetting[] = [
   },
   {
     id: "grok-default",
-    label: "Grok Build",
+    label: "Verification Runner",
     bestFor: "Fast mechanical work and second-pass verification.",
     workingGuidance: "",
     access: "read-only",
@@ -97,7 +97,7 @@ export const DEFAULT_SPECIALISTS: SpecialistSetting[] = [
   },
   {
     id: "kimi-default",
-    label: "Kimi Code",
+    label: "Long-Context Analyst",
     bestFor: "Long-context repository work and an independent coding pass.",
     workingGuidance: "",
     access: "read-only",
@@ -114,6 +114,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function optionalText(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function migratedDefaultLabel(id: string, label: string): string {
+  const legacyLabels: Record<string, [legacy: string, role: string]> = {
+    "codex-default": ["Codex (OpenAI)", "Repository Engineer"],
+    "claude-default": ["Claude", "Product & Code Critic"],
+    "antigravity-default": ["Antigravity (Gemini)", "Research Explorer"],
+    "cursor-default": ["Cursor", "Codebase Navigator"],
+    "grok-default": ["Grok Build", "Verification Runner"],
+    "kimi-default": ["Kimi Code", "Long-Context Analyst"],
+  };
+  const migration = legacyLabels[id];
+  return migration && label === migration[0] ? migration[1] : label;
 }
 
 function normalizeRoute(value: unknown, fallbackRuntime: string): SpecialistRoute {
@@ -164,7 +177,7 @@ export function normalizeSpecialists(value: unknown): SpecialistSetting[] {
     const modern = Array.isArray(candidate.serviceLevels);
     specialists.push({
       id,
-      label: optionalText(candidate.label) ?? "Untitled specialist",
+      label: migratedDefaultLabel(id, optionalText(candidate.label) ?? "Untitled specialist"),
       bestFor: typeof candidate.bestFor === "string" ? candidate.bestFor : "",
       workingGuidance:
         typeof candidate.workingGuidance === "string"

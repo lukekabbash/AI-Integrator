@@ -647,6 +647,28 @@ describe("runtime projection reducer", () => {
     expect(runtimeTranscript(unknown)[0].title).toBe("Runtime event");
   });
 
+  it("describes Integrator scheduling as ordinary agent activity", () => {
+    const scheduled = applyRuntimeProjection(
+      createRuntimeProjectionState("task-1"),
+      event(54, {
+        kind: "itemChanged",
+        item: {
+          id: "codex:thread-1:turn-1:schedule",
+          providerItemId: "schedule",
+          kind: "mcpTool",
+          status: "completed",
+          mcpServer: "integrator",
+          mcpTool: "schedule_wakeup",
+          toolInput: '{"afterSeconds":1200}',
+          truncated: false,
+          updatedAt: "2026-07-10T16:00:00Z",
+        },
+      }),
+    );
+
+    expect(runtimeTranscript(scheduled)[0].title).toBe("Wake-up scheduled");
+  });
+
   it("turns file tools into readable paths with diff-style line counts", () => {
     const state = applyRuntimeProjection(
       createRuntimeProjectionState("task-1"),

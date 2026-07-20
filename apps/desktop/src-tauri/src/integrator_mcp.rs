@@ -428,7 +428,10 @@ pub fn resume_state_is_current(
         .is_none_or(|revision| state.updated_at >= revision.updated_at)
 }
 
-fn overview(app: &tauri::AppHandle, store: &LocalStore) -> CommandResult<IntegratorMcpOverview> {
+pub(crate) fn overview(
+    app: &tauri::AppHandle,
+    store: &LocalStore,
+) -> CommandResult<IntegratorMcpOverview> {
     let documents = documents_dir(app).ok_or(CommandError {
         code: "unavailable",
         message: "could not locate the Documents folder".into(),

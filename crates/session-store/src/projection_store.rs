@@ -9,10 +9,9 @@ use integrator_core::{
     ApprovalDecision, ApprovalKind, ApprovalProjection, ApprovalState, IntegratorError,
     ItemProjection, ItemStatus, NewTask, ProviderKind, ProviderSession, ProviderSessionId, Result,
     RuntimeBinding, RuntimeProjection, RuntimeProjectionEvent, RuntimeSession, RuntimeSessionId,
-    StopRequestResult, TASK_PROJECTION_HYDRATE_TAIL, Task, TaskId,
-    TaskProjectionConnectionHydrate, TaskProjectionDiffHydrate, TaskProjectionErrorHydrate,
-    TaskProjectionHydrate, TaskSnapshot, TaskSnapshotQuery, TransportRequestId, TurnProjection,
-    TurnStatus, UsageProjection,
+    StopRequestResult, TASK_PROJECTION_HYDRATE_TAIL, Task, TaskId, TaskProjectionConnectionHydrate,
+    TaskProjectionDiffHydrate, TaskProjectionErrorHydrate, TaskProjectionHydrate, TaskSnapshot,
+    TaskSnapshotQuery, TransportRequestId, TurnProjection, TurnStatus, UsageProjection,
 };
 use integrator_runtime::{
     ItemTextField, ProjectionMutation, ReducedProviderEvent, redact_and_bound,
@@ -113,7 +112,7 @@ impl LocalStore {
         self.connection
             .lock()
             .query_row(
-                "SELECT i.turn_id FROM codex_items i JOIN provider_sessions p ON p.id=i.provider_session_id WHERE i.task_id=?1 AND p.provider=?2 AND i.item_id=?3 ORDER BY i.last_event_seq DESC LIMIT 1",
+                "SELECT i.turn_id FROM integrator_items i JOIN provider_sessions p ON p.id=i.provider_session_id WHERE i.task_id=?1 AND p.provider=?2 AND i.item_id=?3 ORDER BY i.last_event_seq DESC LIMIT 1",
                 params![task_id.to_string(), provider.as_str(), provider_item_id],
                 |row| row.get(0),
             )
@@ -133,7 +132,7 @@ impl LocalStore {
         let connection = self.connection.lock();
         let mut statement = connection
             .prepare(
-                "SELECT projection_json FROM codex_items
+                "SELECT projection_json FROM integrator_items
                  WHERE provider_session_id = ?1 AND turn_id = ?2
                  ORDER BY CASE WHEN first_event_seq = 0 THEN last_event_seq ELSE first_event_seq END,
                           last_event_seq,
@@ -293,7 +292,7 @@ impl LocalStore {
         let transaction = connection.transaction().map_err(storage_error)?;
         validate_runtime_binding(&transaction, binding, provider_session_id, thread_id)?;
         transaction.execute(
-            "INSERT INTO codex_event_log(task_id, provider_session_id, runtime_session_id, process_id, thread_id, turn_id, method, audit_json, audit_truncated, occurred_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO integrator_event_log(task_id, provider_session_id, runtime_session_id, process_id, thread_id, turn_id, method, audit_json, audit_truncated, occurred_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![binding.task_id.to_string(), provider_session_id.to_string(), binding.runtime_session_id.to_string(), binding.process_id, thread_id, reduced.turn_id, reduced.method, reduced.audit_json, reduced.audit_truncated, reduced.occurred_at.to_rfc3339()],
         ).map_err(storage_error)?;
         let seq = transaction.last_insert_rowid();
@@ -343,9 +342,9 @@ impl LocalStore {
         let watermark = connection
             .query_row(
                 "SELECT MAX(
-                    (SELECT COALESCE(MAX(seq), 0) FROM codex_event_log WHERE task_id = ?1),
-                    (SELECT COALESCE(MAX(last_event_seq), 0) FROM codex_items WHERE task_id = ?1),
-                    (SELECT COALESCE(MAX(last_event_seq), 0) FROM codex_turns WHERE task_id = ?1)
+                    (SELECT COALESCE(MAX(seq), 0) FROM integrator_event_log WHERE task_id = ?1),
+                    (SELECT COALESCE(MAX(last_event_seq), 0) FROM integrator_items WHERE task_id = ?1),
+                    (SELECT COALESCE(MAX(last_event_seq), 0) FROM integrator_turns WHERE task_id = ?1)
                 )",
                 [&task_key],
                 |row| row.get::<_, i64>(0),
@@ -353,7 +352,7 @@ impl LocalStore {
             .map_err(storage_error)?;
         let reset_seq = connection
             .query_row(
-                "SELECT COALESCE(reset_seq, 0) FROM codex_task_projection WHERE task_id = ?1",
+                "SELECT COALESCE(reset_seq, 0) FROM integrator_task_projection WHERE task_id = ?1",
                 [&task_key],
                 |row| row.get::<_, i64>(0),
             )
@@ -384,14 +383,14 @@ impl LocalStore {
             .prepare(
                 r#"
             SELECT last_event_seq, snapshot_event_json FROM (
-                SELECT last_event_seq, snapshot_event_json FROM codex_items
+                SELECT last_event_seq, snapshot_event_json FROM integrator_items
                     WHERE task_id = ?1
                       AND last_event_seq > ?2
                       AND last_event_seq <= ?3
                       AND last_event_seq < ?4
                       AND snapshot_event_json IS NOT NULL
                 UNION ALL
-                SELECT last_event_seq, snapshot_event_json FROM codex_approvals
+                SELECT last_event_seq, snapshot_event_json FROM integrator_approvals
                     WHERE task_id = ?1
                       AND last_event_seq > ?2
                       AND last_event_seq <= ?3
@@ -422,11 +421,11 @@ impl LocalStore {
                 connection
                     .query_row(
                         "SELECT EXISTS(
-                        SELECT 1 FROM codex_items
+                        SELECT 1 FROM integrator_items
                             WHERE task_id = ?1 AND last_event_seq > ?2 AND last_event_seq < ?3
                               AND last_event_seq <= ?4 AND snapshot_event_json IS NOT NULL
                         UNION ALL
-                        SELECT 1 FROM codex_approvals
+                        SELECT 1 FROM integrator_approvals
                             WHERE task_id = ?1 AND last_event_seq > ?2 AND last_event_seq < ?3
                               AND last_event_seq <= ?4 AND snapshot_event_json IS NOT NULL
                     )",
@@ -505,22 +504,22 @@ impl LocalStore {
                 r#"
             WITH boundary AS (
                 SELECT COALESCE(reset_seq, 0) AS reset_seq
-                FROM codex_task_projection WHERE task_id = ?1
+                FROM integrator_task_projection WHERE task_id = ?1
             )
             SELECT seq, event_json FROM (
-                SELECT turn_seq AS seq, turn_event_json AS event_json FROM codex_task_projection
+                SELECT turn_seq AS seq, turn_event_json AS event_json FROM integrator_task_projection
                     WHERE task_id=?1 AND turn_seq > (SELECT reset_seq FROM boundary)
-                UNION ALL SELECT plan_seq, plan_event_json FROM codex_task_projection
+                UNION ALL SELECT plan_seq, plan_event_json FROM integrator_task_projection
                     WHERE task_id=?1 AND plan_seq > (SELECT reset_seq FROM boundary)
-                UNION ALL SELECT diff_seq, diff_event_json FROM codex_task_projection
+                UNION ALL SELECT diff_seq, diff_event_json FROM integrator_task_projection
                     WHERE task_id=?1 AND diff_seq > (SELECT reset_seq FROM boundary)
-                UNION ALL SELECT usage_seq, usage_event_json FROM codex_task_projection
+                UNION ALL SELECT usage_seq, usage_event_json FROM integrator_task_projection
                     WHERE task_id=?1 AND usage_seq > (SELECT reset_seq FROM boundary)
-                UNION ALL SELECT mode_seq, mode_event_json FROM codex_task_projection
+                UNION ALL SELECT mode_seq, mode_event_json FROM integrator_task_projection
                     WHERE task_id=?1 AND mode_seq > (SELECT reset_seq FROM boundary)
-                UNION ALL SELECT error_seq, error_event_json FROM codex_task_projection
+                UNION ALL SELECT error_seq, error_event_json FROM integrator_task_projection
                     WHERE task_id=?1 AND error_seq > (SELECT reset_seq FROM boundary)
-                UNION ALL SELECT connection_seq, connection_event_json FROM codex_task_projection
+                UNION ALL SELECT connection_seq, connection_event_json FROM integrator_task_projection
                     WHERE task_id=?1 AND connection_seq > (SELECT reset_seq FROM boundary)
             )
             WHERE event_json IS NOT NULL AND seq <= ?2
@@ -610,6 +609,7 @@ impl LocalStore {
     ) -> Result<Task> {
         let source = self.get_task(task_id)?;
         let fork = build_task(NewTask {
+            kind: source.kind,
             title,
             repository_path: source.repository_path.clone(),
             worktree_path: source.worktree_path.clone(),
@@ -629,8 +629,8 @@ impl LocalStore {
                 let (cutoff, turn_status) = transaction
                     .query_row(
                         "SELECT item.last_event_seq, turn.status
-                         FROM codex_items item
-                         LEFT JOIN codex_turns turn
+                         FROM integrator_items item
+                         LEFT JOIN integrator_turns turn
                            ON turn.provider_session_id = item.provider_session_id
                           AND turn.turn_id = item.turn_id
                          WHERE item.task_id = ?1 AND item.stable_id = ?2
@@ -710,10 +710,10 @@ impl LocalStore {
             // leaves the NULL rows NULL, which task_snapshot already skips.
             transaction
                 .execute(
-                    "INSERT INTO codex_turns(provider_session_id, task_id, thread_id, turn_id, status, stop_requested, error, started_at, completed_at, projection_json, last_event_seq, first_event_seq, first_occurred_at, snapshot_event_json)
+                    "INSERT INTO integrator_turns(provider_session_id, task_id, thread_id, turn_id, status, stop_requested, error, started_at, completed_at, projection_json, last_event_seq, first_event_seq, first_occurred_at, snapshot_event_json)
                      SELECT ?1, ?2, thread_id, turn_id, status, 0, error, started_at, completed_at, projection_json, last_event_seq, first_event_seq, first_occurred_at,
                             json_set(snapshot_event_json, '$.taskId', ?2, '$.providerSessionId', ?1)
-                     FROM codex_turns
+                     FROM integrator_turns
                      WHERE provider_session_id = ?3
                        AND last_event_seq <= ?4
                        AND status NOT IN (?5, ?6)",
@@ -729,16 +729,16 @@ impl LocalStore {
                 .map_err(storage_error)?;
             transaction
                 .execute(
-                    "INSERT INTO codex_items(provider_session_id, task_id, thread_id, turn_id, item_id, stable_id, kind, status, title, body, command_text, cwd, output, exit_code, file_changes_json, mcp_server, mcp_tool, truncated, updated_at, projection_json, last_event_seq, first_event_seq, first_occurred_at, snapshot_event_json, native_skill)
+                    "INSERT INTO integrator_items(provider_session_id, task_id, thread_id, turn_id, item_id, stable_id, kind, status, title, body, command_text, cwd, output, exit_code, file_changes_json, mcp_server, mcp_tool, truncated, updated_at, projection_json, last_event_seq, first_event_seq, first_occurred_at, snapshot_event_json, native_skill)
                      SELECT ?1, ?2, thread_id, turn_id, item_id, stable_id, kind, status, title, body, command_text, cwd, output, exit_code, file_changes_json, mcp_server, mcp_tool, truncated, updated_at, projection_json, last_event_seq, first_event_seq, first_occurred_at,
                             json_set(snapshot_event_json, '$.taskId', ?2, '$.providerSessionId', ?1)
                             , native_skill
-                     FROM codex_items item
+                     FROM integrator_items item
                      WHERE item.provider_session_id = ?3
                        AND item.last_event_seq <= ?4
                        AND NOT EXISTS (
                            SELECT 1
-                           FROM codex_turns turn
+                           FROM integrator_turns turn
                            WHERE turn.provider_session_id = item.provider_session_id
                              AND turn.turn_id = item.turn_id
                              AND turn.status IN (?5, ?6)
@@ -758,7 +758,7 @@ impl LocalStore {
 
         let source_projection = transaction
             .query_row(
-                "SELECT provider_session_id, thread_id FROM codex_task_projection WHERE task_id = ?1",
+                "SELECT provider_session_id, thread_id FROM integrator_task_projection WHERE task_id = ?1",
                 [task_id.to_string()],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
@@ -775,7 +775,7 @@ impl LocalStore {
             // for a truncated fork they describe work past the branch point.
             transaction
                 .execute(
-                    "INSERT INTO codex_task_projection(task_id, provider_session_id, thread_id) VALUES (?1, ?2, ?3)",
+                    "INSERT INTO integrator_task_projection(task_id, provider_session_id, thread_id) VALUES (?1, ?2, ?3)",
                     params![fork.id.to_string(), new_session_id, thread_id],
                 )
                 .map_err(storage_error)?;
@@ -794,7 +794,7 @@ impl LocalStore {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction().map_err(storage_error)?;
         let row = transaction.query_row(
-            "SELECT projection_json, request_kind, request_value, process_id, provider_session_id, runtime_session_id, thread_id, turn_id FROM codex_approvals WHERE id = ?1 AND task_id = ?2",
+            "SELECT projection_json, request_kind, request_value, process_id, provider_session_id, runtime_session_id, thread_id, turn_id FROM integrator_approvals WHERE id = ?1 AND task_id = ?2",
             params![approval_id, task_id.to_string()],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, Option<String>>(7)?)),
         ).optional().map_err(storage_error)?.ok_or_else(|| IntegratorError::NotFound(format!("approval {approval_id}")))?;
@@ -819,7 +819,7 @@ impl LocalStore {
             "state": approval.state.as_str(),
         })
         .to_string();
-        transaction.execute("INSERT INTO codex_event_log(task_id, provider_session_id, runtime_session_id, process_id, thread_id, turn_id, method, audit_json, audit_truncated, occurred_at) VALUES (?1,?2,?3,?4,?5,?6,'client/approval/responding',?7,0,?8)", params![task_id.to_string(), row.4, row.5, row.3, row.6, row.7, audit_json, approval.updated_at.to_rfc3339()]).map_err(storage_error)?;
+        transaction.execute("INSERT INTO integrator_event_log(task_id, provider_session_id, runtime_session_id, process_id, thread_id, turn_id, method, audit_json, audit_truncated, occurred_at) VALUES (?1,?2,?3,?4,?5,?6,'client/approval/responding',?7,0,?8)", params![task_id.to_string(), row.4, row.5, row.3, row.6, row.7, audit_json, approval.updated_at.to_rfc3339()]).map_err(storage_error)?;
         let seq = transaction.last_insert_rowid();
         let event = RuntimeProjectionEvent {
             seq,
@@ -834,7 +834,7 @@ impl LocalStore {
             },
         };
         persist_snapshot_event(&transaction, &event)?;
-        transaction.execute("UPDATE codex_approvals SET state='responding', decision=?1, updated_at=?2, last_event_seq=?3, projection_json=?4 WHERE id=?5", params![approval.decision.as_ref().map(ApprovalDecision::as_protocol_str), approval.updated_at.to_rfc3339(), seq, serde_json::to_string(&approval)?, approval_id]).map_err(storage_error)?;
+        transaction.execute("UPDATE integrator_approvals SET state='responding', decision=?1, updated_at=?2, last_event_seq=?3, projection_json=?4 WHERE id=?5", params![approval.decision.as_ref().map(ApprovalDecision::as_protocol_str), approval.updated_at.to_rfc3339(), seq, serde_json::to_string(&approval)?, approval_id]).map_err(storage_error)?;
         transaction.commit().map_err(storage_error)?;
         Ok(PreparedApprovalResponse {
             event,
@@ -858,7 +858,7 @@ impl LocalStore {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction().map_err(storage_error)?;
         let row = transaction.query_row(
-            "SELECT projection_json, request_kind, request_value, process_id, provider_session_id, runtime_session_id, thread_id, turn_id FROM codex_approvals WHERE id = ?1 AND task_id = ?2",
+            "SELECT projection_json, request_kind, request_value, process_id, provider_session_id, runtime_session_id, thread_id, turn_id FROM integrator_approvals WHERE id = ?1 AND task_id = ?2",
             params![approval_id, task_id.to_string()],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, Option<String>>(7)?)),
         ).optional().map_err(storage_error)?.ok_or_else(|| IntegratorError::NotFound(format!("approval {approval_id}")))?;
@@ -875,7 +875,11 @@ impl LocalStore {
                 "this approval is not a question".into(),
             ));
         }
-        if !approval.options.iter().any(|option| option.option_id == option_id) {
+        if !approval
+            .options
+            .iter()
+            .any(|option| option.option_id == option_id)
+        {
             return Err(IntegratorError::InvalidInput(
                 "that option was not offered for this question".into(),
             ));
@@ -895,7 +899,7 @@ impl LocalStore {
             "state": approval.state.as_str(),
         })
         .to_string();
-        transaction.execute("INSERT INTO codex_event_log(task_id, provider_session_id, runtime_session_id, process_id, thread_id, turn_id, method, audit_json, audit_truncated, occurred_at) VALUES (?1,?2,?3,?4,?5,?6,'client/approval/responding',?7,0,?8)", params![task_id.to_string(), row.4, row.5, row.3, row.6, row.7, audit_json, approval.updated_at.to_rfc3339()]).map_err(storage_error)?;
+        transaction.execute("INSERT INTO integrator_event_log(task_id, provider_session_id, runtime_session_id, process_id, thread_id, turn_id, method, audit_json, audit_truncated, occurred_at) VALUES (?1,?2,?3,?4,?5,?6,'client/approval/responding',?7,0,?8)", params![task_id.to_string(), row.4, row.5, row.3, row.6, row.7, audit_json, approval.updated_at.to_rfc3339()]).map_err(storage_error)?;
         let seq = transaction.last_insert_rowid();
         let event = RuntimeProjectionEvent {
             seq,
@@ -910,7 +914,7 @@ impl LocalStore {
             },
         };
         persist_snapshot_event(&transaction, &event)?;
-        transaction.execute("UPDATE codex_approvals SET state='responding', decision=?1, updated_at=?2, last_event_seq=?3, projection_json=?4 WHERE id=?5", params![approval.decision.as_ref().map(ApprovalDecision::as_protocol_str), approval.updated_at.to_rfc3339(), seq, serde_json::to_string(&approval)?, approval_id]).map_err(storage_error)?;
+        transaction.execute("UPDATE integrator_approvals SET state='responding', decision=?1, updated_at=?2, last_event_seq=?3, projection_json=?4 WHERE id=?5", params![approval.decision.as_ref().map(ApprovalDecision::as_protocol_str), approval.updated_at.to_rfc3339(), seq, serde_json::to_string(&approval)?, approval_id]).map_err(storage_error)?;
         transaction.commit().map_err(storage_error)?;
         Ok(PreparedApprovalResponse {
             event,
@@ -939,7 +943,7 @@ impl LocalStore {
         let connection = self.connection.lock();
         let stop_requested = connection
             .query_row(
-                "SELECT t.stop_requested FROM codex_task_projection p JOIN codex_turns t ON t.provider_session_id=p.provider_session_id AND t.turn_id=p.current_turn_id WHERE p.task_id=?1",
+                "SELECT t.stop_requested FROM integrator_task_projection p JOIN integrator_turns t ON t.provider_session_id=p.provider_session_id AND t.turn_id=p.current_turn_id WHERE p.task_id=?1",
                 [task_id.to_string()],
                 |row| row.get::<_, bool>(0),
             )
@@ -952,7 +956,7 @@ impl LocalStore {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction().map_err(storage_error)?;
         let row = transaction.query_row(
-            "SELECT t.projection_json, p.provider_session_id, p.thread_id, p.current_turn_id FROM codex_task_projection p JOIN codex_turns t ON t.provider_session_id=p.provider_session_id AND t.turn_id=p.current_turn_id WHERE p.task_id=?1",
+            "SELECT t.projection_json, p.provider_session_id, p.thread_id, p.current_turn_id FROM integrator_task_projection p JOIN integrator_turns t ON t.provider_session_id=p.provider_session_id AND t.turn_id=p.current_turn_id WHERE p.task_id=?1",
             [task_id.to_string()],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
         ).optional().map_err(storage_error)?;
@@ -980,7 +984,7 @@ impl LocalStore {
         let already_requested = turn.stop_requested;
         turn.stop_requested = true;
         let occurred_at = Utc::now();
-        let inserted = transaction.execute("INSERT INTO codex_event_log(task_id,provider_session_id,runtime_session_id,process_id,thread_id,turn_id,method,audit_json,audit_truncated,occurred_at) SELECT ?1,?2,id,process_id,?3,?4,'client/turn/stopRequested','{}',0,?5 FROM runtime_sessions WHERE task_id=?1 AND provider_session_id=?2 AND process_id IS NOT NULL ORDER BY started_at DESC LIMIT 1", params![task_id.to_string(), row.1, row.2, row.3, occurred_at.to_rfc3339()]).map_err(storage_error)?;
+        let inserted = transaction.execute("INSERT INTO integrator_event_log(task_id,provider_session_id,runtime_session_id,process_id,thread_id,turn_id,method,audit_json,audit_truncated,occurred_at) SELECT ?1,?2,id,process_id,?3,?4,'client/turn/stopRequested','{}',0,?5 FROM runtime_sessions WHERE task_id=?1 AND provider_session_id=?2 AND process_id IS NOT NULL ORDER BY started_at DESC LIMIT 1", params![task_id.to_string(), row.1, row.2, row.3, occurred_at.to_rfc3339()]).map_err(storage_error)?;
         if inserted != 1 {
             // Same dead-session path: no live runtime session can carry the
             // stop, so settle the turn locally instead of failing.
@@ -997,7 +1001,7 @@ impl LocalStore {
             });
         }
         let seq = transaction.last_insert_rowid();
-        transaction.execute("UPDATE codex_turns SET stop_requested=1,last_event_seq=?1,projection_json=?2 WHERE provider_session_id=?3 AND turn_id=?4", params![seq, serde_json::to_string(&turn)?, row.1, row.3]).map_err(storage_error)?;
+        transaction.execute("UPDATE integrator_turns SET stop_requested=1,last_event_seq=?1,projection_json=?2 WHERE provider_session_id=?3 AND turn_id=?4", params![seq, serde_json::to_string(&turn)?, row.1, row.3]).map_err(storage_error)?;
         let event = RuntimeProjectionEvent {
             seq,
             task_id,
@@ -1041,7 +1045,7 @@ impl LocalStore {
         let connection = self.connection.lock();
         let json = connection
             .query_row(
-                "SELECT projection_json FROM codex_turns WHERE task_id=?1 AND status='interrupted' ORDER BY last_event_seq DESC LIMIT 1",
+                "SELECT projection_json FROM integrator_turns WHERE task_id=?1 AND status='interrupted' ORDER BY last_event_seq DESC LIMIT 1",
                 [task_id.to_string()],
                 |row| row.get::<_, String>(0),
             )
@@ -1072,7 +1076,7 @@ impl LocalStore {
         let connection = self.connection.lock();
         connection
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM codex_turns WHERE task_id=?1 AND status IN ('pending','in_progress'))",
+                "SELECT EXISTS(SELECT 1 FROM integrator_turns WHERE task_id=?1 AND status IN ('pending','in_progress'))",
                 [task_id.to_string()],
                 |row| row.get::<_, bool>(0),
             )
@@ -1087,7 +1091,7 @@ impl LocalStore {
             let connection = self.connection.lock();
             let mut statement = connection
                 .prepare(
-                    "SELECT DISTINCT task_id FROM codex_turns WHERE status IN ('pending','in_progress')",
+                    "SELECT DISTINCT task_id FROM integrator_turns WHERE status IN ('pending','in_progress')",
                 )
                 .map_err(storage_error)?;
             let rows = statement
@@ -1130,7 +1134,7 @@ impl LocalStore {
         let mut turn_statement = connection
             .prepare(
                 "SELECT turn_id, MAX(last_event_seq) AS tip
-                 FROM codex_items
+                 FROM integrator_items
                  WHERE task_id = ?1
                  GROUP BY turn_id
                  ORDER BY tip DESC
@@ -1150,7 +1154,7 @@ impl LocalStore {
             .prepare(
                 "SELECT turn_id, kind, title, body, command_text, output, exit_code,
                         file_changes_json, mcp_server, mcp_tool, projection_json, last_event_seq
-                 FROM codex_items
+                 FROM integrator_items
                  WHERE task_id = ?1
                  ORDER BY last_event_seq ASC",
             )
@@ -1341,7 +1345,7 @@ impl LocalStore {
 
         let in_flight = transaction
             .query_row(
-                "SELECT COUNT(*) FROM codex_turns WHERE task_id = ?1 AND status IN (?2, ?3)",
+                "SELECT COUNT(*) FROM integrator_turns WHERE task_id = ?1 AND status IN (?2, ?3)",
                 params![
                     task_id.to_string(),
                     TurnStatus::Pending.as_str(),
@@ -1358,7 +1362,7 @@ impl LocalStore {
 
         let cutoff = transaction
             .query_row(
-                "SELECT last_event_seq FROM codex_items WHERE task_id = ?1 AND stable_id = ?2 ORDER BY last_event_seq DESC LIMIT 1",
+                "SELECT last_event_seq FROM integrator_items WHERE task_id = ?1 AND stable_id = ?2 ORDER BY last_event_seq DESC LIMIT 1",
                 params![task_id.to_string(), from_stable_id],
                 |row| row.get::<_, i64>(0),
             )
@@ -1371,7 +1375,7 @@ impl LocalStore {
         if save_context {
             let mut statement = transaction
                 .prepare(
-                    "SELECT body FROM codex_items WHERE task_id = ?1 AND kind = 'agent_message' AND body IS NOT NULL AND last_event_seq > ?2 ORDER BY last_event_seq ASC LIMIT 40",
+                    "SELECT body FROM integrator_items WHERE task_id = ?1 AND kind = 'agent_message' AND body IS NOT NULL AND last_event_seq > ?2 ORDER BY last_event_seq ASC LIMIT 40",
                 )
                 .map_err(storage_error)?;
             let bodies = statement
@@ -1416,19 +1420,19 @@ impl LocalStore {
 
         transaction
             .execute(
-                "DELETE FROM codex_items WHERE task_id = ?1 AND last_event_seq >= ?2",
+                "DELETE FROM integrator_items WHERE task_id = ?1 AND last_event_seq >= ?2",
                 params![task_id.to_string(), cutoff],
             )
             .map_err(storage_error)?;
         transaction
             .execute(
-                "DELETE FROM codex_turns WHERE task_id = ?1 AND last_event_seq >= ?2",
+                "DELETE FROM integrator_turns WHERE task_id = ?1 AND last_event_seq >= ?2",
                 params![task_id.to_string(), cutoff],
             )
             .map_err(storage_error)?;
         transaction
             .execute(
-                "DELETE FROM codex_approvals WHERE task_id = ?1 AND last_event_seq >= ?2",
+                "DELETE FROM integrator_approvals WHERE task_id = ?1 AND last_event_seq >= ?2",
                 params![task_id.to_string(), cutoff],
             )
             .map_err(storage_error)?;
@@ -1444,7 +1448,7 @@ impl LocalStore {
         // right rail does not keep advertising discarded results.
         transaction
             .execute(
-                "UPDATE codex_task_projection SET current_turn_id=NULL, plan_json=NULL, plan_truncated=0, plan_seq=0, plan_event_json=NULL, diff=NULL, diff_truncated=0, diff_seq=0, diff_event_json=NULL, usage_json=NULL, usage_seq=0, usage_event_json=NULL, turn_seq=0, turn_event_json=NULL, mode_seq=0, mode_event_json=NULL, error_seq=0, error_event_json=NULL WHERE task_id=?1",
+                "UPDATE integrator_task_projection SET current_turn_id=NULL, plan_json=NULL, plan_truncated=0, plan_seq=0, plan_event_json=NULL, diff=NULL, diff_truncated=0, diff_seq=0, diff_event_json=NULL, usage_json=NULL, usage_seq=0, usage_event_json=NULL, turn_seq=0, turn_event_json=NULL, mode_seq=0, mode_event_json=NULL, error_seq=0, error_event_json=NULL WHERE task_id=?1",
                 [task_id.to_string()],
             )
             .map_err(storage_error)?;
@@ -1465,7 +1469,7 @@ impl LocalStore {
         let connection = self.connection.lock();
         connection
             .query_row(
-                "SELECT COALESCE(MAX(last_event_seq), 0) FROM codex_items WHERE task_id = ?1",
+                "SELECT COALESCE(MAX(last_event_seq), 0) FROM integrator_items WHERE task_id = ?1",
                 [task_id.to_string()],
                 |row| row.get(0),
             )
@@ -1483,7 +1487,7 @@ impl LocalStore {
         let connection = self.connection.lock();
         let mut statement = connection
             .prepare(
-                "SELECT last_event_seq, body FROM codex_items WHERE task_id = ?1 AND kind = 'agent_message' AND body IS NOT NULL AND last_event_seq > ?2 ORDER BY last_event_seq ASC LIMIT 100",
+                "SELECT last_event_seq, body FROM integrator_items WHERE task_id = ?1 AND kind = 'agent_message' AND body IS NOT NULL AND last_event_seq > ?2 ORDER BY last_event_seq ASC LIMIT 100",
             )
             .map_err(storage_error)?;
         let rows = statement
@@ -1517,20 +1521,20 @@ impl LocalStore {
         let sql = if include_archived {
             r#"
                 SELECT task_id,
-                       snippet(codex_items_fts, 0, '', '', ' ... ', 22)
-                FROM codex_items_fts
-                WHERE codex_items_fts MATCH ?1
-                ORDER BY bm25(codex_items_fts), rowid DESC
+                       snippet(integrator_items_fts, 0, '', '', ' ... ', 22)
+                FROM integrator_items_fts
+                WHERE integrator_items_fts MATCH ?1
+                ORDER BY bm25(integrator_items_fts), rowid DESC
                 LIMIT ?2
                 "#
         } else {
             r#"
-                SELECT codex_items_fts.task_id,
-                       snippet(codex_items_fts, 0, '', '', ' ... ', 22)
-                FROM codex_items_fts
-                INNER JOIN tasks ON tasks.id = codex_items_fts.task_id
-                WHERE codex_items_fts MATCH ?1 AND tasks.archived = 0
-                ORDER BY bm25(codex_items_fts), codex_items_fts.rowid DESC
+                SELECT integrator_items_fts.task_id,
+                       snippet(integrator_items_fts, 0, '', '', ' ... ', 22)
+                FROM integrator_items_fts
+                INNER JOIN tasks ON tasks.id = integrator_items_fts.task_id
+                WHERE integrator_items_fts MATCH ?1 AND tasks.archived = 0
+                ORDER BY bm25(integrator_items_fts), integrator_items_fts.rowid DESC
                 LIMIT ?2
                 "#
         };
@@ -1560,7 +1564,7 @@ impl LocalStore {
         let approval_ids = {
             let connection = self.connection.lock();
             let mut statement = connection
-                .prepare("SELECT id FROM codex_approvals WHERE process_id=?1 AND state IN ('pending','responding','response_failed')")
+                .prepare("SELECT id FROM integrator_approvals WHERE process_id=?1 AND state IN ('pending','responding','response_failed')")
                 .map_err(storage_error)?;
             statement
                 .query_map([process_id], |row| row.get::<_, String>(0))
@@ -1583,7 +1587,7 @@ impl LocalStore {
         let transaction = connection.transaction().map_err(storage_error)?;
         let row = transaction
             .query_row(
-                "SELECT projection_json, task_id, provider_session_id, runtime_session_id, process_id, thread_id, turn_id, state FROM codex_approvals WHERE id=?1",
+                "SELECT projection_json, task_id, provider_session_id, runtime_session_id, process_id, thread_id, turn_id, state FROM integrator_approvals WHERE id=?1",
                 [approval_id],
                 |row| {
                     Ok((
@@ -1631,7 +1635,7 @@ impl LocalStore {
         .to_string();
         transaction
             .execute(
-                "INSERT INTO codex_event_log(task_id,provider_session_id,runtime_session_id,process_id,thread_id,turn_id,method,audit_json,audit_truncated,occurred_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,?9)",
+                "INSERT INTO integrator_event_log(task_id,provider_session_id,runtime_session_id,process_id,thread_id,turn_id,method,audit_json,audit_truncated,occurred_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,?9)",
                 params![row.1, row.2, row.3, row.4, row.5, row.6, method, audit_json, approval.updated_at.to_rfc3339()],
             )
             .map_err(storage_error)?;
@@ -1651,7 +1655,7 @@ impl LocalStore {
         persist_snapshot_event(&transaction, &event)?;
         transaction
             .execute(
-                "UPDATE codex_approvals SET state=?1,updated_at=?2,projection_json=?3,last_event_seq=?4 WHERE id=?5",
+                "UPDATE integrator_approvals SET state=?1,updated_at=?2,projection_json=?3,last_event_seq=?4 WHERE id=?5",
                 params![approval.state.as_str(), approval.updated_at.to_rfc3339(), serde_json::to_string(&approval)?, seq, approval_id],
             )
             .map_err(storage_error)?;
@@ -1678,7 +1682,7 @@ fn settle_failed_turn(
 ) -> Result<()> {
     let row = transaction
         .query_row(
-            "SELECT projection_json, provider_session_id, turn_id FROM codex_turns WHERE task_id=?1 AND status IN ('pending','in_progress') ORDER BY last_event_seq DESC LIMIT 1",
+            "SELECT projection_json, provider_session_id, turn_id FROM integrator_turns WHERE task_id=?1 AND status IN ('pending','in_progress') ORDER BY last_event_seq DESC LIMIT 1",
             [task_id.to_string()],
             |row| {
                 Ok((
@@ -1699,7 +1703,7 @@ fn settle_failed_turn(
     turn.completed_at = Some(occurred_at);
     transaction
         .execute(
-            "UPDATE codex_turns SET status='failed',error=?1,completed_at=?2,projection_json=?3,last_event_seq=?4 WHERE provider_session_id=?5 AND turn_id=?6",
+            "UPDATE integrator_turns SET status='failed',error=?1,completed_at=?2,projection_json=?3,last_event_seq=?4 WHERE provider_session_id=?5 AND turn_id=?6",
             params![
                 message,
                 occurred_at.to_rfc3339(),
@@ -1726,7 +1730,7 @@ fn settle_stale_turn(
     stop_requested: bool,
 ) -> Result<Option<RuntimeProjectionEvent>> {
     let unfinished = transaction.query_row(
-        "SELECT projection_json, provider_session_id, thread_id, turn_id FROM codex_turns WHERE task_id=?1 AND status IN ('pending','in_progress') ORDER BY last_event_seq DESC LIMIT 1",
+        "SELECT projection_json, provider_session_id, thread_id, turn_id FROM integrator_turns WHERE task_id=?1 AND status IN ('pending','in_progress') ORDER BY last_event_seq DESC LIMIT 1",
         [task_id.to_string()],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
     ).optional().map_err(storage_error)?;
@@ -1735,7 +1739,7 @@ fn settle_stale_turn(
     } else if stop_requested {
         transaction
             .query_row(
-                "SELECT projection_json, provider_session_id, thread_id, turn_id FROM codex_turns WHERE task_id=?1 AND status='interrupted' AND stop_requested=0 ORDER BY last_event_seq DESC LIMIT 1",
+                "SELECT projection_json, provider_session_id, thread_id, turn_id FROM integrator_turns WHERE task_id=?1 AND status='interrupted' AND stop_requested=0 ORDER BY last_event_seq DESC LIMIT 1",
                 [task_id.to_string()],
                 |row| {
                     Ok((
@@ -1767,7 +1771,7 @@ fn settle_stale_turn(
         "client/turn/interruptedSettled"
     };
     let inserted = transaction.execute(
-        "INSERT INTO codex_event_log(task_id,provider_session_id,runtime_session_id,process_id,thread_id,turn_id,method,audit_json,audit_truncated,occurred_at) SELECT ?1,?2,id,COALESCE(process_id,'expired'),?3,?4,?5,'{}',0,?6 FROM runtime_sessions WHERE task_id=?1 AND provider_session_id=?2 ORDER BY started_at DESC LIMIT 1",
+        "INSERT INTO integrator_event_log(task_id,provider_session_id,runtime_session_id,process_id,thread_id,turn_id,method,audit_json,audit_truncated,occurred_at) SELECT ?1,?2,id,COALESCE(process_id,'expired'),?3,?4,?5,'{}',0,?6 FROM runtime_sessions WHERE task_id=?1 AND provider_session_id=?2 ORDER BY started_at DESC LIMIT 1",
         params![task_id.to_string(), row.1, row.2, row.3, method, occurred_at.to_rfc3339()],
     ).map_err(storage_error)?;
     if inserted != 1 {
@@ -1775,7 +1779,7 @@ fn settle_stale_turn(
     }
     let seq = transaction.last_insert_rowid();
     transaction.execute(
-        "UPDATE codex_turns SET status='interrupted',stop_requested=?1,completed_at=?2,projection_json=?3,last_event_seq=?4 WHERE provider_session_id=?5 AND turn_id=?6",
+        "UPDATE integrator_turns SET status='interrupted',stop_requested=?1,completed_at=?2,projection_json=?3,last_event_seq=?4 WHERE provider_session_id=?5 AND turn_id=?6",
         params![turn.stop_requested, turn.completed_at.map(|v| v.to_rfc3339()), serde_json::to_string(&turn)?, seq, row.1, row.3],
     ).map_err(storage_error)?;
     let event = RuntimeProjectionEvent {
@@ -1808,11 +1812,11 @@ fn apply_mutation(
     ensure_task_projection(transaction, binding, seq)?;
     match &reduced.mutation {
         ProjectionMutation::Turn(turn) => {
-            let stop_requested = transaction.query_row("SELECT stop_requested FROM codex_turns WHERE provider_session_id=?1 AND turn_id=?2", params![provider_session_id.to_string(), turn.id], |row| row.get::<_, bool>(0)).optional().map_err(storage_error)?.unwrap_or(false);
+            let stop_requested = transaction.query_row("SELECT stop_requested FROM integrator_turns WHERE provider_session_id=?1 AND turn_id=?2", params![provider_session_id.to_string(), turn.id], |row| row.get::<_, bool>(0)).optional().map_err(storage_error)?.unwrap_or(false);
             let mut turn = turn.clone();
             turn.stop_requested |= stop_requested;
-            transaction.execute("INSERT INTO codex_turns(provider_session_id,task_id,thread_id,turn_id,status,stop_requested,error,started_at,completed_at,projection_json,last_event_seq,first_event_seq,first_occurred_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11,?12) ON CONFLICT(provider_session_id,turn_id) DO UPDATE SET status=excluded.status,stop_requested=excluded.stop_requested,error=excluded.error,started_at=excluded.started_at,completed_at=excluded.completed_at,projection_json=excluded.projection_json,last_event_seq=excluded.last_event_seq", params![provider_session_id.to_string(),binding.task_id.to_string(),thread_id,turn.id,turn.status.as_str(),turn.stop_requested,turn.error,turn.started_at.map(|v|v.to_rfc3339()),turn.completed_at.map(|v|v.to_rfc3339()),serde_json::to_string(&turn)?,seq,reduced.occurred_at.to_rfc3339()]).map_err(storage_error)?;
-            transaction.execute("UPDATE codex_task_projection SET current_turn_id=?1,last_event_seq=?2 WHERE task_id=?3", params![turn.id,seq,binding.task_id.to_string()]).map_err(storage_error)?;
+            transaction.execute("INSERT INTO integrator_turns(provider_session_id,task_id,thread_id,turn_id,status,stop_requested,error,started_at,completed_at,projection_json,last_event_seq,first_event_seq,first_occurred_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11,?12) ON CONFLICT(provider_session_id,turn_id) DO UPDATE SET status=excluded.status,stop_requested=excluded.stop_requested,error=excluded.error,started_at=excluded.started_at,completed_at=excluded.completed_at,projection_json=excluded.projection_json,last_event_seq=excluded.last_event_seq", params![provider_session_id.to_string(),binding.task_id.to_string(),thread_id,turn.id,turn.status.as_str(),turn.stop_requested,turn.error,turn.started_at.map(|v|v.to_rfc3339()),turn.completed_at.map(|v|v.to_rfc3339()),serde_json::to_string(&turn)?,seq,reduced.occurred_at.to_rfc3339()]).map_err(storage_error)?;
+            transaction.execute("UPDATE integrator_task_projection SET current_turn_id=?1,last_event_seq=?2 WHERE task_id=?3", params![turn.id,seq,binding.task_id.to_string()]).map_err(storage_error)?;
             Ok(RuntimeProjection::TurnChanged { turn })
         }
         ProjectionMutation::ReplaceItem(item) | ProjectionMutation::NeutralItem(item) => {
@@ -1915,21 +1919,21 @@ fn apply_mutation(
             Ok(RuntimeProjection::ItemChanged { item })
         }
         ProjectionMutation::Plan { steps, truncated } => {
-            transaction.execute("UPDATE codex_task_projection SET plan_json=?1,plan_truncated=?2,plan_seq=?3,last_event_seq=?3 WHERE task_id=?4",params![serde_json::to_string(steps)?,truncated,seq,binding.task_id.to_string()]).map_err(storage_error)?;
+            transaction.execute("UPDATE integrator_task_projection SET plan_json=?1,plan_truncated=?2,plan_seq=?3,last_event_seq=?3 WHERE task_id=?4",params![serde_json::to_string(steps)?,truncated,seq,binding.task_id.to_string()]).map_err(storage_error)?;
             Ok(RuntimeProjection::PlanChanged {
                 steps: steps.clone(),
                 truncated: *truncated,
             })
         }
         ProjectionMutation::Diff { diff, truncated } => {
-            transaction.execute("UPDATE codex_task_projection SET diff=?1,diff_truncated=?2,diff_seq=?3,last_event_seq=?3 WHERE task_id=?4",params![diff,truncated,seq,binding.task_id.to_string()]).map_err(storage_error)?;
+            transaction.execute("UPDATE integrator_task_projection SET diff=?1,diff_truncated=?2,diff_seq=?3,last_event_seq=?3 WHERE task_id=?4",params![diff,truncated,seq,binding.task_id.to_string()]).map_err(storage_error)?;
             Ok(RuntimeProjection::DiffChanged {
                 diff: diff.clone(),
                 truncated: *truncated,
             })
         }
         ProjectionMutation::Usage(usage) => {
-            transaction.execute("UPDATE codex_task_projection SET usage_json=?1,usage_seq=?2,last_event_seq=?2 WHERE task_id=?3",params![serde_json::to_string(usage)?,seq,binding.task_id.to_string()]).map_err(storage_error)?;
+            transaction.execute("UPDATE integrator_task_projection SET usage_json=?1,usage_seq=?2,last_event_seq=?2 WHERE task_id=?3",params![serde_json::to_string(usage)?,seq,binding.task_id.to_string()]).map_err(storage_error)?;
             Ok(RuntimeProjection::UsageChanged {
                 usage: usage.clone(),
             })
@@ -1937,7 +1941,7 @@ fn apply_mutation(
         ProjectionMutation::UsageDelta(delta) => {
             let existing = transaction
                 .query_row(
-                    "SELECT usage_json FROM codex_task_projection WHERE task_id=?1",
+                    "SELECT usage_json FROM integrator_task_projection WHERE task_id=?1",
                     params![binding.task_id.to_string()],
                     |row| row.get::<_, Option<String>>(0),
                 )
@@ -1966,13 +1970,13 @@ fn apply_mutation(
                     delta.vendor_cost_micro_usd,
                 ),
             };
-            transaction.execute("UPDATE codex_task_projection SET usage_json=?1,usage_seq=?2,last_event_seq=?2 WHERE task_id=?3",params![serde_json::to_string(&usage)?,seq,binding.task_id.to_string()]).map_err(storage_error)?;
+            transaction.execute("UPDATE integrator_task_projection SET usage_json=?1,usage_seq=?2,last_event_seq=?2 WHERE task_id=?3",params![serde_json::to_string(&usage)?,seq,binding.task_id.to_string()]).map_err(storage_error)?;
             Ok(RuntimeProjection::UsageChanged { usage })
         }
         ProjectionMutation::Mode(mode) => {
             transaction
                 .execute(
-                    "UPDATE codex_task_projection SET last_event_seq=?1 WHERE task_id=?2",
+                    "UPDATE integrator_task_projection SET last_event_seq=?1 WHERE task_id=?2",
                     params![seq, binding.task_id.to_string()],
                 )
                 .map_err(storage_error)?;
@@ -1990,7 +1994,7 @@ fn apply_mutation(
             options,
         } => {
             let (request_kind, request_value) = request_id_parts(request_id);
-            let existing=transaction.query_row("SELECT projection_json FROM codex_approvals WHERE runtime_session_id=?1 AND request_kind=?2 AND request_value=?3 AND approval_kind=?4 AND COALESCE(approval_id,'')=COALESCE(?5,'') ORDER BY updated_at DESC LIMIT 1",params![binding.runtime_session_id.to_string(),request_kind,request_value,approval_kind.as_str(),approval_id],|row|row.get::<_,String>(0)).optional().map_err(storage_error)?;
+            let existing=transaction.query_row("SELECT projection_json FROM integrator_approvals WHERE runtime_session_id=?1 AND request_kind=?2 AND request_value=?3 AND approval_kind=?4 AND COALESCE(approval_id,'')=COALESCE(?5,'') ORDER BY updated_at DESC LIMIT 1",params![binding.runtime_session_id.to_string(),request_kind,request_value,approval_kind.as_str(),approval_id],|row|row.get::<_,String>(0)).optional().map_err(storage_error)?;
             let mut approval = if let Some(json) = existing {
                 serde_json::from_str::<ApprovalProjection>(&json)?
             } else {
@@ -2032,16 +2036,16 @@ fn apply_mutation(
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
-            transaction.execute("INSERT INTO codex_approvals(id,provider_session_id,runtime_session_id,task_id,process_id,thread_id,turn_id,item_id,approval_id,request_kind,request_value,approval_kind,state,decision,reason,command_text,cwd,file_changes_json,updated_at,projection_json,last_event_seq,first_event_seq,first_occurred_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'pending',NULL,?13,?14,?15,?16,?17,?18,?19,?19,?17) ON CONFLICT(id) DO UPDATE SET state='pending',reason=excluded.reason,command_text=excluded.command_text,cwd=excluded.cwd,file_changes_json=excluded.file_changes_json,updated_at=excluded.updated_at,projection_json=excluded.projection_json,last_event_seq=excluded.last_event_seq",params![approval.id,provider_session_id.to_string(),binding.runtime_session_id.to_string(),binding.task_id.to_string(),binding.process_id,thread_id,reduced.turn_id,item_id,approval_id,request_kind,request_value,approval_kind.as_str(),reason,command,cwd,file_changes_json,reduced.occurred_at.to_rfc3339(),serde_json::to_string(&approval)?,seq]).map_err(storage_error)?;
+            transaction.execute("INSERT INTO integrator_approvals(id,provider_session_id,runtime_session_id,task_id,process_id,thread_id,turn_id,item_id,approval_id,request_kind,request_value,approval_kind,state,decision,reason,command_text,cwd,file_changes_json,updated_at,projection_json,last_event_seq,first_event_seq,first_occurred_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'pending',NULL,?13,?14,?15,?16,?17,?18,?19,?19,?17) ON CONFLICT(id) DO UPDATE SET state='pending',reason=excluded.reason,command_text=excluded.command_text,cwd=excluded.cwd,file_changes_json=excluded.file_changes_json,updated_at=excluded.updated_at,projection_json=excluded.projection_json,last_event_seq=excluded.last_event_seq",params![approval.id,provider_session_id.to_string(),binding.runtime_session_id.to_string(),binding.task_id.to_string(),binding.process_id,thread_id,reduced.turn_id,item_id,approval_id,request_kind,request_value,approval_kind.as_str(),reason,command,cwd,file_changes_json,reduced.occurred_at.to_rfc3339(),serde_json::to_string(&approval)?,seq]).map_err(storage_error)?;
             Ok(RuntimeProjection::ApprovalChanged { approval })
         }
         ProjectionMutation::ApprovalResolved { request_id } => {
             let (kind, value) = request_id_parts(request_id);
-            let json=transaction.query_row("SELECT projection_json FROM codex_approvals WHERE runtime_session_id=?1 AND request_kind=?2 AND request_value=?3 ORDER BY updated_at DESC LIMIT 1",params![binding.runtime_session_id.to_string(),kind,value],|row|row.get::<_,String>(0)).optional().map_err(storage_error)?.ok_or_else(||IntegratorError::NotFound("resolved approval".into()))?;
+            let json=transaction.query_row("SELECT projection_json FROM integrator_approvals WHERE runtime_session_id=?1 AND request_kind=?2 AND request_value=?3 ORDER BY updated_at DESC LIMIT 1",params![binding.runtime_session_id.to_string(),kind,value],|row|row.get::<_,String>(0)).optional().map_err(storage_error)?.ok_or_else(||IntegratorError::NotFound("resolved approval".into()))?;
             let mut approval: ApprovalProjection = serde_json::from_str(&json)?;
             approval.state = ApprovalState::Resolved;
             approval.updated_at = reduced.occurred_at;
-            transaction.execute("UPDATE codex_approvals SET state='resolved',updated_at=?1,projection_json=?2,last_event_seq=?3 WHERE id=?4",params![approval.updated_at.to_rfc3339(),serde_json::to_string(&approval)?,seq,approval.id]).map_err(storage_error)?;
+            transaction.execute("UPDATE integrator_approvals SET state='resolved',updated_at=?1,projection_json=?2,last_event_seq=?3 WHERE id=?4",params![approval.updated_at.to_rfc3339(),serde_json::to_string(&approval)?,seq,approval.id]).map_err(storage_error)?;
             Ok(RuntimeProjection::ApprovalChanged { approval })
         }
         ProjectionMutation::TurnError { message, retryable } => {
@@ -2060,7 +2064,7 @@ fn apply_mutation(
             })
         }
         ProjectionMutation::Connection { state, reason } => {
-            transaction.execute("UPDATE codex_task_projection SET connection_state=?1,connection_reason=?2,process_id=?3,connection_seq=?4,last_event_seq=?4 WHERE task_id=?5",params![state.as_str(),reason,binding.process_id,seq,binding.task_id.to_string()]).map_err(storage_error)?;
+            transaction.execute("UPDATE integrator_task_projection SET connection_state=?1,connection_reason=?2,process_id=?3,connection_seq=?4,last_event_seq=?4 WHERE task_id=?5",params![state.as_str(),reason,binding.process_id,seq,binding.task_id.to_string()]).map_err(storage_error)?;
             Ok(RuntimeProjection::ConnectionChanged {
                 state: state.clone(),
                 reason: reason.clone(),
@@ -2084,7 +2088,7 @@ fn persist_snapshot_event(
     match &event.projection {
         RuntimeProjection::ItemChanged { item } => {
             let (first_seq, first_at, reset_seq) = transaction.query_row(
-                "SELECT i.first_event_seq,i.first_occurred_at,COALESCE(p.reset_seq,0) FROM codex_items i JOIN codex_task_projection p ON p.task_id=i.task_id WHERE i.provider_session_id=?1 AND i.stable_id=?2 ORDER BY i.last_event_seq DESC LIMIT 1",
+                "SELECT i.first_event_seq,i.first_occurred_at,COALESCE(p.reset_seq,0) FROM integrator_items i JOIN integrator_task_projection p ON p.task_id=i.task_id WHERE i.provider_session_id=?1 AND i.stable_id=?2 ORDER BY i.last_event_seq DESC LIMIT 1",
                 params![provider_session_id, item.id],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, i64>(2)?)),
             ).map_err(storage_error)?;
@@ -2102,13 +2106,13 @@ fn persist_snapshot_event(
             };
             snapshot.occurred_at = first_at;
             transaction.execute(
-                "UPDATE codex_items SET first_event_seq=?1,first_occurred_at=?2,snapshot_event_json=?3 WHERE provider_session_id=?4 AND stable_id=?5",
+                "UPDATE integrator_items SET first_event_seq=?1,first_occurred_at=?2,snapshot_event_json=?3 WHERE provider_session_id=?4 AND stable_id=?5",
                 params![first_seq, first_at.to_rfc3339(), serde_json::to_string(&snapshot)?, provider_session_id, item.id],
             ).map_err(storage_error)?;
         }
         RuntimeProjection::ApprovalChanged { approval } => {
             let (first_seq, first_at, reset_seq) = transaction.query_row(
-                "SELECT a.first_event_seq,a.first_occurred_at,COALESCE(p.reset_seq,0) FROM codex_approvals a JOIN codex_task_projection p ON p.task_id=a.task_id WHERE a.id=?1",
+                "SELECT a.first_event_seq,a.first_occurred_at,COALESCE(p.reset_seq,0) FROM integrator_approvals a JOIN integrator_task_projection p ON p.task_id=a.task_id WHERE a.id=?1",
                 [approval.id.as_str()],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, i64>(2)?)),
             ).map_err(storage_error)?;
@@ -2126,18 +2130,18 @@ fn persist_snapshot_event(
             };
             snapshot.occurred_at = first_at;
             transaction.execute(
-                "UPDATE codex_approvals SET first_event_seq=?1,first_occurred_at=?2,snapshot_event_json=?3 WHERE id=?4",
+                "UPDATE integrator_approvals SET first_event_seq=?1,first_occurred_at=?2,snapshot_event_json=?3 WHERE id=?4",
                 params![first_seq, first_at.to_rfc3339(), serde_json::to_string(&snapshot)?, approval.id],
             ).map_err(storage_error)?;
         }
         RuntimeProjection::TurnChanged { turn } => {
             let json = serde_json::to_string(&snapshot)?;
             transaction.execute(
-                "UPDATE codex_turns SET first_event_seq=CASE WHEN first_event_seq=0 THEN ?1 ELSE first_event_seq END,first_occurred_at=COALESCE(first_occurred_at,?2),snapshot_event_json=?3 WHERE provider_session_id=?4 AND turn_id=?5",
+                "UPDATE integrator_turns SET first_event_seq=CASE WHEN first_event_seq=0 THEN ?1 ELSE first_event_seq END,first_occurred_at=COALESCE(first_occurred_at,?2),snapshot_event_json=?3 WHERE provider_session_id=?4 AND turn_id=?5",
                 params![event.seq, event.occurred_at.to_rfc3339(), json, provider_session_id, turn.id],
             ).map_err(storage_error)?;
             transaction.execute(
-                "UPDATE codex_task_projection SET turn_seq=?1,turn_event_json=?2 WHERE task_id=?3",
+                "UPDATE integrator_task_projection SET turn_seq=?1,turn_event_json=?2 WHERE task_id=?3",
                 params![event.seq, serde_json::to_string(&snapshot)?, task_id],
             ).map_err(storage_error)?;
         }
@@ -2186,24 +2190,24 @@ fn persist_snapshot_event(
         RuntimeProjection::ProjectionReset { .. } => {
             transaction
                 .execute(
-                    "DELETE FROM codex_turns WHERE task_id=?1",
+                    "DELETE FROM integrator_turns WHERE task_id=?1",
                     [task_id.as_str()],
                 )
                 .map_err(storage_error)?;
             transaction
                 .execute(
-                    "DELETE FROM codex_items WHERE task_id=?1",
+                    "DELETE FROM integrator_items WHERE task_id=?1",
                     [task_id.as_str()],
                 )
                 .map_err(storage_error)?;
             transaction
                 .execute(
-                    "DELETE FROM codex_approvals WHERE task_id=?1",
+                    "DELETE FROM integrator_approvals WHERE task_id=?1",
                     [task_id.as_str()],
                 )
                 .map_err(storage_error)?;
             transaction.execute(
-                "UPDATE codex_task_projection SET current_turn_id=NULL,plan_json=NULL,plan_truncated=0,plan_seq=0,plan_event_json=NULL,diff=NULL,diff_truncated=0,diff_seq=0,diff_event_json=NULL,usage_json=NULL,usage_seq=0,usage_event_json=NULL,turn_seq=0,turn_event_json=NULL,mode_seq=0,mode_event_json=NULL,error_seq=0,error_event_json=NULL,connection_seq=0,connection_event_json=NULL,reset_seq=?1,reset_event_json=?2,last_event_seq=?1 WHERE task_id=?3",
+                "UPDATE integrator_task_projection SET current_turn_id=NULL,plan_json=NULL,plan_truncated=0,plan_seq=0,plan_event_json=NULL,diff=NULL,diff_truncated=0,diff_seq=0,diff_event_json=NULL,usage_json=NULL,usage_seq=0,usage_event_json=NULL,turn_seq=0,turn_event_json=NULL,mode_seq=0,mode_event_json=NULL,error_seq=0,error_event_json=NULL,connection_seq=0,connection_event_json=NULL,reset_seq=?1,reset_event_json=?2,last_event_seq=?1 WHERE task_id=?3",
                 params![event.seq, serde_json::to_string(&snapshot)?, task_id],
             ).map_err(storage_error)?;
         }
@@ -2221,7 +2225,7 @@ fn update_singleton_snapshot(
     // Column names are closed over at compile time by the match above; no
     // provider- or renderer-controlled identifier reaches this statement.
     let sql = format!(
-        "UPDATE codex_task_projection SET {seq_column}=?1,{json_column}=?2 WHERE task_id=?3"
+        "UPDATE integrator_task_projection SET {seq_column}=?1,{json_column}=?2 WHERE task_id=?3"
     );
     transaction
         .execute(
@@ -2287,7 +2291,7 @@ fn ensure_task_projection(
         .thread_id
         .as_deref()
         .ok_or_else(|| IntegratorError::Storage("runtime thread identity is missing".into()))?;
-    transaction.execute("INSERT INTO codex_task_projection(task_id,provider_session_id,thread_id,process_id,last_event_seq) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(task_id) DO UPDATE SET provider_session_id=excluded.provider_session_id,thread_id=excluded.thread_id,process_id=excluded.process_id,last_event_seq=excluded.last_event_seq",params![binding.task_id.to_string(),provider_session_id.to_string(),thread_id,binding.process_id,seq]).map_err(storage_error)?;
+    transaction.execute("INSERT INTO integrator_task_projection(task_id,provider_session_id,thread_id,process_id,last_event_seq) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(task_id) DO UPDATE SET provider_session_id=excluded.provider_session_id,thread_id=excluded.thread_id,process_id=excluded.process_id,last_event_seq=excluded.last_event_seq",params![binding.task_id.to_string(),provider_session_id.to_string(),thread_id,binding.process_id,seq]).map_err(storage_error)?;
     Ok(())
 }
 fn upsert_item(
@@ -2304,7 +2308,7 @@ fn upsert_item(
         .thread_id
         .as_deref()
         .ok_or_else(|| IntegratorError::Storage("runtime thread identity is missing".into()))?;
-    transaction.execute("INSERT INTO codex_items(provider_session_id,task_id,thread_id,turn_id,item_id,stable_id,kind,status,title,body,command_text,cwd,output,exit_code,file_changes_json,mcp_server,mcp_tool,truncated,updated_at,projection_json,last_event_seq,first_event_seq,first_occurred_at,native_skill) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?21,?22,?23) ON CONFLICT(provider_session_id,turn_id,item_id) DO UPDATE SET stable_id=excluded.stable_id,kind=excluded.kind,status=excluded.status,title=excluded.title,body=excluded.body,command_text=excluded.command_text,cwd=excluded.cwd,output=excluded.output,exit_code=excluded.exit_code,file_changes_json=excluded.file_changes_json,mcp_server=excluded.mcp_server,mcp_tool=excluded.mcp_tool,truncated=excluded.truncated,updated_at=excluded.updated_at,projection_json=excluded.projection_json,last_event_seq=excluded.last_event_seq,native_skill=excluded.native_skill",params![provider_session_id.to_string(),binding.task_id.to_string(),thread_id,reduced.turn_id,item.provider_item_id,item.id,item.kind.as_str(),item.status.as_str(),item.title,item.body,item.command,item.cwd,item.output,item.exit_code,item.file_changes.as_ref().map(serde_json::to_string).transpose()?,item.mcp_server,item.mcp_tool,item.truncated,item.updated_at.to_rfc3339(),serde_json::to_string(item)?,seq,reduced.occurred_at.to_rfc3339(),item.native_skill]).map_err(storage_error)?;
+    transaction.execute("INSERT INTO integrator_items(provider_session_id,task_id,thread_id,turn_id,item_id,stable_id,kind,status,title,body,command_text,cwd,output,exit_code,file_changes_json,mcp_server,mcp_tool,truncated,updated_at,projection_json,last_event_seq,first_event_seq,first_occurred_at,native_skill) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?21,?22,?23) ON CONFLICT(provider_session_id,turn_id,item_id) DO UPDATE SET stable_id=excluded.stable_id,kind=excluded.kind,status=excluded.status,title=excluded.title,body=excluded.body,command_text=excluded.command_text,cwd=excluded.cwd,output=excluded.output,exit_code=excluded.exit_code,file_changes_json=excluded.file_changes_json,mcp_server=excluded.mcp_server,mcp_tool=excluded.mcp_tool,truncated=excluded.truncated,updated_at=excluded.updated_at,projection_json=excluded.projection_json,last_event_seq=excluded.last_event_seq,native_skill=excluded.native_skill",params![provider_session_id.to_string(),binding.task_id.to_string(),thread_id,reduced.turn_id,item.provider_item_id,item.id,item.kind.as_str(),item.status.as_str(),item.title,item.body,item.command,item.cwd,item.output,item.exit_code,item.file_changes.as_ref().map(serde_json::to_string).transpose()?,item.mcp_server,item.mcp_tool,item.truncated,item.updated_at.to_rfc3339(),serde_json::to_string(item)?,seq,reduced.occurred_at.to_rfc3339(),item.native_skill]).map_err(storage_error)?;
     Ok(())
 }
 fn load_item(
@@ -2313,7 +2317,7 @@ fn load_item(
     turn_id: &str,
     item_id: &str,
 ) -> Result<Option<ItemProjection>> {
-    transaction.query_row("SELECT projection_json FROM codex_items WHERE provider_session_id=?1 AND turn_id=?2 AND item_id=?3",params![provider_session_id.to_string(),turn_id,item_id],|row|row.get::<_,String>(0)).optional().map_err(storage_error)?.map(|json|serde_json::from_str(&json).map_err(Into::into)).transpose()
+    transaction.query_row("SELECT projection_json FROM integrator_items WHERE provider_session_id=?1 AND turn_id=?2 AND item_id=?3",params![provider_session_id.to_string(),turn_id,item_id],|row|row.get::<_,String>(0)).optional().map_err(storage_error)?.map(|json|serde_json::from_str(&json).map_err(Into::into)).transpose()
 }
 fn request_id_parts(id: &TransportRequestId) -> (&'static str, String) {
     match id {
@@ -2726,7 +2730,7 @@ mod tests {
     use super::*;
     use chrono::DateTime;
     use integrator_core::{
-        ApprovalKind, ConnectionState, ItemKind, ModeOption, ModeProjection, NewTask,
+        ApprovalKind, ConnectionState, ItemKind, ModeOption, ModeProjection, NewTask, TaskKind,
         TaskSnapshotQuery, TransportRequestId, TurnStatus,
     };
 
@@ -2734,6 +2738,7 @@ mod tests {
         let store = LocalStore::open_in_memory().expect("open store");
         let task = store
             .create_task(NewTask {
+                kind: TaskKind::Code,
                 title: "Projection fixture".into(),
                 repository_path: None,
                 worktree_path: None,
@@ -2756,7 +2761,7 @@ mod tests {
         let connection = store.connection.lock();
         connection
             .query_row(
-                "SELECT COUNT(*) FROM codex_event_log WHERE task_id=?1 AND projection_json IS NOT NULL",
+                "SELECT COUNT(*) FROM integrator_event_log WHERE task_id=?1 AND projection_json IS NOT NULL",
                 [task_id.to_string()],
                 |row| row.get(0),
             )
@@ -2933,7 +2938,7 @@ mod tests {
         let transaction = connection.transaction().expect("reset transaction");
         transaction
             .execute(
-                "INSERT INTO codex_event_log(task_id,provider_session_id,runtime_session_id,process_id,thread_id,turn_id,method,audit_json,audit_truncated,occurred_at) VALUES (?1,?2,?3,?4,?5,NULL,'client/projection/reset','{}',0,?6)",
+                "INSERT INTO integrator_event_log(task_id,provider_session_id,runtime_session_id,process_id,thread_id,turn_id,method,audit_json,audit_truncated,occurred_at) VALUES (?1,?2,?3,?4,?5,NULL,'client/projection/reset','{}',0,?6)",
                 params![
                     binding.task_id.to_string(),
                     provider_session_id.to_string(),
@@ -3127,7 +3132,7 @@ mod tests {
                 .connection
                 .lock()
                 .query_row(
-                    "SELECT status FROM codex_turns WHERE turn_id='turn-1'",
+                    "SELECT status FROM integrator_turns WHERE turn_id='turn-1'",
                     [],
                     |row| row.get::<_, String>(0),
                 )
@@ -3337,7 +3342,7 @@ mod tests {
         let connection = store.connection.lock();
         let audit_count: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM codex_event_log WHERE task_id=?1",
+                "SELECT COUNT(*) FROM integrator_event_log WHERE task_id=?1",
                 [binding.task_id.to_string()],
                 |row| row.get(0),
             )
@@ -3370,7 +3375,7 @@ mod tests {
             let connection = store.connection.lock();
             let mut statement = connection
                 .prepare(
-                    "SELECT method,audit_json FROM codex_event_log WHERE task_id=?1 AND method LIKE 'client/approval/%' ORDER BY seq",
+                    "SELECT method,audit_json FROM integrator_event_log WHERE task_id=?1 AND method LIKE 'client/approval/%' ORDER BY seq",
                 )
                 .expect("prepare compact audit query");
             statement
@@ -3436,7 +3441,7 @@ mod tests {
             let connection = store.connection.lock();
             let mut statement = connection
                 .prepare(
-                    "SELECT method FROM codex_event_log WHERE task_id=?1 AND method LIKE 'client/approval/%' ORDER BY seq",
+                    "SELECT method FROM integrator_event_log WHERE task_id=?1 AND method LIKE 'client/approval/%' ORDER BY seq",
                 )
                 .expect("prepare approval audit query");
             statement
@@ -3470,8 +3475,9 @@ mod tests {
         let prepared = store
             .prepare_question_response(binding.task_id, &approval.id, "opt-quarterly")
             .expect("prepare question response");
-        let RuntimeProjection::ApprovalChanged { approval: responding } =
-            prepared.event.projection
+        let RuntimeProjection::ApprovalChanged {
+            approval: responding,
+        } = prepared.event.projection
         else {
             panic!("expected approval projection");
         };
@@ -3590,7 +3596,7 @@ mod tests {
         let connection = store.connection.lock();
         let audit_count: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM codex_event_log WHERE task_id=?1",
+                "SELECT COUNT(*) FROM integrator_event_log WHERE task_id=?1",
                 [binding.task_id.to_string()],
                 |row| row.get(0),
             )
@@ -3605,6 +3611,7 @@ mod tests {
         let store = LocalStore::open(&database).expect("open store");
         let task = store
             .create_task(NewTask {
+                kind: TaskKind::Code,
                 title: "Restart fixture".into(),
                 repository_path: None,
                 worktree_path: None,
@@ -3678,6 +3685,7 @@ mod tests {
         for index in 0..2 {
             let task = store
                 .create_task(NewTask {
+                    kind: TaskKind::Code,
                     title: format!("Restart fixture {index}"),
                     repository_path: None,
                     worktree_path: None,
@@ -4064,7 +4072,7 @@ mod tests {
             let connection = store.connection.lock();
             connection
                 .execute(
-                    "INSERT INTO codex_event_log(task_id,provider_session_id,runtime_session_id,process_id,thread_id,turn_id,method,audit_json,audit_truncated,occurred_at,projection_json) VALUES (?1,?2,?3,?4,?5,NULL,'fixture/adversarial','not-json',1,?6,'{')",
+                    "INSERT INTO integrator_event_log(task_id,provider_session_id,runtime_session_id,process_id,thread_id,turn_id,method,audit_json,audit_truncated,occurred_at,projection_json) VALUES (?1,?2,?3,?4,?5,NULL,'fixture/adversarial','not-json',1,?6,'{')",
                     params![
                         binding.task_id.to_string(),
                         binding.provider_session_id.expect("provider session").to_string(),
@@ -4297,6 +4305,7 @@ mod tests {
             let (store_ref, binding) = {
                 let task = store
                     .create_task(NewTask {
+                        kind: TaskKind::Code,
                         title: "Restart handoff".into(),
                         repository_path: None,
                         worktree_path: None,
@@ -4333,6 +4342,7 @@ mod tests {
         let store = LocalStore::open_in_memory().expect("open");
         let task = store
             .create_task(NewTask {
+                kind: TaskKind::Code,
                 title: "Mixed providers".into(),
                 repository_path: None,
                 worktree_path: None,

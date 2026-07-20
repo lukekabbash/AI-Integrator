@@ -26,11 +26,13 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use integrator_core::{
+    AutomationId, AutomationRoute, AutomationSource, AutomationTarget, AutomationTrigger,
     Delegation, DelegationCapabilitySnapshot, DelegationId, DelegationPermission, DelegationRoute,
     DelegationSender, DelegationStatus, IntegratorError, ItemKind, ItemProjection, ItemStatus,
-    ProviderKind, Result, RuntimeBinding, TaskId, TurnStatus,
+    MemoryCreator, NewMemoryEntry, ProviderKind, Result, RuntimeBinding, TaskId, TaskKind,
+    TurnStatus,
 };
 use integrator_runtime::{
     ProjectionMutation, ReducedProviderEvent, StructuredCliEventKind, StructuredCliLaunchOptions,
@@ -39,7 +41,7 @@ use integrator_runtime::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use session_store::{LocalStore, NewDelegation};
+use session_store::{LocalStore, NewAutomation, NewDelegation};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -176,7 +178,7 @@ fn default_profiles() -> Vec<DelegationProfile> {
     vec![
         DelegationProfile {
             id: "codex-default".into(),
-            label: "Codex (OpenAI)".into(),
+            label: "Repository Engineer".into(),
             best_for: "Implementation, tests, and careful repository work.".into(),
             working_guidance: String::new(),
             access: Some(DelegationPermission::ReadOnly),
@@ -191,7 +193,7 @@ fn default_profiles() -> Vec<DelegationProfile> {
         },
         DelegationProfile {
             id: "claude-default".into(),
-            label: "Claude".into(),
+            label: "Product & Code Critic".into(),
             best_for: "Review, synthesis, and nuanced product reasoning.".into(),
             working_guidance: String::new(),
             access: Some(DelegationPermission::ReadOnly),
@@ -206,7 +208,7 @@ fn default_profiles() -> Vec<DelegationProfile> {
         },
         DelegationProfile {
             id: "antigravity-default".into(),
-            label: "Antigravity (Gemini)".into(),
+            label: "Research Explorer".into(),
             best_for: "Broad exploration and alternate implementation approaches.".into(),
             working_guidance: String::new(),
             access: Some(DelegationPermission::ReadOnly),
@@ -221,7 +223,7 @@ fn default_profiles() -> Vec<DelegationProfile> {
         },
         DelegationProfile {
             id: "cursor-default".into(),
-            label: "Cursor".into(),
+            label: "Codebase Navigator".into(),
             best_for: "Focused codebase navigation and implementation.".into(),
             working_guidance: String::new(),
             access: Some(DelegationPermission::ReadOnly),
@@ -236,7 +238,7 @@ fn default_profiles() -> Vec<DelegationProfile> {
         },
         DelegationProfile {
             id: "grok-default".into(),
-            label: "Grok Build".into(),
+            label: "Verification Runner".into(),
             best_for: "Fast mechanical work and second-pass verification.".into(),
             working_guidance: String::new(),
             access: Some(DelegationPermission::ReadOnly),
@@ -251,7 +253,7 @@ fn default_profiles() -> Vec<DelegationProfile> {
         },
         DelegationProfile {
             id: "kimi-default".into(),
-            label: "Kimi Code".into(),
+            label: "Long-Context Analyst".into(),
             best_for: "Long-context repository work and an independent coding pass.".into(),
             working_guidance: String::new(),
             access: Some(DelegationPermission::ReadOnly),
@@ -298,6 +300,7 @@ pub fn delegation_profiles(store: &LocalStore) -> Vec<DelegationProfile> {
 fn normalize_profile(mut profile: DelegationProfile) -> Option<DelegationProfile> {
     profile.id = profile.id.trim().to_owned();
     profile.label = profile.label.trim().to_owned();
+    profile.label = migrated_default_label(&profile.id, &profile.label).into();
     if profile.id.is_empty()
         || profile.label.is_empty()
         || profile.id.len() > 128
@@ -353,6 +356,18 @@ fn normalize_profile(mut profile: DelegationProfile) -> Option<DelegationProfile
         .take(64 * 1024)
         .collect();
     Some(profile)
+}
+
+fn migrated_default_label<'a>(id: &str, label: &'a str) -> &'a str {
+    match (id, label) {
+        ("codex-default", "Codex (OpenAI)") => "Repository Engineer",
+        ("claude-default", "Claude") => "Product & Code Critic",
+        ("antigravity-default", "Antigravity (Gemini)") => "Research Explorer",
+        ("cursor-default", "Cursor") => "Codebase Navigator",
+        ("grok-default", "Grok Build") => "Verification Runner",
+        ("kimi-default", "Kimi Code") => "Long-Context Analyst",
+        _ => label,
+    }
 }
 
 fn normalize_route(mut route: DelegationRoute) -> Option<DelegationRoute> {
@@ -604,15 +619,42 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
         .map(|(key, value)| (key.to_owned(), Value::String(value)))
         .collect();
     let enabled_tools = match role {
+        "chat" if mode == "memory-on" => json!([
+            "memory_save",
+            "schedule_wakeup",
+            "schedule_recurring",
+            "automation_list",
+            "automation_leave_note",
+            "automation_cancel"
+        ]),
+        "chat" => json!([
+            "schedule_wakeup",
+            "schedule_recurring",
+            "automation_list",
+            "automation_leave_note",
+            "automation_cancel"
+        ]),
         "child" => json!([
             "skill_data_request",
             "task_complete",
             "orchestrator_ask",
             "orchestrator_report"
         ]),
-        _ if mode == "off" => json!(["skill_data_request"]),
+        _ if mode == "off" => json!([
+            "skill_data_request",
+            "schedule_wakeup",
+            "schedule_recurring",
+            "automation_list",
+            "automation_leave_note",
+            "automation_cancel"
+        ]),
         _ => json!([
             "skill_data_request",
+            "schedule_wakeup",
+            "schedule_recurring",
+            "automation_list",
+            "automation_leave_note",
+            "automation_cancel",
             "peers_list",
             "delegate_start",
             "delegation_status",
@@ -864,10 +906,94 @@ async fn dispatch_tool(
     params: &Value,
 ) -> Result<Value> {
     match (session.role.as_str(), method) {
+        ("chat", "memory_save") => {
+            let task_id = session
+                .scope
+                .parse::<TaskId>()
+                .map_err(|_| IntegratorError::Unauthorized("invalid Chat task scope".into()))?;
+            let state = app.state::<AppState>();
+            let task = state.store.get_task(task_id)?;
+            if task.kind != TaskKind::Chat {
+                return Err(IntegratorError::Unauthorized(
+                    "memory_save is available only to Chat tasks".into(),
+                ));
+            }
+            let enabled = state
+                .store
+                .get_setting("settings.memory.enabled")?
+                .is_some_and(|setting| setting.value.as_bool() == Some(true));
+            if !enabled {
+                return Err(IntegratorError::Unavailable(
+                    "Memory is disabled in Settings".into(),
+                ));
+            }
+            let text = text_param(params, "text")
+                .ok_or_else(|| IntegratorError::InvalidInput("text is required".into()))?;
+            let memory = state.store.create_memory(NewMemoryEntry {
+                text,
+                creator: MemoryCreator::Agent,
+                source_task_id: Some(task_id),
+                source_item_id: None,
+            })?;
+            Ok(json!({ "memory": memory }))
+        }
         ("orchestrator" | "child", "skill_data_request") => {
             validate_skill_data_scope(app, session, params)?;
             let state = app.state::<AppState>();
             crate::skill_api::execute(app, &state, params).await
+        }
+        ("orchestrator" | "chat", "schedule_wakeup") => {
+            let task_id = orchestrator_scope(session)?;
+            schedule_wakeup(app, task_id, params)
+        }
+        ("orchestrator" | "chat", "schedule_recurring") => {
+            let task_id = orchestrator_scope(session)?;
+            schedule_recurring(app, task_id, params)
+        }
+        ("orchestrator" | "chat", "automation_list") => {
+            let task_id = orchestrator_scope(session)?;
+            let state = app.state::<AppState>();
+            Ok(json!({ "automations": state.store.list_automations(Some(task_id))? }))
+        }
+        ("orchestrator" | "chat", "automation_leave_note") => {
+            let task_id = orchestrator_scope(session)?;
+            let id = text_param(params, "automationId")
+                .ok_or_else(|| IntegratorError::InvalidInput("automationId is required".into()))?;
+            let id = AutomationId::from_str(&id)
+                .map_err(|_| IntegratorError::InvalidInput("invalid automationId".into()))?;
+            let note = text_param(params, "note")
+                .ok_or_else(|| IntegratorError::InvalidInput("note is required".into()))?;
+            let state = app.state::<AppState>();
+            let automation = state.store.get_automation(id)?;
+            if automation.task_id != task_id {
+                return Err(IntegratorError::Unauthorized(
+                    "automation belongs to another task".into(),
+                ));
+            }
+            let automation = state.store.leave_automation_iteration_note(id, &note)?;
+            crate::automations::emit_changed(app, &automation);
+            Ok(json!({
+                "automationId": automation.id,
+                "saved": true,
+                "note": "This replaces the note supplied to the next run."
+            }))
+        }
+        ("orchestrator" | "chat", "automation_cancel") => {
+            let task_id = orchestrator_scope(session)?;
+            let id = text_param(params, "automationId")
+                .ok_or_else(|| IntegratorError::InvalidInput("automationId is required".into()))?;
+            let id = AutomationId::from_str(&id)
+                .map_err(|_| IntegratorError::InvalidInput("invalid automationId".into()))?;
+            let state = app.state::<AppState>();
+            let automation = state.store.get_automation(id)?;
+            if automation.task_id != task_id {
+                return Err(IntegratorError::Unauthorized(
+                    "automation belongs to another task".into(),
+                ));
+            }
+            let automation = state.store.cancel_automation(id)?;
+            state.automation_notify.notify_one();
+            Ok(json!({ "automation": automation }))
         }
         ("orchestrator", "peers_list") => {
             let task_id = orchestrator_scope(session)?;
@@ -948,6 +1074,206 @@ async fn dispatch_tool(
             method, session.role
         ))),
     }
+}
+
+fn schedule_wakeup(app: &AppHandle<tauri::Wry>, task_id: TaskId, params: &Value) -> Result<Value> {
+    let title = required_text(params, "title")?;
+    let prompt = required_text(params, "prompt")?;
+    let after_seconds = params.get("afterSeconds").and_then(Value::as_u64);
+    let wake_at = optional_time(params, "wakeAt")?;
+    let delegation_trigger = params.get("whenDelegationsSettle");
+    if usize::from(after_seconds.is_some())
+        + usize::from(wake_at.is_some())
+        + usize::from(delegation_trigger.is_some())
+        != 1
+    {
+        return Err(IntegratorError::InvalidInput(
+            "schedule_wakeup requires exactly one trigger".into(),
+        ));
+    }
+    let trigger = if let Some(seconds) = after_seconds {
+        if !(1..=2_592_000).contains(&seconds) {
+            return Err(IntegratorError::InvalidInput(
+                "afterSeconds must be between 1 second and 30 days".into(),
+            ));
+        }
+        let seconds = i64::try_from(seconds)
+            .map_err(|_| IntegratorError::InvalidInput("afterSeconds is too large".into()))?;
+        AutomationTrigger::At {
+            run_at: Utc::now() + chrono::Duration::seconds(seconds),
+        }
+    } else if let Some(run_at) = wake_at {
+        AutomationTrigger::At { run_at }
+    } else {
+        let value = delegation_trigger.expect("trigger count checked");
+        let ids = value
+            .get("delegationIds")
+            .and_then(Value::as_array)
+            .ok_or_else(|| IntegratorError::InvalidInput("delegationIds must be an array".into()))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| {
+                        IntegratorError::InvalidInput("delegationIds must contain strings".into())
+                    })?
+                    .parse::<DelegationId>()
+                    .map_err(|_| IntegratorError::InvalidInput("invalid delegationId".into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        AutomationTrigger::DelegationsSettled {
+            delegation_ids: ids,
+            require_all: value
+                .get("requireAll")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            timeout_at: optional_time(value, "timeoutAt")?,
+        }
+    };
+    let target = match text_param(params, "targetDelegationId") {
+        Some(id) => AutomationTarget::Delegation {
+            delegation_id: id
+                .parse()
+                .map_err(|_| IntegratorError::InvalidInput("invalid targetDelegationId".into()))?,
+        },
+        None => AutomationTarget::Task,
+    };
+    create_agent_automation(app, task_id, title, prompt, target, trigger, None, false)
+}
+
+fn schedule_recurring(
+    app: &AppHandle<tauri::Wry>,
+    task_id: TaskId,
+    params: &Value,
+) -> Result<Value> {
+    let title = required_text(params, "title")?;
+    let prompt = required_text(params, "prompt")?;
+    let every_seconds = params
+        .get("everySeconds")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| IntegratorError::InvalidInput("everySeconds is required".into()))?;
+    if !(60..=2_592_000).contains(&every_seconds) {
+        return Err(IntegratorError::InvalidInput(
+            "everySeconds must be between 60 seconds and 30 days".into(),
+        ));
+    }
+    let user_request = required_text(params, "userRequest")?;
+    let state = app.state::<AppState>();
+    let latest = state.store.latest_user_message(task_id)?.ok_or_else(|| {
+        IntegratorError::Unauthorized(
+            "recurring automation requires a persisted user request".into(),
+        )
+    })?;
+    if !latest.contains(&user_request) || !explicitly_recurring(&user_request) {
+        return Err(IntegratorError::Unauthorized(
+            "userRequest must be an exact excerpt of the latest message explicitly requesting recurrence"
+                .into(),
+        ));
+    }
+    let seconds = i64::try_from(every_seconds)
+        .map_err(|_| IntegratorError::InvalidInput("everySeconds is too large".into()))?;
+    let anchor_at = optional_time(params, "firstRunAt")?
+        .unwrap_or_else(|| Utc::now() + chrono::Duration::seconds(seconds));
+    let end_at = optional_time(params, "endAt")?;
+    let iteration_notes = params
+        .get("iterationNotes")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if end_at.is_some_and(|end| end < anchor_at) {
+        return Err(IntegratorError::InvalidInput(
+            "endAt must not be before firstRunAt".into(),
+        ));
+    }
+    create_agent_automation(
+        app,
+        task_id,
+        title,
+        prompt,
+        AutomationTarget::Task,
+        AutomationTrigger::Interval {
+            every_seconds,
+            anchor_at,
+            end_at,
+        },
+        Some(user_request),
+        iteration_notes,
+    )
+}
+
+fn create_agent_automation(
+    app: &AppHandle<tauri::Wry>,
+    task_id: TaskId,
+    title: String,
+    prompt: String,
+    target: AutomationTarget,
+    trigger: AutomationTrigger,
+    recurrence_user_request: Option<String>,
+    iteration_notes: bool,
+) -> Result<Value> {
+    let state = app.state::<AppState>();
+    let task = state.store.get_task(task_id)?;
+    let resume = state.store.provider_resume_state(task_id)?.ok_or_else(|| {
+        IntegratorError::Unauthorized(
+            "the task does not yet have a persisted execution policy to freeze".into(),
+        )
+    })?;
+    let route = AutomationRoute {
+        runtime: task
+            .runtime
+            .ok_or_else(|| IntegratorError::InvalidInput("task has no saved runtime".into()))?,
+        model: task.model.unwrap_or_else(|| "Provider default".into()),
+        effort: task.effort,
+        fallbacks: Vec::new(),
+        permission: resume.permission,
+        delegation: resume.delegation,
+    };
+    let automation = state.store.create_automation(NewAutomation {
+        task_id,
+        title,
+        prompt,
+        target,
+        trigger,
+        route,
+        source: AutomationSource::Agent,
+        recurrence_user_request,
+        iteration_notes,
+    })?;
+    state.automation_notify.notify_one();
+    crate::automations::emit_changed(app, &automation);
+    Ok(json!({ "automation": automation }))
+}
+
+fn required_text(params: &Value, key: &str) -> Result<String> {
+    text_param(params, key)
+        .ok_or_else(|| IntegratorError::InvalidInput(format!("{key} is required")))
+}
+
+fn optional_time(params: &Value, key: &str) -> Result<Option<DateTime<Utc>>> {
+    text_param(params, key)
+        .map(|value| {
+            DateTime::parse_from_rfc3339(&value)
+                .map(|time| time.with_timezone(&Utc))
+                .map_err(|_| IntegratorError::InvalidInput(format!("{key} must be ISO 8601")))
+        })
+        .transpose()
+}
+
+fn explicitly_recurring(request: &str) -> bool {
+    let request = request.to_ascii_lowercase();
+    [
+        "every ",
+        "each day",
+        "each week",
+        "each month",
+        "daily",
+        "weekly",
+        "monthly",
+        "hourly",
+        "recurring",
+        "repeatedly",
+    ]
+    .iter()
+    .any(|marker| request.contains(marker))
 }
 
 fn validate_skill_data_scope(
@@ -1528,6 +1854,7 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
     let ordinal = delegation_ordinal(&state.store, &delegation)?;
     let initial_title = format_subagent_title(ordinal, &delegation.title);
     let child_task = state.store.create_task(integrator_core::NewTask {
+        kind: integrator_core::TaskKind::Code,
         title: initial_title.clone(),
         repository_path: parent.repository_path.clone(),
         worktree_path: parent.worktree_path.clone(),
@@ -1875,11 +2202,11 @@ async fn spawn_structured_child(
             &cwd,
             &process_id,
             permission_mode,
-            if mcp_config.is_some() {
+            crate::antigravity_hooks::AntigravityOverlayPolicy::Harness(if mcp_config.is_some() {
                 crate::harness_prompt::LocalToolsProjection::Projected
             } else {
                 crate::harness_prompt::LocalToolsProjection::Unavailable
-            },
+            }),
         )?;
         crate::integrator_mcp::write_antigravity_mcp_config_with_base(
             &overlay.root,
@@ -2250,11 +2577,13 @@ async fn spawn_acp_child(
     } else {
         crate::harness_prompt::LocalToolsProjection::Unavailable
     };
-    let arguments = crate::commands::acp_launch_arguments(&provider, Some(tools))
+    let profile = crate::commands::AcpLaunchProfile::Project { tools };
+    let arguments = crate::commands::acp_launch_arguments(&provider, &profile)
         .map_err(|error| IntegratorError::InvalidInput(error.message))?;
     let client = adapter_acp::AcpClient::spawn(adapter_acp::AcpLaunchOptions {
         executable,
         arguments,
+        environment: crate::commands::acp_launch_environment(&provider, &profile),
         working_directory: Some(cwd.clone()),
         client_version: env!("CARGO_PKG_VERSION").into(),
     })
@@ -3155,6 +3484,7 @@ pub async fn stop_delegation(
 // ---------------------------------------------------------------------------
 
 pub fn emit_update(app: &AppHandle<tauri::Wry>, parent_task_id: TaskId) {
+    app.state::<AppState>().automation_notify.notify_one();
     let _ = app.emit(
         DELEGATION_UPDATE_EVENT,
         json!({ "parentTaskId": parent_task_id.to_string() }),
@@ -3353,6 +3683,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recurring_authorization_requires_recurrence_language() {
+        assert!(explicitly_recurring("check this every weekday"));
+        assert!(explicitly_recurring("run a weekly review"));
+        assert!(!explicitly_recurring("check this again tomorrow"));
+    }
+
+    #[test]
     fn stale_mcp_config_cleanup_is_narrow_and_idempotent() {
         let root = tempfile::tempdir().expect("temporary app data");
         assert_eq!(
@@ -3398,6 +3735,11 @@ mod tests {
             server["enabled_tools"],
             json!([
                 "skill_data_request",
+                "schedule_wakeup",
+                "schedule_recurring",
+                "automation_list",
+                "automation_leave_note",
+                "automation_cancel",
                 "peers_list",
                 "delegate_start",
                 "delegation_status",
@@ -3442,13 +3784,50 @@ mod tests {
     }
 
     #[test]
-    fn codex_local_tools_remain_available_when_delegation_is_off() {
+    fn codex_data_and_automation_tools_remain_available_when_delegation_is_off() {
         let config = codex_mcp_config(&BrokerInfo::new(43125), "orchestrator", "task-3", "off")
             .expect("Codex MCP config");
 
         assert_eq!(
             config["mcp_servers"]["integrator"]["enabled_tools"],
-            json!(["skill_data_request"])
+            json!([
+                "skill_data_request",
+                "schedule_wakeup",
+                "schedule_recurring",
+                "automation_list",
+                "automation_leave_note",
+                "automation_cancel"
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_mcp_config_exposes_scheduling_and_only_opted_in_memory() {
+        let disabled = codex_mcp_config(&BrokerInfo::new(43127), "chat", "task-chat", "off")
+            .expect("disabled Chat MCP config");
+        assert_eq!(
+            disabled["mcp_servers"]["integrator"]["enabled_tools"],
+            json!([
+                "schedule_wakeup",
+                "schedule_recurring",
+                "automation_list",
+                "automation_leave_note",
+                "automation_cancel"
+            ])
+        );
+
+        let enabled = codex_mcp_config(&BrokerInfo::new(43128), "chat", "task-chat", "memory-on")
+            .expect("enabled Chat MCP config");
+        assert_eq!(
+            enabled["mcp_servers"]["integrator"]["enabled_tools"],
+            json!([
+                "memory_save",
+                "schedule_wakeup",
+                "schedule_recurring",
+                "automation_list",
+                "automation_leave_note",
+                "automation_cancel"
+            ])
         );
     }
 
@@ -3488,6 +3867,23 @@ mod tests {
                 .iter()
                 .any(|service| service.level == "standard")
         }));
+    }
+
+    #[test]
+    fn exact_legacy_default_labels_migrate_without_touching_custom_names() {
+        let mut legacy = default_profiles().remove(0);
+        legacy.label = "Codex (OpenAI)".into();
+        assert_eq!(
+            normalize_profile(legacy).expect("legacy profile").label,
+            "Repository Engineer"
+        );
+
+        let mut custom = default_profiles().remove(0);
+        custom.label = "My Codex specialist".into();
+        assert_eq!(
+            normalize_profile(custom).expect("custom profile").label,
+            "My Codex specialist"
+        );
     }
 
     #[test]

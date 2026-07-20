@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-automation-update"
+description = "Enables the automation_update command without any pre-configured scope."
+commands.allow = ["automation_update"]
+
+[[permission]]
+identifier = "deny-automation-update"
+description = "Denies the automation_update command without any pre-configured scope."
+commands.deny = ["automation_update"]

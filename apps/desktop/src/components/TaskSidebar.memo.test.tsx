@@ -54,11 +54,11 @@ describe("TaskSidebar memoization", () => {
   it("skips re-render when data and callback identities stay equal", () => {
     const props = stableProps();
     const { rerender } = render(<TaskSidebar {...props} />);
-    expect(travelingRender.count).toBe(1);
-    expect(screen.getByTestId("traveling-selection")).toBeInTheDocument();
+    expect(travelingRender.count).toBe(2);
+    expect(screen.getAllByTestId("traveling-selection")).toHaveLength(2);
 
     rerender(<TaskSidebar {...props} />);
-    expect(travelingRender.count).toBe(1);
+    expect(travelingRender.count).toBe(2);
 
     // Simulate a parent App stream frame that only rebuilt inline lambdas —
     // without stable callback identities, memo would miss and re-render.
@@ -69,13 +69,13 @@ describe("TaskSidebar memoization", () => {
         onNewTask={() => props.onNewTask()}
       />,
     );
-    expect(travelingRender.count).toBe(2);
+    expect(travelingRender.count).toBe(4);
   });
 
   it("re-renders when task lifecycle data changes", () => {
     const props = stableProps();
     const { rerender } = render(<TaskSidebar {...props} />);
-    expect(travelingRender.count).toBe(1);
+    expect(travelingRender.count).toBe(2);
 
     const [first, ...rest] = props.tasks;
     rerender(
@@ -84,6 +84,6 @@ describe("TaskSidebar memoization", () => {
         tasks={[{ ...first, status: "waiting", updatedAt: "2099-01-01T00:00:00Z" }, ...rest]}
       />,
     );
-    expect(travelingRender.count).toBe(2);
+    expect(travelingRender.count).toBe(4);
   });
 });

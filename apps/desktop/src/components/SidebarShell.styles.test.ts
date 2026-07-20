@@ -76,9 +76,7 @@ describe("sidebar shell corners", () => {
     // data-menu-open still lifts z-index for chat menus; only
     // data-project-menu-open may reveal …/+ / pin scooch.
     expect(rule('.project-group[data-menu-open="true"]')).toContain("z-index: 20");
-    expect(styles).not.toContain(
-      '.project-group[data-menu-open="true"] .project-header-actions',
-    );
+    expect(styles).not.toContain('.project-group[data-menu-open="true"] .project-header-actions');
     expect(styles).toContain(
       '.project-group[data-project-menu-open="true"] .project-header-actions',
     );
@@ -89,13 +87,31 @@ describe("sidebar shell corners", () => {
     expect(rule(".project-chat-list-clip")).toContain(
       "grid-template-rows 220ms cubic-bezier(0.2, 0.8, 0.2, 1)",
     );
-    expect(rule('.project-chat-list-clip[data-open="true"]')).toContain(
+    expect(rule('.project-chat-list-clip[data-open="true"]')).toContain("grid-template-rows: 1fr");
+    expect(rule(".project-chat-list-inner")).toContain("overflow: hidden");
+    expect(
+      rule('.project-chat-list-clip[data-menu-open="true"] .project-chat-list-inner'),
+    ).toContain("overflow: visible");
+    expect(rule('.project-chat-list[data-menu-open="true"]')).toContain("overflow: visible");
+  });
+
+  it("keeps collection carets quiet until the section is hovered or focused", () => {
+    expect(rule(".rail-section-disclosure .disclosure")).toContain("opacity: 0");
+    expect(
+      rule(
+        ".rail-section-heading:hover .rail-section-disclosure .disclosure,\n" +
+          ".rail-section-disclosure:focus-visible .disclosure",
+      ),
+    ).toContain("opacity: 1");
+  });
+
+  it("animates both collection directions with the same grid track", () => {
+    expect(rule(".sidebar-collection-clip")).toContain("grid-template-rows: 0fr");
+    expect(rule(".sidebar-collection-clip")).toContain(
+      "grid-template-rows 220ms cubic-bezier(0.2, 0.8, 0.2, 1)",
+    );
+    expect(rule('.sidebar-collection-clip[data-open="true"]')).toContain(
       "grid-template-rows: 1fr",
     );
-    expect(rule(".project-chat-list-inner")).toContain("overflow: hidden");
-    expect(rule('.project-chat-list-clip[data-menu-open="true"] .project-chat-list-inner')).toContain(
-      "overflow: visible",
-    );
-    expect(rule('.project-chat-list[data-menu-open="true"]')).toContain("overflow: visible");
   });
 });

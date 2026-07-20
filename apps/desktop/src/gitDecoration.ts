@@ -14,7 +14,8 @@ export const DEFAULT_COMMIT_PREFIX = "ai-integrator:";
 /** The identity written when the co-author trailer is on. The address is a
  * `noreply` form because a trailer becomes part of permanent history and must
  * not imply a mailbox that could receive replies. */
-export const CO_AUTHOR_TRAILER = "Co-authored-by: AI Integrator <ai-integrator@users.noreply.github.com>";
+export const CO_AUTHOR_TRAILER =
+  "Co-authored-by: AI Integrator <ai-integrator@users.noreply.github.com>";
 
 export interface GitDecorationSettings {
   coAuthor: boolean;
@@ -22,7 +23,9 @@ export interface GitDecorationSettings {
   commitPrefix: string;
 }
 
-export function readGitDecorationSettings(settings: Record<string, unknown>): GitDecorationSettings {
+export function readGitDecorationSettings(
+  settings: Record<string, unknown>,
+): GitDecorationSettings {
   const value = settings[GIT_SETTINGS.commitPrefix];
   return {
     coAuthor: settings[GIT_SETTINGS.coAuthor] === true,
@@ -61,10 +64,7 @@ function appendTrailer(message: string, trailer: string): string {
  * can pass through twice — an edited retry, a generated draft the user then
  * commits — without growing a second prefix or a duplicate trailer.
  */
-export function decorateCommitMessage(
-  message: string,
-  settings: GitDecorationSettings,
-): string {
+export function decorateCommitMessage(message: string, settings: GitDecorationSettings): string {
   let decorated = message.trim();
   if (!decorated) return decorated;
   const prefix = settings.commitPrefix.trim();

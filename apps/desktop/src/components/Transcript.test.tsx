@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TranscriptEvent } from "../bridge";
 import { Transcript } from "./Transcript";
@@ -18,6 +18,7 @@ const event = (id: string, kind: TranscriptEvent["kind"], body: string): Transcr
 
 describe("Transcript", () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     localStorage.clear();
@@ -81,14 +82,42 @@ describe("Transcript", () => {
     );
 
     expect(
-      document.querySelector('[data-event-id="assistant-1"]')?.classList.contains(
-        "turn--assistant-interim",
-      ),
+      document
+        .querySelector('[data-event-id="assistant-1"]')
+        ?.classList.contains("turn--assistant-interim"),
     ).toBe(true);
     const finalReply = document.querySelector('[data-event-id="assistant-2"]');
     expect(finalReply?.classList.contains("turn--assistant-interim")).toBe(false);
     expect(finalReply).toHaveAttribute("aria-label", "Agent response");
     expect(screen.getByRole("button", { name: "Copy this response" })).toBeInTheDocument();
+  });
+
+  it("renders project Markdown links as inline file actions with exact locations", () => {
+    const onOpenFile = vi.fn();
+    render(
+      <Transcript
+        events={[
+          event(
+            "assistant-1",
+            "assistant",
+            "Updated [App.tsx:12–18](./src/App.tsx#L12-L18), including *[the fallback](./src/fallback.ts#L4)*.",
+          ),
+        ]}
+        onOpenFile={onOpenFile}
+      />,
+    );
+
+    const appLink = screen.getByRole("link", { name: "App.tsx:12–18" });
+    expect(appLink).toHaveClass("assistant-file-link");
+    expect(appLink.querySelector(".file-type-icon")).not.toBeNull();
+    expect(screen.getByRole("link", { name: "the fallback" }).closest("em")).not.toBeNull();
+
+    fireEvent.click(appLink);
+    expect(onOpenFile).toHaveBeenCalledWith({
+      path: "src/App.tsx",
+      startLine: 12,
+      endLine: 18,
+    });
   });
 
   it("streams final_answer phase replies in normal chrome while the turn is still running", () => {
@@ -110,9 +139,9 @@ describe("Transcript", () => {
     );
 
     expect(
-      document.querySelector('[data-event-id="assistant-1"]')?.classList.contains(
-        "turn--assistant-interim",
-      ),
+      document
+        .querySelector('[data-event-id="assistant-1"]')
+        ?.classList.contains("turn--assistant-interim"),
     ).toBe(true);
     const finalReply = document.querySelector('[data-event-id="assistant-2"]');
     expect(finalReply?.classList.contains("turn--assistant-interim")).toBe(false);
@@ -120,9 +149,7 @@ describe("Transcript", () => {
     expect(screen.getByText("Codex")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Copy this response" })).toBeInTheDocument();
     // Branch stays withheld until the turn settles, even for final_answer.
-    expect(
-      screen.queryByRole("button", { name: "Branch the chat from this response" }),
-    ).toBeNull();
+    expect(screen.queryByRole("button", { name: "Branch the chat from this response" })).toBeNull();
   });
 
   it("keeps prior turn-final replies normal when a follow-up turn starts", () => {
@@ -135,9 +162,9 @@ describe("Transcript", () => {
       />,
     );
     expect(
-      document.querySelector('[data-event-id="assistant-1"]')?.classList.contains(
-        "turn--assistant-interim",
-      ),
+      document
+        .querySelector('[data-event-id="assistant-1"]')
+        ?.classList.contains("turn--assistant-interim"),
     ).toBe(false);
 
     rerender(
@@ -152,9 +179,9 @@ describe("Transcript", () => {
       />,
     );
     expect(
-      document.querySelector('[data-event-id="assistant-1"]')?.classList.contains(
-        "turn--assistant-interim",
-      ),
+      document
+        .querySelector('[data-event-id="assistant-1"]')
+        ?.classList.contains("turn--assistant-interim"),
     ).toBe(false);
     expect(screen.getByRole("button", { name: "Copy this response" })).toBeInTheDocument();
     expect(
@@ -224,9 +251,7 @@ describe("Transcript", () => {
 
   it("omits Branch entirely when the host wires no handler", () => {
     render(<Transcript events={[event("assistant-1", "assistant", "answer")]} />);
-    expect(
-      screen.queryByRole("button", { name: "Branch the chat from this response" }),
-    ).toBeNull();
+    expect(screen.queryByRole("button", { name: "Branch the chat from this response" })).toBeNull();
     expect(screen.getByRole("button", { name: "Copy this response" })).toBeVisible();
   });
 
@@ -254,6 +279,65 @@ describe("Transcript", () => {
     render(<Transcript events={[event("user-1", "user", "hello")]} />);
     expect(screen.getByRole("button", { name: "Copy this message" })).toBeVisible();
     expect(screen.queryByRole("button", { name: "Edit this message" })).toBeNull();
+  });
+
+  it("renders scheduled wakeups as quiet stream activity instead of user messages", () => {
+    const onCancelScheduledTask = vi.fn();
+    render(
+      <Transcript
+        events={[
+          {
+            ...event(
+              "scheduled-prompt",
+              "user",
+              'The user asked you to say hi after 30 seconds.\nReply with "Hi!" only.',
+            ),
+            title: "Scheduled task started",
+            meta: "Say hi in 30s",
+            scheduling: {
+              automationId: "automation-1",
+              runId: "run-1",
+              phase: "prompt",
+              canCancel: true,
+            },
+          },
+        ]}
+        onCancelScheduledTask={onCancelScheduledTask}
+      />,
+    );
+
+    expect(screen.getByLabelText("Scheduled task started")).toHaveClass("scheduling-message");
+    expect(screen.getByLabelText("Scheduled task started")).not.toHaveClass("task-status-pill");
+    expect(screen.getByLabelText("Scheduled task started")).toHaveAttribute("data-phase", "prompt");
+    expect(screen.getByText("Say hi in 30s")).toBeVisible();
+    expect(screen.getByText(/The user asked you to say hi/)).toBeVisible();
+    expect(screen.queryByLabelText("Your message")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onCancelScheduledTask).toHaveBeenCalledWith("automation-1");
+  });
+
+  it("counts down a fixed near-term wakeup in place", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-19T16:00:00Z"));
+    render(
+      <Transcript
+        events={[
+          {
+            ...event("scheduled-countdown", "activity", "Say hi in 30s"),
+            title: "Wake-up scheduled",
+            scheduling: {
+              automationId: "automation-1",
+              phase: "created",
+              countdownAt: "2026-07-19T16:00:30Z",
+            },
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("Waking up in 30s")).toBeVisible();
+    act(() => vi.advanceTimersByTime(1_000));
+    expect(screen.getByText("Waking up in 29s")).toBeVisible();
   });
 
   it("styles only a verified native skill in a user message", () => {
@@ -316,10 +400,7 @@ describe("Transcript", () => {
 
   it("does not promote a streaming bullet start into a setext heading", () => {
     const { rerender } = render(
-      <Transcript
-        events={[event("assistant-1", "assistant", "Here are the steps:\n-")]}
-        running
-      />,
+      <Transcript events={[event("assistant-1", "assistant", "Here are the steps:\n-")]} running />,
     );
 
     let response = screen.getByLabelText("Agent progress");
@@ -345,9 +426,7 @@ describe("Transcript", () => {
     );
     expect(screen.getByLabelText("Agent response").querySelector("hr")).not.toBeNull();
 
-    rerender(
-      <Transcript events={[event("assistant-1", "assistant", "Here are the steps:\n-")]} />,
-    );
+    rerender(<Transcript events={[event("assistant-1", "assistant", "Here are the steps:\n-")]} />);
     const response = screen.getByLabelText("Agent response");
     expect(response.querySelector("h2")).toBeNull();
     expect(response).toHaveTextContent("Here are the steps:");
@@ -489,10 +568,7 @@ describe("Transcript", () => {
         <Transcript
           key="chat-a"
           ownerKey="task:chat-a"
-          events={[
-            event("a-1", "user", "A question"),
-            event("a-2", "assistant", "A answer"),
-          ]}
+          events={[event("a-1", "user", "A question"), event("a-2", "assistant", "A answer")]}
           scrollContainerRef={scrollContainerRef}
         />
       </div>,
@@ -538,10 +614,7 @@ describe("Transcript", () => {
       <div data-testid="transcript-scroll" ref={scrollContainerRef}>
         <Transcript
           ownerKey="task:settle-follow"
-          events={[
-            event("u-1", "user", "Question"),
-            event("a-1", "assistant", "Answer"),
-          ]}
+          events={[event("u-1", "user", "Question"), event("a-1", "assistant", "Answer")]}
           scrollContainerRef={scrollContainerRef}
         />
       </div>,
@@ -625,9 +698,7 @@ describe("Transcript", () => {
     scrollContainer.scrollTop = 0;
     fireEvent.scroll(scrollContainer);
 
-    await waitFor(() =>
-      expect(document.querySelector('[data-event-id="mid-1"]')).not.toBeNull(),
-    );
+    await waitFor(() => expect(document.querySelector('[data-event-id="mid-1"]')).not.toBeNull());
     // Must not snap to latest from settle noise.
     await waitFor(() => expect(scrollContainer.scrollTop).toBeLessThan(800));
     expect(readTranscriptViewportState("task:restore-mid")?.following).toBe(false);
@@ -1063,7 +1134,7 @@ describe("Transcript", () => {
     expect(document.querySelectorAll(".diff-line--delete")).toHaveLength(1);
 
     fireEvent.click(fileLink);
-    expect(onOpenFile).toHaveBeenCalledWith("src/App.tsx");
+    expect(onOpenFile).toHaveBeenCalledWith({ path: "src/App.tsx" });
   });
 
   it("shows basename for absolute edit paths and keeps the full path on hover and open", () => {
@@ -1095,7 +1166,7 @@ describe("Transcript", () => {
     expect(fileLink).toHaveAttribute("title", absolute);
     expect(screen.queryByText(absolute)).toBeNull();
     fireEvent.click(fileLink);
-    expect(onOpenFile).toHaveBeenCalledWith(absolute);
+    expect(onOpenFile).toHaveBeenCalledWith({ path: absolute });
   });
 
   it("keeps Worked for collapsed by default and reveals nested activity on expand", () => {

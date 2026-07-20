@@ -90,10 +90,7 @@ export const TaskStatusPill = memo(function TaskStatusPill({
 
   return (
     <div className="task-status-anchor">
-      <div
-        className="task-status-float-row"
-        data-has-queue={queue || recovery ? true : undefined}
-      >
+      <div className="task-status-float-row" data-has-queue={queue || recovery ? true : undefined}>
         <AnimatePresence initial={false}>
           {runningSince ? (
             <motion.div

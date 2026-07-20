@@ -749,12 +749,13 @@ fn parse_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Delegat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use integrator_core::{DelegationRoute, NewTask};
+    use integrator_core::{DelegationRoute, NewTask, TaskKind};
 
     fn store_with_task() -> (LocalStore, TaskId) {
         let store = LocalStore::open_in_memory().expect("open store");
         let task = store
             .create_task(NewTask {
+                kind: TaskKind::Code,
                 title: "Parent".into(),
                 repository_path: None,
                 worktree_path: None,
@@ -820,6 +821,7 @@ mod tests {
 
         let child = store
             .create_task(NewTask {
+                kind: TaskKind::Code,
                 title: "Subagent: Refactor tests".into(),
                 repository_path: None,
                 worktree_path: None,
@@ -999,6 +1001,7 @@ mod tests {
         let (store, parent) = store_with_task();
         let child = store
             .create_task(NewTask {
+                kind: TaskKind::Code,
                 title: "Child".into(),
                 repository_path: None,
                 worktree_path: None,

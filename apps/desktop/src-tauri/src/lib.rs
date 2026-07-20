@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod antigravity_hooks;
+mod automations;
 mod broker_mcp;
 mod chat_title;
 mod code_explain;
@@ -19,8 +20,14 @@ mod provider_routing;
 mod repository_watch;
 mod runtime_setup;
 mod skill_api;
+mod specialist_generator;
 mod state;
 
+use automations::{
+    automation_cancel, automation_create, automation_finish_run, automation_list,
+    automation_pending_dispatches, automation_run_list, automation_run_now, automation_set_paused,
+    automation_timeline, automation_update,
+};
 use chat_title::task_generate_title;
 use code_explain::{selection_explain, selection_explain_preview};
 use commands::*;
@@ -44,6 +51,7 @@ use runtime_setup::{
     runtime_action_plan_list, runtime_terminal_close, runtime_terminal_open,
     runtime_terminal_resize, runtime_terminal_write,
 };
+use specialist_generator::specialist_generate;
 use state::AppState;
 use tauri::Manager;
 
@@ -104,6 +112,7 @@ pub fn run() {
             }
             delegation::start_broker_host(app.handle().clone());
             delegation::emit_recovered_delegation_updates(app.handle());
+            automations::start(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -122,6 +131,12 @@ pub fn run() {
             task_list,
             task_list_archived,
             task_search_messages,
+            task_context_reference_list,
+            memory_list,
+            memory_create,
+            memory_update,
+            memory_set_enabled,
+            memory_delete,
             task_set_state,
             task_update_metadata,
             task_generate_title,
@@ -179,6 +194,7 @@ pub fn run() {
             project_file_open,
             project_file_reveal,
             attachment_preview,
+            chat_attachment_pick,
             attachment_save_paste,
             git_status,
             git_tracked_paths,
@@ -195,6 +211,7 @@ pub fn run() {
             terminal_write,
             terminal_resize,
             terminal_interrupt,
+            terminal_has_foreground_process,
             terminal_close,
             runtime_action_plan_list,
             runtime_terminal_open,
@@ -236,6 +253,17 @@ pub fn run() {
             delegation_deny,
             delegation_send_message,
             delegation_stop_cmd,
+            specialist_generate,
+            automation_list,
+            automation_create,
+            automation_update,
+            automation_run_list,
+            automation_timeline,
+            automation_pending_dispatches,
+            automation_set_paused,
+            automation_cancel,
+            automation_run_now,
+            automation_finish_run,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run AI Integrator");

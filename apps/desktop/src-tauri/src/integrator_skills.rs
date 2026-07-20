@@ -195,7 +195,10 @@ pub struct IntegratorSkillsOverview {
     pub skills: Vec<IntegratorSkillInfo>,
 }
 
-fn overview(app: &tauri::AppHandle, store: &LocalStore) -> CommandResult<IntegratorSkillsOverview> {
+pub(crate) fn overview(
+    app: &tauri::AppHandle,
+    store: &LocalStore,
+) -> CommandResult<IntegratorSkillsOverview> {
     let documents = documents_dir(app).ok_or(CommandError {
         code: "unavailable",
         message: "could not locate the Documents folder".into(),

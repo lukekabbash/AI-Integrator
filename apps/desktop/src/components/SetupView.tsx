@@ -106,9 +106,9 @@ export function SetupView({
                 One native workspace.
               </motion.h1>
               <motion.p variants={itemVariants}>
-                AI Integrator orchestrates the agent CLIs already installed on this machine —
-                Claude Code, Codex, Gemini, and more. Each task runs as a real terminal process
-                under your existing subscription, and everything it produces stays on disk.
+                AI Integrator orchestrates the agent CLIs already installed on this machine — Claude
+                Code, Codex, Gemini, and more. Each task runs as a real terminal process under your
+                existing subscription, and everything it produces stays on disk.
               </motion.p>
               <motion.div className="setup-feature-line" variants={itemVariants}>
                 <span>
@@ -232,8 +232,8 @@ export function SetupView({
               </motion.span>
               <motion.h1 variants={itemVariants}>How your tasks actually run.</motion.h1>
               <motion.p variants={itemVariants}>
-                Every task is a real CLI process, not an API wrapper. You get exactly the agent
-                you would have in a terminal — with review and history built around it.
+                Every task is a real CLI process, not an API wrapper. You get exactly the agent you
+                would have in a terminal — with review and history built around it.
               </motion.p>
               <motion.div className="setup-exec-grid" variants={itemVariants}>
                 <div>
@@ -319,11 +319,7 @@ export function SetupView({
                 </div>
               </motion.div>
               <motion.div className="setup-actions setup-finish" variants={itemVariants}>
-                <button
-                  className="ghost-button"
-                  type="button"
-                  onClick={() => setStep("execution")}
-                >
+                <button className="ghost-button" type="button" onClick={() => setStep("execution")}>
                   <ArrowLeft /> Back
                 </button>
                 <div className="setup-finish-buttons">

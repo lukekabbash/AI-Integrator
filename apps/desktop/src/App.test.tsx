@@ -285,6 +285,7 @@ describe("AI Integrator desktop workspace", () => {
     const navigation = screen.getByRole("complementary", { name: "Settings navigation" });
     const categoryLabels = [
       "General",
+      "Memory",
       "Appearance",
       "Composer",
       "Runtimes and Models",
@@ -438,7 +439,7 @@ describe("AI Integrator desktop workspace", () => {
     );
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /^New chat(?! in)/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "New chat in AI Integrator" }));
 
     expect(await screen.findByRole("button", { name: "Runtime" })).toHaveTextContent("Claude Code");
     expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("Claude Fable 5");
@@ -457,7 +458,7 @@ describe("AI Integrator desktop workspace", () => {
     );
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /^New chat(?! in)/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "New chat in AI Integrator" }));
 
     expect(await screen.findByRole("button", { name: "Runtime" })).toHaveTextContent("Claude Code");
     expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("Claude Sonnet 5");
@@ -473,7 +474,7 @@ describe("AI Integrator desktop workspace", () => {
     fireEvent.click(screen.getByRole("button", { name: "Preferred model for claude" }));
     fireEvent.click(screen.getByRole("option", { name: "Claude Sonnet 5" }));
     fireEvent.click(screen.getByRole("button", { name: /Back to workspace/i }));
-    fireEvent.click(await screen.findByRole("button", { name: /^New chat(?! in)/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "New chat in AI Integrator" }));
 
     expect(await screen.findByRole("button", { name: "Runtime" })).toHaveTextContent("Claude Code");
     expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("Claude Sonnet 5");
@@ -489,7 +490,7 @@ describe("AI Integrator desktop workspace", () => {
     );
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /^New chat(?! in)/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "New chat in AI Integrator" }));
 
     expect(await screen.findByRole("button", { name: "Runtime" })).toHaveTextContent("Claude Code");
     await waitFor(() =>
@@ -762,6 +763,7 @@ describe("AI Integrator desktop workspace", () => {
     snapshot.activeTaskId = "";
     snapshot.transcript = [];
     storeSnapshot(snapshot);
+    const startTask = vi.spyOn(bridge, "startTask");
     render(<App />);
 
     expect(
@@ -771,9 +773,15 @@ describe("AI Integrator desktop workspace", () => {
     fireEvent.change(composer, { target: { value: "Audit the trusted project boundary" } });
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
-    expect(
-      await screen.findByRole("heading", { name: "Audit the trusted project boundary" }),
-    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(startTask).toHaveBeenCalledWith(
+        expect.objectContaining({
+          projectId: snapshot.activeProjectId,
+          prompt: "Audit the trusted project boundary",
+        }),
+      ),
+    );
+    expect(await screen.findByRole("heading", { name: "Coding session" })).toBeInTheDocument();
     expect(
       await screen.findByText("Audit the trusted project boundary", { selector: ".turn--user p" }),
     ).toBeInTheDocument();
@@ -800,10 +808,7 @@ describe("AI Integrator desktop workspace", () => {
         }),
       ),
     );
-    const newChatLabel = await screen.findByText("New chat", {
-      selector: ".new-task-button span",
-    });
-    fireEvent.click(newChatLabel.closest("button") as HTMLButtonElement);
+    fireEvent.click(await screen.findByRole("button", { name: "New chat in AI Integrator" }));
     expect(await screen.findByRole("heading", { name: "New chat" })).toBeInTheDocument();
     expect(screen.getByRole("textbox", { name: "Task message" })).toHaveValue("unsent draft");
     expect(screen.getByRole("heading", { name: "What are we working on?" })).toBeInTheDocument();
@@ -827,7 +832,7 @@ describe("AI Integrator desktop workspace", () => {
       ),
     );
 
-    fireEvent.click(await screen.findByRole("button", { name: /^New chat(?! in)/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "New chat in AI Integrator" }));
     const newComposer = await screen.findByRole("textbox", { name: "Task message" });
     expect(newComposer).toHaveValue("");
     fireEvent.change(newComposer, { target: { value: "Start a separate piece of work" } });
@@ -848,7 +853,7 @@ describe("AI Integrator desktop workspace", () => {
       "Follow up in the existing chat",
     );
 
-    fireEvent.click(await screen.findByRole("button", { name: /^New chat(?! in)/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "New chat in AI Integrator" }));
     expect(await screen.findByRole("textbox", { name: "Task message" })).toHaveValue(
       "Start a separate piece of work",
     );

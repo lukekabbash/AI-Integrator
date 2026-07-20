@@ -38,13 +38,7 @@ describe("TaskStatusPill", () => {
   });
 
   it("renders recovery beside the composer without a running timer", () => {
-    render(
-      <TaskStatusPill
-        recovery={
-          <button type="button">Resume</button>
-        }
-      />,
-    );
+    render(<TaskStatusPill recovery={<button type="button">Resume</button>} />);
     expect(screen.getByRole("button", { name: "Resume" })).toBeInTheDocument();
     expect(screen.queryByText(/s$/)).not.toBeInTheDocument();
   });

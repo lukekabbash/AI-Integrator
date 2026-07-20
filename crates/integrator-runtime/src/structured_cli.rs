@@ -28,6 +28,9 @@ pub enum StructuredCliProvider {
 pub enum StructuredPermissionMode {
     Prompt,
     ReadOnly,
+    /// General Chat: no coding tools or provider customizations. Provider
+    /// adapters may still project the one explicitly configured Chat MCP.
+    Chat,
     AcceptEdits,
     /// Skip provider approval prompts entirely. Only reachable from the
     /// explicit "Full access" profile the user picked in the composer.
@@ -227,8 +230,8 @@ impl StructuredCliClient {
     }
 
     /// Same as [`Self::start_turn`], reattaching local images for handoff.
-    /// Claude receives multimodal content blocks; Antigravity gets explicit
-    /// path references in the prompt text.
+    /// Claude receives multimodal content blocks; Antigravity gets workspace-
+    /// scoped `@{path}` references that its prompt loader resolves as media.
     pub async fn start_turn_with_images(
         &self,
         options: StructuredCliLaunchOptions,
@@ -353,6 +356,7 @@ fn provider_args(options: &StructuredCliLaunchOptions) -> Vec<String> {
                 match options.permission_mode {
                     StructuredPermissionMode::Prompt => "manual",
                     StructuredPermissionMode::ReadOnly => "plan",
+                    StructuredPermissionMode::Chat => "dontAsk",
                     StructuredPermissionMode::AcceptEdits => "acceptEdits",
                     StructuredPermissionMode::BypassPermissions => "bypassPermissions",
                 }
@@ -379,6 +383,15 @@ fn provider_args(options: &StructuredCliLaunchOptions) -> Vec<String> {
                 .filter(|instructions| !instructions.is_empty())
             {
                 args.extend(["--append-system-prompt".into(), instructions.into()]);
+            }
+            if options.permission_mode == StructuredPermissionMode::Chat {
+                args.extend([
+                    "--tools".into(),
+                    String::new(),
+                    "--disable-slash-commands".into(),
+                    "--safe-mode".into(),
+                    "--no-chrome".into(),
+                ]);
             }
             args
         }
@@ -411,6 +424,9 @@ fn provider_args(options: &StructuredCliLaunchOptions) -> Vec<String> {
                 // request-review prompts; callers must not route "ask" here.
                 StructuredPermissionMode::Prompt => {}
                 StructuredPermissionMode::ReadOnly => {
+                    args.extend(["--mode".into(), "plan".into()]);
+                }
+                StructuredPermissionMode::Chat => {
                     args.extend(["--mode".into(), "plan".into()]);
                 }
                 StructuredPermissionMode::AcceptEdits => {
@@ -470,6 +486,7 @@ fn provider_args(options: &StructuredCliLaunchOptions) -> Vec<String> {
         args.extend([
             "--mcp-config".into(),
             mcp_config.to_string_lossy().into_owned(),
+            "--strict-mcp-config".into(),
             "--allowed-tools".into(),
             "mcp__integrator".into(),
         ]);
@@ -595,11 +612,14 @@ fn antigravity_prompt_with_images(prompt: &str, image_paths: &[PathBuf]) -> Stri
     let mut lines = vec![
         prompt.to_owned(),
         String::new(),
-        "Prior turn images still on disk (open these paths if you need the visual context):".into(),
+        "User-selected images supplied as multimodal workspace context:".into(),
     ];
     for path in image_paths {
         if path.is_file() {
-            lines.push(format!("- {}", path.display()));
+            let rendered = path.to_string_lossy();
+            if !rendered.contains('{') && !rendered.contains('}') {
+                lines.push(format!("- @{{{rendered}}}"));
+            }
         }
     }
     lines.join("\n")
@@ -1168,6 +1188,62 @@ mod tests {
     }
 
     #[test]
+    fn chat_mode_removes_claude_coding_tools_and_keeps_antigravity_in_plan() {
+        let options = |provider| StructuredCliLaunchOptions {
+            provider,
+            executable: "agent".into(),
+            working_directory: ".".into(),
+            model: None,
+            effort: None,
+            system_instructions: Some("Chat policy".into()),
+            resume_session_id: None,
+            permission_mode: StructuredPermissionMode::Chat,
+            mcp_config_path: Some("/app/chat-mcp.json".into()),
+            control_overlay: None,
+            plugin_dirs: Vec::new(),
+        };
+        let claude = provider_args(&options(StructuredCliProvider::Claude));
+        assert!(
+            claude
+                .windows(2)
+                .any(|pair| pair[0] == "--permission-mode" && pair[1] == "dontAsk")
+        );
+        assert!(
+            claude
+                .windows(2)
+                .any(|pair| pair[0] == "--tools" && pair[1].is_empty())
+        );
+        assert!(
+            claude
+                .iter()
+                .any(|argument| argument == "--disable-slash-commands")
+        );
+        assert!(claude.iter().any(|argument| argument == "--safe-mode"));
+        assert!(
+            claude
+                .iter()
+                .any(|argument| argument == "--strict-mcp-config")
+        );
+        assert!(
+            claude
+                .windows(2)
+                .any(|pair| pair[0] == "--allowed-tools" && pair[1] == "mcp__integrator")
+        );
+
+        let antigravity = provider_args(&options(StructuredCliProvider::Antigravity));
+        assert!(
+            antigravity
+                .windows(2)
+                .any(|pair| pair[0] == "--mode" && pair[1] == "plan")
+        );
+        assert!(
+            !antigravity
+                .iter()
+                .any(|argument| argument == "--dangerously-skip-permissions")
+        );
+    }
+
+    #[test]
     fn plugin_dirs_project_per_provider_mechanism() {
         for provider in [
             StructuredCliProvider::Claude,
@@ -1438,6 +1514,20 @@ mod tests {
             StructuredCliEventKind::ToolUse { id, name, .. }
                 if id == "tool-1" && name == "Read"
         ));
+    }
+
+    #[test]
+    fn antigravity_images_use_workspace_multimodal_references() {
+        let root = std::env::temp_dir().join(format!("agy-image-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create image fixture directory");
+        let image = root.join("screenshot.png");
+        std::fs::write(&image, [0x89, 0x50, 0x4e, 0x47]).expect("write image fixture");
+
+        let prompt = antigravity_prompt_with_images("Describe this", std::slice::from_ref(&image));
+        assert!(prompt.starts_with("Describe this\n"));
+        assert!(prompt.contains(&format!("@{{{}}}", image.display())));
+
+        std::fs::remove_dir_all(root).expect("clean up image fixture directory");
     }
 
     #[test]

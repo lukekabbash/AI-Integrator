@@ -124,6 +124,7 @@ function TerminalPane({
   const [phase, setPhase] = useState<TerminalPhase>("opening");
   const [failure, setFailure] = useState("");
   const [sessionVersion, setSessionVersion] = useState(0);
+  const [hasForegroundProcess, setHasForegroundProcess] = useState(false);
 
   useEffect(() => {
     visibleRef.current = visible;
@@ -280,6 +281,30 @@ function TerminalPane({
     };
   }, [visible]);
 
+  useEffect(() => {
+    if (!visible || phase !== "running" || !session) {
+      setHasForegroundProcess(false);
+      return;
+    }
+    let cancelled = false;
+    const poll = () => {
+      bridge
+        .terminalHasForegroundProcess(session.id)
+        .then((busy) => {
+          if (!cancelled) setHasForegroundProcess(busy);
+        })
+        .catch(() => {
+          if (!cancelled) setHasForegroundProcess(false);
+        });
+    };
+    poll();
+    const timer = window.setInterval(poll, 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [visible, phase, session]);
+
   const stop = () => {
     if (!session) return;
     void bridge.interruptTerminal(session.id).catch((error) => {
@@ -302,7 +327,7 @@ function TerminalPane({
           {phaseLabel(phase)}
         </span>
         <div className="terminal-actions">
-          {phase === "running" ? (
+          {phase === "running" && hasForegroundProcess ? (
             <button
               className="terminal-stop"
               type="button"

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDemoSnapshot } from "../demoData";
 import { TaskSidebar } from "./TaskSidebar";
@@ -24,6 +24,9 @@ function setup(overrides?: Partial<Parameters<typeof TaskSidebar>[0]>) {
     onDeleteProject: vi.fn(),
     onDeleteTask: vi.fn(),
     onOpenSettings: vi.fn(),
+    onOpenScheduled: vi.fn(),
+    onOpenCapabilities: vi.fn(),
+    onOpenSubagents: vi.fn(),
     onResize: vi.fn(),
     ...pickFnOverrides(overrides),
   };
@@ -57,6 +60,21 @@ function pickFnOverrides(overrides?: Partial<Parameters<typeof TaskSidebar>[0]>)
 }
 
 describe("TaskSidebar", () => {
+  it("keeps core agent surfaces in the permanent navigation rail", () => {
+    const { callbacks } = setup({ activeDestination: "scheduled" });
+
+    const scheduled = screen.getByRole("button", { name: "Scheduled" });
+    expect(scheduled).toHaveAttribute("data-active", "true");
+    fireEvent.click(scheduled);
+    fireEvent.click(screen.getByRole("button", { name: "Skills & plugins" }));
+    fireEvent.click(screen.getByRole("button", { name: "Subagents" }));
+
+    expect(callbacks.onOpenScheduled).toHaveBeenCalledOnce();
+    expect(callbacks.onOpenCapabilities).toHaveBeenCalledOnce();
+    expect(callbacks.onOpenSubagents).toHaveBeenCalledOnce();
+    expect(document.querySelector(".new-task-button")).toBeVisible();
+  });
+
   it("mounts a fresh motion title when an automatic name arrives", () => {
     const snapshot = createDemoSnapshot();
     const task = { ...snapshot.tasks[0], title: "Coding session" };
@@ -147,7 +165,9 @@ describe("TaskSidebar", () => {
         ).toBeInTheDocument();
       });
       expect(
-        screen.getByRole("button", { name: new RegExp(activeChat.title) }).closest(".chat-row-shell"),
+        screen
+          .getByRole("button", { name: new RegExp(activeChat.title) })
+          .closest(".chat-row-shell"),
       ).toHaveAttribute("data-traveling-selection", activeChat.id);
     } finally {
       delete document.documentElement.dataset.motion;
@@ -159,24 +179,107 @@ describe("TaskSidebar", () => {
     try {
       const { snapshot } = setup();
       const active = snapshot.projects.find((project) => project.id === snapshot.activeProjectId)!;
+      const activeProjectGroup = screen
+        .getByRole("button", { name: active.name })
+        .closest(".project-group");
 
-      const openClip = document.querySelector(".project-chat-list-clip");
+      const openClip = activeProjectGroup?.querySelector(".project-chat-list-clip");
       expect(openClip).toHaveAttribute("data-open", "true");
       expect(openClip?.querySelector(".project-chat-list")).toBeTruthy();
 
       fireEvent.click(screen.getByRole("button", { name: `Collapse ${active.name}` }));
-      expect(document.querySelector(".project-chat-list-clip")).toBeNull();
+      expect(activeProjectGroup?.querySelector(".project-chat-list-clip")).toBeNull();
       expect(
         screen.queryByRole("button", { name: new RegExp(snapshot.tasks[0].title) }),
       ).not.toBeInTheDocument();
 
       fireEvent.click(screen.getByRole("button", { name: `Expand ${active.name}` }));
-      const reopened = document.querySelector(".project-chat-list-clip");
+      const reopened = activeProjectGroup?.querySelector(".project-chat-list-clip");
       expect(reopened).toHaveAttribute("data-open", "true");
-      expect(screen.getByRole("button", { name: new RegExp(snapshot.tasks[0].title) })).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: new RegExp(snapshot.tasks[0].title) }),
+      ).toBeInTheDocument();
     } finally {
       delete document.documentElement.dataset.motion;
     }
+  });
+
+  it("keeps the original section-heading hierarchy while both collections collapse", () => {
+    document.documentElement.dataset.motion = "none";
+    const snapshot = createDemoSnapshot();
+    const generalChat = {
+      ...snapshot.tasks[0],
+      id: "general-chat",
+      projectId: "__integrator_chats__",
+      kind: "chat" as const,
+      title: "Research notes",
+    };
+    setup({ tasks: [...snapshot.tasks, generalChat] });
+
+    const projectsDisclosure = screen.getByRole("button", { name: "Collapse Projects" });
+    const chatsDisclosure = screen.getByRole("button", { name: "Collapse Chats" });
+    expect(projectsDisclosure).toHaveClass("rail-section-disclosure");
+    expect(chatsDisclosure).toHaveClass("rail-section-disclosure");
+    expect(projectsDisclosure.closest(".rail-section-heading")).toBeInTheDocument();
+    expect(chatsDisclosure.closest(".rail-section-heading")).toHaveClass(
+      "rail-section-heading--later",
+    );
+    expect(projectsDisclosure.querySelector(".disclosure--open")).toBeTruthy();
+    expect(chatsDisclosure.querySelector(".disclosure--open")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: `Collapse ${snapshot.projects[0].name}` }),
+    ).toHaveClass("project-disclosure");
+    expect(screen.getByRole("button", { name: "Open another project" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create a new chat" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Research notes/ })).toBeInTheDocument();
+
+    fireEvent.click(chatsDisclosure);
+    expect(screen.getByRole("button", { name: "Expand Chats" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Research notes/ })).not.toBeInTheDocument();
+
+    fireEvent.click(projectsDisclosure);
+    expect(screen.getByRole("button", { name: "Expand Projects" })).toBeInTheDocument();
+    delete document.documentElement.dataset.motion;
+  });
+
+  it("paints the closed frame before animating a collection open", () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => undefined);
+    const snapshot = createDemoSnapshot();
+    setup({
+      tasks: [
+        ...snapshot.tasks,
+        {
+          ...snapshot.tasks[0],
+          id: "general-chat",
+          projectId: "__integrator_chats__",
+          kind: "chat",
+          title: "Research notes",
+        },
+      ],
+    });
+    const chatCollection = screen.getByRole("region", { name: "Chat collection" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse Chats" }));
+    const closingClip = chatCollection.querySelector(".project-chat-list-clip");
+    expect(closingClip).toHaveAttribute("data-open", "false");
+    fireEvent.transitionEnd(closingClip as Element, { propertyName: "grid-template-rows" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand Chats" }));
+    const openingClip = chatCollection.querySelector(".project-chat-list-clip");
+    expect(openingClip).toHaveAttribute("data-open", "false");
+    expect(frames).toHaveLength(1);
+
+    act(() => frames.shift()?.(0));
+    expect(openingClip).toHaveAttribute("data-open", "false");
+    expect(frames).toHaveLength(1);
+
+    act(() => frames.shift()?.(16));
+    expect(openingClip).toHaveAttribute("data-open", "true");
   });
 
   it("shows five chats per project, pages ten at a time, and collapses back", () => {
@@ -571,9 +674,7 @@ describe("TaskSidebar", () => {
       .getByRole("button", { name: `Collapse ${active.name}` })
       .closest(".project-group") as HTMLElement;
 
-    fireEvent.click(
-      within(group).getByRole("button", { name: `More actions for ${active.name}` }),
-    );
+    fireEvent.click(within(group).getByRole("button", { name: `More actions for ${active.name}` }));
 
     expect(group).toHaveAttribute("data-menu-open", "true");
     expect(group).toHaveAttribute("data-project-menu-open", "true");
@@ -610,9 +711,7 @@ describe("TaskSidebar", () => {
       .getByRole("button", { name: `Collapse ${active.name}` })
       .closest(".project-group") as HTMLElement;
 
-    fireEvent.click(
-      within(group).getByRole("button", { name: `More actions for ${active.name}` }),
-    );
+    fireEvent.click(within(group).getByRole("button", { name: `More actions for ${active.name}` }));
     // Portaled to document.body, so query from screen rather than within(group).
     fireEvent.click(screen.getByRole("menuitem", { name: /^Pin$/i }));
     expect(callbacks.onUpdateProject).toHaveBeenCalledWith(active.id, { pinned: true });

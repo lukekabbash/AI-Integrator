@@ -173,8 +173,12 @@ replacement task.
 Settings → Subagents uses one continuous roster/editor surface:
 
 - compact global safeguards and optional delegation guidance;
+- a semantic **Describe a specialist** composer that creates a complete,
+  disabled profile from the host-discovered runtime/model, Skill, and enabled
+  MCP inventory;
 - one selected specialist at a time;
-- provider icons in the roster and runtime pickers;
+- role-based specialist names, with compact provider-route icon stacks in the
+  roster and provider icons in runtime pickers;
 - Best for and collapsed child-only Working guidance;
 - Budget/Standard/Premium routes with optional ordered fallbacks;
 - read-only/project-write access ceiling;
@@ -188,6 +192,17 @@ orchestrator chats. Those enablement settings remain separate: ordinary chats
 receive the globally enabled inventory, while a specialist receives only its
 explicitly frozen Skill IDs. Removing a specialist assignment or uninstalling
 the Skill revokes it for future launches.
+
+Generated specialists are persisted immediately but always start disabled. The
+isolated, tool-denied helper receives bounded Skill descriptions and enabled
+MCP identities, never credential values, MCP commands, repository contents, or
+raw Skill bodies. It is instructed to prefer relevant complete Plugins, Skills,
+and ready MCPs over empty capability lists. Every generated service route has an
+explicit catalog model and an enabled fallback on a different installed runtime;
+the native host repairs missing or invented route values from the bounded model
+catalogs and discards capability IDs absent from the discovered local inventory
+before the profile reaches Settings. Enabling the resulting specialist remains
+an explicit user action.
 
 Delegation mode remains in the composer. Settings does not duplicate that
 choice, and there are no Preferred helper or recursive-delegation controls.

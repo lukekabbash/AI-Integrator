@@ -45,6 +45,10 @@ uuid_id!(RuntimeSessionId);
 uuid_id!(ProviderSessionId);
 uuid_id!(ProjectId);
 uuid_id!(QueuedMessageId);
+uuid_id!(AutomationId);
+uuid_id!(AutomationRunId);
+uuid_id!(ContextReferenceId);
+uuid_id!(MemoryId);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -220,10 +224,44 @@ impl FromStr for TaskState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskKind {
+    #[default]
+    Code,
+    Chat,
+}
+
+impl TaskKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Chat => "chat",
+        }
+    }
+}
+
+impl FromStr for TaskKind {
+    type Err = crate::IntegratorError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "code" => Ok(Self::Code),
+            "chat" => Ok(Self::Chat),
+            _ => Err(crate::IntegratorError::InvalidInput(format!(
+                "unknown task kind: {value}"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Task {
     pub id: TaskId,
+    #[serde(default)]
+    pub kind: TaskKind,
     pub title: String,
     pub repository_path: Option<PathBuf>,
     pub worktree_path: Option<PathBuf>,
@@ -253,6 +291,8 @@ pub struct Task {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewTask {
+    #[serde(default)]
+    pub kind: TaskKind,
     pub title: String,
     pub repository_path: Option<PathBuf>,
     pub worktree_path: Option<PathBuf>,
@@ -327,6 +367,238 @@ pub struct ProviderResumeState {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Who created an automation. Agent-created recurring work still carries a
+/// separately verified excerpt of the user's explicit recurrence request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutomationSource {
+    User,
+    Agent,
+}
+
+impl AutomationSource {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Agent => "agent",
+        }
+    }
+}
+
+impl FromStr for AutomationSource {
+    type Err = crate::IntegratorError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "user" => Ok(Self::User),
+            "agent" => Ok(Self::Agent),
+            _ => Err(crate::IntegratorError::InvalidInput(format!(
+                "unknown automation source: {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutomationStatus {
+    Active,
+    Paused,
+    Running,
+    Completed,
+    NeedsAttention,
+    Cancelled,
+}
+
+impl AutomationStatus {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::NeedsAttention => "needs-attention",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl FromStr for AutomationStatus {
+    type Err = crate::IntegratorError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "active" => Ok(Self::Active),
+            "paused" => Ok(Self::Paused),
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "needs-attention" => Ok(Self::NeedsAttention),
+            "cancelled" => Ok(Self::Cancelled),
+            _ => Err(crate::IntegratorError::InvalidInput(format!(
+                "unknown automation status: {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum AutomationTarget {
+    Task,
+    Delegation {
+        #[serde(alias = "delegation_id")]
+        delegation_id: DelegationId,
+    },
+}
+
+/// Triggers are deliberately small and provider-neutral. Calendar/RRULE UI
+/// can compile into these primitives without entering any runtime adapter.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum AutomationTrigger {
+    At {
+        #[serde(alias = "run_at")]
+        run_at: DateTime<Utc>,
+    },
+    Interval {
+        #[serde(alias = "every_seconds")]
+        every_seconds: u64,
+        #[serde(alias = "anchor_at")]
+        anchor_at: DateTime<Utc>,
+        #[serde(default, alias = "end_at", skip_serializing_if = "Option::is_none")]
+        end_at: Option<DateTime<Utc>>,
+    },
+    DelegationsSettled {
+        #[serde(alias = "delegation_ids")]
+        delegation_ids: Vec<DelegationId>,
+        #[serde(alias = "require_all")]
+        require_all: bool,
+        #[serde(default, alias = "timeout_at", skip_serializing_if = "Option::is_none")]
+        timeout_at: Option<DateTime<Utc>>,
+    },
+}
+
+impl AutomationTrigger {
+    #[must_use]
+    pub const fn is_recurring(&self) -> bool {
+        matches!(self, Self::Interval { .. })
+    }
+}
+
+/// Exact execution policy frozen when the automation is created. Mutable
+/// composer defaults never silently change an unattended run.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationFallback {
+    pub runtime: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationRoute {
+    pub runtime: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub fallbacks: Vec<AutomationFallback>,
+    pub permission: String,
+    pub delegation: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Automation {
+    pub id: AutomationId,
+    pub task_id: TaskId,
+    pub title: String,
+    pub prompt: String,
+    pub target: AutomationTarget,
+    pub trigger: AutomationTrigger,
+    pub route: AutomationRoute,
+    pub source: AutomationSource,
+    /// Exact excerpt of the latest user message used to authorize recurrence.
+    /// Absent for one-shot automation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recurrence_user_request: Option<String>,
+    #[serde(default)]
+    pub iteration_notes: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_note: Option<String>,
+    pub status: AutomationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutomationRunStatus {
+    Claimed,
+    Dispatched,
+    Failed,
+}
+
+impl AutomationRunStatus {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Claimed => "claimed",
+            Self::Dispatched => "dispatched",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl FromStr for AutomationRunStatus {
+    type Err = crate::IntegratorError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "claimed" => Ok(Self::Claimed),
+            "dispatched" => Ok(Self::Dispatched),
+            "failed" => Ok(Self::Failed),
+            _ => Err(crate::IntegratorError::InvalidInput(format!(
+                "unknown automation run status: {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationRun {
+    pub id: AutomationRunId,
+    pub automation_id: AutomationId,
+    pub scheduled_for: DateTime<Utc>,
+    pub status: AutomationRunStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub claimed_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalExport {
@@ -343,6 +615,10 @@ pub struct LocalExport {
     pub provider_resume_states: Vec<ProviderResumeState>,
     pub composer_drafts: Vec<ComposerDraft>,
     pub queued_messages: Vec<QueuedMessage>,
+    #[serde(default)]
+    pub context_references: Vec<TaskContextReference>,
+    #[serde(default)]
+    pub memories: Vec<MemoryEntry>,
 }
 
 /// One page of archived root chats for the Archive sidebar/settings surfaces.
@@ -378,12 +654,25 @@ pub struct ComposerDraftAttachment {
     pub entry: Option<String>,
 }
 
+/// A durable composer selection. The native host resolves the source Chat at
+/// send time; the renderer never supplies transcript text or a filesystem
+/// path for this reference.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatContextReference {
+    pub id: ContextReferenceId,
+    pub source_task_id: TaskId,
+    pub source_title: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ComposerDraft {
     pub owner: ComposerDraftOwner,
     pub prompt: String,
     pub attachments: Vec<ComposerDraftAttachment>,
+    #[serde(default)]
+    pub context_references: Vec<ChatContextReference>,
     pub runtime: String,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -433,6 +722,8 @@ pub struct NewQueuedMessage {
     pub task_id: TaskId,
     pub prompt: String,
     pub attachments: Vec<ComposerDraftAttachment>,
+    #[serde(default)]
+    pub context_references: Vec<ChatContextReference>,
     pub runtime: String,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -450,6 +741,8 @@ pub struct QueuedMessage {
     pub task_id: TaskId,
     pub prompt: String,
     pub attachments: Vec<ComposerDraftAttachment>,
+    #[serde(default)]
+    pub context_references: Vec<ChatContextReference>,
     pub runtime: String,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -462,6 +755,118 @@ pub struct QueuedMessage {
     pub state: QueuedMessageState,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Immutable record of the exact bounded Chat context supplied to one target
+/// task. `source_task_id` becomes null if the source is deleted, while the
+/// snapshot and provenance stay legible in the target's local history.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskContextReference {
+    pub id: ContextReferenceId,
+    pub target_task_id: TaskId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_task_id: Option<TaskId>,
+    pub source_title: String,
+    pub source_watermark: u64,
+    pub message_count: u32,
+    pub rendered_chars: u32,
+    pub rendered_sha256: String,
+    pub rendered_markdown: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemoryState {
+    #[default]
+    Active,
+    Disabled,
+}
+
+impl MemoryState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+impl FromStr for MemoryState {
+    type Err = crate::IntegratorError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "active" => Ok(Self::Active),
+            "disabled" => Ok(Self::Disabled),
+            _ => Err(crate::IntegratorError::InvalidInput(format!(
+                "unknown memory state: {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemoryCreator {
+    #[default]
+    User,
+    Agent,
+}
+
+impl MemoryCreator {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Agent => "agent",
+        }
+    }
+}
+
+impl FromStr for MemoryCreator {
+    type Err = crate::IntegratorError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "user" => Ok(Self::User),
+            "agent" => Ok(Self::Agent),
+            _ => Err(crate::IntegratorError::InvalidInput(format!(
+                "unknown memory creator: {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryEntry {
+    pub id: MemoryId,
+    pub text: String,
+    pub state: MemoryState,
+    pub creator: MemoryCreator,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_task_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_item_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewMemoryEntry {
+    pub text: String,
+    #[serde(default)]
+    pub creator: MemoryCreator,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_task_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_item_id: Option<String>,
 }
 
 uuid_id!(DelegationId);
@@ -701,6 +1106,7 @@ pub struct DelegationMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn provider_kind_round_trips_as_stable_wire_value() {
@@ -718,5 +1124,55 @@ mod tests {
     fn versioned_wrapper_marks_current_schema() {
         let wrapped = Versioned::current(TaskState::Ready);
         assert_eq!(wrapped.schema_version, crate::DOMAIN_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn automation_wire_values_use_complete_camel_case_payloads() {
+        let anchor_at = "2026-07-19T23:47:00Z"
+            .parse::<DateTime<Utc>>()
+            .expect("valid automation anchor");
+        let trigger = AutomationTrigger::Interval {
+            every_seconds: 60,
+            anchor_at,
+            end_at: None,
+        };
+
+        assert_eq!(
+            serde_json::to_value(&trigger).expect("serialize automation trigger"),
+            json!({
+                "kind": "interval",
+                "everySeconds": 60,
+                "anchorAt": "2026-07-19T23:47:00Z"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<AutomationTrigger>(json!({
+                "kind": "interval",
+                "everySeconds": 60,
+                "anchorAt": "2026-07-19T23:47:00Z"
+            }))
+            .expect("deserialize automation trigger"),
+            trigger
+        );
+        assert_eq!(
+            serde_json::from_value::<AutomationTrigger>(json!({
+                "kind": "interval",
+                "every_seconds": 60,
+                "anchor_at": "2026-07-19T23:47:00Z"
+            }))
+            .expect("deserialize legacy automation trigger"),
+            trigger
+        );
+
+        let route = AutomationRoute {
+            runtime: "codex".into(),
+            model: "gpt-5.6-sol".into(),
+            effort: None,
+            fallbacks: Vec::new(),
+            permission: "read-only".into(),
+            delegation: "off".into(),
+        };
+        let route_json = serde_json::to_value(route).expect("serialize automation route");
+        assert_eq!(route_json["fallbacks"], json!([]));
     }
 }

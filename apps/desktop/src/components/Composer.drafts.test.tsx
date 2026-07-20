@@ -106,9 +106,7 @@ describe("Composer draft lifecycle", () => {
   });
 
   it("does not transcribe when no voice recording was ever started", () => {
-    const transcribeVoiceClip = vi
-      .spyOn(bridge, "transcribeVoiceClip")
-      .mockResolvedValue("unused");
+    const transcribeVoiceClip = vi.spyOn(bridge, "transcribeVoiceClip").mockResolvedValue("unused");
     const { unmount } = render(
       <Composer
         runtimes={runtimes}

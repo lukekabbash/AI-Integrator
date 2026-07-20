@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { bridge, type ModelCatalogEntry, type RuntimeConnection, type RuntimeId } from "../bridge";
 import { Composer } from "./Composer";
 
-const runtimes: RuntimeConnection[] = [
+const chatRuntimes: RuntimeConnection[] = [
   {
     id: "codex",
     name: "Codex",
@@ -15,7 +15,53 @@ const runtimes: RuntimeConnection[] = [
     models: ["gpt-5.6-luna"],
     detail: "Ready",
   },
+  {
+    id: "claude",
+    name: "Claude",
+    command: "claude",
+    status: "connected",
+    fidelity: "structured",
+    models: ["claude-sonnet-4-6"],
+    detail: "Ready",
+  },
+  {
+    id: "cursor",
+    name: "Cursor",
+    command: "agent acp",
+    status: "connected",
+    fidelity: "acp",
+    models: ["composer"],
+    detail: "Ready",
+  },
+  {
+    id: "grok",
+    name: "Grok Build",
+    command: "grok agent stdio",
+    status: "connected",
+    fidelity: "acp",
+    models: ["grok-4.5"],
+    detail: "Ready",
+  },
+  {
+    id: "kimi",
+    name: "Kimi Code",
+    command: "kimi acp",
+    status: "connected",
+    fidelity: "acp",
+    models: ["kimi-k3"],
+    detail: "Ready",
+  },
+  {
+    id: "antigravity",
+    name: "Antigravity",
+    command: "agy",
+    status: "connected",
+    fidelity: "structured",
+    models: ["Gemini 3.1 Pro"],
+    detail: "Ready",
+  },
 ];
+const runtimes = [chatRuntimes[0]];
 
 function mockModelCatalog(
   resolve: (runtime: RuntimeId) => ModelCatalogEntry[] | Promise<ModelCatalogEntry[]>,
@@ -46,6 +92,59 @@ afterEach(() => {
 });
 
 describe("Composer compact controls", () => {
+  it("keeps Chat mode conversational while retaining runtime routing", async () => {
+    mockModelCatalog(() => [{ id: "gpt-5.6-luna", label: "GPT-5.6 Luna" }]);
+    const onSend = vi.fn().mockResolvedValue(true);
+    const onRoutingChange = vi.fn();
+    render(
+      <Composer
+        chatMode
+        runtimes={chatRuntimes}
+        defaultRuntime="codex"
+        defaultModel="gpt-5.6-luna"
+        defaultPermission="full-access"
+        defaultDelegation="balanced"
+        onSend={onSend}
+        onRoutingChange={onRoutingChange}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Model" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Runtime" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Permission" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Delegation" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "More composer controls" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Attach files or images from your computer" }),
+    ).toBeInTheDocument();
+
+    for (const candidate of chatRuntimes.slice(1)) {
+      fireEvent.click(screen.getByRole("button", { name: "Runtime" }));
+      fireEvent.click(screen.getByRole("option", { name: candidate.name }));
+      await waitFor(() =>
+        expect(onRoutingChange).toHaveBeenLastCalledWith(
+          expect.objectContaining({ runtime: candidate.id }),
+        ),
+      );
+    }
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Task message" }), {
+      target: { value: "Think this through with me." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(onSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          runtime: "antigravity",
+          permission: "read-only",
+          delegation: "off",
+        }),
+      ),
+    );
+  });
+
   it("keeps routing and mic visible while the overflow menu controls mode and policy", async () => {
     mockModelCatalog(() => [
       {

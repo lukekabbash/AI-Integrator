@@ -52,9 +52,9 @@ describe("nextForkTitle", () => {
     const existing = ["Port the parser", "Port the parser: Copy 1", "Port the parser: Copy 3"];
     expect(nextForkTitle("Port the parser", "Copy", existing)).toBe("Port the parser: Copy 4");
     // Deleting Copy 3 must not hand out a number that is still in use.
-    expect(
-      nextForkTitle("Port the parser", "Copy", ["Port the parser: Copy 1"]),
-    ).toBe("Port the parser: Copy 2");
+    expect(nextForkTitle("Port the parser", "Copy", ["Port the parser: Copy 1"])).toBe(
+      "Port the parser: Copy 2",
+    );
   });
 
   it("strips and increments so forks of forks do not nest", () => {
