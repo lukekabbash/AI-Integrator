@@ -120,6 +120,7 @@
     "allow-codex-connect",
     "allow-codex-list-models",
     "allow-grok-list-models",
+    "allow-antigravity-list-models",
     "allow-codex-start-thread",
     "allow-codex-resume-thread",
     "allow-codex-start-turn",

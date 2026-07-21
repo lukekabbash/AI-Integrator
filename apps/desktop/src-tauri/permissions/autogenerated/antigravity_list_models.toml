@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-antigravity-list-models"
+description = "Enables the antigravity_list_models command without any pre-configured scope."
+commands.allow = ["antigravity_list_models"]
+
+[[permission]]
+identifier = "deny-antigravity-list-models"
+description = "Denies the antigravity_list_models command without any pre-configured scope."
+commands.deny = ["antigravity_list_models"]
