@@ -3273,12 +3273,11 @@ const CLAUDE_EFFORTS: ModelEffortOption[] = [
 const CLAUDE_DEFAULT_EFFORT = "high";
 
 /**
- * Antigravity (`agy`) has no headless model-list surface (its `models` panel
- * needs a TTY) and silently ignores unknown `--model` values, so this static
- * catalog mirrors the CLI's interactive `/model` picker exactly: model ids are
- * the display names agy accepts, and the reasoning levels listed per model
- * are the "(High)"-style variants the picker offers. The native adapter
- * composes the selected effort back into the `--model` value.
+ * Degraded fallback only: a successfully probed `agy models` catalog replaces
+ * this list with live effort-suffixed slugs (`gemini-3.6-flash-high`), split
+ * into base model + effort by antigravityCatalog(). These static ids are the
+ * display names agy also accepts; the native adapter composes the selected
+ * effort back into the `--model` value in either form.
  */
 const ANTIGRAVITY_CATALOG: ModelCatalogEntry[] = [
   {
@@ -3333,6 +3332,40 @@ const GROK_4_5_EFFORTS: ModelEffortOption[] = [
   { id: "high", label: "High" },
 ];
 
+const AGY_EFFORT_ORDER = ["low", "medium", "high"] as const;
+
+/**
+ * Groups live `agy models` slugs (`gemini-3.6-flash-high`) into base-model
+ * entries with an effort picker. Ids without a trailing effort level
+ * (`claude-opus-4-6-thinking`) pass through as plain entries. The default
+ * effort prefers medium, then high, matching agy's own picker defaults.
+ */
+function antigravityCatalog(ids: string[]): ModelCatalogEntry[] {
+  const effortsByBase = new Map<string, Set<string>>();
+  const order: { base: string; leveled: boolean }[] = [];
+  for (const id of ids) {
+    const match = /^(.*)-(low|medium|high)$/.exec(id);
+    const base = match?.[1] ?? id;
+    const leveled = Boolean(match);
+    if (!effortsByBase.has(base)) {
+      effortsByBase.set(base, new Set());
+      order.push({ base, leveled });
+    }
+    if (match) effortsByBase.get(base)!.add(match[2]!);
+  }
+  return order.map(({ base, leveled }) => {
+    if (!leveled) return { id: base, label: resolveModelLabel(base) };
+    const observed = effortsByBase.get(base)!;
+    const efforts = AGY_EFFORT_ORDER.filter((level) => observed.has(level));
+    return {
+      id: base,
+      label: resolveModelLabel(base),
+      efforts: efforts.map((level) => ({ id: level, label: effortLabel(level) })),
+      defaultEffort: observed.has("medium") ? "medium" : (efforts.at(-1) ?? "high"),
+    };
+  });
+}
+
 function grokCatalog(ids: string[]): ModelCatalogEntry[] {
   return ids.map((id) => ({
     id,
@@ -3344,8 +3377,15 @@ function grokCatalog(ids: string[]): ModelCatalogEntry[] {
 }
 
 async function discoverModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]> {
-  // Curated catalog in every mode: agy exposes no programmatic model list.
-  if (runtime === "antigravity") return ANTIGRAVITY_CATALOG;
+  if (isTauri() && runtime === "antigravity") {
+    try {
+      const models = await nativeInvoke<string[]>("antigravity_list_models");
+      const catalog = antigravityCatalog(models);
+      if (catalog.length > 0) return catalog;
+    } catch {
+      // agy unavailable or logged out; fall through to the static catalog.
+    }
+  }
   if (isTauri() && runtime === "codex") {
     try {
       if (!codexCatalogConnected) {
@@ -3421,6 +3461,9 @@ async function discoverModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEnt
     }
   }
   if (!isTauri()) {
+    // The demo snapshot's antigravity ids carry no effort variants; the
+    // curated catalog keeps the effort picker visible in browser preview.
+    if (runtime === "antigravity") return ANTIGRAVITY_CATALOG;
     const demoModels = readDemoSnapshot().runtimes.find((item) => item.id === runtime)?.models;
     if (demoModels?.length) {
       if (runtime === "grok") return grokCatalog(demoModels);
@@ -3444,6 +3487,7 @@ async function discoverModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEnt
     }));
   }
   if (runtime === "grok") return grokCatalog(FALLBACK_MODELS.grok ?? []);
+  if (runtime === "antigravity") return ANTIGRAVITY_CATALOG;
   return toCatalogEntries(FALLBACK_MODELS[runtime] ?? []);
 }
 

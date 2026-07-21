@@ -99,13 +99,18 @@ export function prettyModelLabel(modelId?: string | null): string {
     }
   }
 
-  // Claude ids encode minor versions as trailing digit-digit (haiku-4-5 → 4.5).
+  // Claude ids encode minor versions as digit-digit pairs (haiku-4-5 → 4.5,
+  // opus-4-6-thinking → 4.6 Thinking).
   if (first === "claude" && tokens.length >= 3) {
-    const last = tokens[tokens.length - 1]!;
-    const secondLast = tokens[tokens.length - 2]!;
-    if (/^\d{1,2}$/.test(last) && /^\d{1,2}$/.test(secondLast)) {
-      const head = tokens.slice(0, -2).map(prettyToken);
-      return [...head, `${secondLast}.${last}`].join(" ");
+    for (let index = tokens.length - 2; index >= 1; index--) {
+      if (/^\d{1,2}$/.test(tokens[index]!) && /^\d{1,2}$/.test(tokens[index + 1]!)) {
+        const merged = [
+          ...tokens.slice(0, index),
+          `${tokens[index]}.${tokens[index + 1]}`,
+          ...tokens.slice(index + 2),
+        ];
+        return merged.map(prettyToken).join(" ");
+      }
     }
   }
 

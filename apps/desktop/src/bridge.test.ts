@@ -522,6 +522,65 @@ describe("native trusted-project bridge", () => {
     expect(invokeMock).toHaveBeenCalledWith("grok_list_models", undefined);
   });
 
+  it("groups Antigravity's live slug catalog into base models with effort pickers", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "antigravity_list_models") {
+        return [
+          "gemini-3.6-flash-high",
+          "gemini-3.6-flash-medium",
+          "gemini-3.6-flash-low",
+          "gemini-3.1-pro-low",
+          "gemini-3.1-pro-high",
+          "claude-opus-4-6-thinking",
+          "gpt-oss-120b-medium",
+        ];
+      }
+      return undefined;
+    });
+
+    await expect(bridge.listModelCatalog("antigravity")).resolves.toEqual([
+      {
+        id: "gemini-3.6-flash",
+        label: "Gemini 3.6 Flash",
+        efforts: [
+          { id: "low", label: "Low" },
+          { id: "medium", label: "Medium" },
+          { id: "high", label: "High" },
+        ],
+        defaultEffort: "medium",
+      },
+      {
+        id: "gemini-3.1-pro",
+        label: "Gemini 3.1 Pro",
+        efforts: [
+          { id: "low", label: "Low" },
+          { id: "high", label: "High" },
+        ],
+        defaultEffort: "high",
+      },
+      { id: "claude-opus-4-6-thinking", label: "Claude Opus 4.6 Thinking" },
+      {
+        id: "gpt-oss-120b",
+        label: "GPT-OSS 120B",
+        efforts: [{ id: "medium", label: "Medium" }],
+        defaultEffort: "medium",
+      },
+    ]);
+    expect(invokeMock).toHaveBeenCalledWith("antigravity_list_models", undefined);
+  });
+
+  it("falls back to the curated Antigravity catalog when the live probe fails", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "antigravity_list_models") {
+        throw new Error("provider-unavailable");
+      }
+      return undefined;
+    });
+
+    const catalog = await bridge.listModelCatalog("antigravity");
+    expect(catalog.map((entry) => entry.id)).toContain("Gemini 3.1 Pro");
+  });
+
   it("sends bounded model catalogs with specialist generation", async () => {
     const generated = { id: "specialist-ai-test", enabled: false };
     invokeMock.mockResolvedValue(generated);

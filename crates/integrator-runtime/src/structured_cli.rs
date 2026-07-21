@@ -71,15 +71,41 @@ pub struct StructuredCliLaunchOptions {
 /// than forwarded so a stale UI value cannot fail the whole turn.
 const CLAUDE_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
-/// Maps a UI effort id to the capitalized suffix agy's model names use.
-/// Unknown values are dropped: agy silently ignores unrecognized `--model`
-/// strings, so a bad compose would silently change the served model.
+/// Maps a UI effort id to the capitalized suffix agy's display-style model
+/// names use ("Gemini 3.1 Pro (High)"). Unknown values are dropped so a stale
+/// UI value cannot fail the whole turn (agy validates `--model` and rejects
+/// unknown selections with an error).
 fn antigravity_effort_suffix(effort: &Option<String>) -> Option<&'static str> {
     match effort.as_deref()? {
         "low" => Some("Low"),
         "medium" => Some("Medium"),
         "high" => Some("High"),
         _ => None,
+    }
+}
+
+/// Composes the selected effort into an agy `--model` value. Live-discovered
+/// ids are bare slugs with the reasoning level baked in
+/// (`gemini-3.6-flash-low`), so a slug base gets `-{effort}` appended; legacy
+/// display-name ids ("Gemini 3.1 Pro", still valid to agy and present in
+/// persisted tasks and the static fallback catalog) keep the "(High)"-style
+/// suffix compose. A slug that already ends in an effort level passes through
+/// unchanged so a doubly-composed id can never reach agy.
+fn antigravity_model_arg(model: &str, effort: &Option<String>) -> String {
+    if model.contains(' ') {
+        return match antigravity_effort_suffix(effort) {
+            Some(suffix) => format!("{model} ({suffix})"),
+            None => model.to_owned(),
+        };
+    }
+    let already_leveled = ["low", "medium", "high"]
+        .iter()
+        .any(|level| model.ends_with(&format!("-{level}")));
+    match effort.as_deref() {
+        Some(level @ ("low" | "medium" | "high")) if !already_leveled => {
+            format!("{model}-{level}")
+        }
+        _ => model.to_owned(),
     }
 }
 
@@ -445,14 +471,11 @@ fn provider_args(options: &StructuredCliLaunchOptions) -> Vec<String> {
         .filter(|value| !value.is_empty() && *value != "provider-default")
     {
         let model = match options.provider {
-            // agy has no effort flag; its catalog encodes the reasoning
-            // level in the model name itself ("Gemini 3.1 Pro (High)"), so
-            // the selected effort composes into the `--model` value.
+            // agy's catalog encodes the reasoning level in the model id
+            // itself, so the selected effort composes into the `--model`
+            // value (slug or legacy display-name form).
             StructuredCliProvider::Antigravity => {
-                match antigravity_effort_suffix(&options.effort) {
-                    Some(suffix) => format!("{model} ({suffix})"),
-                    None => model.to_owned(),
-                }
+                antigravity_model_arg(model, &options.effort)
             }
             StructuredCliProvider::Claude => model.to_owned(),
         };
@@ -1579,6 +1602,37 @@ mod tests {
         );
         // No model selected: nothing to compose, no --model at all.
         assert_eq!(model_arg(provider_args(&options(None, Some("high")))), None);
+        // Live-discovered slug ids compose effort as a `-level` suffix.
+        assert_eq!(
+            model_arg(provider_args(&options(
+                Some("gemini-3.6-flash"),
+                Some("medium")
+            ))),
+            Some("gemini-3.6-flash-medium".into())
+        );
+        // A slug that already carries its level never double-composes.
+        assert_eq!(
+            model_arg(provider_args(&options(
+                Some("gemini-3.6-flash-low"),
+                Some("high")
+            ))),
+            Some("gemini-3.6-flash-low".into())
+        );
+        // Slugs without effort support pass through untouched.
+        assert_eq!(
+            model_arg(provider_args(&options(
+                Some("claude-opus-4-6-thinking"),
+                None
+            ))),
+            Some("claude-opus-4-6-thinking".into())
+        );
+        assert_eq!(
+            model_arg(provider_args(&options(
+                Some("claude-sonnet-4-6"),
+                Some("xhigh")
+            ))),
+            Some("claude-sonnet-4-6".into())
+        );
     }
 
     #[test]

@@ -33,6 +33,13 @@
     "targets": "all",
     "category": "DeveloperTool",
     "shortDescription": "Local-first workspace for AI coding agents",
-    "longDescription": "AI Integrator provides one local-first native workspace for authenticated coding-agent CLIs, sessions, worktrees, diffs, and approvals."
+    "longDescription": "AI Integrator provides one local-first native workspace for authenticated coding-agent CLIs, sessions, worktrees, diffs, and approvals.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
   }
 }

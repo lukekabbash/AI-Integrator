@@ -127,8 +127,17 @@ pub fn open_external_url(url: String) -> CommandResult<()> {
         });
     }
 
+    // `explorer.exe <url>` is a common trick for this, but it is unreliable —
+    // it can surface a literal File Explorer window instead of silently
+    // handing off to the default browser. `cmd /C start "" <url>` is the
+    // standard, reliable incantation for a non-shell spawn; the empty title
+    // argument keeps `start` from treating the URL itself as a window title.
     #[cfg(target_os = "windows")]
-    let mut command = Command::new("explorer.exe");
+    let mut command = {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "start", ""]);
+        cmd
+    };
     #[cfg(target_os = "macos")]
     let mut command = Command::new("open");
     #[cfg(target_os = "linux")]
@@ -3818,6 +3827,20 @@ pub async fn codex_list_models(
         .map_err(Into::into)
 }
 
+fn push_model_id(models: &mut Vec<String>, model: &str) {
+    if !model.is_empty()
+        && model.len() <= 256
+        && !model.starts_with('/')
+        && !model.contains("..")
+        && model
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-._/:".contains(&byte))
+        && !models.iter().any(|existing| existing == model)
+    {
+        models.push(model.to_owned());
+    }
+}
+
 fn parse_grok_models(output: &str) -> Vec<String> {
     let mut models = Vec::new();
     for line in output.lines() {
@@ -3827,17 +3850,20 @@ fn parse_grok_models(output: &str) -> Vec<String> {
         let Some(model) = rest.split_whitespace().next() else {
             continue;
         };
-        if !model.is_empty()
-            && model.len() <= 256
-            && !model.starts_with('/')
-            && !model.contains("..")
-            && model
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"-._/:".contains(&byte))
-            && !models.iter().any(|existing| existing == model)
-        {
-            models.push(model.to_owned());
-        }
+        push_model_id(&mut models, model);
+    }
+    models
+}
+
+/// `agy models` prints one bare slug per line (`gemini-3.6-flash-high`),
+/// with the reasoning level baked into the id.
+fn parse_antigravity_models(output: &str) -> Vec<String> {
+    let mut models = Vec::new();
+    for line in output.lines() {
+        let Some(model) = line.trim().split_whitespace().next() else {
+            continue;
+        };
+        push_model_id(&mut models, model);
     }
     models
 }
@@ -3882,6 +3908,50 @@ pub async fn grok_list_models(state: State<'_, AppState>) -> CommandResult<Vec<S
         return Err(CommandError {
             code: "provider-protocol",
             message: "Grok Build returned an empty model catalog".into(),
+        });
+    }
+    Ok(models)
+}
+
+/// Run Antigravity's read-only model probe (`agy models`, headless-safe since
+/// agy 1.1.x). The renderer receives only sanitized model ids, never the
+/// CLI's auth context, cache, or stderr.
+#[tauri::command]
+pub async fn antigravity_list_models(state: State<'_, AppState>) -> CommandResult<Vec<String>> {
+    let statuses = state
+        .provider_statuses(false)
+        .await
+        .map_err(CommandError::from)?;
+    let executable =
+        provider_executable(&statuses, ProviderKind::Antigravity).ok_or_else(|| CommandError {
+            code: "provider-unavailable",
+            message: "Antigravity CLI is not installed".into(),
+        })?;
+    let mut command = tokio::process::Command::new(executable);
+    command.arg("models").kill_on_drop(true);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let output = timeout(Duration::from_secs(15), command.output())
+        .await
+        .map_err(|_| CommandError {
+            code: "provider-timeout",
+            message: "Antigravity model discovery timed out".into(),
+        })?
+        .map_err(|_| CommandError {
+            code: "provider-unavailable",
+            message: "Antigravity model discovery could not start".into(),
+        })?;
+    if !output.status.success() {
+        return Err(CommandError {
+            code: "provider-unavailable",
+            message: "Antigravity did not return its model catalog".into(),
+        });
+    }
+    let models = parse_antigravity_models(&String::from_utf8_lossy(&output.stdout));
+    if models.is_empty() {
+        return Err(CommandError {
+            code: "provider-protocol",
+            message: "Antigravity returned an empty model catalog".into(),
         });
     }
     Ok(models)
@@ -8757,8 +8827,14 @@ fn resolve_project_file_reveal_target(
 }
 
 fn open_with_system_default(file: &Path) -> CommandResult<()> {
+    // See open_external_url: `start` is the reliable way to hand a target to
+    // its default handler; `explorer.exe` can surface a literal window instead.
     #[cfg(target_os = "windows")]
-    let mut command = Command::new("explorer.exe");
+    let mut command = {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "start", ""]);
+        cmd
+    };
     #[cfg(target_os = "macos")]
     let mut command = Command::new("open");
     #[cfg(target_os = "linux")]
@@ -9547,6 +9623,19 @@ mod tests {
     fn grok_model_output_parser_accepts_only_bounded_model_ids() {
         let output = "Default model: grok-4.5\n\nAvailable models:\n  * grok-4.5 (default)\n  * grok-next_preview\n  * ../not-a-model\n";
         assert_eq!(parse_grok_models(output), ["grok-4.5", "grok-next_preview"]);
+    }
+
+    #[test]
+    fn antigravity_model_output_parser_accepts_only_bounded_model_ids() {
+        let output = "gemini-3.6-flash-high\ngemini-3.6-flash-low\nclaude-opus-4-6-thinking\n../not-a-model\ngemini-3.6-flash-high\n\n";
+        assert_eq!(
+            parse_antigravity_models(output),
+            [
+                "gemini-3.6-flash-high",
+                "gemini-3.6-flash-low",
+                "claude-opus-4-6-thinking"
+            ]
+        );
     }
 
     #[test]

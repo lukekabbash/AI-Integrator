@@ -1272,6 +1272,7 @@ function McpServerCard({
   onCredentialChanged,
   onRemove,
   onViewPlugin,
+  reduceMotion,
 }: {
   server: IntegratorMcpServer;
   enabled: boolean;
@@ -1279,6 +1280,7 @@ function McpServerCard({
   onCredentialChanged: () => void;
   onRemove?: () => void;
   onViewPlugin?: (origin: string) => void;
+  reduceMotion: boolean;
 }) {
   const activationWarning = mcpActivationWarning(server.name);
   const subtitle =
@@ -1288,7 +1290,15 @@ function McpServerCard({
         ? "Local connector"
         : "Plugin connector";
   return (
-    <motion.article layout="position" className="capability-card mcp-card" data-active={enabled}>
+    <motion.article
+      layout={reduceMotion ? false : "position"}
+      initial={reduceMotion ? false : { opacity: 0, y: 8, scale: 0.96 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      exit={reduceMotion ? { opacity: 0 } : { opacity: 0, y: 8, scale: 0.96 }}
+      transition={reduceMotion ? { duration: 0 } : marketplaceCardSpring}
+      className="capability-card mcp-card"
+      data-active={enabled}
+    >
       <div className="capability-card-heading">
         <span className="browse-card-tile" aria-hidden>
           <McpServerIcon server={server} />
@@ -1347,16 +1357,22 @@ function CuratedMcpCard({
   added,
   busy,
   onAdd,
+  reduceMotion,
 }: {
   entry: (typeof CURATED_MCP_SERVERS)[number];
   added: boolean;
   busy: boolean;
   onAdd: () => void;
+  reduceMotion: boolean;
 }) {
   const launch =
     entry.config.url ?? [entry.config.command ?? "", ...(entry.config.args ?? [])].join(" ").trim();
   return (
-    <motion.article layout="position" className="capability-card mcp-card" data-active={added}>
+    <motion.article
+      layout={reduceMotion ? false : "position"}
+      className="capability-card mcp-card"
+      data-active={added}
+    >
       <div className="capability-card-heading">
         <span className="browse-card-tile" aria-hidden>
           <SkillBrandIcon brands={CURATED_INSTALL_BRANDS[entry.icon]} />
@@ -1395,6 +1411,8 @@ function McpSettings({
   onMcpOverview: (overview: IntegratorMcpOverview) => void;
   onViewPlugin?: (origin: string) => void;
 }) {
+  const reduceMotion =
+    Boolean(useReducedMotion()) || document.documentElement.dataset.motion === "none";
   const overview = mcpOverview;
   const setOverview = onMcpOverview;
   const refreshServers = () => {
@@ -1547,17 +1565,20 @@ function McpSettings({
         </SettingRow>
         {servers.length > 0 ? (
           <div className="capability-card-grid">
-            {servers.map((server) => (
-              <McpServerCard
-                key={server.name}
-                server={server}
-                enabled={isOn(server)}
-                onToggle={(value) => toggleServer(server, value)}
-                onCredentialChanged={refreshServers}
-                onViewPlugin={onViewPlugin}
-                onRemove={server.source === "user" ? () => remove(server.name) : undefined}
-              />
-            ))}
+            <AnimatePresence initial={false} mode="popLayout">
+              {servers.map((server) => (
+                <McpServerCard
+                  key={server.name}
+                  server={server}
+                  enabled={isOn(server)}
+                  onToggle={(value) => toggleServer(server, value)}
+                  onCredentialChanged={refreshServers}
+                  onViewPlugin={onViewPlugin}
+                  onRemove={server.source === "user" ? () => remove(server.name) : undefined}
+                  reduceMotion={reduceMotion}
+                />
+              ))}
+            </AnimatePresence>
           </div>
         ) : null}
         {servers.length === 0 ? (
@@ -1585,6 +1606,7 @@ function McpSettings({
               added={savedNames.has(entry.name)}
               busy={busy}
               onAdd={() => save(entry.name, entry.config, `Added ${entry.label}. It starts off.`)}
+              reduceMotion={reduceMotion}
             />
           ))}
         </div>

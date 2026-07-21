@@ -13,7 +13,6 @@ import { AnimatePresence, m as motion, useReducedMotion } from "motion/react";
 import {
   Archive,
   ArchiveRestore,
-  Bot,
   ChevronDown,
   ChevronUp,
   Clock3,
@@ -29,6 +28,7 @@ import {
   Settings,
   Sparkles,
   Trash2,
+  Users,
   X,
 } from "lucide-react";
 import type { ProjectSummary, TaskMessageSearchHit, TaskSummary } from "../bridge";
@@ -1057,7 +1057,7 @@ export const TaskSidebar = memo(function TaskSidebar({
             <span>Skills &amp; plugins</span>
           </button>
           <button type="button" onClick={onOpenSubagents}>
-            <Bot aria-hidden="true" />
+            <Users aria-hidden="true" />
             <span>Subagents</span>
           </button>
         </nav>
