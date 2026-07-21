@@ -100,6 +100,7 @@ import { Tooltip } from "./Tooltip";
 import { Dropdown, ProviderIcon, type DropdownOption } from "./Dropdown";
 import { Slider } from "./Slider";
 import { RuntimeSetupTerminal } from "./RuntimeSetupTerminal";
+import { McpActivationDialog, type McpActivationRequest } from "./McpActivationDialog";
 import { SubagentsSettings } from "./SubagentsSettings";
 import { DEFAULT_SPECIALISTS } from "../subagentSettings";
 import {
@@ -146,6 +147,7 @@ import {
 import {
   CURATED_MCP_SERVERS,
   MCP_ENABLED_KEY,
+  mcpActivationWarning,
   mcpLaunchPreview,
   parseMcpForm,
 } from "../mcpSettings";
@@ -201,7 +203,12 @@ export interface RuntimeActionRequest {
 
 const settingsNav: Array<{ id: SettingsSection; label: string; hint: string; icon: LucideIcon }> = [
   { id: "general", label: "General", hint: "Local app and data", icon: MonitorCog },
-  { id: "memory", label: "Memory", hint: "Optional saved facts and preferences", icon: Brain },
+  {
+    id: "memory",
+    label: "Personalization",
+    hint: "Your name, profile, and memory",
+    icon: Brain,
+  },
   { id: "appearance", label: "Appearance", hint: "Themes, type, motion", icon: Palette },
   { id: "composer", label: "Composer", hint: "Send behavior", icon: Braces },
   {
@@ -242,6 +249,9 @@ const DEFAULT_SETTINGS: SettingsMap = {
   "general.autoResumeInterruptedTurns": false,
   "general.confirmExternalActions": true,
   "general.saveContextOnEdit": false,
+  "personalization.enabled": true,
+  "personalization.name": "",
+  "personalization.about": "",
   "memory.enabled": false,
   "composer.enterToSend": true,
   "transcript.showModel": true,
@@ -388,6 +398,7 @@ const SKILL_BRAND_MARKS = {
   figma: "/brand/skills/figma.ico",
   sentry: "/brand/skills/sentry.ico",
   blender: "/brand/skills/blender.ico",
+  robinhood: "/brand/skills/robinhood.svg",
 } as const;
 
 type SkillBrand = keyof typeof SKILL_BRAND_MARKS;
@@ -445,6 +456,7 @@ const CURATED_INSTALL_BRANDS: Record<string, SkillBrand[]> = {
   figma: ["figma"],
   sentry: ["sentry"],
   blender: ["blender"],
+  robinhood: ["robinhood"],
 };
 
 function SkillBrandIcon({ brands }: { brands?: SkillBrand[] }) {
@@ -1268,6 +1280,7 @@ function McpServerCard({
   onRemove?: () => void;
   onViewPlugin?: (origin: string) => void;
 }) {
+  const activationWarning = mcpActivationWarning(server.name);
   const subtitle =
     server.transport === "remote"
       ? "Remote connector"
@@ -1312,7 +1325,10 @@ function McpServerCard({
         ))}
       </div>
       <div className="capability-card-footer">
-        <span>{enabled ? "Enabled" : "Off until explicitly enabled"}</span>
+        <span className={enabled && activationWarning ? "mcp-high-consequence-status" : undefined}>
+          {enabled && activationWarning ? <TriangleAlert aria-hidden /> : null}
+          {enabled ? (activationWarning?.activeLabel ?? "Enabled") : "Off until explicitly enabled"}
+        </span>
         <div className="capability-card-actions">
           {onRemove ? (
             <button className="skills-uninstall-button" type="button" onClick={onRemove}>
@@ -1389,6 +1405,7 @@ function McpSettings({
   };
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  const [pendingActivation, setPendingActivation] = useState<McpActivationRequest | null>(null);
   const [form, setForm] = useState({
     name: "",
     transport: "stdio" as "stdio" | "remote",
@@ -1403,12 +1420,23 @@ function McpSettings({
   const isOn = (server: IntegratorMcpServer) => overrides[server.name] ?? server.enabled;
   const toggleServer = (server: IntegratorMcpServer, value: boolean) => {
     if (value) {
+      const warning = mcpActivationWarning(server.name);
+      if (warning) {
+        setPendingActivation({ server, warning });
+        return;
+      }
       const approved = window.confirm(
         `Enable "${server.name}"?\n\nThe next turn will be allowed to launch:\n${mcpLaunchPreview(server)}`,
       );
       if (!approved) return;
     }
     setSetting(MCP_ENABLED_KEY, withSkillEnablement(overrides, server.name, value));
+  };
+  const confirmActivation = () => {
+    if (!pendingActivation) return;
+    const current = readSkillEnablement(settings[MCP_ENABLED_KEY]);
+    setSetting(MCP_ENABLED_KEY, withSkillEnablement(current, pendingActivation.server.name, true));
+    setPendingActivation(null);
   };
   const save = (name: string, config: IntegratorMcpConfig, note: string) => {
     if (busy) return;
@@ -1488,6 +1516,11 @@ function McpSettings({
   const savedNames = new Set(servers.map((server) => server.name));
   return (
     <>
+      <McpActivationDialog
+        request={pendingActivation}
+        onClose={() => setPendingActivation(null)}
+        onConfirm={confirmActivation}
+      />
       <section className="settings-section">
         <header>
           <h2>MCP servers</h2>
@@ -4614,7 +4647,7 @@ function UsageSettings({
   );
 }
 
-function MemorySettings({
+function PersonalizationSettings({
   settings,
   setSetting,
 }: {
@@ -4626,6 +4659,9 @@ function MemorySettings({
   const [newText, setNewText] = useState("");
   const [busyId, setBusyId] = useState("");
   const [message, setMessage] = useState("");
+  const storedName = readSetting(settings, "personalization.name", "");
+  const storedAbout = readSetting(settings, "personalization.about", "");
+  const profileEnabled = readSetting(settings, "personalization.enabled", true);
   const enabled = readSetting(settings, "memory.enabled", false);
 
   const refresh = useCallback(async () => {
@@ -4660,13 +4696,58 @@ function MemorySettings({
           <Brain />
         </span>
         <div>
-          <h1>Memory</h1>
-          <p>A small, transparent scratchpad of facts and preferences you control.</p>
+          <h1>Personalization</h1>
+          <p>Choose how Chat addresses you and what it should know about you.</p>
         </div>
       </div>
+      <section className="settings-section personalization-profile">
+        <header>
+          <h2>About you</h2>
+          <p>Your profile stays local and is only shared with general Chats when enabled.</p>
+        </header>
+        <SettingRow label="Name" description="Used for greetings throughout AI Integrator.">
+          <input
+            className="personalization-name-input"
+            value={storedName}
+            maxLength={80}
+            aria-label="Your name"
+            placeholder="What should we call you?"
+            onChange={(event) => setSetting("personalization.name", event.target.value)}
+            onBlur={(event) => {
+              const value = event.target.value.trim();
+              if (value !== storedName) setSetting("personalization.name", value);
+            }}
+          />
+        </SettingRow>
+        <div className="personalization-about-row">
+          <label htmlFor="personalization-about">About you</label>
+          <textarea
+            id="personalization-about"
+            value={storedAbout}
+            maxLength={2_000}
+            rows={4}
+            placeholder="Your work, interests, goals, or how you like assistants to respond."
+            onChange={(event) => setSetting("personalization.about", event.target.value)}
+            onBlur={(event) => {
+              const value = event.target.value.trim();
+              if (value !== storedAbout) setSetting("personalization.about", value);
+            }}
+          />
+        </div>
+        <SettingRow
+          label="Use profile in Chats"
+          description="Share the name and details above with conversational assistants."
+        >
+          <Switch
+            checked={profileEnabled}
+            onChange={(value) => setSetting("personalization.enabled", value)}
+            label="Use profile in Chats"
+          />
+        </SettingRow>
+      </section>
       <section className="settings-section memory-settings">
         <header>
-          <h2>Saved memory</h2>
+          <h2>Memory</h2>
           <p>
             Disabled by default. When enabled, up to 20 active entries are supplied to general
             Chats; no embeddings or API key are used.
@@ -6416,7 +6497,7 @@ export function SettingsView(props: SettingsViewProps) {
             <UsageSettings usage={props.usage} runtimes={props.runtimes} />
           ) : null}
           {section === "memory" ? (
-            <MemorySettings settings={settings} setSetting={setSetting} />
+            <PersonalizationSettings settings={settings} setSetting={setSetting} />
           ) : null}
           {section === "archive" ? (
             <ArchiveSettings

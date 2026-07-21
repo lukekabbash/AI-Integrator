@@ -12,6 +12,7 @@ import {
   Server,
   Sparkles,
   Trash2,
+  TriangleAlert,
   Users,
   X,
 } from "lucide-react";
@@ -108,6 +109,10 @@ function serviceSummary(service: SpecialistService): string {
   return fallbackCount === 0
     ? "No fallbacks"
     : `${fallbackCount} fallback${fallbackCount === 1 ? "" : "s"}`;
+}
+
+function hasEnabledService(specialist: SpecialistSetting): boolean {
+  return specialist.serviceLevels.some((service) => service.enabled);
 }
 
 function SpecialistRouteIcons({ specialist }: { specialist: SpecialistSetting }) {
@@ -395,6 +400,7 @@ export function SubagentsSettings({
   const [skills, setSkills] = useState<IntegratorSkillsOverview | null>(null);
   const [mcps, setMcps] = useState<IntegratorMcpOverview | null>(null);
   const [inventoryError, setInventoryError] = useState("");
+  const [generatorOpen, setGeneratorOpen] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerSearch, setPickerSearch] = useState("");
   const [specialistDescription, setSpecialistDescription] = useState("");
@@ -419,6 +425,7 @@ export function SubagentsSettings({
     ? creatorRuntime
     : (usableTargets[0]?.runtime ?? "codex");
   const sequence = useRef(0);
+  const pickerRef = useRef<HTMLDivElement>(null);
 
   const selected = specialists.find((specialist) => specialist.id === selectedId) ?? specialists[0];
 
@@ -449,6 +456,24 @@ export function SubagentsSettings({
       current = false;
     };
   }, []);
+
+  // Mirrors the outside-click/Escape contract Dropdown uses for its own
+  // floating menu, so this picker behaves like every other popover in Settings.
+  useEffect(() => {
+    if (!pickerOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (!pickerRef.current?.contains(event.target as Node)) setPickerOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setPickerOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [pickerOpen]);
 
   const save = (next: SpecialistSetting[]) => setSetting("delegation.profiles", next);
   const updateSelected = (patch: Partial<SpecialistSetting>) => {
@@ -531,6 +556,10 @@ export function SubagentsSettings({
   };
   const removeSelected = () => {
     if (!selected) return;
+    const approved = window.confirm(
+      `Delete "${selected.label}"?\n\nThis removes its guidance, routing, and capability assignments. Subagents already running keep the profile they started with.`,
+    );
+    if (!approved) return;
     const index = specialists.findIndex((specialist) => specialist.id === selected.id);
     const next = specialists.filter((specialist) => specialist.id !== selected.id);
     save(next);
@@ -607,6 +636,7 @@ export function SubagentsSettings({
     runtimes.some(
       (connection) => connection.id === runtime && connection.status !== "not_installed",
     );
+  const selectedHasEnabledService = selected ? hasEnabledService(selected) : true;
 
   return (
     <>
@@ -627,10 +657,14 @@ export function SubagentsSettings({
         <h2 id="specialist-safeguards-title">Safeguards</h2>
         <div className="specialist-safeguards-row">
           <label>
-            <span>Concurrent subagents</span>
+            <span>
+              <strong>Concurrent subagents</strong>
+              <small>At most one may edit the project at once, regardless of this limit.</small>
+            </span>
             <input
               className="subagent-number"
               type="number"
+              aria-label="Concurrent subagents"
               min={1}
               max={4}
               value={maxConcurrent}
@@ -714,53 +748,89 @@ export function SubagentsSettings({
           <h2 id="specialists-title">Specialists</h2>
           <p>Choose when each specialist should be used and what it is equipped to access.</p>
         </header>
-        <form className="specialist-generator" onSubmit={generateSpecialist}>
-          <textarea
-            aria-label="Describe a specialist"
-            value={specialistDescription}
-            maxLength={6_000}
-            rows={3}
-            placeholder="Describe the work you want a specialist to own, how it should work, and what it may need."
-            onChange={(event) => setSpecialistDescription(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-                event.preventDefault();
-                event.currentTarget.form?.requestSubmit();
-              }
-            }}
-          />
-          <div className="specialist-generator-controls">
-            <span>
-              <Sparkles /> Chooses models, fallback, and capabilities · starts disabled
-            </span>
-            <Dropdown
-              compact
-              placement="up"
-              aria-label="Specialist creator runtime"
-              value={resolvedCreatorRuntime}
-              options={usableTargets.map((target) => ({
-                value: target.runtime,
-                label: target.label,
-                icon: <ProviderIcon provider={target.runtime} label={target.label} />,
-              }))}
-              onChange={(runtime) => setCreatorRuntime(runtime as RuntimeId)}
-            />
-            <button
-              type="submit"
-              aria-label={generating ? "Creating specialist" : "Create specialist from description"}
-              disabled={generating || !specialistDescription.trim() || !usableTargets.length}
-            >
-              {generating ? <span aria-hidden="true">•••</span> : <ArrowUp />}
-            </button>
-          </div>
-        </form>
-        {generationMessage ? (
-          <p className="specialist-generator-message" role="status" aria-live="polite">
-            {generationMessage}
-          </p>
-        ) : null}
+
         <div className="specialist-workbench">
           <aside className="specialist-roster" aria-label="Specialists">
+            <div className="specialist-roster-head">
+              <span>
+                {specialists.length} specialist{specialists.length === 1 ? "" : "s"}
+              </span>
+              <div className="specialist-roster-actions">
+                <button
+                  className="ghost-button"
+                  type="button"
+                  aria-expanded={generatorOpen}
+                  data-active={generatorOpen}
+                  onClick={() => setGeneratorOpen((open) => !open)}
+                >
+                  <Sparkles /> Generate
+                </button>
+                <button className="ghost-button" type="button" onClick={addSpecialist}>
+                  <Plus /> New
+                </button>
+              </div>
+            </div>
+
+            {generatorOpen ? (
+              <form className="specialist-generator" onSubmit={generateSpecialist}>
+                <div className="specialist-generator-head">
+                  <span>
+                    <Sparkles /> Chooses models, fallback, and capabilities · starts disabled
+                  </span>
+                  <button
+                    className="specialist-icon-button"
+                    type="button"
+                    aria-label="Close generator"
+                    onClick={() => setGeneratorOpen(false)}
+                  >
+                    <X />
+                  </button>
+                </div>
+                <textarea
+                  aria-label="Describe a specialist"
+                  value={specialistDescription}
+                  maxLength={6_000}
+                  rows={3}
+                  placeholder="Describe the work you want a specialist to own, how it should work, and what it may need."
+                  onChange={(event) => setSpecialistDescription(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                      event.preventDefault();
+                      event.currentTarget.form?.requestSubmit();
+                    }
+                  }}
+                />
+                <div className="specialist-generator-controls">
+                  <Dropdown
+                    compact
+                    placement="up"
+                    aria-label="Specialist creator runtime"
+                    value={resolvedCreatorRuntime}
+                    options={usableTargets.map((target) => ({
+                      value: target.runtime,
+                      label: target.label,
+                      icon: <ProviderIcon provider={target.runtime} label={target.label} />,
+                    }))}
+                    onChange={(runtime) => setCreatorRuntime(runtime as RuntimeId)}
+                  />
+                  <button
+                    type="submit"
+                    aria-label={
+                      generating ? "Creating specialist" : "Create specialist from description"
+                    }
+                    disabled={generating || !specialistDescription.trim() || !usableTargets.length}
+                  >
+                    {generating ? <span aria-hidden="true">•••</span> : <ArrowUp />}
+                  </button>
+                </div>
+                {generationMessage ? (
+                  <p className="specialist-generator-message" role="status" aria-live="polite">
+                    {generationMessage}
+                  </p>
+                ) : null}
+              </form>
+            ) : null}
+
             <div
               className="specialist-roster-list"
               role="listbox"
@@ -770,6 +840,7 @@ export function SubagentsSettings({
                 const primaryRuntime =
                   specialist.serviceLevels.find((service) => service.enabled)?.primary.runtime ??
                   "codex";
+                const inert = !hasEnabledService(specialist);
                 return (
                   <div
                     role="option"
@@ -797,9 +868,18 @@ export function SubagentsSettings({
                           .join(" · ") || "No service levels"}
                         {!runtimeInstalled(primaryRuntime) ? " · Runtime unavailable" : ""}
                       </small>
-                      <small>
-                        {specialist.skillIds.length} skills · {specialist.mcpServerIds.length} MCP
-                        {specialist.mcpServerIds.length === 1 ? "" : "s"}
+                      <small data-warning={inert}>
+                        {inert ? (
+                          <>
+                            <TriangleAlert /> No service level enabled
+                          </>
+                        ) : (
+                          <>
+                            {specialist.skillIds.length} skills · {specialist.mcpServerIds.length}{" "}
+                            MCP
+                            {specialist.mcpServerIds.length === 1 ? "" : "s"}
+                          </>
+                        )}
                       </small>
                     </span>
                     <Switch
@@ -816,10 +896,10 @@ export function SubagentsSettings({
                   </div>
                 );
               })}
+              {!specialists.length ? (
+                <p className="specialist-roster-empty">No specialists yet.</p>
+              ) : null}
             </div>
-            <button className="specialist-new" type="button" onClick={addSpecialist}>
-              <Plus /> New specialist
-            </button>
           </aside>
 
           {selected ? (
@@ -837,7 +917,7 @@ export function SubagentsSettings({
                   onChange={(enabled) => updateSelected({ enabled })}
                 />
                 <button
-                  className="specialist-icon-button"
+                  className="specialist-icon-button specialist-icon-button--danger"
                   type="button"
                   aria-label={`Delete ${selected.label}`}
                   onClick={removeSelected}
@@ -868,9 +948,13 @@ export function SubagentsSettings({
                       to use.
                     </small>
                   </span>
-                  <span>
-                    {offered.length ? `${offered.join(" · ")} enabled` : "No levels enabled"}
-                  </span>
+                  {selectedHasEnabledService ? (
+                    <span>{offered.length ? `${offered.join(" · ")} enabled` : "No levels enabled"}</span>
+                  ) : (
+                    <span className="specialist-inert-warning">
+                      <TriangleAlert /> Can&apos;t be delegated to
+                    </span>
+                  )}
                 </div>
                 <div className="specialist-service-columns" aria-hidden="true">
                   <span>Level</span>
@@ -953,142 +1037,152 @@ export function SubagentsSettings({
                         MCP servers stay explicit.
                       </small>
                     </span>
-                    <button type="button" onClick={() => setPickerOpen((open) => !open)}>
-                      <Plus /> Add capabilities
-                    </button>
-                  </div>
-                  {pickerOpen ? (
-                    <div className="specialist-capability-picker">
-                      <label>
-                        <Search />
-                        <input
-                          autoFocus
-                          aria-label="Search capabilities"
-                          value={pickerSearch}
-                          onChange={(event) => setPickerSearch(event.target.value)}
-                          placeholder="Search Skills, Plugins, and MCPs"
-                        />
-                      </label>
-                      {inventoryError ? <p role="alert">{inventoryError}</p> : null}
-                      <div className="specialist-capability-options">
-                        {visiblePluginGroups.length ? (
-                          <h3>
-                            Plugins <span>{visiblePluginGroups.length}</span>
-                          </h3>
-                        ) : null}
-                        {visiblePluginGroups.map((group) => {
-                          const names = group.skills.map((skill) => skill.name);
-                          const assignedCount = names.filter((name) =>
-                            selected.skillIds.includes(name),
-                          ).length;
-                          const allAssigned = assignedCount === names.length;
-                          const disabledInMainChats = group.skills.filter(
-                            (skill) => !skill.enabled,
-                          ).length;
-                          return (
-                            <button
-                              key={group.id}
-                              type="button"
-                              role="checkbox"
-                              aria-label={`${allAssigned ? "Remove" : "Add"} ${group.id} plugin`}
-                              aria-checked={
-                                allAssigned ? true : assignedCount > 0 ? "mixed" : false
-                              }
-                              data-kind="plugin"
-                              data-selected={assignedCount > 0}
-                              onClick={() => togglePlugin(names)}
-                            >
-                              <Package />
-                              <span>
-                                <strong>{group.id}</strong>
-                                <small>
-                                  {group.skills.length} installed Skill
-                                  {group.skills.length === 1 ? "" : "s"}
-                                  {disabledInMainChats
-                                    ? ` · ${disabledInMainChats} off in main chats`
-                                    : ""}
-                                </small>
-                              </span>
-                              <small>
-                                {allAssigned
-                                  ? "All added"
-                                  : assignedCount
-                                    ? `Add remaining ${names.length - assignedCount}`
-                                    : `Add all ${names.length}`}
-                              </small>
-                            </button>
-                          );
-                        })}
-                        {visibleSkills.length ? (
-                          <h3>
-                            Individual Skills <span>{visibleSkills.length}</span>
-                          </h3>
-                        ) : null}
-                        {visibleSkills.map((skill) => {
-                          const checked = selected.skillIds.includes(skill.name);
-                          const fromPlugin = skillPluginId(skill.source, skill.name) !== null;
-                          return (
-                            <button
-                              key={skill.name}
-                              type="button"
-                              role="checkbox"
-                              aria-checked={checked}
-                              data-selected={checked}
-                              onClick={() => toggleSkill(skill.name)}
-                            >
-                              {fromPlugin ? <Package /> : <Sparkles />}
-                              <span>
-                                <strong>{skill.name.split(":").at(-1)}</strong>
-                                <small>{pluginLabel(skill.source, skill.name)}</small>
-                              </span>
-                              <small>
-                                {skill.enabled
-                                  ? checked
-                                    ? "Added"
-                                    : "Ready"
-                                  : checked
-                                    ? "Added · Specialist only"
-                                    : "Specialist only"}
-                              </small>
-                            </button>
-                          );
-                        })}
-                        {visibleMcps.length ? (
-                          <h3>
-                            MCP servers <span>{visibleMcps.length}</span>
-                          </h3>
-                        ) : null}
-                        {visibleMcps.map((server) => {
-                          const checked = selected.mcpServerIds.includes(server.name);
-                          return (
-                            <button
-                              key={server.name}
-                              type="button"
-                              role="checkbox"
-                              aria-checked={checked}
-                              disabled={!server.enabled}
-                              data-selected={checked}
-                              onClick={() => toggleMcp(server.name)}
-                            >
-                              <Server />
-                              <span>
-                                <strong>{server.name.split(":").at(-1)}</strong>
-                                <small>MCP · {server.origin}</small>
-                              </span>
-                              <small>
-                                {server.enabled
-                                  ? checked
-                                    ? "Added"
-                                    : mcpState(server)
-                                  : "Enable in MCPs"}
-                              </small>
-                            </button>
-                          );
-                        })}
-                        {!skills && !mcps && !inventoryError ? <p>Loading capabilities…</p> : null}
-                      </div>
+                    <div className="specialist-capability-trigger" ref={pickerRef}>
+                      <button
+                        className="ghost-button"
+                        type="button"
+                        aria-expanded={pickerOpen}
+                        data-active={pickerOpen}
+                        onClick={() => setPickerOpen((open) => !open)}
+                      >
+                        <Plus /> Add capabilities
+                      </button>
+                      {pickerOpen ? (
+                        <div className="specialist-capability-picker">
+                          <label>
+                            <Search />
+                            <input
+                              autoFocus
+                              aria-label="Search capabilities"
+                              value={pickerSearch}
+                              onChange={(event) => setPickerSearch(event.target.value)}
+                              placeholder="Search Skills, Plugins, and MCPs"
+                            />
+                          </label>
+                          {inventoryError ? <p role="alert">{inventoryError}</p> : null}
+                          <div className="specialist-capability-options">
+                            {visiblePluginGroups.length ? (
+                              <h3>
+                                Plugins <span>{visiblePluginGroups.length}</span>
+                              </h3>
+                            ) : null}
+                            {visiblePluginGroups.map((group) => {
+                              const names = group.skills.map((skill) => skill.name);
+                              const assignedCount = names.filter((name) =>
+                                selected.skillIds.includes(name),
+                              ).length;
+                              const allAssigned = assignedCount === names.length;
+                              const disabledInMainChats = group.skills.filter(
+                                (skill) => !skill.enabled,
+                              ).length;
+                              return (
+                                <button
+                                  key={group.id}
+                                  type="button"
+                                  role="checkbox"
+                                  aria-label={`${allAssigned ? "Remove" : "Add"} ${group.id} plugin`}
+                                  aria-checked={
+                                    allAssigned ? true : assignedCount > 0 ? "mixed" : false
+                                  }
+                                  data-kind="plugin"
+                                  data-selected={assignedCount > 0}
+                                  onClick={() => togglePlugin(names)}
+                                >
+                                  <Package />
+                                  <span>
+                                    <strong>{group.id}</strong>
+                                    <small>
+                                      {group.skills.length} installed Skill
+                                      {group.skills.length === 1 ? "" : "s"}
+                                      {disabledInMainChats
+                                        ? ` · ${disabledInMainChats} off in main chats`
+                                        : ""}
+                                    </small>
+                                  </span>
+                                  <small>
+                                    {allAssigned
+                                      ? "All added"
+                                      : assignedCount
+                                        ? `Add remaining ${names.length - assignedCount}`
+                                        : `Add all ${names.length}`}
+                                  </small>
+                                </button>
+                              );
+                            })}
+                            {visibleSkills.length ? (
+                              <h3>
+                                Individual Skills <span>{visibleSkills.length}</span>
+                              </h3>
+                            ) : null}
+                            {visibleSkills.map((skill) => {
+                              const checked = selected.skillIds.includes(skill.name);
+                              const fromPlugin = skillPluginId(skill.source, skill.name) !== null;
+                              return (
+                                <button
+                                  key={skill.name}
+                                  type="button"
+                                  role="checkbox"
+                                  aria-checked={checked}
+                                  data-selected={checked}
+                                  onClick={() => toggleSkill(skill.name)}
+                                >
+                                  {fromPlugin ? <Package /> : <Sparkles />}
+                                  <span>
+                                    <strong>{skill.name.split(":").at(-1)}</strong>
+                                    <small>{pluginLabel(skill.source, skill.name)}</small>
+                                  </span>
+                                  <small>
+                                    {skill.enabled
+                                      ? checked
+                                        ? "Added"
+                                        : "Ready"
+                                      : checked
+                                        ? "Added · Specialist only"
+                                        : "Specialist only"}
+                                  </small>
+                                </button>
+                              );
+                            })}
+                            {visibleMcps.length ? (
+                              <h3>
+                                MCP servers <span>{visibleMcps.length}</span>
+                              </h3>
+                            ) : null}
+                            {visibleMcps.map((server) => {
+                              const checked = selected.mcpServerIds.includes(server.name);
+                              return (
+                                <button
+                                  key={server.name}
+                                  type="button"
+                                  role="checkbox"
+                                  aria-checked={checked}
+                                  disabled={!server.enabled}
+                                  data-selected={checked}
+                                  onClick={() => toggleMcp(server.name)}
+                                >
+                                  <Server />
+                                  <span>
+                                    <strong>{server.name.split(":").at(-1)}</strong>
+                                    <small>MCP · {server.origin}</small>
+                                  </span>
+                                  <small>
+                                    {server.enabled
+                                      ? checked
+                                        ? "Added"
+                                        : mcpState(server)
+                                      : "Enable in MCPs"}
+                                  </small>
+                                </button>
+                              );
+                            })}
+                            {!skills && !mcps && !inventoryError ? (
+                              <p>Loading capabilities…</p>
+                            ) : null}
+                          </div>
+                        </div>
+                      ) : null}
                     </div>
-                  ) : null}
+                  </div>
                   <div className="specialist-capability-list">
                     <h3>
                       <span>Skills &amp; Plugins</span>
@@ -1156,7 +1250,7 @@ export function SubagentsSettings({
             <div className="specialist-editor-empty">
               <Users />
               <p>Create a specialist to define its service levels and capabilities.</p>
-              <button type="button" onClick={addSpecialist}>
+              <button className="ghost-button" type="button" onClick={addSpecialist}>
                 <Plus /> New specialist
               </button>
             </div>

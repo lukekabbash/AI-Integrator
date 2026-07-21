@@ -285,7 +285,7 @@ describe("AI Integrator desktop workspace", () => {
     const navigation = screen.getByRole("complementary", { name: "Settings navigation" });
     const categoryLabels = [
       "General",
-      "Memory",
+      "Personalization",
       "Appearance",
       "Composer",
       "Runtimes and Models",

@@ -119,6 +119,7 @@
     "allow-git-push-confirmed",
     "allow-codex-connect",
     "allow-codex-list-models",
+    "allow-grok-list-models",
     "allow-codex-start-thread",
     "allow-codex-resume-thread",
     "allow-codex-start-turn",

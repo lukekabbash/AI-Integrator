@@ -12,6 +12,7 @@ import {
   type RuntimeId,
 } from "../bridge";
 import { SubagentConversation } from "./SubagentConversation";
+import { SubagentProjectionCache } from "./subagentProjectionCache";
 
 const runtimes: RuntimeConnection[] = [
   {
@@ -47,7 +48,7 @@ const runtimes: RuntimeConnection[] = [
     command: "grok",
     status: "connected",
     fidelity: "acp",
-    models: ["grok-build-0.1"],
+    models: ["grok-4.5"],
     detail: "Ready",
   },
 ];
@@ -169,6 +170,81 @@ afterEach(() => {
 });
 
 describe("SubagentConversation", () => {
+  it("paints a revisited child from cache while reconciling by watermark", async () => {
+    const projectionCache = new SubagentProjectionCache();
+    const loadProjection = vi.spyOn(bridge, "loadTaskProjection").mockResolvedValueOnce({
+      watermarkSeq: 7,
+      resetSeq: 2,
+      runtimeLive: false,
+      hydrate: {
+        items: [
+          {
+            id: "message-child",
+            providerItemId: "message-child",
+            kind: "agentMessage",
+            status: "completed",
+            body: "Cached child answer",
+            truncated: false,
+            updatedAt: "2026-07-12T10:06:07Z",
+          },
+        ],
+        plan: [],
+        planTruncated: false,
+        approvals: [],
+        firstSeen: { "message-child": "2026-07-12T10:06:07Z" },
+        hasMoreOlder: false,
+      },
+    });
+    vi.spyOn(bridge, "subscribeRuntimeProjections").mockResolvedValue(() => undefined);
+    mockModelCatalog(() => [{ id: "gpt-5.6-luna", label: "GPT-5.6 Luna" }]);
+
+    renderSubagent({
+      delegation: stoppedDelegation,
+      projectionCache,
+      runtimes,
+      onClose: vi.fn(),
+      onSend: vi.fn().mockResolvedValue(undefined),
+    });
+    expect(await screen.findByText("Cached child answer")).toBeInTheDocument();
+
+    cleanup();
+    document.querySelectorAll(".test-subagent-header-target").forEach((target) => target.remove());
+    let finishReconcile:
+      ((snapshot: Awaited<ReturnType<typeof bridge.loadTaskProjection>>) => void) | undefined;
+    loadProjection.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishReconcile = resolve;
+        }),
+    );
+
+    renderSubagent({
+      delegation: stoppedDelegation,
+      projectionCache,
+      runtimes,
+      onClose: vi.fn(),
+      onSend: vi.fn().mockResolvedValue(undefined),
+    });
+
+    expect(screen.getByText("Cached child answer")).toBeInTheDocument();
+    expect(screen.queryByText("Loading subagent transcript…")).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(loadProjection).toHaveBeenLastCalledWith("task-child", {
+        knownWatermark: 7,
+        knownResetSeq: 2,
+      }),
+    );
+
+    await act(async () => {
+      finishReconcile?.({
+        watermarkSeq: 7,
+        resetSeq: 2,
+        runtimeLive: false,
+        cacheMatched: true,
+      });
+    });
+  });
+
   it("publishes child text once per frame and flushes completion immediately in order", async () => {
     vi.spyOn(bridge, "loadTaskProjection").mockResolvedValue({
       watermarkSeq: 0,

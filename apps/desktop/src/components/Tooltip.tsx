@@ -11,8 +11,6 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { AnimatePresence, m as motion } from "motion/react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 
 export type TooltipPlacement = "top" | "bottom" | "right" | "left" | "bottom-left" | "top-left";
 
@@ -22,8 +20,6 @@ interface TooltipProps {
   hint?: ReactNode;
   /** Allows longer supporting copy to wrap inside the themed bubble. */
   multiline?: boolean;
-  /** Renders string labels as GitHub-flavored Markdown. */
-  markdown?: boolean;
   placement?: TooltipPlacement;
   /** Delay before showing, in ms. Hiding is immediate. */
   delay?: number;
@@ -70,7 +66,6 @@ export function Tooltip({
   label,
   hint,
   multiline = false,
-  markdown = false,
   placement = "top",
   delay = 420,
   disabled = false,
@@ -182,7 +177,6 @@ export function Tooltip({
                   label={label}
                   hint={hint}
                   multiline={multiline}
-                  markdown={markdown}
                   onMouseEnter={cancelHide}
                   onMouseLeave={hide}
                   bubbleRef={bubbleRef}
@@ -201,7 +195,6 @@ function TooltipBubble({
   label,
   hint,
   multiline,
-  markdown,
   onMouseEnter,
   onMouseLeave,
   bubbleRef,
@@ -211,7 +204,6 @@ function TooltipBubble({
   label: ReactNode;
   hint?: ReactNode;
   multiline: boolean;
-  markdown: boolean;
   onMouseEnter: () => void;
   onMouseLeave: () => void;
   bubbleRef: React.RefObject<HTMLDivElement | null>;
@@ -280,13 +272,7 @@ function TooltipBubble({
       exit={still ? undefined : { opacity: 0, scale: 0.96, transition: { duration: 0.1 } }}
       transition={{ type: "spring", stiffness: 640, damping: 34, mass: 0.6 }}
     >
-      <div className={`app-tooltip-label${markdown ? " app-tooltip-markdown" : ""}`}>
-        {markdown && typeof label === "string" ? (
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{label}</ReactMarkdown>
-        ) : (
-          label
-        )}
-      </div>
+      <div className="app-tooltip-label">{label}</div>
       {hint ? <span className="app-tooltip-hint">{hint}</span> : null}
     </motion.div>
   );

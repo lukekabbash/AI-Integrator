@@ -48,8 +48,10 @@ and Working guidance.
 
 `peers_list` reveals only enabled profiles, Best for, enabled service levels,
 access ceilings, and capability counts. Working guidance is deliberately
-child-only. `delegate_start` accepts a profile ID rather than arbitrary runtime
-or capability configuration.
+child-only. `delegate_start` accepts either a saved profile ID or a one-off
+`name` plus `instructions`. The one-off form does not accept arbitrary runtime
+or capability configuration: it freezes the current chat route, is read-only,
+and receives no optional Skill or MCP grants.
 
 ## Service levels and fallbacks
 
@@ -78,10 +80,14 @@ Before manual approval or launch, the host persists a
 - exact Skill/Plugin-skill and MCP server IDs;
 - snapshot version and timestamp.
 
-Running or resumed children read this snapshot, never the mutable Settings
-profile. Editing or deleting a specialist therefore changes only future
-delegations. Missing Skill identities and missing or disabled MCP selections
-fail closed with a user-visible diagnostic.
+For a one-off specialist, the snapshot contains an ephemeral profile identity,
+the agent-authored role name and durable instructions, the current chat route,
+and empty capability lists. Running or resumed children read the snapshot,
+never the mutable Settings profile. The host reapplies its frozen specialist
+instructions when a provider session must be reconstructed. Editing or deleting
+a saved specialist therefore changes only future delegations. Missing Skill
+identities and missing or disabled MCP selections fail closed with a
+user-visible diagnostic.
 
 ## Local broker and tools
 
@@ -216,6 +222,9 @@ choice, and there are no Preferred helper or recursive-delegation controls.
 - Capability IDs are host-resolved from installed Skill inventory and enabled
   MCP inventory, then frozen before launch; the model cannot submit commands,
   paths, secrets, or arbitrary MCP definitions in `delegate_start`.
+- One-off specialist instructions change behavior, not authority: they stay
+  read-only on the current task route and cannot request Skills, MCPs, fallback
+  routes, or project-write access.
 - The certified concurrency setting is clamped to four, and only one
   project-writing child may be active for a parent task at a time. Read-only
   specialists can still run in parallel within the configured cap.

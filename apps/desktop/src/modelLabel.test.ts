@@ -12,7 +12,7 @@ describe("prettyModelLabel", () => {
     expect(prettyModelLabel("gpt-oss-120b")).toBe("GPT-OSS 120B");
 
     expect(prettyModelLabel("grok-4.5")).toBe("Grok 4.5");
-    expect(prettyModelLabel("grok-build-0.1")).toBe("Grok Build 0.1");
+    expect(prettyModelLabel("grok-build")).toBe("Grok Build");
     expect(prettyModelLabel("kimi-code/k3")).toBe("Kimi K3");
     expect(prettyModelLabel("kimi-code/kimi-for-coding")).toBe("Kimi K2.7 Code");
     expect(prettyModelLabel("kimi-code/kimi-for-coding-highspeed")).toBe(

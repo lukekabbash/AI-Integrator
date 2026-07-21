@@ -1,9 +1,17 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { bridgeMock } = vi.hoisted(() => ({
+const { bridgeMock, rightRailProbe, sidebarProbe } = vi.hoisted(() => ({
+  rightRailProbe: { enabled: false },
+  sidebarProbe: {
+    enabled: false,
+    comparisons: 0,
+    executions: 0,
+    changedKeys: [] as string[][],
+  },
   bridgeMock: {
     loadWorkspace: vi.fn(),
     subscribeRuntimeProjections: vi.fn(),
@@ -37,6 +45,8 @@ const { bridgeMock } = vi.hoisted(() => ({
     pickContextAttachments: vi.fn(),
     savePastedImageAttachment: vi.fn(),
     listNativeProviderActions: vi.fn(),
+    listIntegratorSkills: vi.fn(),
+    listIntegratorMcps: vi.fn(),
     searchTaskMessages: vi.fn(),
     listArchivedTasks: vi.fn(),
     supportsTaskMetadata: vi.fn(),
@@ -83,7 +93,37 @@ vi.mock("./bridge", async (importOriginal) => {
   return { ...actual, bridge: bridgeMock };
 });
 
-vi.mock("./components/RightRail", () => ({ RightRail: () => null }));
+vi.mock("./components/RightRail", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./components/RightRail")>();
+  const React = await import("react");
+  return {
+    ...actual,
+    RightRail: (props: ComponentProps<typeof actual.RightRail>) =>
+      rightRailProbe.enabled ? React.createElement(actual.RightRail, props) : null,
+  };
+});
+
+vi.mock("./components/TaskSidebar", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./components/TaskSidebar")>();
+  const React = await import("react");
+  const ProbedTaskSidebar = React.memo(
+    (props: ComponentProps<typeof actual.TaskSidebar>) => {
+      if (sidebarProbe.enabled) sidebarProbe.executions += 1;
+      return React.createElement(actual.TaskSidebar, props);
+    },
+    (previous, next) => {
+      if (!sidebarProbe.enabled) return false;
+      const keys = new Set([...Object.keys(previous), ...Object.keys(next)]);
+      const changedKeys = [...keys].filter(
+        (key) => !Object.is(Reflect.get(previous, key), Reflect.get(next, key)),
+      );
+      sidebarProbe.comparisons += 1;
+      sidebarProbe.changedKeys.push(changedKeys);
+      return changedKeys.length === 0;
+    },
+  );
+  return { ...actual, TaskSidebar: ProbedTaskSidebar };
+});
 
 import App from "./App";
 import type {
@@ -183,6 +223,11 @@ describe("native runtime recovery UI", () => {
     });
     Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
     for (const value of Object.values(bridgeMock)) value.mockReset();
+    sidebarProbe.enabled = false;
+    rightRailProbe.enabled = false;
+    sidebarProbe.comparisons = 0;
+    sidebarProbe.executions = 0;
+    sidebarProbe.changedKeys = [];
     bridgeMock.listProjectFileOpeners.mockResolvedValue([]);
     bridgeMock.pickContextAttachments.mockResolvedValue(null);
     runtimeListener = undefined;
@@ -200,6 +245,13 @@ describe("native runtime recovery UI", () => {
     bridgeMock.searchTaskMessages.mockResolvedValue([]);
     bridgeMock.listArchivedTasks.mockResolvedValue({ tasks: [], total: 0 });
     bridgeMock.listNativeProviderActions.mockResolvedValue([]);
+    bridgeMock.listIntegratorSkills.mockResolvedValue({
+      skillsRoot: "",
+      pluginsRoot: "",
+      bundledAvailable: true,
+      skills: [],
+    });
+    bridgeMock.listIntegratorMcps.mockResolvedValue({ mcpsRoot: "", servers: [] });
     bridgeMock.listDelegations.mockResolvedValue([]);
     bridgeMock.automationTimeline.mockResolvedValue([]);
     bridgeMock.subscribeAutomationChanges.mockResolvedValue(vi.fn());
@@ -358,7 +410,7 @@ describe("native runtime recovery UI", () => {
     Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
   });
 
-  it("creates the global New chat directly in the durable Chat lane", async () => {
+  it("opens the global Chat welcome without adding the empty chat to the sidebar", async () => {
     render(<App />);
 
     const sidebar = await screen.findByRole("complementary", { name: "Chat navigation" });
@@ -371,7 +423,8 @@ describe("native runtime recovery UI", () => {
         model: "Provider default",
       }),
     );
-    expect(screen.getAllByRole("button", { name: /New chat/ }).length).toBeGreaterThan(1);
+    expect(await screen.findByRole("heading", { name: "What can I help you with?" })).toBeVisible();
+    expect(within(sidebar).queryByText("New chat", { selector: ".chat-row-title" })).toBeNull();
     expect(screen.queryByRole("tab", { name: "Review" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Permission" })).not.toBeInTheDocument();
   });
@@ -436,7 +489,9 @@ describe("native runtime recovery UI", () => {
     ]);
 
     render(<App />);
-    expect(await screen.findByRole("heading", { name: "New chat" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "What can I help you with?" }),
+    ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Runtime" }));
     fireEvent.click(screen.getByRole("option", { name: "Claude Code" }));
     await waitFor(() =>
@@ -457,6 +512,9 @@ describe("native runtime recovery UI", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
+    await waitFor(() =>
+      expect(bridgeMock.setTaskStatus).toHaveBeenCalledWith("chat-route-1", "starting"),
+    );
     await waitFor(() =>
       expect(bridgeMock.sendTurn).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -896,6 +954,92 @@ describe("native runtime recovery UI", () => {
       requestFrame.mockRestore();
       cancelFrame.mockRestore();
     }
+  });
+
+  it("stops every TaskSidebar prop change and execution on token-only frames", async () => {
+    render(<App />);
+    await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
+
+    const frameCallbacks = new Map<number, FrameRequestCallback>();
+    let nextFrameId = 0;
+    const requestFrame = vi
+      .spyOn(window, "requestAnimationFrame")
+      .mockImplementation((callback) => {
+        nextFrameId += 1;
+        frameCallbacks.set(nextFrameId, callback);
+        return nextFrameId;
+      });
+    const cancelFrame = vi
+      .spyOn(window, "cancelAnimationFrame")
+      .mockImplementation((id) => void frameCallbacks.delete(id));
+    const streamingItem = (body: string) => ({
+      id: "codex:thread-1:turn-1:item-sidebar-probe",
+      providerItemId: "item-sidebar-probe",
+      kind: "agentMessage" as const,
+      status: "inProgress" as const,
+      body,
+      truncated: false,
+      updatedAt: "2026-07-10T16:00:02Z",
+    });
+    const flushFrames = () => {
+      for (let pass = 0; pass < 8 && frameCallbacks.size > 0; pass += 1) {
+        const callbacks = [...frameCallbacks.values()];
+        frameCallbacks.clear();
+        act(() => callbacks.forEach((callback) => callback(performance.now())));
+      }
+    };
+
+    sidebarProbe.enabled = true;
+    sidebarProbe.comparisons = 0;
+    sidebarProbe.executions = 0;
+    sidebarProbe.changedKeys = [];
+
+    try {
+      for (let index = 0; index < 30; index += 1) {
+        act(() => {
+          runtimeListener?.(
+            projection(100 + index, {
+              kind: "itemChanged",
+              item: streamingItem(`Sidebar identity frame ${index + 1}`),
+            }),
+          );
+        });
+        flushFrames();
+      }
+
+      console.info(
+        JSON.stringify({
+          frames: 30,
+          comparisons: sidebarProbe.comparisons,
+          executions: sidebarProbe.executions,
+          changedKeys: [...new Set(sidebarProbe.changedKeys.flat())].sort(),
+        }),
+      );
+
+      expect(sidebarProbe.comparisons).toBeGreaterThanOrEqual(30);
+      expect(sidebarProbe.changedKeys.every((keys) => keys.length === 0)).toBe(true);
+      expect(sidebarProbe.executions).toBe(0);
+    } finally {
+      sidebarProbe.enabled = false;
+      requestFrame.mockRestore();
+      cancelFrame.mockRestore();
+    }
+  });
+
+  it("keeps the stable Sidebar Skills shortcut routed to its exact settings section", async () => {
+    render(<App />);
+    await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
+
+    fireEvent.click(screen.getByRole("button", { name: "Skills & plugins" }));
+    expect(await screen.findByRole("heading", { name: "Skills and Plugins" })).toBeVisible();
+  });
+
+  it("keeps the stable Sidebar Subagents shortcut routed to its exact settings section", async () => {
+    render(<App />);
+    await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
+
+    fireEvent.click(screen.getByRole("button", { name: "Subagents" }));
+    expect(await screen.findByRole("heading", { name: "Subagents" })).toBeVisible();
   });
 
   it("preserves health-error clearing across connected then disconnected events", async () => {
@@ -1761,6 +1905,7 @@ describe("native runtime recovery UI", () => {
   });
 
   it("moves the shared terminal and task-tools controls to the rightmost conversation", async () => {
+    rightRailProbe.enabled = true;
     bridgeMock.listDelegations.mockImplementation(async (taskId: string) =>
       taskId === "task-1"
         ? [
@@ -1777,6 +1922,23 @@ describe("native runtime recovery UI", () => {
               brief: "Unify the conversation chrome.",
               status: "stopped",
               createdAt: "2026-07-10T16:00:00Z",
+              updatedAt: "2026-07-10T16:05:00Z",
+              unreadFromChild: 0,
+              pendingQuestions: [],
+            },
+            {
+              id: "delegation-2",
+              parentTaskId: "task-1",
+              childTaskId: "task-child-2",
+              profileId: "review-specialist",
+              profileLabel: "Review specialist",
+              runtime: "claude",
+              model: "claude-fable-5",
+              effort: "high",
+              title: "Inspect the interaction",
+              brief: "Check the conversation behavior.",
+              status: "waiting",
+              createdAt: "2026-07-10T16:01:00Z",
               updatedAt: "2026-07-10T16:05:00Z",
               unreadFromChild: 0,
               pendingQuestions: [],
@@ -1798,7 +1960,7 @@ describe("native runtime recovery UI", () => {
     await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
 
     fireEvent.click(await screen.findByRole("tab", { name: /^Agents/ }));
-    fireEvent.click(await screen.findByRole("button", { name: "View transcript" }));
+    fireEvent.click(await screen.findByRole("treeitem", { name: /Polish the interaction/ }));
     await screen.findByLabelText("Polish the interaction transcript");
     const titlebar = document.querySelector<HTMLElement>(".native-titlebar");
     const appRoot = document.querySelector<HTMLElement>(".app-root");
@@ -1819,6 +1981,17 @@ describe("native runtime recovery UI", () => {
     expect(screen.getAllByRole("button", { name: "Close task tools" })).toHaveLength(1);
     expect(within(titlebar!).getByRole("button", { name: "Toggle terminal" })).toBeInTheDocument();
     expect(within(titlebar!).getByRole("button", { name: "Close task tools" })).toBeInTheDocument();
+
+    const stablePane = document.querySelector(".subagent-workspace-pane");
+    fireEvent.click(screen.getByRole("treeitem", { name: /Inspect the interaction/ }));
+    await screen.findByLabelText("Inspect the interaction transcript");
+    expect(document.querySelectorAll(".subagent-workspace-pane")).toHaveLength(1);
+    expect(document.querySelector(".subagent-workspace-pane")).toBe(stablePane);
+
+    fireEvent.click(screen.getByRole("treeitem", { name: /Polish the interaction/ }));
+    await screen.findByLabelText("Polish the interaction transcript");
+    expect(document.querySelectorAll(".subagent-workspace-pane")).toHaveLength(1);
+    expect(document.querySelector(".subagent-workspace-pane")).toBe(stablePane);
 
     fireEvent.click(within(titlebar!).getByRole("button", { name: "Close subagent transcript" }));
     await waitFor(() =>

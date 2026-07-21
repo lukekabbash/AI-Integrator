@@ -335,7 +335,7 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
       command: "grok agent stdio",
       status: "not_installed",
       fidelity: "acp",
-      models: ["Grok 4.5", "Grok Build 0.1"],
+      models: ["grok-4.5"],
       detail: "Install the vendor runtime, then return to this setup step.",
     },
     {

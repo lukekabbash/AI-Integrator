@@ -776,6 +776,11 @@ export const TaskSidebar = memo(function TaskSidebar({
               onSelectTask(task.id);
               if (options?.searchResult) closeSearch();
             }}
+            onDoubleClick={
+              options?.searchResult || !metadataActionsEnabled
+                ? undefined
+                : () => beginRename(task)
+            }
             aria-current={active ? "page" : undefined}
             data-status={task.status}
           >

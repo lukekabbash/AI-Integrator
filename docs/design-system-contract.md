@@ -26,7 +26,8 @@ AI Integrator is agent-first, calm, restrained, premium, and softly tactile. It 
 - Opening Settings replaces the project/task left rail with settings-category navigation.
 - It is not a right drawer, modal, overlay, or inspector tab.
 - `Back to workspace` restores the previous project, task, canvas tab, scroll/focus, and right-rail state.
-- Categories, in order: General, Appearance, Composer, Runtimes and Models, Skills and Plugins, Subagents, Permissions, Git, Explain, Usage and Budgets, Archives.
+- Categories, in order: General, Personalization, Appearance, Composer, Runtimes and Models, Skills and Plugins, Subagents, Permissions, Git, Explain, Usage and Budgets, Archives.
+- Personalization owns the optional local display name, user-authored Chat profile, and the transparent bounded memory list. Empty profile fields send nothing; profile sharing and memory remain independently controllable.
 - No Account or Integrator Billing category exists in v1. Vendor identities/plans live under Runtimes and Models and Usage.
 - Runtimes and Models owns the optional favorite runtime, per-runtime model/config preferences, connection health, and the user-approved install, authentication, and update terminal flows. With no favorite, new chats inherit the last-used runtime. When a terminal flow is active, routing controls recede so the selected runtime and full terminal stage dominate.
 

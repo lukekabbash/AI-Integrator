@@ -228,6 +228,7 @@ pub fn run() {
             codex_connect,
             codex_disconnect,
             codex_list_models,
+            grok_list_models,
             codex_list_threads,
             codex_read_thread,
             codex_start_thread,

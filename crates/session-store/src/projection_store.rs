@@ -410,6 +410,7 @@ impl LocalStore {
             .map_err(storage_error)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(storage_error)?;
+        drop(statement);
         let fetched = window_rows.len();
         // Reverse to ascending last_event_seq so item/approval array order
         // matches the historical event-stream hydrate path.
@@ -437,6 +438,49 @@ impl LocalStore {
             }
             _ => false,
         };
+
+        let singleton_jsons = if older_page {
+            Vec::new()
+        } else {
+            // Singletons always hydrate fully (tiny); reset itself is baked into
+            // reset_seq rather than replaying a ProjectionReset wipe on the client.
+            let mut singleton_statement = connection
+                .prepare(
+                    r#"
+                WITH boundary AS (
+                    SELECT COALESCE(reset_seq, 0) AS reset_seq
+                    FROM integrator_task_projection WHERE task_id = ?1
+                )
+                SELECT seq, event_json FROM (
+                    SELECT turn_seq AS seq, turn_event_json AS event_json FROM integrator_task_projection
+                        WHERE task_id=?1 AND turn_seq > (SELECT reset_seq FROM boundary)
+                    UNION ALL SELECT plan_seq, plan_event_json FROM integrator_task_projection
+                        WHERE task_id=?1 AND plan_seq > (SELECT reset_seq FROM boundary)
+                    UNION ALL SELECT diff_seq, diff_event_json FROM integrator_task_projection
+                        WHERE task_id=?1 AND diff_seq > (SELECT reset_seq FROM boundary)
+                    UNION ALL SELECT usage_seq, usage_event_json FROM integrator_task_projection
+                        WHERE task_id=?1 AND usage_seq > (SELECT reset_seq FROM boundary)
+                    UNION ALL SELECT mode_seq, mode_event_json FROM integrator_task_projection
+                        WHERE task_id=?1 AND mode_seq > (SELECT reset_seq FROM boundary)
+                    UNION ALL SELECT error_seq, error_event_json FROM integrator_task_projection
+                        WHERE task_id=?1 AND error_seq > (SELECT reset_seq FROM boundary)
+                    UNION ALL SELECT connection_seq, connection_event_json FROM integrator_task_projection
+                        WHERE task_id=?1 AND connection_seq > (SELECT reset_seq FROM boundary)
+                )
+                WHERE event_json IS NOT NULL AND seq <= ?2
+                ORDER BY seq
+                "#,
+                )
+                .map_err(storage_error)?;
+            singleton_statement
+                .query_map(params![task_key, watermark], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(storage_error)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(storage_error)?
+        };
+        drop(connection);
 
         let mut items = Vec::new();
         let mut approvals = Vec::new();
@@ -496,44 +540,6 @@ impl LocalStore {
             has_more_older,
             before_seq: oldest_loaded,
         };
-
-        // Singletons always hydrate fully (tiny); reset itself is baked into
-        // reset_seq rather than replaying a ProjectionReset wipe on the client.
-        let mut singleton_statement = connection
-            .prepare(
-                r#"
-            WITH boundary AS (
-                SELECT COALESCE(reset_seq, 0) AS reset_seq
-                FROM integrator_task_projection WHERE task_id = ?1
-            )
-            SELECT seq, event_json FROM (
-                SELECT turn_seq AS seq, turn_event_json AS event_json FROM integrator_task_projection
-                    WHERE task_id=?1 AND turn_seq > (SELECT reset_seq FROM boundary)
-                UNION ALL SELECT plan_seq, plan_event_json FROM integrator_task_projection
-                    WHERE task_id=?1 AND plan_seq > (SELECT reset_seq FROM boundary)
-                UNION ALL SELECT diff_seq, diff_event_json FROM integrator_task_projection
-                    WHERE task_id=?1 AND diff_seq > (SELECT reset_seq FROM boundary)
-                UNION ALL SELECT usage_seq, usage_event_json FROM integrator_task_projection
-                    WHERE task_id=?1 AND usage_seq > (SELECT reset_seq FROM boundary)
-                UNION ALL SELECT mode_seq, mode_event_json FROM integrator_task_projection
-                    WHERE task_id=?1 AND mode_seq > (SELECT reset_seq FROM boundary)
-                UNION ALL SELECT error_seq, error_event_json FROM integrator_task_projection
-                    WHERE task_id=?1 AND error_seq > (SELECT reset_seq FROM boundary)
-                UNION ALL SELECT connection_seq, connection_event_json FROM integrator_task_projection
-                    WHERE task_id=?1 AND connection_seq > (SELECT reset_seq FROM boundary)
-            )
-            WHERE event_json IS NOT NULL AND seq <= ?2
-            ORDER BY seq
-            "#,
-            )
-            .map_err(storage_error)?;
-        let singleton_jsons = singleton_statement
-            .query_map(params![task_key, watermark], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(storage_error)?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(storage_error)?;
 
         for (_seq, event_json) in singleton_jsons {
             let event: RuntimeProjectionEvent = serde_json::from_str(&event_json)?;

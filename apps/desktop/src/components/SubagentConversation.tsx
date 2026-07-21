@@ -25,6 +25,7 @@ import { SlidingTabIndicator } from "./SlidingTabIndicator";
 import { TaskStatusPill } from "./TaskStatusPill";
 import { formatCompactTokenCount } from "./conversationFormatting";
 import { Dropdown } from "./Dropdown";
+import { SubagentProjectionCache } from "./subagentProjectionCache";
 
 const Transcript = lazy(() =>
   import("./Transcript").then((module) => ({ default: module.Transcript })),
@@ -34,6 +35,8 @@ const DiffView = lazy(() => import("./DiffView").then((module) => ({ default: mo
 interface SubagentConversationProps {
   delegation: DelegationView;
   headerTarget?: HTMLElement | null;
+  /** App-owned cache keeps revisited child transcripts on the immediate paint path. */
+  projectionCache?: SubagentProjectionCache;
   runtimes: RuntimeConnection[];
   contextFiles?: string[];
   /** Requests the bounded project scan the first time an @-token is typed. */
@@ -65,6 +68,7 @@ function statusLabel(status: DelegationView["status"]): string {
 export function SubagentConversation({
   delegation,
   headerTarget,
+  projectionCache: sharedProjectionCache,
   runtimes,
   contextFiles,
   onRequestContextFiles,
@@ -78,8 +82,15 @@ export function SubagentConversation({
   onSend,
   onStop,
 }: SubagentConversationProps) {
-  const [projection, setProjection] = useState<RuntimeProjectionState | null>(null);
-  const [loading, setLoading] = useState(Boolean(delegation.childTaskId));
+  const childTaskId = delegation.childTaskId ?? undefined;
+  const [ownedProjectionCache] = useState(() => new SubagentProjectionCache());
+  const projectionCache = sharedProjectionCache ?? ownedProjectionCache;
+  const cachedProjection = childTaskId ? projectionCache.get(childTaskId) : undefined;
+  const [projection, setProjection] = useState<RuntimeProjectionState | null>(
+    cachedProjection ?? null,
+  );
+  const projectionRef = useRef<RuntimeProjectionState | null>(cachedProjection ?? null);
+  const [loading, setLoading] = useState(Boolean(childTaskId && !cachedProjection));
   const [loadError, setLoadError] = useState("");
   const [stopping, setStopping] = useState(false);
   const [resuming, setResuming] = useState(false);
@@ -103,7 +114,6 @@ export function SubagentConversation({
   const autoResumeAttemptedRef = useRef(new Set<string>());
   // User/orchestrator Stop must never look like crash recovery on reopen.
   const [userStoppedTurns, setUserStoppedTurns] = useState<ReadonlySet<string>>(() => new Set());
-  const childTaskId = delegation.childTaskId ?? undefined;
 
   useEffect(() => {
     if (!childTaskId) return;
@@ -112,16 +122,18 @@ export function SubagentConversation({
     let ready = false;
     let unlisten: (() => void) | undefined;
     let projectionFrame: number | undefined;
+    const cached = projectionCache.get(childTaskId);
     const buffered: RuntimeProjectionEvent[] = [];
     const frameEvents: RuntimeProjectionEvent[] = [];
     const applyEvents = (events: RuntimeProjectionEvent[]) => {
       if (events.length === 0) return;
-      setProjection((current) => {
-        return applyRuntimeProjectionBatch(
-          current ?? createRuntimeProjectionState(childTaskId),
-          events,
-        );
-      });
+      const next = applyRuntimeProjectionBatch(
+        projectionRef.current ?? createRuntimeProjectionState(childTaskId),
+        events,
+      );
+      const published = projectionCache.set(childTaskId, next);
+      projectionRef.current = published;
+      setProjection(published);
     };
     const flushFrameEvents = () => {
       projectionFrame = undefined;
@@ -151,33 +163,46 @@ export function SubagentConversation({
           return;
         }
 
-        const snapshot = await bridge.loadTaskProjection(childTaskId);
-        const hydrate = snapshot.hydrate ?? {
-          items: [],
-          plan: [],
-          planTruncated: false,
-          approvals: [],
-          firstSeen: {},
-          hasMoreOlder: false,
-        };
-        let next = hydrateRuntimeProjectionState(
+        const snapshot = await bridge.loadTaskProjection(
           childTaskId,
-          hydrate,
-          snapshot.watermarkSeq,
-          snapshot.resetSeq,
+          cached
+            ? {
+                knownWatermark: cached.lastSeq,
+                knownResetSeq: cached.resetSeq,
+              }
+            : undefined,
         );
+        const hydrate = snapshot.hydrate;
+        let next =
+          snapshot.cacheMatched && cached
+            ? cached
+            : hydrateRuntimeProjectionState(
+                childTaskId,
+                hydrate ?? {
+                  items: [],
+                  plan: [],
+                  planTruncated: false,
+                  approvals: [],
+                  firstSeen: {},
+                  hasMoreOlder: false,
+                },
+                snapshot.watermarkSeq,
+                snapshot.resetSeq,
+              );
         next = applyRuntimeProjectionBatch(
           next,
           buffered
             .filter((candidate) => candidate.seq > snapshot.watermarkSeq)
             .sort((a, b) => a.seq - b.seq),
         );
+        const published = projectionCache.set(childTaskId, next);
         if (!disposed) {
           ready = true;
-          setProjection(next);
+          projectionRef.current = published;
+          setProjection(published);
         }
       } catch (error) {
-        if (!disposed) {
+        if (!disposed && !cached) {
           setLoadError(error instanceof Error ? error.message : "Could not load this transcript");
         }
       } finally {
@@ -190,7 +215,7 @@ export function SubagentConversation({
       if (projectionFrame !== undefined) window.cancelAnimationFrame(projectionFrame);
       unlisten?.();
     };
-  }, [childTaskId]);
+  }, [childTaskId, projectionCache]);
 
   useEffect(() => {
     if (!childTaskId || centerView !== "review") return;
@@ -410,13 +435,16 @@ export function SubagentConversation({
     if (turnStopKey) {
       setUserStoppedTurns((current) => new Set(current).add(turnStopKey));
     }
-    setProjection((current) => {
-      if (!current?.turn || current.turn.stopRequested) return current;
-      return {
-        ...current,
-        turn: { ...current.turn, stopRequested: true },
+    const currentProjection = projectionRef.current;
+    if (currentProjection?.turn && !currentProjection.turn.stopRequested) {
+      const next = {
+        ...currentProjection,
+        turn: { ...currentProjection.turn, stopRequested: true },
       };
-    });
+      const published = childTaskId ? projectionCache.set(childTaskId, next) : next;
+      projectionRef.current = published;
+      setProjection(published);
+    }
     setStopping(true);
     setActionError("");
     try {

@@ -297,15 +297,17 @@ fn tool_definitions(role: &str, mode: &str, harness_instructions: Option<&str>) 
             }),
             json!({
                 "name": "delegate_start",
-                "description": "Delegate a self-contained subtask to a subagent on another provider. Fully asynchronous: returns a delegationId immediately while the subagent works in the background — continue your own work and check in later. The brief must stand alone: the subagent sees only recent conversation context plus your brief. Set permission to read-only for research, audits, and repo orientation; use project-write only when the child must modify the workspace.",
+                "description": "Delegate a self-contained subtask asynchronously. Use either profileId for a saved specialist, or name plus instructions to mint a one-off read-only specialist on this chat's current runtime. instructions are the durable operating method and remain attached to that child; brief is only the immediate task. Returns a delegationId immediately — continue your own work and check in later.",
                 "annotations": tool_annotations(false, false),
                 "inputSchema": text_schema(json!({
-                    "profileId": { "type": "string", "description": "A profileId from peers_list." },
-                    "serviceLevel": { "type": "string", "enum": ["budget", "standard", "premium"], "description": "An enabled service level from this specialist. Omit to prefer Standard, or Budget in budget-first mode." },
+                    "profileId": { "type": "string", "description": "A profileId from peers_list. Mutually exclusive with name and instructions." },
+                    "serviceLevel": { "type": "string", "enum": ["budget", "standard", "premium"], "description": "For a saved profile only: an enabled service level. Omit to prefer Standard, or Budget in budget-first mode." },
+                    "name": { "type": "string", "minLength": 1, "maxLength": 120, "description": "For a one-off specialist only: a concise role name shown in the Subagents column. Requires instructions and no profileId." },
+                    "instructions": { "type": "string", "minLength": 1, "maxLength": 65536, "description": "For a one-off specialist only: durable role, reasoning discipline, style, checks, and working method. This remains frozen to the child across follow-ups and resume. Do not put the immediate assignment here." },
                     "title": { "type": "string", "description": "Short provisional label for the subtask. The app applies its subagent-number convention and may replace this with an automatically generated chat name." },
-                    "brief": { "type": "string", "description": "Complete standalone instructions: goal, constraints, files, and the deliverable you expect back." },
-                    "permission": { "type": "string", "enum": ["read-only", "project-write"], "default": "read-only", "description": "Enforced child workspace permission. It may never exceed the specialist's access ceiling." }
-                }), &["profileId", "title", "brief"]),
+                    "brief": { "type": "string", "description": "The immediate task only: goal, constraints, relevant files or context, and expected deliverable." },
+                    "permission": { "type": "string", "enum": ["read-only", "project-write"], "default": "read-only", "description": "Enforced child workspace permission. One-off specialists are always read-only; saved profiles may allow project-write." }
+                }), &["title", "brief"]),
             }),
             json!({
                 "name": "delegation_status",
@@ -586,6 +588,31 @@ mod tests {
             Some(true)
         );
         assert_eq!(annotation("peers_list", "openWorldHint"), Some(false));
+    }
+
+    #[test]
+    fn delegate_start_exposes_saved_and_one_off_specialist_forms() {
+        let tools = tool_definitions("orchestrator", "balanced", None);
+        let delegate = tools
+            .iter()
+            .find(|tool| tool["name"] == "delegate_start")
+            .expect("delegate_start tool");
+        let properties = &delegate["inputSchema"]["properties"];
+        assert!(properties.get("profileId").is_some());
+        assert!(properties.get("name").is_some());
+        assert!(properties.get("instructions").is_some());
+        assert!(
+            properties["instructions"]["description"]
+                .as_str()
+                .expect("instructions description")
+                .contains("durable")
+        );
+        let required = delegate["inputSchema"]["required"]
+            .as_array()
+            .expect("required fields");
+        assert!(required.contains(&json!("title")));
+        assert!(required.contains(&json!("brief")));
+        assert!(!required.contains(&json!("profileId")));
     }
 
     #[test]

@@ -1489,6 +1489,28 @@ impl LocalStore {
         Ok(project)
     }
 
+    /// Deletes Integrator-owned code-task history for an exact legacy
+    /// repository path that has no trusted-project row. This never grants
+    /// filesystem authority or removes the path itself.
+    pub fn remove_project_history_by_repository_path(
+        &self,
+        repository_path: &Path,
+    ) -> Result<usize> {
+        let repository_path = repository_path.to_string_lossy();
+        if repository_path.trim().is_empty() || repository_path.chars().count() > 4_096 {
+            return Err(IntegratorError::InvalidInput(
+                "legacy project repository path is invalid".into(),
+            ));
+        }
+        self.connection
+            .lock()
+            .execute(
+                "DELETE FROM tasks WHERE kind = 'code' AND repository_path = ?1",
+                [repository_path.as_ref()],
+            )
+            .map_err(storage_error)
+    }
+
     /// Live navigation set: non-archived tasks ordered for the sidebar.
     pub fn list_tasks(&self) -> Result<Vec<Task>> {
         self.query_tasks(
@@ -5662,6 +5684,44 @@ mod tests {
         assert!(
             repository.exists(),
             "removal must never delete repository data"
+        );
+    }
+
+    #[test]
+    fn legacy_project_history_can_be_removed_by_its_exact_stored_path() {
+        let store = LocalStore::open_in_memory().expect("open store");
+        let legacy_path = PathBuf::from("Projects/AI Integrator");
+        let other_path = PathBuf::from("Projects/Other");
+        for (title, repository_path) in [
+            ("Legacy one", legacy_path.clone()),
+            ("Legacy two", legacy_path.clone()),
+            ("Other project", other_path.clone()),
+        ] {
+            store
+                .create_task(NewTask {
+                    kind: TaskKind::Code,
+                    title: title.into(),
+                    repository_path: Some(repository_path),
+                    worktree_path: None,
+                    runtime: None,
+                    model: None,
+                    effort: None,
+                    parent_task_id: None,
+                })
+                .expect("create legacy task");
+        }
+
+        assert_eq!(
+            store
+                .remove_project_history_by_repository_path(&legacy_path)
+                .expect("remove legacy project history"),
+            2
+        );
+        let remaining = store.list_all_tasks().expect("list remaining tasks");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].repository_path.as_deref(),
+            Some(other_path.as_path())
         );
     }
 

@@ -1032,8 +1032,8 @@ pub struct DelegationRoute {
     pub effort: Option<String>,
 }
 
-/// The host-resolved specialist contract frozen when a delegation is
-/// requested. Existing children never reread the mutable Settings profile.
+/// The host-resolved saved or one-off specialist contract frozen when a
+/// delegation is requested. Existing children never reread mutable Settings.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DelegationCapabilitySnapshot {
@@ -1058,7 +1058,8 @@ pub struct Delegation {
     /// The child task holding the subagent's transcript. Absent until the
     /// delegation is approved and spawned.
     pub child_task_id: Option<TaskId>,
-    /// Delegation-profile identity resolved from user settings at start time.
+    /// Saved-profile identity, or a host-minted ephemeral identity for a
+    /// one-off specialist.
     pub profile_id: String,
     pub profile_label: String,
     pub runtime: String,

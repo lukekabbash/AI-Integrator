@@ -484,7 +484,7 @@ fn select_service_level<'a>(
 /// "Integrator delegation" works instead of just calling the tools.
 pub fn orchestrator_preamble(store: &LocalStore, mode: &str) -> String {
     let mut block = String::from(
-        "<delegation>\nYou can delegate subtasks to user-configured specialists running on other AI providers. The tools for this are already connected on the `integrator` MCP server: peers_list, delegate_start, delegation_status, delegation_message, delegation_thread, delegation_result, delegation_stop. Call them directly — do not search this repository, read Integrator source code, or shell out to provider CLIs to figure out how delegation works. This block plus the tool descriptions are the complete contract.\n\nWorkflow:\n1. peers_list — see which specialists the user enabled, what each is best for, its Budget/Standard/Premium service levels, access ceiling, capability counts, and concurrency headroom. Working guidance is child-only and is intentionally not shown to you.\n2. delegate_start(profileId, serviceLevel, title, brief, permission) — launch a specialist. Pick the specialist by Best for, then the cheapest service level adequate for the task. The child works in this repository but sees only a short digest of recent conversation plus your brief, so the brief must stand alone: goal, constraints, relevant files, and exact deliverable. Use permission \"read-only\" unless edits are necessary; the host rejects access above the specialist's ceiling.\n3. The selected profile, service route, fallbacks, guidance, access, Skills/Plugins, and MCP servers are frozen for that delegation. Fallbacks are tried in order only when an earlier runtime is unavailable before launch; they are not load balancing or mid-turn failover.\n4. delegate_start returns a delegationId immediately and the subagent runs in the background. Do not block waiting on it — continue your own work, and launch several delegations in parallel when subtasks are independent.\n5. delegation_status — check progress when convenient and whenever a <delegation-update> block appears in your prompt. Subagents may queue questions or progress reports mid-run; answer with delegation_message(delegationId, message). Use delegation_thread(delegationId) when you need the persisted child conversation rather than its compact status. The user can open the same transcript in the Agents rail.\n6. delegation_result(delegationId) — collect the finished deliverable (the subagent's summary plus a transcript digest) and integrate it. Verify delegated work before relying on it; your task is not done while delegations you still need are running.\n7. delegation_stop(delegationId) — stop a subagent you no longer need.\n",
+        "<delegation>\nYou can delegate subtasks to saved specialists or mint a one-off specialist with its own durable working instructions. The tools are already connected on the `integrator` MCP server: peers_list, delegate_start, delegation_status, delegation_message, delegation_thread, delegation_result, delegation_stop. Call them directly — do not search this repository, read Integrator source code, or shell out to provider CLIs to figure out how delegation works. This block plus the tool descriptions are the complete contract.\n\nWorkflow:\n1. For a saved specialist, call peers_list, choose by Best for, then use delegate_start(profileId, serviceLevel, title, brief, permission). The profile's route, fallbacks, guidance, access, Skills/Plugins, and MCPs are frozen at launch.\n2. When the task benefits from a purpose-built way of thinking rather than saved capabilities, use delegate_start(name, instructions, title, brief). instructions are the durable special sauce: role, reasoning discipline, checks, style, and working method. brief is only the immediate task: goal, constraints, relevant context, and exact deliverable. One-off specialists use this chat's current route, are read-only, and receive no optional Skills or MCP grants.\n3. The child sees only a short digest of recent conversation plus the frozen instructions and brief, so both must stand alone. Do not repeat the task in instructions; do not put durable working method only in brief.\n4. delegate_start returns a delegationId immediately and the subagent runs in the background. Do not block waiting on it — continue your own work, and launch several delegations in parallel when subtasks are independent.\n5. delegation_status — check progress when convenient and whenever a <delegation-update> block appears in your prompt. Subagents may queue questions or progress reports mid-run; answer with delegation_message(delegationId, message). Use delegation_thread(delegationId) when you need the persisted child conversation rather than its compact status. The user can open the same transcript in the Agents rail.\n6. delegation_result(delegationId) — collect the finished deliverable (the subagent's summary plus a transcript digest) and integrate it. Verify delegated work before relying on it; your task is not done while delegations you still need are running.\n7. delegation_stop(delegationId) — stop a subagent you no longer need.\n",
     );
     match mode {
         "manual" => block.push_str(
@@ -533,19 +533,29 @@ pub fn pending_updates_block(store: &LocalStore, parent_task_id: TaskId) -> Opti
     Some(block)
 }
 
+fn specialist_instructions_block(delegation: &Delegation) -> Option<String> {
+    let instruction = delegation.capability_snapshot.working_guidance.trim();
+    (!instruction.is_empty()).then(|| {
+        format!(
+            "<specialist-instructions>\n{}\n</specialist-instructions>\n",
+            redact_and_bound(instruction, 64 * 1024).0
+        )
+    })
+}
+
 fn child_preamble(delegation: &Delegation, has_tools: bool) -> String {
     let mut block = format!(
-        "<subagent-brief>\nYou are a delegated subagent working on behalf of an orchestrator agent in this repository. Your assignment: {}\nWorkspace permission: {}. This boundary is enforced by the host; do not ask to widen it.\n\n{}\n",
+        "<subagent-brief>\nYou are a delegated subagent working on behalf of an orchestrator agent in this repository. Your assignment: {}\nWorkspace permission: {}. This boundary is enforced by the host; do not ask to widen it.\n\n",
         delegation.title,
         delegation.permission.as_str(),
-        delegation.brief
     );
-    let instruction = delegation.capability_snapshot.working_guidance.trim();
-    if !instruction.is_empty() {
-        block.push_str("\n<specialist-instructions>\n");
-        block.push_str(&redact_and_bound(instruction, 64 * 1024).0);
-        block.push_str("\n</specialist-instructions>\n");
+    if let Some(instructions) = specialist_instructions_block(delegation) {
+        block.push_str(&instructions);
+        block.push('\n');
     }
+    block.push_str("<task-brief>\n");
+    block.push_str(&delegation.brief);
+    block.push_str("\n</task-brief>\n");
     if has_tools {
         block.push_str(
             "\nReporting back: your orchestrator may inspect this transcript, but use the `integrator` MCP tools for active coordination so questions and progress are surfaced immediately.\n- task_complete(summary): call this exactly once when your assignment is done. The summary is your entire deliverable — state what you did, files touched, key decisions, and caveats. Ending your final turn without calling task_complete leaves the orchestrator waiting on you.\n- orchestrator_ask(message): queue a question when you are blocked or the brief is ambiguous. Include enough context to answer without opening your transcript. Delivery is asynchronous — keep making progress on anything that does not depend on the answer.\n- orchestrator_report(message): send short progress notes during long-running work; fire and forget.\n",
@@ -1382,18 +1392,101 @@ fn peers_list(app: &AppHandle<tauri::Wry>, task_id: TaskId, mode: &str) -> Resul
     }))
 }
 
+struct DelegationLaunchProfile {
+    id: String,
+    label: String,
+    best_for: String,
+    working_guidance: String,
+    access_ceiling: DelegationPermission,
+    service_level: String,
+    routes: Vec<DelegationRoute>,
+    skill_ids: Vec<String>,
+    mcp_server_ids: Vec<String>,
+}
+
+fn one_off_launch_profile(
+    current_runtime: Option<&str>,
+    current_model: Option<&str>,
+    current_effort: Option<&str>,
+    installed: &[ProviderKind],
+    name: &str,
+    instructions: &str,
+    requested_title: &str,
+    requested_service_level: Option<&str>,
+    permission: DelegationPermission,
+) -> Result<DelegationLaunchProfile> {
+    if requested_service_level.is_some() {
+        return Err(IntegratorError::InvalidInput(
+            "serviceLevel applies only to a saved specialist profile".into(),
+        ));
+    }
+    if permission != DelegationPermission::ReadOnly {
+        return Err(IntegratorError::Unauthorized(
+            "one-off specialists are read-only; use an enabled saved profile for project-write access"
+                .into(),
+        ));
+    }
+    if name.chars().count() > 120 {
+        return Err(IntegratorError::InvalidInput(
+            "one-off specialist name must contain 1 to 120 characters".into(),
+        ));
+    }
+    let runtime = current_runtime.ok_or_else(|| {
+        IntegratorError::Unavailable(
+            "the current chat has no runtime route for a one-off specialist".into(),
+        )
+    })?;
+    let provider = ProviderKind::from_str(runtime)?;
+    if !matches!(
+        provider,
+        ProviderKind::Codex
+            | ProviderKind::Claude
+            | ProviderKind::Antigravity
+            | ProviderKind::Cursor
+            | ProviderKind::Grok
+            | ProviderKind::Kimi
+    ) {
+        return Err(IntegratorError::Unavailable(format!(
+            "{} cannot run one-off specialists",
+            provider.as_str()
+        )));
+    }
+    if !installed.contains(&provider) {
+        return Err(IntegratorError::Unavailable(format!(
+            "{} is not installed for the one-off specialist",
+            provider.as_str()
+        )));
+    }
+    Ok(DelegationLaunchProfile {
+        id: format!("one-off-{}", uuid::Uuid::new_v4()),
+        label: name.to_owned(),
+        best_for: format!("One-off specialist for {requested_title}."),
+        working_guidance: redact_and_bound(instructions, 64 * 1024).0,
+        access_ceiling: DelegationPermission::ReadOnly,
+        service_level: "standard".into(),
+        routes: vec![DelegationRoute {
+            runtime: provider.as_str().into(),
+            model: current_model.map(str::to_owned),
+            effort: current_effort.map(str::to_owned),
+        }],
+        skill_ids: Vec::new(),
+        mcp_server_ids: Vec::new(),
+    })
+}
+
 async fn delegate_start(
     app: &AppHandle<tauri::Wry>,
     parent_task_id: TaskId,
     mode: &str,
     params: &Value,
 ) -> Result<Value> {
-    let profile_id = text_param(params, "profileId")
-        .ok_or_else(|| IntegratorError::InvalidInput("profileId is required".into()))?;
     let requested_title = text_param(params, "title")
         .ok_or_else(|| IntegratorError::InvalidInput("title is required".into()))?;
     let brief = text_param(params, "brief")
         .ok_or_else(|| IntegratorError::InvalidInput("brief is required".into()))?;
+    let profile_id = text_param(params, "profileId");
+    let one_off_name = text_param(params, "name");
+    let one_off_instructions = text_param(params, "instructions");
     let requested_service_level = text_param(params, "serviceLevel");
     let permission = text_param(params, "permission")
         .map(|value| DelegationPermission::from_str(&value))
@@ -1401,30 +1494,82 @@ async fn delegate_start(
         .unwrap_or(DelegationPermission::ReadOnly);
 
     let state = app.state::<AppState>();
-    let profile = enabled_profile(&state.store, &profile_id)?;
-    let access_ceiling = profile.access.unwrap_or(DelegationPermission::ReadOnly);
-    if permission == DelegationPermission::ProjectWrite && access_ceiling.is_read_only() {
-        return Err(IntegratorError::Unauthorized(format!(
-            "specialist '{}' is limited to read-only access",
-            profile.label
-        )));
-    }
-    let service = select_service_level(&profile, requested_service_level.as_deref(), mode)?;
-    let mut routes = vec![service.primary.clone()];
-    if service.fallbacks_enabled {
-        routes.extend(service.fallbacks.clone());
-    }
+    let launch = match (profile_id, one_off_name, one_off_instructions) {
+        (Some(profile_id), None, None) => {
+            let profile = enabled_profile(&state.store, &profile_id)?;
+            let access_ceiling = profile.access.unwrap_or(DelegationPermission::ReadOnly);
+            if permission == DelegationPermission::ProjectWrite && access_ceiling.is_read_only() {
+                return Err(IntegratorError::Unauthorized(format!(
+                    "specialist '{}' is limited to read-only access",
+                    profile.label
+                )));
+            }
+            let service = select_service_level(&profile, requested_service_level.as_deref(), mode)?;
+            let mut routes = vec![service.primary.clone()];
+            if service.fallbacks_enabled {
+                routes.extend(service.fallbacks.clone());
+            }
+            let service_level = service.level.clone();
+            DelegationLaunchProfile {
+                id: profile.id,
+                label: profile.label,
+                best_for: profile.best_for,
+                working_guidance: profile.working_guidance,
+                access_ceiling,
+                service_level,
+                routes,
+                skill_ids: profile.skill_ids,
+                mcp_server_ids: profile.mcp_server_ids,
+            }
+        }
+        (None, Some(name), Some(instructions)) => {
+            let parent = state.store.get_task(parent_task_id)?;
+            let installed = state
+                .provider_statuses(false)
+                .await?
+                .into_iter()
+                .filter(|status| status.installed)
+                .map(|status| status.provider)
+                .collect::<Vec<_>>();
+            one_off_launch_profile(
+                parent.runtime.as_deref(),
+                parent.model.as_deref(),
+                parent.effort.as_deref(),
+                &installed,
+                &name,
+                &instructions,
+                &requested_title,
+                requested_service_level.as_deref(),
+                permission,
+            )?
+        }
+        (Some(_), _, _) => {
+            return Err(IntegratorError::InvalidInput(
+                "use either profileId or name plus instructions, never both".into(),
+            ));
+        }
+        (None, _, _) => {
+            return Err(IntegratorError::InvalidInput(
+                "delegate_start requires either profileId or both name and instructions".into(),
+            ));
+        }
+    };
+    let primary = launch
+        .routes
+        .first()
+        .cloned()
+        .ok_or_else(|| IntegratorError::Unavailable("specialist has no launch route".into()))?;
     let snapshot = DelegationCapabilitySnapshot {
         version: 1,
-        profile_id: profile.id.clone(),
-        profile_label: profile.label.clone(),
-        best_for: profile.best_for.clone(),
-        working_guidance: profile.working_guidance.clone(),
-        access_ceiling,
-        service_level: service.level.clone(),
-        routes,
-        skill_ids: profile.skill_ids.clone(),
-        mcp_server_ids: profile.mcp_server_ids.clone(),
+        profile_id: launch.id.clone(),
+        profile_label: launch.label.clone(),
+        best_for: launch.best_for,
+        working_guidance: launch.working_guidance,
+        access_ceiling: launch.access_ceiling,
+        service_level: launch.service_level.clone(),
+        routes: launch.routes,
+        skill_ids: launch.skill_ids,
+        mcp_server_ids: launch.mcp_server_ids,
         created_at: Utc::now(),
     };
     let active = state.store.active_delegation_count(parent_task_id)?;
@@ -1448,12 +1593,12 @@ async fn delegate_start(
     let manual = mode == "manual";
     let delegation = state.store.create_delegation(NewDelegation {
         parent_task_id,
-        profile_id: profile.id.clone(),
-        profile_label: profile.label.clone(),
-        runtime: service.primary.runtime.clone(),
-        model: service.primary.model.clone(),
-        effort: service.primary.effort.clone(),
-        service_level: service.level.clone(),
+        profile_id: launch.id,
+        profile_label: launch.label,
+        runtime: primary.runtime,
+        model: primary.model,
+        effort: primary.effort,
+        service_level: launch.service_level,
         capability_snapshot: snapshot,
         permission,
         title: requested_title.clone(),
@@ -2578,8 +2723,13 @@ async fn spawn_acp_child(
         crate::harness_prompt::LocalToolsProjection::Unavailable
     };
     let profile = crate::commands::AcpLaunchProfile::Project { tools };
-    let arguments = crate::commands::acp_launch_arguments(&provider, &profile)
-        .map_err(|error| IntegratorError::InvalidInput(error.message))?;
+    let arguments = crate::commands::acp_launch_arguments_with_route(
+        &provider,
+        &profile,
+        delegation.model.as_deref(),
+        delegation.effort.as_deref(),
+    )
+    .map_err(|error| IntegratorError::InvalidInput(error.message))?;
     let client = adapter_acp::AcpClient::spawn(adapter_acp::AcpLaunchOptions {
         executable,
         arguments,
@@ -2689,6 +2839,8 @@ async fn spawn_acp_child(
     let runtime = AcpRuntime {
         client: client.clone(),
         provider,
+        launch_model: delegation.model.clone(),
+        launch_effort: delegation.effort.clone(),
         process_id,
         alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         binding: Arc::new(std::sync::Mutex::new(Some(binding))),
@@ -3217,6 +3369,14 @@ async fn deliver_queued_messages_with_context(
             "<continuation-context>\nYou are continuing the same delegated conversation through a fresh provider session. Recent locally persisted transcript:\n\n{}\n</continuation-context>\n\n",
             digest.text
         ));
+    }
+    if include_continuation_context {
+        let delegation = state.store.get_delegation(child.delegation_id)?;
+        if let Some(instructions) = specialist_instructions_block(&delegation) {
+            wire.push_str("Your frozen specialist instructions still apply:\n");
+            wire.push_str(&instructions);
+            wire.push('\n');
+        }
     }
     wire.push_str(&format!(
         "<orchestrator-message>\n{note}</orchestrator-message>\nContinue your assignment accordingly."
@@ -4141,7 +4301,50 @@ mod tests {
         assert!(preamble.contains("Prefer Codex for mechanical work."));
         assert!(preamble.contains("delegate_start"));
         assert!(preamble.contains("peers_list"));
+        assert!(preamble.contains("one-off specialist"));
+        assert!(preamble.contains("durable special sauce"));
         assert!(preamble.contains("do not search this repository"));
+    }
+
+    #[test]
+    fn one_off_specialists_freeze_method_without_minting_authority() {
+        let launch = one_off_launch_profile(
+            Some("codex"),
+            Some("gpt-5.6-sol"),
+            Some("high"),
+            &[ProviderKind::Codex, ProviderKind::Claude],
+            "Careful Math Specialist",
+            "Be terse. State assumptions. Try counterexamples before claiming a proof.",
+            "Analyze the recurrence",
+            None,
+            DelegationPermission::ReadOnly,
+        )
+        .expect("one-off launch profile");
+
+        assert!(launch.id.starts_with("one-off-"));
+        assert_eq!(launch.label, "Careful Math Specialist");
+        assert!(launch.working_guidance.contains("Try counterexamples"));
+        assert_eq!(launch.access_ceiling, DelegationPermission::ReadOnly);
+        assert!(launch.skill_ids.is_empty());
+        assert!(launch.mcp_server_ids.is_empty());
+        assert_eq!(launch.routes[0].runtime, "codex");
+        assert_eq!(launch.routes[0].model.as_deref(), Some("gpt-5.6-sol"));
+
+        let write_attempt = one_off_launch_profile(
+            Some("codex"),
+            None,
+            None,
+            &[ProviderKind::Codex],
+            "Writer",
+            "Edit carefully.",
+            "Change the repository",
+            None,
+            DelegationPermission::ProjectWrite,
+        );
+        assert!(matches!(
+            write_attempt,
+            Err(IntegratorError::Unauthorized(_))
+        ));
     }
 
     #[test]
@@ -4188,6 +4391,11 @@ mod tests {
         assert!(prompt.contains("task_complete"));
         assert!(prompt.contains("Workspace permission: read-only"));
         assert!(prompt.contains("may inspect this transcript"));
+        assert!(prompt.contains("<task-brief>\nReview the flow\n</task-brief>"));
+        assert!(
+            prompt.find("<specialist-instructions>").unwrap()
+                < prompt.find("<task-brief>").unwrap()
+        );
 
         let untooled = child_preamble(&delegation, false);
         assert!(!untooled.contains("task_complete"));

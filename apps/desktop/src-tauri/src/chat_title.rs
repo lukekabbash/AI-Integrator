@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     commands::{
-        AcpLaunchProfile, CommandError, CommandResult, acp_launch_arguments,
+        AcpLaunchProfile, CommandError, CommandResult, acp_launch_arguments_with_route,
         acp_launch_environment, apply_chat_codex_policy, authenticate_acp_provider,
         enforce_chat_acp_client_mode,
     },
@@ -433,7 +433,12 @@ async fn generate_acp_title(
     };
     let client = adapter_acp::AcpClient::spawn(AcpLaunchOptions {
         executable,
-        arguments: acp_launch_arguments(&provider, &profile)?,
+        arguments: acp_launch_arguments_with_route(
+            &provider,
+            &profile,
+            route.model(),
+            route.effort(),
+        )?,
         environment: acp_launch_environment(&provider, &profile),
         working_directory: Some(cwd.to_path_buf()),
         client_version: env!("CARGO_PKG_VERSION").into(),

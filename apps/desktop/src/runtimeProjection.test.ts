@@ -1485,6 +1485,49 @@ describe("runtime projection reducer", () => {
     parse.mockRestore();
   });
 
+  it("reuses exact transcript states across a bounded task-switch working set", () => {
+    const stateFor = (taskId: string) =>
+      hydrateRuntimeProjectionState(
+        taskId,
+        {
+          items: [
+            {
+              id: `${taskId}-message`,
+              providerItemId: `${taskId}-message`,
+              kind: "agentMessage",
+              status: "completed",
+              body: `Message for ${taskId}`,
+              truncated: false,
+              updatedAt: "2026-07-10T16:00:00Z",
+            },
+          ],
+          plan: [],
+          planTruncated: false,
+          approvals: [],
+          firstSeen: { [`${taskId}-message`]: "2026-07-10T16:00:00Z" },
+          hasMoreOlder: false,
+        },
+        1,
+        0,
+      );
+    const states = ["task-a", "task-b", "task-c", "task-d", "task-e"].map(stateFor);
+    const deriveTranscript = createRuntimeTranscriptDeriver();
+
+    const firstA = deriveTranscript(states[0]);
+    const firstB = deriveTranscript(states[1]);
+    expect(deriveTranscript(states[0])).toBe(firstA);
+
+    const changedA = { ...states[0], lastSeq: 2 };
+    expect(deriveTranscript(changedA)).not.toBe(firstA);
+    expect(deriveTranscript(changedA)).toEqual(runtimeTranscript(changedA));
+
+    deriveTranscript(states[2]);
+    deriveTranscript(states[3]);
+    deriveTranscript(states[4]);
+    expect(deriveTranscript(states[1])).not.toBe(firstB);
+    expect(deriveTranscript(states[1])).toEqual(runtimeTranscript(states[1]));
+  });
+
   it("frame-batches only in-progress assistant and reasoning projections", () => {
     expect(
       isFrameBatchableRuntimeProjection(

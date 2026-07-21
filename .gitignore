@@ -11,10 +11,17 @@ dist/
 # Rust / Tauri
 target/
 src-tauri/target/
-/temp/
-/tmp/
 *.profraw
 *.lcov
+
+# Local agent scratch — design prompts, optimization notes, mockups
+/tmp/
+/temp/
+
+# Local docs fluff — keep normative contracts tracked (see AGENTS.md / README)
+docs/runtime-e2e-log.md
+docs/research-and-design-principles.md
+docs/canonical-update-map.md
 
 # Local environment and credentials
 .env

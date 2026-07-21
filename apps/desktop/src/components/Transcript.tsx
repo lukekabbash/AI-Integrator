@@ -58,6 +58,7 @@ import {
   type TranscriptAnchor,
   type TranscriptViewportState,
 } from "./transcriptViewportState";
+import { createFirstEventIndex } from "./transcriptEventIndex";
 
 const FOLLOW_THRESHOLD_PX = 96;
 const VIRTUALIZATION_THRESHOLD = 250;
@@ -65,6 +66,7 @@ const MINIMUM_ROW_HEIGHT_PX = 26;
 const OVERSCAN_VIEWPORTS = 1.5;
 /** Max time the open-settle lock may suppress scroll-driven follow/pagination. */
 const OPEN_SETTLE_TIMEOUT_MS = 150;
+const COLLAPSED_SCHEDULING_COPY_HEIGHT_PX = 42;
 
 interface TranscriptProps {
   events: TranscriptEvent[];
@@ -542,13 +544,17 @@ const NoticeMessage = memo(function NoticeMessage({
 const SchedulingMessage = memo(function SchedulingMessage({
   event,
   onCancel,
+  onOpenFile,
 }: {
   event: TranscriptEvent;
   onCancel?: (automationId: string) => void;
+  onOpenFile?: (location: ProjectFileLocation) => void;
 }) {
   const scheduling = event.scheduling;
   const countdownAt = scheduling?.countdownAt;
+  const reduceMotion = useReducedMotion();
   const [now, setNow] = useState(Date.now);
+  const [expanded, setExpanded] = useState(false);
   useEffect(() => {
     const target = countdownAt ? Date.parse(countdownAt) : Number.NaN;
     if (!Number.isFinite(target) || target <= Date.now()) return;
@@ -572,6 +578,11 @@ const SchedulingMessage = memo(function SchedulingMessage({
         ? "Waking up now"
         : `Waking up in ${Math.floor(remainingSeconds / 60) > 0 ? `${Math.floor(remainingSeconds / 60)}m ` : ""}${remainingSeconds % 60}s`;
   const title = countdown ?? event.title;
+  const scheduledCopy = `${event.meta ?? ""}\n${event.body}`.trim();
+  const expandable = scheduledCopy.length > 120 || scheduledCopy.split(/\r?\n/).length > 3;
+  const toggleExpanded = () => {
+    if (expandable) setExpanded((current) => !current);
+  };
   const SchedulingIcon =
     scheduling.phase === "prompt"
       ? CirclePlay
@@ -590,12 +601,54 @@ const SchedulingMessage = memo(function SchedulingMessage({
       <span className="scheduling-message-icon-shell" aria-hidden="true">
         <SchedulingIcon className="scheduling-message-icon" />
       </span>
-      <div className="scheduling-message-copy">
-        <strong>{title}</strong>
-        {event.meta ? <small title={event.meta}>{event.meta}</small> : null}
-        <p className={prompt ? "scheduling-message-prompt" : undefined} title={event.body}>
-          {event.body}
-        </p>
+      <div
+        className="scheduling-message-copy"
+        data-expandable={expandable || undefined}
+        role={expandable ? "button" : undefined}
+        tabIndex={expandable ? 0 : undefined}
+        aria-expanded={expandable ? expanded : undefined}
+        aria-label={
+          expandable ? `${expanded ? "Collapse" : "Expand"} scheduled task details` : undefined
+        }
+        onClick={(clickEvent) => {
+          if ((clickEvent.target as HTMLElement).closest("a, button")) return;
+          toggleExpanded();
+        }}
+        onKeyDown={(keyboardEvent) => {
+          if (!expandable || (keyboardEvent.key !== "Enter" && keyboardEvent.key !== " ")) return;
+          keyboardEvent.preventDefault();
+          toggleExpanded();
+        }}
+      >
+        <span className="scheduling-message-heading">
+          <strong>{title}</strong>
+          {expandable ? (
+            <ChevronDown
+              className={`scheduling-message-disclosure${expanded ? " scheduling-message-disclosure--open" : ""}`}
+              aria-hidden="true"
+            />
+          ) : null}
+        </span>
+        <motion.div
+          className="scheduling-message-details"
+          data-collapsed={expandable && !expanded ? "true" : undefined}
+          initial={false}
+          animate={{
+            height: expandable && !expanded ? COLLAPSED_SCHEDULING_COPY_HEIGHT_PX : "auto",
+          }}
+          transition={reduceMotion ? { duration: 0 } : { duration: 0.18, ease: "easeOut" }}
+        >
+          {event.meta ? (
+            <div className="scheduling-message-markdown scheduling-message-meta">
+              <MarkdownBody body={event.meta} onOpenFile={onOpenFile} />
+            </div>
+          ) : null}
+          <div
+            className={`scheduling-message-markdown scheduling-message-body${prompt ? " scheduling-message-prompt" : ""}`}
+          >
+            <MarkdownBody body={event.body} onOpenFile={onOpenFile} />
+          </div>
+        </motion.div>
       </div>
       {scheduling.canCancel && onCancel ? (
         <button type="button" onClick={() => onCancel(scheduling.automationId)}>
@@ -1078,6 +1131,7 @@ export function Transcript({
     () => findTurnFinalAssistantIds(events, renderedEventCount),
     [events, renderedEventCount],
   );
+  const firstEventIndex = useMemo(() => createFirstEventIndex(events), [events]);
   const currentActivity = liveActivity
     ? findActivityLeaf(liveActivity)
     : running
@@ -1721,7 +1775,13 @@ export function Transcript({
 
   const renderTranscriptEvent = (event: TranscriptEvent) => {
     if (event.scheduling) {
-      return <SchedulingMessage event={event} onCancel={onCancelScheduledTask} />;
+      return (
+        <SchedulingMessage
+          event={event}
+          onCancel={onCancelScheduledTask}
+          onOpenFile={onOpenFile ? openFile : undefined}
+        />
+      );
     }
     if (event.kind === "user") {
       return (
@@ -1743,10 +1803,8 @@ export function Transcript({
     if (event.kind === "assistant") {
       const isLatestAssistant = event.id === lastAssistantId;
       const isTurnFinal = turnFinalAssistantIds.has(event.id);
-      const openTurnIndex = latestUserId
-        ? events.findIndex((candidate) => candidate.id === latestUserId)
-        : -1;
-      const assistantIndex = events.findIndex((candidate) => candidate.id === event.id);
+      const openTurnIndex = latestUserId ? firstEventIndex(latestUserId) : -1;
+      const assistantIndex = firstEventIndex(event.id);
       const inOpenTurn = openTurnIndex < 0 ? true : assistantIndex > openTurnIndex;
       // Live tip of the open turn — Branch/Regenerate stay withheld until settle
       // even when phase marks the text as the final answer (so it can stream

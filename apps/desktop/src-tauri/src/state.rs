@@ -19,7 +19,7 @@ use integrator_runtime::{
 };
 use portable_pty::{ChildKiller, MasterPty};
 use session_store::LocalStore;
-use tokio::sync::{Mutex, Notify, broadcast};
+use tokio::sync::{Mutex, Notify, broadcast, watch};
 use zeroize::Zeroizing;
 
 use crate::repository_watch::{RepositoryWatchRegistry, RepositoryWatcher};
@@ -80,6 +80,10 @@ pub struct AcpRuntime {
     /// Provider identity is retained alongside the shared ACP transport so
     /// bindings, diagnostics, and cancellation never silently assume Cursor.
     pub provider: ProviderKind,
+    /// Model/effort fixed at process launch for ACP agents such as Grok that
+    /// expose routing as CLI flags instead of session config options.
+    pub launch_model: Option<String>,
+    pub launch_effort: Option<String>,
     pub process_id: String,
     pub alive: Arc<AtomicBool>,
     pub binding: Arc<std::sync::Mutex<Option<RuntimeBinding>>>,
@@ -318,6 +322,63 @@ fn reusable_provider_statuses(
     if force { None } else { cached.clone() }
 }
 
+struct CodexUsageRefreshState {
+    running: bool,
+    generation: u64,
+}
+
+struct CodexUsageRefreshFlight {
+    state: std::sync::Mutex<CodexUsageRefreshState>,
+    completed: watch::Sender<u64>,
+}
+
+impl CodexUsageRefreshFlight {
+    fn new() -> Self {
+        let (completed, _) = watch::channel(0);
+        Self {
+            state: std::sync::Mutex::new(CodexUsageRefreshState {
+                running: false,
+                generation: 0,
+            }),
+            completed,
+        }
+    }
+
+    async fn join_or_lead(&self) -> Option<CodexUsageRefreshGuard<'_>> {
+        let mut completed = self.completed.subscribe();
+        let generation = {
+            let mut state = self.state.lock().expect("Codex usage refresh lock");
+            if !state.running {
+                state.running = true;
+                return Some(CodexUsageRefreshGuard { flight: self });
+            }
+            state.generation
+        };
+        while *completed.borrow() == generation {
+            if completed.changed().await.is_err() {
+                break;
+            }
+        }
+        None
+    }
+}
+
+pub struct CodexUsageRefreshGuard<'a> {
+    flight: &'a CodexUsageRefreshFlight,
+}
+
+impl Drop for CodexUsageRefreshGuard<'_> {
+    fn drop(&mut self) {
+        let generation = {
+            let mut state = self.flight.state.lock().expect("Codex usage refresh lock");
+            state.running = false;
+            state.generation = state.generation.wrapping_add(1);
+            state.generation
+        };
+        self.flight.completed.send_replace(generation);
+    }
+}
+
 pub struct AppState {
     pub store: Arc<LocalStore>,
     pub data_directory: PathBuf,
@@ -336,6 +397,7 @@ pub struct AppState {
     /// Unbound helper used only for provider-wide discovery such as model
     /// catalogs. It never owns a task turn.
     pub codex_catalog: Mutex<Option<CodexRuntime>>,
+    codex_usage_refresh: CodexUsageRefreshFlight,
     pub acp: Mutex<HashMap<TaskId, AcpRuntime>>,
     /// ACP discovery helpers are provider-keyed because Cursor and Grok use
     /// different local processes even before a task session exists.
@@ -393,6 +455,7 @@ impl AppState {
             )),
             codex: Mutex::new(HashMap::new()),
             codex_catalog: Mutex::new(None),
+            codex_usage_refresh: CodexUsageRefreshFlight::new(),
             acp: Mutex::new(HashMap::new()),
             acp_catalog: Mutex::new(HashMap::new()),
             structured: Mutex::new(HashMap::new()),
@@ -419,6 +482,10 @@ impl AppState {
             .lock()
             .expect("turn launch lock")
             .contains(&task_id)
+    }
+
+    pub async fn begin_codex_usage_refresh(&self) -> Option<CodexUsageRefreshGuard<'_>> {
+        self.codex_usage_refresh.join_or_lead().await
     }
 
     pub fn cached_skill_credential(&self, id: &str) -> Result<Option<Zeroizing<String>>> {
@@ -461,11 +528,17 @@ impl AppState {
 #[cfg(test)]
 mod task_runtime_registry_fixtures {
     use super::{
-        NativeSecretCache, remove_task_runtime, replace_task_runtime, reserve_turn_launch,
-        reusable_provider_statuses,
+        CodexUsageRefreshFlight, NativeSecretCache, remove_task_runtime, replace_task_runtime,
+        reserve_turn_launch, reusable_provider_statuses,
     };
     use integrator_core::TaskId;
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
     use zeroize::Zeroizing;
 
     #[test]
@@ -570,5 +643,35 @@ mod task_runtime_registry_fixtures {
         assert_eq!(reusable_provider_statuses(&cached, false), Some(Vec::new()));
         assert_eq!(reusable_provider_statuses(&cached, true), None);
         assert_eq!(reusable_provider_statuses(&None, false), None);
+    }
+
+    #[tokio::test]
+    async fn concurrent_codex_usage_refreshes_share_one_flight() {
+        let flight = Arc::new(CodexUsageRefreshFlight::new());
+        let barrier = Arc::new(tokio::sync::Barrier::new(20));
+        let leaders = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..20 {
+            let flight = Arc::clone(&flight);
+            let barrier = Arc::clone(&barrier);
+            let leaders = Arc::clone(&leaders);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                if let Some(_guard) = flight.join_or_lead().await {
+                    leaders.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.expect("join usage refresh caller");
+        }
+        assert_eq!(leaders.load(Ordering::Relaxed), 1);
+
+        let next = flight
+            .join_or_lead()
+            .await
+            .expect("a completed flight must not become a freshness cache");
+        drop(next);
     }
 }

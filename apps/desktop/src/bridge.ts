@@ -1810,7 +1810,7 @@ const FALLBACK_MODELS: Partial<Record<RuntimeId, string[]>> = {
   // These are a degraded fallback only. A successfully negotiated Cursor ACP
   // catalog replaces them with the models available to the signed-in account.
   cursor: ["composer-2.5", "cursor-small", "deepseek-v3.1", "deepseek-r1", "auto"],
-  grok: ["grok-4.5", "grok-build-0.1"],
+  grok: ["grok-4.5"],
   // Kimi replaces this with the account's negotiated ACP catalog on first use.
   kimi: ["kimi-code/k3", "kimi-code/kimi-for-coding", "kimi-code/kimi-for-coding-highspeed"],
   custom: [],
@@ -3070,14 +3070,27 @@ async function ensureStandardAcpSessionUnlocked(
   const nativeTaskId = await ensureNativeTask(input.taskId);
   const cwd = repositoryForTask(input.taskId);
   const state = standardAcpState[runtime];
+  const launchSelection =
+    runtime === "grok"
+      ? { model: realModelId(input.model), effort: input.effort }
+      : undefined;
+  const appliedSelection = state.selections.get(nativeTaskId);
+  const routingChanged = Boolean(
+    launchSelection &&
+      state.connections.has(nativeTaskId) &&
+      (appliedSelection?.model !== launchSelection.model ||
+        appliedSelection?.effort !== launchSelection.effort),
+  );
   if (
     !state.connections.has(nativeTaskId) ||
-    activeAcpProviderByTask.get(nativeTaskId) !== runtime
+    activeAcpProviderByTask.get(nativeTaskId) !== runtime ||
+    routingChanged
   ) {
     await nativeInvoke("acp_connect", {
       provider: runtime,
       workingDirectory: cwd,
       taskId: nativeTaskId,
+      ...(launchSelection ?? {}),
     });
     await certifyAcpSession(nativeTaskId, runtime);
     resetCursorConnectionState(nativeTaskId);
@@ -3087,6 +3100,7 @@ async function ensureStandardAcpSessionUnlocked(
     state.connections.add(nativeTaskId);
     activeAcpProviderByTask.set(nativeTaskId, runtime);
     state.sessions.delete(nativeTaskId);
+    if (launchSelection) state.selections.set(nativeTaskId, launchSelection);
   }
   if (
     !state.sessions.has(nativeTaskId) ||
@@ -3133,7 +3147,8 @@ async function ensureStandardAcpSessionUnlocked(
     }
     state.sessions.add(nativeTaskId);
     state.delegations.set(nativeTaskId, input.delegation);
-    state.selections.delete(nativeTaskId);
+    if (launchSelection) state.selections.set(nativeTaskId, launchSelection);
+    else state.selections.delete(nativeTaskId);
     if (runtime === "kimi") updateKimiCatalog(session);
   }
   return nativeTaskId;
@@ -3312,6 +3327,22 @@ const DEMO_EFFORTS: ModelEffortOption[] = [
   { id: "high", label: "High" },
 ];
 
+const GROK_4_5_EFFORTS: ModelEffortOption[] = [
+  { id: "low", label: "Low" },
+  { id: "medium", label: "Medium" },
+  { id: "high", label: "High" },
+];
+
+function grokCatalog(ids: string[]): ModelCatalogEntry[] {
+  return ids.map((id) => ({
+    id,
+    label: resolveModelLabel(id),
+    ...(id === "grok-4.5"
+      ? { efforts: GROK_4_5_EFFORTS, defaultEffort: "high" }
+      : {}),
+  }));
+}
+
 async function discoverModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]> {
   // Curated catalog in every mode: agy exposes no programmatic model list.
   if (runtime === "antigravity") return ANTIGRAVITY_CATALOG;
@@ -3328,6 +3359,15 @@ async function discoverModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEnt
       if (catalog.length > 0) return catalog;
     } catch {
       // Codex unavailable right now; fall through to the static catalog.
+    }
+  }
+  if (isTauri() && runtime === "grok") {
+    try {
+      const models = await nativeInvoke<string[]>("grok_list_models");
+      if (models.length > 0) return grokCatalog(models);
+    } catch {
+      // Grok unavailable or offline; retain only the current known model as a
+      // degraded fallback instead of inventing stale provider choices.
     }
   }
   if (isTauri() && runtime === "cursor") {
@@ -3383,6 +3423,7 @@ async function discoverModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEnt
   if (!isTauri()) {
     const demoModels = readDemoSnapshot().runtimes.find((item) => item.id === runtime)?.models;
     if (demoModels?.length) {
+      if (runtime === "grok") return grokCatalog(demoModels);
       return demoModels.map((id) => {
         const label = resolveModelLabel(id);
         if (runtime === "claude") {
@@ -3402,6 +3443,7 @@ async function discoverModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEnt
       defaultEffort: CLAUDE_DEFAULT_EFFORT,
     }));
   }
+  if (runtime === "grok") return grokCatalog(FALLBACK_MODELS.grok ?? []);
   return toCatalogEntries(FALLBACK_MODELS[runtime] ?? []);
 }
 
@@ -4196,7 +4238,21 @@ export const bridge: AppBridge = {
   removeProject: async (projectId, options) => {
     const deleteFiles = Boolean(options?.deleteFiles);
     if (isTauri()) {
-      await nativeInvoke("project_remove", { projectId, deleteFiles });
+      const project =
+        nativeProjectById.get(projectId) ??
+        cachedWorkspace?.projects.find((item) => item.id === projectId);
+      if (!project) throw new Error(`Project ${projectId} was not found.`);
+
+      // Older tasks can outlive their trusted-project row. They still hydrate
+      // into the sidebar by repository path, but their display-only project ID
+      // is not a UUID. The native fallback accepts that exact stored path for
+      // Integrator-history deletion only; disk deletion remains UUID-gated.
+      const nativeProjectId = nativeProjectById.has(projectId) ? projectId : undefined;
+      await nativeInvoke("project_remove", {
+        projectId: nativeProjectId,
+        repositoryPath: nativeProjectId ? undefined : project.path,
+        deleteFiles,
+      });
       nativeProjectById.delete(projectId);
       repositoryByProjectId.delete(projectId);
       if (cachedWorkspace) {
@@ -5650,6 +5706,17 @@ export const bridge: AppBridge = {
   updateTaskRouting: async (taskId, input) => {
     if (isTauri()) {
       const nativeTaskId = await ensureNativeTask(taskId);
+      const existingRoute = (cachedWorkspace ?? readDemoSnapshot()).tasks.find(
+        (task) => task.id === taskId,
+      );
+      if (
+        input.runtime === "grok" &&
+        (existingRoute?.runtime !== input.runtime ||
+          existingRoute.model !== input.model ||
+          existingRoute.effort !== input.effort)
+      ) {
+        resetStandardAcpConnectionState("grok", nativeTaskId);
+      }
       const task = await nativeInvoke<NativeTask>("task_update_routing", {
         taskId: nativeTaskId,
         input: {

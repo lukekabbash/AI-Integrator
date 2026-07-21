@@ -23,6 +23,11 @@ const GUIDANCE_MAX_CHARS: usize = 64 * 1024;
 const MAX_CAPABILITIES: usize = 128;
 const MAX_MODELS_PER_RUNTIME: usize = 128;
 const MODEL_VALUE_MAX_CHARS: usize = 240;
+const SPECIALIST_AUTO_ASSIGN_BLOCKED_MCPS: &[&str] = &["robinhood-trading"];
+
+fn mcp_is_auto_assignable(name: &str) -> bool {
+    !SPECIALIST_AUTO_ASSIGN_BLOCKED_MCPS.contains(&name)
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -166,10 +171,17 @@ pub async fn specialist_generate(
             })
         })
         .collect::<Vec<_>>();
-    let mcp_catalog = mcps
+    let auto_assignable_mcps = mcps
         .servers
         .iter()
         .filter(|server| server.enabled)
+        .filter(|server| mcp_is_auto_assignable(&server.name))
+        .map(|server| server.name.clone())
+        .collect::<HashSet<_>>();
+    let mcp_catalog = mcps
+        .servers
+        .iter()
+        .filter(|server| auto_assignable_mcps.contains(&server.name))
         .take(MAX_CAPABILITIES)
         .map(|server| {
             json!({
@@ -210,12 +222,7 @@ pub async fn specialist_generate(
                         .iter()
                         .map(|skill| skill.name.clone())
                         .collect(),
-                    &mcps
-                        .servers
-                        .iter()
-                        .filter(|server| server.enabled)
-                        .map(|server| server.name.clone())
-                        .collect(),
+                    &auto_assignable_mcps,
                 );
             }
             Err(error) if is_worth_failing_over(error.code) => last_error = Some(error),
@@ -511,6 +518,12 @@ mod tests {
         );
         assert!(profile.service_levels[1].enabled);
         assert!(!profile.service_levels[0].enabled);
+    }
+
+    #[test]
+    fn financial_trading_mcp_is_never_eligible_for_generated_specialists() {
+        assert!(!mcp_is_auto_assignable("robinhood-trading"));
+        assert!(mcp_is_auto_assignable("github"));
     }
 
     #[test]

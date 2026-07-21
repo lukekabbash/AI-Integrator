@@ -316,6 +316,53 @@ describe("Transcript", () => {
     expect(onCancelScheduledTask).toHaveBeenCalledWith("automation-1");
   });
 
+  it("renders scheduled task Markdown in a compact expandable block", () => {
+    render(
+      <Transcript
+        events={[
+          {
+            ...event(
+              "scheduled-markdown",
+              "activity",
+              "Review **new evidence**.\n\n- Compare the baseline\n- Record `dead ends`.",
+            ),
+            title: "Scheduled task started",
+            meta: "Review the **brief**",
+            scheduling: {
+              automationId: "automation-1",
+              phase: "prompt",
+            },
+          },
+        ]}
+      />,
+    );
+
+    const message = screen.getByLabelText("Scheduled task started");
+    expect(within(message).getByText("brief").tagName).toBe("STRONG");
+    expect(within(message).getByText("new evidence").tagName).toBe("STRONG");
+    expect(within(message).getByText("Compare the baseline").closest("li")).not.toBeNull();
+    expect(within(message).getByText("dead ends").tagName).toBe("CODE");
+
+    const toggle = within(message).getByRole("button", {
+      name: "Expand scheduled task details",
+    });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(message.querySelector(".scheduling-message-details")).toHaveAttribute(
+      "data-collapsed",
+      "true",
+    );
+    expect(message.querySelector("[title]")).toBeNull();
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(message.querySelector(".scheduling-message-details")).not.toHaveAttribute(
+      "data-collapsed",
+    );
+
+    fireEvent.keyDown(toggle, { key: "Enter" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+  });
+
   it("counts down a fixed near-term wakeup in place", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-19T16:00:00Z"));

@@ -251,6 +251,43 @@ describe("RightRail", () => {
     expect(screen.getByRole("tab", { name: /^Git/ })).toBeInTheDocument();
   });
 
+  it("keeps delegation brief Markdown in the delayed tooltip", () => {
+    vi.useFakeTimers();
+    const brief = "Review **new evidence**.\n\n- Compare the baseline\n- Record `dead ends`.";
+    const delegation: DelegationView = {
+      id: "delegation-markdown",
+      parentTaskId: "task-root",
+      childTaskId: "task-child",
+      profileId: "codex-default",
+      profileLabel: "Codex builder",
+      runtime: "codex",
+      model: "gpt-5.6-codex",
+      title: "Audit the constraint",
+      brief,
+      status: "running",
+      createdAt: "2026-07-20T12:00:00Z",
+      updatedAt: "2026-07-20T12:00:00Z",
+      unreadFromChild: 0,
+      pendingQuestions: [],
+    };
+
+    try {
+      setup({ delegations: [delegation] });
+      fireEvent.click(screen.getByRole("tab", { name: /Agents/ }));
+      const activity = document.querySelector<HTMLElement>(".agent-activity");
+      expect(activity).toHaveAttribute("title", brief);
+      fireEvent.mouseEnter(activity!);
+      act(() => vi.advanceTimersByTime(420));
+
+      const tooltip = screen.getByRole("tooltip");
+      expect(within(tooltip).getByText("new evidence").tagName).toBe("STRONG");
+      expect(within(tooltip).getByText("Compare the baseline").closest("li")).not.toBeNull();
+      expect(within(tooltip).getByText("dead ends").tagName).toBe("CODE");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("gives concurrent agents stable provider-colored glyphs and opens transcripts from the row", () => {
     const statuses: DelegationView["status"][] = [
       "starting",

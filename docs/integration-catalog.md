@@ -142,7 +142,12 @@ from generic prompt shortcuts:
   prose while claiming native execution.
 - Grok uses `grok --no-auto-update agent stdio`; before `session/new`, the ACP
   adapter may select only the provider-advertised `cached_token` auth method.
-  It never reads, accepts, or proxies an xAI API key.
+  It never reads, accepts, or proxies an xAI API key. Current Grok Build ACP
+  initialization does not advertise mutable model or thought-level config
+  options, so Integrator discovers model ids with the documented `grok models`
+  probe and applies model/effort through process-launch flags. Changing either
+  route starts a fresh Grok process and resumes the bound provider session
+  through ACP instead of pretending an in-place config update succeeded.
 
 Catalog metadata is untrusted and bounded. Refresh replaces old opaque ids,
 and execution revalidates the selected action against the same canonical
@@ -433,7 +438,7 @@ negotiated catalog and preserve provider IDs exactly:
 |---|---|---|---|
 | Codex | GPT-family models, including the model IDs returned by the current Codex build | Local app-server `model/list`; pass the selected `model` and advertised `reasoningEffort` to `thread/start` or the documented turn override | Store/render `reasoning.summary`; never persist raw `reasoning.content` as a handoff or audit payload |
 | Cursor Agent | Composer 2.5, frontier-provider models, and account-visible open-weight models | ACP `session/new` `configOptions`; `session/set_config_option`; `agent models` only as a structured fallback | Use provider-advertised `thought_level` options; do not infer effort suffixes from model names |
-| Grok Build | `grok-4.5` and the Grok Build model exposed by the installed CLI | `grok agent stdio` ACP; CLI `grok models`, `--model`, and `--effort` for fallback/probing | Preserve the ACP capability/effort contract; never infer subscription quota or expose hidden reasoning |
+| Grok Build | `grok-4.5` and models returned by the installed CLI | `grok models` for live ids; `--model` and `--reasoning-effort` before `grok agent stdio`; reconnect when the route changes because current ACP does not advertise mutable routing config | Expose `low`, `medium`, and `high` only for the currently verified `grok-4.5`; leave future models without an effort picker until their capability is documented or advertised; never infer subscription quota or expose hidden reasoning |
 | Claude Code | `claude-opus-4-8`, `claude-fable-5`, `claude-sonnet-5`, and `claude-haiku-4-5` where the user's Claude Code surface exposes them | User-owned `claude -p` structured CLI; `--model` plus Claude Code's `/effort` control; no AI Integrator account/login path | Do not store raw `thinking`/hidden chain-of-thought events; only retain provider-labeled summaries or observable final/tool activity |
 | Gemini CLI | Account/config-visible Gemini models | `gemini --acp` (or the installed CLI's current ACP flag); ACP config options when advertised | Treat thought events as provider content and apply the same raw-thought boundary |
 

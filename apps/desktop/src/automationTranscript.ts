@@ -105,6 +105,8 @@ export function mergeSchedulingTranscript(
   events: TranscriptEvent[],
   timeline: AutomationTimelineEntry[],
 ): TranscriptEvent[] {
+  if (timeline.length === 0) return events;
+
   const scheduled: TranscriptEvent[] = [];
   const replacements = new Map<string, TranscriptEvent>();
   const usedPrompts = new Set<string>();

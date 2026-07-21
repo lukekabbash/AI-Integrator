@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { CURATED_MCP_SERVERS, mcpLaunchPreview, parseMcpForm } from "./mcpSettings";
+import {
+  CURATED_MCP_SERVERS,
+  mcpActivationWarning,
+  mcpLaunchPreview,
+  parseMcpForm,
+} from "./mcpSettings";
 
 describe("parseMcpForm", () => {
   it("builds a stdio config with split args and env lines", () => {
@@ -86,5 +91,20 @@ describe("curated MCP authentication", () => {
     expect(
       CURATED_MCP_SERVERS.find((server) => server.name === "cloudflare-docs")?.config.auth,
     ).toBeUndefined();
+  });
+
+  it("pins Robinhood's official OAuth endpoint and trading disclosure", () => {
+    expect(CURATED_MCP_SERVERS.find((server) => server.name === "robinhood-trading")).toMatchObject(
+      {
+        label: "Robinhood Trading",
+        icon: "robinhood",
+        config: { url: "https://agent.robinhood.com/mcp/trading", auth: "oauth" },
+      },
+    );
+    expect(mcpActivationWarning("robinhood-trading")).toMatchObject({
+      confirmLabel: "Enable Robinhood Trading",
+      activeLabel: "Real trading enabled",
+    });
+    expect(mcpActivationWarning("figma")).toBeUndefined();
   });
 });

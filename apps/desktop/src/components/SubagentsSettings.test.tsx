@@ -214,6 +214,7 @@ describe("Subagents settings", () => {
   it("creates a complete generated specialist in the disabled state", async () => {
     const setSetting = renderSettings();
 
+    fireEvent.click(screen.getByRole("button", { name: "Generate" }));
     fireEvent.change(screen.getByLabelText("Describe a specialist"), {
       target: { value: "A security reviewer with design and Figma context." },
     });

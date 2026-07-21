@@ -54,6 +54,41 @@ export interface CuratedMcpServer {
   config: IntegratorMcpConfig;
 }
 
+export interface McpActivationWarning {
+  title: string;
+  introduction: string;
+  disclosures: Array<{ title: string; detail: string }>;
+  note: string;
+  confirmLabel: string;
+  activeLabel: string;
+}
+
+const MCP_ACTIVATION_WARNINGS: Record<string, McpActivationWarning> = {
+  "robinhood-trading": {
+    title: "Enable Robinhood Trading?",
+    introduction: "This is a real brokerage connection, not a market-data demo.",
+    disclosures: [
+      {
+        title: "Financial data across your accounts",
+        detail:
+          "Your agent can read Robinhood account numbers, balances, positions, transactions, and order history.",
+      },
+      {
+        title: "Real order authority",
+        detail:
+          "Your agent can place and cancel real equity and options orders in your dedicated Agentic account.",
+      },
+    ],
+    note: "Robinhood confines trading to the dedicated Agentic account. Disconnect or disable this connector at any time to remove future access.",
+    confirmLabel: "Enable Robinhood Trading",
+    activeLabel: "Real trading enabled",
+  },
+};
+
+export function mcpActivationWarning(name: string): McpActivationWarning | undefined {
+  return MCP_ACTIVATION_WARNINGS[name];
+}
+
 export const CURATED_MCP_SERVERS: CuratedMcpServer[] = [
   {
     name: "playwright",
@@ -93,6 +128,14 @@ export const CURATED_MCP_SERVERS: CuratedMcpServer[] = [
       "Stripe's official remote server — payments, customers, and test data. Signs in on first use.",
     icon: "stripe",
     config: { url: "https://mcp.stripe.com", auth: "oauth" },
+  },
+  {
+    name: "robinhood-trading",
+    label: "Robinhood Trading",
+    description:
+      "Robinhood's official Agentic Trading connector — portfolio research and real equity or options orders in a dedicated account.",
+    icon: "robinhood",
+    config: { url: "https://agent.robinhood.com/mcp/trading", auth: "oauth" },
   },
   {
     name: "cloudflare-docs",

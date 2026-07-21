@@ -59,6 +59,7 @@ fn known_oauth_server(url: &str) -> bool {
             | "https://mcp.linear.app/mcp"
             | "https://mcp.figma.com/mcp"
             | "https://mcp.sentry.dev/mcp"
+            | "https://agent.robinhood.com/mcp/trading"
     )
 }
 
@@ -1076,6 +1077,12 @@ mod tests {
         ));
         assert!(matches!(
             parse_transport(&serde_json::json!({ "url": "https://mcp.figma.com/mcp" })),
+            Ok(McpTransport::Remote { oauth: true, .. })
+        ));
+        assert!(matches!(
+            parse_transport(
+                &serde_json::json!({ "url": "https://agent.robinhood.com/mcp/trading" })
+            ),
             Ok(McpTransport::Remote { oauth: true, .. })
         ));
         assert!(matches!(

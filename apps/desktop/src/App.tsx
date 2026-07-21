@@ -102,6 +102,7 @@ import {
   type ThemePreferences,
 } from "./theme";
 import { Composer } from "./components/Composer";
+import { ChatWelcome } from "./components/ChatWelcome";
 import { DeleteChatModal } from "./components/DeleteChatModal";
 import { DeleteArchivedChatsModal } from "./components/DeleteArchivedChatsModal";
 import { DeleteProjectModal, type DeleteProjectScope } from "./components/DeleteProjectModal";
@@ -118,6 +119,7 @@ import { decorateCommitMessage, readGitDecorationSettings, readPushForce } from 
 import { TitlebarFileTabs } from "./components/TitlebarFileTabs";
 import { resolveRequestedFile, type ProjectFileLocation } from "./components/fileViewSupport";
 import { TaskStatusPill } from "./components/TaskStatusPill";
+import { SubagentProjectionCache } from "./components/subagentProjectionCache";
 import { QueuedMessages } from "./components/QueuedMessages";
 import { formatCompactTokenCount } from "./components/conversationFormatting";
 import { ResizeHandle } from "./components/ResizeHandle";
@@ -1145,6 +1147,15 @@ function EmptyTaskState({ project }: { project: ProjectSummary }) {
   );
 }
 
+function isPendingGeneralChat(task: TaskSummary): boolean {
+  return (
+    task.kind === "chat" &&
+    !task.archived &&
+    task.status === "draft" &&
+    task.title === GENERAL_CHAT_TITLE_PLACEHOLDER
+  );
+}
+
 /**
  * Grace period before a non-connected notice becomes visible. New tasks pass
  * through reconciling/connecting for a few hundred milliseconds while the
@@ -1490,6 +1501,7 @@ export default function App() {
     setOptimisticUserMessage((current) => clearOptimisticMessageForTask(current, taskId));
   }, []);
   const [freshTaskIds, setFreshTaskIds] = useState<ReadonlySet<string>>(() => new Set());
+  const pendingGeneralChatRef = useRef<TaskSummary | undefined>(undefined);
   const [composerDraftStore] = useState(() => new ComposerDraftStore());
   const draftPersistenceFailureShown = useRef(false);
   const pendingDraftWrites = useRef(new Map<string, ComposerDraft>());
@@ -1622,6 +1634,7 @@ export default function App() {
   const projectionGeneration = useRef(0);
   const navigationGeneration = useRef(0);
   const taskProjectionCache = useRef(new Map<string, RuntimeProjectionState>());
+  const [subagentProjectionCache] = useState(() => new SubagentProjectionCache());
   const activeTaskIdRef = useRef<string | undefined>(snapshot.activeTaskId);
   const activeProjectIdRef = useRef<string | undefined>(snapshot.activeProjectId);
   const taskRuntimeByIdRef = useRef(
@@ -1855,11 +1868,7 @@ export default function App() {
         if (loaded.cacheMatched) {
           // Watermark + reset epoch match: keep cached display state. Still
           // merge buffered live events and apply runtimeLive settlement below.
-          next = {
-            ...displayState,
-            lastSeq: Math.max(displayState.lastSeq, loaded.watermarkSeq),
-            resetSeq: loaded.resetSeq,
-          };
+          next = displayState;
         } else {
           const hydrate = loaded.hydrate ?? {
             items: [],
@@ -2509,9 +2518,15 @@ export default function App() {
   const activeProjectionUnavailable =
     nativeHost && Boolean(activeTask) && readyProjectionTaskId !== activeTask?.id;
   const rootTasks = useMemo(
-    () => snapshot.tasks.filter((task) => !task.parentId && !task.archived),
+    () =>
+      snapshot.tasks.filter(
+        (task) => !task.parentId && !task.archived && !isPendingGeneralChat(task),
+      ),
     [snapshot.tasks],
   );
+  useEffect(() => {
+    pendingGeneralChatRef.current = snapshot.tasks.find(isPendingGeneralChat);
+  }, [snapshot.tasks]);
   const sidebarTasks = useMemo(
     () => [...rootTasks, ...archivedTasks.filter((task) => !task.parentId)],
     [archivedTasks, rootTasks],
@@ -2749,11 +2764,12 @@ export default function App() {
   const selectedDelegation = delegations.find(
     (delegation) => delegation.id === selectedDelegationId && delegation.childTaskId,
   );
+  const subagentOpen = Boolean(selectedDelegation);
 
   useLayoutEffect(() => {
     const root = appRootRef.current;
     const pane = subagentPaneRef.current;
-    if (!root || !pane || !selectedDelegation) return;
+    if (!root || !pane || !subagentOpen) return;
 
     const alignHeader = () => {
       const rootRect = root.getBoundingClientRect();
@@ -2778,7 +2794,7 @@ export default function App() {
       delete root.dataset.subagentLayoutReady;
       root.style.removeProperty("--subagent-pane-left");
     };
-  }, [selectedDelegation, subagentPaneRatio]);
+  }, [subagentOpen, subagentPaneRatio]);
   const titleContext =
     screen === "settings"
       ? "Settings"
@@ -3183,6 +3199,17 @@ export default function App() {
 
   const newTask = async (projectId?: string) => {
     if (!projectId) {
+      const pendingChat =
+        pendingGeneralChatRef.current ?? snapshot.tasks.find(isPendingGeneralChat);
+      if (pendingChat) {
+        setScreen("workspace");
+        if (activeTaskIdRef.current !== pendingChat.id) await selectTask(pendingChat.id);
+        window.setTimeout(
+          () => document.querySelector<HTMLTextAreaElement>(".composer textarea")?.focus(),
+          0,
+        );
+        return;
+      }
       if (creatingTask) return;
       setCreatingTask(true);
       setOperationError("");
@@ -3327,6 +3354,9 @@ export default function App() {
           : task,
       ),
     }));
+    if (isChat && targetTask.status === "draft") {
+      await bridge.setTaskStatus?.(targetTask.id, "starting").catch(() => undefined);
+    }
     if (nativeHost && !options?.resumeInterrupted) {
       setOptimisticUserMessage({
         taskId: targetTask.id,
@@ -4107,6 +4137,14 @@ export default function App() {
     setSettingsSection(section);
     setScreen("settings");
   }, []);
+  const handleSidebarOpenCapabilities = useCallback(
+    () => handleSidebarOpenSettingsSection("skills"),
+    [handleSidebarOpenSettingsSection],
+  );
+  const handleSidebarOpenSubagents = useCallback(
+    () => handleSidebarOpenSettingsSection("subagents"),
+    [handleSidebarOpenSettingsSection],
+  );
   const handleSidebarOpenScheduled = useCallback(() => {
     setScheduledRailOpen(false);
     setScreen("scheduled");
@@ -5883,8 +5921,8 @@ export default function App() {
         onDeleteArchivedChats={handleSidebarDeleteArchivedChats}
         onOpenSettings={handleSidebarOpenSettings}
         onOpenScheduled={handleSidebarOpenScheduled}
-        onOpenCapabilities={() => handleSidebarOpenSettingsSection("skills")}
-        onOpenSubagents={() => handleSidebarOpenSettingsSection("subagents")}
+        onOpenCapabilities={handleSidebarOpenCapabilities}
+        onOpenSubagents={handleSidebarOpenSubagents}
         activeDestination={activeDestination}
         onResize={handleSidebarResize}
         sidebarMenuDirection={preferences.sidebarMenuDirection}
@@ -6308,7 +6346,15 @@ export default function App() {
                                     showDisconnected={nativeTurnActive || optimisticTurnStarting}
                                   />
                                 ) : null}
-                                {activeTask ? (
+                                {activeTask && isPendingGeneralChat(activeTask) ? (
+                                  <ChatWelcome
+                                    name={
+                                      typeof localSettings["personalization.name"] === "string"
+                                        ? localSettings["personalization.name"]
+                                        : ""
+                                    }
+                                  />
+                                ) : activeTask ? (
                                   <Suspense
                                     fallback={
                                       <div
@@ -6673,7 +6719,6 @@ export default function App() {
                           <motion.div
                             ref={subagentPaneRef}
                             className="subagent-workspace-pane"
-                            key={selectedDelegation.id}
                             style={{ width: `${subagentPaneRatio * 100}%` }}
                             initial={{ opacity: 0 }}
                             animate={{ opacity: 1 }}
@@ -6700,8 +6745,10 @@ export default function App() {
                               }
                             >
                               <SubagentConversation
+                                key={selectedDelegation.id}
                                 delegation={selectedDelegation}
                                 headerTarget={subagentHeaderTarget}
+                                projectionCache={subagentProjectionCache}
                                 runtimes={snapshot.runtimes}
                                 contextFiles={contextFilePaths}
                                 onRequestContextFiles={requestProjectFiles}

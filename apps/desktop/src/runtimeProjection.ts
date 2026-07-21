@@ -1247,34 +1247,52 @@ export function runtimeTranscript(
   return buildRuntimeTranscript(state, deriveItemTranscriptEvents, density);
 }
 
+const RUNTIME_TRANSCRIPT_TASK_CACHE_SIZE = 4;
+
 export function createRuntimeTranscriptDeriver(
   density: TranscriptDensity = "normal",
 ): (state: RuntimeProjectionState) => TranscriptEvent[] {
-  let cachedTaskId: string | undefined;
-  let itemCache = new WeakMap<
-    ItemProjection,
-    {
-      timestamp: string;
-      status: TranscriptEvent["status"];
-      events: readonly TranscriptEvent[];
-    }
-  >();
+  type CacheEntry = {
+    taskId: string;
+    state?: RuntimeProjectionState;
+    transcript?: TranscriptEvent[];
+    items: WeakMap<
+      ItemProjection,
+      {
+        timestamp: string;
+        status: TranscriptEvent["status"];
+        events: readonly TranscriptEvent[];
+      }
+    >;
+  };
+  const taskCaches: CacheEntry[] = [];
 
   return (state) => {
-    if (cachedTaskId !== state.taskId) {
-      cachedTaskId = state.taskId;
-      itemCache = new WeakMap();
+    const cacheIndex = taskCaches.findIndex((entry) => entry.taskId === state.taskId);
+    let cache = taskCaches[cacheIndex];
+    if (!cache) {
+      cache = { taskId: state.taskId, items: new WeakMap() };
+      taskCaches.unshift(cache);
+      if (taskCaches.length > RUNTIME_TRANSCRIPT_TASK_CACHE_SIZE) taskCaches.pop();
+    } else if (cacheIndex > 0) {
+      taskCaches.splice(cacheIndex, 1);
+      taskCaches.unshift(cache);
     }
-    return buildRuntimeTranscript(
+    if (cache.state === state && cache.transcript) return cache.transcript;
+
+    const transcript = buildRuntimeTranscript(
       state,
       (item, timestamp, status) => {
-        const cached = itemCache.get(item);
+        const cached = cache.items.get(item);
         if (cached?.timestamp === timestamp && cached.status === status) return cached.events;
         const events = deriveItemTranscriptEvents(item, timestamp, status);
-        itemCache.set(item, { timestamp, status, events });
+        cache.items.set(item, { timestamp, status, events });
         return events;
       },
       density,
     );
+    cache.state = state;
+    cache.transcript = transcript;
+    return transcript;
   };
 }

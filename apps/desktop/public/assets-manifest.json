@@ -298,6 +298,16 @@
       "sha256": "583B9269453A03DED8BA3FBD49FF8A979C9C6117BDE271E899C3FA20B3E7381C",
       "approved": true,
       "notes": "Downloaded from the publisher's official favicon endpoint."
+    },
+    {
+      "path": "brand/skills/robinhood.svg",
+      "kind": "provider-favicon",
+      "purpose": "Robinhood identity for the curated Agentic Trading MCP in Settings",
+      "source": "https://robinhood.com/us/en/rh_favicon_60.png?v=2024",
+      "sha256": "2401474EF917522D5C89C4E783C636BA053DA10A12E95B7AFC1536A135A767E9",
+      "dimensions": "60x60",
+      "approved": true,
+      "notes": "Robinhood's declared official 60px favicon, bundled byte-for-byte inside a local SVG wrapper."
     }
   ]
 }

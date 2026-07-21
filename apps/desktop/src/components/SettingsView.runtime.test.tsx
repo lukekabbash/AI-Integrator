@@ -187,7 +187,7 @@ describe("Runtime Settings command disclosure", () => {
     );
   });
 
-  it("keeps memory opt-in and exposes its editable local scratchpad", async () => {
+  it("keeps personalization and memory transparent and editable", async () => {
     const saved = {
       id: "memory-1",
       text: "Prefers concise release notes",
@@ -210,7 +210,20 @@ describe("Runtime Settings command disclosure", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Memory" }));
+    fireEvent.click(screen.getByRole("button", { name: "Personalization" }));
+    const name = await screen.findByRole("textbox", { name: "Your name" });
+    fireEvent.change(name, { target: { value: "Luke" } });
+    fireEvent.blur(name);
+    expect(bridgeMock.setSetting).toHaveBeenCalledWith("settings.personalization.name", "Luke");
+
+    const about = screen.getByRole("textbox", { name: "About you" });
+    fireEvent.change(about, { target: { value: "I build local-first AI products." } });
+    fireEvent.blur(about);
+    expect(bridgeMock.setSetting).toHaveBeenCalledWith(
+      "settings.personalization.about",
+      "I build local-first AI products.",
+    );
+
     const memoryToggle = await screen.findByRole("switch", { name: "Use memory in Chats" });
     expect(memoryToggle).toHaveAttribute("aria-checked", "false");
     fireEvent.click(memoryToggle);
@@ -431,6 +444,70 @@ describe("Runtime Settings command disclosure", () => {
       ).toHaveAttribute("aria-checked", "true"),
     );
     expect(card?.querySelector("img")).toHaveAttribute("src", "/brand/skills/figma.ico");
+  });
+
+  it("warns before every Robinhood activation and keeps the enabled state visible", async () => {
+    bridgeMock.listIntegratorMcps.mockResolvedValue({
+      mcpsRoot: "/tmp/AI Integrator/MCPs",
+      servers: [
+        {
+          name: "robinhood-trading",
+          source: "user",
+          origin: "MCPs folder",
+          enabled: false,
+          authorization: { state: "notConnected" as const, available: true },
+          oauth: true,
+          transport: "remote" as const,
+          url: "https://agent.robinhood.com/mcp/trading",
+        },
+      ],
+    });
+    const genericConfirm = vi.spyOn(window, "confirm");
+
+    render(
+      <SettingsView
+        preferences={DEFAULT_THEME_PREFERENCES}
+        runtimes={[claudeRuntime, runtime]}
+        usage={createEmptySnapshot().usage}
+        onChangePreferences={vi.fn()}
+        onResetPreferences={vi.fn()}
+        onBack={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Skills and Plugins" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "MCPs" }));
+    const card = (await screen.findByText("robinhood-trading")).closest(".mcp-card") as HTMLElement;
+    expect(card.querySelector("img")).toHaveAttribute("src", "/brand/skills/robinhood.svg");
+
+    fireEvent.click(within(card).getByRole("switch", { name: "Enable robinhood-trading" }));
+    const dialog = await screen.findByRole("dialog", { name: "Enable Robinhood Trading?" });
+    expect(dialog).toHaveTextContent("real brokerage connection");
+    expect(dialog).toHaveTextContent("Financial data across your accounts");
+    expect(dialog).toHaveTextContent("Real order authority");
+    expect(genericConfirm).not.toHaveBeenCalled();
+    expect(bridgeMock.setSetting).not.toHaveBeenCalledWith(
+      "settings.mcp.integrator.enabled",
+      expect.anything(),
+    );
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog", { name: "Enable Robinhood Trading?" })).toBeNull();
+
+    fireEvent.click(within(card).getByRole("switch", { name: "Enable robinhood-trading" }));
+    fireEvent.click(
+      within(await screen.findByRole("dialog", { name: "Enable Robinhood Trading?" })).getByRole(
+        "button",
+        { name: "Enable Robinhood Trading" },
+      ),
+    );
+
+    await waitFor(() =>
+      expect(bridgeMock.setSetting).toHaveBeenCalledWith("settings.mcp.integrator.enabled", {
+        "robinhood-trading": true,
+      }),
+    );
+    await waitFor(() => expect(card).toHaveTextContent("Real trading enabled"));
   });
 
   it("signs remote MCP servers in and out from their installed cards", async () => {

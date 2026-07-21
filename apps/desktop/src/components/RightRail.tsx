@@ -12,6 +12,8 @@ import {
   type ReactNode,
 } from "react";
 import { AnimatePresence, LayoutGroup, m as motion, useReducedMotion } from "motion/react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   Activity,
   ArrowDown,
@@ -2207,7 +2209,15 @@ function DelegationRow({
             {delegationStatusLabel(delegation.status)}
           </span>
         </span>
-        <Tooltip label={delegation.brief} markdown multiline placement="bottom-left">
+        <Tooltip
+          label={
+            <div className="app-tooltip-markdown">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{delegation.brief}</ReactMarkdown>
+            </div>
+          }
+          multiline
+          placement="bottom-left"
+        >
           <span className="agent-activity" title={delegation.brief}>
             {delegation.brief}
           </span>

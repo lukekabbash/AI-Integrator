@@ -617,6 +617,32 @@ describe("TaskSidebar", () => {
     expect(screen.queryByRole("menu")).toBeNull();
   });
 
+  it("opens the rename field when a chat name is double-clicked", () => {
+    const snapshot = createDemoSnapshot();
+    const task = snapshot.tasks[0];
+    const { callbacks } = setup({ tasks: [task], activeTaskId: task.id });
+
+    fireEvent.doubleClick(screen.getByRole("button", { name: new RegExp(task.title) }));
+
+    const input = screen.getByRole("textbox", { name: "Chat name" });
+    expect(input).toHaveValue(task.title);
+    fireEvent.change(input, { target: { value: "Renamed via double click" } });
+    fireEvent.submit(input.closest("form")!);
+    expect(callbacks.onUpdateTask).toHaveBeenCalledWith(task.id, {
+      title: "Renamed via double click",
+    });
+  });
+
+  it("ignores double-click renaming while metadata actions are unavailable", () => {
+    const snapshot = createDemoSnapshot();
+    const task = snapshot.tasks[0];
+    setup({ tasks: [task], activeTaskId: task.id, metadataActionsEnabled: false });
+
+    fireEvent.doubleClick(screen.getByRole("button", { name: new RegExp(task.title) }));
+
+    expect(screen.queryByRole("textbox", { name: "Chat name" })).toBeNull();
+  });
+
   it("clips a fork's name rather than the marker that identifies it", () => {
     const snapshot = createDemoSnapshot();
     const task = { ...snapshot.tasks[0], title: "Port the parser: Branch 2" };

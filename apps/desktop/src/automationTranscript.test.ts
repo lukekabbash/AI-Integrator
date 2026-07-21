@@ -28,6 +28,19 @@ function user(id: string, body: string, timestamp: string): TranscriptEvent {
 }
 
 describe("mergeSchedulingTranscript", () => {
+  it("returns the authoritative transcript unchanged when scheduling owns no rows", () => {
+    const events = [
+      user("later", "Second", "not-a-timestamp"),
+      user("earlier", "First", "2026-07-19T15:59:55Z"),
+    ];
+
+    const result = mergeSchedulingTranscript(events, []);
+
+    expect(result).toBe(events);
+    expect(result[0]).toBe(events[0]);
+    expect(result[1]).toBe(events[1]);
+  });
+
   it("attaches a live countdown only while a near-term fixed wakeup is active", () => {
     const [receipt] = mergeSchedulingTranscript(
       [],

@@ -500,6 +500,28 @@ describe("native trusted-project bridge", () => {
     bridge.invalidateModelCatalog("codex");
   });
 
+  it("uses Grok Build's live catalog and exposes only model-supported efforts", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "grok_list_models") return ["grok-4.5", "grok-future"];
+      return undefined;
+    });
+
+    await expect(bridge.listModelCatalog("grok")).resolves.toEqual([
+      {
+        id: "grok-4.5",
+        label: "Grok 4.5",
+        efforts: [
+          { id: "low", label: "Low" },
+          { id: "medium", label: "Medium" },
+          { id: "high", label: "High" },
+        ],
+        defaultEffort: "high",
+      },
+      { id: "grok-future", label: "Grok Future" },
+    ]);
+    expect(invokeMock).toHaveBeenCalledWith("grok_list_models", undefined);
+  });
+
   it("sends bounded model catalogs with specialist generation", async () => {
     const generated = { id: "specialist-ai-test", enabled: false };
     invokeMock.mockResolvedValue(generated);
@@ -732,6 +754,47 @@ describe("native trusted-project bridge", () => {
     expect(invokeMock).toHaveBeenCalledWith("project_register", {
       path: "H:\\Code\\sample",
     });
+  });
+
+  it("resolves a path-hydrated legacy project before removing it", async () => {
+    const root = "Projects/AI Integrator";
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "local_export") {
+        return Promise.resolve({
+          projects: [],
+          tasks: [
+            {
+              id: "task-legacy",
+              kind: "code",
+              title: "Legacy chat",
+              repositoryPath: root,
+              state: "ready",
+              pinned: false,
+              archived: false,
+              createdAt: "2026-07-10T15:00:00Z",
+              updatedAt: "2026-07-10T15:00:00Z",
+            },
+          ],
+          settings: [],
+          providerSessions: [],
+          runtimeSessions: [],
+          composerDrafts: [],
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const workspace = await bridge.loadWorkspace();
+    expect(workspace.projects[0]).toMatchObject({ id: "project-1", path: root });
+
+    await bridge.removeProject("project-1");
+
+    expect(invokeMock).toHaveBeenCalledWith("project_remove", {
+      projectId: undefined,
+      repositoryPath: root,
+      deleteFiles: false,
+    });
+    expect(invokeMock).not.toHaveBeenCalledWith("project_register", expect.anything());
   });
 
   it("loads repository Git state immediately after cloning a project", async () => {
@@ -1622,6 +1685,7 @@ describe("native trusted-project bridge", () => {
         };
       }
       if (command === "acp_start_session") return { sessionId: "grok-session" };
+      if (command === "acp_resume_session") return { sessionId: "grok-session" };
       if (command === "acp_send_turn") return { turnId: "grok-turn" };
       return undefined;
     });
@@ -1649,6 +1713,92 @@ describe("native trusted-project bridge", () => {
         .filter(([command]) => command === "acp_send_turn")
         .map(([, args]) => args?.delegation),
     ).toEqual(["balanced", "balanced", "budget-first"]);
+  });
+
+  it("relaunches Grok with the selected model and reasoning effort", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "app_bootstrap") return { value: {} };
+      if (command === "local_export") {
+        return {
+          projects: [
+            {
+              id: "project-grok-effort",
+              displayName: "integrator-3",
+              repositoryRoot: "H:\\Code\\integrator-3",
+              gitCommonDirectory: "H:\\Code\\integrator-3\\.git",
+              createdAt: "2026-07-20T00:00:00Z",
+              lastOpenedAt: "2026-07-20T00:00:00Z",
+            },
+          ],
+          tasks: [
+            {
+              id: "task-grok-effort",
+              title: "Grok effort",
+              repositoryPath: "H:\\Code\\integrator-3",
+              state: "ready",
+              pinned: false,
+              archived: false,
+              runtime: "grok",
+              model: "grok-4.5",
+              effort: "high",
+              createdAt: "2026-07-20T00:00:00Z",
+              updatedAt: "2026-07-20T00:00:00Z",
+            },
+          ],
+          settings: [],
+          providerSessions: [],
+          providerResumeStates: [],
+          runtimeSessions: [],
+        };
+      }
+      if (command === "acp_start_session") return { sessionId: "grok-session" };
+      if (command === "acp_send_turn") return { turnId: "grok-turn" };
+      return undefined;
+    });
+
+    const base = {
+      taskId: "task-grok-effort",
+      runtime: "grok" as const,
+      model: "grok-4.5",
+      permission: "project-write" as const,
+      delegation: "off" as const,
+    };
+    await bridge.loadWorkspace();
+    await bridge.sendTurn({ ...base, prompt: "Use high effort", effort: "high" });
+    await bridge.sendTurn({ ...base, prompt: "Keep high effort", effort: "high" });
+    await bridge.sendTurn({ ...base, prompt: "Use low effort", effort: "low" });
+
+    expect(invokeMock.mock.calls.filter(([command]) => command === "acp_connect")).toEqual([
+      [
+        "acp_connect",
+        {
+          provider: "grok",
+          workingDirectory: "H:\\Code\\integrator-3",
+          taskId: "task-grok-effort",
+          model: "grok-4.5",
+          effort: "high",
+        },
+      ],
+      [
+        "acp_connect",
+        {
+          provider: "grok",
+          workingDirectory: "H:\\Code\\integrator-3",
+          taskId: "task-grok-effort",
+          model: "grok-4.5",
+          effort: "low",
+        },
+      ],
+    ]);
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "acp_start_session"),
+    ).toHaveLength(1);
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "acp_resume_session"),
+    ).toHaveLength(1);
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "acp_set_config_option"),
+    ).toHaveLength(0);
   });
 
   it("routes projectless Chat turns through every certified runtime", async () => {
