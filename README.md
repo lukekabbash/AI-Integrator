@@ -1,5 +1,7 @@
 # AI Integrator
 
+AI Integrator is a local-first desktop workspace for developers who use more than one coding agent. It coordinates installed runtimes—Codex, Claude Code, Google Antigravity, Cursor Agent, Grok Build, and Kimi Code—while keeping each task’s context, permissions, evidence, and Git identity coherent across model handoffs and bounded delegation. The native app is built with Tauri, Rust, React, and TypeScript.
+
 I’m Luke. I have used large language models since they first became available to consumers, and over the years I have learned that the best work rarely comes from asking one model to do everything.
 
 It comes from orchestration.
@@ -95,7 +97,7 @@ Its first complete loop is:
 6. Review the resulting evidence and diff.
 7. Commit and push as separate, explicit actions.
 
-Codex and Cursor are the first certified runtime paths. Additional ACP and structured-stream runtimes are capability-gated until their actual behavior passes the same conformance bar. Provider names in the UI are not promises of parity.
+The built-in runtime paths are Codex, Claude Code, Google Antigravity, Cursor Agent, Grok Build, and Kimi Code. Codex and Cursor are the certified v1 launch targets; the other paths are capability-gated and expose only the behavior supported by their installed CLI and current conformance status. Provider names in the UI are not promises of parity.
 
 ## Build contracts
 
