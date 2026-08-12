@@ -51,6 +51,9 @@ import {
   Upload,
   Users,
   X,
+  FolderOpen,
+  FolderSearch,
+  ScrollText,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import {
@@ -66,6 +69,7 @@ import {
   type IntegratorSkillInfo,
   type IntegratorSkillsOverview,
   type LocalAppInfo,
+  type LogsTotals,
   type MemoryEntry,
   type ModelCatalogEntry,
   type ProjectSummary,
@@ -290,6 +294,9 @@ const DEFAULT_SETTINGS: SettingsMap = {
   // chat's last activity, auto-delete counts from the moment it was archived.
   "archive.autoArchiveAfter": "never",
   "archive.autoDeleteAfter": "never",
+  // Compact incident logs always write; this gates verbose lifecycle/probe trails.
+  "diagnostics.detailedLogging": false,
+  "diagnostics.retention": "7d",
   // Consumed by the native delegation broker (peers_list / delegate_start
   // policy) and by the composer's delegation-mode default.
   "delegation.defaultMode": "off",
@@ -4340,6 +4347,142 @@ function StorageTotalsSettings() {
   );
 }
 
+const LOG_RETENTION_OPTIONS = [
+  { value: "7d", label: "After 7 days" },
+  { value: "14d", label: "After 14 days" },
+  { value: "30d", label: "After 30 days" },
+  { value: "never", label: "Never (size cap only)" },
+];
+
+function DiagnosticLogsSettings({
+  settings,
+  setSetting,
+}: {
+  settings: SettingsMap;
+  setSetting: (key: string, value: unknown) => void;
+}) {
+  const [totals, setTotals] = useState<LogsTotals | null>(null);
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const refreshTotals = useCallback(async () => {
+    try {
+      setTotals(await bridge.getLogsTotals());
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Log totals unavailable.");
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshTotals();
+  }, [refreshTotals]);
+
+  const openFolder = async () => {
+    setMessage("");
+    setBusy(true);
+    try {
+      await bridge.openLogsFolder();
+      setMessage("Opened Documents › AI Integrator › Logs.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not open the logs folder.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const clearLogs = async () => {
+    if (
+      !window.confirm(
+        "Delete all diagnostic log files in Documents › AI Integrator › Logs? This cannot be undone.",
+      )
+    ) {
+      return;
+    }
+    setMessage("");
+    setBusy(true);
+    try {
+      await bridge.clearLogs();
+      await refreshTotals();
+      setMessage("Diagnostic logs cleared.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not clear diagnostic logs.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="settings-section">
+      <header>
+        <h2>Diagnostic logs</h2>
+        <p>
+          Local, redacted JSONL under Documents › AI Integrator › Logs. Compact incident records
+          always capture visible errors and session cut-offs; detailed trails are optional.
+        </p>
+      </header>
+      <SettingRow
+        label="Enable detailed logs"
+        description="Write verbose lifecycle, probe, and connection trails alongside compact incidents. Off keeps only the fault journal."
+        icon={<ScrollText />}
+      >
+        <Switch
+          checked={readSetting(settings, "diagnostics.detailedLogging", false)}
+          onChange={(value) => setSetting("diagnostics.detailedLogging", value)}
+          label="Enable detailed logs"
+        />
+      </SettingRow>
+      <SettingRow
+        label="Delete logs older than"
+        description="Aged files are removed on launch and when this setting changes. A 500 MB soft cap also deletes the oldest files first."
+      >
+        <Dropdown
+          aria-label="Diagnostic log retention"
+          value={readSetting(settings, "diagnostics.retention", "7d")}
+          options={LOG_RETENTION_OPTIONS}
+          onChange={(value) => {
+            setSetting("diagnostics.retention", value);
+            void bridge.pruneLogs().then(refreshTotals).catch(() => undefined);
+          }}
+        />
+      </SettingRow>
+      <div className="settings-location">
+        <FolderOpen />
+        <span>
+          <strong>{totals?.path ?? "Documents/AI Integrator/Logs"}</strong>
+          <small>
+            {totals
+              ? `${formatBytes(totals.bytes)} · ${totals.fileCount} file${totals.fileCount === 1 ? "" : "s"} · ${totals.incidentFiles} incident · ${totals.detailFiles} detail`
+              : "Measuring log footprint…"}
+          </small>
+        </span>
+      </div>
+      <div className="data-actions">
+        <button
+          className="secondary-button"
+          type="button"
+          onClick={() => void openFolder()}
+          disabled={busy}
+        >
+          <FolderSearch /> Open logs folder
+        </button>
+        <button
+          className="danger-button"
+          type="button"
+          onClick={() => void clearLogs()}
+          disabled={busy}
+        >
+          <Trash2 /> Clear logs
+        </button>
+      </div>
+      {message ? (
+        <p className="settings-action-message" role="status">
+          {message}
+        </p>
+      ) : null}
+    </section>
+  );
+}
+
 function UsageSettings({
   usage,
   runtimes,
@@ -5006,6 +5149,10 @@ function PolicySettings({
           </div>
         </section>
         <StorageTotalsSettings />
+        <DiagnosticLogsSettings
+          settings={settings}
+          setSetting={setSetting}
+        />
         <section className="settings-section danger-zone">
           <header>
             <h2>Portability and deletion</h2>

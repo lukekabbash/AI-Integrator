@@ -62,6 +62,7 @@ pub fn ensure_roots(app: &tauri::AppHandle) -> io::Result<()> {
     fs::create_dir_all(skills_root(&documents))?;
     fs::create_dir_all(plugins_root(&documents))?;
     fs::create_dir_all(crate::integrator_mcp::mcps_root(&documents))?;
+    crate::diagnostic_log::ensure_logs_dir(&documents)?;
     Ok(())
 }
 

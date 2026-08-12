@@ -425,6 +425,17 @@ describe("runtime authentication messaging", () => {
         detail: "login-required",
       }),
     ).toContain("login is required");
+    expect(
+      runtimeAuthWarning({
+        id: "grok",
+        name: "Grok Build",
+        command: "grok agent stdio",
+        status: "degraded",
+        fidelity: "acp",
+        models: [],
+        detail: "auth-not-probed",
+      }),
+    ).toContain("ACP session handshake");
   });
 });
 
@@ -518,7 +529,7 @@ describe("native trusted-project bridge", () => {
     await expect(bridge.listModelCatalog("claude")).resolves.toEqual([
       {
         id: "claude-opus-5[1m]",
-        label: "Opus (1M context)",
+        label: "Claude Opus 5",
         efforts: [
           { id: "low", label: "Low" },
           { id: "medium", label: "Medium" },
@@ -528,9 +539,58 @@ describe("native trusted-project bridge", () => {
         ],
         defaultEffort: "high",
       },
-      { id: "claude-haiku-4-5-20251001", label: "Haiku" },
+      { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
     ]);
     expect(invokeMock).toHaveBeenCalledWith("claude_list_models", undefined);
+  });
+
+  it("keeps the CLI's context note only when two Claude entries would collide", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "claude_list_models") {
+        return [
+          { id: "claude-opus-5", label: "Opus", efforts: [] },
+          { id: "claude-opus-5[1m]", label: "Opus (1M context)", efforts: [] },
+          { id: "claude-sonnet-5", label: "Sonnet", efforts: [] },
+        ];
+      }
+      return undefined;
+    });
+
+    await expect(bridge.listModelCatalog("claude")).resolves.toEqual([
+      { id: "claude-opus-5", label: "Claude Opus 5" },
+      { id: "claude-opus-5[1m]", label: "Claude Opus 5 (1M context)" },
+      { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
+    ]);
+  });
+
+  it("warms only the standalone-probe catalogs of connected runtimes", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "claude_list_models")
+        return [{ id: "claude-opus-5", label: "", efforts: [] }];
+      if (command === "grok_list_models") return ["grok-4.5"];
+      return undefined;
+    });
+    const connection = (id: string, status: string) =>
+      ({ id, status }) as unknown as Parameters<typeof bridge.prefetchModelCatalogs>[0][number];
+
+    bridge.prefetchModelCatalogs([
+      connection("claude", "connected"),
+      connection("grok", "connected"),
+      // Login-required and session-bound runtimes must stay lazy.
+      connection("codex", "login_required"),
+      connection("cursor", "connected"),
+    ]);
+    await vi.waitFor(() => {
+      expect(bridge.getCachedModelCatalog("claude")).toEqual([
+        { id: "claude-opus-5", label: "Claude Opus 5" },
+      ]);
+      expect(bridge.getCachedModelCatalog("grok")).toBeDefined();
+    });
+
+    expect(bridge.getCachedModelCatalog("codex")).toBeUndefined();
+    expect(bridge.getCachedModelCatalog("cursor")).toBeUndefined();
+    expect(invokeMock).not.toHaveBeenCalledWith("codex_list_models", expect.anything());
+    expect(invokeMock).not.toHaveBeenCalledWith("acp_connect", expect.anything());
   });
 
   it("falls back to the static Claude catalog when the live probe fails", async () => {
@@ -548,11 +608,22 @@ describe("native trusted-project bridge", () => {
 
   it("uses Grok Build's live catalog and exposes only model-supported efforts", async () => {
     invokeMock.mockImplementation(async (command: string) => {
-      if (command === "grok_list_models") return ["grok-4.5", "grok-future"];
+      if (command === "grok_list_models") return ["grok-4.6", "grok-4.5", "grok-future"];
       return undefined;
     });
 
     await expect(bridge.listModelCatalog("grok")).resolves.toEqual([
+      {
+        id: "grok-4.6",
+        label: "Grok 4.6",
+        efforts: [
+          { id: "low", label: "Low" },
+          { id: "medium", label: "Medium" },
+          { id: "high", label: "High" },
+          { id: "xhigh", label: "Extra high" },
+        ],
+        defaultEffort: "high",
+      },
       {
         id: "grok-4.5",
         label: "Grok 4.5",
@@ -566,6 +637,66 @@ describe("native trusted-project bridge", () => {
       { id: "grok-future", label: "Grok Future" },
     ]);
     expect(invokeMock).toHaveBeenCalledWith("grok_list_models", undefined);
+  });
+
+  it("warms Grok ACP before send so the first turn is not a cold spawn", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "task_create") {
+        return { id: "v1-shell", kind: "code", title: "Construct the native v1 workspace" };
+      }
+      if (command === "acp_connect" || command === "acp_start_session") {
+        return { sessionId: "sess-1" };
+      }
+      if (command === "acp_session_capabilities") {
+        return { load: true, resume: true, mcpHttp: false, mcpSse: false };
+      }
+      return undefined;
+    });
+
+    await bridge.prepareAcpRuntime({
+      taskId: "v1-shell",
+      runtime: "grok",
+      model: "grok-4.6",
+      effort: "xhigh",
+      permission: "project-write",
+      delegation: "off",
+    });
+
+    expect(invokeMock).toHaveBeenCalledWith(
+      "acp_connect",
+      expect.objectContaining({
+        provider: "grok",
+        taskId: "v1-shell",
+        model: "grok-4.6",
+        effort: "xhigh",
+      }),
+    );
+    expect(invokeMock).toHaveBeenCalledWith(
+      "acp_start_session",
+      expect.objectContaining({
+        taskId: "v1-shell",
+        permission: "project-write",
+      }),
+    );
+  });
+
+  it("falls back to the documented Grok catalog when the live probe fails", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "grok_list_models") {
+        throw new Error("provider-unavailable");
+      }
+      return undefined;
+    });
+
+    const catalog = await bridge.listModelCatalog("grok");
+    expect(catalog.map((entry) => entry.id)).toEqual(["grok-4.6", "grok-4.5"]);
+    expect(catalog[0]?.efforts?.map((effort) => effort.id)).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
+    expect(catalog[1]?.efforts?.map((effort) => effort.id)).toEqual(["low", "medium", "high"]);
   });
 
   it("groups Antigravity's live slug catalog into base models with effort pickers", async () => {

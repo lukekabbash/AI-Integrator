@@ -127,6 +127,9 @@ pub struct AcpLaunchOptions {
     pub environment: Vec<(String, String)>,
     pub working_directory: Option<PathBuf>,
     pub client_version: String,
+    /// Grok Build 1.0.3 rejects ACP's `initialized` notification (`Method not
+    /// found`). Cursor and Kimi still require it before `session/new`.
+    pub skip_initialized_notification: bool,
 }
 
 /// The result of a completed `session/prompt` turn.
@@ -247,7 +250,12 @@ impl AcpClient {
                 initialization: Mutex::new(Value::Null),
             }),
         };
-        let initialization = client.initialize(&options.client_version).await?;
+        let initialization = client
+            .initialize(
+                &options.client_version,
+                options.skip_initialized_notification,
+            )
+            .await?;
         *client.inner.initialization.lock().await = initialization;
         Ok(client)
     }
@@ -461,7 +469,11 @@ impl AcpClient {
         Ok(())
     }
 
-    async fn initialize(&self, client_version: &str) -> Result<Value> {
+    async fn initialize(
+        &self,
+        client_version: &str,
+        skip_initialized_notification: bool,
+    ) -> Result<Value> {
         let response = self
             .request(
                 "initialize",
@@ -486,13 +498,16 @@ impl AcpClient {
             .await?;
 
         // Stable ACP uses an explicit initialized notification before
-        // session/new or any other session request.
-        self.write_message(json!({
-            "jsonrpc": "2.0",
-            "method": "initialized",
-            "params": {}
-        }))
-        .await?;
+        // session/new or any other session request. Grok 1.0.3 does not
+        // implement it and logs `Method not found`.
+        if !skip_initialized_notification {
+            self.write_message(json!({
+                "jsonrpc": "2.0",
+                "method": "initialized",
+                "params": {}
+            }))
+            .await?;
+        }
 
         Ok(response)
     }

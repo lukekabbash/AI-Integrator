@@ -24,6 +24,7 @@ import {
   CircleDollarSign,
   Cloud,
   Copy,
+  CopyPlus,
   CloudUpload,
   Download,
   FileText,
@@ -358,6 +359,10 @@ interface RightRailProps {
   openingFilePath?: string;
   /** Renames a project file in place; the caller refreshes the file list. */
   onRenameProjectFile?: (file: ProjectFileEntry, newName: string) => Promise<void>;
+  /** Duplicates a project file beside itself; the caller refreshes the file list. */
+  onDuplicateProjectFile?: (file: ProjectFileEntry) => Promise<void>;
+  /** Resolves a relative path to an absolute clipboard value. */
+  onResolveProjectAbsolutePath?: (path: string) => Promise<string>;
   /** Inserts the file as an @context mention into the main chat composer. */
   onMentionProjectFile?: (file: ProjectFileEntry) => void;
   /** Inserts a folder as an @context mention into the main chat composer. */
@@ -468,6 +473,7 @@ function GitPanel({
   fileOpeners = [],
   onOpenGitFileExternal,
   onRevealGitFile,
+  onResolveProjectAbsolutePath,
 }: Pick<
   RightRailProps,
   | "git"
@@ -492,6 +498,7 @@ function GitPanel({
   | "fileOpeners"
   | "onOpenGitFileExternal"
   | "onRevealGitFile"
+  | "onResolveProjectAbsolutePath"
 >) {
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState<
@@ -849,31 +856,29 @@ function GitPanel({
             {isStaged ? <Minus /> : <Plus />}
           </button>
         </span>
-        <Tooltip label={file.path} placement="left">
-          <button
-            className="git-file-name"
-            type="button"
-            onClick={() => onSelectFile(file)}
-            onKeyDown={(event) => {
-              if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
-                event.preventDefault();
-                const bounds = event.currentTarget.getBoundingClientRect();
-                openFileContextMenu(
-                  file,
-                  bounds.right - 12,
-                  bounds.bottom,
-                  event.currentTarget,
-                  true,
-                );
-              }
-            }}
-            aria-label={file.path}
-            aria-pressed={activeFile ? diffFileKey(activeFile) === diffFileKey(file) : false}
-          >
-            <span>{file.path.split("/").at(-1)}</span>
-            <small>{file.path.split("/").slice(0, -1).join("/")}</small>
-          </button>
-        </Tooltip>
+        <button
+          className="git-file-name"
+          type="button"
+          onClick={() => onSelectFile(file)}
+          onKeyDown={(event) => {
+            if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+              event.preventDefault();
+              const bounds = event.currentTarget.getBoundingClientRect();
+              openFileContextMenu(
+                file,
+                bounds.right - 12,
+                bounds.bottom,
+                event.currentTarget,
+                true,
+              );
+            }
+          }}
+          aria-label={file.path}
+          aria-pressed={activeFile ? diffFileKey(activeFile) === diffFileKey(file) : false}
+        >
+          <span>{file.path.split("/").at(-1)}</span>
+          <small>{file.path.split("/").slice(0, -1).join("/")}</small>
+        </button>
         <span className="file-change-count">
           {file.statsLoaded === false ? (
             <small aria-label="Line counts load when this diff is opened">…</small>
@@ -1811,6 +1816,25 @@ function GitPanel({
           >
             <Copy /> Copy relative path
           </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              void (async () => {
+                try {
+                  const absolute = onResolveProjectAbsolutePath
+                    ? await onResolveProjectAbsolutePath(fileContextMenu.file.path)
+                    : fileContextMenu.file.path;
+                  await navigator.clipboard.writeText(absolute);
+                } catch {
+                  // Clipboard access can be denied; the menu simply closes.
+                }
+                setFileContextMenu(null);
+              })();
+            }}
+          >
+            <Copy /> Copy absolute path
+          </button>
         </div>
       ) : null}
     </div>
@@ -2351,6 +2375,8 @@ function FilePanel({
   activeFilePath = "",
   openingFilePath = "",
   onRenameProjectFile,
+  onDuplicateProjectFile,
+  onResolveProjectAbsolutePath,
   onMentionProjectFile,
   onMentionProjectFolder,
   onOpenProjectFileExternal,
@@ -2364,6 +2390,8 @@ function FilePanel({
   | "activeFilePath"
   | "openingFilePath"
   | "onRenameProjectFile"
+  | "onDuplicateProjectFile"
+  | "onResolveProjectAbsolutePath"
   | "onMentionProjectFile"
   | "onMentionProjectFolder"
   | "onOpenProjectFileExternal"
@@ -2560,6 +2588,43 @@ function FilePanel({
     }
   };
 
+  const revealFolder = async (path: string) => {
+    if (!onRevealProjectFile) return;
+    setFileActionError("");
+    setFolderMenu(null);
+    try {
+      await onRevealProjectFile(path);
+    } catch (error) {
+      setFileActionError(
+        error instanceof Error ? error.message : "Could not reveal that folder in File Explorer.",
+      );
+    }
+  };
+
+  const copyAbsolutePath = async (relativePath: string) => {
+    try {
+      const absolute = onResolveProjectAbsolutePath
+        ? await onResolveProjectAbsolutePath(relativePath)
+        : relativePath;
+      await navigator.clipboard.writeText(absolute);
+    } catch {
+      // Clipboard access can be denied; the menu simply closes.
+    }
+  };
+
+  const duplicateFile = async (file: ProjectFileEntry) => {
+    if (!onDuplicateProjectFile) return;
+    setFileActionError("");
+    setContextMenu(null);
+    try {
+      await onDuplicateProjectFile(file);
+    } catch (error) {
+      setFileActionError(
+        error instanceof Error ? error.message : "Could not duplicate that project file.",
+      );
+    }
+  };
+
   return (
     <div className="rail-panel file-panel">
       <header className="rail-panel-header">
@@ -2730,6 +2795,15 @@ function FilePanel({
               <Pencil /> Rename
             </button>
           ) : null}
+          {onDuplicateProjectFile ? (
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => void duplicateFile(contextMenu.file)}
+            >
+              <CopyPlus /> Duplicate
+            </button>
+          ) : null}
           <button
             type="button"
             role="menuitem"
@@ -2739,6 +2813,16 @@ function FilePanel({
             }}
           >
             <Copy /> Copy relative path
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              void copyAbsolutePath(contextMenu.file.path);
+              setContextMenu(null);
+            }}
+          >
+            <Copy /> Copy absolute path
           </button>
         </div>
       ) : null}
@@ -2769,6 +2853,11 @@ function FilePanel({
               <AtSign /> Add to chat as context
             </button>
           ) : null}
+          {onRevealProjectFile ? (
+            <button type="button" role="menuitem" onClick={() => void revealFolder(folderMenu.path)}>
+              <FolderSearch /> Reveal in File Explorer
+            </button>
+          ) : null}
           <button
             type="button"
             role="menuitem"
@@ -2778,6 +2867,16 @@ function FilePanel({
             }}
           >
             <Copy /> Copy relative path
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              void copyAbsolutePath(folderMenu.path);
+              setFolderMenu(null);
+            }}
+          >
+            <Copy /> Copy absolute path
           </button>
         </div>
       ) : null}
@@ -3316,6 +3415,8 @@ export function RightRail(props: RightRailProps) {
           activeFilePath={props.activeFilePath}
           openingFilePath={props.openingFilePath}
           onRenameProjectFile={props.onRenameProjectFile}
+          onDuplicateProjectFile={props.onDuplicateProjectFile}
+          onResolveProjectAbsolutePath={props.onResolveProjectAbsolutePath}
           onMentionProjectFile={props.onMentionProjectFile}
           onMentionProjectFolder={props.onMentionProjectFolder}
           fileOpeners={props.fileOpeners}

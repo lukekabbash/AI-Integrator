@@ -843,6 +843,63 @@ describe("Transcript", () => {
     expect(onLoadOlder).toHaveBeenCalledTimes(2);
   });
 
+  it("chains the next older page when a prepend lands inside the top band", async () => {
+    const onLoadOlder = vi.fn();
+    const scrollContainerRef = { current: null as HTMLDivElement | null };
+    let contentHeight = 1000;
+    const baseEvents = Array.from({ length: 20 }, (_, index) =>
+      event(`e-${index}`, "assistant", `Message ${index}`),
+    );
+    const { rerender } = render(
+      <div data-testid="transcript-scroll" ref={scrollContainerRef}>
+        <Transcript
+          ownerKey="task:paginate-chain"
+          events={baseEvents}
+          hasMoreOlder
+          onLoadOlder={onLoadOlder}
+          scrollContainerRef={scrollContainerRef}
+        />
+      </div>,
+    );
+    const scrollContainer = screen.getByTestId("transcript-scroll");
+    Object.defineProperty(scrollContainer, "scrollHeight", {
+      configurable: true,
+      get: () => contentHeight,
+    });
+    Object.defineProperty(scrollContainer, "clientHeight", {
+      configurable: true,
+      get: () => 100,
+    });
+    await waitFor(() => expect(scrollContainer.scrollTop).toBe(900));
+
+    fireEvent.wheel(scrollContainer, { deltaY: -40 });
+    scrollContainer.scrollTop = 40;
+    fireEvent.scroll(scrollContainer);
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+
+    // A short prepend keeps the restored anchor inside the top band, where no
+    // further scroll event will fire — the next page must chain immediately.
+    contentHeight = 1040;
+    rerender(
+      <div data-testid="transcript-scroll" ref={scrollContainerRef}>
+        <Transcript
+          ownerKey="task:paginate-chain"
+          events={[
+            event("older-0", "assistant", "Older 0"),
+            event("older-1", "assistant", "Older 1"),
+            ...baseEvents,
+          ]}
+          hasMoreOlder
+          onLoadOlder={onLoadOlder}
+          scrollContainerRef={scrollContainerRef}
+        />
+      </div>,
+    );
+
+    await waitFor(() => expect(onLoadOlder).toHaveBeenCalledTimes(2));
+    expect(scrollContainer.scrollTop).toBe(80);
+  });
+
   it("retries a dropped older-page request on an upward gesture while parked at top", async () => {
     const onLoadOlder = vi.fn();
     const scrollContainerRef = { current: null as HTMLDivElement | null };

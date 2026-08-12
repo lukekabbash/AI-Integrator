@@ -1060,11 +1060,8 @@ fn acp_tool_input(update: &Value) -> Option<String> {
             }
             json_detail(Some(&Value::Object(enriched)), TOOL_DETAIL_LIMIT)
         }
-        Some(other) => json_detail(Some(other), TOOL_DETAIL_LIMIT).or_else(|| {
-            location_path.map(|path| {
-                json!({ "path": path }).to_string()
-            })
-        }),
+        Some(other) => json_detail(Some(other), TOOL_DETAIL_LIMIT)
+            .or_else(|| location_path.map(|path| json!({ "path": path }).to_string())),
         None => location_path.map(|path| json!({ "path": path }).to_string()),
     }
 }
@@ -1159,11 +1156,38 @@ pub fn reduce_acp_update(
         .get("sessionUpdate")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    // ACP calls this stream `agent_thought_chunk`, but it is raw thought
-    // content rather than a provider-labeled summary. Do not persist or
-    // forward it as a transcript item or audit payload.
+    // ACP `agent_thought_chunk` is raw hidden thought. Persist only a host
+    // activity placeholder so xhigh/long-reasoning turns are not a blank
+    // spinner; never copy the vendor text into the transcript or audit.
     if kind == "agent_thought_chunk" {
-        return Ok(None);
+        return Ok(Some(ReducedProviderEvent {
+            method: "session/update/agent_thought_chunk".into(),
+            thread_id: session_id.to_owned(),
+            turn_id: Some(turn_id.to_owned()),
+            audit_json: r#"{"sessionUpdate":"agent_thought_chunk"}"#.into(),
+            audit_truncated: false,
+            mutation: ProjectionMutation::ReplaceItem(ItemProjection {
+                id: format!("acp:{session_id}:{turn_id}:reasoning"),
+                provider_item_id: format!("{turn_id}-reasoning"),
+                kind: ItemKind::ReasoningSummary,
+                status: ItemStatus::InProgress,
+                title: Some("Reasoning".into()),
+                body: Some("Thinking…".into()),
+                native_skill: None,
+                phase: None,
+                command: None,
+                cwd: None,
+                output: None,
+                exit_code: None,
+                file_changes: None,
+                mcp_server: None,
+                mcp_tool: None,
+                tool_input: None,
+                truncated: false,
+                updated_at: occurred_at,
+            }),
+            occurred_at,
+        }));
     }
     let (audit_json, audit_truncated) = bounded_audit(update);
     let mutation = match kind {
@@ -2060,7 +2084,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_acp_thought_chunks_are_dropped() {
+    fn raw_acp_thought_chunks_become_host_activity_without_vendor_text() {
         let event = reduce_acp_update(
             "session-1",
             "turn-1",
@@ -2071,8 +2095,17 @@ mod tests {
             }),
             Utc::now(),
         )
-        .expect("reduce");
-        assert!(event.is_none());
+        .expect("reduce")
+        .expect("placeholder");
+        assert!(!event.audit_json.contains("Raw hidden"));
+        match event.mutation {
+            ProjectionMutation::ReplaceItem(item) => {
+                assert_eq!(item.kind, ItemKind::ReasoningSummary);
+                assert_eq!(item.body.as_deref(), Some("Thinking…"));
+                assert_eq!(item.title.as_deref(), Some("Reasoning"));
+            }
+            other => panic!("expected reasoning placeholder, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2182,7 +2215,10 @@ mod tests {
             panic!("expected replace mutation");
         };
         let input = item.tool_input.as_deref().expect("tool input");
-        assert!(input.contains("activity rows"), "raw query preserved: {input}");
+        assert!(
+            input.contains("activity rows"),
+            "raw query preserved: {input}"
+        );
         assert!(
             input.contains("Transcript.tsx"),
             "location path is folded in when rawInput has no path field: {input}"

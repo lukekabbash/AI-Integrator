@@ -1189,6 +1189,180 @@ describe("runtime projection reducer", () => {
     expect(transcript.some((entry) => entry.id === "command-a")).toBe(false);
   });
 
+  it("keeps a streaming span live when the settled turn projection is stale", () => {
+    let state = createRuntimeProjectionState("task-1");
+    state = applyRuntimeProjection(
+      state,
+      event(300, {
+        kind: "turnChanged",
+        turn: {
+          id: "turn-1",
+          status: "completed",
+          stopRequested: false,
+          startedAt: "2026-07-10T16:00:00Z",
+          completedAt: "2026-07-10T16:07:42Z",
+        },
+      }),
+    );
+    const items = [
+      {
+        id: "user-a",
+        providerItemId: "user-a",
+        kind: "userMessage" as const,
+        status: "completed" as const,
+        body: "First ask",
+        truncated: false,
+        updatedAt: "2026-07-10T16:00:00Z",
+      },
+      {
+        id: "command-a",
+        providerItemId: "command-a",
+        kind: "commandExecution" as const,
+        status: "completed" as const,
+        command: "pnpm test",
+        truncated: false,
+        updatedAt: "2026-07-10T16:03:00Z",
+      },
+      {
+        id: "assistant-a",
+        providerItemId: "assistant-a",
+        kind: "agentMessage" as const,
+        status: "completed" as const,
+        body: "First answer",
+        truncated: false,
+        updatedAt: "2026-07-10T16:07:40Z",
+      },
+      // A follow-up turn starts streaming, but its turnChanged has not
+      // reached the projection: the turn state is still last turn's.
+      {
+        id: "user-b",
+        providerItemId: "user-b",
+        kind: "userMessage" as const,
+        status: "completed" as const,
+        body: "Second ask",
+        truncated: false,
+        updatedAt: "2026-07-10T16:30:00Z",
+      },
+      {
+        id: "command-b",
+        providerItemId: "command-b",
+        kind: "commandExecution" as const,
+        status: "inProgress" as const,
+        command: "pnpm build",
+        truncated: false,
+        updatedAt: "2026-07-10T16:30:05Z",
+      },
+      {
+        id: "assistant-b",
+        providerItemId: "assistant-b",
+        kind: "agentMessage" as const,
+        status: "inProgress" as const,
+        body: "Working on the second ask…",
+        truncated: false,
+        updatedAt: "2026-07-10T16:30:10Z",
+      },
+    ];
+    for (const [index, item] of items.entries()) {
+      state = applyRuntimeProjection(state, {
+        ...event(301 + index, { kind: "itemChanged", item }),
+        occurredAt: item.updatedAt,
+      });
+    }
+
+    const transcript = runtimeTranscript(state);
+    const ids = transcript.map((entry) => entry.id);
+    // The finished first turn still folds.
+    expect(ids).toContain("worked-for-assistant-a");
+    // The streaming span must not fold under the stale turn's frozen clock.
+    expect(ids).toContain("command-b");
+    expect(ids.some((id) => id.startsWith("worked-for-assistant-b"))).toBe(false);
+    expect(transcript[transcript.length - 1]).toMatchObject({
+      kind: "assistant",
+      body: "Working on the second ask…",
+    });
+  });
+
+  it("does not revive cut-off items from an earlier turn while a new turn runs", () => {
+    let state = createRuntimeProjectionState("task-1");
+    const items = [
+      {
+        id: "user-a",
+        providerItemId: "user-a",
+        kind: "userMessage" as const,
+        status: "completed" as const,
+        body: "Ask from last night",
+        truncated: false,
+        updatedAt: "2026-07-10T22:00:00Z",
+      },
+      // Cut off when the app closed mid-turn; never completed.
+      {
+        id: "command-cut",
+        providerItemId: "command-cut",
+        kind: "commandExecution" as const,
+        status: "inProgress" as const,
+        command: "pnpm test --watch",
+        truncated: false,
+        updatedAt: "2026-07-10T22:03:00Z",
+      },
+      {
+        id: "assistant-a",
+        providerItemId: "assistant-a",
+        kind: "agentMessage" as const,
+        status: "completed" as const,
+        body: "Partial answer",
+        truncated: false,
+        updatedAt: "2026-07-10T22:07:00Z",
+      },
+      {
+        id: "user-b",
+        providerItemId: "user-b",
+        kind: "userMessage" as const,
+        status: "completed" as const,
+        body: "Morning follow-up",
+        truncated: false,
+        updatedAt: "2026-07-11T09:00:00Z",
+      },
+      {
+        id: "command-b",
+        providerItemId: "command-b",
+        kind: "commandExecution" as const,
+        status: "inProgress" as const,
+        command: "pnpm build",
+        truncated: false,
+        updatedAt: "2026-07-11T09:00:05Z",
+      },
+    ];
+    for (const [index, item] of items.entries()) {
+      state = applyRuntimeProjection(state, {
+        ...event(400 + index, { kind: "itemChanged", item }),
+        occurredAt: item.updatedAt,
+      });
+    }
+    state = applyRuntimeProjection(
+      state,
+      event(410, {
+        kind: "turnChanged",
+        turn: {
+          id: "turn-2",
+          status: "inProgress",
+          stopRequested: false,
+          startedAt: "2026-07-11T09:00:00Z",
+        },
+      }),
+    );
+
+    const transcript = runtimeTranscript(state);
+    const workedFor = transcript.find((entry) => entry.id === "worked-for-assistant-a");
+    expect(workedFor).toBeDefined();
+    // Last night's cut-off command must not spin again under the new turn.
+    expect(workedFor?.status).not.toBe("running");
+    expect(workedFor?.children).toContainEqual(
+      expect.objectContaining({ id: "command-cut", status: "neutral" }),
+    );
+    // The new turn's own work still shows live.
+    expect(transcript.find((entry) => entry.id === "command-b")?.status).toBe("running");
+  });
+
   it("tracks session mode snapshots for the composer mode picker", () => {
     let state = createRuntimeProjectionState("task-1");
     state = applyRuntimeProjection(

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-project-path-resolve"
+description = "Enables the project_path_resolve command without any pre-configured scope."
+commands.allow = ["project_path_resolve"]
+
+[[permission]]
+identifier = "deny-project-path-resolve"
+description = "Denies the project_path_resolve command without any pre-configured scope."
+commands.deny = ["project_path_resolve"]

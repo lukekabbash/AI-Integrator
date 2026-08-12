@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-task-working-directory"
+description = "Enables the task_working_directory command without any pre-configured scope."
+commands.allow = ["task_working_directory"]
+
+[[permission]]
+identifier = "deny-task-working-directory"
+description = "Denies the task_working_directory command without any pre-configured scope."
+commands.deny = ["task_working_directory"]

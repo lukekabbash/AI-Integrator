@@ -1566,6 +1566,25 @@ export function Transcript({
       if (!node || pendingPrependAnchorRef.current !== pending) return;
       pendingPrependAnchorRef.current = null;
       node.scrollTop = pending.scrollTop + Math.max(0, node.scrollHeight - pending.scrollHeight);
+      // The requested page has landed, so release the one-shot latch. If the
+      // restored position is still inside the top band (short prepend, or the
+      // scrollbar held at the very top), no scroll event will ever fire to
+      // clear it via hysteresis and pagination would stall one page in —
+      // chain the next older-page request here.
+      loadOlderRequestedRef.current = false;
+      if (
+        hasMoreOlder &&
+        onLoadOlder &&
+        paginationArmedRef.current &&
+        node.scrollTop <= LOAD_OLDER_THRESHOLD_PX
+      ) {
+        pendingPrependAnchorRef.current = {
+          scrollHeight: node.scrollHeight,
+          scrollTop: node.scrollTop,
+        };
+        loadOlderRequestedRef.current = true;
+        onLoadOlder();
+      }
     };
 
     if (prependAnchorFrameRef.current !== undefined) {
@@ -1582,7 +1601,7 @@ export function Transcript({
     } else {
       apply();
     }
-  }, [events, scrollContainerRef, virtualizationEnabled]);
+  }, [events, hasMoreOlder, onLoadOlder, scrollContainerRef, virtualizationEnabled]);
 
   useEffect(() => {
     if (openSettledRef.current || events.length === 0) return;
@@ -2293,6 +2312,9 @@ function sameEventSurface(
 function findCurrentActivity(events: TranscriptEvent[]): TranscriptEvent | undefined {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index];
+    // Never narrate across a user prompt: everything above it belongs to an
+    // earlier turn, and a cut-off relic there would freeze the live ticker.
+    if (event.kind === "user") return undefined;
     if (event.children?.length) {
       const nested = findCurrentActivity(event.children);
       if (nested) return nested;

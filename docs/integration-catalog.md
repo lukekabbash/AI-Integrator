@@ -1,7 +1,7 @@
 # Integration catalog
 
 **Product:** AI Integrator  
-**Last source review:** 2026-07-11
+**Last source review:** 2026-08-12
 **Purpose:** Make provider-adapter implementation possible without rediscovering install, login, protocol, session, permission, usage, and policy details.
 
 This is an implementation notebook, not a promise that every vendor surface is stable or contractually available. Commands and protocol fields must be re-probed against the installed version during adapter startup. Do not copy credentials out of a vendor's store, synthesize private APIs, or call a consumer web endpoint when an official CLI, ACP server, SDK, or app-server exists.
@@ -140,7 +140,10 @@ from generic prompt shortcuts:
   but the current print-mode route is not a slash-command transport. Those
   rows are labeled interactive-only; they must never be sent as ordinary model
   prose while claiming native execution.
-- Grok uses `grok --no-auto-update agent stdio`; before `session/new`, the ACP
+- Grok uses `grok --no-auto-update agent --no-leader --always-approve stdio`
+  (Chat omits `--always-approve` and locks tools with `--permission-mode dontAsk`);
+  model and effort are agent flags (`--model`, `--reasoning-effort`) so a route
+  change relaunches. Before `session/new`, the ACP
   adapter may select only the provider-advertised `cached_token` auth method.
   It never reads, accepts, or proxies an xAI API key. Current Grok Build ACP
   initialization does not advertise mutable model or thought-level config
@@ -437,8 +440,8 @@ negotiated catalog and preserve provider IDs exactly:
 | Runtime | Current documented model examples | Correct discovery/selection surface | Reasoning/hidden-thought rule |
 |---|---|---|---|
 | Codex | GPT-family models, including the model IDs returned by the current Codex build | Local app-server `model/list`; pass the selected `model` and advertised `reasoningEffort` to `thread/start` or the documented turn override | Store/render `reasoning.summary`; never persist raw `reasoning.content` as a handoff or audit payload |
-| Cursor Agent | Composer 2.5, frontier-provider models, and account-visible open-weight models | ACP `session/new` `configOptions`; `session/set_config_option`; `agent models` only as a structured fallback | Use provider-advertised `thought_level` options; do not infer effort suffixes from model names |
-| Grok Build | `grok-4.5` and models returned by the installed CLI | `grok models` for live ids; `--model` and `--reasoning-effort` before `grok agent stdio`; reconnect when the route changes because current ACP does not advertise mutable routing config | Expose `low`, `medium`, and `high` only for the currently verified `grok-4.5`; leave future models without an effort picker until their capability is documented or advertised; never infer subscription quota or expose hidden reasoning |
+| Cursor Agent | Composer 2.5, Claude Fable/Opus/Sonnet 5, GPT-5.6 Sol/Terra/Luna, Cursor Grok 4.5, and other account-visible frontier models | ACP `session/new` `configOptions`; `session/set_config_option`; `agent models` / static setup ids only as a structured fallback | Use provider-advertised `thought_level` options; do not infer effort suffixes from model names |
+| Grok Build | Models returned by the installed CLI (`grok-4.6`, `grok-4.5` on current builds) | `grok models` for live ids and login sentence; ACP `initialize` / `session/new` `_meta.modelState` when a session exists; `--model` and `--reasoning-effort` before `grok agent stdio`; reconnect when the route changes because current ACP does not advertise mutable `configOptions` | Attach a picker only for documented or advertised menus: `grok-4.6` is `low` / `medium` / `high` / `xhigh` (API default `high`); `grok-4.5` is `low` / `medium` / `high`; unknown slugs stay picker-less until ACP advertises `reasoningEfforts`. Never infer subscription quota or expose hidden reasoning |
 | Claude Code | `claude-opus-4-8`, `claude-fable-5`, `claude-sonnet-5`, and `claude-haiku-4-5` where the user's Claude Code surface exposes them | User-owned `claude -p` structured CLI; `--model` plus Claude Code's `/effort` control; no AI Integrator account/login path | Do not store raw `thinking`/hidden chain-of-thought events; only retain provider-labeled summaries or observable final/tool activity |
 | Gemini CLI | Account/config-visible Gemini models | `gemini --acp` (or the installed CLI's current ACP flag); ACP config options when advertised | Treat thought events as provider content and apply the same raw-thought boundary |
 

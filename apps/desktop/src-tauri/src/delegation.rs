@@ -478,10 +478,14 @@ fn select_service_level<'a>(
 // Prompt assembly
 // ---------------------------------------------------------------------------
 
-/// Instruction block prepended to the orchestrator's wire prompt when
-/// delegation is active. Spells out the full workflow inline: agents that
-/// only saw tool names have gone hunting through the repository for how
-/// "Integrator delegation" works instead of just calling the tools.
+/// Durable delegation contract for an orchestrator session. Spells out the
+/// full workflow inline: agents that only saw tool names have gone hunting
+/// through the repository for how "Integrator delegation" works instead of
+/// just calling the tools. Provider sessions keep their history, so this
+/// block must enter each session once, not ride every turn: Claude carries
+/// it in the per-process system layer (`--append-system-prompt`), Codex and
+/// ACP inject it into the thread/session once and repeat it only when its
+/// content changes.
 pub fn orchestrator_preamble(store: &LocalStore, mode: &str) -> String {
     let mut block = String::from(
         "<delegation>\nYou can delegate subtasks to saved specialists or mint a one-off specialist with its own durable working instructions. The tools are already connected on the `integrator` MCP server: peers_list, delegate_start, delegation_status, delegation_message, delegation_thread, delegation_result, delegation_stop. Call them directly — do not search this repository, read Integrator source code, or shell out to provider CLIs to figure out how delegation works. This block plus the tool descriptions are the complete contract.\n\nWorkflow:\n1. For a saved specialist, call peers_list, choose by Best for, then use delegate_start(profileId, serviceLevel, title, brief, permission). The profile's route, fallbacks, guidance, access, Skills/Plugins, and MCPs are frozen at launch.\n2. When the task benefits from a purpose-built way of thinking rather than saved capabilities, use delegate_start(name, instructions, title, brief). instructions are the durable special sauce: role, reasoning discipline, checks, style, and working method. brief is only the immediate task: goal, constraints, relevant context, and exact deliverable. One-off specialists use this chat's current route, are read-only, and receive no optional Skills or MCP grants.\n3. The child sees only a short digest of recent conversation plus the frozen instructions and brief, so both must stand alone. Do not repeat the task in instructions; do not put durable working method only in brief.\n4. delegate_start returns a delegationId immediately and the subagent runs in the background. Do not block waiting on it — continue your own work, and launch several delegations in parallel when subtasks are independent.\n5. delegation_status — check progress when convenient and whenever a <delegation-update> block appears in your prompt. Subagents may queue questions or progress reports mid-run; answer with delegation_message(delegationId, message). Use delegation_thread(delegationId) when you need the persisted child conversation rather than its compact status. The user can open the same transcript in the Agents rail.\n6. delegation_result(delegationId) — collect the finished deliverable (the subagent's summary plus a transcript digest) and integrate it. Verify delegated work before relying on it; your task is not done while delegations you still need are running.\n7. delegation_stop(delegationId) — stop a subagent you no longer need.\n",
@@ -2381,6 +2385,7 @@ async fn spawn_structured_child(
         control_overlay,
         hook_event_log,
         resume_context: None,
+        sent_skill_index: Arc::new(std::sync::Mutex::new(None)),
     };
     crate::commands::spawn_structured_cli_pump(
         app.clone(),
@@ -2398,7 +2403,7 @@ async fn spawn_structured_child(
             child_task_id,
             mcp_config.is_some(),
         ),
-        capability_index,
+        capability_index: Arc::new(std::sync::Mutex::new(capability_index)),
         driver: DelegationChildDriver::Structured {
             runtime,
             provider,
@@ -2518,6 +2523,8 @@ async fn spawn_codex_child(
         binding: Arc::new(std::sync::Mutex::new(Some(binding))),
         context_primer: Arc::new(std::sync::Mutex::new(None)),
         pending_user_prompt: Arc::new(std::sync::Mutex::new(None)),
+        sent_delegation_preamble: Arc::new(std::sync::Mutex::new(None)),
+        sent_skill_index: Arc::new(std::sync::Mutex::new(None)),
     };
     crate::commands::spawn_projection_pump(app.clone(), Arc::clone(&state.store), runtime.clone());
     let child = DelegationChild {
@@ -2527,7 +2534,7 @@ async fn spawn_codex_child(
         busy: Arc::new(std::sync::Mutex::new(false)),
         completed: Arc::new(std::sync::Mutex::new(false)),
         sentinel_watermark: sentinel_watermark_for(&state.store, child_task_id, has_tools),
-        capability_index,
+        capability_index: Arc::new(std::sync::Mutex::new(capability_index)),
         driver: DelegationChildDriver::Codex { runtime, thread_id },
     };
     watch_codex_child(app.clone(), &child, client);
@@ -2736,6 +2743,7 @@ async fn spawn_acp_child(
         environment: crate::commands::acp_launch_environment(&provider, &profile),
         working_directory: Some(cwd.clone()),
         client_version: env!("CARGO_PKG_VERSION").into(),
+        skip_initialized_notification: provider == ProviderKind::Grok,
     })
     .await?;
     if let Err(error) = crate::commands::authenticate_acp_provider(&client, &provider).await {
@@ -2853,7 +2861,9 @@ async fn spawn_acp_child(
         available_actions: Arc::new(std::sync::Mutex::new(Vec::new())),
         context_primer: Arc::new(std::sync::Mutex::new(None)),
         delegation_preamble: Arc::new(std::sync::Mutex::new(None)),
+        sent_skill_index: Arc::new(std::sync::Mutex::new(None)),
         unattended: true,
+        auto_approve_permissions: true,
         read_only: delegation.permission.is_read_only(),
         session_spec: Arc::new(std::sync::Mutex::new(Some(AcpSessionSpec {
             cwd,
@@ -2869,7 +2879,7 @@ async fn spawn_acp_child(
         busy: Arc::new(std::sync::Mutex::new(false)),
         completed: Arc::new(std::sync::Mutex::new(false)),
         sentinel_watermark: sentinel_watermark_for(&state.store, child_task_id, has_tools),
-        capability_index,
+        capability_index: Arc::new(std::sync::Mutex::new(capability_index)),
         driver: DelegationChildDriver::Acp {
             runtime: runtime.clone(),
             session_id,
@@ -2899,7 +2909,9 @@ async fn start_child_turn(
     mut prompt: ChildPrompt,
 ) -> Result<()> {
     *child.busy.lock().expect("busy lock") = true;
-    if let Some(index) = &child.capability_index {
+    // Spent on the first turn only: the child's provider session keeps its
+    // history, so repeating the index on every turn would compound it.
+    if let Some(index) = child.capability_index.lock().expect("index lock").take() {
         prompt.wire = format!("{index}{}", prompt.wire);
     }
     let result: Result<()> = async {

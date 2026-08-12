@@ -442,6 +442,7 @@ async fn generate_acp_title(
         environment: acp_launch_environment(&provider, &profile),
         working_directory: Some(cwd.to_path_buf()),
         client_version: env!("CARGO_PKG_VERSION").into(),
+        skip_initialized_notification: provider == ProviderKind::Grok,
     })
     .await
     .map_err(CommandError::from)?;

@@ -647,6 +647,53 @@ describe("native runtime recovery UI", () => {
     );
   }, 30_000);
 
+  it("keeps a restored empty chat quiet while its runtime check is still pending", async () => {
+    const workspace = createEmptySnapshot();
+    workspace.projects = [
+      {
+        id: "project-1",
+        name: "sample",
+        path: "H:\\Code\\sample",
+        branch: "main",
+        dirtyFiles: 0,
+        expanded: true,
+      },
+    ];
+    workspace.tasks = [
+      {
+        id: "task-1",
+        projectId: "project-1",
+        title: "New chat",
+        status: "draft",
+        runtime: "codex",
+        model: "Provider default",
+        updatedAt: "2026-07-10T16:00:00Z",
+      },
+    ];
+    workspace.activeProjectId = "project-1";
+    workspace.activeTaskId = "task-1";
+    bridgeMock.loadWorkspace.mockResolvedValue(workspace);
+    // No persisted events: hydrate carries the "reconciling" placeholder
+    // connection, and the authority check (runtime liveness probe) never
+    // resolves within the notice grace period.
+    const persisted = projectionSnapshot({ watermarkSeq: 0, runtimeLive: false });
+    bridgeMock.loadTaskProjection.mockImplementation(
+      async (_taskId: string, options?: LoadTaskProjectionOptions) =>
+        options?.skipRuntimeCheck
+          ? persisted
+          : new Promise<TaskProjectionSnapshot>(() => undefined),
+    );
+
+    render(<App />);
+
+    await screen.findByRole("textbox", { name: "Task message" });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 900));
+    });
+    expect(screen.queryByText("Reconciling persisted task state…")).not.toBeInTheDocument();
+    expect(screen.queryByText("Loading persisted task state")).not.toBeInTheDocument();
+  }, 30_000);
+
   it("preserves persisted history and fails closed when runtime authority is unavailable", async () => {
     const persisted = projectionSnapshot({
       watermarkSeq: 3,

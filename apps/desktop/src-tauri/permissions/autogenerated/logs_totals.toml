@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-logs-totals"
+description = "Enables the logs_totals command without any pre-configured scope."
+commands.allow = ["logs_totals"]
+
+[[permission]]
+identifier = "deny-logs-totals"
+description = "Denies the logs_totals command without any pre-configured scope."
+commands.deny = ["logs_totals"]

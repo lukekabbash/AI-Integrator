@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ProviderKind, ProviderSessionId, RuntimeSessionId, Task, TaskId};
 
-/// Newest item/approval rows returned on cold UI hydrate.
+/// Minimum item/approval rows returned on cold UI hydrate.
 ///
 /// Kept above the transcript virtualization threshold (250) so a typical open
 /// paints without an immediate older-page fetch, while bounding SQLite/IPC
@@ -13,6 +13,17 @@ use crate::{ProviderKind, ProviderSessionId, RuntimeSessionId, Task, TaskId};
 /// (unchanged contract: shared SQLite by task_id across providers); this
 /// constant is display-hydrate only.
 pub const TASK_PROJECTION_HYDRATE_TAIL: usize = 300;
+
+/// User/agent messages a default hydrate page keeps extending toward.
+///
+/// Tool-heavy turns fill the item window with command/tool/reasoning rows, so
+/// counting raw items alone can hydrate a page holding almost no conversation.
+/// The window grows past [`TASK_PROJECTION_HYDRATE_TAIL`] until it contains
+/// this many `user_message`/`agent_message` rows (or the caps below stop it).
+pub const TASK_PROJECTION_HYDRATE_TAIL_MESSAGES: usize = 100;
+
+/// Hard cap on item/approval rows in one default hydrate page.
+pub const TASK_PROJECTION_HYDRATE_MAX_ITEMS: usize = 1500;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "camelCase")]

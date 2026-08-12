@@ -50,6 +50,14 @@ pub struct CodexRuntime {
     /// Keeps provider-only context out of the durable user transcript and,
     /// when applicable, stamps a verified native skill invocation.
     pub pending_user_prompt: Arc<std::sync::Mutex<Option<PendingUserPrompt>>>,
+    /// The delegation preamble text most recently injected into the live
+    /// thread. Codex threads persist their history, so the block is sent
+    /// once and repeated only when its content changes (mode or user policy
+    /// edits), never on every turn.
+    pub sent_delegation_preamble: Arc<std::sync::Mutex<Option<String>>>,
+    /// See [`CodexRuntime::sent_delegation_preamble`]; same dedupe for the
+    /// `<integrator-skills>` index, re-sent only when the enabled set changes.
+    pub sent_skill_index: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// A permission option advertised by an ACP `session/request_permission`
@@ -114,6 +122,10 @@ pub struct AcpRuntime {
     /// One-shot delegation tool preamble queued at session start and spent
     /// on the first turn (ACP sessions persist, so it must not repeat).
     pub delegation_preamble: Arc<std::sync::Mutex<Option<String>>>,
+    /// The `<integrator-skills>` index most recently injected into the live
+    /// session. ACP sessions persist their history, so the index is re-sent
+    /// only when the enabled-skill set changes, never on every turn.
+    pub sent_skill_index: Arc<std::sync::Mutex<Option<String>>>,
     /// Delegated children run without a human watching their approvals: the
     /// pump resolves `session/request_permission` and `cursor/create_plan`
     /// immediately (the ACP analog of Codex's approval-policy "never")
@@ -122,6 +134,9 @@ pub struct AcpRuntime {
     /// Read-only delegated children reject ACP permission requests instead of
     /// inheriting the unattended auto-allow behavior used by writing workers.
     pub read_only: bool,
+    /// Project Grok ACP launches `--always-approve` so tool prompts must not
+    /// park a card. Chat stays `dontAsk` and keeps this false.
+    pub auto_approve_permissions: bool,
     /// Exact lifecycle parameters required by ACP session/load or
     /// session/resume. Kept in memory only; the durable resume record stores
     /// no MCP secrets.
@@ -161,6 +176,12 @@ pub struct StructuredRuntime {
     /// Redacted official-hook event stream inside `control_overlay`.
     pub hook_event_log: Option<PathBuf>,
     pub resume_context: Option<StructuredResumeContext>,
+    /// The `<integrator-skills>` index most recently injected into the
+    /// resumed provider conversation (Antigravity only; Claude loads skills
+    /// natively). Carried across the per-turn process respawns like
+    /// `control_overlay` so the index repeats only when the enabled-skill
+    /// set changes, never on every turn.
+    pub sent_skill_index: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// See [`StructuredRuntime::permission_requests`].
@@ -188,8 +209,10 @@ pub struct DelegationChild {
     /// safely (e.g. while working on Integrator's own source).
     pub sentinel_watermark: Option<Arc<std::sync::Mutex<i64>>>,
     /// Exact selected-skill index for runtimes without native plugin loading.
-    /// Wire-only and repeated on each fresh turn/session continuation.
-    pub capability_index: Option<String>,
+    /// Wire-only, spent on the child's first turn: the provider session keeps
+    /// its history, so later turns must not repeat it. Respawned drivers are
+    /// rebuilt with a fresh index.
+    pub capability_index: Arc<std::sync::Mutex<Option<String>>>,
     pub driver: DelegationChildDriver,
 }
 

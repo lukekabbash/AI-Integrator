@@ -14,6 +14,20 @@ First-class ACP runtimes share one protocol boundary, but installation, authenti
 8. Certify session recovery and MCP transports from the live ACP handshake. Missing capabilities stay visible as degraded rather than being filled in from marketing claims.
 9. Test discovery order, launch arguments, login/update commands, mode parsing, model/thought parsing, routing application, delegation changes, reconnect, cancellation, and malformed or missing capability snapshots.
 
+## Grok Build record
+
+Implemented against Grok Build CLI 1.0.3 and the official xAI Build / reasoning docs on 2026-08-12.
+
+- Install: official PowerShell/bash installer to `~/.grok/bin`; npm package `@xai-official/grok`.
+- Update: `grok update`.
+- Login: vendor `grok login` / browser / device auth. Discovery asks `grok --no-auto-update models` and parses the login sentence (`You are logged in with grok.com.`). Integrator does not read `~/.grok/auth.json` or `config.toml`.
+- Launch: `grok --no-auto-update agent --no-leader --always-approve [--model <id>] [--reasoning-effort <level>] stdio`. Chat omits `--always-approve` and uses `--permission-mode dontAsk`. Grok applies `cached_token` during `initialize` (`defaultAuthMethodId`); Integrator does not send ACP `authenticate` or `initialized` when that default is already selected. Logged-out agents that omit `cached_token` still require `grok login`.
+- Models: live ids from `grok models` (`*` default and `-` siblings). ACP `initialize` / `session/new` `_meta.modelState.availableModels` is authoritative when present. Degraded fallback ids are `grok-4.6` and `grok-4.5`.
+- Effort: documented menus only — `grok-4.6` exposes `low` / `medium` / `high` / `xhigh`; `grok-4.5` exposes `low` / `medium` / `high`. Current ACP does not advertise mutable `configOptions`, so route changes relaunch with flags and resume the bound session.
+- Modes: Grok ACP does not advertise session modes. Chat isolation is launch-flag and env based (`--tools ""`, `--no-memory`, compatibility scanners off).
+
+Primary sources: [Grok Build overview](https://docs.x.ai/build/overview), [CLI reference](https://docs.x.ai/build/cli/reference), [headless / ACP](https://docs.x.ai/build/cli/headless-scripting), [reasoning effort](https://docs.x.ai/developers/model-capabilities/text/reasoning), and [models](https://docs.x.ai/developers/models).
+
 ## Kimi Code record
 
 Implemented against the current Moonshot `kimi-code` TypeScript runtime and its official documentation on 2026-07-17.

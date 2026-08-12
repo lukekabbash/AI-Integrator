@@ -9,6 +9,7 @@ mod commands;
 mod commit_message;
 mod credential_store;
 mod delegation;
+mod diagnostic_log;
 mod explain_context;
 mod harness_prompt;
 mod integrator_mcp;
@@ -103,6 +104,21 @@ pub fn run() {
             })?;
             integrator_skills::prune_projections(&state.data_directory);
             integrator_mcp::prune_projections(&state.data_directory);
+            if let Ok(documents) = app.path().document_dir() {
+                let retention = state
+                    .store
+                    .get_setting("settings.diagnostics.retention")
+                    .ok()
+                    .flatten()
+                    .and_then(|setting| setting.value.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "7d".into());
+                if let Err(error) = crate::diagnostic_log::prune_logs(
+                    &documents,
+                    crate::diagnostic_log::parse_retention(&retention),
+                ) {
+                    eprintln!("diagnostic log prune failed: {error}");
+                }
+            }
             app.manage(state);
             if let Err(error) = integrator_skills::ensure_roots(app.handle()) {
                 eprintln!("skills root creation failed: {error}");
@@ -193,6 +209,16 @@ pub fn run() {
             project_file_opener_list,
             project_file_open,
             project_file_reveal,
+            project_file_duplicate,
+            project_path_resolve,
+            path_reveal,
+            task_reveal,
+            task_working_directory,
+            logs_open_folder,
+            logs_totals,
+            logs_clear,
+            logs_prune,
+            diagnostics_report,
             attachment_preview,
             chat_attachment_pick,
             attachment_save_paste,

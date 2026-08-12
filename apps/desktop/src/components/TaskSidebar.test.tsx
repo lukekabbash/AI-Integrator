@@ -534,6 +534,84 @@ describe("TaskSidebar", () => {
     expect(overflowButtons[0].parentElement).toHaveAttribute("data-menu-open", "true");
   });
 
+  it("opens the chat overflow menu from a right-click and reveals the folder", () => {
+    document.documentElement.dataset.motion = "none";
+    try {
+      const onRevealTask = vi.fn();
+      const snapshot = createDemoSnapshot();
+      const task = snapshot.tasks.find((entry) => entry.id === snapshot.activeTaskId)!;
+      setup({ onRevealTask, tasks: [task], activeTaskId: task.id });
+      fireEvent.contextMenu(screen.getByRole("button", { name: new RegExp(task.title) }));
+      const menu = screen.getByRole("menu");
+      fireEvent.click(within(menu).getByRole("menuitem", { name: /Reveal in File Explorer/i }));
+      expect(onRevealTask).toHaveBeenCalledWith(expect.objectContaining({ id: task.id }));
+    } finally {
+      delete document.documentElement.dataset.motion;
+    }
+  });
+
+  it("resolves a general chat folder when copy path has no project pairing", async () => {
+    document.documentElement.dataset.motion = "none";
+    try {
+      const onResolveTaskFolder = vi.fn().mockResolvedValue("C:\\Users\\me\\chat-runtime\\general-chat");
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText },
+      });
+      const snapshot = createDemoSnapshot();
+      const generalChat = {
+        ...snapshot.tasks[0],
+        id: "general-chat",
+        projectId: "__integrator_chats__",
+        kind: "chat" as const,
+        title: "Research notes",
+        worktree: undefined,
+      };
+      setup({
+        onResolveTaskFolder,
+        tasks: [generalChat],
+        activeTaskId: generalChat.id,
+        activeProjectId: undefined,
+        projects: [],
+      });
+      fireEvent.contextMenu(screen.getByRole("button", { name: /Research notes/ }));
+      fireEvent.click(screen.getByRole("menuitem", { name: /Copy absolute path/i }));
+      expect(onResolveTaskFolder).toHaveBeenCalledWith(expect.objectContaining({ id: generalChat.id }));
+      await waitFor(() => {
+        expect(writeText).toHaveBeenCalledWith("C:\\Users\\me\\chat-runtime\\general-chat");
+      });
+    } finally {
+      delete document.documentElement.dataset.motion;
+    }
+  });
+
+  it("opens the project overflow menu from a right-click with reveal and copy path", () => {
+    document.documentElement.dataset.motion = "none";
+    try {
+      const onRevealProject = vi.fn();
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText },
+      });
+      const { snapshot } = setup({ onRevealProject });
+      const active = snapshot.projects.find((project) => project.id === snapshot.activeProjectId)!;
+      fireEvent.contextMenu(screen.getByRole("button", { name: active.name }));
+      const menu = screen.getByRole("menu");
+      fireEvent.click(within(menu).getByRole("menuitem", { name: /Copy absolute path/i }));
+      expect(writeText).toHaveBeenCalledWith(active.path);
+      fireEvent.contextMenu(screen.getByRole("button", { name: active.name }));
+      fireEvent.click(screen.getByRole("menuitem", { name: /Copy relative path/i }));
+      expect(writeText).toHaveBeenCalledWith(active.path.replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).at(-1));
+      fireEvent.contextMenu(screen.getByRole("button", { name: active.name }));
+      fireEvent.click(screen.getByRole("menuitem", { name: /Reveal in File Explorer/i }));
+      expect(onRevealProject).toHaveBeenCalledWith(expect.objectContaining({ id: active.id }));
+    } finally {
+      delete document.documentElement.dataset.motion;
+    }
+  });
+
   it("anchors the overflow menu left when that direction is selected", () => {
     setup({ sidebarMenuDirection: "left" });
     const overflowButtons = screen.getAllByRole("button", { name: "More chat actions" });
@@ -554,8 +632,8 @@ describe("TaskSidebar", () => {
 
     const menu = screen.getByRole("menu");
     expect(menu).toHaveAttribute("data-direction", "left");
-    // Menu width 164 → left edge at trigger.right - 3 - 164.
-    expect(menu).toHaveStyle({ left: "77px" });
+    // Menu width 200 → left edge at trigger.right - 3 - 200.
+    expect(menu).toHaveStyle({ left: "41px" });
   });
 
   it("opens the chat overflow menu upward when space below is tight", () => {
@@ -598,7 +676,7 @@ describe("TaskSidebar", () => {
     const { callbacks } = setup({ tasks: [task], activeTaskId: task.id });
     fireEvent.click(screen.getByRole("button", { name: "More chat actions" }));
 
-    fireEvent.click(within(screen.getByRole("menu")).getByRole("menuitem", { name: /Copy/ }));
+    fireEvent.click(within(screen.getByRole("menu")).getByRole("menuitem", { name: /^Copy$/ }));
 
     expect(callbacks.onCopyTask).toHaveBeenCalledWith(task.id);
     expect(screen.queryByRole("menu")).toBeNull();
@@ -610,7 +688,7 @@ describe("TaskSidebar", () => {
     const { callbacks } = setup({ tasks: [task], activeTaskId: task.id });
     fireEvent.click(screen.getByRole("button", { name: "More chat actions" }));
 
-    const copy = within(screen.getByRole("menu")).getByRole("menuitem", { name: /Copy/ });
+    const copy = within(screen.getByRole("menu")).getByRole("menuitem", { name: /^Copy$/ });
     expect(copy).toBeEnabled();
     fireEvent.click(copy);
     expect(callbacks.onCopyTask).toHaveBeenCalledWith(task.id);

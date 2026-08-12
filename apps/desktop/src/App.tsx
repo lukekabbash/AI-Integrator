@@ -41,6 +41,7 @@ import {
 } from "lucide-react";
 import {
   bridge,
+  CHAT_PROJECT_ID,
   CHAT_TITLE_PLACEHOLDER,
   GENERAL_CHAT_TITLE_PLACEHOLDER,
   diffFileKey,
@@ -510,7 +511,7 @@ function NativeTitlebar({
   onOpenSettings,
   onOpenSetup,
 }: {
-  context: string;
+  context?: string;
   title?: string;
   detail?: ReactNode;
   leading?: ReactNode;
@@ -769,7 +770,7 @@ function NativeTitlebar({
         ) : null}
         {resourceTabs}
       </div>
-      {tabs || title ? null : <div className="titlebar-context">{context}</div>}
+      {!tabs && !title && context ? <div className="titlebar-context">{context}</div> : null}
       <div className="titlebar-end">
         {tabs}
         {trailing}
@@ -1695,6 +1696,43 @@ export default function App() {
   const taskProjectionCache = useRef(new Map<string, RuntimeProjectionState>());
   const [subagentProjectionCache] = useState(() => new SubagentProjectionCache());
   const activeTaskIdRef = useRef<string | undefined>(snapshot.activeTaskId);
+
+  useEffect(() => {
+    const message = operationError.trim();
+    if (!message) return;
+    void bridge.reportDiagnostic?.("incident", {
+      level: "error",
+      faultId:
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `fault-${Date.now()}`,
+      layer: "ui",
+      op: "ui.operationError",
+      outcome: "fail",
+      causeClass: "ui-state",
+      taskId: activeTaskIdRef.current || undefined,
+      projectId: snapshot.activeProjectId || undefined,
+      detail: message,
+    });
+  }, [operationError, snapshot.activeProjectId]);
+
+  useEffect(() => {
+    if (!composerError?.message.trim()) return;
+    void bridge.reportDiagnostic?.("incident", {
+      level: "error",
+      faultId:
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `fault-${Date.now()}`,
+      layer: "ui",
+      op: "ui.composerNotice",
+      outcome: "fail",
+      causeClass: "ui-state",
+      taskId: activeTaskIdRef.current || undefined,
+      projectId: snapshot.activeProjectId || undefined,
+      detail: composerError.message,
+    });
+  }, [composerError, snapshot.activeProjectId]);
   const activeProjectIdRef = useRef<string | undefined>(snapshot.activeProjectId);
   const taskRuntimeByIdRef = useRef(
     new Map(snapshot.tasks.map((task) => [task.id, task.runtime] as const)),
@@ -2338,6 +2376,9 @@ export default function App() {
               if (!active || !runtimes) return;
               setSnapshot((current) => ({ ...current, runtimes }));
               applyVerifiedRuntimeHealth(runtimes, loaded.tasks);
+              // Warm every connected runtime's catalog now so switching
+              // runtime in the composer paints from cache, not a CLI probe.
+              bridge.prefetchModelCatalogs?.(runtimes);
             })
             .catch(() => undefined);
         }
@@ -2769,6 +2810,28 @@ export default function App() {
       ? { ...activeComposerDraft, permission: taskPermissions[activeTask.id] }
       : activeComposerDraft;
   const autoApproveActive = Boolean(activeTask && activeTaskPermission === "full-access");
+  useEffect(() => {
+    if (!nativeHost || !activeTask) return;
+    if (activeTask.runtime !== "grok" && activeTask.runtime !== "kimi") return;
+    void bridge
+      .prepareAcpRuntime?.({
+        taskId: activeTask.id,
+        runtime: activeTask.runtime,
+        model: activeTask.model,
+        effort: activeTask.effort,
+        permission: activeTaskPermission,
+        delegation: activeTask.kind === "chat" ? "off" : "manual",
+      })
+      .catch(() => undefined);
+  }, [
+    nativeHost,
+    activeTask?.id,
+    activeTask?.runtime,
+    activeTask?.model,
+    activeTask?.effort,
+    activeTask?.kind,
+    activeTaskPermission,
+  ]);
   const persistComposerDraft = (draft: ComposerDraft) => {
     if (typeof bridge.saveComposerDraft !== "function") return;
     pendingDraftWrites.current.set(draftOwnerKey(draft.owner), draft);
@@ -2923,7 +2986,7 @@ export default function App() {
   }, [subagentOpen, subagentPaneRatio]);
   const titleContext =
     screen === "settings"
-      ? "Settings"
+      ? undefined
       : screen === "scheduled"
         ? "Scheduled"
         : screen === "setup"
@@ -2948,6 +3011,9 @@ export default function App() {
     const runtimes = await bridge.probeRuntimes({ force: true });
     setSnapshot((current) => ({ ...current, runtimes }));
     applyVerifiedRuntimeHealth(runtimes, snapshot.tasks);
+    // A forced probe drops the catalog of any runtime whose version or auth
+    // moved; re-warm so the picker stays instant instead of re-probing lazily.
+    bridge.prefetchModelCatalogs?.(runtimes);
     return runtimes;
   }, [applyVerifiedRuntimeHealth, snapshot.tasks]);
 
@@ -4990,6 +5056,103 @@ export default function App() {
     await bridge.revealProjectFile(activeProject.id, path);
   };
 
+  const resolveProjectAbsolutePath = async (path: string) => {
+    if (!activeProject) throw new Error("Open a project before resolving paths.");
+    const resolved = await bridge.resolveProjectPath(activeProject.id, path);
+    return resolved.absolutePath;
+  };
+
+  const duplicateProjectFile = async (file: ProjectFileEntry) => {
+    if (!activeProject) throw new Error("Open a project before duplicating files.");
+    await bridge.duplicateProjectFile(activeProject.id, file.path);
+    try {
+      const files = await bridge.listProjectFiles(activeProject.id);
+      projectFilesCache.current.set(activeProject.id, files);
+      setProjectFiles(files);
+    } catch {
+      // The duplicate succeeded; the stale list refreshes on the next project load.
+    }
+    if (activeTask) {
+      scheduleTaskGitRefresh(activeTask.id, [file.path]);
+    } else {
+      scheduleProjectGitRefresh(activeProject.id);
+    }
+  };
+
+  const revealSidebarTask = (task: TaskSummary) => {
+    const project = snapshot.projects.find((entry) => entry.id === task.projectId);
+    void bridge.reportDiagnostic?.("detail", {
+      layer: "ui",
+      op: "ui.revealTask",
+      outcome: "start",
+      taskId: task.id,
+      projectId: task.projectId,
+      code: task.kind ?? "code",
+      detail: JSON.stringify({
+        kind: task.kind ?? "code",
+        hasWorktree: Boolean(task.worktree),
+        hasProjectPath: Boolean(project?.path),
+        syntheticChatProject: task.projectId === CHAT_PROJECT_ID,
+      }),
+    });
+    void bridge.revealTask(task.id).catch((error) => {
+      const message = formatBridgeError(error, "Could not reveal that folder.");
+      void bridge.reportDiagnostic?.("incident", {
+        level: "error",
+        layer: "ui",
+        op: "ui.revealTask",
+        outcome: "fail",
+        code: "reveal-failed",
+        causeClass:
+          task.kind === "chat" || task.projectId === CHAT_PROJECT_ID
+            ? "unpaired-folder"
+            : "reveal",
+        taskId: task.id,
+        projectId: task.projectId,
+        detail: message,
+      });
+      setOperationError(message);
+    });
+  };
+
+  const resolveSidebarTaskFolder = (task: TaskSummary) => {
+    void bridge.reportDiagnostic?.("detail", {
+      layer: "ui",
+      op: "ui.resolveTaskFolder",
+      outcome: "start",
+      taskId: task.id,
+      projectId: task.projectId,
+      code: task.kind ?? "code",
+      detail: JSON.stringify({
+        kind: task.kind ?? "code",
+        hasWorktree: Boolean(task.worktree),
+        syntheticChatProject: task.projectId === CHAT_PROJECT_ID,
+      }),
+    });
+    return bridge.resolveTaskFolder(task.id).catch((error) => {
+      const message = formatBridgeError(error, "Could not copy that folder path.");
+      void bridge.reportDiagnostic?.("incident", {
+        level: "error",
+        layer: "ui",
+        op: "ui.resolveTaskFolder",
+        outcome: "fail",
+        code: "resolve-failed",
+        causeClass: "unpaired-folder",
+        taskId: task.id,
+        projectId: task.projectId,
+        detail: message,
+      });
+      setOperationError(message);
+      throw error;
+    });
+  };
+
+  const revealSidebarProject = (project: ProjectSummary) => {
+    void bridge.revealAbsolutePath(project.path).catch((error) => {
+      setOperationError(formatBridgeError(error, "Could not reveal that project folder."));
+    });
+  };
+
   const openGitFileExternal = (file: DiffFile, openerId: string) =>
     openProjectPathExternal(file.path, openerId);
 
@@ -6187,6 +6350,9 @@ export default function App() {
         onDeleteProject={handleSidebarDeleteProject}
         onDeleteTask={handleSidebarDeleteTask}
         onDeleteArchivedChats={handleSidebarDeleteArchivedChats}
+        onRevealTask={nativeHost ? revealSidebarTask : undefined}
+        onResolveTaskFolder={nativeHost ? resolveSidebarTaskFolder : undefined}
+        onRevealProject={nativeHost ? revealSidebarProject : undefined}
         onOpenSettings={handleSidebarOpenSettings}
         onOpenScheduled={handleSidebarOpenScheduled}
         onOpenCapabilities={handleSidebarOpenCapabilities}
@@ -6610,7 +6776,15 @@ export default function App() {
                                       activeTask && resumingTaskId === activeTask.id,
                                     )}
                                     quietReconciling={Boolean(
-                                      activeTask && freshTaskIds.has(activeTask.id),
+                                      activeTask &&
+                                        (freshTaskIds.has(activeTask.id) ||
+                                          // A task with no persisted events (a new or
+                                          // restored draft chat) has nothing to
+                                          // reconcile; freshTaskIds only covers tasks
+                                          // created in this session.
+                                          (runtimeState.lastSeq === 0 &&
+                                            runtimeState.items.length === 0 &&
+                                            !runtimeState.turn)),
                                     )}
                                     showDisconnected={nativeTurnActive || optimisticTurnStarting}
                                   />
@@ -7117,6 +7291,10 @@ export default function App() {
                         activeFilePath={activeFileTabPath}
                         openingFilePath={fileTabOpeningPath}
                         onRenameProjectFile={renameProjectFile}
+                        onDuplicateProjectFile={nativeHost ? duplicateProjectFile : undefined}
+                        onResolveProjectAbsolutePath={
+                          nativeHost ? resolveProjectAbsolutePath : undefined
+                        }
                         onMentionProjectFile={mentionProjectFile}
                         onMentionProjectFolder={mentionProjectFolder}
                         fileOpeners={projectFileOpeners}

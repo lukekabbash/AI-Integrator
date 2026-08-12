@@ -1,7 +1,7 @@
 /**
  * Display helpers for model identifiers.
  *
- * Wire/API ids stay unchanged (`gpt-5.6-sol`, `grok-4.5`). These helpers only
+ * Wire/API ids stay unchanged (`gpt-5.6-sol`, `grok-4.6`). These helpers only
  * produce human-facing labels for pickers, transcripts, and agent routes.
  * Prefer a provider-supplied display name when it is already distinct from the
  * wire id; otherwise pretty-print the slug.
@@ -60,7 +60,7 @@ function prettyToken(token: string): string {
  *
  * Examples:
  * - `gpt-5.6-sol` → `GPT-5.6 Sol`
- * - `grok-4.5` → `Grok 4.5`
+ * - `grok-4.6` → `Grok 4.6`
  * - `claude-haiku-4-5` → `Claude Haiku 4.5`
  * - `composer-2.5` → `Composer 2.5`
  * Already-pretty names (`Gemini 3.1 Pro`, `GPT-5.4`) are left alone.
@@ -100,18 +100,22 @@ export function prettyModelLabel(modelId?: string | null): string {
   }
 
   // Claude ids encode minor versions as digit-digit pairs (haiku-4-5 → 4.5,
-  // opus-4-6-thinking → 4.6 Thinking).
+  // opus-4-6-thinking → 4.6 Thinking). Live-discovered ids can also carry a
+  // trailing snapshot date (haiku-4-5-20251001) that isn't part of the
+  // version and would otherwise get pretty-printed as a bogus extra number.
   if (first === "claude" && tokens.length >= 3) {
-    for (let index = tokens.length - 2; index >= 1; index--) {
-      if (/^\d{1,2}$/.test(tokens[index]!) && /^\d{1,2}$/.test(tokens[index + 1]!)) {
+    const dated = tokens.filter((token) => !/^\d{8}$/.test(token));
+    for (let index = dated.length - 2; index >= 1; index--) {
+      if (/^\d{1,2}$/.test(dated[index]!) && /^\d{1,2}$/.test(dated[index + 1]!)) {
         const merged = [
-          ...tokens.slice(0, index),
-          `${tokens[index]}.${tokens[index + 1]}`,
-          ...tokens.slice(index + 2),
+          ...dated.slice(0, index),
+          `${dated[index]}.${dated[index + 1]}`,
+          ...dated.slice(index + 2),
         ];
         return merged.map(prettyToken).join(" ");
       }
     }
+    return dated.map(prettyToken).join(" ");
   }
 
   return tokens.map(prettyToken).join(" ");

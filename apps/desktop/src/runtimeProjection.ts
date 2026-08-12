@@ -388,13 +388,31 @@ export function applyRuntimeProjectionBatch(
   return next;
 }
 
-function itemStatus(item: ItemProjection, turnSettled: boolean): TranscriptEvent["status"] {
+/** Tolerance between provider/renderer clocks when relating items to a turn. */
+const STALE_TURN_SLACK_MS = 5_000;
+/** An unfinished item this much older than the running turn is a cut-off relic. */
+const STALE_ITEM_REVIVAL_SLACK_MS = 120_000;
+
+function itemStatus(
+  item: ItemProjection,
+  turnSettled: boolean,
+  turnStartedAtMs: number = Number.NaN,
+): TranscriptEvent["status"] {
   if (item.status === "failed") return "error";
   if (item.status === "declined") return "warning";
   if (item.status === "completed") return "success";
   // An unfinished item under a settled turn was cut off and will never
   // complete; a live spinner would misreport it as still streaming.
-  return turnSettled ? "neutral" : "running";
+  if (turnSettled) return "neutral";
+  // Same for relics of an earlier turn: an unfinished item last touched well
+  // before the running turn began was cut off then, not revived by it.
+  if (Number.isFinite(turnStartedAtMs)) {
+    const updatedMs = Date.parse(item.updatedAt);
+    if (Number.isFinite(updatedMs) && updatedMs + STALE_ITEM_REVIVAL_SLACK_MS < turnStartedAtMs) {
+      return "neutral";
+    }
+  }
+  return "running";
 }
 
 function countChangedLines(text?: string): { additions: number; deletions: number } {
@@ -942,7 +960,16 @@ function workedForDuration(children: TranscriptEvent[], turn: TurnProjection | u
   const started = turn?.startedAt ? Date.parse(turn.startedAt) : Number.NaN;
   const completed = turn?.completedAt ? Date.parse(turn.completedAt) : Number.NaN;
   if (Number.isFinite(started) && Number.isFinite(completed) && completed >= started) {
-    return formatElapsedClock(completed - started);
+    // Children newer than the settled turn mean the turn projection is stale
+    // (a fresh turn is streaming); its clock would freeze the row at the old
+    // turn's duration.
+    const newest = children.reduce((max, child) => {
+      const value = Date.parse(child.timestamp);
+      return Number.isFinite(value) && value > max ? value : max;
+    }, Number.NEGATIVE_INFINITY);
+    if (newest <= completed + STALE_TURN_SLACK_MS) {
+      return formatElapsedClock(completed - started);
+    }
   }
   return formatActivityDuration(children);
 }
@@ -1031,7 +1058,17 @@ function collapseSettledTurnActivity(
     // Collapse completed prior turns always. Collapse the latest turn only once
     // it has settled — otherwise live activity stays visible while running.
     const isPriorTurn = nextUserIndex >= 0;
-    const shouldCollapse = isPriorTurn || options.turnSettled;
+    // A span whose user prompt or reply postdates the settled turn belongs to
+    // a newer turn the projection has not been told about yet; folding it
+    // would bury live streaming under the old turn's frozen clock.
+    const turnCompletedMs = options.turn?.completedAt
+      ? Date.parse(options.turn.completedAt)
+      : Number.NaN;
+    const spanPostdatesSettledTurn =
+      Number.isFinite(turnCompletedMs) &&
+      (Date.parse(event.timestamp) > turnCompletedMs + STALE_TURN_SLACK_MS ||
+        Date.parse(events[finalAssistantIndex].timestamp) > turnCompletedMs + STALE_TURN_SLACK_MS);
+    const shouldCollapse = isPriorTurn || (options.turnSettled && !spanPostdatesSettledTurn);
     if (!shouldCollapse) {
       while (index <= finalAssistantIndex) {
         result.push(events[index]);
@@ -1198,6 +1235,7 @@ function buildRuntimeTranscript(
     state.turn !== undefined &&
     state.turn.status !== "inProgress" &&
     state.turn.status !== "pending";
+  const turnStartedAtMs = state.turn?.startedAt ? Date.parse(state.turn.startedAt) : Number.NaN;
 
   if (state.plan.length > 0) {
     events.push({
@@ -1207,7 +1245,13 @@ function buildRuntimeTranscript(
       title: state.planTruncated ? "Plan (truncated)" : "Plan",
       body: `${state.plan.filter((step) => step.status === "completed").length} of ${state.plan.length} steps complete`,
       timestamp: state.items[0]?.updatedAt ?? new Date(0).toISOString(),
-      status: state.plan.every((step) => step.status === "completed") ? "success" : "running",
+      // An incomplete plan only spins while a turn is actually working it;
+      // after settle it is simply unfinished, not running.
+      status: state.plan.every((step) => step.status === "completed")
+        ? "success"
+        : turnSettled
+          ? "neutral"
+          : "running",
       children: state.plan.map((step) => ({
         id: `runtime-plan-${state.taskId}-${step.index}`,
         kind: "activity",
@@ -1228,7 +1272,7 @@ function buildRuntimeTranscript(
       ...deriveItem(
         item,
         state.firstSeen[item.id] ?? item.updatedAt,
-        itemStatus(item, turnSettled),
+        itemStatus(item, turnSettled, turnStartedAtMs),
       ),
     );
   }

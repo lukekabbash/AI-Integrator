@@ -303,7 +303,7 @@ fn find_known_install(provider: &ProviderKind) -> Option<PathBuf> {
 }
 
 fn known_install_candidates(provider: &ProviderKind) -> Vec<PathBuf> {
-    match provider {
+    let mut candidates = match provider {
         ProviderKind::Cursor => {
             let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
                 return Vec::new();
@@ -315,22 +315,60 @@ fn known_install_candidates(provider: &ProviderKind) -> Vec<PathBuf> {
                 root.join("dist-package").join("cursor-agent.cmd"),
             ]
         }
-        ProviderKind::Kimi => {
-            let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
-            else {
-                return Vec::new();
-            };
-            let home = PathBuf::from(home);
-            vec![
-                home.join(".local").join("bin").join("kimi"),
-                home.join(".local").join("bin").join("kimi.exe"),
-                home.join(".local").join("bin").join("kimi.cmd"),
-                home.join(".kimi-code").join("bin").join("kimi"),
-                home.join(".kimi-code").join("bin").join("kimi.exe"),
-                home.join(".kimi-code").join("bin").join("kimi.cmd"),
-            ]
-        }
+        ProviderKind::Kimi => home_dir()
+            .map(|home| {
+                vec![
+                    home.join(".local").join("bin").join("kimi"),
+                    home.join(".local").join("bin").join("kimi.exe"),
+                    home.join(".local").join("bin").join("kimi.cmd"),
+                    home.join(".kimi-code").join("bin").join("kimi"),
+                    home.join(".kimi-code").join("bin").join("kimi.exe"),
+                    home.join(".kimi-code").join("bin").join("kimi.cmd"),
+                ]
+            })
+            .unwrap_or_default(),
+        // The official installer (x.ai/cli/install.ps1|sh) places the binary
+        // in ~/.grok/bin and only amends the persistent PATH, which a running
+        // app never inherits.
+        ProviderKind::Grok => home_dir()
+            .map(|home| {
+                vec![
+                    home.join(".grok").join("bin").join("grok.exe"),
+                    home.join(".grok").join("bin").join("grok"),
+                ]
+            })
+            .unwrap_or_default(),
         _ => Vec::new(),
+    };
+    // npm global shims land in %APPDATA%\npm, which exists on PATH only after
+    // a re-login when npm itself created the directory.
+    #[cfg(windows)]
+    if let (Some(package_binary), Some(app_data)) =
+        (npm_binary_name(provider), std::env::var_os("APPDATA"))
+    {
+        candidates.push(
+            PathBuf::from(app_data)
+                .join("npm")
+                .join(format!("{package_binary}.cmd")),
+        );
+    }
+    candidates
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+}
+
+#[cfg(windows)]
+fn npm_binary_name(provider: &ProviderKind) -> Option<&'static str> {
+    match provider {
+        ProviderKind::Codex => Some("codex"),
+        ProviderKind::Claude => Some("claude"),
+        ProviderKind::Grok => Some("grok"),
+        ProviderKind::Kimi => Some("kimi"),
+        _ => None,
     }
 }
 
@@ -408,9 +446,22 @@ fn authentication_status(
             AuthenticationState::Unknown,
             Some("auth-probe-requires-acp".into()),
         ),
-        ProviderKind::Grok | ProviderKind::CustomAcp => {
-            (AuthenticationState::Unknown, Some("auth-not-probed".into()))
+        // `grok models` is the documented read-only inventory and prints a
+        // login sentence (`You are logged in with grok.com.`) without exposing
+        // token contents. Do not read `~/.grok/auth.json`.
+        ProviderKind::Grok => {
+            match run_bounded(executable, &["--no-auto-update", "models"], None) {
+                Ok(output) => {
+                    let combined = format!("{} {}", output.stdout, output.stderr);
+                    parse_cli_auth_text(&combined)
+                }
+                Err(_) => (
+                    AuthenticationState::Unknown,
+                    Some("auth-probe-failed".into()),
+                ),
+            }
         }
+        ProviderKind::CustomAcp => (AuthenticationState::Unknown, Some("auth-not-probed".into())),
     }
 }
 
@@ -636,8 +687,27 @@ mod tests {
 
     #[test]
     fn providers_without_documented_install_locations_have_no_fallback() {
-        assert!(known_install_candidates(&ProviderKind::Codex).is_empty());
-        assert!(known_install_candidates(&ProviderKind::Claude).is_empty());
+        assert!(known_install_candidates(&ProviderKind::Antigravity).is_empty());
+        assert!(known_install_candidates(&ProviderKind::CustomAcp).is_empty());
+    }
+
+    #[test]
+    fn grok_fallback_covers_official_installer_and_npm_locations() {
+        if home_dir().is_none() {
+            return;
+        }
+        let candidates = known_install_candidates(&ProviderKind::Grok);
+        assert!(
+            candidates
+                .iter()
+                .any(|path| path.ends_with(Path::new(".grok/bin/grok.exe")))
+        );
+        #[cfg(windows)]
+        assert!(
+            candidates
+                .iter()
+                .any(|path| path.ends_with(Path::new("npm/grok.cmd")))
+        );
     }
 
     #[test]
@@ -659,5 +729,26 @@ mod tests {
         let (state, code) = parse_cli_auth_text("Not authenticated. Run agent login.");
         assert_eq!(state, AuthenticationState::LoggedOut);
         assert_eq!(code.as_deref(), Some("login-required"));
+    }
+
+    #[test]
+    fn grok_models_login_sentence_is_authenticated() {
+        let (state, code) = parse_cli_auth_text("You are logged in with grok.com.");
+        assert_eq!(state, AuthenticationState::Authenticated);
+        assert_eq!(code, None);
+    }
+
+    #[test]
+    fn grok_models_logged_out_sentence_requires_login() {
+        let (state, code) = parse_cli_auth_text("Not logged in. Run grok login.");
+        assert_eq!(state, AuthenticationState::LoggedOut);
+        assert_eq!(code.as_deref(), Some("login-required"));
+    }
+
+    #[test]
+    fn grok_models_without_login_language_stays_unknown() {
+        let (state, code) = parse_cli_auth_text("Default model: grok-4.6\n\nAvailable models:");
+        assert_eq!(state, AuthenticationState::Unknown);
+        assert_eq!(code.as_deref(), Some("auth-status-unknown"));
     }
 }

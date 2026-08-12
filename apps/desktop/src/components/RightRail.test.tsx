@@ -681,6 +681,9 @@ describe("RightRail", () => {
     fireEvent.contextMenu(fileButton, { clientX: 760, clientY: 220 });
     fireEvent.click(screen.getByRole("menuitem", { name: "Reveal in File Explorer" }));
     await waitFor(() => expect(onRevealProjectFile).toHaveBeenCalledWith("src/App.tsx"));
+    fireEvent.contextMenu(fileButton, { clientX: 760, clientY: 220 });
+    expect(screen.getByRole("menuitem", { name: /Copy absolute path/i })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /^Duplicate$/i })).not.toBeInTheDocument();
   });
 
   it("keeps Git metadata compact, refreshes Git, and stages a whole group", async () => {

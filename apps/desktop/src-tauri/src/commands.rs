@@ -475,6 +475,7 @@ async fn probe_acp_actions(
         environment: Vec::new(),
         working_directory: Some(repository.to_path_buf()),
         client_version: env!("CARGO_PKG_VERSION").into(),
+        skip_initialized_notification: *provider == ProviderKind::Grok,
     })
     .await
     .map_err(CommandError::from)?;
@@ -530,11 +531,35 @@ pub(crate) async fn authenticate_acp_provider(
             ),
         });
     }
+    // Grok Build applies `cached_token` during `initialize` (`defaultAuthMethodId`)
+    // and its own ACP client never sends `authenticate`. Repeating that RPC is
+    // redundant and can stall the shared 25s handshake: the event pump is not
+    // running yet, so a refresh/reauth server request is dropped.
+    if *provider == ProviderKind::Grok && grok_cached_token_already_applied(&initialization) {
+        return Ok(());
+    }
     client
         .authenticate(method, true)
         .await
         .map(|_| ())
         .map_err(CommandError::from)
+}
+
+fn grok_cached_token_already_applied(initialization: &Value) -> bool {
+    acp_has_auth_method(initialization, "cached_token")
+        && acp_default_auth_method(initialization) == Some("cached_token")
+}
+
+fn acp_default_auth_method(initialization: &Value) -> Option<&str> {
+    initialization
+        .get("_meta")
+        .and_then(|meta| {
+            meta.get("defaultAuthMethodId")
+                .or_else(|| meta.get("default_auth_method_id"))
+        })
+        .or_else(|| initialization.get("defaultAuthMethodId"))
+        .or_else(|| initialization.get("default_auth_method_id"))
+        .and_then(Value::as_str)
 }
 
 fn acp_has_auth_method(initialization: &Value, expected: &str) -> bool {
@@ -1076,21 +1101,37 @@ pub async fn setting_list(state: State<'_, AppState>) -> CommandResult<Vec<Setti
 
 #[tauri::command]
 pub async fn setting_set(
+    app: AppHandle,
     state: State<'_, AppState>,
     key: String,
     value: Value,
 ) -> CommandResult<Setting> {
     let store = Arc::clone(&state.store);
-    tauri::async_runtime::spawn_blocking(move || {
-        let setting = store.set_setting(&key, value)?;
-        if key == crate::integrator_mcp::ENABLED_SETTING_KEY {
+    let retention_value = value.clone();
+    let stored_key = key.clone();
+    let setting = tauri::async_runtime::spawn_blocking(move || {
+        let setting = store.set_setting(&stored_key, value)?;
+        if stored_key == crate::integrator_mcp::ENABLED_SETTING_KEY {
             crate::integrator_mcp::mark_configuration_changed(&store)?;
         }
         Ok::<Setting, IntegratorError>(setting)
     })
     .await
     .map_err(|_| worker_error())?
-    .map_err(Into::into)
+    .map_err(CommandError::from)?;
+    if key == "settings.diagnostics.retention"
+        && let Ok(documents) = documents_directory(&app)
+    {
+        let retention = retention_value
+            .as_str()
+            .map(crate::diagnostic_log::parse_retention)
+            .unwrap_or(crate::diagnostic_log::Retention::Days(7));
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            crate::diagnostic_log::prune_logs(&documents, retention)
+        })
+        .await;
+    }
+    Ok(setting)
 }
 
 #[tauri::command]
@@ -2501,6 +2542,366 @@ pub async fn project_file_reveal(
         .map_err(|_| worker_error())?
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectFileDuplicateInput {
+    path: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectPathResolveInput {
+    path: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedProjectPath {
+    absolute_path: String,
+    relative_path: String,
+}
+
+/// Copies one trusted project file beside itself with a unique sibling name.
+#[tauri::command]
+pub async fn project_file_duplicate(
+    state: State<'_, AppState>,
+    repository: PathBuf,
+    input: ProjectFileDuplicateInput,
+) -> CommandResult<ProjectFileEntry> {
+    let root = authorized_project_directory(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(move || duplicate_project_file(&root, &input.path))
+        .await
+        .map_err(|_| worker_error())?
+        .map_err(Into::into)
+}
+
+/// Resolves a repository-relative path to a canonical absolute path inside a
+/// trusted project. Used for clipboard "copy absolute path" actions.
+#[tauri::command]
+pub async fn project_path_resolve(
+    state: State<'_, AppState>,
+    repository: PathBuf,
+    input: ProjectPathResolveInput,
+) -> CommandResult<ResolvedProjectPath> {
+    let root = authorized_project_directory(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(move || resolve_project_absolute_path(&root, &input.path))
+        .await
+        .map_err(|_| worker_error())?
+        .map_err(Into::into)
+}
+
+/// Reveals an absolute directory or file that belongs to a trusted project or
+/// one of its known worktrees. Unlike `project_file_reveal`, the renderer may
+/// pass a checkout root rather than a relative file path.
+#[tauri::command]
+pub async fn path_reveal(state: State<'_, AppState>, path: PathBuf) -> CommandResult<()> {
+    let authorized = authorize_absolute_reveal_path(&state, path).await?;
+    tauri::async_runtime::spawn_blocking(move || reveal_absolute_path(&authorized))
+        .await
+        .map_err(|_| worker_error())?
+}
+
+/// Reveals the folder paired with a task. General chats use the app-owned
+/// `chat-runtime/{taskId}` directory; code tasks use their worktree or
+/// repository. The renderer never supplies the path.
+#[tauri::command]
+pub async fn task_reveal(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    task_id: TaskId,
+) -> CommandResult<()> {
+    let (directory, folder_kind, task) = match resolve_task_folder(&state, task_id).await {
+        Ok(resolved) => resolved,
+        Err((error, task)) => {
+            log_task_folder_event(
+                &app,
+                &state,
+                "native.taskReveal",
+                task_id,
+                task.as_ref(),
+                None,
+                None,
+                Some(&error),
+            );
+            return Err(error);
+        }
+    };
+    let reveal_path = directory.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || reveal_absolute_path(&reveal_path))
+        .await
+        .map_err(|_| worker_error())?;
+    match result {
+        Ok(()) => {
+            log_task_folder_event(
+                &app,
+                &state,
+                "native.taskReveal",
+                task_id,
+                Some(&task),
+                Some(folder_kind),
+                Some(&directory),
+                None,
+            );
+            Ok(())
+        }
+        Err(error) => {
+            log_task_folder_event(
+                &app,
+                &state,
+                "native.taskReveal",
+                task_id,
+                Some(&task),
+                Some(folder_kind),
+                Some(&directory),
+                Some(&error),
+            );
+            Err(error)
+        }
+    }
+}
+
+/// Returns the folder paired with a task so the renderer can copy the path.
+/// Same resolution as `task_reveal`; the renderer still cannot broaden scope.
+#[tauri::command]
+pub async fn task_working_directory(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    task_id: TaskId,
+) -> CommandResult<String> {
+    match resolve_task_folder(&state, task_id).await {
+        Ok((directory, folder_kind, task)) => {
+            log_task_folder_event(
+                &app,
+                &state,
+                "native.taskWorkingDirectory",
+                task_id,
+                Some(&task),
+                Some(folder_kind),
+                Some(&directory),
+                None,
+            );
+            Ok(directory.to_string_lossy().into_owned())
+        }
+        Err((error, task)) => {
+            log_task_folder_event(
+                &app,
+                &state,
+                "native.taskWorkingDirectory",
+                task_id,
+                task.as_ref(),
+                None,
+                None,
+                Some(&error),
+            );
+            Err(error)
+        }
+    }
+}
+
+async fn resolve_task_folder(
+    state: &State<'_, AppState>,
+    task_id: TaskId,
+) -> std::result::Result<(PathBuf, &'static str, Task), (CommandError, Option<Task>)> {
+    let task = match state.store.get_task(task_id) {
+        Ok(task) => task,
+        Err(error) => return Err((CommandError::from(error), None)),
+    };
+    if task.kind == TaskKind::Chat {
+        return match authorized_task_directory(state, task_id, PathBuf::new()).await {
+            Ok(directory) => Ok((directory, "chat-runtime", task)),
+            Err(error) => Err((error, Some(task))),
+        };
+    }
+    if let Some(path) = task.worktree_path.clone() {
+        return match authorize_absolute_reveal_path(state, path).await {
+            Ok(directory) => Ok((directory, "worktree", task)),
+            Err(error) => Err((error, Some(task))),
+        };
+    }
+    if let Some(path) = task.repository_path.clone() {
+        return match authorize_absolute_reveal_path(state, path).await {
+            Ok(directory) => Ok((directory, "repository", task)),
+            Err(error) => Err((error, Some(task))),
+        };
+    }
+    Err((
+        CommandError {
+            code: "invalid-input",
+            message: "This chat is not paired with a folder to reveal.".into(),
+        },
+        Some(task),
+    ))
+}
+
+fn log_task_folder_event(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    op: &str,
+    task_id: TaskId,
+    task: Option<&Task>,
+    folder_kind: Option<&str>,
+    directory: Option<&Path>,
+    error: Option<&CommandError>,
+) {
+    let Ok(documents) = documents_directory(app) else {
+        return;
+    };
+    let detailed = detailed_logging_enabled(&state.store);
+    let failed = error.is_some();
+    let cause_class = error.map(|entry| match entry.code {
+        "invalid-input" => "unpaired-folder",
+        "unauthorized" => "unauthorized",
+        "not-found" => "not-found",
+        _ => "io",
+    });
+    let mut record = serde_json::json!({
+        "level": if failed { "error" } else { "info" },
+        "faultId": uuid::Uuid::new_v4().to_string(),
+        "layer": "native",
+        "op": op,
+        "outcome": if failed { "fail" } else { "ok" },
+        "code": error.map(|entry| entry.code).unwrap_or("ok"),
+        "causeClass": cause_class.unwrap_or("ok"),
+        "taskId": task_id.to_string(),
+        "taskKind": task.map(|entry| entry.kind.as_str()).unwrap_or("unknown"),
+        "folderKind": folder_kind.unwrap_or(""),
+        "hasWorktree": task.map(|entry| entry.worktree_path.is_some()).unwrap_or(false),
+        "hasRepository": task.map(|entry| entry.repository_path.is_some()).unwrap_or(false),
+        "detail": error.map(|entry| entry.message.as_str()).unwrap_or(""),
+    });
+    if let (true, Some(path), Some(object)) = (detailed, directory, record.as_object_mut()) {
+        object.insert(
+            "path".into(),
+            Value::String(path.to_string_lossy().into_owned()),
+        );
+    }
+    if failed {
+        let _ = crate::diagnostic_log::append_incident(&documents, &record);
+    }
+    let _ = crate::diagnostic_log::append_detail(&documents, &record, detailed);
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogsTotalsView {
+    bytes: u64,
+    file_count: u64,
+    incident_files: u64,
+    detail_files: u64,
+    measured_at: DateTime<Utc>,
+    path: String,
+}
+
+fn documents_directory(app: &AppHandle) -> CommandResult<PathBuf> {
+    app.path().document_dir().map_err(|_| CommandError {
+        code: "unavailable",
+        message: "Documents folder is unavailable on this machine".into(),
+    })
+}
+
+fn detailed_logging_enabled(store: &session_store::LocalStore) -> bool {
+    store
+        .get_setting("settings.diagnostics.detailedLogging")
+        .ok()
+        .flatten()
+        .and_then(|setting| setting.value.as_bool())
+        .unwrap_or(false)
+}
+
+fn diagnostics_retention(store: &session_store::LocalStore) -> crate::diagnostic_log::Retention {
+    let value = store
+        .get_setting("settings.diagnostics.retention")
+        .ok()
+        .flatten()
+        .and_then(|setting| setting.value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "7d".into());
+    crate::diagnostic_log::parse_retention(&value)
+}
+
+#[tauri::command]
+pub async fn logs_open_folder(app: AppHandle) -> CommandResult<()> {
+    let documents = documents_directory(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::diagnostic_log::open_logs_folder(&documents)
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn logs_totals(app: AppHandle) -> CommandResult<LogsTotalsView> {
+    let documents = documents_directory(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let totals = crate::diagnostic_log::logs_totals(&documents)?;
+        Ok::<LogsTotalsView, IntegratorError>(LogsTotalsView {
+            bytes: totals.total_bytes,
+            file_count: totals.file_count,
+            incident_files: totals.incident_files,
+            detail_files: totals.detail_files,
+            measured_at: Utc::now(),
+            path: crate::diagnostic_log::logs_root(&documents)
+                .to_string_lossy()
+                .into_owned(),
+        })
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn logs_clear(app: AppHandle) -> CommandResult<()> {
+    let documents = documents_directory(&app)?;
+    tauri::async_runtime::spawn_blocking(move || crate::diagnostic_log::clear_logs(&documents))
+        .await
+        .map_err(|_| worker_error())?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn logs_prune(app: AppHandle, state: State<'_, AppState>) -> CommandResult<()> {
+    let documents = documents_directory(&app)?;
+    let retention = diagnostics_retention(&state.store);
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::diagnostic_log::prune_logs(&documents, retention).map(|_| ())
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
+}
+
+/// Appends one redacted diagnostic record. `channel` is `incident` (always) or
+/// `detail` (only when detailed logging is enabled).
+#[tauri::command]
+pub async fn diagnostics_report(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    channel: String,
+    record: Value,
+) -> CommandResult<()> {
+    let documents = documents_directory(&app)?;
+    let detailed = detailed_logging_enabled(&state.store);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut envelope = record;
+        if let Some(object) = envelope.as_object_mut() {
+            object
+                .entry("ts".to_string())
+                .or_insert_with(|| Value::String(Utc::now().to_rfc3339()));
+            object
+                .entry("os".to_string())
+                .or_insert_with(|| Value::String(std::env::consts::OS.to_string()));
+        }
+        match channel.as_str() {
+            "detail" => crate::diagnostic_log::append_detail(&documents, &envelope, detailed),
+            _ => crate::diagnostic_log::append_incident(&documents, &envelope),
+        }
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
+}
+
 /// Upper bound for inline attachment previews returned to the renderer.
 const ATTACHMENT_PREVIEW_MAX_BYTES: u64 = 12 * 1024 * 1024;
 const CHAT_ATTACHMENT_COUNT_LIMIT: usize = 20;
@@ -3411,6 +3812,8 @@ pub async fn codex_connect(
         binding: Arc::new(std::sync::Mutex::new(None)),
         context_primer: Arc::new(std::sync::Mutex::new(None)),
         pending_user_prompt: Arc::new(std::sync::Mutex::new(None)),
+        sent_delegation_preamble: Arc::new(std::sync::Mutex::new(None)),
+        sent_skill_index: Arc::new(std::sync::Mutex::new(None)),
     };
     if let Some(task_id) = task_id {
         let store = Arc::clone(&state.store);
@@ -3862,16 +4265,37 @@ fn push_model_id(models: &mut Vec<String>, model: &str) {
     }
 }
 
+fn grok_listed_model(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix(['*', '-', '+'])?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    rest.split_whitespace().next()
+}
+
+fn grok_default_model(line: &str) -> Option<&str> {
+    line.trim()
+        .split_once(':')
+        .filter(|(label, _)| label.eq_ignore_ascii_case("default model"))
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+}
+
 fn parse_grok_models(output: &str) -> Vec<String> {
     let mut models = Vec::new();
+    let mut default_model = None;
     for line in output.lines() {
-        let Some(rest) = line.trim().strip_prefix('*') else {
-            continue;
-        };
-        let Some(model) = rest.split_whitespace().next() else {
-            continue;
-        };
-        push_model_id(&mut models, model);
+        if let Some(model) = grok_default_model(line) {
+            default_model = Some(model.to_owned());
+        }
+        if let Some(model) = grok_listed_model(line) {
+            push_model_id(&mut models, model);
+        }
+    }
+    if models.is_empty() {
+        if let Some(model) = default_model {
+            push_model_id(&mut models, &model);
+        }
     }
     models
 }
@@ -4295,6 +4719,13 @@ pub async fn codex_start_thread(
         .map_err(CommandError::from)?;
     if let Some(thread_id) = extract_thread_id(&response) {
         bind_thread(&state, &runtime, task_id, &thread_id).await?;
+        // A fresh thread has fresh provider history: durable wire blocks
+        // (delegation preamble, skill index) must be injected again.
+        *runtime
+            .sent_delegation_preamble
+            .lock()
+            .expect("preamble lock") = None;
+        *runtime.sent_skill_index.lock().expect("index lock") = None;
         persist_provider_resume_state(
             &state.store,
             task_id,
@@ -4947,18 +5378,40 @@ pub async fn codex_start_turn(
         && let Some(mode) = delegation.as_deref().filter(|mode| *mode != "off")
         && native_action_id.is_none()
     {
-        let mut preface = crate::delegation::orchestrator_preamble(&state.store, mode);
+        // The Codex thread keeps its history, so the durable preamble enters
+        // it once and repeats only if its content changes (mode toggle or
+        // user delegation-policy edit); each turn carries only new updates.
+        let preamble = crate::delegation::orchestrator_preamble(&state.store, mode);
+        let mut preface = String::new();
+        {
+            let mut sent = runtime
+                .sent_delegation_preamble
+                .lock()
+                .expect("preamble lock");
+            if sent.as_deref() != Some(preamble.as_str()) {
+                preface.push_str(&preamble);
+                *sent = Some(preamble);
+            }
+        }
         if let Some(updates) = crate::delegation::pending_updates_block(&state.store, task_id) {
             preface.push_str(&updates);
         }
-        wire_prompt = format!("{preface}{wire_prompt}");
+        if !preface.is_empty() {
+            wire_prompt = format!("{preface}{wire_prompt}");
+        }
     }
     // Auto-trigger channel: Codex has no verified route to load external
-    // skill directories, so the bounded index rides each plain turn.
+    // skill directories, so the bounded index rides the wire — once per
+    // thread, repeated only when the enabled-skill set changes (the thread
+    // keeps its history).
     if !is_chat && native_action_id.is_none() {
         let skills = crate::integrator_skills::enabled_skills(&app, &state.store);
         if let Some(index) = crate::integrator_skills::skill_index_block(&skills) {
-            wire_prompt = format!("{index}{wire_prompt}");
+            let mut sent = runtime.sent_skill_index.lock().expect("index lock");
+            if sent.as_deref() != Some(index.as_str()) {
+                wire_prompt = format!("{index}{wire_prompt}");
+                *sent = Some(index);
+            }
         }
     }
     *runtime
@@ -5407,6 +5860,8 @@ pub async fn codex_stop_turn(
     Ok(persisted.result)
 }
 
+const ACP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(25);
+
 #[tauri::command]
 pub async fn acp_connect(
     app: AppHandle<tauri::Wry>,
@@ -5478,19 +5933,30 @@ pub async fn acp_connect(
         code: "provider-unavailable",
         message: format!("{} CLI is not installed", provider.as_str()),
     })?;
-    let client = adapter_acp::AcpClient::spawn(adapter_acp::AcpLaunchOptions {
-        executable,
-        arguments,
-        environment,
-        working_directory,
-        client_version: env!("CARGO_PKG_VERSION").into(),
+    let client = timeout(ACP_HANDSHAKE_TIMEOUT, async {
+        let client = adapter_acp::AcpClient::spawn(adapter_acp::AcpLaunchOptions {
+            executable,
+            arguments,
+            environment,
+            working_directory,
+            client_version: env!("CARGO_PKG_VERSION").into(),
+            skip_initialized_notification: provider == ProviderKind::Grok,
+        })
+        .await
+        .map_err(CommandError::from)?;
+        if let Err(error) = authenticate_acp_provider(&client, &provider).await {
+            let _ = client.shutdown().await;
+            return Err(error);
+        }
+        Ok(client)
     })
     .await
-    .map_err(CommandError::from)?;
-    if let Err(error) = authenticate_acp_provider(&client, &provider).await {
-        let _ = client.shutdown().await;
-        return Err(error);
-    }
+    .map_err(|_| CommandError {
+        code: "provider-timeout",
+        message: format!(
+            "{provider} did not finish its ACP handshake in time; retry the turn"
+        ),
+    })??;
     let (turn_settled, _) = tokio::sync::broadcast::channel(8);
     let runtime = AcpRuntime {
         client,
@@ -5509,8 +5975,10 @@ pub async fn acp_connect(
         available_actions: Arc::new(std::sync::Mutex::new(Vec::new())),
         context_primer: Arc::new(std::sync::Mutex::new(None)),
         delegation_preamble: Arc::new(std::sync::Mutex::new(None)),
+        sent_skill_index: Arc::new(std::sync::Mutex::new(None)),
         unattended: false,
         read_only: is_chat,
+        auto_approve_permissions: provider == ProviderKind::Grok && !is_chat,
         session_spec: Arc::new(std::sync::Mutex::new(None)),
         replaying_history: Arc::new(AtomicBool::new(false)),
     };
@@ -5647,18 +6115,11 @@ pub(crate) fn acp_launch_arguments_with_route(
             }
             _ => vec!["acp".into()],
         },
-        // Scripted ACP starts disable implicit self-updates; the vendor CLI
-        // and its vendor-owned cached login remain the authority.
+        // Official Grok ACP is `grok agent --no-leader [--always-approve] stdio`.
+        // Top-level flags (`--rules`, Chat lockdown) stay before `agent`;
+        // model/effort are agent options so the stdio process honors them.
         ProviderKind::Grok => {
             let mut arguments = vec!["--no-auto-update".into()];
-            if let Some(model) = model {
-                validate_grok_route_value(model, "model", 256)?;
-                arguments.extend(["--model".into(), model.into()]);
-            }
-            if let Some(effort) = effort {
-                validate_grok_route_value(effort, "reasoning effort", 64)?;
-                arguments.extend(["--reasoning-effort".into(), effort.into()]);
-            }
             match profile {
                 AcpLaunchProfile::Project { tools } => arguments.extend([
                     "--rules".into(),
@@ -5682,7 +6143,19 @@ pub(crate) fn acp_launch_arguments_with_route(
                 ]),
                 AcpLaunchProfile::Default => {}
             }
-            arguments.extend(["agent".into(), "stdio".into()]);
+            arguments.extend(["agent".into(), "--no-leader".into()]);
+            if !matches!(profile, AcpLaunchProfile::Chat { .. }) {
+                arguments.push("--always-approve".into());
+            }
+            if let Some(model) = model {
+                validate_grok_route_value(model, "model", 256)?;
+                arguments.extend(["--model".into(), model.into()]);
+            }
+            if let Some(effort) = effort {
+                validate_grok_route_value(effort, "reasoning effort", 64)?;
+                arguments.extend(["--reasoning-effort".into(), effort.into()]);
+            }
+            arguments.push("stdio".into());
             arguments
         }
         _ => {
@@ -5787,11 +6260,21 @@ pub async fn acp_start_session(
         *runtime.delegation_preamble.lock().expect("preamble lock") =
             Some(crate::delegation::orchestrator_preamble(&state.store, mode));
     }
-    let response = runtime
-        .client
-        .new_session(&cwd, mcp_servers.clone())
-        .await
-        .map_err(CommandError::from)?;
+    // A new session has fresh provider history: the skill index must be
+    // injected again on its first plain turn.
+    *runtime.sent_skill_index.lock().expect("index lock") = None;
+    let response = timeout(
+        ACP_HANDSHAKE_TIMEOUT,
+        runtime.client.new_session(&cwd, mcp_servers.clone()),
+    )
+    .await
+    .map_err(|_| CommandError {
+        code: "provider-timeout",
+        message: format!(
+            "{provider_name} did not create an ACP session in time; retry the turn"
+        ),
+    })?
+    .map_err(CommandError::from)?;
     let session_id = response
         .get("sessionId")
         .and_then(Value::as_str)
@@ -5998,16 +6481,36 @@ pub async fn acp_resume_session(
     let capabilities = runtime.client.session_capabilities().await;
     let result = if capabilities.resume {
         runtime.replaying_history.store(true, Ordering::Release);
-        runtime
-            .client
-            .resume_session(&saved.session_ref, &cwd, mcp_servers)
-            .await
+        timeout(
+            ACP_HANDSHAKE_TIMEOUT,
+            runtime
+                .client
+                .resume_session(&saved.session_ref, &cwd, mcp_servers),
+        )
+        .await
+        .map_err(|_| {
+            IntegratorError::Unavailable(format!(
+                "{} did not resume its ACP session in time",
+                runtime.provider.as_str()
+            ))
+        })
+        .and_then(|inner| inner)
     } else if capabilities.load {
         runtime.replaying_history.store(true, Ordering::Release);
-        runtime
-            .client
-            .load_session(&saved.session_ref, &cwd, mcp_servers)
-            .await
+        timeout(
+            ACP_HANDSHAKE_TIMEOUT,
+            runtime
+                .client
+                .load_session(&saved.session_ref, &cwd, mcp_servers),
+        )
+        .await
+        .map_err(|_| {
+            IntegratorError::Unavailable(format!(
+                "{} did not load its ACP session in time",
+                runtime.provider.as_str()
+            ))
+        })
+        .and_then(|inner| inner)
     } else {
         Err(IntegratorError::Unavailable(format!(
             "{} did not advertise ACP session recovery",
@@ -6356,11 +6859,16 @@ pub async fn acp_send_turn(
         }
     }
     // Auto-trigger channel: ACP has no skill-loading parameter, so the
-    // bounded index rides each plain turn.
+    // bounded index rides the wire — once per session, repeated only when
+    // the enabled-skill set changes (the session keeps its history).
     if !is_chat && native_action_id.is_none() {
         let skills = crate::integrator_skills::enabled_skills(&app, &state.store);
         if let Some(index) = crate::integrator_skills::skill_index_block(&skills) {
-            wire_prompt = format!("{index}{wire_prompt}");
+            let mut sent = runtime.sent_skill_index.lock().expect("index lock");
+            if sent.as_deref() != Some(index.as_str()) {
+                wire_prompt = format!("{index}{wire_prompt}");
+                *sent = Some(index);
+            }
         }
     }
     let client = runtime.client.clone();
@@ -6675,6 +7183,7 @@ pub async fn structured_cli_start_turn(
         });
     let mut resume_session_id = None;
     let mut control_overlay = None;
+    let mut sent_skill_index = None;
     let previous = {
         let mut runtimes = state.structured.lock().await;
         remove_task_runtime(&mut *runtimes, task_id)
@@ -6689,6 +7198,9 @@ pub async fn structured_cli_start_turn(
         if same_provider && saved_resume.is_some() {
             resume_session_id = previous.session_ref.lock().expect("session lock").clone();
             control_overlay = previous.control_overlay.clone();
+            // The resumed conversation already carries whatever index the
+            // previous turn injected; carry the marker so it is not repeated.
+            sent_skill_index = previous.sent_skill_index.lock().expect("index lock").clone();
         }
         let turn = { previous.current_turn.lock().expect("turn lock").clone() };
         if let Some(turn) = turn {
@@ -6756,9 +7268,10 @@ pub async fn structured_cli_start_turn(
         .map_err(CommandError::from)?;
     }
 
-    // Delegation broker injection: each structured turn is a fresh provider
-    // session, so the tool preamble and any pending subagent updates ride on
-    // every wire prompt while delegation is active.
+    // Delegation broker injection. The provider conversation persists across
+    // the per-turn process respawns (`--resume`), so the durable preamble must
+    // never ride the wire prompt: it goes into the per-process system layer
+    // instead, and only new subagent updates ride each turn.
     let delegation_mode = (!is_chat)
         .then_some(delegation.as_deref().filter(|mode| *mode != "off"))
         .flatten();
@@ -6794,15 +7307,16 @@ pub async fn structured_cli_start_turn(
         )
         .map_err(CommandError::from)?,
     );
-    if let Some(mode) = delegation_mode {
-        let store = Arc::clone(&state.store);
-        let mut preface = crate::delegation::orchestrator_preamble(&store, mode);
-        if let Some(updates) = crate::delegation::pending_updates_block(&store, task_id) {
-            preface.push_str(&updates);
-        }
-        if native_action.is_none() {
-            wire_prompt = format!("{preface}{wire_prompt}");
-        }
+    let delegation_system_block = delegation_mode
+        .map(|mode| crate::delegation::orchestrator_preamble(&state.store, mode));
+    if delegation_mode.is_some()
+        && native_action.is_none()
+        // Rendering marks the messages delivered, so skip it on native-action
+        // turns (which must keep `/name` at byte zero) rather than consuming
+        // updates that never reach the wire.
+        && let Some(updates) = crate::delegation::pending_updates_block(&state.store, task_id)
+    {
+        wire_prompt = format!("{updates}{wire_prompt}");
     }
 
     // Project the enabled Integrator skills into this turn. The overlay is a
@@ -6827,12 +7341,16 @@ pub async fn structured_cli_start_turn(
         .map_err(|_| worker_error())?;
         if let Ok(projection) = projection {
             plugin_dirs = projection.plugin_dirs;
+            // The resumed conversation keeps every earlier injection, so the
+            // index rides again only when the enabled-skill set changed.
             if matches!(structured_provider, StructuredCliProvider::Antigravity)
                 && native_action.is_none()
                 && let Some(index) =
                     crate::integrator_skills::skill_index_block(&projection.entries)
+                && sent_skill_index.as_deref() != Some(index.as_str())
             {
                 wire_prompt = format!("{index}{wire_prompt}");
+                sent_skill_index = Some(index);
             }
         }
     }
@@ -6965,6 +7483,7 @@ pub async fn structured_cli_start_turn(
             permission: permission.clone(),
             delegation: delegation.clone().unwrap_or_else(|| "off".into()),
         }),
+        sent_skill_index: Arc::new(std::sync::Mutex::new(sent_skill_index)),
     };
     spawn_structured_cli_pump(app.clone(), Arc::clone(&state.store), runtime.clone());
     let turn_id = client
@@ -6986,10 +7505,19 @@ pub async fn structured_cli_start_turn(
                                 .is_some_and(|setting| setting.value.as_bool() == Some(true));
                             crate::harness_prompt::chat_developer_instructions(memory_enabled)
                         } else {
-                            crate::harness_prompt::instructions(
+                            let mut instructions = crate::harness_prompt::instructions(
                                 provider,
                                 crate::harness_prompt::LocalToolsProjection::Projected,
-                            )
+                            );
+                            // Durable delegation contract lives in the
+                            // per-process system layer: every respawned turn
+                            // gets it without ever entering the resumed
+                            // conversation history.
+                            if let Some(block) = delegation_system_block.as_deref() {
+                                instructions.push_str("\n\n");
+                                instructions.push_str(block.trim_end());
+                            }
+                            instructions
                         }
                     }),
                 resume_session_id,
@@ -7429,6 +7957,27 @@ pub(crate) fn spawn_structured_cli_pump(
                         .lock()
                         .expect("diagnostic lock")
                         .take();
+                    if let Ok(documents) = app.path().document_dir() {
+                        let detailed = detailed_logging_enabled(&store);
+                        let mut record = serde_json::json!({
+                            "level": if cancelled { "warn" } else { "error" },
+                            "faultId": uuid::Uuid::new_v4().to_string(),
+                            "layer": "adapter",
+                            "op": "provider.process.exit",
+                            "outcome": if cancelled { "cancelled" } else { "exit" },
+                            "causeClass": "process",
+                            "taskId": binding.task_id.to_string(),
+                            "processId": runtime.process_id,
+                            "turnId": event.turn_id,
+                            "code": code.map(|value| value.to_string()).unwrap_or_default(),
+                            "detail": diagnostic.clone().unwrap_or_default(),
+                        });
+                        let _ = crate::diagnostic_log::append_incident(&documents, &record);
+                        if let Some(object) = record.as_object_mut() {
+                            object.insert("channel".into(), serde_json::json!("detail"));
+                        }
+                        let _ = crate::diagnostic_log::append_detail(&documents, &record, detailed);
+                    }
                     *runtime.current_turn.lock().expect("turn lock") = None;
                     // Requests can no longer be answered once the process is
                     // gone; expire them so the UI drops stale popups.
@@ -7688,7 +8237,7 @@ pub(crate) fn spawn_acp_pump(
             let turn_id = runtime.current_turn.lock().expect("turn lock").clone();
             match event {
                 adapter_acp::AcpEvent::Notification { method, params } => {
-                    if method != "session/update" {
+                    if !acp_session_update_method(&method) {
                         continue;
                     }
                     if let Some(actions) = params.get("update").and_then(parse_acp_actions) {
@@ -7792,7 +8341,10 @@ pub(crate) fn spawn_acp_pump(
                     // trusted worktree, accept plan reviews) instead of
                     // parking an approval card no one is watching. This is
                     // the ACP analog of Codex children's approval "never".
-                    if runtime.unattended || runtime.read_only {
+                    if runtime.unattended
+                        || runtime.read_only
+                        || runtime.auto_approve_permissions
+                    {
                         let result = if method == "session/request_permission" {
                             if runtime.read_only {
                                 serde_json::json!({ "outcome": { "outcome": "cancelled" } })
@@ -7859,9 +8411,20 @@ pub(crate) fn spawn_acp_pump(
                     }
                     let (Some(binding), Some(turn_id)) = (binding.as_ref(), turn_id.as_deref())
                     else {
+                        // An unanswered permission request parks the turn
+                        // forever. If the UI cannot show a card yet, resolve
+                        // with the least-privileged advertised allow.
+                        let _ = runtime
+                            .client
+                            .respond_to_server_request(&id, acp_auto_allow_outcome(&params))
+                            .await;
                         continue;
                     };
                     let Some(session_id) = binding.thread_id.as_deref() else {
+                        let _ = runtime
+                            .client
+                            .respond_to_server_request(&id, acp_auto_allow_outcome(&params))
+                            .await;
                         continue;
                     };
                     let request_id = acp_transport_id(&id);
@@ -8169,6 +8732,13 @@ fn structured_permission_response(
 /// Build the response for a Cursor `cursor/create_plan` extension request.
 /// Success tells the agent the plan was accepted; the error result carries
 /// the rejection back so the agent keeps planning instead of building.
+fn acp_session_update_method(method: &str) -> bool {
+    matches!(
+        method,
+        "session/update" | "_x.ai/session/update" | "x.ai/session/update" | "_x.ai/session_notification"
+    )
+}
+
 /// Select the least-privileged allow option a `session/request_permission`
 /// request advertises. Unattended children auto-allow inside the trusted
 /// worktree; a request advertising no allow option is cancelled, not guessed.
@@ -8842,6 +9412,191 @@ fn rename_project_file(
         path: normalized_relative_path(&target_relative),
         size,
     })
+}
+
+fn duplicate_project_file(
+    root: &Path,
+    requested_path: &str,
+) -> integrator_core::Result<ProjectFileEntry> {
+    let relative = validate_project_relative_path(requested_path)?;
+    if is_sensitive_project_file(&relative) {
+        return Err(IntegratorError::Unauthorized(
+            "sensitive project files cannot be duplicated".into(),
+        ));
+    }
+    let source = resolve_existing_project_file(root, requested_path)?;
+    let file_name = relative
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| IntegratorError::InvalidInput("file name is missing".into()))?;
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let (stem, extension) = match relative.extension().and_then(|value| value.to_str()) {
+        Some(ext) if !file_name.starts_with('.') => {
+            let stem = relative
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or(file_name);
+            (stem.to_string(), Some(ext.to_string()))
+        }
+        _ => (file_name.to_string(), None),
+    };
+    let mut attempt = 1u32;
+    loop {
+        let suffix = if attempt == 1 {
+            " copy".to_string()
+        } else {
+            format!(" copy {attempt}")
+        };
+        let candidate_name = match &extension {
+            Some(ext) => format!("{stem}{suffix}.{ext}"),
+            None => format!("{stem}{suffix}"),
+        };
+        let target_relative = if parent == Path::new("") {
+            PathBuf::from(&candidate_name)
+        } else {
+            parent.join(&candidate_name)
+        };
+        if is_sensitive_project_file(&target_relative) {
+            return Err(IntegratorError::Unauthorized(
+                "files cannot be duplicated onto protected sensitive names".into(),
+            ));
+        }
+        let target = root.join(&target_relative);
+        if !target.exists() {
+            fs::copy(&source, &target).map_err(io_error)?;
+            let size = fs::metadata(&target).map_err(io_error)?.len();
+            return Ok(ProjectFileEntry {
+                path: normalized_relative_path(&target_relative),
+                size,
+            });
+        }
+        attempt = attempt.saturating_add(1);
+        if attempt > 100 {
+            return Err(IntegratorError::InvalidInput(
+                "could not find an unused name for the duplicate".into(),
+            ));
+        }
+    }
+}
+
+fn resolve_project_absolute_path(
+    root: &Path,
+    requested_path: &str,
+) -> integrator_core::Result<ResolvedProjectPath> {
+    let relative = validate_project_relative_path(requested_path)?;
+    let canonical_root = dunce::canonicalize(root).map_err(io_error)?;
+    let candidate = canonical_root.join(&relative);
+    let absolute = if candidate.exists() {
+        let canonical = dunce::canonicalize(&candidate).map_err(io_error)?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err(IntegratorError::Unauthorized(
+                "path is outside the trusted repository".into(),
+            ));
+        }
+        canonical
+    } else {
+        // Folder paths may not exist as files; still return the joined path when
+        // every ancestor stays inside the trusted root.
+        if !candidate.starts_with(&canonical_root) {
+            return Err(IntegratorError::Unauthorized(
+                "path is outside the trusted repository".into(),
+            ));
+        }
+        candidate
+    };
+    Ok(ResolvedProjectPath {
+        absolute_path: absolute.to_string_lossy().into_owned(),
+        relative_path: normalized_relative_path(&relative),
+    })
+}
+
+async fn authorize_absolute_reveal_path(
+    state: &State<'_, AppState>,
+    candidate: PathBuf,
+) -> CommandResult<PathBuf> {
+    let selected = tauri::async_runtime::spawn_blocking(move || {
+        dunce::canonicalize(&candidate).map_err(IntegratorError::Io)
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(CommandError::from)?;
+    let store = Arc::clone(&state.store);
+    let allowed = tauri::async_runtime::spawn_blocking(move || {
+        let mut roots = store
+            .list_trusted_projects()?
+            .into_iter()
+            .filter_map(|project| canonical_project_directory(&project.repository_root).ok())
+            .collect::<Vec<_>>();
+        for task in store.list_tasks()? {
+            for path in [task.worktree_path.as_ref(), task.repository_path.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if let Ok(root) = canonical_project_directory(path) {
+                    roots.push(root);
+                }
+            }
+        }
+        Ok::<Vec<PathBuf>, IntegratorError>(roots)
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(CommandError::from)?;
+    if allowed
+        .iter()
+        .any(|root| selected == *root || selected.starts_with(root))
+    {
+        return Ok(selected);
+    }
+    Err(CommandError {
+        code: "unauthorized",
+        message: "that path is outside your trusted projects".into(),
+    })
+}
+
+fn reveal_absolute_path(path: &Path) -> CommandResult<()> {
+    let select_file = path.is_file();
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = Command::new("explorer.exe");
+        if select_file {
+            command.arg(format!("/select,{}", path.display()));
+        } else {
+            command.arg(path);
+        }
+        spawn_quiet(command, "could not show the path in File Explorer")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = Command::new("open");
+        if select_file {
+            command.arg("-R");
+        }
+        command.arg(path);
+        spawn_quiet(command, "could not reveal the path in Finder")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let target = if select_file {
+            path.parent().unwrap_or(path).to_path_buf()
+        } else {
+            path.to_path_buf()
+        };
+        let mut command = Command::new("xdg-open");
+        command.arg(target);
+        spawn_quiet(
+            command,
+            "could not show the path in the system file manager",
+        )
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = select_file;
+        Err(CommandError {
+            code: "file-reveal-unavailable",
+            message: "revealing paths is not supported on this platform".into(),
+        })
+    }
 }
 
 fn discover_project_file_openers() -> Vec<ProjectFileOpener> {
@@ -9762,7 +10517,10 @@ mod tests {
         assert_eq!(grok[1], "--rules");
         assert!(grok[2].contains("durable harness policy"));
         assert!(grok[2].contains("delegation are unavailable"));
-        assert_eq!(&grok[3..], ["agent", "stdio"]);
+        assert_eq!(
+            &grok[3..],
+            ["agent", "--no-leader", "--always-approve", "stdio"]
+        );
         let chat = AcpLaunchProfile::Chat {
             instructions: "Chat tools are unavailable".into(),
         };
@@ -9790,13 +10548,15 @@ mod tests {
                 .iter()
                 .any(|argument| argument == "Chat tools are unavailable")
         );
+        assert!(grok_chat.windows(2).any(|pair| pair == ["agent", "--no-leader"]));
+        assert!(!grok_chat.iter().any(|argument| argument == "--always-approve"));
         let grok_environment = acp_launch_environment(&ProviderKind::Grok, &chat);
         assert!(grok_environment.contains(&("GROK_CURSOR_MCPS_ENABLED".into(), "0".into())));
         assert!(grok_environment.contains(&("GROK_CLAUDE_MCPS_ENABLED".into(), "0".into())));
         assert_eq!(
             acp_launch_arguments(&ProviderKind::Grok, &AcpLaunchProfile::Default)
                 .expect("default Grok ACP route"),
-            ["--no-auto-update", "agent", "stdio"]
+            ["--no-auto-update", "agent", "--no-leader", "--always-approve", "stdio"]
         );
         assert_eq!(
             acp_launch_arguments(&ProviderKind::Cursor, &chat).expect("Cursor Chat route"),
@@ -9813,23 +10573,25 @@ mod tests {
     }
 
     #[test]
-    fn grok_launch_applies_model_and_effort_before_agent_mode() {
+    fn grok_launch_applies_model_and_effort_as_agent_options() {
         let arguments = acp_launch_arguments_with_route(
             &ProviderKind::Grok,
             &AcpLaunchProfile::Default,
-            Some("grok-4.5"),
-            Some("low"),
+            Some("grok-4.6"),
+            Some("xhigh"),
         )
         .expect("routed Grok launch");
         assert_eq!(
             arguments,
             [
                 "--no-auto-update",
-                "--model",
-                "grok-4.5",
-                "--reasoning-effort",
-                "low",
                 "agent",
+                "--no-leader",
+                "--always-approve",
+                "--model",
+                "grok-4.6",
+                "--reasoning-effort",
+                "xhigh",
                 "stdio"
             ]
         );
@@ -9848,6 +10610,18 @@ mod tests {
     fn grok_model_output_parser_accepts_only_bounded_model_ids() {
         let output = "Default model: grok-4.5\n\nAvailable models:\n  * grok-4.5 (default)\n  * grok-next_preview\n  * ../not-a-model\n";
         assert_eq!(parse_grok_models(output), ["grok-4.5", "grok-next_preview"]);
+    }
+
+    #[test]
+    fn grok_model_output_parser_keeps_star_and_dash_rows() {
+        let output = "You are logged in with grok.com.\n\nDefault model: grok-4.6\n\nAvailable models:\n  * grok-4.6 (default)\n  - grok-4.5\n  --not-a-model\n  * ../not-a-model\n";
+        assert_eq!(parse_grok_models(output), ["grok-4.6", "grok-4.5"]);
+    }
+
+    #[test]
+    fn grok_model_output_parser_falls_back_to_default_model_line() {
+        let output = "You are logged in with grok.com.\n\nDefault model: grok-4.6\n";
+        assert_eq!(parse_grok_models(output), ["grok-4.6"]);
     }
 
     #[test]
@@ -9897,6 +10671,14 @@ mod tests {
     }
 
     #[test]
+    fn grok_session_notifications_count_as_session_updates() {
+        assert!(acp_session_update_method("session/update"));
+        assert!(acp_session_update_method("_x.ai/session_notification"));
+        assert!(acp_session_update_method("x.ai/session/update"));
+        assert!(!acp_session_update_method("_x.ai/models/update"));
+    }
+
+    #[test]
     fn unattended_acp_children_prefer_the_narrowest_allow_option() {
         let params = serde_json::json!({ "options": [
             { "optionId": "always", "kind": "allow_always" },
@@ -9938,6 +10720,45 @@ mod tests {
             &serde_json::json!({ "authMethods": [{ "id": "api-key" }] }),
             "login"
         ));
+    }
+
+    #[test]
+    fn grok_skips_authenticate_when_initialize_already_selected_cached_token() {
+        let live = serde_json::json!({
+            "authMethods": [
+                { "id": "cached_token", "name": "cached_token" },
+                { "id": "grok.com", "name": "Grok" }
+            ],
+            "_meta": { "defaultAuthMethodId": "cached_token" }
+        });
+        assert!(grok_cached_token_already_applied(&live));
+
+        let snake_case_meta = serde_json::json!({
+            "authMethods": [{ "id": "cached_token" }],
+            "_meta": { "default_auth_method_id": "cached_token" }
+        });
+        assert!(grok_cached_token_already_applied(&snake_case_meta));
+    }
+
+    #[test]
+    fn grok_still_authenticates_when_cached_token_is_not_the_default() {
+        let browser_default = serde_json::json!({
+            "authMethods": [{ "id": "cached_token" }, { "id": "grok.com" }],
+            "_meta": { "defaultAuthMethodId": "grok.com" }
+        });
+        assert!(!grok_cached_token_already_applied(&browser_default));
+
+        let logged_out = serde_json::json!({
+            "authMethods": [{ "id": "grok.com" }],
+            "_meta": { "defaultAuthMethodId": null }
+        });
+        assert!(!grok_cached_token_already_applied(&logged_out));
+        assert!(!acp_has_auth_method(&logged_out, "cached_token"));
+
+        let missing_default = serde_json::json!({
+            "authMethods": [{ "id": "cached_token" }]
+        });
+        assert!(!grok_cached_token_already_applied(&missing_default));
     }
 
     #[test]

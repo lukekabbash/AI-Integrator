@@ -474,9 +474,7 @@ fn provider_args(options: &StructuredCliLaunchOptions) -> Vec<String> {
             // agy's catalog encodes the reasoning level in the model id
             // itself, so the selected effort composes into the `--model`
             // value (slug or legacy display-name form).
-            StructuredCliProvider::Antigravity => {
-                antigravity_model_arg(model, &options.effort)
-            }
+            StructuredCliProvider::Antigravity => antigravity_model_arg(model, &options.effort),
             StructuredCliProvider::Claude => model.to_owned(),
         };
         args.extend(["--model".into(), model]);
@@ -551,6 +549,14 @@ fn spawn_structured_child(options: &StructuredCliLaunchOptions) -> Result<Child>
         // long-standing updater-specific name kept for older CLIs.
         command.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
         command.env("DISABLE_AUTOUPDATER", "1");
+        // Defer MCP tool schemas out of the system prompt when the toolset is
+        // large (names stay listed; definitions load on demand and do not
+        // invalidate the prompt cache). "auto" keeps small toolsets upfront
+        // and falls back safely on endpoints without tool_reference support.
+        // A user-set value always wins.
+        if std::env::var_os("ENABLE_TOOL_SEARCH").is_none() {
+            command.env("ENABLE_TOOL_SEARCH", "auto");
+        }
     }
     #[cfg(unix)]
     {

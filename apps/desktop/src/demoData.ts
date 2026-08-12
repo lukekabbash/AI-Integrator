@@ -315,7 +315,14 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
       version: "3.9.21",
       status: "degraded",
       fidelity: "acp",
-      models: ["Composer 2.5", "DeepSeek V3.1", "DeepSeek R1", "Auto"],
+      models: [
+        "Auto",
+        "Composer 2.5",
+        "Claude Fable 5",
+        "Claude Opus 5",
+        "GPT-5.6 Sol",
+        "Cursor Grok 4.5",
+      ],
       detail: "Desktop detected; agent CLI setup is required for structured runs.",
     },
     {
@@ -332,10 +339,10 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
     {
       id: "grok",
       name: "Grok Build",
-      command: "grok agent stdio",
+      command: "grok agent --no-leader --always-approve stdio",
       status: "not_installed",
       fidelity: "acp",
-      models: ["grok-4.5"],
+      models: ["grok-4.6", "grok-4.5"],
       detail: "Install the vendor runtime, then return to this setup step.",
     },
     {

@@ -5,7 +5,7 @@ import {
   DEMO_GIT_RECENT_COMMITS,
   demoGitHistoryArchive,
 } from "./demoData";
-import { resolveModelLabel } from "./modelLabel";
+import { prettyModelLabel, resolveModelLabel } from "./modelLabel";
 import type { SpecialistSetting } from "./subagentSettings";
 
 export type RuntimeId = "codex" | "cursor" | "claude" | "grok" | "kimi" | "antigravity" | "custom";
@@ -125,7 +125,7 @@ export function runtimeAuthWarning(runtime: RuntimeConnection | undefined): stri
     return `${runtime.name} reports that its vendor-owned login is required.`;
   }
   if (runtime.status !== "degraded") return undefined;
-  if (runtime.detail === "auth-probe-requires-acp") {
+  if (runtime.detail === "auth-probe-requires-acp" || runtime.detail === "auth-not-probed") {
     return `${runtime.name} auth is checked during its ACP session handshake.`;
   }
   if (runtime.detail === "client-unsupported") {
@@ -356,6 +356,41 @@ export interface StorageTotals {
   sharedMemoryBytes: number;
   measuredAt: string;
   kind: "sqlite" | "browser-local-storage";
+}
+
+export interface LogsTotals {
+  bytes: number;
+  fileCount: number;
+  incidentFiles: number;
+  detailFiles: number;
+  measuredAt: string;
+  path: string;
+}
+
+export type DiagnosticChannel = "incident" | "detail";
+
+export interface DiagnosticRecord {
+  level?: string;
+  faultId?: string;
+  layer?: string;
+  op?: string;
+  outcome?: string;
+  code?: string;
+  causeClass?: string;
+  retryable?: boolean;
+  projectId?: string;
+  taskId?: string;
+  runId?: string;
+  processId?: string;
+  turnId?: string;
+  requestId?: string;
+  route?: string;
+  prevPhase?: string;
+  durationMs?: number;
+  detail?: string;
+  message?: string;
+  appVersion?: string;
+  [key: string]: unknown;
 }
 
 export interface ProviderUsageSummary {
@@ -1194,6 +1229,11 @@ export interface ExplainStreamEvent {
 export interface AppBridge {
   getAppInfo(): Promise<LocalAppInfo>;
   getStorageTotals(): Promise<StorageTotals>;
+  getLogsTotals(): Promise<LogsTotals>;
+  openLogsFolder(): Promise<void>;
+  clearLogs(): Promise<void>;
+  pruneLogs(): Promise<void>;
+  reportDiagnostic(channel: DiagnosticChannel, record: DiagnosticRecord): Promise<void>;
   getUsageSummary(): Promise<UsageSummary>;
   listSettings(): Promise<LocalSetting[]>;
   setSetting(key: string, value: unknown): Promise<LocalSetting>;
@@ -1346,10 +1386,23 @@ export interface AppBridge {
   explainPromptPreview(config: ExplainConfig, project?: string): Promise<string>;
   /** Rename a file in place inside the trusted project (native builds only). */
   renameProjectFile(projectId: string, path: string, newName: string): Promise<ProjectFileEntry>;
+  /** Duplicate a file beside itself inside the trusted project (native only). */
+  duplicateProjectFile(projectId: string, path: string): Promise<ProjectFileEntry>;
+  /** Resolve a repository-relative path to a canonical absolute path. */
+  resolveProjectPath(
+    projectId: string,
+    path: string,
+  ): Promise<{ absolutePath: string; relativePath: string }>;
   /** Native-detected, allowlisted file-opening targets for one trusted project. */
   listProjectFileOpeners(projectId: string): Promise<ProjectFileOpener[]>;
   openProjectFileExternal(projectId: string, path: string, openerId: string): Promise<void>;
   revealProjectFile(projectId: string, path: string): Promise<void>;
+  /** Reveal an absolute project/worktree path in the system file manager. */
+  revealAbsolutePath(path: string): Promise<void>;
+  /** Reveal the folder paired with a task (chat-runtime, worktree, or repository). */
+  revealTask(taskId: string): Promise<void>;
+  /** Resolve the folder paired with a task for copy-path actions. */
+  resolveTaskFolder(taskId: string): Promise<string>;
   openTerminal(
     projectId: string,
     dimensions: { cols: number; rows: number },
@@ -1461,6 +1514,18 @@ export interface AppBridge {
   listModels(runtime: RuntimeId): Promise<string[]>;
   listModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]>;
   getCachedModelCatalog(runtime: RuntimeId): ModelCatalogEntry[] | undefined;
+  /** Warm the catalogs of connected runtimes so a picker never waits on a
+   *  first probe. Fire-and-forget: failures leave the lazy path unchanged. */
+  prefetchModelCatalogs(runtimes: RuntimeConnection[]): void;
+  /** Start Grok/Kimi ACP (connect + session) before the user hits send. */
+  prepareAcpRuntime(input: {
+    taskId: string;
+    runtime: RuntimeId;
+    model?: string;
+    effort?: string;
+    permission?: StartTaskInput["permission"];
+    delegation?: StartTaskInput["delegation"];
+  }): Promise<void>;
   refreshModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]>;
   invalidateModelCatalog(runtime: RuntimeId): void;
   subscribeModelCatalogs(listener: () => void): () => void;
@@ -1815,10 +1880,27 @@ const FALLBACK_MODELS: Partial<Record<RuntimeId, string[]>> = {
     "Claude Opus 4.6 (Thinking)",
     "GPT-OSS 120B",
   ],
-  // These are a degraded fallback only. A successfully negotiated Cursor ACP
-  // catalog replaces them with the models available to the signed-in account.
-  cursor: ["composer-2.5", "cursor-small", "deepseek-v3.1", "deepseek-r1", "auto"],
-  grok: ["grok-4.5"],
+  // Degraded setup fallback only. Prefer the negotiated Cursor ACP
+  // `configOptions` catalog (account- and version-specific). Keep base wire
+  // ids here — Cursor exposes thought level separately, not as CLI effort
+  // suffixes. Refresh against `agent --list-models` when Cursor's top families
+  // change; do not mirror every effort/fast variant.
+  cursor: [
+    "auto",
+    "composer-2.5",
+    "claude-fable-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-sonnet-5",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "cursor-grok-4.5",
+    "gemini-3.6-flash",
+    "kimi-k3",
+  ],
+  grok: ["grok-4.6", "grok-4.5"],
   // Kimi replaces this with the account's negotiated ACP catalog on first use.
   kimi: ["kimi-code/k3", "kimi-code/kimi-for-coding", "kimi-code/kimi-for-coding-highspeed"],
   custom: [],
@@ -2481,7 +2563,7 @@ function mapRuntime(status: NativeProviderStatus): RuntimeConnection {
     name: names[id],
     command:
       status.provider === "grok"
-        ? "grok agent stdio"
+        ? "grok agent --no-leader --always-approve stdio"
         : status.provider === "kimi"
           ? "kimi acp"
           : (status.executable ?? status.provider),
@@ -3079,15 +3161,13 @@ async function ensureStandardAcpSessionUnlocked(
   const cwd = repositoryForTask(input.taskId);
   const state = standardAcpState[runtime];
   const launchSelection =
-    runtime === "grok"
-      ? { model: realModelId(input.model), effort: input.effort }
-      : undefined;
+    runtime === "grok" ? { model: realModelId(input.model), effort: input.effort } : undefined;
   const appliedSelection = state.selections.get(nativeTaskId);
   const routingChanged = Boolean(
     launchSelection &&
-      state.connections.has(nativeTaskId) &&
-      (appliedSelection?.model !== launchSelection.model ||
-        appliedSelection?.effort !== launchSelection.effort),
+    state.connections.has(nativeTaskId) &&
+    (appliedSelection?.model !== launchSelection.model ||
+      appliedSelection?.effort !== launchSelection.effort),
   );
   if (
     !state.connections.has(nativeTaskId) ||
@@ -3334,11 +3414,24 @@ const DEMO_EFFORTS: ModelEffortOption[] = [
   { id: "high", label: "High" },
 ];
 
+/** Documented Grok 4.x effort menus. Unknown slugs stay picker-less until ACP
+ * advertises a menu. Do not attach `xhigh` to 4.5 — the API coerces it to high. */
 const GROK_4_5_EFFORTS: ModelEffortOption[] = [
   { id: "low", label: "Low" },
   { id: "medium", label: "Medium" },
   { id: "high", label: "High" },
 ];
+const GROK_4_6_EFFORTS: ModelEffortOption[] = [
+  ...GROK_4_5_EFFORTS,
+  { id: "xhigh", label: "Extra high" },
+];
+const GROK_DOCUMENTED_EFFORTS: Record<
+  string,
+  { efforts: ModelEffortOption[]; defaultEffort: string }
+> = {
+  "grok-4.6": { efforts: GROK_4_6_EFFORTS, defaultEffort: "high" },
+  "grok-4.5": { efforts: GROK_4_5_EFFORTS, defaultEffort: "high" },
+};
 
 const AGY_EFFORT_ORDER = ["low", "medium", "high"] as const;
 
@@ -3377,17 +3470,31 @@ function antigravityCatalog(ids: string[]): ModelCatalogEntry[] {
 /** One sanitized entry from the native `claude_list_models` probe. */
 type ClaudeModelInfo = { id: string; label: string; efforts: string[] };
 
+/** The CLI appends context/mode notes ("Opus (1M context)") to its picker
+ *  names; the picker shows the model, not its context window. */
+const CLAUDE_LABEL_SUFFIX = /\s(\(.+\))\s*$/;
+
 /**
  * Claude Code's `list_models` control response reports per-model effort
  * support, so live entries only get the picker where the CLI would honor
- * `--effort`. Labels come from the CLI's own `/model` picker names.
+ * `--effort`.
+ *
+ * Labels come from our id-derived formatter, not the CLI's terse `/model`
+ * names ("Opus", "Sonnet"), which drop the version number. The CLI's
+ * parenthetical is dropped as noise unless two entries would otherwise carry
+ * the identical label — e.g. `claude-opus-5` beside `claude-opus-5[1m]`.
  */
 function claudeCatalog(models: ClaudeModelInfo[]): ModelCatalogEntry[] {
-  return models.map(({ id, label, efforts }) => {
-    if (efforts.length === 0) return { id, label: resolveModelLabel(id, label) };
+  const base = models.map(({ id, label }) => prettyModelLabel(id) || label || id);
+  const ambiguous = new Set(base.filter((label, index) => base.indexOf(label) !== index));
+  return models.map(({ id, label, efforts }, index) => {
+    const plain = base[index]!;
+    const suffix = ambiguous.has(plain) ? label.match(CLAUDE_LABEL_SUFFIX)?.[1] : undefined;
+    const resolved = suffix && !plain.includes(suffix) ? `${plain} ${suffix}` : plain;
+    if (efforts.length === 0) return { id, label: resolved };
     return {
       id,
-      label: resolveModelLabel(id, label),
+      label: resolved,
       efforts: efforts.map((level) => ({ id: level, label: effortLabel(level) })),
       defaultEffort: efforts.includes(CLAUDE_DEFAULT_EFFORT)
         ? CLAUDE_DEFAULT_EFFORT
@@ -3397,13 +3504,16 @@ function claudeCatalog(models: ClaudeModelInfo[]): ModelCatalogEntry[] {
 }
 
 function grokCatalog(ids: string[]): ModelCatalogEntry[] {
-  return ids.map((id) => ({
-    id,
-    label: resolveModelLabel(id),
-    ...(id === "grok-4.5"
-      ? { efforts: GROK_4_5_EFFORTS, defaultEffort: "high" }
-      : {}),
-  }));
+  return ids.map((id) => {
+    const documented = GROK_DOCUMENTED_EFFORTS[id];
+    return {
+      id,
+      label: resolveModelLabel(id),
+      ...(documented
+        ? { efforts: documented.efforts, defaultEffort: documented.defaultEffort }
+        : {}),
+    };
+  });
 }
 
 async function discoverModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]> {
@@ -3446,8 +3556,8 @@ async function discoverModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEnt
       const models = await nativeInvoke<string[]>("grok_list_models");
       if (models.length > 0) return grokCatalog(models);
     } catch {
-      // Grok unavailable or offline; retain only the current known model as a
-      // degraded fallback instead of inventing stale provider choices.
+      // Grok unavailable or offline; fall through to the documented
+      // grok-4.6 / grok-4.5 fallback instead of inventing stale ids.
     }
   }
   if (isTauri() && runtime === "cursor") {
@@ -3529,6 +3639,40 @@ async function discoverModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEnt
   if (runtime === "grok") return grokCatalog(FALLBACK_MODELS.grok ?? []);
   if (runtime === "antigravity") return ANTIGRAVITY_CATALOG;
   return toCatalogEntries(FALLBACK_MODELS[runtime] ?? []);
+}
+
+/**
+ * Runtimes whose catalog comes from a standalone CLI probe, so it can be
+ * warmed before the user opens a picker. Cursor and Kimi are excluded on
+ * purpose: their catalogs are negotiated inside a task-bound ACP session, so
+ * probing them early would either spawn a session the user never asked for or
+ * cache the degraded static list when no task is active.
+ */
+const PREFETCHABLE_RUNTIMES: readonly RuntimeId[] = ["claude", "codex", "grok", "antigravity"];
+
+/**
+ * Warm the model catalogs for the connected runtimes so switching runtime in
+ * the composer paints from cache instead of waiting on a CLI probe. Probes run
+ * one at a time — startup already spawns provider discovery, and nothing here
+ * is on a user-visible path.
+ */
+function prefetchModelCatalogs(runtimes: RuntimeConnection[]): void {
+  const pending = runtimes.filter(
+    (runtime) =>
+      runtime.status === "connected" &&
+      PREFETCHABLE_RUNTIMES.includes(runtime.id) &&
+      modelCatalogCache.get(runtime.id) === undefined,
+  );
+  void pending.reduce(
+    (queue, runtime) =>
+      queue.then(() =>
+        loadModelCatalog(runtime.id).then(
+          () => undefined,
+          () => undefined,
+        ),
+      ),
+    Promise.resolve(),
+  );
 }
 
 async function loadModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]> {
@@ -3967,6 +4111,47 @@ export const bridge: AppBridge = {
       measuredAt: new Date().toISOString(),
       kind: "browser-local-storage",
     };
+  },
+
+  getLogsTotals: async () => {
+    if (isTauri()) return nativeInvoke<LogsTotals>("logs_totals");
+    return {
+      bytes: 0,
+      fileCount: 0,
+      incidentFiles: 0,
+      detailFiles: 0,
+      measuredAt: new Date().toISOString(),
+      path: "Documents/AI Integrator/Logs",
+    };
+  },
+
+  openLogsFolder: async () => {
+    if (!isTauri()) {
+      throw new Error("Opening the logs folder requires the native desktop app.");
+    }
+    await nativeInvoke("logs_open_folder");
+  },
+
+  clearLogs: async () => {
+    if (isTauri()) {
+      await nativeInvoke("logs_clear");
+      return;
+    }
+  },
+
+  pruneLogs: async () => {
+    if (isTauri()) {
+      await nativeInvoke("logs_prune");
+    }
+  },
+
+  reportDiagnostic: async (channel, record) => {
+    if (!isTauri()) return;
+    try {
+      await nativeInvoke("diagnostics_report", { channel, record });
+    } catch {
+      // Diagnostics must never break the user path.
+    }
   },
 
   getUsageSummary: async () => {
@@ -4501,6 +4686,25 @@ export const bridge: AppBridge = {
   listModelCatalog: loadModelCatalog,
 
   getCachedModelCatalog: (runtime) => modelCatalogCache.get(runtime),
+
+  prefetchModelCatalogs,
+
+  prepareAcpRuntime: async (input) => {
+    if (!isTauri()) return;
+    if (input.runtime !== "grok" && input.runtime !== "kimi") return;
+    await ensureStandardAcpSession(
+      {
+        taskId: input.taskId,
+        prompt: "",
+        runtime: input.runtime,
+        model: input.model || PROVIDER_DEFAULT_MODEL,
+        effort: input.effort,
+        permission: input.permission ?? (input.runtime === "grok" ? "project-write" : "ask"),
+        delegation: input.delegation ?? "off",
+      },
+      input.runtime,
+    );
+  },
 
   refreshModelCatalog: async (runtime) => {
     invalidateModelCatalog(runtime);
@@ -5559,6 +5763,28 @@ export const bridge: AppBridge = {
     throw new Error("Renaming project files requires the native desktop app.");
   },
 
+  duplicateProjectFile: async (projectId, path) => {
+    if (isTauri()) {
+      return nativeInvoke<ProjectFileEntry>("project_file_duplicate", {
+        repository: repositoryForProject(projectId),
+        input: { path },
+      });
+    }
+    throw new Error("Duplicating project files requires the native desktop app.");
+  },
+
+  resolveProjectPath: async (projectId, path) => {
+    if (isTauri()) {
+      return nativeInvoke<{ absolutePath: string; relativePath: string }>("project_path_resolve", {
+        repository: repositoryForProject(projectId),
+        input: { path },
+      });
+    }
+    const project = readDemoSnapshot().projects.find((entry) => entry.id === projectId);
+    const absolutePath = project ? `${project.path.replace(/[\\/]+$/, "")}/${path}` : path;
+    return { absolutePath, relativePath: path };
+  },
+
   listProjectFileOpeners: async (projectId) => {
     if (!isTauri()) return [];
     return nativeInvoke<ProjectFileOpener[]>("project_file_opener_list", {
@@ -5584,6 +5810,27 @@ export const bridge: AppBridge = {
       repository: repositoryForProject(projectId),
       input: { path },
     });
+  },
+
+  revealAbsolutePath: async (path) => {
+    if (!isTauri()) {
+      throw new Error("Revealing folders requires the native desktop app.");
+    }
+    await nativeInvoke("path_reveal", { path });
+  },
+
+  revealTask: async (taskId) => {
+    if (!isTauri()) {
+      throw new Error("Revealing folders requires the native desktop app.");
+    }
+    await nativeInvoke("task_reveal", { taskId });
+  },
+
+  resolveTaskFolder: async (taskId) => {
+    if (!isTauri()) {
+      throw new Error("Resolving a chat folder requires the native desktop app.");
+    }
+    return nativeInvoke<string>("task_working_directory", { taskId });
   },
 
   openTerminal: async (projectId, dimensions) => {

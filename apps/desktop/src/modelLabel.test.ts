@@ -12,6 +12,7 @@ describe("prettyModelLabel", () => {
     expect(prettyModelLabel("gpt-oss-120b")).toBe("GPT-OSS 120B");
 
     expect(prettyModelLabel("grok-4.5")).toBe("Grok 4.5");
+    expect(prettyModelLabel("grok-4.6")).toBe("Grok 4.6");
     expect(prettyModelLabel("grok-build")).toBe("Grok Build");
     expect(prettyModelLabel("kimi-code/k3")).toBe("Kimi K3");
     expect(prettyModelLabel("kimi-code/kimi-for-coding")).toBe("Kimi K2.7 Code");
@@ -25,6 +26,7 @@ describe("prettyModelLabel", () => {
     expect(prettyModelLabel("claude-sonnet-4-6")).toBe("Claude Sonnet 4.6");
     expect(prettyModelLabel("claude-sonnet-5")).toBe("Claude Sonnet 5");
     expect(prettyModelLabel("claude-fable-5")).toBe("Claude Fable 5");
+    expect(prettyModelLabel("claude-haiku-4-5-20251001")).toBe("Claude Haiku 4.5");
 
     expect(prettyModelLabel("composer-2.5")).toBe("Composer 2.5");
     expect(prettyModelLabel("cursor-small")).toBe("Cursor Small");
@@ -69,5 +71,6 @@ describe("resolveModelLabel", () => {
     expect(resolveModelLabel("gpt-5.6-sol", "gpt-5.6-sol")).toBe("GPT-5.6 Sol");
     expect(resolveModelLabel("grok-4.5", "")).toBe("Grok 4.5");
     expect(resolveModelLabel("grok-4.5", null)).toBe("Grok 4.5");
+    expect(resolveModelLabel("grok-4.6", "")).toBe("Grok 4.6");
   });
 });

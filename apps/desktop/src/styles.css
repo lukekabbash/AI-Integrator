@@ -7900,12 +7900,7 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   max-width: 280px;
   padding: 4px;
   border: 1px solid var(--color-border-subtle);
-  border-radius: 9px;
-  background: var(--color-layer-1);
-  box-shadow: var(--shadow-elevated);
-  animation: context-menu-in 120ms ease-out;
-}
-@keyframes context-menu-in {
+  border-radius: var(--radius-control);
   from {
     opacity: 0;
     transform: translateY(4px) scale(0.98);
@@ -12914,7 +12909,7 @@ button.explain-fallback-step:hover .explain-fallback-role {
   transition: none;
 }
 .project-action-menu {
-  width: 168px;
+  width: 200px;
 }
 .project-action-menu-danger {
   color: var(--color-danger) !important;
@@ -13394,7 +13389,7 @@ button.explain-fallback-step:hover .explain-fallback-role {
 .chat-action-menu {
   position: fixed;
   z-index: 45;
-  width: 164px;
+  width: 200px;
   padding: 4px;
   display: grid;
   gap: 1px;

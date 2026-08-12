@@ -30,6 +30,8 @@ import {
   Trash2,
   Users,
   X,
+  Copy,
+  FolderSearch,
 } from "lucide-react";
 import type { ProjectSummary, TaskMessageSearchHit, TaskSummary } from "../bridge";
 import { parseForkTitle } from "../forkTitle";
@@ -85,6 +87,12 @@ interface TaskSidebarProps {
   /** Bulk-delete the archived chats of a live project (archive view only). */
   onDeleteArchivedChats?: (projectId: string) => void;
   onDeleteTask?: (taskId: string) => void;
+  /** Reveal the chat's worktree, project folder, or chat-runtime directory. */
+  onRevealTask?: (task: TaskSummary) => void;
+  /** Resolve a chat folder when the sidebar has no project/worktree path. */
+  onResolveTaskFolder?: (task: TaskSummary) => Promise<string>;
+  /** Reveal the project root in the system file manager. */
+  onRevealProject?: (project: ProjectSummary) => void;
   onOpenSettings: () => void;
   onOpenScheduled?: () => void;
   onOpenCapabilities?: () => void;
@@ -186,11 +194,31 @@ const PROJECT_CHAT_PAGE_SIZE = 10;
 const INITIAL_SEARCH_RESULT_LIMIT = 80;
 /** Matches `.project-chat-list-clip` grid-template-rows timing. */
 const PROJECT_CHAT_LIST_CLIP_MS = 220;
-/** Rename / Copy / Pin / Archive / Delete — used to decide flip-up vs down. */
-const CHAT_ACTION_MENU_HEIGHT = 168;
-const CHAT_ACTION_MENU_WIDTH = 164;
-const PROJECT_ACTION_MENU_HEIGHT = 112;
-const PROJECT_ACTION_MENU_WIDTH = 168;
+/** Rename / Copy / Reveal / path copies / Pin / Archive / Delete — used to decide flip-up vs down. */
+const CHAT_ACTION_MENU_HEIGHT = 258;
+const CHAT_ACTION_MENU_WIDTH = 200;
+const PROJECT_ACTION_MENU_HEIGHT = 204;
+const PROJECT_ACTION_MENU_WIDTH = 200;
+
+function lastPathSegment(value: string): string {
+  return value.replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).at(-1) ?? value;
+}
+
+function pathRelativeToRoot(absolute: string, root?: string): string {
+  if (!root) return lastPathSegment(absolute);
+  const normalized = absolute.replace(/\\/g, "/");
+  const rootNorm = root.replace(/\\/g, "/").replace(/\/+$/, "");
+  if (normalized.toLowerCase() === rootNorm.toLowerCase()) return ".";
+  const prefix = `${rootNorm.toLowerCase()}/`;
+  if (normalized.toLowerCase().startsWith(prefix)) {
+    return normalized.slice(rootNorm.length).replace(/^\/+/, "");
+  }
+  return lastPathSegment(absolute);
+}
+
+function copyText(value: string) {
+  void navigator.clipboard.writeText(value).catch(() => undefined);
+}
 
 function overflowMenuPlacement(
   trigger: HTMLElement,
@@ -401,6 +429,9 @@ export const TaskSidebar = memo(function TaskSidebar({
   onDeleteProject,
   onDeleteArchivedChats,
   onDeleteTask,
+  onRevealTask,
+  onResolveTaskFolder,
+  onRevealProject,
   onOpenSettings,
   onOpenScheduled,
   onOpenCapabilities,
@@ -776,6 +807,20 @@ export const TaskSidebar = memo(function TaskSidebar({
               onSelectTask(task.id);
               if (options?.searchResult) closeSearch();
             }}
+            onContextMenu={(event) => {
+              if (options?.searchResult) return;
+              event.preventDefault();
+              event.stopPropagation();
+              setOpenProjectMenuId("");
+              const trigger = event.currentTarget;
+              setMenuPlacement(
+                overflowMenuPlacement(trigger, chatListRef.current, CHAT_ACTION_MENU_HEIGHT),
+              );
+              setMenuAnchor(
+                overflowMenuAnchor(trigger, sidebarMenuDirection, CHAT_ACTION_MENU_WIDTH),
+              );
+              setOpenMenuId(task.id);
+            }}
             onDoubleClick={
               options?.searchResult || !metadataActionsEnabled
                 ? undefined
@@ -942,6 +987,54 @@ export const TaskSidebar = memo(function TaskSidebar({
                         <CopyPlus /> Copy
                       </button>
                     </MenuActionTooltip>
+                    {onRevealTask ? (
+                      <button
+                        role="menuitem"
+                        type="button"
+                        onClick={() => {
+                          setOpenMenuId("");
+                          onRevealTask(task);
+                        }}
+                      >
+                        <FolderSearch /> Reveal in File Explorer
+                      </button>
+                    ) : null}
+                    <button
+                      role="menuitem"
+                      type="button"
+                      onClick={() => {
+                        const project = projects.find((entry) => entry.id === task.projectId);
+                        const local = task.worktree ?? project?.path;
+                        setOpenMenuId("");
+                        if (local) {
+                          copyText(local);
+                          return;
+                        }
+                        if (!onResolveTaskFolder) return;
+                        void onResolveTaskFolder(task).then(copyText);
+                      }}
+                    >
+                      <Copy /> Copy absolute path
+                    </button>
+                    <button
+                      role="menuitem"
+                      type="button"
+                      onClick={() => {
+                        const project = projects.find((entry) => entry.id === task.projectId);
+                        const local = task.worktree ?? project?.path;
+                        setOpenMenuId("");
+                        if (local) {
+                          copyText(pathRelativeToRoot(local, project?.path));
+                          return;
+                        }
+                        if (!onResolveTaskFolder) return;
+                        void onResolveTaskFolder(task).then((absolute) =>
+                          copyText(pathRelativeToRoot(absolute, project?.path)),
+                        );
+                      }}
+                    >
+                      <Copy /> Copy relative path
+                    </button>
                     <MenuActionTooltip
                       label={
                         metadataActionsEnabled ? undefined : "Native persistence is being added"
@@ -1181,6 +1274,31 @@ export const TaskSidebar = memo(function TaskSidebar({
                             }
                             toggleProjectExpanded(project.id, expanded);
                           }}
+                          onContextMenu={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            setOpenMenuId("");
+                            const trigger =
+                              (event.currentTarget
+                                .closest(".project-group-header")
+                                ?.querySelector(".project-more-button") as HTMLElement | null) ??
+                              event.currentTarget;
+                            setProjectMenuPlacement(
+                              overflowMenuPlacement(
+                                trigger,
+                                chatListRef.current,
+                                PROJECT_ACTION_MENU_HEIGHT,
+                              ),
+                            );
+                            setProjectMenuAnchor(
+                              overflowMenuAnchor(
+                                trigger,
+                                sidebarMenuDirection,
+                                PROJECT_ACTION_MENU_WIDTH,
+                              ),
+                            );
+                            setOpenProjectMenuId(project.id);
+                          }}
                           aria-expanded={expanded}
                           aria-current={project.id === activeProjectId ? "true" : undefined}
                         >
@@ -1324,6 +1442,38 @@ export const TaskSidebar = memo(function TaskSidebar({
                                       >
                                         {project.pinned ? <PinOff /> : <Pin />}
                                         {project.pinned ? "Unpin" : "Pin"}
+                                      </button>
+                                      {onRevealProject ? (
+                                        <button
+                                          role="menuitem"
+                                          type="button"
+                                          onClick={() => {
+                                            setOpenProjectMenuId("");
+                                            onRevealProject(project);
+                                          }}
+                                        >
+                                          <FolderSearch /> Reveal in File Explorer
+                                        </button>
+                                      ) : null}
+                                      <button
+                                        role="menuitem"
+                                        type="button"
+                                        onClick={() => {
+                                          copyText(project.path);
+                                          setOpenProjectMenuId("");
+                                        }}
+                                      >
+                                        <Copy /> Copy absolute path
+                                      </button>
+                                      <button
+                                        role="menuitem"
+                                        type="button"
+                                        onClick={() => {
+                                          copyText(lastPathSegment(project.path));
+                                          setOpenProjectMenuId("");
+                                        }}
+                                      >
+                                        <Copy /> Copy relative path
                                       </button>
                                       <button
                                         role="menuitem"

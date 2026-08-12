@@ -165,10 +165,15 @@ fn probe_command(executable: &Path, args: &[&str]) -> Command {
     #[cfg(windows)]
     {
         if is_windows_script(executable) {
+            use std::os::windows::process::CommandExt;
+
             let mut command =
                 Command::new(std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into()));
             command.args(["/d", "/s", "/c"]);
-            command.arg(windows_command_line(executable, args));
+            // cmd.exe does not understand the MSVC `\"` escaping that
+            // Command::arg applies, so hand it the exact `/s`-shaped line:
+            // one outer quote pair that `/s` strips, leaving each part quoted.
+            command.raw_arg(format!("\"{}\"", windows_command_line(executable, args)));
             return command;
         }
     }
@@ -282,6 +287,21 @@ mod tests {
             }
             ProcessRunOutcome::TimedOut => panic!("child exited; probe must not time out"),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_script_probes_survive_cmd_exe_quoting() {
+        let dir = std::env::temp_dir().join("integrator-probe-quoting-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // A space in the path exercises the /s outer-quote stripping.
+        let script = dir.join("echo args.cmd");
+        std::fs::write(&script, "@echo %1 %2\r\n").expect("write script");
+        let output = run_bounded(&script, &["--version", "second"], None).expect("probe run");
+        assert!(output.success, "stderr: {}", output.stderr);
+        assert!(output.stdout.contains("--version"));
+        assert!(output.stdout.contains("second"));
+        let _ = std::fs::remove_file(&script);
     }
 
     #[test]

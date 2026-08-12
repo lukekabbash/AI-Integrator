@@ -9,7 +9,8 @@ use integrator_core::{
     ApprovalDecision, ApprovalKind, ApprovalProjection, ApprovalState, IntegratorError,
     ItemProjection, ItemStatus, NewTask, ProviderKind, ProviderSession, ProviderSessionId, Result,
     RuntimeBinding, RuntimeProjection, RuntimeProjectionEvent, RuntimeSession, RuntimeSessionId,
-    StopRequestResult, TASK_PROJECTION_HYDRATE_TAIL, Task, TaskId, TaskProjectionConnectionHydrate,
+    StopRequestResult, TASK_PROJECTION_HYDRATE_MAX_ITEMS, TASK_PROJECTION_HYDRATE_TAIL,
+    TASK_PROJECTION_HYDRATE_TAIL_MESSAGES, Task, TaskId, TaskProjectionConnectionHydrate,
     TaskProjectionDiffHydrate, TaskProjectionErrorHydrate, TaskProjectionHydrate, TaskSnapshot,
     TaskSnapshotQuery, TransportRequestId, TurnProjection, TurnStatus, UsageProjection,
 };
@@ -24,11 +25,18 @@ const RENDERER_CONTENT_LIMIT: usize = 480 * 1024;
 const ITEM_BODY_LIMIT: usize = 2 * 1024 * 1024;
 const COMMAND_OUTPUT_LIMIT: usize = 1024 * 1024;
 const COMMAND_OUTPUT_HEAD: usize = 128 * 1024;
+/// Stops the message-anchored hydrate window from extending past the item
+/// floor once the page already carries this much snapshot JSON. Only the
+/// extension is budgeted: the first `TASK_PROJECTION_HYDRATE_TAIL` rows load
+/// regardless, so worst-case cost never exceeds today's floor plus this.
+const HYDRATE_WINDOW_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 
 /// Default handoff window: last N turns from shared task projections.
 pub const HANDOFF_DEFAULT_MAX_TURNS: usize = 10;
-/// ~50k tokens at chars/4 for fresh-session primers across any provider.
-pub const HANDOFF_DEFAULT_MAX_TOKENS: usize = 50_000;
+/// ~16k tokens at chars/4 for fresh-session primers across any provider.
+/// Deliberately lean: the primer enters the provider's history forever, so
+/// every extra token here is re-billed on all later turns of the session.
+pub const HANDOFF_DEFAULT_MAX_TOKENS: usize = 16_000;
 /// Bound vision reattachment cost on the primed turn.
 pub const HANDOFF_DEFAULT_MAX_IMAGES: usize = 4;
 /// Child/orchestrator digests stay tighter so briefs remain focused.
@@ -376,21 +384,33 @@ impl LocalStore {
             });
         }
 
-        let limit = query.limit.unwrap_or(TASK_PROJECTION_HYDRATE_TAIL).max(1);
+        // An explicit `limit` keeps plain item-count paging (tests/tools). The
+        // default window is message-anchored: it extends past the item floor
+        // until the page holds enough user/agent messages that a tool-heavy
+        // chat still hydrates real conversation, bounded by a hard item cap
+        // and a byte budget so the extension cost stays predictable.
+        let (min_items, message_target, max_items) = match query.limit {
+            Some(limit) => (limit.max(1), 0, limit.max(1)),
+            None => (
+                TASK_PROJECTION_HYDRATE_TAIL,
+                TASK_PROJECTION_HYDRATE_TAIL_MESSAGES,
+                TASK_PROJECTION_HYDRATE_MAX_ITEMS,
+            ),
+        };
         let before_seq = query.before_seq.unwrap_or(i64::MAX);
 
         let mut statement = connection
             .prepare(
                 r#"
-            SELECT last_event_seq, snapshot_event_json FROM (
-                SELECT last_event_seq, snapshot_event_json FROM integrator_items
+            SELECT last_event_seq, snapshot_event_json, kind FROM (
+                SELECT last_event_seq, snapshot_event_json, kind FROM integrator_items
                     WHERE task_id = ?1
                       AND last_event_seq > ?2
                       AND last_event_seq <= ?3
                       AND last_event_seq < ?4
                       AND snapshot_event_json IS NOT NULL
                 UNION ALL
-                SELECT last_event_seq, snapshot_event_json FROM integrator_approvals
+                SELECT last_event_seq, snapshot_event_json, 'approval' AS kind FROM integrator_approvals
                     WHERE task_id = ?1
                       AND last_event_seq > ?2
                       AND last_event_seq <= ?3
@@ -402,41 +422,70 @@ impl LocalStore {
             "#,
             )
             .map_err(storage_error)?;
-        let mut window_rows = statement
+        let fetched_rows = statement
             .query_map(
-                params![task_key, reset_seq, watermark, before_seq, limit as i64],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                params![task_key, reset_seq, watermark, before_seq, max_items as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .map_err(storage_error)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(storage_error)?;
         drop(statement);
-        let fetched = window_rows.len();
+        let fetched = fetched_rows.len();
+        let mut window_rows: Vec<(i64, String)> = Vec::with_capacity(fetched.min(min_items));
+        let mut message_count = 0usize;
+        let mut window_bytes = 0usize;
+        for (seq, event_json, kind) in fetched_rows {
+            if window_rows.len() >= min_items
+                && (message_count >= message_target
+                    || window_bytes >= HYDRATE_WINDOW_BYTE_BUDGET)
+            {
+                break;
+            }
+            if kind == "user_message" || kind == "agent_message" {
+                message_count += 1;
+            }
+            window_bytes += event_json.len();
+            window_rows.push((seq, event_json));
+        }
+        let kept = window_rows.len();
         // Reverse to ascending last_event_seq so item/approval array order
         // matches the historical event-stream hydrate path.
         window_rows.reverse();
 
         let oldest_loaded = window_rows.first().map(|(seq, _)| *seq);
-        let has_more_older = match oldest_loaded {
-            Some(oldest) if fetched >= limit => {
-                connection
-                    .query_row(
-                        "SELECT EXISTS(
-                        SELECT 1 FROM integrator_items
-                            WHERE task_id = ?1 AND last_event_seq > ?2 AND last_event_seq < ?3
-                              AND last_event_seq <= ?4 AND snapshot_event_json IS NOT NULL
-                        UNION ALL
-                        SELECT 1 FROM integrator_approvals
-                            WHERE task_id = ?1 AND last_event_seq > ?2 AND last_event_seq < ?3
-                              AND last_event_seq <= ?4 AND snapshot_event_json IS NOT NULL
-                    )",
-                        params![task_key, reset_seq, oldest, watermark],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .map_err(storage_error)?
-                    > 0
+        let has_more_older = if kept < fetched {
+            // The trim discarded fetched in-range rows, so older content
+            // provably exists without another query.
+            true
+        } else {
+            match oldest_loaded {
+                Some(oldest) if fetched >= max_items => {
+                    connection
+                        .query_row(
+                            "SELECT EXISTS(
+                            SELECT 1 FROM integrator_items
+                                WHERE task_id = ?1 AND last_event_seq > ?2 AND last_event_seq < ?3
+                                  AND last_event_seq <= ?4 AND snapshot_event_json IS NOT NULL
+                            UNION ALL
+                            SELECT 1 FROM integrator_approvals
+                                WHERE task_id = ?1 AND last_event_seq > ?2 AND last_event_seq < ?3
+                                  AND last_event_seq <= ?4 AND snapshot_event_json IS NOT NULL
+                        )",
+                            params![task_key, reset_seq, oldest, watermark],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map_err(storage_error)?
+                        > 0
+                }
+                _ => false,
             }
-            _ => false,
         };
 
         let singleton_jsons = if older_page {
@@ -4128,6 +4177,88 @@ mod tests {
         assert_eq!(oldest_hydrate.items.len(), 1);
         assert!(!oldest_hydrate.has_more_older);
         assert_eq!(oldest_hydrate.items[0].provider_item_id, "item-0");
+    }
+
+    #[test]
+    fn default_hydrate_extends_past_item_floor_when_tools_crowd_out_messages() {
+        let (store, binding) = bound_store(ProviderKind::Codex);
+        // Oldest: real conversation. Newest: a tool-heavy stretch larger than
+        // the item floor, which used to evict every message from the window.
+        for index in 0..40 {
+            store
+                .apply_reduced_event(
+                    &binding,
+                    &completed_message(
+                        &format!("msg-{index:03}"),
+                        ItemKind::AgentMessage,
+                        &format!("message body {index}"),
+                    ),
+                )
+                .expect("persist message item");
+        }
+        for index in 0..400 {
+            store
+                .apply_reduced_event(
+                    &binding,
+                    &completed_message(
+                        &format!("cmd-{index:03}"),
+                        ItemKind::CommandExecution,
+                        &format!("command output {index}"),
+                    ),
+                )
+                .expect("persist command item");
+        }
+
+        let snapshot = store.task_snapshot(binding.task_id).expect("hydrate");
+        let hydrate = snapshot.hydrate.expect("hydrate");
+        assert_eq!(hydrate.items.len(), 440, "window keeps extending to reach messages");
+        assert!(!hydrate.has_more_older);
+        let messages = hydrate
+            .items
+            .iter()
+            .filter(|item| item.kind == ItemKind::AgentMessage)
+            .count();
+        assert_eq!(messages, 40);
+    }
+
+    #[test]
+    fn default_hydrate_stops_at_message_target_and_pages_older() {
+        let (store, binding) = bound_store(ProviderKind::Codex);
+        for index in 0..500 {
+            store
+                .apply_reduced_event(
+                    &binding,
+                    &completed_message(
+                        &format!("msg-{index:03}"),
+                        ItemKind::AgentMessage,
+                        &format!("message body {index}"),
+                    ),
+                )
+                .expect("persist message item");
+        }
+
+        let snapshot = store.task_snapshot(binding.task_id).expect("hydrate");
+        let hydrate = snapshot.hydrate.expect("hydrate");
+        // Message-dense chats satisfy the message target within the item
+        // floor, so the window matches the historical tail size.
+        assert_eq!(hydrate.items.len(), TASK_PROJECTION_HYDRATE_TAIL);
+        assert!(hydrate.has_more_older);
+        assert_eq!(hydrate.items[0].provider_item_id, "msg-200");
+
+        let older = store
+            .task_snapshot_with(
+                binding.task_id,
+                TaskSnapshotQuery {
+                    before_seq: hydrate.before_seq,
+                    ..TaskSnapshotQuery::default()
+                },
+            )
+            .expect("older page");
+        let older_hydrate = older.hydrate.expect("older hydrate");
+        assert_eq!(older_hydrate.items.len(), 200);
+        assert!(!older_hydrate.has_more_older);
+        assert_eq!(older_hydrate.items[0].provider_item_id, "msg-000");
+        assert_eq!(older_hydrate.items[199].provider_item_id, "msg-199");
     }
 
     #[test]
