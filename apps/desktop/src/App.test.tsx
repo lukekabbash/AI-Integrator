@@ -69,7 +69,7 @@ describe("AI Integrator desktop workspace", () => {
     );
     // No provider reports quota in the demo snapshot: the pill shows tokens
     // only instead of a dead "—%".
-    const usagePill = screen.getByTitle(/Plan usage not exposed/);
+    const usagePill = screen.getByRole("button", { name: /Plan usage not exposed/ });
     expect(usagePill).not.toHaveTextContent("%");
     expect(usagePill).toHaveTextContent("tokens");
     expect(screen.getByPlaceholderText("Commit message")).toBeInTheDocument();
@@ -228,13 +228,14 @@ describe("AI Integrator desktop workspace", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Open Settings" }));
     expect(
-      await screen.findByRole("heading", { name: "Appearance" }, { timeout: 5000 }),
+      await screen.findByRole("heading", { name: "General" }, { timeout: 5000 }),
     ).toBeInTheDocument();
     expect(
       screen.queryByRole("complementary", { name: "Chat navigation" }),
     ).not.toBeInTheDocument();
 
-    const themeGroup = screen.getByRole("radiogroup", { name: "Theme preset" });
+    fireEvent.click(screen.getByRole("button", { name: "Appearance" }));
+    const themeGroup = await screen.findByRole("radiogroup", { name: "Theme preset" });
     const ocean = within(themeGroup).getByRole("radio", { name: /Ocean/i });
     fireEvent.click(ocean);
     expect(ocean).toHaveAttribute("aria-checked", "true");
@@ -249,20 +250,20 @@ describe("AI Integrator desktop workspace", () => {
   it("moves one active marker with the selected Settings category", async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Open Settings" }));
-    await screen.findByRole("heading", { name: "Appearance" });
+    await screen.findByRole("heading", { name: "General" }, { timeout: 5000 });
 
     const navigation = screen.getByRole("complementary", { name: "Settings navigation" });
     const appearance = within(navigation).getByRole("button", { name: "Appearance" });
     const general = within(navigation).getByRole("button", { name: "General" });
 
-    expect(appearance.querySelector(".settings-nav-active")).toBeInTheDocument();
+    expect(general.querySelector(".settings-nav-active")).toBeInTheDocument();
     expect(navigation.querySelectorAll(".settings-nav-active")).toHaveLength(1);
 
-    fireEvent.click(general);
-    await screen.findByRole("heading", { name: "General" });
+    fireEvent.click(appearance);
+    await screen.findByRole("heading", { name: "Appearance" });
     await waitFor(() => {
-      expect(general.querySelector(".settings-nav-active")).toBeInTheDocument();
-      expect(appearance.querySelector(".settings-nav-active")).not.toBeInTheDocument();
+      expect(appearance.querySelector(".settings-nav-active")).toBeInTheDocument();
+      expect(general.querySelector(".settings-nav-active")).not.toBeInTheDocument();
       expect(navigation.querySelectorAll(".settings-nav-active")).toHaveLength(1);
     });
   });
@@ -272,14 +273,16 @@ describe("AI Integrator desktop workspace", () => {
     await screen.findByRole("tab", { name: "Task" });
     expect(screen.queryByRole("tab", { name: "Settings" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Open Settings" }));
-    expect(await screen.findByRole("heading", { name: "Appearance" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "General" }, { timeout: 5000 }),
+    ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Back to workspace/i })).toBeInTheDocument();
   });
 
   it("exposes only real, wired settings categories and persists local policy choices", async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Open Settings" }));
-    await screen.findByRole("heading", { name: "Appearance" });
+    await screen.findByRole("heading", { name: "General" }, { timeout: 5000 });
     // Scope to the settings rail: the workspace screen is still cross-fading
     // out when these assertions run, so global queries could see its buttons.
     const navigation = screen.getByRole("complementary", { name: "Settings navigation" });
@@ -367,7 +370,7 @@ describe("AI Integrator desktop workspace", () => {
   it("manages archived chats from the Archives settings section", async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Open Settings" }));
-    await screen.findByRole("heading", { name: "Appearance" });
+    await screen.findByRole("heading", { name: "General" }, { timeout: 5000 });
     const navigation = screen.getByRole("complementary", { name: "Settings navigation" });
     fireEvent.click(within(navigation).getByRole("button", { name: "Archives" }));
     expect(await screen.findByRole("heading", { name: "Archives" })).toBeInTheDocument();
@@ -500,7 +503,7 @@ describe("AI Integrator desktop workspace", () => {
 
   it("opens a syntax-aware review from the Git rail", async () => {
     render(<App />);
-    const fileButton = await screen.findByTitle("src/runtime/router.ts");
+    const fileButton = await screen.findByRole("button", { name: "src/runtime/router.ts" });
     fireEvent.click(fileButton);
     expect(
       await screen.findByRole("region", { name: /Diff for src\/runtime\/router\.ts/i }),
@@ -602,11 +605,29 @@ describe("AI Integrator desktop workspace", () => {
     );
   });
 
+  it("applies a Settings permission change to the task the user returns to", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "Permission" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Settings" }));
+    await screen.findByRole("heading", { name: "General" }, { timeout: 5000 });
+    fireEvent.click(screen.getByRole("button", { name: "Permissions" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Default profile" }));
+    fireEvent.click(screen.getByRole("option", { name: /Full access/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Back to workspace/i }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Permission" })).toHaveTextContent("Full access"),
+    );
+  });
+
   it("opens a trusted project file as a first-class titlebar tab in the canvas", async () => {
     render(<App />);
 
     fireEvent.click(await screen.findByRole("tab", { name: "Files" }, { timeout: 5000 }));
-    fireEvent.click(await screen.findByTitle("Open src/runtime/router.ts", {}, { timeout: 5000 }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Open src/runtime/router.ts" }, { timeout: 5000 }),
+    );
     // The file becomes a titlebar tab owning the primary canvas.
     const fileTab = await screen.findByRole("tab", { name: /router\.ts/ });
     expect(fileTab).toHaveAttribute("aria-selected", "true");
@@ -614,7 +635,11 @@ describe("AI Integrator desktop workspace", () => {
     expect(screen.queryByRole("textbox", { name: "Task message" })).not.toBeInTheDocument();
 
     fireEvent.click(
-      await screen.findByTitle("Open src/components/UsageMeter.tsx", {}, { timeout: 5000 }),
+      await screen.findByRole(
+        "button",
+        { name: "Open src/components/UsageMeter.tsx" },
+        { timeout: 5000 },
+      ),
     );
     await screen.findByRole("tab", { name: /UsageMeter\.tsx/ }, { timeout: 5000 });
     const openFiles = screen.getByRole("tablist", { name: "Open files" });
@@ -633,7 +658,7 @@ describe("AI Integrator desktop workspace", () => {
     expect(titleHeading.parentElement).toHaveTextContent("AI Integrator · feature/v1-native-app");
 
     // The chat title is the way home; the tab stays open.
-    fireEvent.click(screen.getByTitle("Back to the conversation"));
+    fireEvent.click(screen.getByRole("button", { name: "Back to the conversation" }));
     expect(screen.getByRole("textbox", { name: "Task message" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /router\.ts/ })).toHaveAttribute(
       "aria-selected",
@@ -901,7 +926,9 @@ describe("AI Integrator desktop workspace", () => {
     ).toBeInTheDocument();
     expect(await screen.findByText("Lotmind transcript")).toBeInTheDocument();
     expect(screen.queryByText("Integrator transcript")).not.toBeInTheDocument();
-    expect(screen.getByTitle(/222,000 tokens on this task/)).toHaveTextContent("222k tokens");
+    expect(screen.getByRole("button", { name: /222,000 tokens on this task/ })).toHaveTextContent(
+      "222k tokens",
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "AI Integrator" }));
     expect(

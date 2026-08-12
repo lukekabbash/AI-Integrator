@@ -102,13 +102,15 @@ export function DeleteProjectModal({
               </Tooltip>
             </header>
 
-            <div className="delete-project-target" title={project.path}>
-              <Folder aria-hidden="true" />
-              <span className="delete-project-target-copy">
-                <strong>{project.name}</strong>
-                <code>{project.path}</code>
-              </span>
-            </div>
+            <Tooltip label={project.path} placement="top">
+              <div className="delete-project-target">
+                <Folder aria-hidden="true" />
+                <span className="delete-project-target-copy">
+                  <strong>{project.name}</strong>
+                  <code>{project.path}</code>
+                </span>
+              </div>
+            </Tooltip>
 
             <div className="delete-project-options" role="radiogroup" aria-label="Deletion scope">
               <button

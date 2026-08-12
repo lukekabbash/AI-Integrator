@@ -14,6 +14,7 @@ import {
   type SelectionContext,
   type SelectionPayload,
 } from "./SelectionActionPopover";
+import { Tooltip } from "./Tooltip";
 
 const LANGUAGE_BY_EXTENSION: Record<string, string> = {
   ts: "TypeScript",
@@ -410,7 +411,9 @@ export function DiffView({
         <div className="diff-file-title">
           <FileCode2 />
           <span>
-            <strong title={file.path}>{fileName(file.path)}</strong>
+            <Tooltip label={file.path} placement="bottom">
+              <strong aria-label={file.path}>{fileName(file.path)}</strong>
+            </Tooltip>
             {inline ? null : (
               <small className="diff-file-meta">
                 <span className="diff-file-path">{file.path}</span>
@@ -445,15 +448,20 @@ export function DiffView({
             >
               <Check aria-hidden="true" /> {reviewed ? "Approved" : "Approve"}
             </button>
-            <button
-              className="diff-inline-action"
-              type="button"
-              onClick={() => void onRevert?.(file)}
-              disabled={!onRevert}
-              title={onRevert ? undefined : "Reverting an edit is not available yet."}
+            <Tooltip
+              label="Reverting an edit is not available yet."
+              disabled={Boolean(onRevert)}
+              placement="top"
             >
-              <Undo2 aria-hidden="true" /> Revert
-            </button>
+              <button
+                className="diff-inline-action"
+                type="button"
+                onClick={() => void onRevert?.(file)}
+                disabled={!onRevert}
+              >
+                <Undo2 aria-hidden="true" /> Revert
+              </button>
+            </Tooltip>
           </div>
         ) : null}
         <div className="diff-summary">
@@ -467,16 +475,20 @@ export function DiffView({
         {inline ? null : (
           <div className="diff-header-actions">
             {onRefresh ? (
-              <button
-                className="diff-header-icon-button"
-                type="button"
-                onClick={() => void onRefresh()}
-                disabled={refreshing}
-                aria-label={refreshing ? "Refreshing diff" : "Refresh diff"}
-                title={refreshing ? "Refreshing diff" : "Refresh diff"}
+              <Tooltip
+                label={refreshing ? "Refreshing diff" : "Refresh diff"}
+                placement="top"
               >
-                <RefreshCw aria-hidden="true" />
-              </button>
+                <button
+                  className="diff-header-icon-button"
+                  type="button"
+                  onClick={() => void onRefresh()}
+                  disabled={refreshing}
+                  aria-label={refreshing ? "Refreshing diff" : "Refresh diff"}
+                >
+                  <RefreshCw aria-hidden="true" />
+                </button>
+              </Tooltip>
             ) : null}
             {onViewModeChange ? (
               <div className="diff-layout-toggle" role="group" aria-label="Diff layout">
@@ -499,20 +511,21 @@ export function DiffView({
               </div>
             ) : null}
             {showReviewActions ? (
-              <button
-                className="diff-review-button"
-                type="button"
-                data-reviewed={reviewed}
-                onClick={() => void onMarkReviewed?.(file)}
-                disabled={!canMarkReviewed}
-                title={
-                  canMarkReviewed
-                    ? undefined
-                    : "Review state will be available when it is stored with this task."
-                }
+              <Tooltip
+                label="Review state will be available when it is stored with this task."
+                disabled={canMarkReviewed}
+                placement="top"
               >
-                <Check aria-hidden="true" /> {reviewed ? "Reviewed" : "Mark reviewed"}
-              </button>
+                <button
+                  className="diff-review-button"
+                  type="button"
+                  data-reviewed={reviewed}
+                  onClick={() => void onMarkReviewed?.(file)}
+                  disabled={!canMarkReviewed}
+                >
+                  <Check aria-hidden="true" /> {reviewed ? "Reviewed" : "Mark reviewed"}
+                </button>
+              </Tooltip>
             ) : null}
           </div>
         )}

@@ -36,6 +36,7 @@ import type { ComposerNotice } from "../composerNotices";
 import { prettyModelLabel, resolveModelLabel } from "../modelLabel";
 import type { RuntimeRouteDefaults } from "../routingDefaults";
 import { Dropdown, ProviderIcon } from "./Dropdown";
+import { Tooltip } from "./Tooltip";
 import { insertVoiceText } from "./voiceTyping";
 
 interface ComposerProps {
@@ -1740,17 +1741,18 @@ export function Composer({
             >
               <div className="composer-notice-heading">
                 <strong>{notice.title}</strong>
-                <button
-                  className="composer-notice-dismiss"
-                  type="button"
-                  aria-label={`Dismiss ${notice.title}`}
-                  title="Dismiss notice"
-                  onClick={() =>
-                    setDismissedNoticeIds((current) => new Set(current).add(notice.id))
-                  }
-                >
-                  <X aria-hidden="true" />
-                </button>
+                <Tooltip label="Dismiss notice" placement="top">
+                  <button
+                    className="composer-notice-dismiss"
+                    type="button"
+                    aria-label={`Dismiss ${notice.title}`}
+                    onClick={() =>
+                      setDismissedNoticeIds((current) => new Set(current).add(notice.id))
+                    }
+                  >
+                    <X aria-hidden="true" />
+                  </button>
+                </Tooltip>
               </div>
               <p>{notice.message}</p>
               {notice.action ? (
@@ -1827,19 +1829,19 @@ export function Composer({
                 </p>
               ) : null}
               {autocompleteMatches.map((match, index) => (
-                <button
+                <Tooltip
                   key={match.actionId ?? `${match.value}:${index}`}
+                  label="Open this provider's interactive terminal to use this action"
+                  disabled={match.invocation !== "interactiveOnly"}
+                  placement="top"
+                >
+                <button
                   type="button"
                   role="option"
                   aria-selected={index === highlightedIndex}
                   aria-disabled={match.invocation === "interactiveOnly"}
                   data-active={index === highlightedIndex}
                   data-disabled={match.invocation === "interactiveOnly" || undefined}
-                  title={
-                    match.invocation === "interactiveOnly"
-                      ? "Open this provider's interactive terminal to use this action"
-                      : undefined
-                  }
                   // Keep focus in the textarea so accepting never blurs the draft.
                   onMouseDown={(event) => event.preventDefault()}
                   onMouseEnter={() => setHighlightedIndex(index)}
@@ -1857,6 +1859,7 @@ export function Composer({
                   <span className="autocomplete-token">{match.label}</span>
                   {match.detail ? <small>{match.detail}</small> : null}
                 </button>
+                </Tooltip>
               ))}
             </motion.div>
           ) : null}
@@ -1976,20 +1979,21 @@ export function Composer({
               <div className="composer-attachment composer-chat-reference" key={reference.id}>
                 <MessageCircle className="file-type-icon" aria-hidden="true" />
                 <span>{reference.sourceTitle}</span>
-                <button
-                  className="composer-attachment-remove"
-                  type="button"
-                  aria-label={`Remove ${reference.sourceTitle}`}
-                  title="Remove chat context"
-                  onClick={() => {
-                    draftTouchedRef.current = true;
-                    setContextReferences((current) =>
-                      current.filter((item) => item.id !== reference.id),
-                    );
-                  }}
-                >
-                  <X aria-hidden="true" />
-                </button>
+                <Tooltip label="Remove chat context" placement="top">
+                  <button
+                    className="composer-attachment-remove"
+                    type="button"
+                    aria-label={`Remove ${reference.sourceTitle}`}
+                    onClick={() => {
+                      draftTouchedRef.current = true;
+                      setContextReferences((current) =>
+                        current.filter((item) => item.id !== reference.id),
+                      );
+                    }}
+                  >
+                    <X aria-hidden="true" />
+                  </button>
+                </Tooltip>
               </div>
             ))}
             {attachments.map((attachment) => (
@@ -1998,7 +2002,6 @@ export function Composer({
                   attachment.dataUrl ? " composer-attachment--image" : ""
                 }`}
                 key={attachmentIdentity(attachment)}
-                title={attachment.path}
               >
                 {attachment.dataUrl ? (
                   <img src={attachment.dataUrl} alt={attachment.name} />
@@ -2007,23 +2010,26 @@ export function Composer({
                 ) : (
                   <FileIcon fileName={attachment.name} />
                 )}
-                <span>{attachment.name}</span>
-                <button
-                  className="composer-attachment-remove"
-                  type="button"
-                  aria-label={`Remove ${attachment.name}`}
-                  title="Remove attachment"
-                  onClick={() => {
-                    draftTouchedRef.current = true;
-                    setAttachments((current) =>
-                      current.filter(
-                        (item) => attachmentIdentity(item) !== attachmentIdentity(attachment),
-                      ),
-                    );
-                  }}
-                >
-                  <X aria-hidden="true" />
-                </button>
+                <Tooltip label={attachment.path} placement="top">
+                  <span>{attachment.name}</span>
+                </Tooltip>
+                <Tooltip label="Remove attachment" placement="top">
+                  <button
+                    className="composer-attachment-remove"
+                    type="button"
+                    aria-label={`Remove ${attachment.name}`}
+                    onClick={() => {
+                      draftTouchedRef.current = true;
+                      setAttachments((current) =>
+                        current.filter(
+                          (item) => attachmentIdentity(item) !== attachmentIdentity(attachment),
+                        ),
+                      );
+                    }}
+                  >
+                    <X aria-hidden="true" />
+                  </button>
+                </Tooltip>
               </div>
             ))}
             {attachmentError ? (
@@ -2036,15 +2042,16 @@ export function Composer({
         <div className="composer-control-row">
           <div className="composer-controls-left">
             {bridge.pickContextAttachments ? (
-              <button
-                className="icon-button subtle composer-attach"
-                type="button"
-                onClick={() => void addAttachments()}
-                aria-label="Attach files or images from your computer"
-                title="Attach files or images as context"
-              >
-                <Plus aria-hidden="true" />
-              </button>
+              <Tooltip label="Attach files or images as context" placement="top">
+                <button
+                  className="icon-button subtle composer-attach"
+                  type="button"
+                  onClick={() => void addAttachments()}
+                  aria-label="Attach files or images from your computer"
+                >
+                  <Plus aria-hidden="true" />
+                </button>
+              </Tooltip>
             ) : null}
             {!chatMode ? (
               <div className="composer-controls-optional">
@@ -2085,21 +2092,22 @@ export function Composer({
             ) : null}
             {!chatMode ? (
               <div className="composer-overflow-controls" ref={controlsMenuRef}>
-                <button
-                  ref={controlsMenuButtonRef}
-                  className="dropdown-trigger composer-overflow-trigger"
-                  type="button"
-                  aria-label="More composer controls"
-                  title="Mode, permission, delegation"
-                  aria-haspopup="menu"
-                  aria-expanded={controlsMenuOpen}
-                  onClick={() => {
-                    setControlsSubmenu(null);
-                    setControlsMenuOpen((open) => !open);
-                  }}
-                >
-                  <SlidersHorizontal aria-hidden="true" />
-                </button>
+                <Tooltip label="Mode, permission, delegation" placement="top">
+                  <button
+                    ref={controlsMenuButtonRef}
+                    className="dropdown-trigger composer-overflow-trigger"
+                    type="button"
+                    aria-label="More composer controls"
+                    aria-haspopup="menu"
+                    aria-expanded={controlsMenuOpen}
+                    onClick={() => {
+                      setControlsSubmenu(null);
+                      setControlsMenuOpen((open) => !open);
+                    }}
+                  >
+                    <SlidersHorizontal aria-hidden="true" />
+                  </button>
+                </Tooltip>
                 <AnimatePresence>
                   {controlsMenuOpen ? (
                     <motion.div
@@ -2305,29 +2313,8 @@ export function Composer({
               }))}
               compact
             />
-            <button
-              className={`icon-button composer-mic${voiceRecording ? " is-recording" : ""}${
-                voiceTranscribing ? " is-transcribing" : ""
-              }`}
-              type="button"
-              onClick={() =>
-                void (voiceRecording
-                  ? finishVoiceRecording()
-                  : voicePhase === "starting"
-                    ? cancelVoiceRecording("Recording discarded.")
-                    : startVoiceRecording())
-              }
-              aria-label={
-                voiceRecording
-                  ? "Stop recording and transcribe"
-                  : voicePhase === "starting"
-                    ? "Cancel voice recording startup"
-                    : "Start voice typing"
-              }
-              aria-pressed={voiceRecording}
-              aria-keyshortcuts={voiceActive ? "Escape" : undefined}
-              disabled={voiceTranscribing || voiceConfigured === null || voiceConfigured === false}
-              title={
+            <Tooltip
+              label={
                 voicePhase === "starting"
                   ? "Cancel voice recording startup"
                   : voiceTranscribing
@@ -2340,13 +2327,40 @@ export function Composer({
                           ? "Checking voice typing setup"
                           : "Add an OpenAI API key in Settings → General"
               }
+              placement="top"
             >
-              {voiceRecording || voicePhase === "starting" ? (
-                <Square aria-hidden="true" />
-              ) : (
-                <Mic aria-hidden="true" />
-              )}
-            </button>
+              <button
+                className={`icon-button composer-mic${voiceRecording ? " is-recording" : ""}${
+                  voiceTranscribing ? " is-transcribing" : ""
+                }`}
+                type="button"
+                onClick={() =>
+                  void (voiceRecording
+                    ? finishVoiceRecording()
+                    : voicePhase === "starting"
+                      ? cancelVoiceRecording("Recording discarded.")
+                      : startVoiceRecording())
+                }
+                aria-label={
+                  voiceRecording
+                    ? "Stop recording and transcribe"
+                    : voicePhase === "starting"
+                      ? "Cancel voice recording startup"
+                      : "Start voice typing"
+                }
+                aria-pressed={voiceRecording}
+                aria-keyshortcuts={voiceActive ? "Escape" : undefined}
+                disabled={
+                  voiceTranscribing || voiceConfigured === null || voiceConfigured === false
+                }
+              >
+                {voiceRecording || voicePhase === "starting" ? (
+                  <Square aria-hidden="true" />
+                ) : (
+                  <Mic aria-hidden="true" />
+                )}
+              </button>
+            </Tooltip>
             <Dropdown
               className="mic-select"
               aria-label="Microphone"
@@ -2371,8 +2385,7 @@ export function Composer({
                     type="button"
                     onClick={onStop}
                     disabled={stopping}
-                    aria-label={stopping ? "Stopping turn" : "Stop turn"}
-                    title={stopping ? "Stopping…" : "Stop the current turn"}
+                    aria-label={stopping ? "Stopping…" : "Stop the current turn"}
                     initial={{ opacity: 0, y: 6, scale: 0.94 }}
                     animate={{ opacity: 1, y: 0, scale: 1 }}
                     exit={{ opacity: 0, y: 6, scale: 0.94 }}
@@ -2386,17 +2399,21 @@ export function Composer({
                 ) : null}
               </AnimatePresence>
               {running && onStop && !draftPresent ? (
-                <motion.button
-                  className="send-button send-button--stop"
-                  type="button"
-                  onClick={onStop}
-                  disabled={stopping}
-                  aria-label={stopping ? "Stopping turn" : "Stop turn"}
-                  title={stopping ? "Stopping…" : "Stop the current turn"}
-                  whileTap={motionDisabled ? undefined : { scale: 0.94 }}
+                <Tooltip
+                  label={stopping ? "Stopping…" : "Stop the current turn"}
+                  placement="top"
                 >
-                  <Square />
-                </motion.button>
+                  <motion.button
+                    className="send-button send-button--stop"
+                    type="button"
+                    onClick={onStop}
+                    disabled={stopping}
+                    aria-label={stopping ? "Stopping turn" : "Stop turn"}
+                    whileTap={motionDisabled ? undefined : { scale: 0.94 }}
+                  >
+                    <Square />
+                  </motion.button>
+                </Tooltip>
               ) : (
                 <motion.button
                   className="send-button"

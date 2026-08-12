@@ -1015,6 +1015,60 @@ fn json_detail(value: Option<&Value>, limit: usize) -> Option<String> {
     Some(bound_and_redact(trimmed, limit).0)
 }
 
+/// First absolute/relative path from ACP `locations` (follow-along file hints).
+fn acp_location_path(update: &Value) -> Option<String> {
+    let locations = update.get("locations")?.as_array()?;
+    for location in locations {
+        let Some(path) = location
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        else {
+            continue;
+        };
+        return Some(bound_and_redact(path, PATH_LIMIT).0);
+    }
+    None
+}
+
+fn tool_input_object_has_path(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    ["path", "filePath", "file_path", "filename", "file"]
+        .iter()
+        .any(|key| {
+            object
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty())
+        })
+}
+
+/// Prefer `rawInput`; when Cursor/ACP only reports `locations`, fold the path
+/// in so the transcript can show "Read main.rs" instead of a bare "Read".
+fn acp_tool_input(update: &Value) -> Option<String> {
+    let location_path = acp_location_path(update);
+    match update.get("rawInput") {
+        Some(Value::Object(map)) => {
+            let mut enriched = map.clone();
+            if !tool_input_object_has_path(&Value::Object(enriched.clone()))
+                && let Some(path) = location_path
+            {
+                enriched.insert("path".into(), Value::String(path));
+            }
+            json_detail(Some(&Value::Object(enriched)), TOOL_DETAIL_LIMIT)
+        }
+        Some(other) => json_detail(Some(other), TOOL_DETAIL_LIMIT).or_else(|| {
+            location_path.map(|path| {
+                json!({ "path": path }).to_string()
+            })
+        }),
+        None => location_path.map(|path| json!({ "path": path }).to_string()),
+    }
+}
+
 fn u64_field(value: &Value, key: &str) -> u64 {
     value.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
@@ -1199,7 +1253,7 @@ pub fn reduce_acp_update(
                     .get("kind")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
-                tool_input: json_detail(update.get("rawInput"), TOOL_DETAIL_LIMIT),
+                tool_input: acp_tool_input(update),
                 truncated: false,
                 updated_at: occurred_at,
             };
@@ -2074,6 +2128,65 @@ mod tests {
             "partial update must not fabricate a title"
         );
         assert_eq!(item.output.as_deref(), Some("fn main() {}"));
+    }
+
+    #[test]
+    fn acp_tool_call_folds_locations_into_tool_input_when_raw_input_omits_path() {
+        let event = reduce_acp_update(
+            "session-1",
+            "turn-1",
+            0,
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-loc",
+                "title": "Read",
+                "kind": "read",
+                "status": "in_progress",
+                "locations": [{"path": "apps/desktop/src/components/Transcript.tsx", "line": 12}]
+            }),
+            Utc::now(),
+        )
+        .expect("reduce")
+        .expect("accepted");
+        let ProjectionMutation::ReplaceItem(item) = &event.mutation else {
+            panic!("expected replace mutation");
+        };
+        assert_eq!(item.title.as_deref(), Some("Read"));
+        assert!(
+            item.tool_input
+                .as_deref()
+                .expect("tool input")
+                .contains("Transcript.tsx"),
+            "locations path should become tool_input: {:?}",
+            item.tool_input
+        );
+
+        let with_raw = reduce_acp_update(
+            "session-1",
+            "turn-1",
+            0,
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-both",
+                "title": "Searched",
+                "kind": "search",
+                "status": "completed",
+                "rawInput": {"query": "activity rows"},
+                "locations": [{"path": "apps/desktop/src/components/Transcript.tsx"}]
+            }),
+            Utc::now(),
+        )
+        .expect("reduce")
+        .expect("accepted");
+        let ProjectionMutation::ReplaceItem(item) = &with_raw.mutation else {
+            panic!("expected replace mutation");
+        };
+        let input = item.tool_input.as_deref().expect("tool input");
+        assert!(input.contains("activity rows"), "raw query preserved: {input}");
+        assert!(
+            input.contains("Transcript.tsx"),
+            "location path is folded in when rawInput has no path field: {input}"
+        );
     }
 
     #[test]

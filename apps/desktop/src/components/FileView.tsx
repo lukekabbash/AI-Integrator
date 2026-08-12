@@ -22,6 +22,7 @@ import {
 import { AnimatePresence, m as motion, useReducedMotion } from "motion/react";
 import { FileIcon } from "./FileIcon";
 import { type SelectionContext, type SelectionPayload } from "./SelectionActionPopover";
+import { Tooltip } from "./Tooltip";
 import { selectionEndpointElement } from "./conversationFormatting";
 import { highlightCodeLine } from "./codeHighlight";
 import {
@@ -340,33 +341,35 @@ function SelectionAskPanel({
       }
       transition={still ? { duration: 0 } : MENU_ENTER}
     >
-      <header
-        className="selection-ask-header"
-        onPointerDown={startDrag}
-        // The header doubles as the drag handle; announce it as one.
-        title="Drag to move"
-      >
-        <div className="selection-ask-title">
-          <MessageCircleQuestion aria-hidden="true" />
-          <div>
-            <strong>Ask about this</strong>
-            <small title={state.payload.path}>{title}</small>
+      <header className="selection-ask-header" onPointerDown={startDrag}>
+        <Tooltip label="Drag to move" placement="top">
+          <div className="selection-ask-title">
+            <MessageCircleQuestion aria-hidden="true" />
+            <div>
+              <strong>Ask about this</strong>
+              <Tooltip label={state.payload.path} placement="bottom">
+                <small>{title}</small>
+              </Tooltip>
+            </div>
           </div>
-        </div>
+        </Tooltip>
         <div className="selection-ask-header-actions">
           {onAddToChat ? (
-            <button
-              type="button"
-              aria-label="Add selection to chat"
-              title="Add selection to chat"
-              onClick={() => onAddToChat(state.payload)}
-            >
-              <AtSign aria-hidden="true" />
-            </button>
+            <Tooltip label="Add selection to chat" placement="top">
+              <button
+                type="button"
+                aria-label="Add selection to chat"
+                onClick={() => onAddToChat(state.payload)}
+              >
+                <AtSign aria-hidden="true" />
+              </button>
+            </Tooltip>
           ) : null}
-          <button type="button" aria-label="Close explanation" title="Close" onClick={onClose}>
-            <X aria-hidden="true" />
-          </button>
+          <Tooltip label="Close" placement="top">
+            <button type="button" aria-label="Close explanation" onClick={onClose}>
+              <X aria-hidden="true" />
+            </button>
+          </Tooltip>
         </div>
       </header>
       <p className="selection-ask-agent" role="status" aria-live="polite">
@@ -423,15 +426,16 @@ function SelectionAskPanel({
             }
           }}
         />
-        <button
-          type="button"
-          aria-label="Send follow-up"
-          title="Send follow-up"
-          disabled={busy || !question.trim()}
-          onClick={submitFollowUp}
-        >
-          <CornerDownLeft aria-hidden="true" />
-        </button>
+        <Tooltip label="Send follow-up" placement="top">
+          <button
+            type="button"
+            aria-label="Send follow-up"
+            disabled={busy || !question.trim()}
+            onClick={submitFollowUp}
+          >
+            <CornerDownLeft aria-hidden="true" />
+          </button>
+        </Tooltip>
       </footer>
     </motion.section>
   );
@@ -526,13 +530,15 @@ function SelectionContextMenu({
           // Acting on the selection must not collapse it first.
           onPointerDown={(event) => event.preventDefault()}
         >
-          <div className="selection-context-menu-path" title={path}>
-            <FileIcon fileName={path} />
-            <span>
-              {fileName(path)}
-              {rangeLabel ? ` (${rangeLabel})` : ""}
-            </span>
-          </div>
+          <Tooltip label={path} placement="left">
+            <div className="selection-context-menu-path">
+              <FileIcon fileName={path} />
+              <span>
+                {fileName(path)}
+                {rangeLabel ? ` (${rangeLabel})` : ""}
+              </span>
+            </div>
+          </Tooltip>
           {onAskAbout ? (
             <button type="button" role="menuitem" onClick={askAbout}>
               <MessageCircleQuestion aria-hidden="true" /> Ask about this
@@ -889,7 +895,9 @@ export function FileWorkspace({
         <div className="diff-file-title">
           <FileIcon fileName={file.path} />
           <span>
-            <strong title={file.path}>{fileName(file.path)}</strong>
+            <Tooltip label={file.path} placement="bottom">
+              <strong>{fileName(file.path)}</strong>
+            </Tooltip>
             <small className="diff-file-meta">
               <span className="diff-file-path">{file.path}</span>
               <span className="diff-file-meta-divider" aria-hidden="true">

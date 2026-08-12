@@ -21,6 +21,7 @@ describe("prettyModelLabel", () => {
 
     expect(prettyModelLabel("claude-haiku-4-5")).toBe("Claude Haiku 4.5");
     expect(prettyModelLabel("claude-opus-4-8")).toBe("Claude Opus 4.8");
+    expect(prettyModelLabel("claude-opus-5")).toBe("Claude Opus 5");
     expect(prettyModelLabel("claude-sonnet-4-6")).toBe("Claude Sonnet 4.6");
     expect(prettyModelLabel("claude-sonnet-5")).toBe("Claude Sonnet 5");
     expect(prettyModelLabel("claude-fable-5")).toBe("Claude Fable 5");

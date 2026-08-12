@@ -127,17 +127,11 @@ pub fn open_external_url(url: String) -> CommandResult<()> {
         });
     }
 
-    // `explorer.exe <url>` is a common trick for this, but it is unreliable —
-    // it can surface a literal File Explorer window instead of silently
-    // handing off to the default browser. `cmd /C start "" <url>` is the
-    // standard, reliable incantation for a non-shell spawn; the empty title
-    // argument keeps `start` from treating the URL itself as a window title.
     #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut cmd = Command::new("cmd");
-        cmd.args(["/C", "start", ""]);
-        cmd
-    };
+    return spawn_quiet(
+        windows_external_url_command(&parsed),
+        "could not open the default browser",
+    );
     #[cfg(target_os = "macos")]
     let mut command = Command::new("open");
     #[cfg(target_os = "linux")]
@@ -148,11 +142,38 @@ pub fn open_external_url(url: String) -> CommandResult<()> {
         message: "opening external URLs is not supported on this platform".into(),
     });
 
-    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         command.arg(parsed.as_str());
         spawn_quiet(command, "could not open the default browser")
     }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_external_url_command(url: &url::Url) -> Command {
+    // OAuth URLs contain cmd.exe metacharacters (`&` and `%`). Passing one to
+    // `cmd /C start` can silently strip client_id, redirect_uri, and PKCE
+    // parameters. Keep the URL as base64 data until a fixed PowerShell
+    // expression hands it to the registered URL handler.
+    let encoded_url = BASE64.encode(url.as_str().as_bytes());
+    let script = format!(
+        "Start-Process -FilePath ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded_url}')))"
+    );
+    let encoded_command = BASE64.encode(
+        script
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+    let mut command = Command::new("powershell");
+    command.args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+        encoded_command.as_str(),
+    ]);
+    command
 }
 
 /// Opens a second window mirroring `task_id`, or focuses it if already open.
@@ -3952,6 +3973,177 @@ pub async fn antigravity_list_models(state: State<'_, AppState>) -> CommandResul
         return Err(CommandError {
             code: "provider-protocol",
             message: "Antigravity returned an empty model catalog".into(),
+        });
+    }
+    Ok(models)
+}
+
+/// One entry from Claude Code's `list_models` control response, reduced to
+/// the fields the renderer's model picker needs. `id` is the CLI's
+/// `resolvedModel` (`claude-opus-5[1m]`), which `--model` accepts verbatim.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeModelEntry {
+    pub id: String,
+    pub label: String,
+    pub efforts: Vec<String>,
+}
+
+/// Effort slugs `claude --effort` accepts; anything else from the catalog is
+/// dropped rather than forwarded to the renderer.
+const CLAUDE_EFFORT_SLUGS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// Claude ids may carry a `[1m]` context suffix, so square brackets join the
+/// byte set `push_model_id` allows for other providers.
+fn valid_claude_model_id(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= 256
+        && !model.starts_with('/')
+        && !model.contains("..")
+        && model
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-._/:[]".contains(&byte))
+}
+
+/// Claude Code answers a `list_models` control request on stream-json stdout
+/// with `{response:{response:{models:[{value, resolvedModel, displayName,
+/// supportedEffortLevels}]}}}`. The synthetic `default` alias is skipped (its
+/// resolved model appears again under its own name) and duplicate resolved
+/// ids collapse into the first entry.
+fn parse_claude_models(output: &str) -> Vec<ClaudeModelEntry> {
+    for line in output.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("control_response") {
+            continue;
+        }
+        let Some(models) = value
+            .pointer("/response/response/models")
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        let mut entries: Vec<ClaudeModelEntry> = Vec::new();
+        for model in models {
+            if model.get("value").and_then(Value::as_str) == Some("default") {
+                continue;
+            }
+            let Some(id) = model
+                .get("resolvedModel")
+                .or_else(|| model.get("value"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            if !valid_claude_model_id(id) || entries.iter().any(|entry| entry.id == id) {
+                continue;
+            }
+            let label = model
+                .get("displayName")
+                .and_then(Value::as_str)
+                .map(|label| {
+                    label
+                        .chars()
+                        .filter(|ch| !ch.is_control())
+                        .take(64)
+                        .collect::<String>()
+                        .trim()
+                        .to_owned()
+                })
+                .filter(|label| !label.is_empty())
+                .unwrap_or_else(|| id.to_owned());
+            let efforts = model
+                .get("supportedEffortLevels")
+                .and_then(Value::as_array)
+                .map(|levels| {
+                    levels
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|level| CLAUDE_EFFORT_SLUGS.contains(level))
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            entries.push(ClaudeModelEntry {
+                id: id.to_owned(),
+                label,
+                efforts,
+            });
+        }
+        if !entries.is_empty() {
+            return entries;
+        }
+    }
+    Vec::new()
+}
+
+/// Probe Claude Code's model catalog over its stream-json control channel
+/// (`list_models`) — the same request the CLI's own `/model` picker issues,
+/// and it answers even while logged out. `--bare` keeps the probe free of
+/// hooks, plugins, and background traffic. The renderer receives only
+/// sanitized ids, labels, and effort slugs, never the CLI's auth context.
+#[tauri::command]
+pub async fn claude_list_models(
+    state: State<'_, AppState>,
+) -> CommandResult<Vec<ClaudeModelEntry>> {
+    let statuses = state
+        .provider_statuses(false)
+        .await
+        .map_err(CommandError::from)?;
+    let executable =
+        provider_executable(&statuses, ProviderKind::Claude).ok_or_else(|| CommandError {
+            code: "provider-unavailable",
+            message: "Claude Code CLI is not installed".into(),
+        })?;
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .args([
+            "-p",
+            "--verbose",
+            "--bare",
+            "--tools",
+            "",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let mut child = command.spawn().map_err(|_| CommandError {
+        code: "provider-unavailable",
+        message: "Claude Code model discovery could not start".into(),
+    })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt as _;
+        let request = concat!(
+            r#"{"type":"control_request","request_id":"integrator-list-models","#,
+            r#""request":{"subtype":"list_models"}}"#,
+            "\n"
+        );
+        let _ = stdin.write_all(request.as_bytes()).await;
+        // Dropping stdin closes it; the CLI answers the request and exits.
+    }
+    let output = timeout(Duration::from_secs(30), child.wait_with_output())
+        .await
+        .map_err(|_| CommandError {
+            code: "provider-timeout",
+            message: "Claude Code model discovery timed out".into(),
+        })?
+        .map_err(|_| CommandError {
+            code: "provider-unavailable",
+            message: "Claude Code model discovery failed".into(),
+        })?;
+    let models = parse_claude_models(&String::from_utf8_lossy(&output.stdout));
+    if models.is_empty() {
+        return Err(CommandError {
+            code: "provider-protocol",
+            message: "Claude Code returned an empty model catalog".into(),
         });
     }
     Ok(models)
@@ -9021,6 +9213,39 @@ fn worker_error() -> CommandError {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn external_oauth_url_is_passed_to_powershell_as_data() {
+        let url = url::Url::parse(
+            "https://example.com/oauth?response_type=code&client_id=app&redirect_uri=http%3A%2F%2F127.0.0.1%3A54321%2Foauth%2Fcallback",
+        )
+        .expect("OAuth URL");
+        let command = windows_external_url_command(&url);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let encoded = args.last().expect("encoded command argument");
+        let decoded = BASE64.decode(encoded).expect("base64 command");
+        let utf16 = decoded
+            .chunks_exact(2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect::<Vec<_>>();
+        let script = String::from_utf16(&utf16).expect("PowerShell command");
+        let encoded_url = script
+            .split_once("FromBase64String('")
+            .and_then(|(_, tail)| tail.split_once("')"))
+            .map(|(value, _)| value)
+            .expect("encoded URL in command");
+        let decoded_url = BASE64.decode(encoded_url).expect("base64 URL");
+
+        assert_eq!(decoded_url, url.as_str().as_bytes());
+        assert!(!encoded.contains('&'));
+        assert!(!encoded.contains('%'));
+        assert!(args.contains(&"-EncodedCommand".to_owned()));
+        assert_eq!(command.get_program(), "powershell");
+    }
+
     #[test]
     fn chat_codex_policy_disables_every_command_capable_feature() {
         let mut config = serde_json::json!({"mcp_servers": {"integrator": {}}});
@@ -9634,6 +9859,39 @@ mod tests {
                 "gemini-3.6-flash-high",
                 "gemini-3.6-flash-low",
                 "claude-opus-4-6-thinking"
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_model_parser_resolves_aliases_and_bounds_ids() {
+        let response = serde_json::json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": "integrator-list-models", "response": { "models": [
+                { "value": "default", "resolvedModel": "claude-opus-5[1m]", "displayName": "Default (recommended)",
+                  "supportedEffortLevels": ["low", "high"] },
+                { "value": "opus[1m]", "resolvedModel": "claude-opus-5[1m]", "displayName": "Opus (1M context)",
+                  "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max", "turbo"] },
+                { "value": "sonnet", "resolvedModel": "claude-sonnet-5", "displayName": "Sonnet" },
+                { "value": "haiku", "resolvedModel": "../evil", "displayName": "Haiku" }
+            ] } }
+        });
+        let output = format!("{{\"type\":\"system\"}}\n{response}\n");
+        assert_eq!(
+            parse_claude_models(&output),
+            [
+                ClaudeModelEntry {
+                    id: "claude-opus-5[1m]".into(),
+                    label: "Opus (1M context)".into(),
+                    efforts: ["low", "medium", "high", "xhigh", "max"]
+                        .map(String::from)
+                        .to_vec(),
+                },
+                ClaudeModelEntry {
+                    id: "claude-sonnet-5".into(),
+                    label: "Sonnet".into(),
+                    efforts: Vec::new(),
+                },
             ]
         );
     }

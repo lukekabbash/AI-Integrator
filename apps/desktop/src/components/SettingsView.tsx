@@ -654,17 +654,18 @@ function SkillSettingsRow({
           <span>
             {displayName}
             {onViewPlugin && namespace ? (
-              <button
-                className="origin-chip"
-                type="button"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onViewPlugin();
-                }}
-                title={`View the ${namespace} plugin`}
-              >
-                {namespace}
-              </button>
+              <Tooltip label={`View the ${namespace} plugin`} placement="top">
+                <button
+                  className="origin-chip"
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onViewPlugin();
+                  }}
+                >
+                  {namespace}
+                </button>
+              </Tooltip>
             ) : null}
           </span>
         </strong>
@@ -752,17 +753,18 @@ function SkillCard({
           <strong>
             {displayName}
             {namespace && onViewPlugin ? (
-              <button
-                className="origin-chip"
-                type="button"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onViewPlugin();
-                }}
-                title={`View the ${namespace} plugin`}
-              >
-                {namespace}
-              </button>
+              <Tooltip label={`View the ${namespace} plugin`} placement="top">
+                <button
+                  className="origin-chip"
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onViewPlugin();
+                  }}
+                >
+                  {namespace}
+                </button>
+              </Tooltip>
             ) : null}
           </strong>
           <small>{sourceLabel}</small>
@@ -1229,14 +1231,15 @@ function McpServerRow({
         <strong>
           {server.name}
           {showOrigin && server.source !== "user" && onViewPlugin ? (
-            <button
-              className="origin-chip"
-              type="button"
-              onClick={() => onViewPlugin(server.origin)}
-              title={`View the ${server.origin} plugin`}
-            >
-              {server.origin}
-            </button>
+            <Tooltip label={`View the ${server.origin} plugin`} placement="top">
+              <button
+                className="origin-chip"
+                type="button"
+                onClick={() => onViewPlugin(server.origin)}
+              >
+                {server.origin}
+              </button>
+            </Tooltip>
           ) : null}
         </strong>
         {subtitle ? <small>{subtitle}</small> : null}
@@ -1307,14 +1310,15 @@ function McpServerCard({
           <strong>
             {server.name}
             {server.source !== "user" && onViewPlugin ? (
-              <button
-                className="origin-chip"
-                type="button"
-                onClick={() => onViewPlugin(server.origin)}
-                title={`View the ${server.origin} plugin`}
-              >
-                {server.origin}
-              </button>
+              <Tooltip label={`View the ${server.origin} plugin`} placement="top">
+                <button
+                  className="origin-chip"
+                  type="button"
+                  onClick={() => onViewPlugin(server.origin)}
+                >
+                  {server.origin}
+                </button>
+              </Tooltip>
             ) : null}
           </strong>
           <small>{subtitle}</small>
@@ -4577,11 +4581,13 @@ function UsageSettings({
           {dailyUsage.length > 0 ? (
             <div className="usage-activity-chart" aria-label="Codex daily token activity">
               {dailyUsage.map((bucket) => (
-                <i
+                <Tooltip
                   key={bucket.startDate}
-                  style={{ height: `${Math.max(4, (bucket.tokens / dailyMaximum) * 100)}%` }}
-                  title={`${new Date(bucket.startDate).toLocaleDateString()}: ${bucket.tokens.toLocaleString()} tokens`}
-                />
+                  label={`${new Date(bucket.startDate).toLocaleDateString()}: ${bucket.tokens.toLocaleString()} tokens`}
+                  placement="top"
+                >
+                  <i style={{ height: `${Math.max(4, (bucket.tokens / dailyMaximum) * 100)}%` }} />
+                </Tooltip>
               ))}
             </div>
           ) : null}
@@ -4907,7 +4913,7 @@ function PolicySettings({
     permissions: {
       icon: ShieldCheck,
       title: "Permissions",
-      subtitle: "The permission profile preselected when a new chat opens.",
+      subtitle: "The permission profile for new tasks and the task you came from.",
     },
   }[section];
   const Icon = page.icon;
@@ -5124,11 +5130,14 @@ function PolicySettings({
       <section className="settings-section">
         <header>
           <h2>Default permission profile</h2>
-          <p>Preselected in the composer for new chats; every turn can still narrow or widen it.</p>
+          <p>
+            Applied to new tasks and the task you came from. Other existing tasks keep their last
+            explicit choice.
+          </p>
         </header>
         <SettingRow
           label="Default profile"
-          description="Applied to the permission picker when a new chat's composer opens."
+          description="Sets the current task now and preselects the permission picker for new tasks."
         >
           <Dropdown
             aria-label="Default profile"
@@ -6301,7 +6310,7 @@ export function SettingsView(props: SettingsViewProps) {
   const reduceMotion =
     Boolean(useReducedMotion()) || document.documentElement.dataset.motion === "none";
   const [section, setSection] = useState<SettingsSection>(
-    props.runtimeActionRequest ? "models-runtimes" : (props.initialSection ?? "appearance"),
+    props.runtimeActionRequest ? "models-runtimes" : (props.initialSection ?? "general"),
   );
   const [query, setQuery] = useState("");
   const [settings, setSettings] = useState<SettingsMap>(DEFAULT_SETTINGS);

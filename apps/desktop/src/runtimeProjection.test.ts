@@ -577,6 +577,58 @@ describe("runtime projection reducer", () => {
     });
   });
 
+  it("recovers the target from a bare ACP-style title when tool input is empty", () => {
+    const state = applyRuntimeProjection(
+      createRuntimeProjectionState("task-1"),
+      event(50, {
+        kind: "itemChanged",
+        item: {
+          id: "acp:session:turn:read-title",
+          providerItemId: "read-title",
+          kind: "mcpTool",
+          status: "completed",
+          title: "Read Transcript.tsx",
+          mcpTool: "read",
+          truncated: false,
+          updatedAt: "2026-07-10T16:00:00Z",
+        },
+      }),
+    );
+
+    expect(runtimeTranscript(state)[0]).toMatchObject({
+      kind: "tool",
+      title: "Read",
+      body: "Transcript.tsx",
+    });
+  });
+
+  it("prefers a location path folded into tool input over a bare Read title", () => {
+    const state = applyRuntimeProjection(
+      createRuntimeProjectionState("task-1"),
+      event(50, {
+        kind: "itemChanged",
+        item: {
+          id: "acp:session:turn:read-loc",
+          providerItemId: "read-loc",
+          kind: "mcpTool",
+          status: "completed",
+          title: "Read",
+          mcpTool: "read",
+          toolInput: '{"path":"apps/desktop/src/components/Transcript.tsx"}',
+          truncated: false,
+          updatedAt: "2026-07-10T16:00:00Z",
+        },
+      }),
+    );
+
+    expect(runtimeTranscript(state)[0]).toMatchObject({
+      kind: "tool",
+      title: "Read",
+      body: "apps/desktop/src/components/Transcript.tsx",
+      filePath: "apps/desktop/src/components/Transcript.tsx",
+    });
+  });
+
   it("normalizes legacy unsupported web search rows", () => {
     const state = applyRuntimeProjection(
       createRuntimeProjectionState("task-1"),
@@ -1226,6 +1278,51 @@ describe("runtime projection reducer", () => {
         kind: "approval",
         title: "Plan approval",
         status: "warning",
+      }),
+    );
+  });
+
+  it("labels agent questions and failed approval responses as attention items", () => {
+    let state = applyRuntimeProjection(
+      createRuntimeProjectionState("task-1"),
+      event(71, {
+        kind: "approvalChanged",
+        approval: {
+          id: "approval-question",
+          requestId: { kind: "string", value: "request-question" },
+          approvalKind: "question",
+          state: "pending",
+          reason: "Which environment should I use?",
+          updatedAt: "2026-07-10T16:00:00Z",
+        },
+      }),
+    );
+    state = applyRuntimeProjection(
+      state,
+      event(72, {
+        kind: "approvalChanged",
+        approval: {
+          id: "approval-failed",
+          requestId: { kind: "string", value: "request-failed" },
+          approvalKind: "commandExecution",
+          state: "responseFailed",
+          reason: "The approval response could not be delivered.",
+          updatedAt: "2026-07-10T16:00:01Z",
+        },
+      }),
+    );
+
+    expect(runtimeTranscript(state)).toContainEqual(
+      expect.objectContaining({
+        id: "runtime-approval-approval-question",
+        title: "Agent question",
+        status: "warning",
+      }),
+    );
+    expect(runtimeTranscript(state)).toContainEqual(
+      expect.objectContaining({
+        id: "runtime-approval-approval-failed",
+        status: "error",
       }),
     );
   });

@@ -843,6 +843,44 @@ describe("Transcript", () => {
     expect(onLoadOlder).toHaveBeenCalledTimes(2);
   });
 
+  it("retries a dropped older-page request on an upward gesture while parked at top", async () => {
+    const onLoadOlder = vi.fn();
+    const scrollContainerRef = { current: null as HTMLDivElement | null };
+    const baseEvents = Array.from({ length: 20 }, (_, index) =>
+      event(`e-${index}`, "assistant", `Message ${index}`),
+    );
+    render(
+      <div data-testid="transcript-scroll" ref={scrollContainerRef}>
+        <Transcript
+          ownerKey="task:paginate-retry"
+          events={baseEvents}
+          hasMoreOlder
+          onLoadOlder={onLoadOlder}
+          scrollContainerRef={scrollContainerRef}
+        />
+      </div>,
+    );
+    const scrollContainer = screen.getByTestId("transcript-scroll");
+    Object.defineProperty(scrollContainer, "scrollHeight", { configurable: true, value: 1000 });
+    Object.defineProperty(scrollContainer, "clientHeight", { configurable: true, value: 100 });
+    await waitFor(() => expect(scrollContainer.scrollTop).toBe(900));
+
+    // First request fires but nothing prepends (e.g. dropped while the
+    // projection was still reconciling after a chat switch).
+    fireEvent.wheel(scrollContainer, { deltaY: -40 });
+    scrollContainer.scrollTop = 0;
+    fireEvent.scroll(scrollContainer);
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+
+    // Passive scroll events at the top must not cascade…
+    fireEvent.scroll(scrollContainer);
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+
+    // …but a deliberate upward gesture at the top retries the page.
+    fireEvent.wheel(scrollContainer, { deltaY: -40 });
+    expect(onLoadOlder).toHaveBeenCalledTimes(2);
+  });
+
   it("ignores reconstructed history while still flagging a changed tail", async () => {
     const scrollContainerRef = { current: null as HTMLDivElement | null };
     const firstResponse = event("assistant-1", "assistant", "First response.");
@@ -1014,6 +1052,41 @@ describe("Transcript", () => {
     expect(screen.queryByText(/Working on/)).not.toBeInTheDocument();
   });
 
+  it("shows the file basename beside Read in settled activity rows", () => {
+    const onOpenFile = vi.fn();
+    render(
+      <Transcript
+        events={[
+          {
+            ...event("read-1", "tool", "apps/desktop/src/components/Transcript.tsx"),
+            activityType: "tool",
+            title: "Read",
+            filePath: "apps/desktop/src/components/Transcript.tsx",
+            status: "success",
+          },
+          {
+            ...event("search-1", "tool", "activityDisplayBody"),
+            activityType: "tool",
+            title: "Searched",
+            status: "success",
+          },
+        ]}
+        onOpenFile={onOpenFile}
+      />,
+    );
+
+    const readRow = document.querySelector('[data-event-id="read-1"]') as HTMLElement;
+    expect(within(readRow).getByText("Read")).toBeInTheDocument();
+    const fileLink = within(readRow).getByRole("button", {
+      name: "Open apps/desktop/src/components/Transcript.tsx in Files",
+    });
+    expect(fileLink).toHaveTextContent("Transcript.tsx");
+
+    const searchRow = document.querySelector('[data-event-id="search-1"]') as HTMLElement;
+    expect(within(searchRow).getByText("Searched")).toBeInTheDocument();
+    expect(within(searchRow).getByText("activityDisplayBody")).toBeInTheDocument();
+  });
+
   it("shows Editing with a file basename in the live narration line", () => {
     render(
       <Transcript
@@ -1171,8 +1244,15 @@ describe("Transcript", () => {
     expect(within(row).getByText("Edited")).toBeInTheDocument();
     const fileLink = screen.getByRole("button", { name: "Open src/App.tsx in Files" });
     expect(fileLink).toHaveTextContent("App.tsx");
-    expect(fileLink).toHaveAttribute("title", "src/App.tsx");
+    // Full path lives in the themed hover tooltip, not a native title.
+    expect(fileLink).not.toHaveAttribute("title");
     expect(within(row).queryByText("src/App.tsx")).toBeNull();
+    vi.useFakeTimers();
+    fireEvent.mouseEnter(fileLink);
+    act(() => vi.advanceTimersByTime(420));
+    expect(screen.getByRole("tooltip")).toHaveTextContent("src/App.tsx");
+    fireEvent.mouseLeave(fileLink);
+    vi.useRealTimers();
     expect(screen.getByLabelText("1 lines added, 1 lines removed")).toBeInTheDocument();
     expect(row.querySelector(".lucide-pencil")).not.toBeNull();
     expect(row.querySelector(".activity-icon-pencil--writing")).toBeNull();
@@ -1210,8 +1290,15 @@ describe("Transcript", () => {
     expect(row.querySelector(".activity-icon-pencil--writing")).not.toBeNull();
     const fileLink = screen.getByRole("button", { name: `Open ${absolute} in Files` });
     expect(fileLink).toHaveTextContent("Transcript.tsx");
-    expect(fileLink).toHaveAttribute("title", absolute);
+    // Full path lives in the themed hover tooltip, not a native title.
+    expect(fileLink).not.toHaveAttribute("title");
     expect(screen.queryByText(absolute)).toBeNull();
+    vi.useFakeTimers();
+    fireEvent.mouseEnter(fileLink);
+    act(() => vi.advanceTimersByTime(420));
+    expect(screen.getByRole("tooltip")).toHaveTextContent(absolute);
+    fireEvent.mouseLeave(fileLink);
+    vi.useRealTimers();
     fireEvent.click(fileLink);
     expect(onOpenFile).toHaveBeenCalledWith({ path: absolute });
   });

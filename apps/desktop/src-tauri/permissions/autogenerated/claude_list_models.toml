@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-claude-list-models"
+description = "Enables the claude_list_models command without any pre-configured scope."
+commands.allow = ["claude_list_models"]
+
+[[permission]]
+identifier = "deny-claude-list-models"
+description = "Denies the claude_list_models command without any pre-configured scope."
+commands.deny = ["claude_list_models"]

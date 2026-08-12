@@ -500,6 +500,52 @@ describe("native trusted-project bridge", () => {
     bridge.invalidateModelCatalog("codex");
   });
 
+  it("uses Claude Code's live catalog and exposes only model-supported efforts", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "claude_list_models") {
+        return [
+          {
+            id: "claude-opus-5[1m]",
+            label: "Opus (1M context)",
+            efforts: ["low", "medium", "high", "xhigh", "max"],
+          },
+          { id: "claude-haiku-4-5-20251001", label: "Haiku", efforts: [] },
+        ];
+      }
+      return undefined;
+    });
+
+    await expect(bridge.listModelCatalog("claude")).resolves.toEqual([
+      {
+        id: "claude-opus-5[1m]",
+        label: "Opus (1M context)",
+        efforts: [
+          { id: "low", label: "Low" },
+          { id: "medium", label: "Medium" },
+          { id: "high", label: "High" },
+          { id: "xhigh", label: "Extra high" },
+          { id: "max", label: "Max" },
+        ],
+        defaultEffort: "high",
+      },
+      { id: "claude-haiku-4-5-20251001", label: "Haiku" },
+    ]);
+    expect(invokeMock).toHaveBeenCalledWith("claude_list_models", undefined);
+  });
+
+  it("falls back to the static Claude catalog when the live probe fails", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "claude_list_models") {
+        throw new Error("provider-unavailable");
+      }
+      return undefined;
+    });
+
+    const catalog = await bridge.listModelCatalog("claude");
+    expect(catalog.map((entry) => entry.id)).toContain("claude-fable-5");
+    expect(catalog.every((entry) => entry.defaultEffort === "high")).toBe(true);
+  });
+
   it("uses Grok Build's live catalog and exposes only model-supported efforts", async () => {
     invokeMock.mockImplementation(async (command: string) => {
       if (command === "grok_list_models") return ["grok-4.5", "grok-future"];

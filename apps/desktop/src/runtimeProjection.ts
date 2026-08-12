@@ -498,10 +498,40 @@ function semanticToolTitle(item: ItemProjection): string | undefined {
 }
 
 function toolQuery(input: Record<string, unknown>): string | undefined {
-  const candidate = [input.pattern, input.query, input.q].find(
-    (value): value is string => typeof value === "string" && value.trim().length > 0,
-  );
+  const candidate = [
+    input.pattern,
+    input.query,
+    input.q,
+    input.search_term,
+    input.searchTerm,
+    input.regex,
+    input.glob,
+    input.glob_pattern,
+    input.globPattern,
+  ].find((value): value is string => typeof value === "string" && value.trim().length > 0);
   return candidate?.trim();
+}
+
+/** When providers put the target in the title ("Read App.tsx") but leave
+ *  rawInput empty, recover the trailing detail after the verb. */
+function detailFromTitle(title: string | undefined, action: ToolAction): string | undefined {
+  if (!title?.trim()) return undefined;
+  const verb: Record<ToolAction, RegExp> = {
+    read: /^(Reading|Reads|Read)\b/i,
+    write: /^(Creating|Created|Create|Writing|Wrote|Write)\b/i,
+    edit: /^(Editing|Edited|Edits|Edit|Changing|Changed|Adding|Added|Deleting|Deleted|Renaming|Renamed)\b/i,
+    search: /^(Searching|Searched|Searches|Search|Grep|Glob|Find)\b/i,
+    execute: /^(Running|Ran|Execute|Executing|Command)\b/i,
+    other: /^(?!)/,
+  };
+  const match = title.match(verb[action]);
+  if (!match) return undefined;
+  const rest = title
+    .slice(match[0].length)
+    .trim()
+    .replace(/^(for|in|at|[:\-–—])\s*/i, "")
+    .trim();
+  return rest || undefined;
 }
 
 function toolSummary(
@@ -532,28 +562,41 @@ function toolSummary(
           ? { additions: lineCount(input.content), deletions: 0 }
           : undefined));
   const fallback = item.body || toolInputPreview(item.toolInput);
+  const fromTitle = detailFromTitle(item.title, action);
   const semanticTitle = semanticToolTitle(item);
-  if (semanticTitle) return { title: semanticTitle, body: path ?? fallback ?? "", changeStats };
+  if (semanticTitle)
+    return { title: semanticTitle, body: path ?? fromTitle ?? fallback ?? "", changeStats };
   const running = item.status === "pending" || item.status === "inProgress";
   if (action === "read")
-    return { title: running ? "Reading" : "Read", body: path ?? fallback ?? "" };
+    return {
+      title: running ? "Reading" : "Read",
+      body: path ?? fromTitle ?? fallback ?? "",
+    };
   if (action === "write")
-    return { title: running ? "Creating" : "Created", body: path ?? fallback ?? "", changeStats };
+    return {
+      title: running ? "Creating" : "Created",
+      body: path ?? fromTitle ?? fallback ?? "",
+      changeStats,
+    };
   if (action === "edit")
-    return { title: running ? "Editing" : "Edited", body: path ?? fallback ?? "", changeStats };
+    return {
+      title: running ? "Editing" : "Edited",
+      body: path ?? fromTitle ?? fallback ?? "",
+      changeStats,
+    };
   if (action === "search")
     return {
       title: running ? "Searching" : "Searched",
-      body: toolQuery(input) ?? path ?? fallback ?? "",
+      body: toolQuery(input) ?? path ?? fromTitle ?? fallback ?? "",
     };
   if (action === "execute")
     return {
       title: running ? "Running a command" : "Ran a command",
-      body: fallback ?? "",
+      body: fromTitle ?? fallback ?? "",
     };
   return {
     title: "Runtime event",
-    body: path ?? fallback ?? "",
+    body: path ?? fromTitle ?? fallback ?? "",
     changeStats,
   };
 }
@@ -1200,15 +1243,19 @@ function buildRuntimeTranscript(
           ? "Command approval"
           : approval.approvalKind === "planReview"
             ? "Plan approval"
-            : "File approval",
+            : approval.approvalKind === "question"
+              ? "Agent question"
+              : "File approval",
       body: approval.reason ?? `Approval is ${approval.state}.`,
       timestamp: state.firstSeen[approval.id] ?? approval.updatedAt,
       status:
         approval.state === "pending" || approval.state === "responding"
           ? "warning"
-          : approval.state === "resolved"
-            ? "success"
-            : "neutral",
+          : approval.state === "responseFailed"
+            ? "error"
+            : approval.state === "resolved"
+              ? "success"
+              : "neutral",
     });
   }
 

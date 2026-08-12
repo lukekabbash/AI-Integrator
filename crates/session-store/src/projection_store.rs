@@ -1818,9 +1818,21 @@ fn apply_mutation(
     ensure_task_projection(transaction, binding, seq)?;
     match &reduced.mutation {
         ProjectionMutation::Turn(turn) => {
-            let stop_requested = transaction.query_row("SELECT stop_requested FROM integrator_turns WHERE provider_session_id=?1 AND turn_id=?2", params![provider_session_id.to_string(), turn.id], |row| row.get::<_, bool>(0)).optional().map_err(storage_error)?.unwrap_or(false);
+            let existing = transaction.query_row("SELECT stop_requested, started_at FROM integrator_turns WHERE provider_session_id=?1 AND turn_id=?2", params![provider_session_id.to_string(), turn.id], |row| Ok((row.get::<_, bool>(0)?, row.get::<_, Option<String>>(1)?))).optional().map_err(storage_error)?;
             let mut turn = turn.clone();
-            turn.stop_requested |= stop_requested;
+            if let Some((stop_requested, stored_started_at)) = existing {
+                turn.stop_requested |= stop_requested;
+                // A turn's start time is fixed when it begins. Settlement events
+                // restate it — some providers send "now" — and must not move it,
+                // or the settled turn's duration collapses to zero.
+                if let Some(started) = stored_started_at
+                    .as_deref()
+                    .and_then(|value| parse_time(value).ok())
+                {
+                    turn.started_at =
+                        Some(turn.started_at.map_or(started, |incoming| incoming.min(started)));
+                }
+            }
             transaction.execute("INSERT INTO integrator_turns(provider_session_id,task_id,thread_id,turn_id,status,stop_requested,error,started_at,completed_at,projection_json,last_event_seq,first_event_seq,first_occurred_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11,?12) ON CONFLICT(provider_session_id,turn_id) DO UPDATE SET status=excluded.status,stop_requested=excluded.stop_requested,error=excluded.error,started_at=excluded.started_at,completed_at=excluded.completed_at,projection_json=excluded.projection_json,last_event_seq=excluded.last_event_seq", params![provider_session_id.to_string(),binding.task_id.to_string(),thread_id,turn.id,turn.status.as_str(),turn.stop_requested,turn.error,turn.started_at.map(|v|v.to_rfc3339()),turn.completed_at.map(|v|v.to_rfc3339()),serde_json::to_string(&turn)?,seq,reduced.occurred_at.to_rfc3339()]).map_err(storage_error)?;
             transaction.execute("UPDATE integrator_task_projection SET current_turn_id=?1,last_event_seq=?2 WHERE task_id=?3", params![turn.id,seq,binding.task_id.to_string()]).map_err(storage_error)?;
             Ok(RuntimeProjection::TurnChanged { turn })
@@ -3093,6 +3105,73 @@ mod tests {
         };
         assert_eq!(hydrate.turn.as_ref(), Some(&turn));
         assert!(hydrate.items.is_empty());
+    }
+
+    #[test]
+    fn turn_settlement_keeps_the_original_start_time() {
+        let (store, binding) = bound_store(ProviderKind::Claude);
+        let started_at = Utc::now();
+        let settled_at = started_at + chrono::Duration::seconds(42);
+        let turn_event = |status: TurnStatus,
+                          started: DateTime<Utc>,
+                          completed: Option<DateTime<Utc>>,
+                          occurred_at: DateTime<Utc>| ReducedProviderEvent {
+            method: "turn/started".into(),
+            thread_id: "thread-fixture".into(),
+            turn_id: Some("turn-1".into()),
+            audit_json: "{}".into(),
+            audit_truncated: false,
+            mutation: ProjectionMutation::Turn(TurnProjection {
+                id: "turn-1".into(),
+                status,
+                stop_requested: false,
+                error: None,
+                started_at: Some(started),
+                completed_at: completed,
+            }),
+            occurred_at,
+        };
+        store
+            .apply_reduced_event(
+                &binding,
+                &turn_event(TurnStatus::InProgress, started_at, None, started_at),
+            )
+            .expect("start turn");
+        // Structured CLIs settle with `now` as the restated start; the stored
+        // start must survive or the settled turn's duration collapses to zero.
+        let event = store
+            .apply_reduced_event(
+                &binding,
+                &turn_event(
+                    TurnStatus::Completed,
+                    settled_at,
+                    Some(settled_at),
+                    settled_at,
+                ),
+            )
+            .expect("settle turn");
+        let RuntimeProjection::TurnChanged { turn } = event.projection else {
+            panic!("expected turn event");
+        };
+        assert_eq!(turn.started_at.map(|v| v.timestamp()), Some(started_at.timestamp()));
+        assert_eq!(turn.completed_at.map(|v| v.timestamp()), Some(settled_at.timestamp()));
+        let stored = store
+            .connection
+            .lock()
+            .query_row(
+                "SELECT started_at, completed_at FROM integrator_turns WHERE turn_id='turn-1'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("read stored turn");
+        assert_eq!(
+            parse_time(&stored.0).expect("parse start").timestamp(),
+            started_at.timestamp()
+        );
+        assert_eq!(
+            parse_time(&stored.1).expect("parse completion").timestamp(),
+            settled_at.timestamp()
+        );
     }
 
     #[test]

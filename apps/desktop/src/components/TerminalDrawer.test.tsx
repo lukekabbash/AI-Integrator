@@ -165,12 +165,12 @@ describe("TerminalDrawer", () => {
     expect(terminalMock.instances[1].writes).toContain("second terminal\r\n");
     expect(terminalMock.instances[0].writes).not.toContain("second terminal\r\n");
 
-    fireEvent.click(screen.getByTitle("Terminal 1"));
+    fireEvent.click(screen.getByRole("button", { name: "Terminal 1" }));
     expect(screen.getByText("Terminal 1", { selector: ".terminal-title strong" })).toBeVisible();
 
     fireEvent.click(screen.getByRole("button", { name: "Close Terminal 2" }));
     await waitFor(() => expect(terminalMock.closeTerminal).toHaveBeenCalledWith("term-2"));
-    expect(screen.queryByTitle("Terminal 2")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Terminal 2" })).not.toBeInTheDocument();
   });
 
   it("collapses the terminal list without removing its sessions or new-terminal action", async () => {

@@ -1189,14 +1189,15 @@ export const TaskSidebar = memo(function TaskSidebar({
                           {showArchived && project.archived ? (
                             // Icon-only: a text pill starves the name of space in
                             // the narrow sidebar.
-                            <small
-                              className="project-archived-badge"
-                              role="img"
-                              aria-label="Archived project"
-                              title="Archived project"
-                            >
-                              <Archive aria-hidden="true" />
-                            </small>
+                            <Tooltip label="Archived project" placement="right">
+                              <small
+                                className="project-archived-badge"
+                                role="img"
+                                aria-label="Archived project"
+                              >
+                                <Archive aria-hidden="true" />
+                              </small>
+                            </Tooltip>
                           ) : null}
                         </button>
                         <span className="project-header-meta" data-has-actions="true">

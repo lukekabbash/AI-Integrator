@@ -146,9 +146,11 @@ import {
 import {
   clearOptimisticMessageForTask,
   isComposerTurnBusy,
+  isTurnActiveError,
   type OptimisticUserMessage,
 } from "./appTurnState";
 import { SlidingPanelSlot } from "./components/SlidingPanelSlot";
+import { Tooltip } from "./components/Tooltip";
 import "./styles.css";
 
 const RightRail = lazy(() =>
@@ -188,6 +190,39 @@ type ComposerTurnInput = {
   nativeAction?: NativeActionReference;
   draftRevision?: number;
 };
+
+type SendTurnOutcome = "started" | "turn-active" | "failed";
+
+type TaskPermission = ComposerTurnInput["permission"];
+
+function isTaskPermission(value: unknown): value is TaskPermission {
+  return (
+    value === "read-only" || value === "project-write" || value === "ask" || value === "full-access"
+  );
+}
+
+function settingsDefaultPermission(settings: Record<string, unknown>): TaskPermission {
+  const configured = settings["permissions.defaultProfile"];
+  return isTaskPermission(configured) ? configured : "project-write";
+}
+
+/** Full access silently handles routine approvals; deliberate gates and failures stay visible. */
+function approvalVisibleForPermission(
+  approval: ApprovalProjection,
+  permission: TaskPermission,
+  autoResponseFailed = false,
+): boolean {
+  if (autoResponseFailed) return true;
+  if (permission !== "full-access") return true;
+  if (approval.approvalKind === "planReview" || approval.approvalKind === "question") return true;
+  if (approval.state === "pending" || approval.state === "responding") return false;
+  if (approval.state === "resolved") {
+    return approval.decision === "decline" || approval.decision === "cancel";
+  }
+  return true;
+}
+
+const autoApprovalKey = (taskId: string, approvalId: string) => `${taskId}:${approvalId}`;
 
 function queuedMessagePrompt(message: QueuedMessage): string {
   const prompt = message.prompt.trim();
@@ -691,25 +726,31 @@ function NativeTitlebar({
             <div className="titlebar-heading">
               <h1>
                 {onTitleSelect ? (
-                  <button
-                    className="titlebar-title-button"
-                    type="button"
-                    onClick={onTitleSelect}
-                    aria-current={titleActive ? "page" : undefined}
-                    title="Back to the conversation"
+                  <Tooltip
+                    label="Back to the conversation"
+                    disabled={titleActive}
+                    placement="bottom"
                   >
-                    <motion.span
-                      className="titlebar-title-copy"
-                      key={title}
-                      initial={
-                        motionScale === 0 ? false : { opacity: 0, y: 2, filter: "blur(2px)" }
-                      }
-                      animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
-                      transition={{ duration: 0.2 * motionScale, ease: [0.2, 0, 0, 1] }}
+                    <button
+                      className="titlebar-title-button"
+                      type="button"
+                      onClick={onTitleSelect}
+                      aria-current={titleActive ? "page" : undefined}
+                      aria-label={titleActive ? undefined : "Back to the conversation"}
                     >
-                      {title}
-                    </motion.span>
-                  </button>
+                      <motion.span
+                        className="titlebar-title-copy"
+                        key={title}
+                        initial={
+                          motionScale === 0 ? false : { opacity: 0, y: 2, filter: "blur(2px)" }
+                        }
+                        animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                        transition={{ duration: 0.2 * motionScale, ease: [0.2, 0, 0, 1] }}
+                      >
+                        {title}
+                      </motion.span>
+                    </button>
+                  </Tooltip>
                 ) : (
                   <motion.span
                     className="titlebar-title-copy"
@@ -1085,7 +1126,9 @@ function AddProjectModal({
             <div className="clone-location-row">
               <span>
                 <small>Location</small>
-                <strong title={parent}>{parent || "Loading default location…"}</strong>
+                <Tooltip label={parent || "Loading default location…"} placement="top">
+                  <strong>{parent || "Loading default location…"}</strong>
+                </Tooltip>
               </span>
               <button
                 type="button"
@@ -1277,7 +1320,6 @@ function ApprovalControl({
   busy,
   autoApproving,
   runtime,
-  crowded,
   onDecision,
   onSelectOption,
 }: {
@@ -1286,9 +1328,6 @@ function ApprovalControl({
   autoApproving?: boolean;
   /** Which provider raised the approval; tailors plan-review actions. */
   runtime?: RuntimeId;
-  /** The status shelf (run timer / recovery / queue) floats above the
-   *  composer at the same time — pull back to clear it. */
-  crowded?: boolean;
   onDecision: (decision: ApprovalDecision) => void;
   /** Answer a "question" approval with one of its offered options. ACP has
    *  no elicitation method, so the agent asked through the same permission
@@ -1311,7 +1350,6 @@ function ApprovalControl({
     <section
       className="approval-control"
       data-auto={autoApproving || undefined}
-      data-crowded={crowded || undefined}
       aria-labelledby={`approval-${approval.id}`}
     >
       <header className="approval-header">
@@ -1415,26 +1453,34 @@ function ApprovalControl({
               {isPlan ? "Keep planning" : "Decline"}
             </button>
             {isCommand ? (
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => onDecision("acceptForSession")}
-                disabled={busy}
-                title="Allow this and similar commands for the rest of this session"
+              <Tooltip
+                label="Allow this and similar commands for the rest of this session"
+                placement="top"
               >
-                Allow for session
-              </button>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => onDecision("acceptForSession")}
+                  disabled={busy}
+                >
+                  Allow for session
+                </button>
+              </Tooltip>
             ) : null}
             {isPlan && runtime !== "cursor" ? (
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => onDecision("acceptForSession")}
-                disabled={busy}
-                title="Approve the plan and auto-accept the file edits that implement it"
+              <Tooltip
+                label="Approve the plan and auto-accept the file edits that implement it"
+                placement="top"
               >
-                Approve & auto-edit
-              </button>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => onDecision("acceptForSession")}
+                  disabled={busy}
+                >
+                  Approve & auto-edit
+                </button>
+              </Tooltip>
             ) : null}
             <button
               type="button"
@@ -1515,14 +1561,18 @@ export default function App() {
   const [respondingApprovalId, setRespondingApprovalId] = useState("");
   // Live composer permission per task. Switching to full access mid-run
   // auto-approves pending and future command approvals for that task.
-  const [taskPermissions, setTaskPermissions] = useState<Record<string, string>>({});
+  const [taskPermissions, setTaskPermissions] = useState<Record<string, TaskPermission>>({});
   const autoApprovedIdsRef = useRef<Set<string>>(new Set());
+  const [autoApprovalFailures, setAutoApprovalFailures] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   // External composer permission set-requests: mirrors agent-driven mode
   // changes (e.g. an approved plan exit) back into the permission picker.
   // The id is the task:mode pair the request derives from.
   const [permissionRequest, setPermissionRequest] = useState<{
+    taskId: string;
     id: string;
-    value: "read-only" | "project-write" | "ask" | "full-access";
+    value: TaskPermission;
   } | null>(null);
   // Task whose approved Cursor plan should be built once the planning turn
   // settles. Cleared if the user sends their own message first.
@@ -1545,19 +1595,28 @@ export default function App() {
   const queueBusyIdRef = useRef("");
   const priorityQueueIdRef = useRef("");
   const queuePausedTaskIdsRef = useRef(new Set<string>());
+  // A native turn-active rejection can arrive before the matching projection.
+  // Hold its follow-up until that authoritative active turn becomes visible.
+  const queueWaitingForActiveTurnByTaskRef = useRef(new Map<string, number>());
   const queueAwaitingTurnRef = useRef<{ taskId: string; previousTurnId?: string } | undefined>(
     undefined,
   );
   const automationDispatchingRef = useRef(new Set<string>());
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
   const [screen, setScreen] = useState<Screen>(initialScreen);
-  const [settingsSection, setSettingsSection] = useState<SettingsSection>("appearance");
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
   const [runtimeActionRequest, setRuntimeActionRequest] = useState<RuntimeActionRequest | null>(
     null,
   );
   const runtimeActionSequence = useRef(0);
   const [centerView, setCenterView] = useState<CenterView>(initialCenterView);
   const [localSettings, setLocalSettings] = useState<Record<string, unknown>>({});
+  const taskPermissionsRef = useRef(taskPermissions);
+  taskPermissionsRef.current = taskPermissions;
+  const autoApprovalFailuresRef = useRef(autoApprovalFailures);
+  autoApprovalFailuresRef.current = autoApprovalFailures;
+  const localSettingsRef = useRef(localSettings);
+  localSettingsRef.current = localSettings;
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
     () =>
       typeof window !== "undefined" && Boolean(window.matchMedia?.("(max-width: 900px)").matches),
@@ -2082,7 +2141,61 @@ export default function App() {
             if (event.projection.kind === "turnError" && !event.projection.retryable) {
               queuePausedTaskIdsRef.current.add(event.taskId);
             }
-            const persistedActivity = taskActivityUpdate(event, false);
+            const approval =
+              event.projection.kind === "approvalChanged" ? event.projection.approval : undefined;
+            const draftPermission = composerDraftStore.read({
+              kind: "task",
+              taskId: event.taskId,
+            })?.permission;
+            const taskPermission =
+              taskPermissionsRef.current[event.taskId] ??
+              (isTaskPermission(draftPermission) ? draftPermission : undefined) ??
+              settingsDefaultPermission(localSettingsRef.current);
+            const routineFullAccessApproval = Boolean(
+              approval &&
+              taskPermission === "full-access" &&
+              approval.approvalKind !== "planReview" &&
+              approval.approvalKind !== "question",
+            );
+            if (
+              approval?.state === "pending" &&
+              routineFullAccessApproval &&
+              event.taskId !== activeTaskIdRef.current
+            ) {
+              const approvalKey = autoApprovalKey(event.taskId, approval.id);
+              if (
+                !autoApprovedIdsRef.current.has(approvalKey) &&
+                !autoApprovalFailuresRef.current.has(approvalKey)
+              ) {
+                autoApprovedIdsRef.current.add(approvalKey);
+                void bridge
+                  .respondToApproval(event.taskId, approval.id, "acceptForSession")
+                  .catch((error: unknown) => {
+                    autoApprovedIdsRef.current.delete(approvalKey);
+                    setAutoApprovalFailures((current) => new Set(current).add(approvalKey));
+                    setComposerError({
+                      id: `auto-approval-${approval.id}`,
+                      taskId: event.taskId,
+                      message:
+                        error instanceof Error
+                          ? error.message
+                          : "Could not automatically approve that action",
+                    });
+                    setSnapshot((current) => ({
+                      ...current,
+                      tasks: current.tasks.map((task) =>
+                        task.id === event.taskId
+                          ? { ...task, status: "waiting", updatedAt: event.occurredAt }
+                          : task,
+                      ),
+                    }));
+                  });
+              }
+            }
+            const persistedActivity =
+              approval?.state === "pending" && routineFullAccessApproval
+                ? { status: "running" as const, updatedAt: event.occurredAt }
+                : taskActivityUpdate(event, false);
             if (persistedActivity) {
               setSnapshot((current) => {
                 const taskIndex = current.tasks.findIndex((task) => task.id === event.taskId);
@@ -2643,6 +2756,19 @@ export default function App() {
   const activeComposerDraft = activeDraftOwner
     ? composerDraftStore.read(activeDraftOwner)
     : undefined;
+  const activeTaskPermission: TaskPermission =
+    activeTask?.kind === "chat"
+      ? "read-only"
+      : activeTask
+        ? (taskPermissions[activeTask.id] ??
+          activeComposerDraft?.permission ??
+          settingsDefaultPermission(localSettings))
+        : settingsDefaultPermission(localSettings);
+  const activeComposerDraftWithPermission =
+    activeComposerDraft && activeTask && taskPermissions[activeTask.id]
+      ? { ...activeComposerDraft, permission: taskPermissions[activeTask.id] }
+      : activeComposerDraft;
+  const autoApproveActive = Boolean(activeTask && activeTaskPermission === "full-access");
   const persistComposerDraft = (draft: ComposerDraft) => {
     if (typeof bridge.saveComposerDraft !== "function") return;
     pendingDraftWrites.current.set(draftOwnerKey(draft.owner), draft);
@@ -3301,12 +3427,12 @@ export default function App() {
   const sendTurn = async (
     input: ComposerTurnInput,
     options?: { resumeInterrupted?: boolean },
-  ): Promise<boolean> => {
+  ): Promise<SendTurnOutcome> => {
     const project = activeProject;
     const isChat = activeTask?.kind === "chat";
     if (!project && !isChat) {
       setOperationError("Open a project before starting a task.");
-      return false;
+      return "failed";
     }
     const routedInput: ComposerTurnInput = isChat
       ? {
@@ -3336,7 +3462,7 @@ export default function App() {
           delegation: routedInput.delegation,
           draft: submittedDraft?.revision === input.draftRevision ? submittedDraft : undefined,
         })));
-    if (!targetTask) return false;
+    if (!targetTask) return "failed";
     setTaskPermissions((current) => ({
       ...current,
       [targetTask.id]: routedInput.permission,
@@ -3473,6 +3599,19 @@ export default function App() {
           .catch(() => undefined);
       }
     } catch (error) {
+      if (isTurnActiveError(error)) {
+        clearOptimisticUserMessageForTask(targetTask.id);
+        setSnapshot((current) => ({
+          ...current,
+          tasks: current.tasks.map((task) =>
+            task.id === targetTask.id && task.status === "starting"
+              ? { ...task, status: "running" }
+              : task,
+          ),
+        }));
+        setPromotingDraftTaskId((current) => (current === targetTask.id ? "" : current));
+        return "turn-active";
+      }
       composerNoticeSequence.current += 1;
       setComposerError({
         id: `composer-error-${composerNoticeSequence.current}`,
@@ -3498,7 +3637,7 @@ export default function App() {
         void bridge.setTaskStatus?.(targetTask.id, "failed").catch(() => undefined);
       }
       setPromotingDraftTaskId((current) => (current === targetTask.id ? "" : current));
-      return false;
+      return "failed";
     }
     setLocalSettings((current) => ({ ...current, "models.lastRuntime": routedInput.runtime }));
     void bridge
@@ -3538,7 +3677,7 @@ export default function App() {
           : task,
       ),
     }));
-    if (nativeHost) return true;
+    if (nativeHost) return "started";
     const activity: TranscriptEvent = {
       id: `activity-${Date.now()}`,
       kind: "activity",
@@ -3581,7 +3720,7 @@ export default function App() {
         ),
       };
     });
-    return true;
+    return "started";
   };
 
   const resumeInterruptedTurn = async (): Promise<boolean> => {
@@ -3620,7 +3759,7 @@ export default function App() {
     resumeWorkedForBaselineRef.current = new Set(
       projectedTranscript.filter((event) => event.title === "Worked for").map((event) => event.id),
     );
-    const accepted = await sendTurn(
+    const outcome = await sendTurn(
       {
         prompt: INTERRUPTED_RESUME_VISIBLE_PROMPT,
         runtime: activeTask.runtime,
@@ -3634,6 +3773,7 @@ export default function App() {
       { resumeInterrupted: true },
     );
     setResumingTaskId("");
+    const accepted = outcome === "started";
     if (!accepted) {
       resumeWorkedForBaselineRef.current = null;
       setRecoveryFailure({
@@ -3660,29 +3800,10 @@ export default function App() {
     return messages;
   };
 
-  const submitComposerTurn = async (input: ComposerTurnInput): Promise<boolean> => {
-    const task = activeTask;
-    if (task && activeProjectionUnavailable) return false;
-    const projectedTurnActive =
-      runtimeState?.taskId === task?.id &&
-      (runtimeState?.turn?.status === "pending" || runtimeState?.turn?.status === "inProgress");
-    const queueBusyForTask = snapshot.queuedMessages.some(
-      (message) => message.taskId === task?.id && message.id === queueBusyIdRef.current,
-    );
-    const turnBusy = Boolean(
-      task &&
-      isComposerTurnBusy({
-        projectedTurnActive,
-        optimisticTurnStarting,
-        resuming: resumingTaskId === task.id,
-        queueBusy: queueBusyForTask,
-        queueAwaiting: queueAwaitingTurnRef.current?.taskId === task.id,
-      }),
-    );
-    if (!task || (!turnBusy && !queuePausedTaskIdsRef.current.has(task.id))) {
-      return sendTurn(input);
-    }
-
+  const enqueueComposerTurn = async (
+    task: TaskSummary,
+    input: ComposerTurnInput,
+  ): Promise<boolean> => {
     try {
       const message = await bridge.enqueueMessage({
         taskId: task.id,
@@ -3713,6 +3834,44 @@ export default function App() {
       setOperationError(formatBridgeError(error, "The message could not be queued"));
       return false;
     }
+  };
+
+  const submitComposerTurn = async (input: ComposerTurnInput): Promise<boolean> => {
+    const task = activeTask;
+    if (task && activeProjectionUnavailable) return false;
+    const projectedTurnActive =
+      runtimeState?.taskId === task?.id &&
+      (runtimeState?.turn?.status === "pending" || runtimeState?.turn?.status === "inProgress");
+    const queueBusyForTask = snapshot.queuedMessages.some(
+      (message) => message.taskId === task?.id && message.id === queueBusyIdRef.current,
+    );
+    const turnBusy = Boolean(
+      task &&
+      isComposerTurnBusy({
+        projectedTurnActive,
+        optimisticTurnStarting,
+        resuming: resumingTaskId === task.id,
+        queueBusy: queueBusyForTask,
+        queueAwaiting: queueAwaitingTurnRef.current?.taskId === task.id,
+      }),
+    );
+    if (!task || (!turnBusy && !queuePausedTaskIdsRef.current.has(task.id))) {
+      const outcome = await sendTurn(input);
+      if (outcome !== "turn-active" || !task) return outcome === "started";
+
+      const lastProjectedSeq = runtimeState?.taskId === task.id ? runtimeState.lastSeq : -1;
+      queueWaitingForActiveTurnByTaskRef.current.set(task.id, lastProjectedSeq);
+      const queued = await enqueueComposerTurn(task, input);
+      if (queued) {
+        // Pull the native unfinished turn into the renderer before the queue
+        // effect can mistake the stale idle projection for an open slot.
+        void reconcileTaskProjection(task.id, true);
+      } else {
+        queueWaitingForActiveTurnByTaskRef.current.delete(task.id);
+      }
+      return queued;
+    }
+    return enqueueComposerTurn(task, input);
   };
 
   const reorderQueuedMessages = async (orderedIds: string[]) => {
@@ -4132,8 +4291,13 @@ export default function App() {
       .then(() => setDeleteArchivedChatsProjectId(projectId));
   }, []);
   const handleSidebarOpenProject = useCallback(() => setAddProjectOpen(true), []);
-  const handleSidebarOpenSettings = useCallback(() => setScreen("settings"), []);
+  const handleSidebarOpenSettings = useCallback(() => {
+    setRuntimeActionRequest(null);
+    setSettingsSection("general");
+    setScreen("settings");
+  }, []);
   const handleSidebarOpenSettingsSection = useCallback((section: SettingsSection) => {
+    setRuntimeActionRequest(null);
     setSettingsSection(section);
     setScreen("settings");
   }, []);
@@ -4145,6 +4309,27 @@ export default function App() {
     () => handleSidebarOpenSettingsSection("subagents"),
     [handleSidebarOpenSettingsSection],
   );
+  const handleLocalSettingChanged = (key: string, value: unknown) => {
+    setLocalSettings((current) => ({ ...current, [key]: value }));
+    if (
+      key !== "permissions.defaultProfile" ||
+      !isTaskPermission(value) ||
+      !activeTask ||
+      activeTask.kind === "chat"
+    ) {
+      return;
+    }
+
+    // A Settings change should fix the task the user came from as well as
+    // future tasks. Other existing tasks retain their explicit profile.
+    setTaskPermissions((current) => ({ ...current, [activeTask.id]: value }));
+    setPermissionRequest((current) => (current?.taskId === activeTask.id ? null : current));
+    const owner = { kind: "task", taskId: activeTask.id } as const;
+    const draft = composerDraftStore.read(owner);
+    if (draft) {
+      persistComposerDraft(composerDraftStore.update(owner, { ...draft, permission: value }));
+    }
+  };
   const handleSidebarOpenScheduled = useCallback(() => {
     setScheduledRailOpen(false);
     setScreen("scheduled");
@@ -5064,6 +5249,20 @@ export default function App() {
           (approval.state === "pending" || approval.state === "responseFailed") &&
           !isStaleApproval(approval),
       );
+  const visiblePendingApproval = activeProjectionUnavailable
+    ? undefined
+    : runtimeState?.approvals.find((approval) => {
+        const approvalKey = activeTask ? autoApprovalKey(activeTask.id, approval.id) : "";
+        return (
+          (approval.state === "pending" || approval.state === "responseFailed") &&
+          !isStaleApproval(approval) &&
+          approvalVisibleForPermission(
+            approval,
+            activeTaskPermission,
+            autoApprovalFailures.has(approvalKey),
+          )
+        );
+      });
   const transcriptDensity: TranscriptDensity =
     localSettings["transcript.activityDensity"] === "summary" ||
     localSettings["transcript.activityDensity"] === "verbose"
@@ -5073,12 +5272,26 @@ export default function App() {
     () => createRuntimeTranscriptDeriver(transcriptDensity),
     [transcriptDensity],
   );
+  const visibleRuntimeState = useMemo(() => {
+    if (!runtimeState || activeTaskPermission !== "full-access") return runtimeState;
+    const approvals = runtimeState.approvals.filter((approval) => {
+      const approvalKey = activeTask ? autoApprovalKey(activeTask.id, approval.id) : "";
+      return approvalVisibleForPermission(
+        approval,
+        activeTaskPermission,
+        autoApprovalFailures.has(approvalKey),
+      );
+    });
+    return approvals.length === runtimeState.approvals.length
+      ? runtimeState
+      : { ...runtimeState, approvals };
+  }, [activeTask, activeTaskPermission, autoApprovalFailures, runtimeState]);
   const nativeRuntimeEvents = useMemo(
     () =>
-      nativeHost && runtimeState && runtimeState.taskId === activeTask?.id
-        ? deriveNativeRuntimeTranscript(runtimeState)
+      nativeHost && visibleRuntimeState && visibleRuntimeState.taskId === activeTask?.id
+        ? deriveNativeRuntimeTranscript(visibleRuntimeState)
         : [],
-    [activeTask?.id, deriveNativeRuntimeTranscript, nativeHost, runtimeState],
+    [activeTask?.id, deriveNativeRuntimeTranscript, nativeHost, visibleRuntimeState],
   );
   const optimisticForActiveTask =
     nativeHost && optimisticUserMessage?.taskId === activeTask?.id ? optimisticUserMessage : null;
@@ -5339,8 +5552,20 @@ export default function App() {
         ]
       : []),
   ];
-  const respondToApproval = async (approval: ApprovalProjection, decision: ApprovalDecision) => {
+  const respondToApproval = async (
+    approval: ApprovalProjection,
+    decision: ApprovalDecision,
+    autoResponseKey?: string,
+  ) => {
     if (!activeTask || respondingApprovalId || activeProjectionUnavailable) return;
+    const approvalKey = autoApprovalKey(activeTask.id, approval.id);
+    const recoveringAutoFailure = autoApprovalFailuresRef.current.has(approvalKey);
+    setAutoApprovalFailures((current) => {
+      if (!current.has(approvalKey)) return current;
+      const next = new Set(current);
+      next.delete(approvalKey);
+      return next;
+    });
     setRespondingApprovalId(approval.id);
     setOperationError("");
     try {
@@ -5362,6 +5587,11 @@ export default function App() {
         }
       }
     } catch (error) {
+      if (autoResponseKey || recoveringAutoFailure) {
+        const failedKey = autoResponseKey ?? approvalKey;
+        autoApprovedIdsRef.current.delete(failedKey);
+        setAutoApprovalFailures((current) => new Set(current).add(failedKey));
+      }
       setOperationError(error instanceof Error ? error.message : "Could not send that decision");
     } finally {
       setRespondingApprovalId("");
@@ -5381,8 +5611,6 @@ export default function App() {
     }
   };
 
-  const autoApproveActive = Boolean(activeTask && taskPermissions[activeTask.id] === "full-access");
-
   // Full access selected mid-run means "stop asking": answer each new
   // approval once, automatically, instead of parking the turn on a prompt.
   // Plan reviews stay manual: the user chose plan mode to read the plan
@@ -5400,11 +5628,19 @@ export default function App() {
     )
       return;
     if (respondingApprovalId) return;
-    if (autoApprovedIdsRef.current.has(pendingApproval.id)) return;
-    autoApprovedIdsRef.current.add(pendingApproval.id);
-    void respondToApproval(pendingApproval, "acceptForSession");
+    const approvalKey = autoApprovalKey(activeTask.id, pendingApproval.id);
+    if (autoApprovedIdsRef.current.has(approvalKey) || autoApprovalFailures.has(approvalKey))
+      return;
+    autoApprovedIdsRef.current.add(approvalKey);
+    void respondToApproval(pendingApproval, "acceptForSession", approvalKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- respondToApproval is recreated every render
-  }, [autoApproveActive, activeTask?.id, pendingApproval, respondingApprovalId]);
+  }, [
+    autoApprovalFailures,
+    autoApproveActive,
+    activeTask?.id,
+    pendingApproval,
+    respondingApprovalId,
+  ]);
 
   // Agent-driven mode changes (an approved ExitPlanMode, the launch mode
   // itself) flow back into the per-task permission profile so the next turn
@@ -5416,9 +5652,9 @@ export default function App() {
       ? activeRuntimeState.mode.currentModeId
       : undefined;
   const claudeModeKey = activeTask && claudeModeId ? `${activeTask.id}:${claudeModeId}` : undefined;
-  const [syncedClaudeModeKey, setSyncedClaudeModeKey] = useState<string | undefined>(undefined);
-  if (activeTask && claudeModeId && claudeModeKey !== syncedClaudeModeKey) {
-    setSyncedClaudeModeKey(claudeModeKey);
+  const [syncedClaudeModes, setSyncedClaudeModes] = useState<Record<string, string>>({});
+  if (activeTask && claudeModeId && syncedClaudeModes[activeTask.id] !== claudeModeId) {
+    setSyncedClaudeModes((current) => ({ ...current, [activeTask.id]: claudeModeId }));
     const mapped =
       claudeModeId === "plan"
         ? ("read-only" as const)
@@ -5431,7 +5667,9 @@ export default function App() {
       current[activeTask.id] === mapped ? current : { ...current, [activeTask.id]: mapped },
     );
     setPermissionRequest((current) =>
-      current?.id === claudeModeKey ? current : { id: claudeModeKey ?? "", value: mapped },
+      current?.id === claudeModeKey
+        ? current
+        : { taskId: activeTask.id, id: claudeModeKey ?? "", value: mapped },
     );
   }
 
@@ -5722,7 +5960,7 @@ export default function App() {
       }
 
       priorityQueueIdRef.current = "";
-      const accepted = await sendTurn({
+      const outcome = await sendTurn({
         prompt: queuedMessagePrompt(message),
         attachments: message.attachments,
         runtime: message.runtime,
@@ -5733,7 +5971,22 @@ export default function App() {
         nativeActionId: message.nativeActionId,
         contextReferences: message.contextReferences,
       });
-      if (!accepted) throw new Error("The queued turn could not be started");
+      if (outcome === "turn-active") {
+        const lastProjectedSeq =
+          runtimeState?.taskId === message.taskId ? runtimeState.lastSeq : -1;
+        queueWaitingForActiveTurnByTaskRef.current.set(message.taskId, lastProjectedSeq);
+        const queued = await bridge.setQueuedMessageDispatching(message.taskId, message.id, false);
+        setSnapshot((current) => ({
+          ...current,
+          queuedMessages: current.queuedMessages.map((candidate) =>
+            candidate.id === queued.id ? queued : candidate,
+          ),
+        }));
+        setOperationStatus("Message queued");
+        void reconcileTaskProjection(message.taskId, true);
+        return;
+      }
+      if (outcome !== "started") throw new Error("The queued turn could not be started");
       if (nativeHost) {
         queueAwaitingTurnRef.current = {
           taskId: message.taskId,
@@ -5784,6 +6037,21 @@ export default function App() {
         turn.id !== awaitingTurn.previousTurnId
       ) {
         queueAwaitingTurnRef.current = undefined;
+      } else {
+        return;
+      }
+    }
+    const waitingAfterSeq = queueWaitingForActiveTurnByTaskRef.current.get(activeTask.id);
+    if (waitingAfterSeq !== undefined) {
+      const activeProjection = runtimeState?.taskId === activeTask.id ? runtimeState : undefined;
+      const projectionAdvanced = (activeProjection?.lastSeq ?? -1) > waitingAfterSeq;
+      const terminalProjection =
+        !activeProjection?.turn ||
+        activeProjection.turn.status === "completed" ||
+        activeProjection.turn.status === "failed" ||
+        activeProjection.turn.status === "interrupted";
+      if (nativeTurnActive || (projectionAdvanced && terminalProjection)) {
+        queueWaitingForActiveTurnByTaskRef.current.delete(activeTask.id);
       } else {
         return;
       }
@@ -6065,13 +6333,15 @@ export default function App() {
               </>
             ) : screen === "workspace" && !selectedDelegation ? (
               <>
-                <button className="usage-compact" type="button" title={usagePillTitle}>
-                  {usagePillPercent !== undefined ? (
-                    <strong>{Math.round(usagePillPercent)}%</strong>
-                  ) : null}
-                  <span>{formatCompactTokenCount(displayedUsage.tokens)}</span>
-                  <span className="sr-only"> tokens</span>
-                </button>
+                <Tooltip label={usagePillTitle} placement="bottom">
+                  <button className="usage-compact" type="button" aria-label={usagePillTitle}>
+                    {usagePillPercent !== undefined ? (
+                      <strong>{Math.round(usagePillPercent)}%</strong>
+                    ) : null}
+                    <span>{formatCompactTokenCount(displayedUsage.tokens)}</span>
+                    <span className="sr-only"> tokens</span>
+                  </button>
+                </Tooltip>
                 {activeTask?.kind !== "chat" ? (
                   <>
                     <button
@@ -6116,7 +6386,7 @@ export default function App() {
             if (snapshot.activeTaskId) void bridge.openTaskWindow?.(snapshot.activeTaskId);
           }}
           onReviewChanges={reviewChanges}
-          onOpenSettings={() => setScreen("settings")}
+          onOpenSettings={handleSidebarOpenSettings}
           onOpenSetup={() => setScreen("setup")}
         />
         <div
@@ -6171,9 +6441,7 @@ export default function App() {
                     runtimeActionRequest={runtimeActionRequest}
                     initialSection={settingsSection}
                     onRefreshRuntimes={refreshRuntimes}
-                    onSettingChanged={(key, value) =>
-                      setLocalSettings((current) => ({ ...current, [key]: value }))
-                    }
+                    onSettingChanged={handleLocalSettingChanged}
                     onBack={() => setScreen("workspace")}
                   />
                 </Suspense>
@@ -6280,15 +6548,16 @@ export default function App() {
                               role="alert"
                             >
                               <span className="operation-message-text">{operationError}</span>
-                              <button
-                                className="operation-message-dismiss"
-                                type="button"
-                                aria-label="Dismiss operation error"
-                                title="Dismiss error"
-                                onClick={() => setOperationError("")}
-                              >
-                                <X aria-hidden="true" />
-                              </button>
+                              <Tooltip label="Dismiss error" placement="top">
+                                <button
+                                  className="operation-message-dismiss"
+                                  type="button"
+                                  aria-label="Dismiss operation error"
+                                  onClick={() => setOperationError("")}
+                                >
+                                  <X aria-hidden="true" />
+                                </button>
+                              </Tooltip>
                             </div>
                           ) : null}
                           {operationStatus ? (
@@ -6434,31 +6703,6 @@ export default function App() {
                                   <EmptyTaskState project={activeProject} />
                                 ) : null}
                               </div>
-                              {pendingApproval ? (
-                                <ApprovalControl
-                                  approval={pendingApproval}
-                                  busy={respondingApprovalId === pendingApproval.id}
-                                  autoApproving={
-                                    autoApproveActive &&
-                                    pendingApproval.approvalKind !== "planReview" &&
-                                    pendingApproval.approvalKind !== "question"
-                                  }
-                                  runtime={activeTask?.runtime}
-                                  crowded={Boolean(
-                                    activeTask &&
-                                    (nativeTurnActive ||
-                                      optimisticTurnStarting ||
-                                      visibleQueuedMessages.length > 0 ||
-                                      showRecoveryControl),
-                                  )}
-                                  onDecision={(decision) =>
-                                    void respondToApproval(pendingApproval, decision)
-                                  }
-                                  onSelectOption={(option) =>
-                                    void respondToQuestion(pendingApproval, option)
-                                  }
-                                />
-                              ) : null}
                               <AnimatePresence initial={false}>
                                 {activeTask &&
                                 (nativeTurnActive ||
@@ -6521,6 +6765,20 @@ export default function App() {
                                   />
                                 ) : null}
                               </AnimatePresence>
+                              {visiblePendingApproval ? (
+                                <ApprovalControl
+                                  approval={visiblePendingApproval}
+                                  busy={respondingApprovalId === visiblePendingApproval.id}
+                                  autoApproving={false}
+                                  runtime={activeTask?.runtime}
+                                  onDecision={(decision) =>
+                                    void respondToApproval(visiblePendingApproval, decision)
+                                  }
+                                  onSelectOption={(option) =>
+                                    void respondToQuestion(visiblePendingApproval, option)
+                                  }
+                                />
+                              ) : null}
                               <Composer
                                 key={
                                   activeTask && promotingDraftTaskId !== activeTask.id
@@ -6534,13 +6792,7 @@ export default function App() {
                                 defaultModel={activeTask?.model ?? settingsDefaultModel}
                                 defaultEffort={activeTask?.effort ?? settingsDefaultRoute.effort}
                                 runtimeDefaults={composerRuntimeDefaults}
-                                defaultPermission={
-                                  localSettings["permissions.defaultProfile"] === "read-only" ||
-                                  localSettings["permissions.defaultProfile"] === "ask" ||
-                                  localSettings["permissions.defaultProfile"] === "full-access"
-                                    ? localSettings["permissions.defaultProfile"]
-                                    : "project-write"
-                                }
+                                defaultPermission={activeTaskPermission}
                                 defaultDelegation={
                                   localSettings["delegation.defaultMode"] === "manual" ||
                                   localSettings["delegation.defaultMode"] === "balanced" ||
@@ -6549,7 +6801,7 @@ export default function App() {
                                     : "off"
                                 }
                                 enterToSend={localSettings["composer.enterToSend"] !== false}
-                                initialDraft={activeComposerDraft}
+                                initialDraft={activeComposerDraftWithPermission}
                                 onDraftChange={(value) => {
                                   updateActiveComposerDraft(value);
                                 }}
@@ -6623,14 +6875,22 @@ export default function App() {
                                 delegationDisabled={
                                   activeProjectionUnavailable || activeTask?.kind === "chat"
                                 }
-                                permissionRequest={permissionRequest}
+                                permissionRequest={
+                                  permissionRequest?.taskId === activeTask?.id
+                                    ? permissionRequest
+                                    : null
+                                }
                                 onPermissionChange={
                                   activeTask
-                                    ? (permission) =>
+                                    ? (permission) => {
                                         setTaskPermissions((current) => ({
                                           ...current,
                                           [activeTask.id]: permission,
-                                        }))
+                                        }));
+                                        setPermissionRequest((current) =>
+                                          current?.taskId === activeTask.id ? null : current,
+                                        );
+                                      }
                                     : undefined
                                 }
                                 onRoutingChange={

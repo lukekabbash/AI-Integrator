@@ -196,6 +196,41 @@ select:focus-visible,
   display: grid;
   gap: 1px;
 }
+.titlebar-subagent-title-row {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.titlebar-subagent-title-row h2 {
+  min-width: 0;
+  flex: 0 1 auto;
+}
+.titlebar-subagent-close {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-row, 6px);
+  background: transparent;
+  color: var(--color-text-tertiary);
+  cursor: pointer;
+  transition:
+    color 140ms var(--ease-out-quad, ease-out),
+    background-color 140ms var(--ease-out-quad, ease-out);
+}
+.titlebar-subagent-close svg {
+  width: 11px;
+  height: 11px;
+}
+.titlebar-subagent-close:hover {
+  color: var(--color-text-primary);
+  background: var(--color-surface-raised, rgba(127, 127, 127, 0.14));
+}
 .titlebar-subagent-copy h2,
 .titlebar-subagent-copy span {
   overflow: hidden;
@@ -3554,10 +3589,11 @@ kbd {
   font-size: 10px;
 }
 /* Sits on the same column as the composer (24px side inset, 780px cap).
-   Raised above the status shelf's stacking context (z-index 6) and the
-   composer (7) so it's never the one hidden when both float at once; the
-   [data-crowded] margin gives it real clearance instead of just winning
-   the paint order. */
+   Docked at a fixed 6px above the composer: the status shelf's anchor
+   renders above this card in the DOM, so the run timer / queue / recovery
+   float over the transcript instead of contending for this spot. Raised
+   above the shelf's stacking context (z-index 6) and the composer (7) so
+   it's never the one hidden when surfaces overlap. */
 .approval-control {
   position: relative;
   z-index: 8;
@@ -3574,10 +3610,6 @@ kbd {
     0 8px 22px color-mix(in srgb, black 12%, transparent),
     inset 0 1px color-mix(in srgb, white 3%, transparent);
   animation: approval-enter 180ms ease-out;
-  transition: margin-bottom 180ms ease;
-}
-.approval-control[data-crowded] {
-  margin-bottom: 132px;
 }
 @keyframes approval-enter {
   from {

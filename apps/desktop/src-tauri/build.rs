@@ -113,6 +113,7 @@ const APP_COMMANDS: &[&str] = &[
     "codex_list_models",
     "grok_list_models",
     "antigravity_list_models",
+    "claude_list_models",
     "codex_list_threads",
     "codex_read_thread",
     "codex_start_thread",

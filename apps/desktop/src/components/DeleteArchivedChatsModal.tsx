@@ -101,13 +101,15 @@ export function DeleteArchivedChatsModal({
               </Tooltip>
             </header>
 
-            <div className="delete-project-target" title={project.path}>
-              <Archive aria-hidden="true" />
-              <span className="delete-project-target-copy">
-                <strong>{project.name}</strong>
-                <small>{countLabel}</small>
-              </span>
-            </div>
+            <Tooltip label={project.path} placement="top">
+              <div className="delete-project-target">
+                <Archive aria-hidden="true" />
+                <span className="delete-project-target-copy">
+                  <strong>{project.name}</strong>
+                  <small>{countLabel}</small>
+                </span>
+              </div>
+            </Tooltip>
 
             <p className="delete-project-consequence" data-tone="danger" role="status">
               Permanently removes {countLabel} from AI Integrator. The project, its live chats, and

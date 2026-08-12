@@ -1,6 +1,7 @@
 import { useEffect, useRef, type PointerEvent as ReactPointerEvent } from "react";
 import { X } from "lucide-react";
 import { FileIcon } from "./FileIcon";
+import { Tooltip } from "./Tooltip";
 
 interface TitlebarFileTab {
   path: string;
@@ -113,29 +114,30 @@ export function TitlebarFileTabs({
             key={tab.path}
             ref={active ? activeTabRef : undefined}
           >
-            <button
-              type="button"
-              role="tab"
-              aria-label={name}
-              aria-selected={active}
-              title={tab.path}
-              onClick={(event) => {
-                if (suppressClickRef.current) {
-                  event.preventDefault();
-                  return;
-                }
-                onSelect(tab.path);
-              }}
-              onAuxClick={(event) => {
-                if (event.button === 1) {
-                  event.preventDefault();
-                  onClose(tab.path);
-                }
-              }}
-            >
-              <FileIcon fileName={tab.path} />
-              <span>{name}</span>
-            </button>
+            <Tooltip label={tab.path} placement="bottom">
+              <button
+                type="button"
+                role="tab"
+                aria-label={name}
+                aria-selected={active}
+                onClick={(event) => {
+                  if (suppressClickRef.current) {
+                    event.preventDefault();
+                    return;
+                  }
+                  onSelect(tab.path);
+                }}
+                onAuxClick={(event) => {
+                  if (event.button === 1) {
+                    event.preventDefault();
+                    onClose(tab.path);
+                  }
+                }}
+              >
+                <FileIcon fileName={tab.path} />
+                <span>{name}</span>
+              </button>
+            </Tooltip>
             <button
               className="file-reader-tab-close"
               type="button"

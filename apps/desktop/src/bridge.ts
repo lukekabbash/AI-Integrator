@@ -1799,7 +1799,15 @@ let cursorModelConfigId: string | undefined;
 const kimiEffortConfigByModel = new Map<string, string>();
 let kimiModelConfigId: string | undefined;
 const FALLBACK_MODELS: Partial<Record<RuntimeId, string[]>> = {
-  claude: ["claude-opus-4-8", "claude-fable-5", "claude-sonnet-5", "claude-haiku-4-5"],
+  // No claude CLI surface lists models; keep this current with Anthropic's
+  // published wire ids until live discovery exists for this runtime.
+  claude: [
+    "claude-fable-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-sonnet-5",
+    "claude-haiku-4-5",
+  ],
   antigravity: [
     "Gemini 3.1 Pro",
     "Gemini 3.5 Flash",
@@ -3366,6 +3374,28 @@ function antigravityCatalog(ids: string[]): ModelCatalogEntry[] {
   });
 }
 
+/** One sanitized entry from the native `claude_list_models` probe. */
+type ClaudeModelInfo = { id: string; label: string; efforts: string[] };
+
+/**
+ * Claude Code's `list_models` control response reports per-model effort
+ * support, so live entries only get the picker where the CLI would honor
+ * `--effort`. Labels come from the CLI's own `/model` picker names.
+ */
+function claudeCatalog(models: ClaudeModelInfo[]): ModelCatalogEntry[] {
+  return models.map(({ id, label, efforts }) => {
+    if (efforts.length === 0) return { id, label: resolveModelLabel(id, label) };
+    return {
+      id,
+      label: resolveModelLabel(id, label),
+      efforts: efforts.map((level) => ({ id: level, label: effortLabel(level) })),
+      defaultEffort: efforts.includes(CLAUDE_DEFAULT_EFFORT)
+        ? CLAUDE_DEFAULT_EFFORT
+        : (efforts.at(-1) ?? CLAUDE_DEFAULT_EFFORT),
+    };
+  });
+}
+
 function grokCatalog(ids: string[]): ModelCatalogEntry[] {
   return ids.map((id) => ({
     id,
@@ -3377,6 +3407,16 @@ function grokCatalog(ids: string[]): ModelCatalogEntry[] {
 }
 
 async function discoverModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]> {
+  if (isTauri() && runtime === "claude") {
+    try {
+      const models = await nativeInvoke<ClaudeModelInfo[]>("claude_list_models");
+      const catalog = claudeCatalog(models);
+      if (catalog.length > 0) return catalog;
+    } catch {
+      // Claude Code unavailable or too old to answer `list_models`; fall
+      // through to the static catalog.
+    }
+  }
   if (isTauri() && runtime === "antigravity") {
     try {
       const models = await nativeInvoke<string[]>("antigravity_list_models");

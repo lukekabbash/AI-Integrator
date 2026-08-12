@@ -162,7 +162,7 @@ describe("DiffView", () => {
     expect(screen.queryByRole("button", { name: /Split/i })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Unified/i })).not.toBeInTheDocument();
     expect(document.querySelector(".diff-table--unified")).toBeInTheDocument();
-    const title = screen.getByTitle("C:\\repo\\src\\components\\App.tsx");
+    const title = screen.getByLabelText("C:\\repo\\src\\components\\App.tsx");
     expect(title).toHaveTextContent(/^App\.tsx$/);
     expect(document.querySelector(".diff-file-title small")).not.toBeInTheDocument();
     expect(document.querySelector(".diff-context-bar")).not.toBeInTheDocument();

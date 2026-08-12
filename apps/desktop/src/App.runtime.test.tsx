@@ -1235,6 +1235,190 @@ describe("native runtime recovery UI", () => {
     expect(bridgeMock.sendTurn).not.toHaveBeenCalled();
   });
 
+  it("queues a stale-projection send when native admission reports an active turn", async () => {
+    let nativeRejectedTurn = false;
+    bridgeMock.loadTaskProjection.mockImplementation(async () =>
+      projectionSnapshot({
+        watermarkSeq: nativeRejectedTurn ? 10 : 9,
+        runtimeLive: true,
+        events: [
+          projection(nativeRejectedTurn ? 10 : 9, {
+            kind: "turnChanged",
+            turn: {
+              id: "turn-1",
+              status: nativeRejectedTurn ? "inProgress" : "completed",
+              stopRequested: false,
+              startedAt: "2026-07-10T16:00:00Z",
+              completedAt: nativeRejectedTurn ? undefined : "2026-07-10T16:00:01Z",
+            },
+          }),
+        ],
+      }),
+    );
+    bridgeMock.sendTurn
+      .mockImplementationOnce(async () => {
+        nativeRejectedTurn = true;
+        throw new Error("A turn is already running for this chat (turn-active)");
+      })
+      .mockResolvedValueOnce(undefined);
+    bridgeMock.takeQueuedMessage.mockResolvedValue(queuedMessage("Keep this follow-up"));
+    bridgeMock.listQueuedMessages.mockResolvedValue([]);
+
+    render(<App />);
+    await waitFor(() =>
+      expect(bridgeMock.loadTaskProjection).toHaveBeenCalledWith("task-1", expect.any(Object)),
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "Task message" }), {
+      target: { value: "Keep this follow-up" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(bridgeMock.enqueueMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ taskId: "task-1", prompt: "Keep this follow-up" }),
+      ),
+    );
+    expect(await screen.findByText("Keep this follow-up")).toBeInTheDocument();
+    expect(screen.queryByText(/turn is already running/i)).not.toBeInTheDocument();
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 20));
+    });
+    expect(bridgeMock.sendTurn).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      runtimeListener?.(
+        projection(11, {
+          kind: "turnChanged",
+          turn: {
+            id: "turn-1",
+            status: "completed",
+            stopRequested: false,
+            startedAt: "2026-07-10T16:00:00Z",
+            completedAt: "2026-07-10T16:00:03Z",
+          },
+        }),
+      );
+    });
+
+    await waitFor(() => expect(bridgeMock.sendTurn).toHaveBeenCalledTimes(2));
+    expect(bridgeMock.sendTurn).toHaveBeenLastCalledWith(
+      expect.objectContaining({ taskId: "task-1", prompt: "Keep this follow-up" }),
+    );
+  });
+
+  it("drains once when the rejected turn settles before reconciliation finishes", async () => {
+    let nativeRejectedTurn = false;
+    let finishReconciliation: ((snapshot: TaskProjectionSnapshot) => void) | undefined;
+    const reconciliation = new Promise<TaskProjectionSnapshot>((resolve) => {
+      finishReconciliation = resolve;
+    });
+    bridgeMock.loadTaskProjection.mockImplementation(async () => {
+      if (nativeRejectedTurn) return reconciliation;
+      return projectionSnapshot({
+        watermarkSeq: 9,
+        runtimeLive: true,
+        events: [
+          projection(9, {
+            kind: "turnChanged",
+            turn: {
+              id: "turn-1",
+              status: "completed",
+              stopRequested: false,
+              completedAt: "2026-07-10T16:00:01Z",
+            },
+          }),
+        ],
+      });
+    });
+    bridgeMock.sendTurn
+      .mockImplementationOnce(async () => {
+        nativeRejectedTurn = true;
+        throw new Error("A turn is already running for this chat (turn-active)");
+      })
+      .mockResolvedValueOnce(undefined);
+    bridgeMock.takeQueuedMessage.mockResolvedValue(queuedMessage("Fast-settle follow-up"));
+    bridgeMock.listQueuedMessages.mockResolvedValue([]);
+
+    render(<App />);
+    await waitFor(() =>
+      expect(bridgeMock.loadTaskProjection).toHaveBeenCalledWith("task-1", expect.any(Object)),
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "Task message" }), {
+      target: { value: "Fast-settle follow-up" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(bridgeMock.enqueueMessage).toHaveBeenCalledTimes(1));
+
+    act(() => {
+      runtimeListener?.(
+        projection(11, {
+          kind: "turnChanged",
+          turn: {
+            id: "turn-1",
+            status: "completed",
+            stopRequested: false,
+            completedAt: "2026-07-10T16:00:03Z",
+          },
+        }),
+      );
+      finishReconciliation?.(
+        projectionSnapshot({
+          watermarkSeq: 10,
+          runtimeLive: true,
+          events: [
+            projection(10, {
+              kind: "turnChanged",
+              turn: {
+                id: "turn-1",
+                status: "inProgress",
+                stopRequested: false,
+              },
+            }),
+          ],
+        }),
+      );
+    });
+
+    await waitFor(() => expect(bridgeMock.sendTurn).toHaveBeenCalledTimes(2));
+    expect(bridgeMock.enqueueMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the exact draft when the busy fallback cannot be queued", async () => {
+    bridgeMock.loadTaskProjection.mockResolvedValue(
+      projectionSnapshot({
+        watermarkSeq: 9,
+        runtimeLive: true,
+        events: [
+          projection(9, {
+            kind: "turnChanged",
+            turn: {
+              id: "turn-1",
+              status: "completed",
+              stopRequested: false,
+              completedAt: "2026-07-10T16:00:01Z",
+            },
+          }),
+        ],
+      }),
+    );
+    bridgeMock.sendTurn.mockRejectedValue(
+      new Error("A turn is already running for this chat (turn-active)"),
+    );
+    bridgeMock.enqueueMessage.mockRejectedValue(new Error("Queue storage unavailable"));
+
+    render(<App />);
+    await waitFor(() =>
+      expect(bridgeMock.loadTaskProjection).toHaveBeenCalledWith("task-1", expect.any(Object)),
+    );
+    const composer = screen.getByRole("textbox", { name: "Task message" });
+    fireEvent.change(composer, { target: { value: "Do not lose this exact draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Queue storage unavailable");
+    expect(composer).toHaveValue("Do not lose this exact draft");
+    expect(bridgeMock.enqueueMessage).toHaveBeenCalledTimes(1);
+  });
+
   it("releases optimistic connecting state when a newer turn already settled", async () => {
     bridgeMock.sendTurn.mockResolvedValue(undefined);
     render(<App />);
@@ -2018,6 +2202,11 @@ describe("native runtime recovery UI", () => {
         "acceptForSession",
       ),
     );
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "Run command" })).not.toBeInTheDocument();
+      expect(screen.queryByText("Command approval")).not.toBeInTheDocument();
+      expect(screen.queryByText(/Approval is (?:pending|responding)\./)).not.toBeInTheDocument();
+    });
 
     // The resolved projection lands, then the provider asks about another
     // command. It must be answered without any click.
@@ -2058,6 +2247,113 @@ describe("native runtime recovery UI", () => {
         "acceptForSession",
       ),
     );
+    await waitFor(() => {
+      expect(screen.queryByText("Command approval")).not.toBeInTheDocument();
+      expect(
+        screen.queryByText(/Approval is (?:resolved|pending|responding)\./),
+      ).not.toBeInTheDocument();
+    });
+  }, 10_000);
+
+  it("restores an approval gate when an automatic full-access response cannot be sent", async () => {
+    bridgeMock.respondToApproval.mockRejectedValueOnce(new Error("Approval transport failed"));
+    render(<App />);
+    await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
+
+    fireEvent.click(screen.getByRole("button", { name: "Permission" }));
+    fireEvent.click(screen.getByRole("option", { name: "Full access" }));
+
+    expect(await screen.findByText("Approval transport failed")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Run command" })).toBeInTheDocument();
+  });
+
+  it("keeps an explicit permission choice attached to each Claude task across chat switches", async () => {
+    const workspace = await bridgeMock.loadWorkspace();
+    workspace.tasks = [
+      {
+        ...workspace.tasks[0],
+        title: "First Claude task",
+        status: "completed",
+        runtime: "claude",
+      },
+      {
+        id: "task-2",
+        projectId: "project-1",
+        title: "Second Claude task",
+        status: "completed",
+        runtime: "claude",
+        model: "Provider default",
+        updatedAt: "2026-07-10T15:00:00Z",
+      },
+    ];
+    bridgeMock.loadWorkspace.mockResolvedValue(workspace);
+    bridgeMock.loadTaskProjection.mockImplementation(async (taskId: string) =>
+      projectionSnapshot({ taskId, watermarkSeq: 0, runtimeLive: true, events: [] }),
+    );
+    const reportClaudeAskMode = (taskId: string, seq: number) => {
+      runtimeListener?.({
+        ...projection(seq, {
+          kind: "modeChanged",
+          mode: {
+            currentModeId: "default",
+            availableModes: [
+              { id: "default", name: "Ask before edits" },
+              { id: "acceptEdits", name: "Accept edits" },
+              { id: "bypassPermissions", name: "Bypass permissions" },
+            ],
+          },
+        }),
+        taskId,
+        provider: "claude",
+      });
+    };
+
+    render(<App />);
+    const permission = await screen.findByRole("button", { name: "Permission" });
+    act(() => reportClaudeAskMode("task-1", 1));
+    await waitFor(() => expect(permission).toHaveTextContent("Ask as needed"));
+    fireEvent.click(permission);
+    fireEvent.click(screen.getByRole("option", { name: "Full access" }));
+    expect(screen.getByRole("button", { name: "Permission" })).toHaveTextContent("Full access");
+
+    fireEvent.click(await screen.findByRole("button", { name: /Second Claude task/i }));
+    await waitFor(() =>
+      expect(bridgeMock.loadTaskProjection).toHaveBeenCalledWith("task-2", expect.any(Object)),
+    );
+    act(() => reportClaudeAskMode("task-2", 1));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Permission" })).toHaveTextContent("Ask as needed"),
+    );
+
+    act(() => {
+      runtimeListener?.({
+        ...projection(2, {
+          kind: "approvalChanged",
+          approval: {
+            id: "background-approval",
+            requestId: { kind: "string", value: "background-request" },
+            approvalKind: "commandExecution",
+            state: "pending",
+            command: "npm test",
+            updatedAt: "2026-07-10T16:00:02Z",
+          },
+        }),
+        taskId: "task-1",
+        provider: "claude",
+      });
+    });
+    await waitFor(() =>
+      expect(bridgeMock.respondToApproval).toHaveBeenCalledWith(
+        "task-1",
+        "background-approval",
+        "acceptForSession",
+      ),
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: /First Claude task/i }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Permission" })).toHaveTextContent("Full access"),
+    );
   });
 
   it("renders plan-review approvals with the plan and keeps them out of auto-approve", async () => {
@@ -2072,8 +2368,7 @@ describe("native runtime recovery UI", () => {
             id: "approval-1",
             requestId: { kind: "string", value: "request-a" },
             approvalKind: "commandExecution",
-            state: "resolved",
-            decision: "accept",
+            state: "pending",
             command: "npm test",
             updatedAt: "2026-07-10T16:00:02Z",
           },
@@ -2095,16 +2390,25 @@ describe("native runtime recovery UI", () => {
       );
     });
 
-    expect(await screen.findByText("Approve this plan?")).toBeInTheDocument();
-    expect(screen.getByText(/Add subtract\(a, b\) to hello\.py\./)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Keep planning" })).toBeInTheDocument();
-
     // Full access must not auto-approve a plan review — the user chose plan
     // mode specifically to read the plan first.
     fireEvent.click(screen.getByRole("button", { name: "Permission" }));
     fireEvent.click(screen.getByRole("option", { name: "Full access" }));
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(bridgeMock.respondToApproval).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(bridgeMock.respondToApproval).toHaveBeenCalledWith(
+        "task-1",
+        "approval-1",
+        "acceptForSession",
+      ),
+    );
+    expect(await screen.findByText("Approve this plan?")).toBeInTheDocument();
+    expect(screen.getByText(/Add subtract\(a, b\) to hello\.py\./)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Keep planning" })).toBeInTheDocument();
+    expect(bridgeMock.respondToApproval).not.toHaveBeenCalledWith(
+      "task-1",
+      "approval-plan",
+      expect.anything(),
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "Approve plan" }));
     await waitFor(() =>

@@ -121,6 +121,7 @@
     "allow-codex-list-models",
     "allow-grok-list-models",
     "allow-antigravity-list-models",
+    "allow-claude-list-models",
     "allow-codex-start-thread",
     "allow-codex-resume-thread",
     "allow-codex-start-turn",

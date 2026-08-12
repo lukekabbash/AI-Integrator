@@ -222,53 +222,54 @@ function CommitGraphCell({
     ...row.outgoing.map((edge) => ({ edge, half: "bottom" as const })),
   ].filter(({ edge }) => edge.from < GRAPH_MAX_LANES && edge.to < GRAPH_MAX_LANES);
   return (
-    <svg
-      className="commit-graph-cell"
-      width={width}
-      height={GRAPH_ROW_HEIGHT}
-      viewBox={`0 0 ${width} ${GRAPH_ROW_HEIGHT}`}
-      role="img"
-      aria-label={tooltip}
-    >
-      <title>{tooltip}</title>
-      {edges.map(({ edge, half }, index) => (
-        <path
-          key={`${half}-${index}`}
-          d={graphEdgePath(edge, half)}
-          fill="none"
-          stroke={GRAPH_LANE_COLORS[Math.max(edge.from, edge.to) % GRAPH_LANE_COLORS.length]}
-          strokeWidth="1.5"
-        />
-      ))}
-      {current ? (
+    <Tooltip label={tooltip} placement="right">
+      <svg
+        className="commit-graph-cell"
+        width={width}
+        height={GRAPH_ROW_HEIGHT}
+        viewBox={`0 0 ${width} ${GRAPH_ROW_HEIGHT}`}
+        role="img"
+        aria-label={tooltip}
+      >
+        {edges.map(({ edge, half }, index) => (
+          <path
+            key={`${half}-${index}`}
+            d={graphEdgePath(edge, half)}
+            fill="none"
+            stroke={GRAPH_LANE_COLORS[Math.max(edge.from, edge.to) % GRAPH_LANE_COLORS.length]}
+            strokeWidth="1.5"
+          />
+        ))}
+        {current ? (
+          <circle
+            cx={graphLaneX(row.lane)}
+            cy={GRAPH_ROW_HEIGHT / 2}
+            r={5.6}
+            fill="none"
+            stroke={laneColor}
+            strokeWidth="1"
+            opacity="0.45"
+          />
+        ) : null}
         <circle
+          className="commit-graph-node"
           cx={graphLaneX(row.lane)}
           cy={GRAPH_ROW_HEIGHT / 2}
-          r={5.6}
-          fill="none"
+          r={3.4}
+          fill={unpushed ? "var(--color-rail)" : laneColor}
           stroke={laneColor}
-          strokeWidth="1"
-          opacity="0.45"
+          strokeWidth="1.6"
         />
-      ) : null}
-      <circle
-        className="commit-graph-node"
-        cx={graphLaneX(row.lane)}
-        cy={GRAPH_ROW_HEIGHT / 2}
-        r={3.4}
-        fill={unpushed ? "var(--color-rail)" : laneColor}
-        stroke={laneColor}
-        strokeWidth="1.6"
-      />
-      {merge ? (
-        <circle
-          cx={graphLaneX(row.lane)}
-          cy={GRAPH_ROW_HEIGHT / 2}
-          r={1.3}
-          fill={unpushed ? laneColor : "var(--color-rail)"}
-        />
-      ) : null}
-    </svg>
+        {merge ? (
+          <circle
+            cx={graphLaneX(row.lane)}
+            cy={GRAPH_ROW_HEIGHT / 2}
+            r={1.3}
+            fill={unpushed ? laneColor : "var(--color-rail)"}
+          />
+        ) : null}
+      </svg>
+    </Tooltip>
   );
 }
 
@@ -848,29 +849,31 @@ function GitPanel({
             {isStaged ? <Minus /> : <Plus />}
           </button>
         </span>
-        <button
-          className="git-file-name"
-          type="button"
-          onClick={() => onSelectFile(file)}
-          onKeyDown={(event) => {
-            if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
-              event.preventDefault();
-              const bounds = event.currentTarget.getBoundingClientRect();
-              openFileContextMenu(
-                file,
-                bounds.right - 12,
-                bounds.bottom,
-                event.currentTarget,
-                true,
-              );
-            }
-          }}
-          title={file.path}
-          aria-pressed={activeFile ? diffFileKey(activeFile) === diffFileKey(file) : false}
-        >
-          <span>{file.path.split("/").at(-1)}</span>
-          <small>{file.path.split("/").slice(0, -1).join("/")}</small>
-        </button>
+        <Tooltip label={file.path} placement="left">
+          <button
+            className="git-file-name"
+            type="button"
+            onClick={() => onSelectFile(file)}
+            onKeyDown={(event) => {
+              if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+                event.preventDefault();
+                const bounds = event.currentTarget.getBoundingClientRect();
+                openFileContextMenu(
+                  file,
+                  bounds.right - 12,
+                  bounds.bottom,
+                  event.currentTarget,
+                  true,
+                );
+              }
+            }}
+            aria-label={file.path}
+            aria-pressed={activeFile ? diffFileKey(activeFile) === diffFileKey(file) : false}
+          >
+            <span>{file.path.split("/").at(-1)}</span>
+            <small>{file.path.split("/").slice(0, -1).join("/")}</small>
+          </button>
+        </Tooltip>
         <span className="file-change-count">
           {file.statsLoaded === false ? (
             <small aria-label="Line counts load when this diff is opened">…</small>
@@ -1436,11 +1439,16 @@ function GitPanel({
                         {commit.refs?.length ? (
                           <span className="commit-refs">
                             {collapseCommitRefs(commit.refs, git.upstream, git.branch).map(
-                              (chip) => (
-                                <em key={chip.label} data-kind={chip.kind} title={chip.title}>
-                                  {chip.label}
-                                </em>
-                              ),
+                              (chip) =>
+                                chip.title ? (
+                                  <Tooltip key={chip.label} label={chip.title} placement="top">
+                                    <em data-kind={chip.kind}>{chip.label}</em>
+                                  </Tooltip>
+                                ) : (
+                                  <em key={chip.label} data-kind={chip.kind}>
+                                    {chip.label}
+                                  </em>
+                                ),
                             )}
                           </span>
                         ) : null}
@@ -1669,10 +1677,12 @@ function GitPanel({
           style={{ left: fileContextMenu.x, top: fileContextMenu.y }}
           onKeyDown={handleMenuNavigation}
         >
-          <div className="file-context-menu-path" title={fileContextMenu.file.path}>
-            <FileIcon fileName={fileContextMenu.file.path} />
-            <span>{fileContextMenu.file.path}</span>
-          </div>
+          <Tooltip label={fileContextMenu.file.path} placement="left">
+            <div className="file-context-menu-path">
+              <FileIcon fileName={fileContextMenu.file.path} />
+              <span>{fileContextMenu.file.path}</span>
+            </div>
+          </Tooltip>
           <button
             type="button"
             role="menuitem"
@@ -1762,19 +1772,19 @@ function GitPanel({
                   }}
                 >
                   {supportedFileOpeners.map((opener) => (
-                    <button
-                      type="button"
-                      role="menuitem"
-                      key={opener.id}
-                      title={opener.description}
-                      onClick={() =>
-                        void runExternalFileAction(() =>
-                          onOpenGitFileExternal(fileContextMenu.file, opener.id),
-                        )
-                      }
-                    >
-                      <SquareArrowOutUpRight /> {opener.label}
-                    </button>
+                    <Tooltip key={opener.id} label={opener.description} placement="left">
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() =>
+                          void runExternalFileAction(() =>
+                            onOpenGitFileExternal(fileContextMenu.file, opener.id),
+                          )
+                        }
+                      >
+                        <SquareArrowOutUpRight /> {opener.label}
+                      </button>
+                    </Tooltip>
                   ))}
                 </div>
               ) : null}
@@ -2001,9 +2011,9 @@ function DelegationNudge({
         <ArrowUp aria-hidden="true" />
       </button>
       {error ? (
-        <small role="alert" title={error}>
-          {error}
-        </small>
+        <Tooltip label={error} placement="top">
+          <small role="alert">{error}</small>
+        </Tooltip>
       ) : null}
     </form>
   );
@@ -2218,9 +2228,7 @@ function DelegationRow({
           multiline
           placement="bottom-left"
         >
-          <span className="agent-activity" title={delegation.brief}>
-            {delegation.brief}
-          </span>
+          <span className="agent-activity">{delegation.brief}</span>
         </Tooltip>
         <AgentRoute runtime={delegation.runtime} model={delegation.model} />
         {delegation.unreadFromChild > 0 ? (
@@ -2318,9 +2326,9 @@ function AgentRow({
                 : agent.status.charAt(0).toUpperCase() + agent.status.slice(1)}
           </span>
         </span>
-        <span className="agent-activity" title={agent.activity}>
-          {agent.activity}
-        </span>
+        <Tooltip label={agent.activity} multiline placement="bottom-left">
+          <span className="agent-activity">{agent.activity}</span>
+        </Tooltip>
         <AgentRoute runtime={agent.runtime} model={agent.model} elapsed={agent.elapsed} />
       </span>
     </motion.div>
@@ -2659,10 +2667,12 @@ function FilePanel({
           style={{ left: contextMenu.x, top: contextMenu.y }}
           onKeyDown={handleMenuNavigation}
         >
-          <div className="file-context-menu-path" title={contextMenu.file.path}>
-            <FileIcon fileName={contextMenu.file.path} />
-            <span>{contextMenu.file.path}</span>
-          </div>
+          <Tooltip label={contextMenu.file.path} placement="left">
+            <div className="file-context-menu-path">
+              <FileIcon fileName={contextMenu.file.path} />
+              <span>{contextMenu.file.path}</span>
+            </div>
+          </Tooltip>
           {onMentionProjectFile ? (
             <button
               type="button"
@@ -2741,10 +2751,12 @@ function FilePanel({
           style={{ left: folderMenu.x, top: folderMenu.y }}
           onKeyDown={handleMenuNavigation}
         >
-          <div className="file-context-menu-path" title={folderMenu.path}>
-            <AnimatedFolderIcon open={false} className="tree-folder-icon" />
-            <span>{folderMenu.path}/</span>
-          </div>
+          <Tooltip label={`${folderMenu.path}/`} placement="left">
+            <div className="file-context-menu-path">
+              <AnimatedFolderIcon open={false} className="tree-folder-icon" />
+              <span>{folderMenu.path}/</span>
+            </div>
+          </Tooltip>
           {onMentionProjectFolder ? (
             <button
               type="button"
@@ -2956,37 +2968,38 @@ function ProjectTree({
             onCancel={onCancelRename}
           />
         ) : (
-          <motion.button
-            type="button"
-            key={`project-${file.path}`}
-            data-tree-depth={depth}
-            style={{ "--tree-depth": depth } as CSSProperties}
-            initial={{ opacity: 0, x: -4 }}
-            animate={{ opacity: 1, x: 0 }}
-            transition={{ duration: 0.14, ease: "easeOut" }}
-            onClick={() => onOpenFile(file)}
-            onDoubleClick={() => onStartRename?.(file)}
-            onContextMenu={(event) => {
-              event.preventDefault();
-              onContextMenu(file, event.clientX, event.clientY, event.currentTarget);
-            }}
-            onKeyDown={(event) => {
-              if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+          <Tooltip key={`project-${file.path}`} label={file.path} placement="left">
+            <motion.button
+              type="button"
+              data-tree-depth={depth}
+              style={{ "--tree-depth": depth } as CSSProperties}
+              initial={{ opacity: 0, x: -4 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{ duration: 0.14, ease: "easeOut" }}
+              onClick={() => onOpenFile(file)}
+              onDoubleClick={() => onStartRename?.(file)}
+              onContextMenu={(event) => {
                 event.preventDefault();
-                const bounds = event.currentTarget.getBoundingClientRect();
-                onContextMenu(file, bounds.right - 12, bounds.bottom, event.currentTarget, true);
-              }
-            }}
-            title={`Open ${file.path}`}
-            aria-current={activePath === file.path ? "page" : undefined}
-            aria-busy={openingPath === file.path}
-            data-active={activePath === file.path}
-            data-traveling-selection={file.path}
-          >
-            <FileIcon fileName={file.path} />
-            <span>{file.path.split("/").at(-1)}</span>
-            <small>{formatFileSize(file.size)}</small>
-          </motion.button>
+                onContextMenu(file, event.clientX, event.clientY, event.currentTarget);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+                  event.preventDefault();
+                  const bounds = event.currentTarget.getBoundingClientRect();
+                  onContextMenu(file, bounds.right - 12, bounds.bottom, event.currentTarget, true);
+                }
+              }}
+              aria-label={`Open ${file.path}`}
+              aria-current={activePath === file.path ? "page" : undefined}
+              aria-busy={openingPath === file.path}
+              data-active={activePath === file.path}
+              data-traveling-selection={file.path}
+            >
+              <FileIcon fileName={file.path} />
+              <span>{file.path.split("/").at(-1)}</span>
+              <small>{formatFileSize(file.size)}</small>
+            </motion.button>
+          </Tooltip>
         ),
       )}
     </>

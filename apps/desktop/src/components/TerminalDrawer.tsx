@@ -25,6 +25,7 @@ import {
   type TerminalOutputEvent,
   type TerminalSessionInfo,
 } from "../bridge";
+import { Tooltip } from "./Tooltip";
 
 const DEFAULT_TERMINAL_HEIGHT_PX = 300;
 const MIN_TERMINAL_HEIGHT_PX = 180;
@@ -474,25 +475,26 @@ export function TerminalDrawer({
         ease: [0.33, 1, 0.15, 1] as const,
       }}
     >
-      <div
-        className="terminal-resize-handle"
-        role="separator"
-        aria-label="Resize terminal panel"
-        aria-orientation="horizontal"
-        aria-valuemin={MIN_TERMINAL_HEIGHT_PX}
-        aria-valuemax={maximumTerminalHeight()}
-        aria-valuenow={Math.round(height)}
-        tabIndex={0}
-        title="Drag to resize · Double-click to reset"
-        onPointerDown={handleResizePointerDown}
-        onPointerMove={handleResizePointerMove}
-        onPointerUp={finishResize}
-        onPointerCancel={finishResize}
-        onDoubleClick={() => resizeTo(DEFAULT_TERMINAL_HEIGHT_PX)}
-        onKeyDown={handleResizeKeyDown}
-      >
-        <i aria-hidden="true" />
-      </div>
+      <Tooltip label="Drag to resize · Double-click to reset" placement="top">
+        <div
+          className="terminal-resize-handle"
+          role="separator"
+          aria-label="Resize terminal panel"
+          aria-orientation="horizontal"
+          aria-valuemin={MIN_TERMINAL_HEIGHT_PX}
+          aria-valuemax={maximumTerminalHeight()}
+          aria-valuenow={Math.round(height)}
+          tabIndex={0}
+          onPointerDown={handleResizePointerDown}
+          onPointerMove={handleResizePointerMove}
+          onPointerUp={finishResize}
+          onPointerCancel={finishResize}
+          onDoubleClick={() => resizeTo(DEFAULT_TERMINAL_HEIGHT_PX)}
+          onKeyDown={handleResizeKeyDown}
+        >
+          <i aria-hidden="true" />
+        </div>
+      </Tooltip>
       <div className="terminal-drawer-inner">
         <div className="terminal-session-stack">
           {terminals.map((terminal) => (
@@ -513,18 +515,22 @@ export function TerminalDrawer({
           aria-label="Terminal sessions"
         >
           <header className="terminal-session-rail-header">
-            <button
-              type="button"
-              onClick={() => setRailCollapsed((current) => !current)}
-              aria-label={railCollapsed ? "Expand terminal list" : "Collapse terminal list"}
-              title={railCollapsed ? "Expand terminal list" : "Collapse terminal list"}
+            <Tooltip
+              label={railCollapsed ? "Expand terminal list" : "Collapse terminal list"}
+              placement="left"
             >
-              {railCollapsed ? (
-                <PanelRightOpen aria-hidden="true" />
-              ) : (
-                <PanelRightClose aria-hidden="true" />
-              )}
-            </button>
+              <button
+                type="button"
+                onClick={() => setRailCollapsed((current) => !current)}
+                aria-label={railCollapsed ? "Expand terminal list" : "Collapse terminal list"}
+              >
+                {railCollapsed ? (
+                  <PanelRightOpen aria-hidden="true" />
+                ) : (
+                  <PanelRightClose aria-hidden="true" />
+                )}
+              </button>
+            </Tooltip>
             <strong>Terminals</strong>
             <small>{terminals.length}</small>
           </header>
@@ -537,43 +543,49 @@ export function TerminalDrawer({
                   data-active={activeTerminalId === terminal.id}
                   key={terminal.id}
                 >
-                  <button
-                    className="terminal-session-select"
-                    type="button"
-                    onClick={() => setActiveTerminalId(terminal.id)}
-                    aria-pressed={activeTerminalId === terminal.id}
-                    title={terminal.label}
-                  >
-                    <SquareTerminal aria-hidden="true" />
-                    <span>{terminal.label}</span>
-                    <i data-phase={terminalPhase} aria-label={phaseLabel(terminalPhase)} />
-                  </button>
-                  <button
-                    className="terminal-session-remove"
-                    type="button"
-                    onClick={() => closeTerminal(terminal.id)}
-                    aria-label={`Close ${terminal.label}`}
-                    title={`Close ${terminal.label}`}
-                  >
-                    <X aria-hidden="true" />
-                  </button>
+                  <Tooltip label={terminal.label} placement="left">
+                    <button
+                      className="terminal-session-select"
+                      type="button"
+                      onClick={() => setActiveTerminalId(terminal.id)}
+                      aria-pressed={activeTerminalId === terminal.id}
+                      aria-label={terminal.label}
+                    >
+                      <SquareTerminal aria-hidden="true" />
+                      <span>{terminal.label}</span>
+                      <i data-phase={terminalPhase} aria-label={phaseLabel(terminalPhase)} />
+                    </button>
+                  </Tooltip>
+                  <Tooltip label={`Close ${terminal.label}`} placement="left">
+                    <button
+                      className="terminal-session-remove"
+                      type="button"
+                      onClick={() => closeTerminal(terminal.id)}
+                      aria-label={`Close ${terminal.label}`}
+                    >
+                      <X aria-hidden="true" />
+                    </button>
+                  </Tooltip>
                 </div>
               );
             })}
           </div>
-          <button
-            className="terminal-session-new"
-            type="button"
-            onClick={addTerminal}
-            disabled={terminals.length >= MAX_TERMINALS}
-            aria-label="New terminal"
-            title={
-              terminals.length >= MAX_TERMINALS ? `Maximum ${MAX_TERMINALS} terminals` : undefined
-            }
+          <Tooltip
+            label={`Maximum ${MAX_TERMINALS} terminals`}
+            disabled={terminals.length < MAX_TERMINALS}
+            placement="left"
           >
-            <Plus aria-hidden="true" />
-            <span>New terminal</span>
-          </button>
+            <button
+              className="terminal-session-new"
+              type="button"
+              onClick={addTerminal}
+              disabled={terminals.length >= MAX_TERMINALS}
+              aria-label="New terminal"
+            >
+              <Plus aria-hidden="true" />
+              <span>New terminal</span>
+            </button>
+          </Tooltip>
         </aside>
       </div>
     </m.section>

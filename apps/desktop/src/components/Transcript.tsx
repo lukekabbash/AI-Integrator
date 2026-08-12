@@ -190,17 +190,18 @@ function MarkdownLink({
 
   if (fileLocation) {
     return (
-      <a
-        {...props}
-        className="assistant-file-link"
-        href={href}
-        title={fileLocation.path}
-        aria-disabled={onOpenFile ? undefined : true}
-        onClick={handleClick}
-      >
-        <FileIcon fileName={fileLocation.path} />
-        <span>{children}</span>
-      </a>
+      <Tooltip label={fileLocation.path} placement="top">
+        <a
+          {...props}
+          className="assistant-file-link"
+          href={href}
+          aria-disabled={onOpenFile ? undefined : true}
+          onClick={handleClick}
+        >
+          <FileIcon fileName={fileLocation.path} />
+          <span>{children}</span>
+        </a>
+      </Tooltip>
     );
   }
 
@@ -282,14 +283,15 @@ function AttachmentThumb({
     };
   }, [isImage, path, previewCache]);
   return (
-    <span
-      className={`user-attachment${preview ? " user-attachment--image" : ""}`}
-      title={path}
-      data-attachment-kind={isImage ? "image" : "file"}
-    >
-      {preview ? <img src={preview} alt={name} /> : <FileIcon fileName={name} />}
-      <span>{name}</span>
-    </span>
+    <Tooltip label={path} placement="top">
+      <span
+        className={`user-attachment${preview ? " user-attachment--image" : ""}`}
+        data-attachment-kind={isImage ? "image" : "file"}
+      >
+        {preview ? <img src={preview} alt={name} /> : <FileIcon fileName={name} />}
+        <span>{name}</span>
+      </span>
+    </Tooltip>
   );
 }
 
@@ -335,25 +337,26 @@ const UserMessage = memo(function UserMessage({
         ) : null}
         <p>
           {hasVerifiedSkill ? (
-            <strong
-              className="native-skill-token"
-              aria-label={`Native skill ${skillPrefix}`}
-              title="Provider-native skill"
-            >
-              {skillPrefix}
-            </strong>
+            <Tooltip label="Provider-native skill" placement="top">
+              <strong
+                className="native-skill-token"
+                aria-label={`Native skill ${skillPrefix}`}
+              >
+                {skillPrefix}
+              </strong>
+            </Tooltip>
           ) : null}
           {mentionSegments(tail).map((segment, index) =>
             typeof segment === "string" ? (
               segment
             ) : (
-              <strong
-                className="context-mention-token"
+              <Tooltip
                 key={`${segment.mention}-${index}`}
-                title="Context mention"
+                label="Context mention"
+                placement="top"
               >
-                {segment.mention}
-              </strong>
+                <strong className="context-mention-token">{segment.mention}</strong>
+              </Tooltip>
             ),
           )}
         </p>
@@ -820,21 +823,28 @@ const ActivityEvent = memo(function ActivityEventRow({
           <span className="activity-copy">
             <strong>{event.title ?? event.body}</strong>
             {canOpenFile && filePath && onOpenFile ? (
-              <button
-                className="activity-file-name"
-                type="button"
-                title={filePath}
-                aria-label={`Open ${filePath} in Files`}
-                onClick={(clickEvent) => {
-                  clickEvent.stopPropagation();
-                  onOpenFile({ path: filePath });
-                }}
-                onKeyDown={(keyboardEvent) => keyboardEvent.stopPropagation()}
-              >
-                {displayBody}
-              </button>
-            ) : event.title ? (
-              <span title={pathOnlyBody && filePath ? filePath : undefined}>{displayBody}</span>
+              <Tooltip label={filePath} placement="top">
+                <button
+                  className="activity-file-name"
+                  type="button"
+                  aria-label={`Open ${filePath} in Files`}
+                  onClick={(clickEvent) => {
+                    clickEvent.stopPropagation();
+                    onOpenFile({ path: filePath });
+                  }}
+                  onKeyDown={(keyboardEvent) => keyboardEvent.stopPropagation()}
+                >
+                  {displayBody}
+                </button>
+              </Tooltip>
+            ) : event.title && displayBody ? (
+              pathOnlyBody && filePath ? (
+                <Tooltip label={filePath} placement="top">
+                  <span>{displayBody}</span>
+                </Tooltip>
+              ) : (
+                <span>{displayBody}</span>
+              )
             ) : null}
             {isWorkedFor && event.resumed ? (
               <em className="activity-resumed-cue" aria-label="Resumed after interruption">
@@ -1458,6 +1468,11 @@ export function Transcript({
       if (loadOlderRequestedRef.current && container.scrollTop > LOAD_OLDER_THRESHOLD_PX) {
         loadOlderRequestedRef.current = false;
       }
+      requestOlderPage();
+      queueViewportSave();
+    };
+
+    const requestOlderPage = () => {
       if (
         hasMoreOlder &&
         onLoadOlder &&
@@ -1472,15 +1487,30 @@ export function Transcript({
         loadOlderRequestedRef.current = true;
         onLoadOlder();
       }
-      queueViewportSave();
+    };
+
+    const retryOlderFromTop = () => {
+      // Parked at the very top, an upward gesture produces no scroll event, so
+      // the gesture itself is the pagination signal. It also acts as a retry:
+      // a request dropped while the projection was still reconciling leaves
+      // the one-shot latch set, and without this the top of the chat can
+      // never load after switching back to it. The app side dedupes in-flight
+      // requests by cursor, so clearing the latch here cannot double-fetch.
+      if (container.scrollTop > LOAD_OLDER_THRESHOLD_PX) return;
+      loadOlderRequestedRef.current = false;
+      requestOlderPage();
     };
 
     const handleWheel = (event: WheelEvent) => {
-      if (event.deltaY < 0) armPagination();
+      if (event.deltaY < 0) {
+        armPagination();
+        retryOlderFromTop();
+      }
     };
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "PageUp" || event.key === "Home" || event.key === "ArrowUp") {
         armPagination();
+        retryOlderFromTop();
       }
     };
     const handlePointerDown = (event: PointerEvent) => {
@@ -1495,6 +1525,7 @@ export function Transcript({
       const y = event.touches[0]?.clientY;
       if (lastTouchY !== undefined && y !== undefined && y > lastTouchY) {
         armPagination();
+        retryOlderFromTop();
       }
       lastTouchY = y;
     };

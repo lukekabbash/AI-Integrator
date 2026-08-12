@@ -34,3 +34,18 @@ export function isComposerTurnBusy(state: ComposerTurnBusyState): boolean {
     state.queueAwaiting
   );
 }
+
+/** Native admission is authoritative when the renderer's turn projection lags. */
+export function isTurnActiveError(error: unknown): boolean {
+  if (!error) return false;
+  if (typeof error === "object" && "code" in error && error.code === "turn-active") return true;
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : typeof error === "object" && "message" in error && typeof error.message === "string"
+          ? error.message
+          : "";
+  return /\bturn-active\b|a turn is already (?:running|starting) for this chat/i.test(message);
+}

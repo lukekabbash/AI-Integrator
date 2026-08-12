@@ -26,6 +26,7 @@ import { TaskStatusPill } from "./TaskStatusPill";
 import { formatCompactTokenCount } from "./conversationFormatting";
 import { Dropdown } from "./Dropdown";
 import { SubagentProjectionCache } from "./subagentProjectionCache";
+import { Tooltip } from "./Tooltip";
 
 const Transcript = lazy(() =>
   import("./Transcript").then((module) => ({ default: module.Transcript })),
@@ -469,7 +470,17 @@ export function SubagentConversation({
         ? createPortal(
             <div className="titlebar-subagent-header">
               <div className="titlebar-subagent-copy">
-                <h2>{delegation.title}</h2>
+                <div className="titlebar-subagent-title-row">
+                  <h2>{delegation.title}</h2>
+                  <button
+                    className="titlebar-subagent-close"
+                    type="button"
+                    onClick={onClose}
+                    aria-label="Close subagent transcript"
+                  >
+                    <X aria-hidden="true" />
+                  </button>
+                </div>
                 <span>
                   {delegation.profileLabel} · {selectedRouting.model || selectedRouting.runtime} ·{" "}
                   {statusLabel(delegation.status)}
@@ -507,13 +518,17 @@ export function SubagentConversation({
                 </button>
               </div>
               <div className="titlebar-subagent-actions">
-                <span
-                  className="usage-compact conversation-token-count"
-                  aria-label={`${totalTokens.toLocaleString()} tokens`}
-                  title={`${totalTokens.toLocaleString()} tokens used by this subagent`}
+                <Tooltip
+                  label={`${totalTokens.toLocaleString()} tokens used by this subagent`}
+                  placement="bottom"
                 >
-                  {formatCompactTokenCount(totalTokens)}
-                </span>
+                  <span
+                    className="usage-compact conversation-token-count"
+                    aria-label={`${totalTokens.toLocaleString()} tokens`}
+                  >
+                    {formatCompactTokenCount(totalTokens)}
+                  </span>
+                </Tooltip>
                 {onToggleTerminal ? (
                   <button
                     className="icon-button subtle"
@@ -540,14 +555,6 @@ export function SubagentConversation({
                     )}
                   </button>
                 ) : null}
-                <button
-                  className="icon-button subtle"
-                  type="button"
-                  onClick={onClose}
-                  aria-label="Close subagent transcript"
-                >
-                  <X aria-hidden="true" />
-                </button>
               </div>
             </div>,
             headerTarget,

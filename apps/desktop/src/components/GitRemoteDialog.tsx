@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { AnimatePresence, m as motion, useReducedMotion } from "motion/react";
 import { Plus, Trash2, X } from "lucide-react";
 import type { GitSnapshot } from "../bridge";
+import { Tooltip } from "./Tooltip";
 
 export type GitRemoteDialogMode = "manage" | "connect" | "github" | "branch";
 
@@ -173,7 +174,9 @@ export function GitRemoteDialog({
                     <div key={remote.name} className="git-remote-row">
                       <span>
                         <strong>{remote.name}</strong>
-                        <small title={remote.fetchUrl}>{remote.fetchUrl}</small>
+                        <Tooltip label={remote.fetchUrl} placement="top">
+                          <small>{remote.fetchUrl}</small>
+                        </Tooltip>
                       </span>
                       <div>
                         <button

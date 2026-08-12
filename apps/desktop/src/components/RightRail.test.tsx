@@ -239,7 +239,7 @@ describe("RightRail", () => {
     expect(screen.queryByRole("button", { name: /View transcript/i })).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Audit the interaction transcript")).not.toBeInTheDocument();
     expect(
-      screen.getByTitle(
+      screen.getByText(
         "Review the complete interaction flow and report only the highest-impact selection issues.",
       ),
     ).toHaveClass("agent-activity");
@@ -275,7 +275,8 @@ describe("RightRail", () => {
       setup({ delegations: [delegation] });
       fireEvent.click(screen.getByRole("tab", { name: /Agents/ }));
       const activity = document.querySelector<HTMLElement>(".agent-activity");
-      expect(activity).toHaveAttribute("title", brief);
+      expect(activity).not.toBeNull();
+      expect(activity).not.toHaveAttribute("title");
       fireEvent.mouseEnter(activity!);
       act(() => vi.advanceTimersByTime(420));
 
@@ -366,9 +367,9 @@ describe("RightRail", () => {
     expect(
       screen.queryByRole("separator", { name: "Resize file preview" }),
     ).not.toBeInTheDocument();
-    expect(screen.getByTitle("Open src/App.tsx")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open src/App.tsx" })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByTitle("Open src/App.tsx"));
+    fireEvent.click(screen.getByRole("button", { name: "Open src/App.tsx" }));
     expect(callbacks.onOpenFile).toHaveBeenCalledWith(projectFiles[0]);
   });
 
@@ -376,12 +377,17 @@ describe("RightRail", () => {
     setup({ activeFilePath: "src/App.tsx" });
     fireEvent.click(screen.getByRole("tab", { name: "Files" }));
 
-    expect(screen.getByTitle("Open src/App.tsx")).toHaveAttribute("aria-current", "page");
-    expect(screen.getByTitle("Open src/bridge.ts")).not.toHaveAttribute("aria-current");
+    expect(screen.getByRole("button", { name: "Open src/App.tsx" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+    expect(screen.getByRole("button", { name: "Open src/bridge.ts" })).not.toHaveAttribute(
+      "aria-current",
+    );
     await waitFor(() =>
       expect(document.querySelector(".file-tree-active")?.parentElement).toHaveClass("file-tree"),
     );
-    expect(screen.getByTitle("Open src/App.tsx")).not.toContainElement(
+    expect(screen.getByRole("button", { name: "Open src/App.tsx" })).not.toContainElement(
       document.querySelector(".file-tree-active"),
     );
   });
@@ -392,9 +398,11 @@ describe("RightRail", () => {
     fireEvent.change(screen.getByRole("textbox", { name: "Filter files" }), {
       target: { value: "bridge" },
     });
-    expect(screen.getByTitle("Open src/bridge.ts")).toBeInTheDocument();
-    expect(screen.queryByTitle("Open src/App.tsx")).not.toBeInTheDocument();
-    expect(screen.queryByTitle(snapshot.git.files[0]?.path ?? "missing")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open src/bridge.ts" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Open src/App.tsx" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: snapshot.git.files[0]?.path ?? "missing" }),
+    ).not.toBeInTheDocument();
   });
 
   it("progressively mounts a large project tree while filtering the full file set", () => {
@@ -406,16 +414,16 @@ describe("RightRail", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Files" }));
 
     const tree = screen.getByLabelText("Project files");
-    expect(tree.querySelectorAll("[title^='Open file-']")).toHaveLength(300);
+    expect(tree.querySelectorAll("[aria-label^='Open file-']")).toHaveLength(300);
     expect(screen.getByText("Showing 300 of 1,000 files")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Show next 300 files" }));
-    expect(tree.querySelectorAll("[title^='Open file-']")).toHaveLength(600);
+    expect(tree.querySelectorAll("[aria-label^='Open file-']")).toHaveLength(600);
 
     fireEvent.change(screen.getByRole("textbox", { name: "Filter files" }), {
       target: { value: "file-0999" },
     });
-    expect(screen.getByTitle("Open file-0999.ts")).toBeInTheDocument();
-    expect(tree.querySelectorAll("[title^='Open file-']")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Open file-0999.ts" })).toBeInTheDocument();
+    expect(tree.querySelectorAll("[aria-label^='Open file-']")).toHaveLength(1);
   }, 12_000);
 
   it("indents nested folders and files by their tree depth", () => {
@@ -436,7 +444,10 @@ describe("RightRail", () => {
       "data-tree-depth",
       "1",
     );
-    expect(screen.getByTitle("Open src/runtime/router.ts")).toHaveAttribute("data-tree-depth", "2");
+    expect(screen.getByRole("button", { name: "Open src/runtime/router.ts" })).toHaveAttribute(
+      "data-tree-depth",
+      "2",
+    );
   });
 
   it("collapses the active folder immediately while the selection pill fades in place", async () => {
@@ -619,19 +630,28 @@ describe("RightRail", () => {
     });
     const file = snapshot.git.files[0]!;
 
-    fireEvent.contextMenu(screen.getByTitle(file.path), { clientX: 900, clientY: 240 });
+    fireEvent.contextMenu(screen.getByRole("button", { name: file.path }), {
+      clientX: 900,
+      clientY: 240,
+    });
     const openIn = screen.getByRole("menuitem", { name: /Open in$/i });
     fireEvent.pointerEnter(openIn);
     expect(screen.getByRole("menuitem", { name: "Codex (workspace)" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("menuitem", { name: "Cursor" }));
     await waitFor(() => expect(onOpenGitFileExternal).toHaveBeenCalledWith(file, "cursor"));
 
-    fireEvent.contextMenu(screen.getByTitle(file.path), { clientX: 900, clientY: 240 });
+    fireEvent.contextMenu(screen.getByRole("button", { name: file.path }), {
+      clientX: 900,
+      clientY: 240,
+    });
     fireEvent.pointerEnter(screen.getByRole("menuitem", { name: /Open in$/i }));
     fireEvent.click(screen.getByRole("menuitem", { name: "Codex (workspace)" }));
     await waitFor(() => expect(onOpenGitFileExternal).toHaveBeenCalledWith(file, "codex"));
 
-    fireEvent.contextMenu(screen.getByTitle(file.path), { clientX: 900, clientY: 240 });
+    fireEvent.contextMenu(screen.getByRole("button", { name: file.path }), {
+      clientX: 900,
+      clientY: 240,
+    });
     fireEvent.click(screen.getByRole("menuitem", { name: /Reveal in File Explorer/i }));
     await waitFor(() => expect(onRevealGitFile).toHaveBeenCalledWith(file));
   });
@@ -650,7 +670,7 @@ describe("RightRail", () => {
     });
 
     fireEvent.click(screen.getByRole("tab", { name: "Files" }));
-    const fileButton = screen.getByTitle("Open src/App.tsx");
+    const fileButton = screen.getByRole("button", { name: "Open src/App.tsx" });
     fireEvent.contextMenu(fileButton, { clientX: 760, clientY: 220 });
     expect(screen.queryByRole("menuitem", { name: /Codex/i })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("menuitem", { name: "Open in Cursor" }));
