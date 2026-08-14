@@ -8,7 +8,7 @@
     { "path": "apps/desktop/src/App.tsx", "maxLines": 7405 },
     {
       "path": "apps/desktop/src/components/SettingsView.tsx",
-      "maxLines": 5837
+      "maxLines": 5836
     },
     { "path": "apps/desktop/src/bridge.ts", "maxLines": 6692 },
     { "path": "apps/desktop/src-tauri/src/delegation.rs", "maxLines": 4438 },
