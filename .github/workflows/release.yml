@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "AI Integrator $TAG" --generate-notes
+
+  build:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            rust-targets: x86_64-pc-windows-msvc
+            build-args: ""
+          - os: macos-14
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            build-args: "--target universal-apple-darwin"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            apps/desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+      - uses: swatinem/rust-cache@v2
+      - run: npm ci
+      - run: npm ci
+        working-directory: apps/desktop
+      - run: npm run tauri -- build ${{ matrix.build-args }}
+        working-directory: apps/desktop
+      - name: Stage release assets (stable filenames)
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp target/release/bundle/nsis/*-setup.exe "release-assets/AI-Integrator-Windows-Setup.exe"
+            cp target/release/bundle/msi/*.msi "release-assets/AI-Integrator-Windows.msi"
+          else
+            cp target/universal-apple-darwin/release/bundle/dmg/*.dmg "release-assets/AI-Integrator-macOS.dmg"
+          fi
+          ls -la release-assets
+      - name: Upload to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
