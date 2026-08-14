@@ -591,6 +591,8 @@ fn parses_antigravity_error_line() {
 #[tokio::test]
 async fn cancellation_terminates_structured_provider_descendants() {
     use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+    use tokio::process::Command;
 
     let directory = tempfile::tempdir().expect("provider fixture");
     let executable = directory.path().join("fixture-agent.sh");
