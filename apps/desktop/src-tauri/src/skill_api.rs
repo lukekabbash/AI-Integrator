@@ -248,8 +248,7 @@ pub async fn execute(app: &AppHandle, state: &AppState, params: &Value) -> Resul
             )
         }));
     }
-    let data =
-        serde_json::from_str(&response_text).unwrap_or_else(|_| Value::String(response_text));
+    let data = serde_json::from_str(&response_text).unwrap_or(Value::String(response_text));
     Ok(json!({
         "provider": prepared.api.name(),
         "status": status.as_u16(),

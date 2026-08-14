@@ -1320,7 +1320,7 @@ mod tests {
         };
         assert!(
             acp_mcp_server_entries(
-                &[remote.clone()],
+                std::slice::from_ref(&remote),
                 AcpSessionCapabilities::default(),
                 Path::new(".")
             )

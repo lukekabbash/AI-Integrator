@@ -981,7 +981,6 @@ mod tests {
                 .map(|definition| definition.id),
             Some(ALPHA_VANTAGE_CREDENTIAL.id)
         );
-        assert!(ALPHA_VANTAGE_CREDENTIAL.required);
         assert!(credential_definition(&entry("market-data:stooq")).is_none());
         assert!(credential_definition(&entry("market-data:yfinance")).is_none());
         assert!(skill_api_guidance(&entry("market-data:stooq")).is_none());

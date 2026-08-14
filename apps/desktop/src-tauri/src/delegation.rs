@@ -3657,7 +3657,7 @@ pub fn emit_recovered_delegation_updates(app: &AppHandle<tauri::Wry>) {
     };
     let mut parents = Vec::new();
     for delegation in delegations {
-        if !parents.iter().any(|id| *id == delegation.parent_task_id) {
+        if !parents.contains(&delegation.parent_task_id) {
             parents.push(delegation.parent_task_id);
         }
     }

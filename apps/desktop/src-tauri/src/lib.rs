@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 mod antigravity_hooks;
 mod app_commands;
