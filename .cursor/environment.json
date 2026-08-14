@@ -1,0 +1,21 @@
+{
+  "name": "AI Integrator",
+  "user": "ubuntu",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "install": "npm ci\nnpm --prefix apps/desktop ci",
+  "terminals": [
+    {
+      "name": "web",
+      "command": "npm run dev:web",
+      "description": "Vite dev server for the desktop renderer in browser/web mode (http://localhost:1420)."
+    }
+  ],
+  "ports": [
+    {
+      "name": "web",
+      "port": 1420
+    }
+  ]
+}
