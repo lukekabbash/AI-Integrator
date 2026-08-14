@@ -1,7 +1,0 @@
-{
-  "name": "ai-provider-docs",
-  "description": "Reference skills for Google Gemini, xAI, Vercel AI Gateway/AI SDK, and OpenRouter. Official OpenAI guidance is available through OpenAI's maintained skill catalog.",
-  "version": "0.1.0",
-  "author": { "name": "AI Integrator" },
-  "license": "Apache-2.0"
-}

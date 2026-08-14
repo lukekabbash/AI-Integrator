@@ -139,3 +139,6 @@ temp/agent-provider-docs-2026-07-13/providers/*/*
 !temp/agent-provider-docs-2026-07-13/providers/*/INTEGRATOR-NOTES.md
 !temp/agent-provider-docs-2026-07-13/providers/*/FEATURE-MATRIX.md
 !temp/agent-provider-docs-2026-07-13/providers/*/source-manifest.json
+
+# Local packaged builds (release artifacts live on GitHub Releases)
+dist-local/

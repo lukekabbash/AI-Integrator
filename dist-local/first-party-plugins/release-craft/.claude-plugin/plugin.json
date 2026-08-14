@@ -1,7 +1,0 @@
-{
-  "name": "release-craft",
-  "description": "Turn git history into changelogs and release notes people actually read.",
-  "version": "0.1.0",
-  "author": { "name": "AI Integrator" },
-  "license": "Apache-2.0"
-}

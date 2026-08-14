@@ -1,7 +1,0 @@
-{
-  "name": "market-data",
-  "description": "Provider-specific market data workflows for Alpha Vantage, Stooq, and yfinance.",
-  "version": "0.1.0",
-  "author": { "name": "AI Integrator" },
-  "license": "Apache-2.0"
-}

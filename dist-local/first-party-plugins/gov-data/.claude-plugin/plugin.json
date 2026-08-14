@@ -1,7 +1,0 @@
-{
-  "name": "gov-data",
-  "description": "Query US government data: FRED economic series, BLS labor statistics, Census demographics, EIA energy data, and SEC EDGAR filings.",
-  "version": "0.1.0",
-  "author": { "name": "AI Integrator" },
-  "license": "Apache-2.0"
-}
