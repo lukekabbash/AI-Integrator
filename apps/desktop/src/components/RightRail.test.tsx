@@ -61,6 +61,16 @@ describe("RightRail", () => {
     expect(tabs.querySelectorAll(".sliding-tab-indicator")).toHaveLength(1);
   });
 
+  it("requests an authoritative delegation refresh when Agents opens", () => {
+    const onRequestDelegations = vi.fn();
+    setup({ onRequestDelegations });
+
+    expect(onRequestDelegations).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("tab", { name: /^Agents/ }));
+
+    expect(onRequestDelegations).toHaveBeenCalledTimes(1);
+  });
+
   it("does not offer Git setup while repository detection is still running", () => {
     setup({
       gitLoading: true,

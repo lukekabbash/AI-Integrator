@@ -553,7 +553,9 @@ describe("TaskSidebar", () => {
   it("resolves a general chat folder when copy path has no project pairing", async () => {
     document.documentElement.dataset.motion = "none";
     try {
-      const onResolveTaskFolder = vi.fn().mockResolvedValue("C:\\Users\\me\\chat-runtime\\general-chat");
+      const onResolveTaskFolder = vi
+        .fn()
+        .mockResolvedValue("C:\\Users\\me\\chat-runtime\\general-chat");
       const writeText = vi.fn().mockResolvedValue(undefined);
       Object.defineProperty(navigator, "clipboard", {
         configurable: true,
@@ -577,7 +579,9 @@ describe("TaskSidebar", () => {
       });
       fireEvent.contextMenu(screen.getByRole("button", { name: /Research notes/ }));
       fireEvent.click(screen.getByRole("menuitem", { name: /Copy absolute path/i }));
-      expect(onResolveTaskFolder).toHaveBeenCalledWith(expect.objectContaining({ id: generalChat.id }));
+      expect(onResolveTaskFolder).toHaveBeenCalledWith(
+        expect.objectContaining({ id: generalChat.id }),
+      );
       await waitFor(() => {
         expect(writeText).toHaveBeenCalledWith("C:\\Users\\me\\chat-runtime\\general-chat");
       });
@@ -603,7 +607,13 @@ describe("TaskSidebar", () => {
       expect(writeText).toHaveBeenCalledWith(active.path);
       fireEvent.contextMenu(screen.getByRole("button", { name: active.name }));
       fireEvent.click(screen.getByRole("menuitem", { name: /Copy relative path/i }));
-      expect(writeText).toHaveBeenCalledWith(active.path.replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).at(-1));
+      expect(writeText).toHaveBeenCalledWith(
+        active.path
+          .replace(/[\\/]+$/, "")
+          .split(/[\\/]/)
+          .filter(Boolean)
+          .at(-1),
+      );
       fireEvent.contextMenu(screen.getByRole("button", { name: active.name }));
       fireEvent.click(screen.getByRole("menuitem", { name: /Reveal in File Explorer/i }));
       expect(onRevealProject).toHaveBeenCalledWith(expect.objectContaining({ id: active.id }));

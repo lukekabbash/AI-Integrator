@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::{
-    commands::{CommandError, CommandResult},
+    command_api::{CommandError, CommandResult},
     state::AppState,
 };
 
@@ -673,6 +673,10 @@ fn unix_installer(provider: ProviderKind) -> Option<(&'static str, &'static str)
 
 fn windows_installer(provider: ProviderKind) -> Option<(&'static str, &'static str)> {
     match provider {
+        ProviderKind::Cursor => Some((
+            "irm 'https://cursor.com/install?win32=true' | iex",
+            "https://cursor.com/docs/cli/overview",
+        )),
         ProviderKind::Grok => Some((
             "irm https://x.ai/cli/install.ps1 | iex",
             "https://docs.x.ai/build/overview",
@@ -858,6 +862,20 @@ mod tests {
                     .all(|plan| plan.public.modifies_outside_projects)
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cursor_uses_its_disclosed_native_windows_installer() {
+        let plan = install_plans(ProviderKind::Cursor)
+            .into_iter()
+            .next()
+            .expect("Cursor installer");
+        assert_eq!(
+            plan.public.command,
+            "irm 'https://cursor.com/install?win32=true' | iex"
+        );
+        assert!(plan.public.recommended);
     }
 
     #[test]

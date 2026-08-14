@@ -37,9 +37,18 @@ if (
   env.APPLE_SIGNING_IDENTITY = identity;
 }
 
+const npmArguments = [
+  "--prefix",
+  "apps/desktop",
+  "run",
+  "tauri",
+  "--",
+  "build",
+];
+const npmCli = env.npm_execpath;
 const result = spawnSync(
-  "npm",
-  ["--prefix", "apps/desktop", "run", "tauri", "--", "build"],
+  npmCli ? process.execPath : process.platform === "win32" ? "npm.cmd" : "npm",
+  npmCli ? [npmCli, ...npmArguments] : npmArguments,
   {
     cwd: root,
     env,

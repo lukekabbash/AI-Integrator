@@ -18,7 +18,8 @@ use sha2::{Digest, Sha256};
 use url::{Host, Url};
 use zeroize::Zeroizing;
 
-use crate::commands::{CommandError, CommandResult, open_external_url};
+use crate::app_commands::open_external_url;
+use crate::command_api::{CommandError, CommandResult};
 use crate::credential_store;
 
 const MCP_OAUTH_SERVICE: &str = "dev.aiintegrator.mcp-oauth";

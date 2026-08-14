@@ -1,0 +1,29 @@
+{
+  "plugins": [
+    "ai-provider-docs",
+    "firebase",
+    "gov-data",
+    "integrator-authoring",
+    "market-data",
+    "release-craft",
+    "tauri"
+  ],
+  "skills": [
+    "ai-provider-docs:ai-gateway-docs",
+    "ai-provider-docs:gemini-docs",
+    "ai-provider-docs:openrouter-docs",
+    "ai-provider-docs:xai-docs",
+    "firebase:firebase-docs",
+    "gov-data:bls",
+    "gov-data:census",
+    "gov-data:eia",
+    "gov-data:fred",
+    "gov-data:sec-edgar",
+    "integrator-authoring:skill-creator",
+    "market-data:alpha-vantage",
+    "market-data:stooq",
+    "market-data:yfinance",
+    "release-craft:release-notes",
+    "tauri:tauri-docs"
+  ]
+}

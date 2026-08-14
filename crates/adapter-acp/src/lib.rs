@@ -13,7 +13,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -25,6 +25,10 @@ use tokio::{
     process::{Child, ChildStdin, Command},
     sync::{Mutex, broadcast, oneshot},
 };
+
+mod process_io;
+
+use process_io::{spawn_stderr_drain, spawn_stdout_reader};
 
 const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 /// Bytes of an oversized frame retained for response-id identification.
@@ -179,6 +183,7 @@ struct Inner {
     events: broadcast::Sender<AcpEvent>,
     next_id: AtomicU64,
     initialization: Mutex<Value>,
+    transport_alive: Arc<AtomicBool>,
 }
 
 struct PendingRequest {
@@ -237,7 +242,13 @@ impl AcpClient {
 
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let pending = Arc::new(Mutex::new(HashMap::new()));
-        spawn_stdout_reader(stdout, Arc::clone(&pending), events.clone());
+        let transport_alive = Arc::new(AtomicBool::new(true));
+        spawn_stdout_reader(
+            stdout,
+            Arc::clone(&pending),
+            events.clone(),
+            Arc::clone(&transport_alive),
+        );
         spawn_stderr_drain(stderr, events.clone());
 
         let client = Self {
@@ -248,6 +259,7 @@ impl AcpClient {
                 events,
                 next_id: AtomicU64::new(1),
                 initialization: Mutex::new(Value::Null),
+                transport_alive,
             }),
         };
         let initialization = client
@@ -263,6 +275,14 @@ impl AcpClient {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<AcpEvent> {
         self.inner.events.subscribe()
+    }
+
+    /// Native routing uses this before reusing a cached ACP runtime. The
+    /// reader clears it before waking failed requests, closing the small gap
+    /// between subprocess exit and higher-level event-pump reconciliation.
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.inner.transport_alive.load(Ordering::Acquire)
     }
 
     /// Sanitized callers use this only to inspect advertised protocol
@@ -461,6 +481,7 @@ impl AcpClient {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        self.inner.transport_alive.store(false, Ordering::Release);
         let mut child = self.inner.child.lock().await;
         if let Some(mut process) = child.take() {
             process.kill().await?;
@@ -561,15 +582,24 @@ impl AcpClient {
         // an agent that stops reading parks this write holding the stdin
         // mutex, and cancel() — the user's escape hatch — queues behind it
         // forever.
-        tokio::time::timeout(STDIN_WRITE_TIMEOUT, async {
+        match tokio::time::timeout(STDIN_WRITE_TIMEOUT, async {
             stdin.write_all(&encoded).await?;
             stdin.flush().await
         })
         .await
-        .map_err(|_| {
-            IntegratorError::Unavailable("ACP agent stopped reading its stdin".into())
-        })??;
-        Ok(())
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                self.inner.transport_alive.store(false, Ordering::Release);
+                Err(error.into())
+            }
+            Err(_) => {
+                self.inner.transport_alive.store(false, Ordering::Release);
+                Err(IntegratorError::Unavailable(
+                    "ACP agent stopped reading its stdin".into(),
+                ))
+            }
+        }
     }
 }
 
@@ -617,7 +647,8 @@ fn launch_command(executable: &Path, arguments: &[String]) -> Command {
             // the long-lived duplex stdio channel ACP requires on this host.
             // Prefer the vendor-owned sibling script directly when present.
             let powershell_launcher = executable.with_extension("ps1");
-            if powershell_launcher.is_file() {
+            if powershell_launcher.is_file() && !powershell_shim_drains_stdin(&powershell_launcher)
+            {
                 let mut command = Command::new(
                     std::env::var_os("SystemRoot")
                         .map(PathBuf::from)
@@ -652,6 +683,21 @@ fn launch_command(executable: &Path, arguments: &[String]) -> Command {
     let mut command = Command::new(executable);
     command.args(arguments);
     command
+}
+
+/// npm generates PowerShell shims that pipe `$input` into the real binary
+/// whenever `$MyInvocation.ExpectingInput` is true. ACP holds stdin open for
+/// the life of the session, so that branch blocks draining stdin to an EOF
+/// that never arrives and the agent is never launched at all — the process
+/// hangs before emitting a byte. Vendor-authored shims (Cursor's `agent.ps1`)
+/// have no such branch and stay on the PowerShell route.
+#[cfg(windows)]
+fn powershell_shim_drains_stdin(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|script| script.contains("ExpectingInput"))
+        // An unreadable shim is not worth guessing about: fall back to the
+        // `cmd.exe` route, which never has this failure mode.
+        .unwrap_or(true)
 }
 
 #[cfg(windows)]
@@ -765,66 +811,6 @@ fn encode_message(value: &Value) -> Result<Vec<u8>> {
     }
     encoded.push(b'\n');
     Ok(encoded)
-}
-
-fn spawn_stdout_reader(
-    stdout: impl AsyncRead + Unpin + Send + 'static,
-    pending: Arc<Mutex<HashMap<u64, PendingRequest>>>,
-    events: broadcast::Sender<AcpEvent>,
-) {
-    tokio::spawn(async move {
-        read_jsonl(stdout, |frame| {
-            let pending = Arc::clone(&pending);
-            let events = events.clone();
-            async move {
-                match frame {
-                    JsonlFrame::Message(message) => route_message(message, pending, events).await,
-                    JsonlFrame::Invalid(bytes) => {
-                        fail_discarded_response(&bytes, &pending, &events, "invalid-json").await;
-                    }
-                    JsonlFrame::TooLarge(head) => {
-                        fail_discarded_response(&head, &pending, &events, "message-too-large")
-                            .await;
-                    }
-                }
-            }
-        })
-        .await;
-        let mut pending = pending.lock().await;
-        for (_, request) in pending.drain() {
-            let error = IntegratorError::Unavailable("ACP agent exited".into());
-            emit_prompt_finished(
-                &events,
-                &request,
-                AcpPromptOutcome::Error {
-                    message: error.to_string(),
-                },
-            );
-            let _ = request.sender.send(Err(error));
-        }
-        let _ = events.send(AcpEvent::Exited);
-    });
-}
-
-fn spawn_stderr_drain(
-    stderr: impl AsyncRead + Unpin + Send + 'static,
-    events: broadcast::Sender<AcpEvent>,
-) {
-    tokio::spawn(async move {
-        let mut stderr = stderr;
-        let mut buffer = [0_u8; 8192];
-        let mut emitted = false;
-        loop {
-            match stderr.read(&mut buffer).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) if !emitted => {
-                    emitted = true;
-                    let _ = events.send(AcpEvent::StderrActivity);
-                }
-                Ok(_) => {}
-            }
-        }
-    });
 }
 
 async fn read_jsonl<R, F, Fut>(mut reader: R, mut on_message: F)
@@ -1504,6 +1490,45 @@ mod tests {
                 .any(|argument| argument == powershell.as_os_str())
         );
         assert!(standard.get_args().any(|argument| argument == "acp"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// npm's shims (Grok, Codex) block on `$input` until stdin reaches EOF,
+    /// which never happens on an ACP session, so the agent is never launched.
+    /// Those must fall back to `cmd.exe`; the vendor shims above must not.
+    #[cfg(windows)]
+    #[test]
+    fn windows_npm_shim_that_drains_stdin_falls_back_to_cmd() {
+        let directory =
+            std::env::temp_dir().join(format!("ai-integrator-acp-npm-shim-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("create launcher fixture");
+        let batch = directory.join("grok.cmd");
+        let powershell = directory.join("grok.ps1");
+        std::fs::write(&batch, "@echo off\r\n").expect("write batch fixture");
+        std::fs::write(
+            &powershell,
+            "if ($MyInvocation.ExpectingInput) {\r\n  $input | & \"node$exe\" $args\r\n}\r\n",
+        )
+        .expect("write npm shim fixture");
+
+        assert!(powershell_shim_drains_stdin(&powershell));
+
+        let command = launch_command(&batch, &["agent".into(), "stdio".into()]);
+        let standard = command.as_std();
+        assert!(
+            standard
+                .get_program()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with("cmd.exe"),
+            "npm shim must not be launched through PowerShell"
+        );
+        assert!(
+            !standard
+                .get_args()
+                .any(|argument| argument == powershell.as_os_str())
+        );
 
         let _ = std::fs::remove_dir_all(directory);
     }

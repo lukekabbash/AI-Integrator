@@ -3,7 +3,10 @@ use std::{
     fs,
     io::Write,
     path::PathBuf,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use adapter_acp::AcpClient;
@@ -145,6 +148,13 @@ pub struct AcpRuntime {
     pub replaying_history: Arc<AtomicBool>,
 }
 
+impl AcpRuntime {
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire) && self.client.is_alive()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StructuredResumeContext {
     pub repository: PathBuf,
@@ -254,6 +264,7 @@ pub struct TerminalSession {
     /// Process id of the PTY session leader (the shell). Compared against
     /// the terminal's foreground process group to tell a foreground job
     /// apart from an idle prompt.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub shell_pid: Option<u32>,
 }
 
@@ -264,7 +275,7 @@ impl TerminalSession {
     pub fn has_foreground_process(&self) -> bool {
         #[cfg(unix)]
         {
-            crate::commands::foreground_process_active(
+            crate::terminal_process::foreground_process_active(
                 self.master.process_group_leader(),
                 self.shell_pid,
             )

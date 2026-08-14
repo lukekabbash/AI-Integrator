@@ -390,7 +390,10 @@ export function applyRuntimeProjectionBatch(
 
 /** Tolerance between provider/renderer clocks when relating items to a turn. */
 const STALE_TURN_SLACK_MS = 5_000;
-/** An unfinished item this much older than the running turn is a cut-off relic. */
+/** An unfinished item this much older than the running turn is a cut-off relic.
+ *  Not a substitute for providers closing their own items: it covers the case
+ *  no reducer can fix retroactively — the app was killed mid-turn, so the
+ *  settle path never ran and the row is orphaned `inProgress` in SQLite. */
 const STALE_ITEM_REVIVAL_SLACK_MS = 120_000;
 
 function itemStatus(

@@ -467,6 +467,8 @@ export function TerminalDrawer({
     <m.section
       className="terminal-drawer"
       aria-label="Project terminal"
+      aria-hidden={open ? undefined : true}
+      inert={open ? undefined : true}
       data-resizing={resizing}
       initial={{ height: 0 }}
       animate={{ height: open ? height : 0 }}

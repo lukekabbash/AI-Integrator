@@ -639,7 +639,7 @@ describe("native trusted-project bridge", () => {
     expect(invokeMock).toHaveBeenCalledWith("grok_list_models", undefined);
   });
 
-  it("warms Grok ACP before send so the first turn is not a cold spawn", async () => {
+  it("does not prewarm Grok outside prompt admission", async () => {
     invokeMock.mockImplementation(async (command: string) => {
       if (command === "task_create") {
         return { id: "v1-shell", kind: "code", title: "Construct the native v1 workspace" };
@@ -662,22 +662,8 @@ describe("native trusted-project bridge", () => {
       delegation: "off",
     });
 
-    expect(invokeMock).toHaveBeenCalledWith(
-      "acp_connect",
-      expect.objectContaining({
-        provider: "grok",
-        taskId: "v1-shell",
-        model: "grok-4.6",
-        effort: "xhigh",
-      }),
-    );
-    expect(invokeMock).toHaveBeenCalledWith(
-      "acp_start_session",
-      expect.objectContaining({
-        taskId: "v1-shell",
-        permission: "project-write",
-      }),
-    );
+    expect(invokeMock).not.toHaveBeenCalledWith("acp_connect", expect.anything());
+    expect(invokeMock).not.toHaveBeenCalledWith("acp_start_session", expect.anything());
   });
 
   it("falls back to the documented Grok catalog when the live probe fails", async () => {
@@ -1360,7 +1346,7 @@ describe("native trusted-project bridge", () => {
     expect(invokeMock).toHaveBeenNthCalledWith(3, "codex_stop_turn", { taskId: "task-1" });
   });
 
-  it("serializes Cursor model discovery with Send so the live ACP process is not replaced", async () => {
+  it("serializes Cursor model discovery and refreshes delegation through a new ACP session", async () => {
     let releaseConnect: (() => void) | undefined;
     const connectGate = new Promise<void>((resolve) => {
       releaseConnect = resolve;
@@ -1488,6 +1474,25 @@ describe("native trusted-project bridge", () => {
       prompt: "Reply with OK",
       delegation: "off",
     });
+    await bridge.sendTurn({
+      taskId: "task-cursor",
+      prompt: "Delegate now",
+      runtime: "cursor",
+      model: "Provider default",
+      permission: "project-write",
+      delegation: "manual",
+    });
+
+    expect(
+      invokeMock.mock.calls
+        .filter(([command]) => command === "acp_start_session")
+        .map(([, args]) => args?.delegation),
+    ).toEqual(["off", "manual"]);
+    expect(
+      invokeMock.mock.calls
+        .filter(([command]) => command === "acp_send_turn")
+        .map(([, args]) => args?.delegation),
+    ).toEqual(["off", "manual"]);
   });
 
   it("keeps two Cursor chats on independent native runtimes", async () => {

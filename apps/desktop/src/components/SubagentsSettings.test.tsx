@@ -136,6 +136,7 @@ describe("Subagents settings", () => {
       <SubagentsSettings
         settings={{
           "delegation.profiles": [DEFAULT_SPECIALISTS[0]],
+          "delegation.defaultMode": "manual",
           "delegation.maxConcurrent": 3,
         }}
         setSetting={setSetting}
@@ -145,7 +146,7 @@ describe("Subagents settings", () => {
     return setSetting;
   }
 
-  it("presents one specialist hierarchy without composer-owned delegation controls", async () => {
+  it("presents one specialist hierarchy without legacy profile controls", async () => {
     renderSettings();
 
     await waitFor(() => expect(bridgeMock.listIntegratorMcps).toHaveBeenCalledOnce());
@@ -166,6 +167,17 @@ describe("Subagents settings", () => {
     expect(screen.queryByText(/delegation preference/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/preferred helper/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/cost tier/i)).not.toBeInTheDocument();
+  });
+
+  it("keeps the global default mode visible and writable", () => {
+    const setSetting = renderSettings();
+    const mode = screen.getByRole("button", { name: "Default delegation mode" });
+
+    expect(mode).toHaveTextContent("Manual approval");
+    fireEvent.click(mode);
+    fireEvent.click(screen.getByRole("option", { name: "Balanced" }));
+
+    expect(setSetting).toHaveBeenCalledWith("delegation.defaultMode", "balanced");
   });
 
   it("makes delegation guidance explicit and animated without hiding the prompt", async () => {

@@ -7901,6 +7901,11 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   padding: 4px;
   border: 1px solid var(--color-border-subtle);
   border-radius: var(--radius-control);
+  background: var(--color-layer-1);
+  box-shadow: var(--shadow-elevated);
+  animation: context-menu-in var(--duration-fast) var(--ease-standard);
+}
+@keyframes context-menu-in {
   from {
     opacity: 0;
     transform: translateY(4px) scale(0.98);
@@ -14590,7 +14595,8 @@ button.explain-fallback-step:hover .explain-fallback-role {
   background: color-mix(in srgb, var(--color-layer-1) 52%, transparent);
 }
 
-.specialist-safeguards-row > label {
+.specialist-safeguards-row > label,
+.specialist-safeguards-row > .specialist-safeguard {
   min-height: 56px;
   padding: 0 18px;
   display: flex;
@@ -14602,17 +14608,20 @@ button.explain-fallback-step:hover .explain-fallback-role {
   font-size: 10.5px;
 }
 
-.specialist-safeguards-row > label > span {
+.specialist-safeguards-row > label > span,
+.specialist-safeguards-row > .specialist-safeguard > span {
   display: grid;
   gap: 2px;
 }
 
-.specialist-safeguards-row > label > span strong {
+.specialist-safeguards-row > label > span strong,
+.specialist-safeguards-row > .specialist-safeguard > span strong {
   font-size: 10.5px;
   font-weight: 620;
 }
 
-.specialist-safeguards-row > label > span small {
+.specialist-safeguards-row > label > span small,
+.specialist-safeguards-row > .specialist-safeguard > span small {
   color: var(--color-text-tertiary);
   font-size: 9px;
 }
@@ -15618,7 +15627,8 @@ button.explain-fallback-step:hover .explain-fallback-role {
   .specialist-workbench {
     grid-template-columns: 1fr;
   }
-  .specialist-safeguards-row > label {
+  .specialist-safeguards-row > label,
+  .specialist-safeguards-row > .specialist-safeguard {
     border-bottom: 1px solid var(--color-border-base);
   }
   .specialist-guidance-trigger small {

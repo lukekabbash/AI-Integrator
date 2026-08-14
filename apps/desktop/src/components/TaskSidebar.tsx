@@ -6,7 +6,6 @@ import {
   useRef,
   useState,
   type ReactElement,
-  type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
 import { AnimatePresence, m as motion, useReducedMotion } from "motion/react";
@@ -39,8 +38,18 @@ import type { SidebarMenuDirection } from "../theme";
 import { AnimatedFolderIcon } from "./AnimatedFolderIcon";
 import { BrandMark } from "./BrandMark";
 import { ResizeHandle } from "./ResizeHandle";
+import { ProjectChatListClip, SidebarCollectionClip } from "./SidebarCollectionClips";
 import { Tooltip } from "./Tooltip";
 import { TravelingSelection } from "./TravelingSelection";
+import {
+  CHAT_DOT_LABEL as chatDotLabel,
+  chatDotKind,
+  chatMeta,
+  lastPathSegment,
+  modKeyLabel,
+  pathRelativeToRoot,
+  sortTasks,
+} from "./taskSidebarModel";
 
 /** Themed tooltip for overflow-menu rows. A span shell keeps hover working
  * when the menuitem itself is disabled (native buttons swallow pointer events). */
@@ -103,85 +112,6 @@ interface TaskSidebarProps {
   sidebarMenuDirection?: SidebarMenuDirection;
 }
 
-const statusLabel: Record<TaskSummary["status"], string> = {
-  draft: "Draft",
-  starting: "Starting",
-  running: "Running",
-  waiting: "Waiting for input",
-  completed: "Completed",
-  failed: "Failed",
-  stopped: "Stopped",
-};
-
-const ACTIVE_STATUSES = new Set<TaskSummary["status"]>([
-  "starting",
-  "running",
-  "waiting",
-  "failed",
-]);
-
-type ChatDotKind = "streaming" | "attention" | "unread" | "unread-failed";
-
-/** Chats only earn a dot when something is happening: streaming output,
- * waiting on the user, or holding an unread reply. Idle rows stay quiet. */
-function chatDotKind(task: TaskSummary): ChatDotKind | null {
-  if (task.status === "waiting") return "attention";
-  if (task.status === "starting" || task.status === "running") return "streaming";
-  if (task.unread) return task.status === "failed" ? "unread-failed" : "unread";
-  return null;
-}
-
-const chatDotLabel: Record<ChatDotKind, string> = {
-  streaming: "Streaming",
-  attention: "Needs your input",
-  unread: "Unread reply",
-  "unread-failed": "Failed, unread",
-};
-
-function sortTasks(tasks: TaskSummary[]): TaskSummary[] {
-  return [...tasks].sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
-}
-
-function isApplePlatform(): boolean {
-  if (typeof navigator === "undefined") return false;
-  const platform =
-    (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform ??
-    navigator.platform ??
-    "";
-  return /mac|iphone|ipad|ipod/i.test(platform);
-}
-
-function modKeyLabel(): string {
-  return isApplePlatform() ? "⌘" : "Ctrl";
-}
-
-function formatRelativeUpdated(value: string): string {
-  const timestamp = Date.parse(value);
-  if (!Number.isFinite(timestamp)) return "";
-  const deltaMs = Date.now() - timestamp;
-  if (deltaMs < 45_000) return "Just now";
-  const minutes = Math.round(deltaMs / 60_000);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.round(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.round(hours / 24);
-  if (days < 7) return `${days}d ago`;
-  return new Date(timestamp).toLocaleDateString(undefined, {
-    month: "short",
-    day: "numeric",
-  });
-}
-
-function chatMeta(
-  task: TaskSummary,
-  options?: { showProject?: boolean; projectName?: string },
-): string {
-  const prefix = options?.showProject ? `${options.projectName ?? "Project"} · ` : "";
-  if (ACTIVE_STATUSES.has(task.status)) return `${prefix}${statusLabel[task.status]}`;
-  const relative = formatRelativeUpdated(task.updatedAt);
-  return relative ? `${prefix}${relative}` : `${prefix}${statusLabel[task.status]}`;
-}
-
 const menuSpring = {
   type: "spring" as const,
   stiffness: 540,
@@ -192,29 +122,11 @@ const menuSpring = {
 const INITIAL_PROJECT_CHAT_LIMIT = 5;
 const PROJECT_CHAT_PAGE_SIZE = 10;
 const INITIAL_SEARCH_RESULT_LIMIT = 80;
-/** Matches `.project-chat-list-clip` grid-template-rows timing. */
-const PROJECT_CHAT_LIST_CLIP_MS = 220;
 /** Rename / Copy / Reveal / path copies / Pin / Archive / Delete — used to decide flip-up vs down. */
 const CHAT_ACTION_MENU_HEIGHT = 258;
 const CHAT_ACTION_MENU_WIDTH = 200;
 const PROJECT_ACTION_MENU_HEIGHT = 204;
 const PROJECT_ACTION_MENU_WIDTH = 200;
-
-function lastPathSegment(value: string): string {
-  return value.replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).at(-1) ?? value;
-}
-
-function pathRelativeToRoot(absolute: string, root?: string): string {
-  if (!root) return lastPathSegment(absolute);
-  const normalized = absolute.replace(/\\/g, "/");
-  const rootNorm = root.replace(/\\/g, "/").replace(/\/+$/, "");
-  if (normalized.toLowerCase() === rootNorm.toLowerCase()) return ".";
-  const prefix = `${rootNorm.toLowerCase()}/`;
-  if (normalized.toLowerCase().startsWith(prefix)) {
-    return normalized.slice(rootNorm.length).replace(/^\/+/, "");
-  }
-  return lastPathSegment(absolute);
-}
 
 function copyText(value: string) {
   void navigator.clipboard.writeText(value).catch(() => undefined);
@@ -276,131 +188,6 @@ const chatRowVariants = {
     },
   }),
 };
-
-function afterNextPaint(callback: () => void) {
-  let secondFrame = 0;
-  const firstFrame = window.requestAnimationFrame(() => {
-    secondFrame = window.requestAnimationFrame(callback);
-  });
-  return () => {
-    window.cancelAnimationFrame(firstFrame);
-    if (secondFrame) window.cancelAnimationFrame(secondFrame);
-  };
-}
-
-/** CSS grid 0fr/1fr clip — avoids Motion height:"auto" measure thrash. */
-function ProjectChatListClip({
-  open,
-  menuOpen,
-  reduceMotion,
-  children,
-}: {
-  open: boolean;
-  menuOpen: boolean;
-  reduceMotion: boolean;
-  children: () => ReactNode;
-}) {
-  const [mounted, setMounted] = useState(open);
-  const [clipOpen, setClipOpen] = useState(open);
-  const previousOpen = useRef(open);
-
-  useEffect(() => {
-    if (previousOpen.current === open) return;
-    previousOpen.current = open;
-    if (open) {
-      setMounted(true);
-      if (reduceMotion) {
-        setClipOpen(true);
-        return;
-      }
-      setClipOpen(false);
-      return afterNextPaint(() => setClipOpen(true));
-    }
-    setClipOpen(false);
-    if (reduceMotion) {
-      setMounted(false);
-      return;
-    }
-    // Safety if transitionend is skipped (e.g. display:none mid-flight).
-    const timer = window.setTimeout(() => setMounted(false), PROJECT_CHAT_LIST_CLIP_MS + 40);
-    return () => window.clearTimeout(timer);
-  }, [open, reduceMotion]);
-
-  if (!mounted) return null;
-
-  return (
-    <div
-      className="project-chat-list-clip"
-      data-open={clipOpen ? "true" : "false"}
-      data-menu-open={menuOpen ? "true" : "false"}
-      onTransitionEnd={(event) => {
-        if (event.target !== event.currentTarget) return;
-        if (event.propertyName !== "grid-template-rows") return;
-        if (!open) setMounted(false);
-      }}
-    >
-      <div className="project-chat-list-inner">
-        <div className="project-chat-list" data-menu-open={menuOpen ? "true" : "false"}>
-          {children()}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function SidebarCollectionClip({
-  open,
-  reduceMotion,
-  children,
-}: {
-  open: boolean;
-  reduceMotion: boolean;
-  children: ReactNode;
-}) {
-  const [mounted, setMounted] = useState(open);
-  const [clipOpen, setClipOpen] = useState(open);
-  const previousOpen = useRef(open);
-
-  useEffect(() => {
-    if (previousOpen.current === open) return;
-    previousOpen.current = open;
-    if (open) {
-      setMounted(true);
-      if (reduceMotion) {
-        setClipOpen(true);
-        return;
-      }
-      setClipOpen(false);
-      return afterNextPaint(() => setClipOpen(true));
-    }
-    setClipOpen(false);
-    if (reduceMotion) {
-      setMounted(false);
-      return;
-    }
-    const timer = window.setTimeout(() => setMounted(false), PROJECT_CHAT_LIST_CLIP_MS + 40);
-    return () => window.clearTimeout(timer);
-  }, [open, reduceMotion]);
-
-  if (!mounted) return null;
-
-  return (
-    <div
-      className="sidebar-collection-clip"
-      data-open={clipOpen ? "true" : "false"}
-      data-reduce-motion={reduceMotion ? "true" : undefined}
-      aria-hidden={!open}
-      onTransitionEnd={(event) => {
-        if (event.target !== event.currentTarget || event.propertyName !== "grid-template-rows") {
-          return;
-        }
-        if (!open) setMounted(false);
-      }}
-    >
-      <div className="sidebar-collection-clip-inner">{children}</div>
-    </div>
-  );
-}
 
 /** Memoized so App's ~RAF `runtimeState` stream commits do not reconcile the
  * Motion / TravelingSelection / Tooltip sidebar tree when task props are idle. */
@@ -526,12 +313,13 @@ export const TaskSidebar = memo(function TaskSidebar({
     };
     document.addEventListener("pointerdown", onPointerDown);
     document.addEventListener("keydown", onKeyDown);
-    chatListRef.current?.addEventListener("scroll", onScrollOrResize, { passive: true });
+    const chatList = chatListRef.current;
+    chatList?.addEventListener("scroll", onScrollOrResize, { passive: true });
     window.addEventListener("resize", onScrollOrResize);
     return () => {
       document.removeEventListener("pointerdown", onPointerDown);
       document.removeEventListener("keydown", onKeyDown);
-      chatListRef.current?.removeEventListener("scroll", onScrollOrResize);
+      chatList?.removeEventListener("scroll", onScrollOrResize);
       window.removeEventListener("resize", onScrollOrResize);
     };
   }, [openMenuId, openProjectMenuId]);
@@ -640,7 +428,9 @@ export const TaskSidebar = memo(function TaskSidebar({
   );
 
   const ensureArchivedRef = useRef(onEnsureArchived);
-  ensureArchivedRef.current = onEnsureArchived;
+  useEffect(() => {
+    ensureArchivedRef.current = onEnsureArchived;
+  }, [onEnsureArchived]);
   useEffect(() => {
     if (showArchived) ensureArchivedRef.current?.();
   }, [showArchived]);
@@ -822,9 +612,7 @@ export const TaskSidebar = memo(function TaskSidebar({
               setOpenMenuId(task.id);
             }}
             onDoubleClick={
-              options?.searchResult || !metadataActionsEnabled
-                ? undefined
-                : () => beginRename(task)
+              options?.searchResult || !metadataActionsEnabled ? undefined : () => beginRename(task)
             }
             aria-current={active ? "page" : undefined}
             data-status={task.status}

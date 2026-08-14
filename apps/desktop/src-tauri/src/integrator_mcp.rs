@@ -24,7 +24,7 @@ use serde_json::Value;
 use session_store::LocalStore;
 use zeroize::Zeroizing;
 
-use crate::commands::{CommandError, CommandResult};
+use crate::command_api::{CommandError, CommandResult};
 use crate::credential_store::{self, CredentialStorage};
 use crate::integrator_skills::{bundled_root, documents_dir, plugins_root};
 use crate::mcp_oauth::McpAuthorization;

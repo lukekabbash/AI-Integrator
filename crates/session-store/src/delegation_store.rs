@@ -612,7 +612,7 @@ impl LocalStore {
                     "Subagent never started before Integrator exited.",
                 )?;
             }
-            if !parents.iter().any(|id| *id == delegation.parent_task_id) {
+            if !parents.contains(&delegation.parent_task_id) {
                 parents.push(delegation.parent_task_id);
             }
         }

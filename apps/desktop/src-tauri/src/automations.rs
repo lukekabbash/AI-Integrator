@@ -9,7 +9,7 @@ use serde::Serialize;
 use session_store::{NewAutomation, UpdateAutomation};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::{commands::CommandResult, state::AppState};
+use crate::{command_api::CommandResult, state::AppState};
 
 pub const DUE_EVENT: &str = "automation://due";
 pub const CHANGED_EVENT: &str = "automation://changed";

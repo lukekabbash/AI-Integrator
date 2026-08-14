@@ -3,11 +3,11 @@
 **Status:** Normative interaction and visual specification  
 **Audience:** Product, design, desktop, frontend, accessibility, adapter, and QA teams  
 **Research window:** 2026-07-09 through 2026-07-10  
-**Companion documents:** [Product specification](product-spec.md), [User stories](user-stories.md), [Research and design principles](research-and-design-principles.md), [Native parity matrix](native-parity-matrix.md), [QOL microinteraction catalog (200)](qol-100.md), [Critical systems primitives](critical-systems-primitives.md), [Delivery and criticality matrix](delivery-criticality-matrix.md), [Repository coordination protocol](repo-coordination-protocol.md), [Broker MCP contract](broker-mcp-contract.md)
+**Companion documents:** [Product specification](product-spec.md), [User stories](user-stories.md), [Native parity matrix](native-parity-matrix.md), [QOL microinteraction catalog (200)](qol-100.md), [Critical systems primitives](critical-systems-primitives.md), [Delivery and criticality matrix](delivery-criticality-matrix.md), [Repository coordination protocol](repo-coordination-protocol.md), [Broker MCP contract](broker-mcp-contract.md)
 
 This document defines the concrete primitives needed to make AI Integrator feel restrained, premium, fast, and trustworthy while supervising multiple coding agents. It deliberately goes below the level of screenshots. A screenshot captures one state at one size; the product must also survive streaming, long histories, narrow windows, six concurrent agents, conflicting Git state, missing runtimes, keyboard use, reduced motion, renderer failure, and platform differences.
 
-Where this document conflicts with the earlier reference values in `research-and-design-principles.md`, this document is authoritative for workspace behavior and component geometry. The earlier document remains design research and historical context.
+This document is authoritative for workspace behavior and component geometry.
 
 The [QOL microinteraction catalog (200)](qol-100.md) is the itemized implementation backlog for the smallest behaviors implied by this specification. Each item maps the client-owned behavior to Codex/app-server and ACP primitives, states the degraded fallback, and defines an acceptance check.
 

@@ -84,11 +84,13 @@ fn definitions() -> [ProbeDefinition; 6] {
 }
 
 fn discover_one(definition: ProbeDefinition) -> ProviderStatus {
-    let executable = definition
+    let path_executable = definition
         .executables
         .iter()
-        .find_map(|candidate| which::which(candidate).ok().map(prefer_windows_launcher))
-        .or_else(|| find_known_install(&definition.provider));
+        .find_map(|candidate| which::which(candidate).ok().map(prefer_windows_launcher));
+    let known_executable = find_known_install(&definition.provider);
+    let executable =
+        select_provider_executable(&definition.provider, path_executable, known_executable);
     let Some(executable) = executable else {
         return ProviderStatus {
             provider: definition.provider,
@@ -142,6 +144,21 @@ fn discover_one(definition: ProbeDefinition) -> ProviderStatus {
             .or(probe_code),
         capabilities,
         certification,
+    }
+}
+
+fn select_provider_executable(
+    provider: &ProviderKind,
+    path_executable: Option<PathBuf>,
+    known_executable: Option<PathBuf>,
+) -> Option<PathBuf> {
+    // Grok's npm shim is suitable for bounded probes but can detach the real
+    // agent and close the duplex stdio pipe. The official installer provides
+    // a direct binary under ~/.grok/bin; prefer it whenever both exist.
+    if *provider == ProviderKind::Grok {
+        known_executable.or(path_executable)
+    } else {
+        path_executable.or(known_executable)
     }
 }
 
@@ -707,6 +724,34 @@ mod tests {
             candidates
                 .iter()
                 .any(|path| path.ends_with(Path::new("npm/grok.cmd")))
+        );
+    }
+
+    #[test]
+    fn grok_prefers_the_direct_vendor_binary_over_a_path_wrapper() {
+        let path_wrapper = PathBuf::from(r"C:\Users\test\AppData\Roaming\npm\grok.cmd");
+        let direct_binary = PathBuf::from(r"C:\Users\test\.grok\bin\grok.exe");
+        assert_eq!(
+            select_provider_executable(
+                &ProviderKind::Grok,
+                Some(path_wrapper),
+                Some(direct_binary.clone()),
+            ),
+            Some(direct_binary)
+        );
+    }
+
+    #[test]
+    fn other_providers_keep_path_precedence() {
+        let path_binary = PathBuf::from(r"C:\tools\cursor-agent.cmd");
+        let fallback_binary = PathBuf::from(r"C:\fallback\cursor-agent.cmd");
+        assert_eq!(
+            select_provider_executable(
+                &ProviderKind::Cursor,
+                Some(path_binary.clone()),
+                Some(fallback_binary),
+            ),
+            Some(path_binary)
         );
     }
 

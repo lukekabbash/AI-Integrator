@@ -6,7 +6,8 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::{
     chat_title::{DeltaSink, HelperRoute, generate_isolated_provider_text_streamed},
-    commands::{CommandError, CommandResult, authorized_project_directory},
+    command_api::{CommandError, CommandResult},
+    commands::authorized_project_directory,
     explain_context::{ContextBudget, Excerpt, SelectionContext, gather},
     provider_routing::{is_worth_failing_over, provider_chain},
     state::AppState,

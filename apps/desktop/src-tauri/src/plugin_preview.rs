@@ -10,7 +10,7 @@ use std::sync::{Mutex, mpsc};
 use integrator_runtime::GithubCliService;
 use serde::Serialize;
 
-use crate::commands::{CommandError, CommandResult};
+use crate::command_api::{CommandError, CommandResult};
 use crate::native_actions::parse_frontmatter;
 
 /// A defensive backstop, not a practical limit — every catalog seen so far

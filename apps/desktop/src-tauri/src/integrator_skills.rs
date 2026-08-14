@@ -21,7 +21,7 @@ use session_store::LocalStore;
 use tauri::Manager;
 use zeroize::Zeroizing;
 
-use crate::commands::{CommandError, CommandResult};
+use crate::command_api::{CommandError, CommandResult};
 use crate::credential_store::{self, CredentialStorage};
 use crate::native_actions::{IntegratorSkillEntry, discover_integrator_skills};
 use crate::state::AppState;
@@ -35,6 +35,7 @@ const DEVELOPMENT_SKILL_SECRET_PRESENCE_SETTING_KEY: &str =
 const PRODUCTION_SKILL_SECRET_PRESENCE_SETTING_KEY: &str =
     "settings.skills.secure-data.production.presence";
 const PROJECTION_DIR: &str = "skills-projection";
+const BUNDLED_PLUGINS_RESOURCE_DIR: &str = "first-party-plugins";
 /// Per-skill copy bounds for the projection overlay. Oversized content is
 /// skipped file-by-file so one huge reference file cannot block a skill.
 const MAX_PROJECTED_FILES: usize = 64;
@@ -71,7 +72,7 @@ pub fn ensure_roots(app: &tauri::AppHandle) -> io::Result<()> {
 /// `tauri dev` exercises the same catalog without a packaging step.
 pub(crate) fn bundled_root(app: &tauri::AppHandle) -> Option<PathBuf> {
     if let Ok(resources) = app.path().resource_dir() {
-        let bundled = resources.join("first-party-plugins");
+        let bundled = resources.join(BUNDLED_PLUGINS_RESOURCE_DIR);
         if bundled.is_dir() {
             return Some(bundled);
         }

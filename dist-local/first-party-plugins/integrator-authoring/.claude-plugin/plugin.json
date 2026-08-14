@@ -1,0 +1,7 @@
+{
+  "name": "integrator-authoring",
+  "description": "Create and package portable agent skills that work in every runtime AI Integrator launches.",
+  "version": "0.1.0",
+  "author": { "name": "AI Integrator" },
+  "license": "Apache-2.0"
+}

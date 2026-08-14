@@ -41,6 +41,7 @@ import { Dropdown, ProviderIcon, type DropdownOption } from "./Dropdown";
 
 type SettingsMap = Record<string, unknown>;
 type IntegratorSkillInfo = IntegratorSkillsOverview["skills"][number];
+type DelegationMode = "off" | "manual" | "balanced" | "budget-first";
 
 type PluginSkillGroup = {
   id: string;
@@ -380,6 +381,13 @@ export function SubagentsSettings({
   setSetting: (key: string, value: unknown) => void;
   runtimes: RuntimeConnection[];
 }) {
+  const configuredMode = settings["delegation.defaultMode"];
+  const defaultMode: DelegationMode =
+    configuredMode === "manual" ||
+    configuredMode === "balanced" ||
+    configuredMode === "budget-first"
+      ? configuredMode
+      : "off";
   const specialists = normalizeSpecialists(settings["delegation.profiles"]);
   const maxConcurrent =
     typeof settings["delegation.maxConcurrent"] === "number"
@@ -656,6 +664,26 @@ export function SubagentsSettings({
       <section className="specialist-safeguards" aria-labelledby="specialist-safeguards-title">
         <h2 id="specialist-safeguards-title">Safeguards</h2>
         <div className="specialist-safeguards-row">
+          <div className="specialist-safeguard">
+            <span>
+              <strong>Default delegation mode</strong>
+              <small>
+                Preselected for new tasks. Existing task drafts keep their selected mode.
+              </small>
+            </span>
+            <Dropdown
+              className="compact-select"
+              aria-label="Default delegation mode"
+              value={defaultMode}
+              options={[
+                { value: "off", label: "No delegation" },
+                { value: "manual", label: "Manual approval" },
+                { value: "balanced", label: "Balanced" },
+                { value: "budget-first", label: "Budget first" },
+              ]}
+              onChange={(value) => setSetting("delegation.defaultMode", value)}
+            />
+          </div>
           <label>
             <span>
               <strong>Concurrent subagents</strong>
@@ -949,7 +977,9 @@ export function SubagentsSettings({
                     </small>
                   </span>
                   {selectedHasEnabledService ? (
-                    <span>{offered.length ? `${offered.join(" · ")} enabled` : "No levels enabled"}</span>
+                    <span>
+                      {offered.length ? `${offered.join(" · ")} enabled` : "No levels enabled"}
+                    </span>
                   ) : (
                     <span className="specialist-inert-warning">
                       <TriangleAlert /> Can&apos;t be delegated to

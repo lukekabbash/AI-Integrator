@@ -12,7 +12,8 @@ use serde::Serialize;
 use tauri::{Emitter, State, WebviewWindow};
 
 use crate::{
-    commands::{CommandError, CommandResult, authorized_project_directory},
+    command_api::{CommandError, CommandResult},
+    commands::authorized_project_directory,
     state::AppState,
 };
 

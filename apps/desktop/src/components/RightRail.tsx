@@ -54,7 +54,6 @@ import {
   type ChildAgent,
   type DelegationView,
   type DiffFile,
-  type GitCommit,
   type GitSnapshot,
   type ProjectFileEntry,
   type ProjectFileOpener,
@@ -68,6 +67,8 @@ import { ResizeHandle } from "./ResizeHandle";
 import { SlidingTabIndicator } from "./SlidingTabIndicator";
 import { Tooltip } from "./Tooltip";
 import { TravelingSelection } from "./TravelingSelection";
+import { CommitGraphCell } from "./commitGraph";
+import { buildCommitGraph, collapseCommitRefs } from "./commitGraphModel";
 
 export type { FileSelectionPayload } from "./FileView";
 
@@ -105,226 +106,6 @@ const gitFileLayoutSpring = {
   mass: 0.6,
 };
 
-const GRAPH_LANE_WIDTH = 9;
-const GRAPH_ROW_HEIGHT = 35;
-const GRAPH_MAX_LANES = 6;
-/** Breathing room on both edges so the widest node — the current-commit ring
- * at r=5.6 plus its 1px stroke — is never clipped by the cell's viewBox. */
-const GRAPH_EDGE_PAD = 2.5;
-/** One vivid hue per lane, Cursor-style, so a side branch reads as a single
- * colored thread. Lane 0 follows the app accent; the rest are fixed hues
- * chosen to stay legible on both light and dark themes. */
-const GRAPH_LANE_COLORS = [
-  "var(--color-accent)",
-  "#d0679d",
-  "#5aa7e0",
-  "#c9a227",
-  "#9a7ecc",
-  "#5fb08a",
-];
-
-interface CommitGraphEdge {
-  from: number;
-  to: number;
-  /** Edge bends into (or out of) this row's node instead of passing through. */
-  node: boolean;
-}
-
-interface CommitGraphRow {
-  lane: number;
-  incoming: CommitGraphEdge[];
-  outgoing: CommitGraphEdge[];
-  laneCount: number;
-}
-
-/**
- * Assign a lane to every commit the way VS Code's commit graph does: each
- * lane tracks the hash it expects next, merges join lanes into the commit's
- * node, and extra parents fork new lanes below it. Parents that fall outside
- * the truncated log keep their lane running off the bottom edge.
- */
-function buildCommitGraph(commits: GitCommit[]): CommitGraphRow[] {
-  const lanes: Array<string | null> = [];
-  return commits.map((commit) => {
-    const expecting = lanes.flatMap((hash, index) => (hash === commit.id ? [index] : []));
-    let lane = expecting.length ? expecting[0] : lanes.indexOf(null);
-    if (lane === -1) lane = lanes.length;
-    const incoming: CommitGraphEdge[] = [];
-    lanes.forEach((hash, index) => {
-      if (hash === null) return;
-      if (hash === commit.id) incoming.push({ from: index, to: lane, node: true });
-      else incoming.push({ from: index, to: index, node: false });
-    });
-    for (const index of expecting) lanes[index] = null;
-    const parents = commit.parents ?? [];
-    const outgoing: CommitGraphEdge[] = [];
-    if (parents.length) {
-      lanes[lane] = parents[0];
-      outgoing.push({ from: lane, to: lane, node: true });
-      for (const parent of parents.slice(1)) {
-        let parentLane = lanes.indexOf(parent);
-        if (parentLane === -1) {
-          parentLane = lanes.indexOf(null);
-          if (parentLane === -1) parentLane = lanes.length;
-          lanes[parentLane] = parent;
-        }
-        outgoing.push({ from: lane, to: parentLane, node: true });
-      }
-    } else {
-      lanes[lane] = null;
-    }
-    lanes.forEach((hash, index) => {
-      if (hash === null || index === lane) return;
-      if (outgoing.some((edge) => edge.node && edge.to === index)) return;
-      outgoing.push({ from: index, to: index, node: false });
-    });
-    while (lanes.length && lanes.at(-1) === null) lanes.pop();
-    const laneCount = [...incoming, ...outgoing].reduce(
-      (max, edge) => Math.max(max, edge.from + 1, edge.to + 1),
-      lane + 1,
-    );
-    return { lane, incoming, outgoing, laneCount: Math.min(laneCount, GRAPH_MAX_LANES) };
-  });
-}
-
-function graphLaneX(lane: number): number {
-  return GRAPH_EDGE_PAD + 4.5 + lane * GRAPH_LANE_WIDTH;
-}
-
-function graphEdgePath(edge: CommitGraphEdge, half: "top" | "bottom"): string {
-  const from = graphLaneX(edge.from);
-  const to = graphLaneX(edge.to);
-  const mid = GRAPH_ROW_HEIGHT / 2;
-  if (half === "top") {
-    if (!edge.node || edge.from === edge.to) return `M ${from} 0 L ${from} ${mid}`;
-    return `M ${from} 0 C ${from} ${mid - 4}, ${to} ${mid - 12}, ${to} ${mid}`;
-  }
-  if (!edge.node || edge.from === edge.to) return `M ${from} ${mid} L ${from} ${GRAPH_ROW_HEIGHT}`;
-  return `M ${from} ${mid} C ${to} ${mid + 12}, ${to} ${mid + 4}, ${to} ${GRAPH_ROW_HEIGHT}`;
-}
-
-function CommitGraphCell({
-  row,
-  current,
-  unpushed,
-  merge,
-  tooltip,
-}: {
-  row: CommitGraphRow;
-  current: boolean;
-  unpushed: boolean;
-  merge: boolean;
-  tooltip: string;
-}) {
-  const width = row.laneCount * GRAPH_LANE_WIDTH + GRAPH_EDGE_PAD * 2;
-  const laneColor = GRAPH_LANE_COLORS[row.lane % GRAPH_LANE_COLORS.length];
-  const edges = [
-    ...row.incoming.map((edge) => ({ edge, half: "top" as const })),
-    ...row.outgoing.map((edge) => ({ edge, half: "bottom" as const })),
-  ].filter(({ edge }) => edge.from < GRAPH_MAX_LANES && edge.to < GRAPH_MAX_LANES);
-  return (
-    <Tooltip label={tooltip} placement="right">
-      <svg
-        className="commit-graph-cell"
-        width={width}
-        height={GRAPH_ROW_HEIGHT}
-        viewBox={`0 0 ${width} ${GRAPH_ROW_HEIGHT}`}
-        role="img"
-        aria-label={tooltip}
-      >
-        {edges.map(({ edge, half }, index) => (
-          <path
-            key={`${half}-${index}`}
-            d={graphEdgePath(edge, half)}
-            fill="none"
-            stroke={GRAPH_LANE_COLORS[Math.max(edge.from, edge.to) % GRAPH_LANE_COLORS.length]}
-            strokeWidth="1.5"
-          />
-        ))}
-        {current ? (
-          <circle
-            cx={graphLaneX(row.lane)}
-            cy={GRAPH_ROW_HEIGHT / 2}
-            r={5.6}
-            fill="none"
-            stroke={laneColor}
-            strokeWidth="1"
-            opacity="0.45"
-          />
-        ) : null}
-        <circle
-          className="commit-graph-node"
-          cx={graphLaneX(row.lane)}
-          cy={GRAPH_ROW_HEIGHT / 2}
-          r={3.4}
-          fill={unpushed ? "var(--color-rail)" : laneColor}
-          stroke={laneColor}
-          strokeWidth="1.6"
-        />
-        {merge ? (
-          <circle
-            cx={graphLaneX(row.lane)}
-            cy={GRAPH_ROW_HEIGHT / 2}
-            r={1.3}
-            fill={unpushed ? laneColor : "var(--color-rail)"}
-          />
-        ) : null}
-      </svg>
-    </Tooltip>
-  );
-}
-
-interface CommitRefChip {
-  label: string;
-  kind: "local" | "remote" | "tag" | "more";
-  title?: string;
-}
-
-/**
- * Collapse raw `%D` decorations into at most two low-noise chips: drop
- * `<remote>/HEAD` pointers, drop the current branch (the Graph header and
- * tip node already say where it is — including its remote twin when it sits
- * on the same commit), fold any other local branch with its remote-tracking
- * twin into one chip, and fold anything past two into a `+n` chip whose
- * tooltip lists the rest.
- */
-function collapseCommitRefs(refs: string[], upstream: string, branch: string): CommitRefChip[] {
-  const remote = upstream.includes("/") ? `${upstream.split("/")[0]}/` : "origin/";
-  const names = refs.filter((name) => !name.endsWith("/HEAD"));
-  const consumed = new Set<string>();
-  if (names.includes(branch)) {
-    consumed.add(branch);
-    consumed.add(`${remote}${branch}`);
-    consumed.add(`origin/${branch}`);
-  }
-  const chips: CommitRefChip[] = [];
-  for (const name of names) {
-    if (consumed.has(name)) continue;
-    if (name.startsWith("tag: ")) {
-      chips.push({ label: name.slice(5), kind: "tag" });
-      continue;
-    }
-    if (name.startsWith(remote) || name.startsWith("origin/")) {
-      chips.push({ label: name, kind: "remote" });
-      continue;
-    }
-    const twin = names.find(
-      (candidate) => candidate === `${remote}${name}` || candidate === `origin/${name}`,
-    );
-    if (twin) consumed.add(twin);
-    chips.push({ label: name, kind: "local", title: twin ? `${name} · also at ${twin}` : name });
-  }
-  if (chips.length > 2) {
-    const extra = chips.splice(2);
-    chips.push({
-      label: `+${extra.length}`,
-      kind: "more",
-      title: extra.map((chip) => chip.label).join(", "),
-    });
-  }
-  return chips;
-}
-
 interface RightRailProps {
   git: GitSnapshot;
   /** True while the selected folder is being checked for an existing repository.
@@ -333,6 +114,8 @@ interface RightRailProps {
   children: ChildAgent[];
   /** Live delegated subagents from the native broker; overrides `children`. */
   delegations?: DelegationView[];
+  /** Reconciles the active lineage when the Agents surface is opened. */
+  onRequestDelegations?: () => void;
   onApproveDelegation?: (delegationId: string) => Promise<void>;
   onDenyDelegation?: (delegationId: string) => Promise<void>;
   onNudgeDelegation?: (delegationId: string, message: string) => Promise<void>;
@@ -2854,7 +2637,11 @@ function FilePanel({
             </button>
           ) : null}
           {onRevealProjectFile ? (
-            <button type="button" role="menuitem" onClick={() => void revealFolder(folderMenu.path)}>
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => void revealFolder(folderMenu.path)}
+            >
               <FolderSearch /> Reveal in File Explorer
             </button>
           ) : null}
@@ -3365,7 +3152,7 @@ export function RightRailShell({
 
 export function RightRail(props: RightRailProps) {
   const [tab, setTab] = useState<RailTab>("git");
-  const { onRequestProjectFiles } = props;
+  const { onRequestDelegations, onRequestProjectFiles } = props;
   // Browser snapshots and test fixtures from before the Git state migration
   // may not yet carry the discriminator or remote list.
   const normalizedGit: GitSnapshot = {
@@ -3376,6 +3163,9 @@ export function RightRail(props: RightRailProps) {
   useEffect(() => {
     if (tab === "files") onRequestProjectFiles?.();
   }, [onRequestProjectFiles, tab]);
+  useEffect(() => {
+    if (tab === "agents") onRequestDelegations?.();
+  }, [onRequestDelegations, tab]);
   const tabs: RightRailTabDefinition[] = [
     {
       id: "git",
@@ -3430,11 +3220,7 @@ export function RightRail(props: RightRailProps) {
       label: "Usage",
       icon: Radio,
       panel: (
-        <UsagePanel
-          usage={props.usage}
-          runtime={props.runtime}
-          subscription={props.subscription}
-        />
+        <UsagePanel usage={props.usage} runtime={props.runtime} subscription={props.subscription} />
       ),
     },
   ];

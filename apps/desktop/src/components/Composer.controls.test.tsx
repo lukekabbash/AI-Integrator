@@ -229,6 +229,71 @@ describe("Composer compact controls", () => {
     );
   });
 
+  it("applies a late-loaded delegation default until the user chooses a mode", async () => {
+    mockModelCatalog(() => [{ id: "gpt-5.6-luna", label: "GPT-5.6 Luna" }]);
+    const props = {
+      runtimes,
+      defaultRuntime: "codex" as const,
+      defaultModel: "gpt-5.6-luna",
+      onSend: vi.fn().mockResolvedValue(true),
+    };
+    const view = render(<Composer {...props} defaultDelegation="off" />);
+
+    view.rerender(<Composer {...props} defaultDelegation="manual" />);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Delegation" })).toHaveTextContent("Manual"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Delegation" }));
+    fireEvent.click(screen.getByRole("option", { name: "Balanced delegation" }));
+    view.rerender(<Composer {...props} defaultDelegation="manual" />);
+
+    expect(screen.getByRole("button", { name: "Delegation" })).toHaveTextContent(
+      "Balanced delegation",
+    );
+  });
+
+  it("restores the saved default after leaving a runtime that cannot delegate", async () => {
+    const antigravity = chatRuntimes.find((runtime) => runtime.id === "antigravity")!;
+    const cursor = chatRuntimes.find((runtime) => runtime.id === "cursor")!;
+    mockModelCatalog((runtime) => [
+      {
+        id: runtime === "cursor" ? "composer" : "Gemini 3.1 Pro",
+        label: runtime === "cursor" ? "Composer" : "Gemini 3.1 Pro",
+      },
+    ]);
+
+    render(
+      <Composer
+        runtimes={[antigravity, cursor]}
+        defaultRuntime="antigravity"
+        defaultModel="Gemini 3.1 Pro"
+        defaultDelegation="manual"
+        initialDraft={{
+          prompt: "",
+          attachments: [],
+          runtime: "antigravity",
+          model: "Gemini 3.1 Pro",
+          permission: "project-write",
+          delegation: "off",
+          selectionStart: 0,
+          selectionEnd: 0,
+        }}
+        onSend={vi.fn().mockResolvedValue(true)}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "Delegation unavailable for this runtime" }),
+    ).toHaveTextContent("No delegation");
+    fireEvent.click(screen.getByRole("button", { name: "Runtime" }));
+    fireEvent.click(screen.getByRole("option", { name: "Cursor" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Delegation" })).toHaveTextContent("Manual"),
+    );
+  });
+
   it("replaces a legacy provider-default route with the discovered model", async () => {
     mockModelCatalog(() => [{ id: "gpt-5.6-luna", label: "GPT-5.6 Luna" }]);
     const onRoutingChange = vi.fn();

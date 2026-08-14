@@ -1,0 +1,110 @@
+{
+  "maxNewProductionLines": 1000,
+  "maxNewTestLines": 1500,
+  "allowedNativeCommandsImports": ["apps/desktop/src-tauri/src/delegation.rs"],
+  "exceptions": [
+    { "path": "apps/desktop/src/styles.css", "maxLines": 16172 },
+    { "path": "apps/desktop/src-tauri/src/commands.rs", "maxLines": 8464 },
+    { "path": "apps/desktop/src/App.tsx", "maxLines": 7405 },
+    {
+      "path": "apps/desktop/src/components/SettingsView.tsx",
+      "maxLines": 5837
+    },
+    { "path": "apps/desktop/src/bridge.ts", "maxLines": 6692 },
+    { "path": "apps/desktop/src-tauri/src/delegation.rs", "maxLines": 4438 },
+    { "path": "apps/desktop/src/components/RightRail.tsx", "maxLines": 3237 },
+    { "path": "apps/desktop/src/App.runtime.test.tsx", "maxLines": 3259 },
+    { "path": "apps/desktop/src/bridge.test.ts", "maxLines": 2768 },
+    { "path": "crates/session-store/src/tests.rs", "maxLines": 2465 },
+    { "path": "apps/desktop/src/components/Transcript.tsx", "maxLines": 2435 },
+    { "path": "apps/desktop/src/runtimeProjection.test.ts", "maxLines": 2227 },
+    { "path": "apps/desktop/src/components/Composer.tsx", "maxLines": 2069 },
+    { "path": "apps/desktop/src/theme.ts", "maxLines": 1853 },
+    {
+      "path": "crates/session-store/src/projection_store/tests.rs",
+      "maxLines": 1803
+    },
+    { "path": "apps/desktop/src/components/TaskSidebar.tsx", "maxLines": 1691 },
+    { "path": "crates/adapter-acp/src/lib.rs", "maxLines": 1535 },
+    {
+      "path": "apps/desktop/src/components/Transcript.test.tsx",
+      "maxLines": 1447
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/integrator_mcp.rs",
+      "maxLines": 1414
+    },
+    { "path": "apps/desktop/src/runtimeProjection.ts", "maxLines": 1392 },
+    { "path": "crates/adapter-codex/src/lib.rs", "maxLines": 1333 },
+    {
+      "path": "apps/desktop/src-tauri/src/commands_tests.rs",
+      "maxLines": 1281
+    },
+    {
+      "path": "apps/desktop/src/components/SubagentsSettings.tsx",
+      "maxLines": 1292
+    },
+    { "path": "crates/integrator-core/src/domain.rs", "maxLines": 1179 },
+    {
+      "path": "apps/desktop/src-tauri/src/integrator_skills.rs",
+      "maxLines": 1169
+    },
+    { "path": "apps/desktop/src-tauri/src/chat_title.rs", "maxLines": 1130 },
+    { "path": "apps/desktop/src/components/FileView.tsx", "maxLines": 1089 },
+    { "path": "apps/desktop/src-tauri/src/mcp_oauth.rs", "maxLines": 1077 },
+    {
+      "path": "crates/session-store/src/delegation_store.rs",
+      "maxLines": 1076
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/native_actions.rs",
+      "maxLines": 1045
+    },
+    {
+      "path": "apps/desktop/src/components/ScheduledView.tsx",
+      "maxLines": 1021
+    }
+  ],
+  "allowedBridgeImports": [
+    "apps/desktop/src/App.tsx",
+    "apps/desktop/src/appTurnState.ts",
+    "apps/desktop/src/automationTranscript.ts",
+    "apps/desktop/src/automationTurnPrompt.ts",
+    "apps/desktop/src/commitMessageSettings.ts",
+    "apps/desktop/src/components/AgentGlyph.tsx",
+    "apps/desktop/src/components/commitGraphModel.ts",
+    "apps/desktop/src/components/Composer.tsx",
+    "apps/desktop/src/components/composerModel.ts",
+    "apps/desktop/src/components/DeleteArchivedChatsModal.tsx",
+    "apps/desktop/src/components/DeleteChatModal.tsx",
+    "apps/desktop/src/components/DeleteProjectModal.tsx",
+    "apps/desktop/src/components/DiffView.tsx",
+    "apps/desktop/src/components/FileView.tsx",
+    "apps/desktop/src/components/fileViewSupport.ts",
+    "apps/desktop/src/components/GitRemoteDialog.tsx",
+    "apps/desktop/src/components/McpActivationDialog.tsx",
+    "apps/desktop/src/components/nativeActionCache.ts",
+    "apps/desktop/src/components/RightRail.tsx",
+    "apps/desktop/src/components/RuntimeSetupTerminal.tsx",
+    "apps/desktop/src/components/ScheduledView.tsx",
+    "apps/desktop/src/components/SettingsView.tsx",
+    "apps/desktop/src/components/SetupView.tsx",
+    "apps/desktop/src/components/SubagentConversation.tsx",
+    "apps/desktop/src/components/SubagentsSettings.tsx",
+    "apps/desktop/src/components/TaskSidebar.tsx",
+    "apps/desktop/src/components/taskSidebarModel.ts",
+    "apps/desktop/src/components/TaskStatusPill.tsx",
+    "apps/desktop/src/components/TerminalDrawer.tsx",
+    "apps/desktop/src/components/Transcript.tsx",
+    "apps/desktop/src/components/transcriptEventIndex.ts",
+    "apps/desktop/src/composerDraftStore.ts",
+    "apps/desktop/src/demoData.ts",
+    "apps/desktop/src/explainSettings.ts",
+    "apps/desktop/src/gitDecoration.ts",
+    "apps/desktop/src/gitSnapshot.ts",
+    "apps/desktop/src/mcpSettings.ts",
+    "apps/desktop/src/routingDefaults.ts",
+    "apps/desktop/src/runtimeProjection.ts",
+    "apps/desktop/src/skillsSettings.ts"
+  ]
+}

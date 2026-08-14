@@ -13,10 +13,10 @@ use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
 use crate::{
+    command_api::{CommandError, CommandResult},
     commands::{
-        AcpLaunchProfile, CommandError, CommandResult, acp_launch_arguments_with_route,
-        acp_launch_environment, apply_chat_codex_policy, authenticate_acp_provider,
-        enforce_chat_acp_client_mode,
+        AcpLaunchProfile, acp_launch_arguments_with_route, acp_launch_environment,
+        apply_chat_codex_policy, authenticate_acp_provider, enforce_chat_acp_client_mode,
     },
     provider_routing::{is_worth_failing_over, provider_chain},
     state::AppState,

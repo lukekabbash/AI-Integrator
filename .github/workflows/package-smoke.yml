@@ -37,3 +37,4 @@ jobs:
         working-directory: apps/desktop
       - run: npm run tauri -- build --target ${{ matrix.target }} --no-bundle
         working-directory: apps/desktop
+      - run: node scripts/check-bundled-skills.mjs --resource-root target/${{ matrix.target }}/release

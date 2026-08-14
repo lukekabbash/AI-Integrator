@@ -50,6 +50,7 @@ use tokio::{
 
 use crate::{
     chat_title::{format_subagent_title, generate_subagent_title},
+    interrupted_turn::{INTERRUPTED_RESUME_VISIBLE_PROMPT, interrupted_resume_wire_prompt},
     state::{
         AcpRuntime, AcpSessionSpec, AppState, CodexRuntime, DelegationChild, DelegationChildDriver,
         StructuredRuntime,
@@ -63,22 +64,6 @@ const CHILD_DIGEST_OPTIONS: session_store::HandoffDigestOptions =
         max_turns: session_store::HANDOFF_DEFAULT_MAX_TURNS,
         max_images: session_store::HANDOFF_DEFAULT_MAX_IMAGES,
     };
-const INTERRUPTED_RESUME_VISIBLE_PROMPT: &str = "Resume from here";
-
-fn interrupted_resume_wire_prompt(interrupted_at: Option<chrono::DateTime<chrono::Utc>>) -> String {
-    let resumed_at = chrono::Utc::now();
-    let interrupted = interrupted_at
-        .map(|time| time.to_rfc3339())
-        .unwrap_or_else(|| "an unknown time".into());
-    format!(
-        "You were interrupted at {interrupted}. It is now {} and this session has been resumed.\n\
-         Continue what you were doing as seamlessly as possible for the user.\n\
-         Complete the task assigned in the last user prompt.\n\
-         Do not repeat completed actions. Prefer the current workspace and provider conversation as source of truth if anything changed while you were interrupted.\n\
-         If any external or mutating outcome is uncertain, stop and explain before retrying it.",
-        resumed_at.to_rfc3339()
-    )
-}
 const MAX_LINE_BYTES: usize = 256 * 1024;
 const MAX_SPECIALISTS: usize = 64;
 const MAX_SPECIALIST_CAPABILITIES: usize = 128;
@@ -3726,7 +3711,7 @@ pub fn delegation_views(store: &LocalStore, parent_task_id: TaskId) -> Result<Ve
 // Tauri commands (UI surface)
 // ---------------------------------------------------------------------------
 
-use crate::commands::{CommandError, CommandResult};
+use crate::command_api::{CommandError, CommandResult};
 
 #[tauri::command]
 pub async fn delegation_list(

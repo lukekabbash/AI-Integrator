@@ -1,4 +1,12 @@
 import type { WorkspaceSnapshot } from "./demoData";
+import { runAcpTurnWithRecovery } from "./acpRecovery";
+import {
+  formatBridgeError,
+  isAcpConnectionError,
+  isCodexConnectionError,
+  isMissingCodexThreadError,
+  isStaleProviderResumeError,
+} from "./bridgeErrors";
 import {
   createDemoSnapshot,
   createEmptySnapshot,
@@ -7,6 +15,8 @@ import {
 } from "./demoData";
 import { prettyModelLabel, resolveModelLabel } from "./modelLabel";
 import type { SpecialistSetting } from "./subagentSettings";
+
+export { formatBridgeError };
 
 export type RuntimeId = "codex" | "cursor" | "claude" | "grok" | "kimi" | "antigravity" | "custom";
 export type TaskStatus =
@@ -2259,19 +2269,6 @@ function isDeepLinkedWindow(): boolean {
   return typeof window !== "undefined" && new URLSearchParams(window.location.search).has("taskId");
 }
 
-export function formatBridgeError(error: unknown, fallback: string): string {
-  if (error instanceof Error && error.message.trim()) return error.message;
-  if (typeof error === "string" && error.trim()) return error;
-  if (error && typeof error === "object") {
-    const value = error as { code?: unknown; message?: unknown };
-    const message = typeof value.message === "string" ? value.message.trim() : "";
-    const code = typeof value.code === "string" ? value.code.trim() : "";
-    if (message && code) return `${message} (${code})`;
-    if (message) return message;
-  }
-  return fallback;
-}
-
 async function nativeInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   const { invoke } = await import("@tauri-apps/api/core");
   try {
@@ -2911,7 +2908,6 @@ interface StandardAcpState {
   delegations: Map<string, StartTaskInput["delegation"]>;
   selections: Map<string, { model?: string; effort?: string }>;
   connections: Set<string>;
-  queue: Promise<void>;
 }
 const activeAcpProviderByTask = new Map<string, AcpRuntimeId>();
 let cursorCatalogConnected = false;
@@ -2920,16 +2916,29 @@ const createStandardAcpState = (): StandardAcpState => ({
   delegations: new Map(),
   selections: new Map(),
   connections: new Set(),
-  queue: Promise.resolve(),
 });
 const standardAcpState: Record<StandardAcpRuntimeId, StandardAcpState> = {
   grok: createStandardAcpState(),
   kimi: createStandardAcpState(),
 };
-// Model discovery and Send can ask for the same ACP session at nearly the
-// same time. Serialize those transitions so a second `acp_connect` cannot
-// replace and shut down the process whose `session/new` is still in flight.
-let cursorSessionQueue: Promise<void> = Promise.resolve();
+// Native ACP ownership is task-scoped, not provider-scoped. Keep connection,
+// session setup, route changes, and prompt admission in one task queue so a
+// Cursor/Kimi probe cannot replace Grok (or vice versa) between commands.
+const acpTaskQueues = new Map<string, Promise<void>>();
+
+function queueAcpTaskTransition<T>(taskId: string, operation: () => Promise<T>): Promise<T> {
+  const previous = acpTaskQueues.get(taskId) ?? Promise.resolve();
+  const result = previous.then(operation);
+  const tail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  acpTaskQueues.set(taskId, tail);
+  void tail.then(() => {
+    if (acpTaskQueues.get(taskId) === tail) acpTaskQueues.delete(taskId);
+  });
+  return result;
+}
 
 /** Cursor only: per-model reasoning parameters from the model-list RPC. */
 let cursorModelParams = new Map<string, CursorModelParams>();
@@ -3046,6 +3055,21 @@ async function certifyAcpSession(taskId: string, runtime: AcpRuntimeId): Promise
   }
 }
 
+async function cachedAcpIsLive(taskId: string, runtime: StandardAcpRuntimeId): Promise<boolean> {
+  try {
+    const capabilities = await nativeInvoke<NativeAcpSessionCapabilities>(
+      "acp_session_capabilities",
+      { taskId },
+    );
+    acpSessionCertification.set(runtime, capabilities);
+    return true;
+  } catch (error) {
+    acpSessionCertification.delete(runtime);
+    if (isAcpConnectionError(error)) return false;
+    throw error;
+  }
+}
+
 async function ensureCursorSessionForTaskUnlocked(
   taskId: string,
   delegation?: StartTaskInput["delegation"],
@@ -3134,25 +3158,6 @@ async function ensureCursorConnectionUnlocked(nativeTaskId: string, cwd: string)
   clearCursorSessionCaches(nativeTaskId);
 }
 
-async function ensureCursorSessionForTask(
-  taskId: string,
-  delegation?: StartTaskInput["delegation"],
-  permission?: StartTaskInput["permission"],
-): Promise<string> {
-  const operation = cursorSessionQueue.then(() =>
-    ensureCursorSessionForTaskUnlocked(taskId, delegation, permission),
-  );
-  cursorSessionQueue = operation.then(
-    () => undefined,
-    () => undefined,
-  );
-  return operation;
-}
-
-async function ensureCursorSession(input: SendTurnInput): Promise<string> {
-  return ensureCursorSessionForTask(input.taskId, input.delegation, input.permission);
-}
-
 async function ensureStandardAcpSessionUnlocked(
   input: SendTurnInput,
   runtime: StandardAcpRuntimeId,
@@ -3169,6 +3174,12 @@ async function ensureStandardAcpSessionUnlocked(
     (appliedSelection?.model !== launchSelection.model ||
       appliedSelection?.effort !== launchSelection.effort),
   );
+  const cachedConnection =
+    state.connections.has(nativeTaskId) && activeAcpProviderByTask.get(nativeTaskId) === runtime;
+  if (cachedConnection && !routingChanged && !(await cachedAcpIsLive(nativeTaskId, runtime))) {
+    // Renderer session hints must not survive a natively exited ACP subprocess.
+    resetStandardAcpConnectionState(runtime, nativeTaskId);
+  }
   if (
     !state.connections.has(nativeTaskId) ||
     activeAcpProviderByTask.get(nativeTaskId) !== runtime ||
@@ -3246,13 +3257,14 @@ async function ensureStandardAcpSession(
   input: SendTurnInput,
   runtime: StandardAcpRuntimeId,
 ): Promise<string> {
-  const state = standardAcpState[runtime];
-  const operation = state.queue.then(() => ensureStandardAcpSessionUnlocked(input, runtime));
-  state.queue = operation.then(
-    () => undefined,
-    () => undefined,
+  return queueAcpTaskTransition(input.taskId, () =>
+    ensureStandardAcpSessionUnlocked(input, runtime),
   );
-  return operation;
+}
+
+function resetStandardAcpAfterFailure(input: SendTurnInput, runtime: StandardAcpRuntimeId): void {
+  resetStandardAcpConnectionState(runtime, nativeTaskIds.get(input.taskId) ?? input.taskId);
+  invalidateModelCatalog(runtime);
 }
 
 /// A model id from the picker that can be forwarded to a provider verbatim.
@@ -3566,15 +3578,10 @@ async function discoverModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEnt
       if (snapshot.activeTaskId) {
         const nativeTaskId = await ensureNativeTask(snapshot.activeTaskId);
         const cwd = repositoryForTask(snapshot.activeTaskId);
-        const operation = cursorSessionQueue.then(async () => {
+        await queueAcpTaskTransition(snapshot.activeTaskId, async () => {
           await ensureCursorConnectionUnlocked(nativeTaskId, cwd);
           await refreshCursorModelParams(nativeTaskId);
         });
-        cursorSessionQueue = operation.then(
-          () => undefined,
-          () => undefined,
-        );
-        await operation;
         const catalog = modelCatalogCache.get("cursor");
         if (catalog?.length) return catalog;
       } else if (!cursorCatalogConnected) {
@@ -3735,31 +3742,6 @@ async function ensureCodexThread(input: SendTurnInput): Promise<string> {
     if (activeCodexThreads.has(existing)) return existing;
   }
   return startNewCodexThread(input, nativeTaskId, cwd);
-}
-
-function isMissingCodexThreadError(error: unknown): boolean {
-  const message = formatBridgeError(error, "").toLowerCase();
-  return (
-    message.includes("no rollout found for thread id") ||
-    message.includes("no longer the active resumable session") ||
-    /(?:thread|rollout).*(?:not found|does not exist|unknown)/i.test(message)
-  );
-}
-
-function isStaleProviderResumeError(error: unknown): boolean {
-  const message = formatBridgeError(error, "").toLowerCase();
-  return (
-    message.includes("no saved provider session") ||
-    message.includes("predates the current mcp configuration") ||
-    message.includes("no longer the active resumable session")
-  );
-}
-
-function isCodexConnectionError(error: unknown): boolean {
-  const message = formatBridgeError(error, "").toLowerCase();
-  return /provider-disconnected|transport (?:closed|failed)|broken pipe|app-server.*(?:closed|exited)/i.test(
-    message,
-  );
 }
 
 function forgetCodexThread(taskId: string, nativeTaskId: string, threadId: string): void {
@@ -4691,7 +4673,9 @@ export const bridge: AppBridge = {
 
   prepareAcpRuntime: async (input) => {
     if (!isTauri()) return;
-    if (input.runtime !== "grok" && input.runtime !== "kimi") return;
+    // Kimi exposes its model catalog through session/new. Grok has a dedicated
+    // read-only model probe and must launch only inside prompt admission.
+    if (input.runtime !== "kimi") return;
     await ensureStandardAcpSession(
       {
         taskId: input.taskId,
@@ -4699,7 +4683,7 @@ export const bridge: AppBridge = {
         runtime: input.runtime,
         model: input.model || PROVIDER_DEFAULT_MODEL,
         effort: input.effort,
-        permission: input.permission ?? (input.runtime === "grok" ? "project-write" : "ask"),
+        permission: input.permission ?? "ask",
         delegation: input.delegation ?? "off",
       },
       input.runtime,
@@ -6183,45 +6167,51 @@ export const bridge: AppBridge = {
           throw error;
         }
       } else if (routedInput.runtime === "cursor") {
-        try {
-          const taskId = await ensureCursorSession(routedInput);
-          await applyCursorSelection(taskId, routedInput);
-          await nativeInvoke("acp_send_turn", {
-            taskId,
-            prompt: routedInput.prompt,
-            delegation: routedInput.delegation,
-            nativeActionId: routedInput.nativeActionId,
-            contextReferences: routedInput.contextReferences,
-            resumeInterrupted: routedInput.resumeInterrupted,
-            ...attachmentArgs,
-          });
-        } catch (error) {
-          resetCursorConnectionState(routedInput.taskId);
-          invalidateModelCatalog("cursor");
-          throw error;
-        }
+        await queueAcpTaskTransition(routedInput.taskId, async () => {
+          try {
+            const taskId = await ensureCursorSessionForTaskUnlocked(
+              routedInput.taskId,
+              routedInput.delegation,
+              routedInput.permission,
+            );
+            await applyCursorSelection(taskId, routedInput);
+            await nativeInvoke("acp_send_turn", {
+              taskId,
+              prompt: routedInput.prompt,
+              delegation: routedInput.delegation,
+              nativeActionId: routedInput.nativeActionId,
+              contextReferences: routedInput.contextReferences,
+              resumeInterrupted: routedInput.resumeInterrupted,
+              ...attachmentArgs,
+            });
+          } catch (error) {
+            resetCursorConnectionState(routedInput.taskId);
+            invalidateModelCatalog("cursor");
+            throw error;
+          }
+        });
       } else if (routedInput.runtime === "grok" || routedInput.runtime === "kimi") {
         const runtime = routedInput.runtime;
-        try {
-          const taskId = await ensureStandardAcpSession(routedInput, runtime);
-          if (runtime === "kimi") await applyKimiSelection(taskId, routedInput);
-          await nativeInvoke("acp_send_turn", {
-            taskId,
-            prompt: routedInput.prompt,
-            delegation: routedInput.delegation,
-            nativeActionId: routedInput.nativeActionId,
-            contextReferences: routedInput.contextReferences,
-            resumeInterrupted: routedInput.resumeInterrupted,
-            ...attachmentArgs,
-          });
-        } catch (error) {
-          resetStandardAcpConnectionState(
-            runtime,
-            nativeTaskIds.get(routedInput.taskId) ?? routedInput.taskId,
-          );
-          invalidateModelCatalog(runtime);
-          throw error;
-        }
+        await queueAcpTaskTransition(routedInput.taskId, () =>
+          runAcpTurnWithRecovery({
+            setup: async () => {
+              const taskId = await ensureStandardAcpSessionUnlocked(routedInput, runtime);
+              if (runtime === "kimi") await applyKimiSelection(taskId, routedInput);
+              return taskId;
+            },
+            submit: (taskId) =>
+              nativeInvoke("acp_send_turn", {
+                taskId,
+                prompt: routedInput.prompt,
+                delegation: routedInput.delegation,
+                nativeActionId: routedInput.nativeActionId,
+                contextReferences: routedInput.contextReferences,
+                resumeInterrupted: routedInput.resumeInterrupted,
+                ...attachmentArgs,
+              }),
+            reset: () => resetStandardAcpAfterFailure(routedInput, runtime),
+          }),
+        );
       } else if (routedInput.runtime === "claude" || routedInput.runtime === "antigravity") {
         const taskId = await ensureNativeTask(routedInput.taskId);
         await nativeInvoke("structured_cli_start_turn", {

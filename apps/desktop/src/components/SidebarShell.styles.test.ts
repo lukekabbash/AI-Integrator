@@ -41,6 +41,14 @@ describe("sidebar shell corners", () => {
     );
   });
 
+  it("keeps file context menus on an elevated surface with a defined entrance", () => {
+    const menu = rule(".file-context-menu");
+    expect(menu).toContain("background: var(--color-layer-1)");
+    expect(menu).toContain("box-shadow: var(--shadow-elevated)");
+    expect(menu).toContain("animation: context-menu-in var(--duration-fast) var(--ease-standard)");
+    expect(styles).toContain("@keyframes context-menu-in {\n  from {");
+  });
+
   it("reserves the open sidebar width so the chat title keeps its canvas edge", () => {
     expect(rule('[data-sidebar-visible="true"] .titlebar-brand-mini')).toContain(
       "width: calc(var(--sidebar-width, 272px) - 18px)",
@@ -110,8 +118,6 @@ describe("sidebar shell corners", () => {
     expect(rule(".sidebar-collection-clip")).toContain(
       "grid-template-rows 220ms cubic-bezier(0.2, 0.8, 0.2, 1)",
     );
-    expect(rule('.sidebar-collection-clip[data-open="true"]')).toContain(
-      "grid-template-rows: 1fr",
-    );
+    expect(rule('.sidebar-collection-clip[data-open="true"]')).toContain("grid-template-rows: 1fr");
   });
 });

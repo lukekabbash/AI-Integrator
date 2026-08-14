@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::{
     chat_title::{HelperRoute, generate_isolated_provider_text_routed},
     code_explain::ExplainRoute,
-    commands::{CommandError, CommandResult},
+    command_api::{CommandError, CommandResult},
     integrator_mcp, integrator_skills,
     provider_routing::{is_worth_failing_over, provider_chain},
     state::AppState,

@@ -23,6 +23,8 @@ jobs:
       - run: npm ci
       - run: npm run check:docs
       - run: npm run check:bridge
+      - run: npm run check:bundled-skills
+      - run: npm run check:maintainability
       - run: npm ci
         working-directory: apps/desktop
       - run: npm run check

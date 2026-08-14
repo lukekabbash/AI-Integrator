@@ -1,29 +1,45 @@
 #![forbid(unsafe_code)]
 
 mod antigravity_hooks;
+mod app_commands;
 mod automations;
 mod broker_mcp;
 mod chat_title;
 mod code_explain;
+mod command_api;
 mod commands;
 mod commit_message;
+mod context_primer;
 mod credential_store;
 mod delegation;
+mod diagnostic_commands;
 mod diagnostic_log;
 mod explain_context;
 mod harness_prompt;
 mod integrator_mcp;
 mod integrator_skills;
+mod interrupted_turn;
+mod local_data_commands;
 mod mcp_oauth;
+mod memory_commands;
 mod native_actions;
+mod native_process;
 mod plugin_preview;
+mod provider_model_catalog;
 mod provider_routing;
+mod provider_usage;
+mod queue_commands;
 mod repository_watch;
 mod runtime_setup;
+mod settings_commands;
 mod skill_api;
 mod specialist_generator;
 mod state;
+mod structured_projection;
+mod task_commands;
+mod terminal_process;
 
+use app_commands::{app_bootstrap, open_external_url, open_task_window};
 use automations::{
     automation_cancel, automation_create, automation_finish_run, automation_list,
     automation_pending_dispatches, automation_run_list, automation_run_now, automation_set_paused,
@@ -37,6 +53,9 @@ use delegation::{
     delegation_approve, delegation_deny, delegation_list, delegation_send_message,
     delegation_stop_cmd,
 };
+use diagnostic_commands::{
+    diagnostics_report, logs_clear, logs_open_folder, logs_prune, logs_totals,
+};
 use integrator_mcp::{
     integrator_mcp_credential_clear, integrator_mcp_credential_set, integrator_mcp_import,
     integrator_mcp_oauth_connect, integrator_mcp_oauth_disconnect, integrator_mcp_overview,
@@ -46,14 +65,19 @@ use integrator_skills::{
     integrator_skill_body, integrator_skill_credential_clear, integrator_skill_credential_set,
     integrator_skills_install, integrator_skills_overview, integrator_skills_uninstall,
 };
+use local_data_commands::*;
+use memory_commands::*;
 use plugin_preview::{integrator_skill_preview_body, integrator_skills_preview};
+use queue_commands::*;
 use repository_watch::{repository_watch_start, repository_watch_stop};
 use runtime_setup::{
     runtime_action_plan_list, runtime_terminal_close, runtime_terminal_open,
     runtime_terminal_resize, runtime_terminal_write,
 };
+use settings_commands::{setting_list, setting_set};
 use specialist_generator::specialist_generate;
 use state::AppState;
+use task_commands::*;
 use tauri::Manager;
 
 /// `--broker-mcp` mode: run the stdio MCP bridge instead of the app. Spawned

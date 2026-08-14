@@ -14,7 +14,6 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   Archive,
-  ArchiveRestore,
   ArrowLeft,
   Bot,
   Brain,
@@ -39,7 +38,6 @@ import {
   Palette,
   Plus,
   RefreshCw,
-  RotateCcw,
   Save,
   Search,
   Server,
@@ -88,24 +86,24 @@ import {
   type VoiceTypingCredentialStatus,
 } from "../bridge";
 import {
-  CODE_FONT_CHOICES,
   exportThemePreferences,
-  getThemePreset,
   importThemePreferences,
-  INTERFACE_FONT_CHOICES,
-  THEME_COLOR_TOKENS,
-  THEME_PRESET_GRID_ORDER,
-  type ThemeColorToken,
   type ThemePreferencePatch,
   type ThemePreferences,
 } from "../theme";
+import { AppearanceSettings } from "./AppearanceSettings";
+import { ArchiveSettings } from "./ArchiveSettings";
 import { BrandMark } from "./BrandMark";
+import { ComposerSettings } from "./ComposerSettings";
 import { Tooltip } from "./Tooltip";
 import { Dropdown, ProviderIcon, type DropdownOption } from "./Dropdown";
 import { Slider } from "./Slider";
 import { RuntimeSetupTerminal } from "./RuntimeSetupTerminal";
 import { McpActivationDialog, type McpActivationRequest } from "./McpActivationDialog";
+import { PermissionsSettings } from "./PermissionsSettings";
 import { SubagentsSettings } from "./SubagentsSettings";
+import { SettingRow, Switch } from "./SettingControls";
+import { readSetting, type SettingsMap } from "./settingsModel";
 import { DEFAULT_SPECIALISTS } from "../subagentSettings";
 import {
   normalizeRuntimeRouteDefaults,
@@ -240,8 +238,6 @@ const settingsNav: Array<{ id: SettingsSection; label: string; hint: string; ico
   { id: "archive", label: "Archives", hint: "Browse, restore, and clean up", icon: Archive },
 ];
 
-type SettingsMap = Record<string, unknown>;
-
 /**
  * Every key here is consumed by real behavior: workspace restore and the
  * external-link confirmation live in the bridge, the composer defaults are
@@ -304,64 +300,6 @@ const DEFAULT_SETTINGS: SettingsMap = {
   "delegation.instruction": "",
   "delegation.profiles": DEFAULT_SPECIALISTS,
 };
-
-function readSetting<T>(settings: SettingsMap, key: string, fallback: T): T {
-  return (key in settings ? settings[key] : fallback) as T;
-}
-
-function SettingRow({
-  label,
-  description,
-  icon,
-  children,
-}: {
-  label: string;
-  description: string;
-  icon?: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="setting-row" data-has-icon={icon ? true : undefined}>
-      {icon ? (
-        <span className="setting-row-icon" aria-hidden>
-          {icon}
-        </span>
-      ) : null}
-      <span>
-        <strong>{label}</strong>
-        <small>{description}</small>
-      </span>
-      <div className="setting-control">{children}</div>
-    </div>
-  );
-}
-
-function Switch({
-  checked,
-  onChange,
-  label,
-  disabled = false,
-}: {
-  checked: boolean;
-  onChange: (value: boolean) => void;
-  label: string;
-  disabled?: boolean;
-}) {
-  return (
-    <button
-      className="switch"
-      type="button"
-      role="switch"
-      disabled={disabled}
-      aria-checked={checked}
-      aria-label={label}
-      onClick={() => onChange(!checked)}
-      data-checked={checked}
-    >
-      <span />
-    </button>
-  );
-}
 
 /**
  * Delegation policy for the native broker: which agents an orchestrator may
@@ -2915,419 +2853,6 @@ function SkillsSettings({
   );
 }
 
-function AppearanceSettings({
-  preferences,
-  onChange,
-  onReset,
-}: Pick<SettingsViewProps, "preferences" | "onResetPreferences"> & {
-  onChange: SettingsViewProps["onChangePreferences"];
-  onReset: () => void;
-}) {
-  const preset = getThemePreset(preferences.themeId);
-  const colors = useMemo(
-    () => ({ ...preset.colors, ...preferences.colorOverrides }),
-    [preset.colors, preferences.colorOverrides],
-  );
-  const contrastRatio = (foreground: string, background: string): number | null => {
-    const parse = (value: string) => {
-      const match = value.match(/^#([\da-f]{6})/i);
-      if (!match) return null;
-      return [0, 2, 4].map((offset) => Number.parseInt(match[1].slice(offset, offset + 2), 16));
-    };
-    const fg = parse(foreground);
-    const bg = parse(background);
-    if (!fg || !bg) return null;
-    const luminance = (rgb: number[]) =>
-      rgb
-        .map((channel) => channel / 255)
-        .map((channel) =>
-          channel <= 0.03928 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4,
-        )
-        .reduce((sum, channel, index) => sum + channel * [0.2126, 0.7152, 0.0722][index], 0);
-    const light = Math.max(luminance(fg), luminance(bg));
-    const dark = Math.min(luminance(fg), luminance(bg));
-    return (light + 0.05) / (dark + 0.05);
-  };
-  const contrastWarnings = (
-    [
-      ["text.primary", "surface.canvas"],
-      ["text.secondary", "surface.canvas"],
-      ["accent.text", "accent.primary"],
-      ["focus.ring", "surface.canvas"],
-    ] as Array<[ThemeColorToken, ThemeColorToken]>
-  ).filter(
-    ([foreground, background]) =>
-      (contrastRatio(colors[foreground], colors[background]) ?? 7) < 4.5,
-  );
-  const updateColor = (token: ThemeColorToken, value: string) =>
-    onChange({ colorOverrides: { ...preferences.colorOverrides, [token]: value } });
-  const resetColor = (token: ThemeColorToken) => {
-    const next = { ...preferences.colorOverrides };
-    delete next[token];
-    onChange({ colorOverrides: next });
-  };
-  return (
-    <>
-      <div className="settings-page-heading">
-        <span>
-          <Palette />
-        </span>
-        <div>
-          <h1>Appearance</h1>
-          <p>Theme, fonts, density, motion, and semantic color overrides.</p>
-        </div>
-        <button className="secondary-button" type="button" onClick={onReset}>
-          <RotateCcw /> Reset
-        </button>
-      </div>
-      <section className="settings-section">
-        <header>
-          <h2>Theme preset</h2>
-          <p>The color palette used across the whole workspace.</p>
-        </header>
-        <div className="theme-grid" role="radiogroup" aria-label="Theme preset">
-          {THEME_PRESET_GRID_ORDER.map((themeId) => {
-            const theme = getThemePreset(themeId);
-            const previewDetail =
-              theme.colors["accent.secondary"] === theme.colors["accent.primary"]
-                ? theme.colors["diff.addedStrong"]
-                : theme.colors["accent.secondary"];
-            return (
-              <button
-                className="theme-swatch"
-                type="button"
-                role="radio"
-                aria-checked={preferences.themeId === theme.id}
-                data-active={preferences.themeId === theme.id}
-                onClick={() => onChange({ themeId: theme.id })}
-                key={theme.id}
-              >
-                <span
-                  className="theme-preview"
-                  style={{
-                    background: theme.colors["surface.canvas"],
-                    borderColor: theme.colors["border.strong"],
-                  }}
-                >
-                  <i style={{ background: theme.colors["surface.rail"] }} />
-                  <b style={{ background: theme.colors["surface.layer1"] }} />
-                  <em style={{ background: theme.colors["accent.primary"] }} />
-                  <small style={{ background: previewDetail }} />
-                </span>
-                <span>
-                  <strong>{theme.label}</strong>
-                  <small>{theme.appearance}</small>
-                </span>
-                {preferences.themeId === theme.id ? <Check /> : null}
-              </button>
-            );
-          })}
-        </div>
-      </section>
-      <section className="settings-section">
-        <header>
-          <h2>Type</h2>
-          <p>
-            Interface and code fonts are independent. Unsupported choices fall back to a native
-            stack.
-          </p>
-        </header>
-        <SettingRow
-          label="Interface font"
-          description="Navigation, transcripts, settings, and controls."
-        >
-          <Dropdown
-            aria-label="Interface font"
-            value={preferences.interfaceFont}
-            onChange={(value) =>
-              onChange({ interfaceFont: value as ThemePreferences["interfaceFont"] })
-            }
-            options={INTERFACE_FONT_CHOICES.map((font) => ({ value: font.id, label: font.label }))}
-          />
-        </SettingRow>
-        <SettingRow label="Code font" description="Diffs, terminals, commands, paths, and logs.">
-          <Dropdown
-            aria-label="Code font"
-            value={preferences.codeFont}
-            onChange={(value) => onChange({ codeFont: value as ThemePreferences["codeFont"] })}
-            options={CODE_FONT_CHOICES.map((font) => ({ value: font.id, label: font.label }))}
-          />
-        </SettingRow>
-        <SettingRow
-          label="Interface size"
-          description="Scales body text while compact metadata stays readable."
-        >
-          <div className="range-control">
-            <input
-              type="range"
-              min="12"
-              max="18"
-              step="1"
-              value={preferences.bodySize}
-              onChange={(event) => onChange({ bodySize: Number(event.target.value) })}
-            />
-            <output>{preferences.bodySize}px</output>
-          </div>
-        </SettingRow>
-        <SettingRow label="Code size" description="Used by the review and terminal surfaces.">
-          <div className="range-control">
-            <input
-              type="range"
-              min="11"
-              max="18"
-              step="1"
-              value={preferences.codeSize}
-              onChange={(event) => onChange({ codeSize: Number(event.target.value) })}
-            />
-            <output>{preferences.codeSize}px</output>
-          </div>
-        </SettingRow>
-        <SettingRow
-          label="Code ligatures"
-          description="Keep operator ligatures when the selected font supports them."
-        >
-          <Switch
-            checked={preferences.ligatures}
-            onChange={(ligatures) => onChange({ ligatures })}
-            label="Code ligatures"
-          />
-        </SettingRow>
-      </section>
-      <section className="settings-section">
-        <header>
-          <h2>Geometry and motion</h2>
-          <p>Layout density, sidebar menus, corner radius, animation, and the streaming cursor.</p>
-        </header>
-        <SettingRow
-          label="Density"
-          description="Compact mode fits more work without shrinking readable text."
-        >
-          <div className="segmented">
-            <button
-              type="button"
-              data-active={preferences.density === "comfortable"}
-              onClick={() => onChange({ density: "comfortable" })}
-            >
-              Comfortable
-            </button>
-            <button
-              type="button"
-              data-active={preferences.density === "compact"}
-              onClick={() => onChange({ density: "compact" })}
-            >
-              Compact
-            </button>
-          </div>
-        </SettingRow>
-        <SettingRow
-          label="Sidebar menus"
-          description="Open chat and project ··· menus to the left or right of the trigger."
-        >
-          <div className="segmented">
-            <button
-              type="button"
-              data-active={preferences.sidebarMenuDirection === "left"}
-              onClick={() => onChange({ sidebarMenuDirection: "left" })}
-            >
-              Left
-            </button>
-            <button
-              type="button"
-              data-active={preferences.sidebarMenuDirection === "right"}
-              onClick={() => onChange({ sidebarMenuDirection: "right" })}
-            >
-              Right
-            </button>
-          </div>
-        </SettingRow>
-        <SettingRow
-          label="Corner softness"
-          description="Controls menus, panes, the composer, and common controls."
-        >
-          <div className="segmented">
-            <button
-              type="button"
-              data-active={preferences.radius === "square"}
-              onClick={() => onChange({ radius: "square" })}
-            >
-              Square
-            </button>
-            <button
-              type="button"
-              data-active={preferences.radius === "subtle"}
-              onClick={() => onChange({ radius: "subtle" })}
-            >
-              Subtle
-            </button>
-            <button
-              type="button"
-              data-active={preferences.radius === "soft"}
-              onClick={() => onChange({ radius: "soft" })}
-            >
-              Soft
-            </button>
-            <button
-              type="button"
-              data-active={preferences.radius === "round"}
-              onClick={() => onChange({ radius: "round" })}
-            >
-              Round
-            </button>
-          </div>
-        </SettingRow>
-        <SettingRow
-          label="Motion"
-          description="Reduced and None preserve state without spatial animation."
-        >
-          <Dropdown
-            aria-label="Motion"
-            value={preferences.motion}
-            onChange={(value) => onChange({ motion: value as ThemePreferences["motion"] })}
-            options={[
-              { value: "system", label: "Follow system" },
-              { value: "full", label: "Full" },
-              { value: "reduced", label: "Reduced" },
-              { value: "none", label: "None" },
-            ]}
-          />
-        </SettingRow>
-        <SettingRow
-          label="Streaming cursor"
-          description="A quiet cursor marks the active response; it never simulates thinking."
-        >
-          <Switch
-            checked={preferences.streamingCursor}
-            onChange={(streamingCursor) => onChange({ streamingCursor })}
-            label="Streaming cursor"
-          />
-        </SettingRow>
-      </section>
-      <section className="settings-section">
-        <header>
-          <h2>Typography detail</h2>
-          <p>Font weight, line height, and panel spacing.</p>
-        </header>
-        <SettingRow
-          label="Body weight"
-          description="Increase weight when low-contrast text needs more presence."
-        >
-          <div className="range-control">
-            <input
-              aria-label="Body weight"
-              type="range"
-              min="350"
-              max="700"
-              step="25"
-              value={preferences.bodyWeight}
-              onChange={(event) => onChange({ bodyWeight: Number(event.target.value) })}
-            />
-            <output>{preferences.bodyWeight}</output>
-          </div>
-        </SettingRow>
-        <SettingRow
-          label="Body line height"
-          description="Keeps transcript and settings text comfortable at larger type scales."
-        >
-          <div className="range-control">
-            <input
-              aria-label="Body line height"
-              type="range"
-              min="1.25"
-              max="2"
-              step="0.05"
-              value={preferences.bodyLineHeight}
-              onChange={(event) => onChange({ bodyLineHeight: Number(event.target.value) })}
-            />
-            <output>{preferences.bodyLineHeight.toFixed(2)}</output>
-          </div>
-        </SettingRow>
-        <SettingRow
-          label="Code line height"
-          description="Balances dense diffs and terminal readability."
-        >
-          <div className="range-control">
-            <input
-              aria-label="Code line height"
-              type="range"
-              min="1.2"
-              max="2"
-              step="0.05"
-              value={preferences.codeLineHeight}
-              onChange={(event) => onChange({ codeLineHeight: Number(event.target.value) })}
-            />
-            <output>{preferences.codeLineHeight.toFixed(2)}</output>
-          </div>
-        </SettingRow>
-        <SettingRow
-          label="Panel spacing"
-          description="Controls the breathing room between grouped surfaces."
-        >
-          <Dropdown
-            aria-label="Panel spacing"
-            value={preferences.panelSpacing}
-            onChange={(value) =>
-              onChange({ panelSpacing: value as ThemePreferences["panelSpacing"] })
-            }
-            options={[
-              { value: "tight", label: "Tight" },
-              { value: "balanced", label: "Balanced" },
-              { value: "airy", label: "Airy" },
-            ]}
-          />
-        </SettingRow>
-      </section>
-      <section className="settings-section">
-        <header>
-          <h2>Semantic color overrides</h2>
-          <p>Override individual UI colors. Each token previews live and can be reset.</p>
-        </header>
-        <div
-          className={`settings-callout ${contrastWarnings.length ? "settings-callout--warning" : "settings-callout--success"}`}
-          role="status"
-        >
-          {contrastWarnings.length ? <RotateCcw /> : <Check />}
-          <span>
-            <strong>
-              {contrastWarnings.length ? "Contrast needs attention" : "Contrast preview passes"}
-            </strong>
-            <small>
-              {contrastWarnings.length
-                ? `${contrastWarnings.length} token pair(s) are below the 4.5:1 normal-text target.`
-                : "Primary text, accent controls, and focus ring meet the current text target."}
-            </small>
-          </span>
-        </div>
-        <div className="color-token-grid">
-          {THEME_COLOR_TOKENS.map((token) => (
-            <div className="color-token-row" key={token}>
-              <span className="color-token-swatch" style={{ background: colors[token] }} />
-              <code>{token}</code>
-              <input
-                aria-label={`${token} color`}
-                type="color"
-                value={
-                  colors[token].startsWith("#")
-                    ? colors[token].slice(0, 7)
-                    : preset.colors["surface.canvas"].slice(0, 7)
-                }
-                onChange={(event) => updateColor(token, event.target.value)}
-              />
-              <button
-                className="text-button"
-                type="button"
-                onClick={() => resetColor(token)}
-                disabled={preferences.colorOverrides[token] === undefined}
-              >
-                Reset
-              </button>
-            </div>
-          ))}
-        </div>
-      </section>
-    </>
-  );
-}
-
 function runtimeConnectionForRequest(
   runtimes: RuntimeConnection[],
   runtimeId: RuntimeId,
@@ -4441,7 +3966,10 @@ function DiagnosticLogsSettings({
           options={LOG_RETENTION_OPTIONS}
           onChange={(value) => {
             setSetting("diagnostics.retention", value);
-            void bridge.pruneLogs().then(refreshTotals).catch(() => undefined);
+            void bridge
+              .pruneLogs()
+              .then(refreshTotals)
+              .catch(() => undefined);
           }}
         />
       </SettingRow>
@@ -5042,262 +4570,129 @@ function PolicySettings({
   onClear,
   actionMessage,
 }: PolicySettingsProps) {
-  const page = {
-    general: {
-      icon: MonitorCog,
-      title: "General",
-      subtitle: "Startup behavior, voice typing, and where local data is stored and exported.",
-    },
-    composer: {
-      icon: Braces,
-      title: "Composer",
-      subtitle: "What the Enter key does, and which metadata appears above transcript replies.",
-    },
-    permissions: {
-      icon: ShieldCheck,
-      title: "Permissions",
-      subtitle: "The permission profile for new tasks and the task you came from.",
-    },
-  }[section];
-  const Icon = page.icon;
-  if (section === "general")
-    return (
-      <>
-        <div className="settings-page-heading">
-          <span>
-            <Icon />
-          </span>
-          <div>
-            <h1>{page.title}</h1>
-            <p>{page.subtitle}</p>
-          </div>
-        </div>
-        <section className="settings-section">
-          <header>
-            <h2>Startup and safety</h2>
-            <p>
-              What reopens at launch, how interrupted responses resume, and when the app asks before
-              acting.
-            </p>
-          </header>
-          <SettingRow
-            label="Restore last workspace"
-            description="Reopen the last project and chat after restart. Off starts on the project list."
-          >
-            <Switch
-              checked={readSetting(settings, "general.openLastWorkspace", true)}
-              onChange={(value) => setSetting("general.openLastWorkspace", value)}
-              label="Restore last workspace"
-            />
-          </SettingRow>
-          <SettingRow
-            label="Automatically resume interrupted responses"
-            description="After a crash or lost connection, reconnect the provider and continue from its last safe boundary. Off leaves a Resume control above the composer."
-          >
-            <Switch
-              checked={readSetting(settings, "general.autoResumeInterruptedTurns", false)}
-              onChange={(value) => setSetting("general.autoResumeInterruptedTurns", value)}
-              label="Automatically resume interrupted responses"
-            />
-          </SettingRow>
-          <SettingRow
-            label="Confirm external actions"
-            description="Ask before a link opens in your default browser."
-          >
-            <Switch
-              checked={readSetting(settings, "general.confirmExternalActions", true)}
-              onChange={(value) => setSetting("general.confirmExternalActions", value)}
-              label="Confirm external actions"
-            />
-          </SettingRow>
-          <SettingRow
-            label="Save context on edit"
-            description="When you edit a prompt and send again, keep the discarded replies below it as context for the model. The chat view still clears past that message. Off starts the new turn from earlier history only."
-          >
-            <Switch
-              checked={readSetting(settings, "general.saveContextOnEdit", false)}
-              onChange={(value) => setSetting("general.saveContextOnEdit", value)}
-              label="Save context on edit"
-            />
-          </SettingRow>
-        </section>
-        <VoiceTypingSettings />
-        <section className="settings-section">
-          <header>
-            <h2>Local data location</h2>
-            <p>The directory where this app keeps its settings, task metadata, and indexes.</p>
-          </header>
-          <div className="settings-location">
-            <Database />
-            <span>
-              <strong>{appInfo.dataDirectory}</strong>
-              <small>
-                SQLite settings, task metadata, indexes, and redacted diagnostics · schema{" "}
-                {appInfo.domainSchemaVersion}
-              </small>
-            </span>
-          </div>
-          <div className="settings-callout">
-            <ShieldCheck />
-            <span>
-              <strong>Accountless by design</strong>
-              <small>
-                There is no Integrator account, cloud transcript store, mandatory telemetry, or
-                credential proxy.
-              </small>
-            </span>
-          </div>
-        </section>
-        <StorageTotalsSettings />
-        <DiagnosticLogsSettings
-          settings={settings}
-          setSetting={setSetting}
-        />
-        <section className="settings-section danger-zone">
-          <header>
-            <h2>Portability and deletion</h2>
-            <p>
-              Exports omit credentials, secure terminal input, hidden policy data, and raw
-              environment values.
-            </p>
-          </header>
-          <div className="data-actions">
-            <button className="secondary-button" type="button" onClick={onExportSettings}>
-              <Download /> Export settings &amp; theme
-            </button>
-            <button className="secondary-button" type="button" onClick={onExportData}>
-              <Save /> Export local data
-            </button>
-            <button className="secondary-button" type="button" onClick={onImport}>
-              <Upload /> Import settings
-            </button>
-            <button className="danger-button" type="button" onClick={onClear}>
-              <Trash2 /> Delete local data…
-            </button>
-          </div>
-          {actionMessage ? (
-            <p className="settings-action-message" role="status">
-              {actionMessage}
-            </p>
-          ) : null}
-        </section>
-      </>
-    );
-  if (section === "composer")
-    return (
-      <>
-        <div className="settings-page-heading">
-          <span>
-            <Icon />
-          </span>
-          <div>
-            <h1>{page.title}</h1>
-            <p>{page.subtitle}</p>
-          </div>
-        </div>
-        <section className="settings-section">
-          <header>
-            <h2>Turn behavior</h2>
-            <p>Changes apply to every chat composer immediately.</p>
-          </header>
-          <SettingRow
-            label="Enter key"
-            description="Choose whether Enter sends or inserts a new line. Ctrl+Enter always sends."
-          >
-            <Dropdown
-              aria-label="Enter key"
-              value={readSetting(settings, "composer.enterToSend", true) ? "send" : "newline"}
-              onChange={(value) => setSetting("composer.enterToSend", value === "send")}
-              options={[
-                { value: "send", label: "Send message" },
-                { value: "newline", label: "New line" },
-              ]}
-            />
-          </SettingRow>
-        </section>
-        <section className="settings-section">
-          <header>
-            <h2>Transcript</h2>
-            <p>Metadata shown above each agent reply in every chat.</p>
-          </header>
-          <SettingRow label="Model attribution" description="Show which model produced each reply.">
-            <Dropdown
-              aria-label="Model attribution"
-              value={readSetting(settings, "transcript.showModel", true) ? "show" : "hide"}
-              onChange={(value) => setSetting("transcript.showModel", value === "show")}
-              options={[
-                { value: "show", label: "Show" },
-                { value: "hide", label: "Hide" },
-              ]}
-            />
-          </SettingRow>
-          <SettingRow
-            label="Timestamps"
-            description="Show the clock time above replies and on your messages."
-          >
-            <Dropdown
-              aria-label="Timestamps"
-              value={readSetting(settings, "transcript.showTimestamps", true) ? "show" : "hide"}
-              onChange={(value) => setSetting("transcript.showTimestamps", value === "show")}
-              options={[
-                { value: "show", label: "Show" },
-                { value: "hide", label: "Hide" },
-              ]}
-            />
-          </SettingRow>
-          <SettingRow
-            label="Activity detail"
-            description="Summary collapses every tool step, Normal groups runs of activity, and Verbose shows each event."
-          >
-            <Dropdown
-              aria-label="Activity detail"
-              value={readSetting(settings, "transcript.activityDensity", "normal")}
-              onChange={(value) => setSetting("transcript.activityDensity", value)}
-              options={[
-                { value: "summary", label: "Summary" },
-                { value: "normal", label: "Normal" },
-                { value: "verbose", label: "Verbose" },
-              ]}
-            />
-          </SettingRow>
-        </section>
-      </>
-    );
+  if (section === "composer") {
+    return <ComposerSettings settings={settings} setSetting={setSetting} />;
+  }
+  if (section === "permissions") {
+    return <PermissionsSettings settings={settings} setSetting={setSetting} />;
+  }
+
   return (
     <>
       <div className="settings-page-heading">
         <span>
-          <Icon />
+          <MonitorCog />
         </span>
         <div>
-          <h1>{page.title}</h1>
-          <p>{page.subtitle}</p>
+          <h1>General</h1>
+          <p>Startup behavior, voice typing, and where local data is stored and exported.</p>
         </div>
       </div>
       <section className="settings-section">
         <header>
-          <h2>Default permission profile</h2>
+          <h2>Startup and safety</h2>
           <p>
-            Applied to new tasks and the task you came from. Other existing tasks keep their last
-            explicit choice.
+            What reopens at launch, how interrupted responses resume, and when the app asks before
+            acting.
           </p>
         </header>
         <SettingRow
-          label="Default profile"
-          description="Sets the current task now and preselects the permission picker for new tasks."
+          label="Restore last workspace"
+          description="Reopen the last project and chat after restart. Off starts on the project list."
         >
-          <Dropdown
-            aria-label="Default profile"
-            value={readSetting(settings, "permissions.defaultProfile", "project-write")}
-            onChange={(value) => setSetting("permissions.defaultProfile", value)}
-            options={[
-              { value: "read-only", label: "Read only" },
-              { value: "project-write", label: "Project write" },
-              { value: "ask", label: "Ask as needed" },
-              { value: "full-access", label: "Full access · explicit" },
-            ]}
+          <Switch
+            checked={readSetting(settings, "general.openLastWorkspace", true)}
+            onChange={(value) => setSetting("general.openLastWorkspace", value)}
+            label="Restore last workspace"
           />
         </SettingRow>
+        <SettingRow
+          label="Automatically resume interrupted responses"
+          description="After a crash or lost connection, reconnect the provider and continue from its last safe boundary. Off leaves a Resume control above the composer."
+        >
+          <Switch
+            checked={readSetting(settings, "general.autoResumeInterruptedTurns", false)}
+            onChange={(value) => setSetting("general.autoResumeInterruptedTurns", value)}
+            label="Automatically resume interrupted responses"
+          />
+        </SettingRow>
+        <SettingRow
+          label="Confirm external actions"
+          description="Ask before a link opens in your default browser."
+        >
+          <Switch
+            checked={readSetting(settings, "general.confirmExternalActions", true)}
+            onChange={(value) => setSetting("general.confirmExternalActions", value)}
+            label="Confirm external actions"
+          />
+        </SettingRow>
+        <SettingRow
+          label="Save context on edit"
+          description="When you edit a prompt and send again, keep the discarded replies below it as context for the model. The chat view still clears past that message. Off starts the new turn from earlier history only."
+        >
+          <Switch
+            checked={readSetting(settings, "general.saveContextOnEdit", false)}
+            onChange={(value) => setSetting("general.saveContextOnEdit", value)}
+            label="Save context on edit"
+          />
+        </SettingRow>
+      </section>
+      <VoiceTypingSettings />
+      <section className="settings-section">
+        <header>
+          <h2>Local data location</h2>
+          <p>The directory where this app keeps its settings, task metadata, and indexes.</p>
+        </header>
+        <div className="settings-location">
+          <Database />
+          <span>
+            <strong>{appInfo.dataDirectory}</strong>
+            <small>
+              SQLite settings, task metadata, indexes, and redacted diagnostics · schema{" "}
+              {appInfo.domainSchemaVersion}
+            </small>
+          </span>
+        </div>
+        <div className="settings-callout">
+          <ShieldCheck />
+          <span>
+            <strong>Accountless by design</strong>
+            <small>
+              There is no Integrator account, cloud transcript store, mandatory telemetry, or
+              credential proxy.
+            </small>
+          </span>
+        </div>
+      </section>
+      <StorageTotalsSettings />
+      <DiagnosticLogsSettings settings={settings} setSetting={setSetting} />
+      <section className="settings-section danger-zone">
+        <header>
+          <h2>Portability and deletion</h2>
+          <p>
+            Exports omit credentials, secure terminal input, hidden policy data, and raw environment
+            values.
+          </p>
+        </header>
+        <div className="data-actions">
+          <button className="secondary-button" type="button" onClick={onExportSettings}>
+            <Download /> Export settings &amp; theme
+          </button>
+          <button className="secondary-button" type="button" onClick={onExportData}>
+            <Save /> Export local data
+          </button>
+          <button className="secondary-button" type="button" onClick={onImport}>
+            <Upload /> Import settings
+          </button>
+          <button className="danger-button" type="button" onClick={onClear}>
+            <Trash2 /> Delete local data…
+          </button>
+        </div>
+        {actionMessage ? (
+          <p className="settings-action-message" role="status">
+            {actionMessage}
+          </p>
+        ) : null}
       </section>
     </>
   );
@@ -5440,295 +4835,6 @@ function VoiceTypingSettings() {
         </p>
       ) : null}
     </section>
-  );
-}
-
-// Same spring as the chat sidebar's traveling selection pill.
-function formatRelativeTime(value: string): string {
-  const timestamp = Date.parse(value);
-  if (!Number.isFinite(timestamp)) return "";
-  const deltaMs = Date.now() - timestamp;
-  if (deltaMs < 60_000) return "just now";
-  const minutes = Math.round(deltaMs / 60_000);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.round(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.round(hours / 24);
-  if (days < 30) return `${days}d ago`;
-  return new Date(timestamp).toLocaleDateString(undefined, { month: "short", day: "numeric" });
-}
-
-const AUTO_ARCHIVE_OPTIONS = [
-  { value: "never", label: "Never" },
-  { value: "7d", label: "After 7 days" },
-  { value: "14d", label: "After 14 days" },
-  { value: "30d", label: "After 30 days" },
-  { value: "90d", label: "After 90 days" },
-];
-
-const AUTO_DELETE_OPTIONS = [
-  { value: "never", label: "Never" },
-  { value: "24h", label: "After 24 hours" },
-  { value: "3d", label: "After 3 days" },
-  { value: "7d", label: "After 7 days" },
-  { value: "30d", label: "After 30 days" },
-  { value: "90d", label: "After 90 days" },
-];
-
-interface ArchiveSettingsProps {
-  projects: ProjectSummary[];
-  tasks: TaskSummary[];
-  taskActionBusyId?: string;
-  archivedLoading?: boolean;
-  archivedHasMore?: boolean;
-  onEnsureArchived?: () => void;
-  onLoadMoreArchived?: () => void;
-  settings: SettingsMap;
-  setSetting: (key: string, value: unknown) => void;
-  onOpenTask?: (taskId: string) => void;
-  onUpdateTask?: (taskId: string, patch: { archived?: boolean }) => void;
-  onUpdateProject?: (projectId: string, patch: { archived?: boolean }) => void;
-  onDeleteTask?: (taskId: string) => void;
-  onDeleteProject?: (projectId: string) => void;
-  onDeleteArchivedChats?: (projectId: string) => void;
-}
-
-/**
- * A full-width view over the same archive the sidebar toggle shows, sized for
- * triage: filter across every project at once, then restore, reopen, or
- * delete without leaving the page. Destructive actions defer to the shared
- * confirmation modals owned by the workspace.
- */
-function ArchiveSettings({
-  projects,
-  tasks,
-  taskActionBusyId,
-  archivedLoading = false,
-  archivedHasMore = false,
-  onEnsureArchived,
-  onLoadMoreArchived,
-  settings,
-  setSetting,
-  onOpenTask,
-  onUpdateTask,
-  onUpdateProject,
-  onDeleteTask,
-  onDeleteProject,
-  onDeleteArchivedChats,
-}: ArchiveSettingsProps) {
-  const [filter, setFilter] = useState("");
-  const ensureArchivedRef = useRef(onEnsureArchived);
-  useEffect(() => {
-    ensureArchivedRef.current = onEnsureArchived;
-  }, [onEnsureArchived]);
-  useEffect(() => {
-    ensureArchivedRef.current?.();
-  }, []);
-  const projectNames = useMemo(
-    () => new Map(projects.map((project) => [project.id, project.name])),
-    [projects],
-  );
-  const archivedChats = useMemo(
-    () =>
-      tasks
-        .filter((task) => task.archived && !task.parentId)
-        .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)),
-    [tasks],
-  );
-  const archivedProjects = projects.filter((project) => project.archived);
-  const query = filter.trim().toLowerCase();
-  const visibleChats = query
-    ? archivedChats.filter(
-        (task) =>
-          task.title.toLowerCase().includes(query) ||
-          (projectNames.get(task.projectId) ?? "").toLowerCase().includes(query),
-      )
-    : archivedChats;
-  // Group in the sidebar's project order so both archive views read the same.
-  const groups = projects
-    .map((project) => ({
-      project,
-      chats: visibleChats.filter((task) => task.projectId === project.id),
-    }))
-    .filter((group) => group.chats.length > 0);
-  const canMutate = Boolean(onUpdateTask);
-
-  return (
-    <>
-      <div className="settings-page-heading">
-        <span>
-          <Archive />
-        </span>
-        <div>
-          <h1>Archives</h1>
-          <p>
-            Everything you have archived, in one sortable place. The sidebar toggle shows the same
-            data next to your chats.
-          </p>
-        </div>
-      </div>
-      <section className="settings-section">
-        <header>
-          <h2>Retention</h2>
-          <p>Automatically archive inactive chats and delete archived ones after a delay.</p>
-        </header>
-        <SettingRow
-          label="Auto-archive inactive chats"
-          description="Archive chats with no activity for this long. Pinned chats and the open chat are never touched."
-        >
-          <Dropdown
-            aria-label="Auto-archive inactive chats"
-            value={readSetting(settings, "archive.autoArchiveAfter", "never")}
-            onChange={(value) => setSetting("archive.autoArchiveAfter", value)}
-            options={AUTO_ARCHIVE_OPTIONS}
-          />
-        </SettingRow>
-        <SettingRow
-          label="Auto-delete archived chats"
-          description="Permanently delete a chat this long after it was archived. The timer starts at archival, not at last activity."
-        >
-          <Dropdown
-            aria-label="Auto-delete archived chats"
-            value={readSetting(settings, "archive.autoDeleteAfter", "never")}
-            onChange={(value) => setSetting("archive.autoDeleteAfter", value)}
-            options={AUTO_DELETE_OPTIONS}
-          />
-        </SettingRow>
-      </section>
-      <section className="settings-section">
-        <header>
-          <h2>Archived chats{archivedChats.length ? ` · ${archivedChats.length}` : ""}</h2>
-          <p>Restore returns a chat to its project; Open jumps straight back into it.</p>
-        </header>
-        {archivedChats.length > 0 ? (
-          <label className="settings-search archive-filter">
-            <Search />
-            <span className="sr-only">Filter archived chats</span>
-            <input
-              value={filter}
-              onChange={(event) => setFilter(event.target.value)}
-              placeholder="Filter by title or project"
-            />
-          </label>
-        ) : null}
-        {archivedLoading && archivedChats.length === 0 ? (
-          <p className="archive-empty" role="status">
-            Loading archived chats…
-          </p>
-        ) : archivedChats.length === 0 ? (
-          <p className="archive-empty" role="status">
-            Nothing archived. Chats you archive from the sidebar will show up here.
-          </p>
-        ) : groups.length === 0 ? (
-          <p className="archive-empty" role="status">
-            No archived chats match “{filter.trim()}”.
-          </p>
-        ) : (
-          groups.map(({ project, chats }) => (
-            <div className="archive-group" key={project.id}>
-              <div className="archive-group-header">
-                <Folder aria-hidden="true" />
-                <strong>{project.name}</strong>
-                <small>{chats.length}</small>
-                {onDeleteArchivedChats && !project.archived ? (
-                  <button
-                    className="archive-action archive-action--danger"
-                    type="button"
-                    onClick={() => onDeleteArchivedChats(project.id)}
-                  >
-                    Delete all…
-                  </button>
-                ) : null}
-              </div>
-              {chats.map((task) => (
-                <div className="archive-row" key={task.id}>
-                  <span className="archive-row-copy">
-                    <strong>{task.title || "Untitled chat"}</strong>
-                    <small>{formatRelativeTime(task.updatedAt)}</small>
-                  </span>
-                  <div className="archive-row-actions">
-                    {onOpenTask ? (
-                      <button
-                        className="archive-action"
-                        type="button"
-                        onClick={() => onOpenTask(task.id)}
-                      >
-                        Open
-                      </button>
-                    ) : null}
-                    {canMutate ? (
-                      <button
-                        className="archive-action"
-                        type="button"
-                        disabled={taskActionBusyId === task.id}
-                        onClick={() => onUpdateTask?.(task.id, { archived: false })}
-                      >
-                        <ArchiveRestore aria-hidden="true" /> Restore
-                      </button>
-                    ) : null}
-                    {onDeleteTask ? (
-                      <button
-                        className="archive-action archive-action--danger"
-                        type="button"
-                        onClick={() => onDeleteTask(task.id)}
-                      >
-                        <Trash2 aria-hidden="true" /> Delete…
-                      </button>
-                    ) : null}
-                  </div>
-                </div>
-              ))}
-            </div>
-          ))
-        )}
-        {archivedHasMore ? (
-          <button
-            className="archive-action"
-            type="button"
-            disabled={archivedLoading}
-            onClick={() => onLoadMoreArchived?.()}
-          >
-            {archivedLoading ? "Loading…" : "Show more archived chats"}
-          </button>
-        ) : null}
-      </section>
-      {archivedProjects.length > 0 ? (
-        <section className="settings-section">
-          <header>
-            <h2>Archived projects · {archivedProjects.length}</h2>
-            <p>Restoring a project brings its chats back to the sidebar unchanged.</p>
-          </header>
-          {archivedProjects.map((project) => (
-            <div className="archive-row" key={project.id}>
-              <span className="archive-row-copy">
-                <strong>{project.name}</strong>
-                <small>{project.path}</small>
-              </span>
-              <div className="archive-row-actions">
-                {onUpdateProject ? (
-                  <button
-                    className="archive-action"
-                    type="button"
-                    onClick={() => onUpdateProject(project.id, { archived: false })}
-                  >
-                    <ArchiveRestore aria-hidden="true" /> Restore
-                  </button>
-                ) : null}
-                {onDeleteProject ? (
-                  <button
-                    className="archive-action archive-action--danger"
-                    type="button"
-                    onClick={() => onDeleteProject(project.id)}
-                  >
-                    <Trash2 aria-hidden="true" /> Delete…
-                  </button>
-                ) : null}
-              </div>
-            </div>
-          ))}
-        </section>
-      ) : null}
-    </>
   );
 }
 
@@ -6638,7 +5744,6 @@ export function SettingsView(props: SettingsViewProps) {
               preferences={props.preferences}
               onChange={props.onChangePreferences}
               onReset={props.onResetPreferences}
-              onResetPreferences={props.onResetPreferences}
             />
           ) : null}
           {section === "models-runtimes" ? (

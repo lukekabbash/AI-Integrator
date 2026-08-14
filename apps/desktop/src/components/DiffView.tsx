@@ -475,10 +475,7 @@ export function DiffView({
         {inline ? null : (
           <div className="diff-header-actions">
             {onRefresh ? (
-              <Tooltip
-                label={refreshing ? "Refreshing diff" : "Refresh diff"}
-                placement="top"
-              >
+              <Tooltip label={refreshing ? "Refreshing diff" : "Refresh diff"} placement="top">
                 <button
                   className="diff-header-icon-button"
                   type="button"

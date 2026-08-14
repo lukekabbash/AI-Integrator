@@ -193,7 +193,6 @@ type ComposerTurnInput = {
 };
 
 type SendTurnOutcome = "started" | "turn-active" | "failed";
-
 type TaskPermission = ComposerTurnInput["permission"];
 
 function isTaskPermission(value: unknown): value is TaskPermission {
@@ -380,7 +379,6 @@ const ARCHIVE_RETENTION_MS: Record<string, number> = {
 const RETENTION_SWEEP_INTERVAL_MS = 30 * 60 * 1000;
 /** Chats mid-turn or waiting on the user are never retention targets. */
 const RETENTION_BUSY_STATUSES = new Set(["starting", "running", "waiting"]);
-
 function readArchivedAtMap(value: unknown): Record<string, string> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const map: Record<string, string> = {};
@@ -391,7 +389,6 @@ function readArchivedAtMap(value: unknown): Record<string, string> {
 }
 
 type ProjectSidebarMeta = Record<string, { pinned?: boolean; archived?: boolean }>;
-
 function readProjectSidebarMeta(value: unknown): ProjectSidebarMeta {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const meta: ProjectSidebarMeta = {};
@@ -2481,6 +2478,9 @@ export default function App() {
     },
     [nativeHost],
   );
+  const requestActiveDelegations = useCallback(() => {
+    void refreshDelegations(activeTaskIdRef.current);
+  }, [refreshDelegations]);
   useEffect(() => {
     // Delegation refresh is an external broker read; its completion updates
     // the rail projection asynchronously.
@@ -2812,7 +2812,10 @@ export default function App() {
   const autoApproveActive = Boolean(activeTask && activeTaskPermission === "full-access");
   useEffect(() => {
     if (!nativeHost || !activeTask) return;
-    if (activeTask.runtime !== "grok" && activeTask.runtime !== "kimi") return;
+    // Grok's model and effort are process-launch options. Starting it from an
+    // effect can race the first prompt's task promotion and replace the ACP
+    // transport before session/new. Admit Grok only from the send path.
+    if (activeTask.runtime !== "kimi") return;
     void bridge
       .prepareAcpRuntime?.({
         taskId: activeTask.id,
@@ -5079,43 +5082,46 @@ export default function App() {
     }
   };
 
-  const revealSidebarTask = (task: TaskSummary) => {
-    const project = snapshot.projects.find((entry) => entry.id === task.projectId);
-    void bridge.reportDiagnostic?.("detail", {
-      layer: "ui",
-      op: "ui.revealTask",
-      outcome: "start",
-      taskId: task.id,
-      projectId: task.projectId,
-      code: task.kind ?? "code",
-      detail: JSON.stringify({
-        kind: task.kind ?? "code",
-        hasWorktree: Boolean(task.worktree),
-        hasProjectPath: Boolean(project?.path),
-        syntheticChatProject: task.projectId === CHAT_PROJECT_ID,
-      }),
-    });
-    void bridge.revealTask(task.id).catch((error) => {
-      const message = formatBridgeError(error, "Could not reveal that folder.");
-      void bridge.reportDiagnostic?.("incident", {
-        level: "error",
+  const revealSidebarTask = useCallback(
+    (task: TaskSummary) => {
+      const project = snapshot.projects.find((entry) => entry.id === task.projectId);
+      void bridge.reportDiagnostic?.("detail", {
         layer: "ui",
         op: "ui.revealTask",
-        outcome: "fail",
-        code: "reveal-failed",
-        causeClass:
-          task.kind === "chat" || task.projectId === CHAT_PROJECT_ID
-            ? "unpaired-folder"
-            : "reveal",
+        outcome: "start",
         taskId: task.id,
         projectId: task.projectId,
-        detail: message,
+        code: task.kind ?? "code",
+        detail: JSON.stringify({
+          kind: task.kind ?? "code",
+          hasWorktree: Boolean(task.worktree),
+          hasProjectPath: Boolean(project?.path),
+          syntheticChatProject: task.projectId === CHAT_PROJECT_ID,
+        }),
       });
-      setOperationError(message);
-    });
-  };
+      void bridge.revealTask(task.id).catch((error) => {
+        const message = formatBridgeError(error, "Could not reveal that folder.");
+        void bridge.reportDiagnostic?.("incident", {
+          level: "error",
+          layer: "ui",
+          op: "ui.revealTask",
+          outcome: "fail",
+          code: "reveal-failed",
+          causeClass:
+            task.kind === "chat" || task.projectId === CHAT_PROJECT_ID
+              ? "unpaired-folder"
+              : "reveal",
+          taskId: task.id,
+          projectId: task.projectId,
+          detail: message,
+        });
+        setOperationError(message);
+      });
+    },
+    [snapshot.projects],
+  );
 
-  const resolveSidebarTaskFolder = (task: TaskSummary) => {
+  const resolveSidebarTaskFolder = useCallback((task: TaskSummary) => {
     void bridge.reportDiagnostic?.("detail", {
       layer: "ui",
       op: "ui.resolveTaskFolder",
@@ -5145,13 +5151,13 @@ export default function App() {
       setOperationError(message);
       throw error;
     });
-  };
+  }, []);
 
-  const revealSidebarProject = (project: ProjectSummary) => {
+  const revealSidebarProject = useCallback((project: ProjectSummary) => {
     void bridge.revealAbsolutePath(project.path).catch((error) => {
       setOperationError(formatBridgeError(error, "Could not reveal that project folder."));
     });
-  };
+  }, []);
 
   const openGitFileExternal = (file: DiffFile, openerId: string) =>
     openProjectPathExternal(file.path, openerId);
@@ -6777,14 +6783,14 @@ export default function App() {
                                     )}
                                     quietReconciling={Boolean(
                                       activeTask &&
-                                        (freshTaskIds.has(activeTask.id) ||
-                                          // A task with no persisted events (a new or
-                                          // restored draft chat) has nothing to
-                                          // reconcile; freshTaskIds only covers tasks
-                                          // created in this session.
-                                          (runtimeState.lastSeq === 0 &&
-                                            runtimeState.items.length === 0 &&
-                                            !runtimeState.turn)),
+                                      (freshTaskIds.has(activeTask.id) ||
+                                        // A task with no persisted events (a new or
+                                        // restored draft chat) has nothing to
+                                        // reconcile; freshTaskIds only covers tasks
+                                        // created in this session.
+                                        (runtimeState.lastSeq === 0 &&
+                                          runtimeState.items.length === 0 &&
+                                          !runtimeState.turn)),
                                     )}
                                     showDisconnected={nativeTurnActive || optimisticTurnStarting}
                                   />
@@ -7258,6 +7264,7 @@ export default function App() {
                         gitLoading={gitLoading}
                         children={snapshot.children}
                         delegations={nativeHost ? delegations : undefined}
+                        onRequestDelegations={nativeHost ? requestActiveDelegations : undefined}
                         selectedDelegationId={selectedDelegation?.id}
                         onSelectDelegation={(delegationId) => {
                           setSelectedDelegationId(delegationId);

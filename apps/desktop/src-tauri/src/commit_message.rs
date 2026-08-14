@@ -8,7 +8,8 @@ use tauri::State;
 use crate::{
     chat_title::{HelperRoute, generate_isolated_provider_text_routed, looks_like_provider_error},
     code_explain::ExplainRoute,
-    commands::{CommandError, CommandResult, authorized_git},
+    command_api::{CommandError, CommandResult},
+    commands::authorized_git,
     provider_routing::{is_worth_failing_over, provider_chain},
     state::AppState,
 };

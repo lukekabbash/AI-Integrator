@@ -162,7 +162,7 @@ describe("Runtime Settings command disclosure", () => {
       />,
     );
 
-    fireEvent.click(screen.getByText("General").closest("button") as HTMLButtonElement);
+    fireEvent.click(screen.getByRole("button", { name: "General" }));
     await screen.findByRole("heading", { name: "General" });
     const saveContext = screen.getByRole("switch", { name: "Save context on edit" });
     expect(saveContext).toHaveAttribute("aria-checked", "false");
@@ -183,6 +183,38 @@ describe("Runtime Settings command disclosure", () => {
       expect(bridgeMock.setSetting).toHaveBeenCalledWith(
         "settings.transcript.activityDensity",
         "verbose",
+      ),
+    );
+  });
+
+  it("preserves composer send behavior and the live default permission profile", async () => {
+    render(
+      <SettingsView
+        preferences={DEFAULT_THEME_PREFERENCES}
+        runtimes={[claudeRuntime, runtime]}
+        usage={createEmptySnapshot().usage}
+        onChangePreferences={vi.fn()}
+        onResetPreferences={vi.fn()}
+        onBack={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Composer" }));
+    await screen.findByRole("heading", { name: "Composer" });
+    fireEvent.click(screen.getByRole("button", { name: "Enter key" }));
+    fireEvent.click(await screen.findByRole("option", { name: "New line" }));
+    await waitFor(() =>
+      expect(bridgeMock.setSetting).toHaveBeenCalledWith("settings.composer.enterToSend", false),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Permissions" }));
+    await screen.findByRole("heading", { name: "Permissions" });
+    fireEvent.click(screen.getByRole("button", { name: "Default profile" }));
+    fireEvent.click(await screen.findByRole("option", { name: "Full access · explicit" }));
+    await waitFor(() =>
+      expect(bridgeMock.setSetting).toHaveBeenCalledWith(
+        "settings.permissions.defaultProfile",
+        "full-access",
       ),
     );
   });

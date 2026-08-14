@@ -160,6 +160,6 @@ describe("Transcript activity memoization", () => {
     expect(diffRender.count).toBe(1);
     fireEvent.click(screen.getByRole("button", { name: "Open src/a.ts in Files" }));
     expect(firstOpen).not.toHaveBeenCalled();
-    expect(latestOpen).toHaveBeenCalledWith("src/a.ts");
+    expect(latestOpen).toHaveBeenCalledWith({ path: "src/a.ts" });
   });
 });

@@ -1489,7 +1489,6 @@ describe("native runtime recovery UI", () => {
       target: { value: "Start a fresh turn" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-    expect(await screen.findByText("Connecting")).toBeInTheDocument();
     await waitFor(() => {
       const elapsed = document.querySelector(".task-status-pill-elapsed");
       expect(elapsed).toBeInTheDocument();
@@ -1512,7 +1511,9 @@ describe("native runtime recovery UI", () => {
       );
     });
 
-    await waitFor(() => expect(screen.queryByText("Connecting")).not.toBeInTheDocument());
+    await waitFor(() =>
+      expect(document.querySelector(".task-status-pill")).not.toBeInTheDocument(),
+    );
   });
 
   it("keeps the draft local until authoritative chat state is ready", async () => {
@@ -1819,7 +1820,11 @@ describe("native runtime recovery UI", () => {
     await waitFor(() => {
       expect(
         bridgeMock.loadTaskProjection.mock.calls.filter(([taskId]) => taskId === "task-2"),
-      ).toHaveLength(2);
+      ).toEqual([
+        ["task-2", { skipRuntimeCheck: true }],
+        ["task-2", { knownWatermark: 2, knownResetSeq: 0 }],
+        ["task-2", { knownWatermark: 2, knownResetSeq: 0 }],
+      ]);
     });
     expect(screen.queryByText("Response interrupted")).not.toBeInTheDocument();
     expect(screen.getByText("2h 5m")).toBeInTheDocument();
@@ -2842,6 +2847,42 @@ describe("native runtime recovery UI", () => {
     );
   });
 
+  it("reconciles missed delegation updates when the Agents tab opens", async () => {
+    rightRailProbe.enabled = true;
+    render(<App />);
+    await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
+    await waitFor(() => expect(bridgeMock.listDelegations).toHaveBeenCalledWith("task-1"));
+
+    bridgeMock.listDelegations.mockImplementation(async (taskId: string) =>
+      taskId === "task-1"
+        ? [
+            {
+              id: "delegation-recovered",
+              parentTaskId: "task-1",
+              childTaskId: null,
+              profileId: "review-specialist",
+              profileLabel: "Review specialist",
+              runtime: "codex",
+              model: "gpt-5.6-luna",
+              effort: "high",
+              title: "Recovered subagent",
+              brief: "Appeared after an authoritative refresh.",
+              status: "waiting",
+              createdAt: "2026-07-10T16:00:00Z",
+              updatedAt: "2026-07-10T16:05:00Z",
+              unreadFromChild: 0,
+              pendingQuestions: [],
+            },
+          ]
+        : [],
+    );
+
+    fireEvent.click(await screen.findByRole("tab", { name: /^Agents/ }));
+
+    expect(await screen.findByText("Recovered subagent")).toBeInTheDocument();
+    expect(bridgeMock.listDelegations).toHaveBeenLastCalledWith("task-1");
+  });
+
   it("projects background activity immediately but defers its Git scan until selection", async () => {
     const workspace = createEmptySnapshot();
     workspace.projects = [
@@ -3114,6 +3155,7 @@ describe("native runtime recovery UI", () => {
   }, 30_000);
 
   it("keeps project Git usable while a new chat becomes its first task", async () => {
+    rightRailProbe.enabled = true;
     const workspace = createEmptySnapshot();
     workspace.projects = [
       {
@@ -3173,7 +3215,7 @@ describe("native runtime recovery UI", () => {
     bridgeMock.sendTurn.mockResolvedValue(undefined);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Stage all" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Stage all" }, { timeout: 4_000 }));
     await waitFor(() =>
       expect(bridgeMock.stageProjectFiles).toHaveBeenCalledWith(
         "project-1",

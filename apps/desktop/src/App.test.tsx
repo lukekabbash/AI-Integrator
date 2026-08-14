@@ -49,7 +49,6 @@ describe("AI Integrator desktop workspace", () => {
       resuming: false,
       queueBusy: false,
       queueAwaiting: false,
-      optimisticMessage: false,
     };
     expect(isComposerTurnBusy(idle)).toBe(false);
 
@@ -63,7 +62,7 @@ describe("AI Integrator desktop workspace", () => {
     expect(
       await screen.findByRole("heading", { name: "Construct the native v1 workspace" }),
     ).toBeInTheDocument();
-    expect(await screen.findByRole("tab", { name: /^Git/ })).toHaveAttribute(
+    expect(await screen.findByRole("tab", { name: /^Git/ }, { timeout: 5_000 })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -159,20 +158,30 @@ describe("AI Integrator desktop workspace", () => {
     expect(openTerminal).not.toHaveBeenCalled();
 
     fireEvent.click(toggle);
-    expect(await screen.findByText("Terminal unavailable for this test.")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Terminal unavailable for this test.", {
+        selector: ".terminal-failure",
+      }),
+    ).toBeInTheDocument();
     expect(openTerminal).toHaveBeenCalledTimes(1);
 
     fireEvent.click(toggle);
     await waitFor(() =>
-      expect(screen.queryByLabelText("Project terminal")).not.toBeInTheDocument(),
+      expect(document.querySelector(".terminal-drawer")).toHaveAttribute("aria-hidden", "true"),
     );
+    expect(document.querySelector(".terminal-drawer")).toHaveAttribute("inert");
     fireEvent.click(toggle);
 
-    expect(await screen.findByText("Terminal unavailable for this test.")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Terminal unavailable for this test.", {
+        selector: ".terminal-failure",
+      }),
+    ).toBeInTheDocument();
+    expect(document.querySelector(".terminal-drawer")).not.toHaveAttribute("aria-hidden");
     expect(openTerminal).toHaveBeenCalledTimes(1);
   });
 
-  it("opens Settings as a full replacement view and applies a theme preset", async () => {
+  function mockStructuredUsageSummary() {
     vi.spyOn(bridge, "getUsageSummary").mockResolvedValue({
       measuredAt: "2026-07-17T18:00:00Z",
       providers: [
@@ -225,6 +234,9 @@ describe("AI Integrator desktop workspace", () => {
         },
       ],
     });
+  }
+
+  it("opens Settings as a full replacement view and applies a theme preset", async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Open Settings" }));
     expect(
@@ -280,6 +292,7 @@ describe("AI Integrator desktop workspace", () => {
   });
 
   it("exposes only real, wired settings categories and persists local policy choices", async () => {
+    mockStructuredUsageSummary();
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Open Settings" }));
     await screen.findByRole("heading", { name: "General" }, { timeout: 5000 });
@@ -481,7 +494,7 @@ describe("AI Integrator desktop workspace", () => {
 
     expect(await screen.findByRole("button", { name: "Runtime" })).toHaveTextContent("Claude Code");
     expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("Claude Sonnet 5");
-  });
+  }, 10_000);
 
   it("repairs a stale model default after a runtime change", async () => {
     window.localStorage.setItem(

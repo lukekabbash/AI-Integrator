@@ -62,7 +62,7 @@ describe("Composer stop and send split", () => {
     const { onStop, textbox } = renderComposer({ running: true });
     fireEvent.change(textbox, { target: { value: "Queue this follow-up" } });
 
-    const stop = screen.getByRole("button", { name: "Stop turn" });
+    const stop = screen.getByRole("button", { name: "Stop the current turn" });
     expect(stop).toHaveClass("send-button--stop-stacked");
     expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled();
     fireEvent.click(stop);
@@ -86,7 +86,7 @@ describe("Composer stop and send split", () => {
     expect(screen.getByRole("button", { name: "Stopping turn" })).toBeDisabled();
 
     fireEvent.change(textbox, { target: { value: "draft during stop" } });
-    const stackedStop = screen.getByRole("button", { name: "Stopping turn" });
+    const stackedStop = screen.getByRole("button", { name: "Stopping…" });
     expect(stackedStop).toHaveClass("send-button--stop-stacked");
     expect(stackedStop).toBeDisabled();
     expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled();
@@ -101,7 +101,7 @@ describe("Composer stop and send split", () => {
   it("clearing the draft mid-run folds stop back into the send position", async () => {
     const { textbox } = renderComposer({ running: true });
     fireEvent.change(textbox, { target: { value: "temporary" } });
-    expect(screen.getByRole("button", { name: "Stop turn" })).toHaveClass(
+    expect(screen.getByRole("button", { name: "Stop the current turn" })).toHaveClass(
       "send-button--stop-stacked",
     );
 

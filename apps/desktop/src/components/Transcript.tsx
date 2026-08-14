@@ -338,10 +338,7 @@ const UserMessage = memo(function UserMessage({
         <p>
           {hasVerifiedSkill ? (
             <Tooltip label="Provider-native skill" placement="top">
-              <strong
-                className="native-skill-token"
-                aria-label={`Native skill ${skillPrefix}`}
-              >
+              <strong className="native-skill-token" aria-label={`Native skill ${skillPrefix}`}>
                 {skillPrefix}
               </strong>
             </Tooltip>
@@ -350,11 +347,7 @@ const UserMessage = memo(function UserMessage({
             typeof segment === "string" ? (
               segment
             ) : (
-              <Tooltip
-                key={`${segment.mention}-${index}`}
-                label="Context mention"
-                placement="top"
-              >
+              <Tooltip key={`${segment.mention}-${index}`} label="Context mention" placement="top">
                 <strong className="context-mention-token">{segment.mention}</strong>
               </Tooltip>
             ),
