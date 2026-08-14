@@ -320,6 +320,7 @@ fn find_known_install(provider: &ProviderKind) -> Option<PathBuf> {
 }
 
 fn known_install_candidates(provider: &ProviderKind) -> Vec<PathBuf> {
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut candidates = match provider {
         ProviderKind::Cursor => {
             let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {

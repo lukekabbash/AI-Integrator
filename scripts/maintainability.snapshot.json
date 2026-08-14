@@ -38,7 +38,7 @@
     { "path": "crates/adapter-codex/src/lib.rs", "maxLines": 1333 },
     {
       "path": "apps/desktop/src-tauri/src/commands_tests.rs",
-      "maxLines": 1281
+      "maxLines": 1286
     },
     {
       "path": "apps/desktop/src/components/SubagentsSettings.tsx",
@@ -47,7 +47,7 @@
     { "path": "crates/integrator-core/src/domain.rs", "maxLines": 1179 },
     {
       "path": "apps/desktop/src-tauri/src/integrator_skills.rs",
-      "maxLines": 1169
+      "maxLines": 1168
     },
     { "path": "apps/desktop/src-tauri/src/chat_title.rs", "maxLines": 1130 },
     { "path": "apps/desktop/src/components/FileView.tsx", "maxLines": 1089 },
