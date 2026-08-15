@@ -1807,6 +1807,121 @@ const providerRouteByTask = new Map<
 const acpSessionCertification = new Map<RuntimeId, NativeAcpSessionCapabilities>();
 let cachedWorkspace: WorkspaceSnapshot | undefined;
 let cachedNativeSettings: LocalSetting[] | undefined;
+
+/* Browser preview only: an in-memory schedule store so the Scheduled screen
+   is exercisable outside the native shell. Never reached under Tauri. */
+const demoAutomations: Automation[] = [];
+const demoAutomationRuns: AutomationRun[] = [];
+const demoAutomationListeners = new Set<(event: AutomationChanged) => void>();
+let demoAutomationsSeeded = false;
+
+function seedDemoAutomations() {
+  if (demoAutomationsSeeded) return;
+  demoAutomationsSeeded = true;
+  const now = Date.now();
+  const iso = (offsetMinutes: number) => new Date(now + offsetMinutes * 60_000).toISOString();
+  const route = (runtime: RuntimeId, model: string): AutomationRoute => ({
+    runtime,
+    model,
+    fallbacks: [],
+    permission: "read-only",
+    delegation: "off",
+  });
+  demoAutomations.push(
+    {
+      id: "demo-auto-ci",
+      taskId: "v1-shell",
+      title: "Re-check CI after the release build",
+      prompt: "Review the latest checks and summarize anything that changed since the last run.",
+      target: { kind: "task" },
+      trigger: { kind: "interval", everySeconds: 3_600, anchorAt: iso(40) },
+      route: {
+        ...route("codex", "GPT-5.4"),
+        fallbacks: [{ runtime: "claude", model: "claude-fable-5" }],
+      },
+      source: "user",
+      recurrenceUserRequest: "Every 1 hours",
+      iterationNotes: true,
+      nextRunNote: "Windows installer job flaked once on signing; watch for a repeat.",
+      status: "active",
+      nextRunAt: iso(40),
+      lastRunAt: iso(-20),
+      createdAt: iso(-600),
+      updatedAt: iso(-20),
+    },
+    {
+      id: "demo-auto-audit",
+      taskId: "adapter-audit",
+      title: "Dependency audit",
+      prompt: "Verify whether the dependency changed and open a note if the lockfile drifted.",
+      target: { kind: "task" },
+      trigger: { kind: "at", runAt: iso(180) },
+      route: route("cursor", "Composer 2.5"),
+      source: "agent",
+      status: "paused",
+      createdAt: iso(-1_400),
+      updatedAt: iso(-90),
+    },
+    {
+      id: "demo-auto-theme",
+      taskId: "theme-pass",
+      title: "Nightly theme contrast sweep",
+      prompt: "Run the contrast checks across every preset and list regressions.",
+      target: { kind: "task" },
+      trigger: { kind: "interval", everySeconds: 86_400, anchorAt: iso(60 * 9) },
+      route: route("claude", "claude-fable-5"),
+      source: "user",
+      recurrenceUserRequest: "Every 1 days",
+      status: "needs-attention",
+      lastError: "The runtime was not signed in when the run started.",
+      nextRunAt: iso(60 * 9),
+      lastRunAt: iso(-60 * 15),
+      createdAt: iso(-60 * 24 * 6),
+      updatedAt: iso(-60 * 15),
+    },
+  );
+  demoAutomationRuns.push(
+    {
+      id: "demo-run-1",
+      automationId: "demo-auto-ci",
+      scheduledFor: iso(-80),
+      status: "dispatched",
+      claimedAt: iso(-80),
+      finishedAt: iso(-78),
+    },
+    {
+      id: "demo-run-2",
+      automationId: "demo-auto-ci",
+      scheduledFor: iso(-20),
+      status: "dispatched",
+      claimedAt: iso(-20),
+      finishedAt: iso(-19),
+    },
+    {
+      id: "demo-run-3",
+      automationId: "demo-auto-theme",
+      scheduledFor: iso(-60 * 15),
+      status: "failed",
+      error: "The runtime was not signed in when the run started.",
+      claimedAt: iso(-60 * 15),
+      finishedAt: iso(-60 * 15),
+    },
+  );
+}
+
+function demoAutomationChanged(taskId: string) {
+  for (const listener of demoAutomationListeners) listener({ taskId });
+}
+
+function updateDemoAutomation(automationId: string, patch: Partial<Automation>): Automation {
+  const index = demoAutomations.findIndex((item) => item.id === automationId);
+  if (index < 0) throw new Error("Scheduled task not found");
+  const next = { ...demoAutomations[index], ...patch, updatedAt: new Date().toISOString() };
+  demoAutomations[index] = next;
+  demoAutomationChanged(next.taskId);
+  return next;
+}
+
 let codexCatalogConnected = false;
 let pendingMcpConfiguration: Promise<void> = Promise.resolve();
 let memoryEnabled = false;
@@ -6276,14 +6391,40 @@ export const bridge: AppBridge = {
   },
 
   listAutomations: async (taskId) => {
-    if (!isTauri()) return [];
+    if (!isTauri()) {
+      seedDemoAutomations();
+      return demoAutomations
+        .filter((item) => !taskId || item.taskId === taskId)
+        .map((item) => ({ ...item }));
+    }
     return nativeInvoke<Automation[]>("automation_list", {
       taskId: taskId ? (nativeTaskIds.get(taskId) ?? taskId) : undefined,
     });
   },
 
   createAutomation: async (input) => {
-    if (!isTauri()) throw new Error("Automations require the native app");
+    if (!isTauri()) {
+      seedDemoAutomations();
+      const now = new Date().toISOString();
+      const nextRunAt =
+        input.trigger.kind === "at"
+          ? input.trigger.runAt
+          : input.trigger.kind === "interval"
+            ? input.trigger.anchorAt
+            : undefined;
+      const automation: Automation = {
+        ...input,
+        id: `demo-auto-${demoAutomations.length + 1}-${Date.now().toString(36)}`,
+        source: "user",
+        status: "active",
+        nextRunAt,
+        createdAt: now,
+        updatedAt: now,
+      };
+      demoAutomations.unshift(automation);
+      demoAutomationChanged(automation.taskId);
+      return { ...automation };
+    }
     return nativeInvoke<Automation>("automation_create", {
       ...input,
       taskId: nativeTaskIds.get(input.taskId) ?? input.taskId,
@@ -6291,12 +6432,17 @@ export const bridge: AppBridge = {
   },
 
   updateAutomation: async (automationId, input) => {
-    if (!isTauri()) throw new Error("Automations require the native app");
+    if (!isTauri()) return updateDemoAutomation(automationId, input);
     return nativeInvoke<Automation>("automation_update", { automationId, ...input });
   },
 
   listAutomationRuns: async (automationId) => {
-    if (!isTauri()) return [];
+    if (!isTauri()) {
+      seedDemoAutomations();
+      return demoAutomationRuns
+        .filter((run) => run.automationId === automationId)
+        .sort((left, right) => right.scheduledFor.localeCompare(left.scheduledFor));
+    }
     return nativeInvoke<AutomationRun[]>("automation_run_list", { automationId });
   },
 
@@ -6313,7 +6459,8 @@ export const bridge: AppBridge = {
   },
 
   setAutomationPaused: async (automationId, paused) => {
-    if (!isTauri()) throw new Error("Automations require the native app");
+    if (!isTauri())
+      return updateDemoAutomation(automationId, { status: paused ? "paused" : "active" });
     return nativeInvoke<Automation>("automation_set_paused", { automationId, paused });
   },
 
@@ -6323,7 +6470,18 @@ export const bridge: AppBridge = {
   },
 
   runAutomationNow: async (automationId) => {
-    if (!isTauri()) throw new Error("Automations require the native app");
+    if (!isTauri()) {
+      const now = new Date().toISOString();
+      demoAutomationRuns.push({
+        id: `demo-run-${demoAutomationRuns.length + 1}-${Date.now().toString(36)}`,
+        automationId,
+        scheduledFor: now,
+        status: "dispatched",
+        claimedAt: now,
+        finishedAt: now,
+      });
+      return updateDemoAutomation(automationId, { lastRunAt: now });
+    }
     return nativeInvoke<Automation>("automation_run_now", { automationId });
   },
 
@@ -6345,7 +6503,12 @@ export const bridge: AppBridge = {
   },
 
   subscribeAutomationChanges: async (listener) => {
-    if (!isTauri()) return () => undefined;
+    if (!isTauri()) {
+      demoAutomationListeners.add(listener);
+      return () => {
+        demoAutomationListeners.delete(listener);
+      };
+    }
     const { listen } = await import("@tauri-apps/api/event");
     return listen<AutomationChanged>("automation://changed", (event) => {
       listener(event.payload);
