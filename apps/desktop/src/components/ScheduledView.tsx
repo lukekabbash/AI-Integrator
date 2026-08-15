@@ -13,6 +13,7 @@ import {
   CalendarClock,
   ExternalLink,
   History,
+  MessageSquarePlus,
   Minus,
   Pause,
   Play,
@@ -51,6 +52,11 @@ type ScheduleDraft = Pick<
 > & { iterationNotes: boolean };
 
 const FILTERS: ScheduleFilter[] = ["all", "active", "paused", "needs-attention"];
+
+/* "Continue in" targets: an existing chat, a fresh general chat, or a fresh
+   chat inside a project. Encoded as dropdown values. */
+const NEW_CHAT_TARGET = "new:chat";
+const NEW_PROJECT_TARGET_PREFIX = "new:project:";
 
 const UNITS: DropdownOption[] = [
   { value: "minutes", label: "minutes" },
@@ -457,7 +463,9 @@ export function ScheduledView({
   tasks,
   runtimes,
   activeTaskId,
+  defaultRoute,
   onOpenTask,
+  onTaskCreated,
 }: {
   createRequest?: number;
   railOpen: boolean;
@@ -469,7 +477,11 @@ export function ScheduledView({
   tasks: TaskSummary[];
   runtimes: RuntimeConnection[];
   activeTaskId?: string;
+  /** Runtime/model the shell would use for a brand-new chat. */
+  defaultRoute?: RouteCandidate;
   onOpenTask: (taskId: string) => void;
+  /** A chat created for a schedule; the shell adds it to the workspace snapshot. */
+  onTaskCreated?: (task: TaskSummary) => void;
 }) {
   const availableTasks = useMemo(
     () => tasks.filter((task) => !task.parentId && !task.archived),
@@ -485,7 +497,8 @@ export function ScheduledView({
   const [query, setQuery] = useState("");
   const [view, setView] = useState<MainView>({ kind: "browser" });
   const [creating, setCreating] = useState(false);
-  const [createTaskId, setCreateTaskId] = useState(defaultTask?.id ?? "");
+  const [createTarget, setCreateTarget] = useState(defaultTask?.id ?? NEW_CHAT_TARGET);
+  const [createRouteOverride, setCreateRouteOverride] = useState<RouteCandidate | null>(null);
   const [newTitle, setNewTitle] = useState("");
   const [newPrompt, setNewPrompt] = useState("");
   const [newKind, setNewKind] = useState<"once" | "repeat">("once");
@@ -559,9 +572,34 @@ export function ScheduledView({
         .catch(() => setRuns([]));
   }, [selected]);
 
-  const routeRuntimes = draft
-    ? [draft.route.runtime, ...draft.route.fallbacks.map((fallback) => fallback.runtime)]
-    : [];
+  const createTargetTask = tasks.find((task) => task.id === createTarget);
+  const createProjectId = createTarget.startsWith(NEW_PROJECT_TARGET_PREFIX)
+    ? createTarget.slice(NEW_PROJECT_TARGET_PREFIX.length)
+    : undefined;
+  const createTargetIsNew = createTarget === NEW_CHAT_TARGET || Boolean(createProjectId);
+  const fallbackRoute: RouteCandidate = defaultRoute ?? {
+    runtime:
+      runtimes.find((runtime) => runtime.status !== "not_installed")?.id ??
+      runtimes[0]?.id ??
+      "codex",
+    model: "Provider default",
+  };
+  const createRoute: RouteCandidate =
+    createRouteOverride ??
+    (createTargetTask
+      ? {
+          runtime: createTargetTask.runtime,
+          model: createTargetTask.model || "Provider default",
+          effort: createTargetTask.effort,
+        }
+      : fallbackRoute);
+
+  const routeRuntimes = [
+    ...(draft
+      ? [draft.route.runtime, ...draft.route.fallbacks.map((fallback) => fallback.runtime)]
+      : []),
+    ...(creating ? [createRoute.runtime] : []),
+  ];
   const routeRuntimeKey = routeRuntimes.join(":");
   useEffect(() => {
     for (const runtime of routeRuntimes) {
@@ -610,26 +648,38 @@ export function ScheduledView({
   };
 
   const createSchedule = async () => {
-    const effectiveTaskId = createTaskId || defaultTask?.id || "";
-    const task = tasks.find((item) => item.id === effectiveTaskId);
-    if (!task || !newTitle.trim() || !newPrompt.trim()) return;
-    if (!newRunAt) return;
+    if (!createTargetIsNew && !createTargetTask) return;
+    if (!newTitle.trim() || !newPrompt.trim() || !newRunAt) return;
     const seconds = intervalSeconds(newEvery, newUnit);
     const trigger: AutomationTrigger =
       newKind === "once"
         ? { kind: "at", runAt: new Date(newRunAt).toISOString() }
         : { kind: "interval", everySeconds: seconds, anchorAt: new Date(newRunAt).toISOString() };
     await perform(async () => {
+      let taskId = createTargetTask?.id;
+      if (!taskId) {
+        // A schedule that continues in a new chat owns that chat: name it after
+        // the schedule so the sidebar and the run history read the same.
+        const created = await bridge.createChat({
+          runtime: createRoute.runtime,
+          model: createRoute.model,
+          ...(createRoute.effort ? { effort: createRoute.effort } : {}),
+          ...(createProjectId ? { projectId: createProjectId } : {}),
+          title: newTitle.trim(),
+        });
+        onTaskCreated?.(created);
+        taskId = created.id;
+      }
       const automation = await bridge.createAutomation({
-        taskId: task.id,
+        taskId,
         title: newTitle.trim(),
         prompt: newPrompt.trim(),
         target: { kind: "task" },
         trigger,
         route: {
-          runtime: task.runtime,
-          model: task.model || "Provider default",
-          effort: task.effort,
+          runtime: createRoute.runtime,
+          model: createRoute.model || "Provider default",
+          effort: createRoute.effort,
           fallbacks: [],
           permission: "read-only",
           delegation: "off",
@@ -642,6 +692,8 @@ export function ScheduledView({
       setNewTitle("");
       setNewPrompt("");
       setNewIterationNotes(true);
+      setCreateRouteOverride(null);
+      if (createTargetIsNew) setCreateTarget(taskId);
       onRailOpenChange(true);
     });
   };
@@ -890,11 +942,19 @@ export function ScheduledView({
   const viewTransition = off
     ? { duration: 0 }
     : { duration: 0.2 * motionScale, ease: [0.2, 0, 0, 1] as const };
-  const taskOptions: DropdownOption[] = availableTasks.map((task) => ({
-    value: task.id,
-    label: taskLabel(task.id),
-    icon: <ProviderIcon provider={task.runtime} label={task.runtime} />,
-  }));
+  const targetOptions: DropdownOption[] = [
+    { value: NEW_CHAT_TARGET, label: "New chat", icon: <MessageSquarePlus aria-hidden="true" /> },
+    ...projects.map((project) => ({
+      value: `${NEW_PROJECT_TARGET_PREFIX}${project.id}`,
+      label: `New chat in ${project.name}`,
+      icon: <MessageSquarePlus aria-hidden="true" />,
+    })),
+    ...availableTasks.map((task) => ({
+      value: task.id,
+      label: taskLabel(task.id),
+      icon: <ProviderIcon provider={task.runtime} label={task.runtime} />,
+    })),
+  ];
   const kindOptions = [
     { value: "once" as const, label: "Once" },
     { value: "repeat" as const, label: "Repeat" },
@@ -1142,13 +1202,27 @@ export function ScheduledView({
                   <Dropdown
                     aria-label="Continue in"
                     className="scheduled-create-target"
-                    value={createTaskId || defaultTask?.id || ""}
-                    options={
-                      taskOptions.length
-                        ? taskOptions
-                        : [{ value: "", label: "No open chats", disabled: true }]
-                    }
-                    onChange={setCreateTaskId}
+                    value={createTarget}
+                    options={targetOptions}
+                    onChange={(value) => {
+                      setCreateTarget(value);
+                      // Follow the target's own route until the user picks one.
+                      setCreateRouteOverride(null);
+                    }}
+                  />
+                  <span className="scheduled-create-hint">
+                    {createTargetIsNew
+                      ? "A fresh chat is created when you save; every run continues there."
+                      : "Runs append to this chat's conversation."}
+                  </span>
+                </div>
+                <div className="scheduled-create-field scheduled-create-route">
+                  <RouteRow
+                    label="Run with"
+                    route={createRoute}
+                    runtimes={runtimes}
+                    catalogs={catalogs}
+                    onChange={setCreateRouteOverride}
                   />
                 </div>
                 <div className="scheduled-create-timing">
@@ -1222,7 +1296,7 @@ export function ScheduledView({
                     type="submit"
                     disabled={
                       busy ||
-                      !(createTaskId || defaultTask?.id) ||
+                      !(createTargetIsNew || createTargetTask) ||
                       !newTitle.trim() ||
                       !newPrompt.trim() ||
                       !newRunAt

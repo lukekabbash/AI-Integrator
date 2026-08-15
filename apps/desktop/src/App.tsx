@@ -6655,9 +6655,24 @@ export default function App() {
                       tasks={snapshot.tasks}
                       runtimes={snapshot.runtimes}
                       activeTaskId={snapshot.activeTaskId}
+                      defaultRoute={{
+                        runtime: settingsDefaultRuntime,
+                        model: settingsDefaultModel,
+                        ...(settingsDefaultRoute.effort
+                          ? { effort: settingsDefaultRoute.effort }
+                          : {}),
+                      }}
                       onOpenTask={(taskId) => {
                         setScreen("workspace");
                         void selectTask(taskId);
+                      }}
+                      onTaskCreated={(task) => {
+                        // Register the schedule's chat without stealing focus
+                        // from the Scheduled screen.
+                        setSnapshot((current) => ({
+                          ...current,
+                          tasks: [task, ...current.tasks.filter((item) => item.id !== task.id)],
+                        }));
                       }}
                     />
                   </Suspense>

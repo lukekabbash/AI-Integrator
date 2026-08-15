@@ -3,7 +3,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { bridge, type Automation } from "../bridge";
+import { bridge, type Automation, type TaskSummary } from "../bridge";
 import { ScheduledView } from "./ScheduledView";
 
 const automation: Automation = {
@@ -65,7 +65,7 @@ const runtimes = [
   },
 ];
 
-function renderScheduled(createRequest = 0) {
+function renderScheduled(createRequest = 0, onTaskCreated?: (task: TaskSummary) => void) {
   function Harness() {
     const [railOpen, setRailOpen] = useState(false);
     return (
@@ -80,7 +80,9 @@ function renderScheduled(createRequest = 0) {
         tasks={tasks}
         runtimes={runtimes}
         activeTaskId="task-1"
+        defaultRoute={{ runtime: "codex", model: "gpt-5.6-sol", effort: "medium" }}
         onOpenTask={() => undefined}
+        onTaskCreated={onTaskCreated}
       />
     );
   }
@@ -192,6 +194,60 @@ describe("ScheduledView", () => {
     );
     expect(container.querySelector("select")).toBeNull();
     expect(document.querySelector(".scheduled-create-sheet select")).toBeNull();
+  });
+
+  it("continues in a fresh project chat and runs with the chosen model", async () => {
+    const created: TaskSummary = {
+      id: "task-new",
+      projectId: "project-1",
+      kind: "code",
+      title: "Check CI",
+      status: "draft",
+      runtime: "codex",
+      model: "gpt-5.6-sol",
+      updatedAt: "2026-07-19T16:00:00.000Z",
+    };
+    const createChat = vi.spyOn(bridge, "createChat").mockResolvedValue(created);
+    const create = vi.spyOn(bridge, "createAutomation").mockResolvedValue(automation);
+    const onTaskCreated = vi.fn();
+    renderScheduled(1, onTaskCreated);
+    fireEvent.change(screen.getByPlaceholderText("Check CI again"), {
+      target: { value: "Check CI" },
+    });
+    fireEvent.change(screen.getByPlaceholderText(/Review the latest checks/), {
+      target: { value: "Review CI." },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Continue in" }));
+    fireEvent.click(screen.getByRole("option", { name: "New chat in Integrator" }));
+    expect(screen.getByText(/A fresh chat is created when you save/)).toBeInTheDocument();
+
+    // The route picker follows the shell default and stays editable.
+    expect(screen.getByRole("button", { name: "Run with runtime" })).toHaveAttribute(
+      "aria-haspopup",
+      "listbox",
+    );
+    expect(screen.getByRole("button", { name: "Run with model" })).toHaveTextContent("GPT-5.6 Sol");
+    fireEvent.click(await screen.findByRole("button", { name: "Run with thinking" }));
+    fireEvent.click(screen.getByRole("option", { name: "Medium" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    expect(createChat).toHaveBeenCalledWith(
+      expect.objectContaining({
+        projectId: "project-1",
+        runtime: "codex",
+        model: "gpt-5.6-sol",
+        title: "Check CI",
+      }),
+    );
+    expect(onTaskCreated).toHaveBeenCalledWith(created);
+    expect(create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        taskId: "task-new",
+        route: expect.objectContaining({ runtime: "codex", model: "gpt-5.6-sol" }),
+      }),
+    );
   });
 
   it("portals the create dialog above the complete app shell", async () => {

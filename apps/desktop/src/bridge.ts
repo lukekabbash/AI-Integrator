@@ -799,7 +799,12 @@ export interface StartTaskInput {
   draft?: ComposerDraft;
 }
 
-export type CreateChatInput = Pick<StartTaskInput, "runtime" | "model" | "effort">;
+export type CreateChatInput = Pick<StartTaskInput, "runtime" | "model" | "effort"> & {
+  /** Create the empty chat inside a project (a code task) instead of the general chats list. */
+  projectId?: string;
+  /** Initial title; defaults to the runtime placeholder the shell renames on first turn. */
+  title?: string;
+};
 
 export interface MemoryEntry {
   id: string;
@@ -5162,12 +5167,19 @@ export const bridge: AppBridge = {
   },
 
   createChat: async (input) => {
+    const project = input.projectId
+      ? (cachedWorkspace ?? readDemoSnapshot()).projects.find((item) => item.id === input.projectId)
+      : undefined;
+    if (input.projectId && !project) throw new Error(`Unknown project: ${input.projectId}`);
+    const kind = project ? "code" : "chat";
+    const title =
+      input.title?.trim() || (project ? CHAT_TITLE_PLACEHOLDER : GENERAL_CHAT_TITLE_PLACEHOLDER);
     if (isTauri()) {
       const task = await nativeInvoke<NativeTask>("task_create", {
         input: {
-          kind: "chat",
-          title: GENERAL_CHAT_TITLE_PLACEHOLDER,
-          repositoryPath: undefined,
+          kind,
+          title,
+          repositoryPath: project?.path,
           worktreePath: undefined,
           runtime: input.runtime,
           model: input.model,
@@ -5175,14 +5187,15 @@ export const bridge: AppBridge = {
         },
       });
       nativeTaskIds.set(task.id, task.id);
-      nativeTaskKinds.set(task.id, "chat");
-      return mapNativeTaskSummary(task, CHAT_PROJECT_ID, input.runtime);
+      nativeTaskKinds.set(task.id, kind);
+      if (project) repositoryByTaskId.set(task.id, project.path);
+      return mapNativeTaskSummary(task, project?.id ?? CHAT_PROJECT_ID, input.runtime);
     }
     return {
-      id: `chat-${Date.now()}`,
-      projectId: CHAT_PROJECT_ID,
-      kind: "chat",
-      title: GENERAL_CHAT_TITLE_PLACEHOLDER,
+      id: `${kind}-${Date.now()}`,
+      projectId: project?.id ?? CHAT_PROJECT_ID,
+      kind,
+      title,
       status: "draft",
       runtime: input.runtime,
       model: input.model,

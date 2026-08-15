@@ -2399,6 +2399,55 @@ kbd {
   right: 0;
 }
 
+.scheduled-create-target .dropdown-selected-icon > svg,
+.scheduled-create-target .dropdown-option-icon > svg {
+  width: 13px;
+  height: 13px;
+  color: var(--color-text-tertiary);
+}
+
+.scheduled-create-field > .scheduled-create-hint {
+  margin-top: -2px;
+  color: var(--color-text-tertiary);
+  font-size: 9.5px;
+  font-weight: 400;
+  line-height: 1.4;
+}
+
+/* "Run with" reuses the rail's route row inside the sheet: same grid, but
+   the controls sit on the sheet's field surface instead of the rail's. */
+.scheduled-create-route .dropdown-menu {
+  left: 0;
+  right: auto;
+  transform-origin: top left;
+}
+
+.scheduled-create-route .scheduled-route-label > span {
+  color: var(--color-text-secondary);
+  font-size: 10.5px;
+  font-weight: 570;
+}
+
+.scheduled-create-route .scheduled-route-row {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr) minmax(0, 0.9fr);
+}
+
+.scheduled-create-route .scheduled-route-row .dropdown--compact .dropdown-trigger,
+.scheduled-create-route .scheduled-route-default {
+  height: 32px;
+  background: var(--color-surface-layer1);
+  font-size: 11px;
+}
+
+.scheduled-create-route .scheduled-route-row .dropdown--compact .dropdown-trigger:hover,
+.scheduled-create-route
+  .scheduled-route-row
+  .dropdown--compact[data-open="true"]
+  .dropdown-trigger {
+  border-color: var(--color-border-base);
+  background: var(--color-surface-layer2);
+}
+
 .scheduled-create-timing {
   display: grid;
   gap: 9px;
