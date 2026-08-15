@@ -435,6 +435,31 @@ describe("Runtime Settings command disclosure", () => {
     expect(connectorCard).toHaveTextContent("npx -y local-docs-mcp");
   });
 
+  it("reports a packaged build that lost its built-in skill payload", async () => {
+    bridgeMock.listIntegratorSkills.mockResolvedValueOnce({
+      skillsRoot: "/tmp/AI Integrator/Skills",
+      pluginsRoot: "/tmp/AI Integrator/Plugins",
+      bundledAvailable: false,
+      skills: [],
+    });
+
+    render(
+      <SettingsView
+        preferences={DEFAULT_THEME_PREFERENCES}
+        runtimes={[claudeRuntime, runtime]}
+        usage={createEmptySnapshot().usage}
+        onChangePreferences={vi.fn()}
+        onResetPreferences={vi.fn()}
+        onBack={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Skills and Plugins" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Built-in skills are missing from this app package",
+    );
+  });
+
   it("keeps a curated MCP icon visible after the server is enabled", async () => {
     bridgeMock.listIntegratorMcps.mockResolvedValue({
       mcpsRoot: "/tmp/AI Integrator/MCPs",
@@ -650,6 +675,10 @@ describe("Runtime Settings command disclosure", () => {
     await waitFor(() => expect(bridgeMock.listIntegratorSkills).toHaveBeenCalled(), {
       timeout: 3_000,
     });
+    fireEvent.click(await screen.findByRole("tab", { name: "Skills" }));
+    expect(screen.getByPlaceholderText("Search 2 skills")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open gov-data:fred" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open gov-data:bls" })).toBeInTheDocument();
     fireEvent.click(await screen.findByRole("tab", { name: "Plugins" }));
     const plugin = await screen.findByRole("button", { name: "gov-data" }, { timeout: 3_000 });
     expect(plugin.querySelector("img")).toHaveAttribute("src", "/brand/skills/data-gov.ico");

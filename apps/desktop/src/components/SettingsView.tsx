@@ -2177,8 +2177,8 @@ function PluginDetailModal({
   );
 }
 
-/** Standalone-skill reader used from the flat Skills tab. Plugin-owned
- * skills disclose inside their plugin modal instead. */
+/** Individual-skill reader used from the flat Skills tab. Plugin bundles
+ * keep their inline disclosure inside PluginDetailModal as well. */
 function SkillDetailModal({ target, onClose }: { target: SkillDetailTarget; onClose: () => void }) {
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -2541,7 +2541,7 @@ function SkillsSettings({
     curatedByFolder,
     installedMarketplaceEntries,
     availableMarketplaceEntries,
-    nativeSkills,
+    allSkills,
   } = useMemo(() => {
     const nextGroups = groupSkills(overview?.skills ?? []);
     const nextMcpCountByOrigin = new Map<string, number>();
@@ -2572,22 +2572,20 @@ function SkillsSettings({
       curatedByFolder: nextCuratedByFolder,
       installedMarketplaceEntries: marketplaceEntries.filter((item) => item.installed),
       availableMarketplaceEntries: marketplaceEntries.filter((item) => !item.installed),
-      // Everything that isn't plugin-worthy — regardless of source — is just
-      // a skill, and lives here instead of behind a one-skill plugin card.
-      nativeSkills: nextGroups
-        .filter((group) => !isPluginWorthy(group))
-        .flatMap((group) => group.skills),
+      // Skills stay individually discoverable even when their owning bundle
+      // also earns a plugin-management card.
+      allSkills: nextGroups.flatMap((group) => group.skills),
     };
   }, [overview, serversByOrigin]);
   const normalizedQuery = skillQuery.trim().toLowerCase();
   const filteredSkills = useMemo(
     () =>
       normalizedQuery.length === 0
-        ? nativeSkills
-        : nativeSkills.filter((skill) =>
+        ? allSkills
+        : allSkills.filter((skill) =>
             `${skill.name} ${skill.description}`.toLowerCase().includes(normalizedQuery),
           ),
-    [nativeSkills, normalizedQuery],
+    [allSkills, normalizedQuery],
   );
 
   const openSkill = (skill: IntegratorSkillInfo) =>
@@ -2627,9 +2625,10 @@ function SkillsSettings({
           <p>Discover, install, and manage portable capabilities from one local-first library.</p>
         </div>
       </div>
-      {loadError ? (
-        <p className="settings-action-message" role="status">
-          {loadError}
+      {loadError || (overview && !overview.bundledAvailable) ? (
+        <p className="settings-action-message" role={loadError ? "status" : "alert"}>
+          {loadError ||
+            "Built-in skills are missing from this app package. Reinstall AI Integrator or use the complete local build folder."}
         </p>
       ) : null}
       {installMessage ? (
@@ -2778,7 +2777,7 @@ function SkillsSettings({
                 <input
                   value={skillQuery}
                   onChange={(event) => setSkillQuery(event.target.value)}
-                  placeholder={`Search ${nativeSkills.length} skills`}
+                  placeholder={`Search ${allSkills.length} skills`}
                 />
               </label>
               {filteredSkills.length > 0 ? (
