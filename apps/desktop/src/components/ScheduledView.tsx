@@ -1,7 +1,15 @@
-import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
-import { createPortal } from "react-dom";
-import { AnimatePresence, m as motion } from "motion/react";
 import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
+import { createPortal } from "react-dom";
+import { AnimatePresence, LayoutGroup, m as motion } from "motion/react";
+import {
+  ArrowLeft,
   CalendarClock,
   ExternalLink,
   History,
@@ -31,14 +39,147 @@ import { prettyModelLabel } from "../modelLabel";
 import { Dropdown, ProviderIcon, type DropdownOption } from "./Dropdown";
 import { RightRailShell } from "./RightRail";
 import { SlidingPanelSlot } from "./SlidingPanelSlot";
+import { TravelingSelection } from "./TravelingSelection";
 
 type ScheduleFilter = "all" | "active" | "paused" | "needs-attention";
 type MainView = { kind: "browser" } | { kind: "run"; id: string };
 type RouteCandidate = Pick<AutomationRoute, "runtime" | "model" | "effort">;
+type IntervalUnit = "minutes" | "hours" | "days";
 type ScheduleDraft = Pick<
   Automation,
   "title" | "prompt" | "trigger" | "route" | "recurrenceUserRequest"
 > & { iterationNotes: boolean };
+
+const FILTERS: ScheduleFilter[] = ["all", "active", "paused", "needs-attention"];
+
+const UNITS: DropdownOption[] = [
+  { value: "minutes", label: "minutes" },
+  { value: "hours", label: "hours" },
+  { value: "days", label: "days" },
+];
+
+/* The same settle every other surface uses (menus, tooltips, rail pills). */
+const settleSpring = { type: "spring" as const, stiffness: 540, damping: 38, mass: 0.7 };
+const rowSpring = { type: "spring" as const, stiffness: 460, damping: 40, mass: 0.7 };
+
+function motionOff(motionScale: number): boolean {
+  return (
+    motionScale === 0 ||
+    (typeof document !== "undefined" && document.documentElement.dataset.motion === "none")
+  );
+}
+
+/* Blocks present on first render appear in place; only later toggles unfold. */
+function useMounted(): boolean {
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => {
+    // Flipping once after mount is the point of this hook.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setMounted(true);
+  }, []);
+  return mounted;
+}
+
+/* Height-reveal used for every conditional block in the rail and the create
+   sheet, so sections unfold instead of popping. Overflow is only clipped
+   while the height is in flight — dropdown menus inside must escape once
+   the block has settled. */
+function UnfoldingBlock({
+  motionScale,
+  animateIn,
+  className,
+  children,
+}: {
+  motionScale: number;
+  animateIn: boolean;
+  className?: string;
+  children: ReactNode;
+}) {
+  const off = motionOff(motionScale);
+  const [settled, setSettled] = useState(off || !animateIn);
+  return (
+    <motion.div
+      className={className}
+      style={{ overflow: settled ? "visible" : "hidden" }}
+      initial={off || !animateIn ? false : { height: 0, opacity: 0 }}
+      animate={{ height: "auto", opacity: 1 }}
+      exit={{ height: 0, opacity: 0 }}
+      transition={
+        off
+          ? { duration: 0 }
+          : { height: settleSpring, opacity: { duration: 0.16, ease: [0.2, 0, 0, 1] } }
+      }
+      onAnimationStart={() => setSettled(false)}
+      onAnimationComplete={(definition) => {
+        if (typeof definition === "object" && definition && "height" in definition) {
+          setSettled((definition as { height?: unknown }).height === "auto");
+        }
+      }}
+    >
+      {children}
+    </motion.div>
+  );
+}
+
+function Reveal({
+  show,
+  motionScale,
+  className,
+  children,
+}: {
+  show: boolean;
+  motionScale: number;
+  className?: string;
+  children: ReactNode;
+}) {
+  const mounted = useMounted();
+  return (
+    <AnimatePresence initial={false}>
+      {show ? (
+        <UnfoldingBlock motionScale={motionScale} animateIn={mounted} className={className}>
+          {children}
+        </UnfoldingBlock>
+      ) : null}
+    </AnimatePresence>
+  );
+}
+
+/* Segmented filter with the traveling pill — same language as the sidebar
+   and settings nav rather than a static highlighted button. */
+function FilterPills<T extends string>({
+  value,
+  options,
+  onChange,
+  label,
+  layoutKey,
+}: {
+  value: T;
+  options: { value: T; label: string }[];
+  onChange: (value: T) => void;
+  label: string;
+  layoutKey: string;
+}) {
+  return (
+    <div className="scheduled-filter" role="group" aria-label={label}>
+      <TravelingSelection
+        activeKey={value}
+        className="scheduled-filter-active"
+        layoutKey={`${layoutKey}:${options.map((option) => option.value).join("|")}`}
+      />
+      {options.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          data-active={value === option.value}
+          data-traveling-selection={option.value}
+          onClick={() => onChange(option.value)}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 const PERMISSIONS: DropdownOption[] = [
   { value: "read-only", label: "Read only" },
@@ -104,13 +245,13 @@ function runLabel(run: AutomationRun): string {
   });
 }
 
-function intervalParts(seconds: number): { amount: number; unit: "minutes" | "hours" | "days" } {
+function intervalParts(seconds: number): { amount: number; unit: IntervalUnit } {
   if (seconds % 86_400 === 0) return { amount: seconds / 86_400, unit: "days" };
   if (seconds % 3_600 === 0) return { amount: seconds / 3_600, unit: "hours" };
   return { amount: Math.max(1, seconds / 60), unit: "minutes" };
 }
 
-function intervalSeconds(amount: number, unit: "minutes" | "hours" | "days"): number {
+function intervalSeconds(amount: number, unit: IntervalUnit): number {
   return amount * (unit === "days" ? 86_400 : unit === "hours" ? 3_600 : 60);
 }
 
@@ -223,13 +364,16 @@ function RouteEditor({
   route,
   runtimes,
   catalogs,
+  motionScale,
   onChange,
 }: {
   route: AutomationRoute;
   runtimes: RuntimeConnection[];
   catalogs: Partial<Record<RuntimeId, ModelCatalogEntry[]>>;
+  motionScale: number;
   onChange: (route: AutomationRoute) => void;
 }) {
+  const mounted = useMounted();
   const addFallback = () => {
     const nextRuntime =
       runtimes.find(
@@ -265,11 +409,10 @@ function RouteEditor({
       />
       <AnimatePresence initial={false}>
         {route.fallbacks.map((fallback, index) => (
-          <motion.div
+          <UnfoldingBlock
             key={`${index}-${fallback.runtime}`}
-            initial={{ opacity: 0, height: 0 }}
-            animate={{ opacity: 1, height: "auto" }}
-            exit={{ opacity: 0, height: 0 }}
+            motionScale={motionScale}
+            animateIn={mounted}
           >
             <RouteRow
               label={`Fallback ${index + 1}`}
@@ -291,14 +434,14 @@ function RouteEditor({
                 })
               }
             />
-          </motion.div>
+          </UnfoldingBlock>
         ))}
       </AnimatePresence>
-      {route.fallbacks.length < 4 ? (
+      <Reveal show={route.fallbacks.length < 4} motionScale={motionScale}>
         <button className="scheduled-add-fallback" type="button" onClick={addFallback}>
           <Plus /> Add fallback
         </button>
-      ) : null}
+      </Reveal>
     </div>
   );
 }
@@ -351,7 +494,7 @@ export function ScheduledView({
     dateInputValue(new Date(Date.now() + 60 * 60_000)),
   );
   const [newEvery, setNewEvery] = useState(1);
-  const [newUnit, setNewUnit] = useState<"minutes" | "hours" | "days">("hours");
+  const [newUnit, setNewUnit] = useState<IntervalUnit>("hours");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -515,6 +658,7 @@ export function ScheduledView({
       <div className="scheduled-rail-panel scheduled-setup-panel">
         <div className="scheduled-rail-heading">
           <span>
+            <i className="scheduled-status-dot" data-status={selected.status} aria-hidden="true" />
             {statusLabel(selected.status)} · {triggerLabel(draft.trigger)}
           </span>
           <input
@@ -570,11 +714,13 @@ export function ScheduledView({
                   });
                 }}
               />
-              <select
+              <Dropdown
+                compact
                 aria-label="Repeat interval unit"
                 value={draftInterval.unit}
-                onChange={(event) => {
-                  const unit = event.target.value as typeof draftInterval.unit;
+                options={UNITS}
+                onChange={(value) => {
+                  const unit = value as IntervalUnit;
                   setDraft({
                     ...draft,
                     recurrenceUserRequest: `Every ${draftInterval.amount} ${unit}`,
@@ -584,11 +730,7 @@ export function ScheduledView({
                     },
                   });
                 }}
-              >
-                <option value="minutes">minutes</option>
-                <option value="hours">hours</option>
-                <option value="days">days</option>
-              </select>
+              />
               <input
                 aria-label="Next run"
                 type="datetime-local"
@@ -621,18 +763,22 @@ export function ScheduledView({
                 <span />
               </button>
             </div>
-            {draft.iterationNotes && selected.nextRunNote ? (
+            <Reveal
+              show={Boolean(draft.iterationNotes && selected.nextRunNote)}
+              motionScale={motionScale}
+            >
               <div className="scheduled-next-note">
                 <span>Next run note</span>
                 <p>{selected.nextRunNote}</p>
               </div>
-            ) : null}
+            </Reveal>
           </>
         ) : null}
         <RouteEditor
           route={draft.route}
           runtimes={runtimes}
           catalogs={catalogs}
+          motionScale={motionScale}
           onChange={(route) => setDraft({ ...draft, route })}
         />
         <div className="scheduled-policy-row">
@@ -661,7 +807,9 @@ export function ScheduledView({
             }
           />
         </div>
-        {error ? <p className="scheduled-error">{error}</p> : null}
+        <Reveal show={Boolean(error)} motionScale={motionScale}>
+          <p className="scheduled-error">{error}</p>
+        </Reveal>
         <div className="scheduled-rail-actions">
           <button
             type="button"
@@ -693,7 +841,10 @@ export function ScheduledView({
         </div>
       </div>
     ) : (
-      <div className="scheduled-rail-empty">Select a scheduled task</div>
+      <div className="scheduled-rail-empty">
+        <CalendarClock aria-hidden="true" />
+        <span>Select a scheduled task</span>
+      </div>
     );
 
   const runsPanel = selected ? (
@@ -705,12 +856,18 @@ export function ScheduledView({
         <strong>{selected.title}</strong>
       </div>
       <div className="scheduled-run-list">
+        <TravelingSelection
+          activeKey={view.kind === "run" ? view.id : ""}
+          className="scheduled-run-active"
+          layoutKey={runs.map((run) => run.id).join("|")}
+        />
         {runs.length ? (
           runs.map((run) => (
             <button
               type="button"
               key={run.id}
               data-active={view.kind === "run" && view.id === run.id}
+              data-traveling-selection={run.id}
               onClick={() => setView({ kind: "run", id: run.id })}
             >
               <span>{runLabel(run)}</span>
@@ -729,6 +886,20 @@ export function ScheduledView({
     </div>
   ) : null;
 
+  const off = motionOff(motionScale);
+  const viewTransition = off
+    ? { duration: 0 }
+    : { duration: 0.2 * motionScale, ease: [0.2, 0, 0, 1] as const };
+  const taskOptions: DropdownOption[] = availableTasks.map((task) => ({
+    value: task.id,
+    label: taskLabel(task.id),
+    icon: <ProviderIcon provider={task.runtime} label={task.runtime} />,
+  }));
+  const kindOptions = [
+    { value: "once" as const, label: "Once" },
+    { value: "repeat" as const, label: "Repeat" },
+  ];
+
   return (
     <div
       className="scheduled-workspace"
@@ -736,117 +907,158 @@ export function ScheduledView({
       style={{ "--right-rail-width": `${rightRailWidth}px` } as CSSProperties}
     >
       <section className="scheduled-canvas">
-        {selected && selectedRun ? (
-          <motion.div
-            className="scheduled-run-view"
-            key={selectedRun.id}
-            initial={motionScale === 0 ? false : { opacity: 0, y: 5 }}
-            animate={{ opacity: 1, y: 0 }}
-          >
-            <button
-              className="scheduled-back-button"
-              type="button"
-              onClick={() => setView({ kind: "browser" })}
+        <AnimatePresence initial={false} mode="popLayout">
+          {selected && selectedRun ? (
+            <motion.div
+              className="scheduled-run-view"
+              key={`run:${selectedRun.id}`}
+              initial={off ? false : { opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -4 }}
+              transition={viewTransition}
             >
-              Back to scheduled tasks
-            </button>
-            <span className="scheduled-eyebrow">Run · {runLabel(selectedRun)}</span>
-            <h2>{selected.title}</h2>
-            <p className="scheduled-summary">
-              {statusLabel(selectedRun.status as Automation["status"])} ·{" "}
-              {runtimeName(selected.route.runtime, runtimes)} ·{" "}
-              {prettyModelLabel(selected.route.model)}
-            </p>
-            <section className="scheduled-run-copy">
-              <span>Scheduled prompt</span>
-              <p>{selected.prompt}</p>
-            </section>
-            {selectedRun.error ? (
-              <section className="scheduled-run-error">
-                <span>Could not start</span>
-                <p>{selectedRun.error}</p>
+              <button
+                className="scheduled-back-button"
+                type="button"
+                onClick={() => setView({ kind: "browser" })}
+              >
+                <ArrowLeft aria-hidden="true" /> Back to scheduled tasks
+              </button>
+              <span className="scheduled-eyebrow">Run · {runLabel(selectedRun)}</span>
+              <h2>{selected.title}</h2>
+              <p className="scheduled-summary">
+                {statusLabel(selectedRun.status as Automation["status"])} ·{" "}
+                {runtimeName(selected.route.runtime, runtimes)} ·{" "}
+                {prettyModelLabel(selected.route.model)}
+              </p>
+              <section className="scheduled-run-copy">
+                <span>Scheduled prompt</span>
+                <p>{selected.prompt}</p>
               </section>
-            ) : null}
-            <button
-              className="scheduled-open-chat"
-              type="button"
-              onClick={() => onOpenTask(selected.taskId)}
-            >
-              Open chat <ExternalLink />
-            </button>
-          </motion.div>
-        ) : (
-          <div className="scheduled-browser">
-            <div className="scheduled-browser-tools">
-              <label>
-                <Search aria-hidden="true" />
-                <input
-                  value={query}
-                  onChange={(event) => setQuery(event.target.value)}
-                  placeholder="Search scheduled tasks"
-                  aria-label="Search scheduled tasks"
-                />
-              </label>
-              <div className="scheduled-filter" aria-label="Filter scheduled tasks">
-                {(["all", "active", "paused", "needs-attention"] as const).map((option) => (
-                  <button
-                    key={option}
-                    type="button"
-                    data-active={filter === option}
-                    onClick={() => setFilter(option)}
-                  >
-                    {option === "all" ? "All" : statusLabel(option)}
-                  </button>
-                ))}
-              </div>
-            </div>
-            {error && !selected ? <p className="scheduled-error">{error}</p> : null}
-            <div className="scheduled-browser-list" aria-label="Scheduled tasks">
-              {filtered.map((automation) => (
-                <button
-                  key={automation.id}
-                  className="scheduled-browser-row"
-                  type="button"
-                  data-selected={railOpen && automation.id === selected?.id}
-                  data-status={
-                    automation.status === "needs-attention" ? "attention" : automation.status
-                  }
-                  onClick={() => {
-                    setSelectedId(automation.id);
-                    setView({ kind: "browser" });
-                    onRailOpenChange(true);
-                  }}
-                >
-                  <span className="scheduled-list-state" aria-hidden="true" />
-                  <span className="scheduled-list-copy">
-                    <strong>{automation.title}</strong>
-                    <small>{taskLabel(automation.taskId)}</small>
-                  </span>
-                  <span className="scheduled-browser-route">
-                    <strong>
-                      {runtimeName(automation.route.runtime, runtimes)}
-                      {automation.route.fallbacks?.length
-                        ? ` +${automation.route.fallbacks.length}`
-                        : ""}
-                    </strong>
-                    <small>{prettyModelLabel(automation.route.model)}</small>
-                  </span>
-                  <span className="scheduled-browser-time">
-                    <strong>{nextRunLabel(automation)}</strong>
-                    <small>{triggerLabel(automation.trigger)}</small>
-                  </span>
-                </button>
-              ))}
-              {!filtered.length ? (
-                <div className="scheduled-empty">
-                  <CalendarClock />
-                  <strong>No scheduled tasks</strong>
-                  <span>Create one here or ask the agent to wake up later.</span>
-                </div>
+              {selectedRun.error ? (
+                <section className="scheduled-run-error">
+                  <span>Could not start</span>
+                  <p>{selectedRun.error}</p>
+                </section>
               ) : null}
-            </div>
-          </div>
-        )}
+              <button
+                className="scheduled-open-chat"
+                type="button"
+                onClick={() => onOpenTask(selected.taskId)}
+              >
+                Open chat <ExternalLink />
+              </button>
+            </motion.div>
+          ) : (
+            <motion.div
+              className="scheduled-browser"
+              key="browser"
+              initial={off ? false : { opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -4 }}
+              transition={viewTransition}
+            >
+              <div className="scheduled-browser-tools">
+                <label>
+                  <Search aria-hidden="true" />
+                  <input
+                    value={query}
+                    onChange={(event) => setQuery(event.target.value)}
+                    placeholder="Search scheduled tasks"
+                    aria-label="Search scheduled tasks"
+                  />
+                </label>
+                <FilterPills
+                  value={filter}
+                  label="Filter scheduled tasks"
+                  layoutKey="browser-filter"
+                  options={FILTERS.map((option) => ({
+                    value: option,
+                    label: option === "all" ? "All" : statusLabel(option),
+                  }))}
+                  onChange={setFilter}
+                />
+              </div>
+              <Reveal show={Boolean(error && !selected)} motionScale={motionScale}>
+                <p className="scheduled-error">{error}</p>
+              </Reveal>
+              <div className="scheduled-browser-list" aria-label="Scheduled tasks">
+                <TravelingSelection
+                  activeKey={railOpen && selected ? selected.id : ""}
+                  className="scheduled-row-active"
+                  layoutKey={`${filter}:${query}:${filtered.map((item) => item.id).join("|")}`}
+                />
+                <LayoutGroup id="scheduled-browser-rows">
+                  <AnimatePresence initial={false} mode="popLayout">
+                    {filtered.map((automation) => (
+                      <motion.button
+                        key={automation.id}
+                        layout={off ? false : "position"}
+                        className="scheduled-browser-row"
+                        type="button"
+                        data-selected={railOpen && automation.id === selected?.id}
+                        data-traveling-selection={automation.id}
+                        data-status={
+                          automation.status === "needs-attention" ? "attention" : automation.status
+                        }
+                        initial={off ? false : { opacity: 0, y: 6, scale: 0.985 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        exit={{ opacity: 0, scale: 0.985, transition: { duration: 0.12 } }}
+                        transition={off ? { duration: 0 } : { layout: rowSpring, ...rowSpring }}
+                        onClick={() => {
+                          setSelectedId(automation.id);
+                          setView({ kind: "browser" });
+                          onRailOpenChange(true);
+                        }}
+                      >
+                        <span className="scheduled-list-state" aria-hidden="true" />
+                        <span className="scheduled-list-copy">
+                          <strong>{automation.title}</strong>
+                          <small>{taskLabel(automation.taskId)}</small>
+                        </span>
+                        <span className="scheduled-browser-route">
+                          <strong>
+                            {runtimeName(automation.route.runtime, runtimes)}
+                            {automation.route.fallbacks?.length
+                              ? ` +${automation.route.fallbacks.length}`
+                              : ""}
+                          </strong>
+                          <small>{prettyModelLabel(automation.route.model)}</small>
+                        </span>
+                        <span className="scheduled-browser-time">
+                          <strong>{nextRunLabel(automation)}</strong>
+                          <small>{triggerLabel(automation.trigger)}</small>
+                        </span>
+                      </motion.button>
+                    ))}
+                  </AnimatePresence>
+                </LayoutGroup>
+                <AnimatePresence initial={false}>
+                  {!filtered.length ? (
+                    <motion.div
+                      className="scheduled-empty"
+                      key="empty"
+                      initial={off ? false : { opacity: 0, y: 4 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, transition: { duration: 0.1 } }}
+                      transition={viewTransition}
+                    >
+                      <CalendarClock />
+                      <strong>
+                        {automations.length ? "Nothing matches" : "No scheduled tasks"}
+                      </strong>
+                      <span>
+                        {automations.length
+                          ? "Try another filter or clear the search."
+                          : "Create one here or ask the agent to wake up later."}
+                      </span>
+                    </motion.div>
+                  ) : null}
+                </AnimatePresence>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </section>
 
       <SlidingPanelSlot open={railOpen} motionScale={motionScale} slotKey="scheduled-tools">
@@ -872,9 +1084,10 @@ export function ScheduledView({
           {creating ? (
             <motion.div
               className="scheduled-modal-backdrop"
-              initial={motionScale === 0 ? false : { opacity: 0 }}
+              initial={off ? false : { opacity: 0 }}
               animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
+              exit={{ opacity: 0, transition: { duration: 0.14 } }}
+              transition={{ duration: 0.18 }}
               onMouseDown={(event) => {
                 if (event.currentTarget === event.target) setCreating(false);
               }}
@@ -884,9 +1097,15 @@ export function ScheduledView({
                 role="dialog"
                 aria-modal="true"
                 aria-labelledby="scheduled-create-title"
-                initial={motionScale === 0 ? false : { opacity: 0, y: 10, scale: 0.985 }}
+                initial={off ? false : { opacity: 0, y: 12, scale: 0.975 }}
                 animate={{ opacity: 1, y: 0, scale: 1 }}
-                exit={{ opacity: 0, y: 6, scale: 0.99 }}
+                exit={{
+                  opacity: 0,
+                  y: 6,
+                  scale: 0.985,
+                  transition: { duration: 0.14, ease: [0.2, 0, 0, 1] },
+                }}
+                transition={off ? { duration: 0 } : settleSpring}
                 onSubmit={(event) => {
                   event.preventDefault();
                   void createSchedule();
@@ -918,81 +1137,83 @@ export function ScheduledView({
                     placeholder="Review the latest checks and summarize anything that changed."
                   />
                 </label>
-                <label>
-                  <span>Continue in</span>
-                  <select
+                <div className="scheduled-create-field">
+                  <span id="scheduled-create-target-label">Continue in</span>
+                  <Dropdown
+                    aria-label="Continue in"
+                    className="scheduled-create-target"
                     value={createTaskId || defaultTask?.id || ""}
-                    onChange={(event) => setCreateTaskId(event.target.value)}
-                  >
-                    {availableTasks.map((task) => (
-                      <option key={task.id} value={task.id}>
-                        {taskLabel(task.id)}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                    options={
+                      taskOptions.length
+                        ? taskOptions
+                        : [{ value: "", label: "No open chats", disabled: true }]
+                    }
+                    onChange={setCreateTaskId}
+                  />
+                </div>
                 <div className="scheduled-create-timing">
-                  <div className="scheduled-filter">
-                    <button
-                      type="button"
-                      data-active={newKind === "once"}
-                      onClick={() => setNewKind("once")}
-                    >
-                      Once
-                    </button>
-                    <button
-                      type="button"
-                      data-active={newKind === "repeat"}
-                      onClick={() => setNewKind("repeat")}
-                    >
-                      Repeat
-                    </button>
+                  <div className="scheduled-create-kind">
+                    <FilterPills
+                      value={newKind}
+                      label="Schedule kind"
+                      layoutKey="create-kind"
+                      options={kindOptions}
+                      onChange={setNewKind}
+                    />
+                    <span className="scheduled-create-kind-hint">
+                      {newKind === "once" ? "Runs one time at" : "First run at"}
+                    </span>
                   </div>
-                  {newKind === "repeat" ? (
-                    <>
-                      <div className="scheduled-interval-input">
-                        <span>Every</span>
-                        <input
-                          type="number"
-                          min="1"
-                          value={newEvery}
-                          onChange={(event) => setNewEvery(Math.max(1, Number(event.target.value)))}
-                        />
-                        <select
-                          value={newUnit}
-                          onChange={(event) => setNewUnit(event.target.value as typeof newUnit)}
-                        >
-                          <option value="minutes">minutes</option>
-                          <option value="hours">hours</option>
-                          <option value="days">days</option>
-                        </select>
-                      </div>
-                      <div className="scheduled-create-iteration">
-                        <span>
-                          <strong>Build on previous runs</strong>
-                          <small>The agent can leave a note for its next iteration.</small>
-                        </span>
-                        <button
-                          className="switch"
-                          type="button"
-                          role="switch"
-                          aria-label="Build on previous runs"
-                          aria-checked={newIterationNotes}
-                          data-checked={newIterationNotes}
-                          onClick={() => setNewIterationNotes((enabled) => !enabled)}
-                        >
-                          <span />
-                        </button>
-                      </div>
-                    </>
-                  ) : null}
+                  <Reveal
+                    show={newKind === "repeat"}
+                    motionScale={motionScale}
+                    className="scheduled-create-repeat"
+                  >
+                    <div className="scheduled-interval-input">
+                      <span>Every</span>
+                      <input
+                        aria-label="Repeat every"
+                        type="number"
+                        min="1"
+                        value={newEvery}
+                        onChange={(event) => setNewEvery(Math.max(1, Number(event.target.value)))}
+                      />
+                      <Dropdown
+                        compact
+                        aria-label="Repeat unit"
+                        value={newUnit}
+                        options={UNITS}
+                        onChange={(value) => setNewUnit(value as IntervalUnit)}
+                      />
+                    </div>
+                    <div className="scheduled-create-iteration">
+                      <span>
+                        <strong>Build on previous runs</strong>
+                        <small>The agent can leave a note for its next iteration.</small>
+                      </span>
+                      <button
+                        className="switch"
+                        type="button"
+                        role="switch"
+                        aria-label="Build on previous runs"
+                        aria-checked={newIterationNotes}
+                        data-checked={newIterationNotes}
+                        onClick={() => setNewIterationNotes((enabled) => !enabled)}
+                      >
+                        <span />
+                      </button>
+                    </div>
+                  </Reveal>
                   <input
+                    aria-label={newKind === "once" ? "Run at" : "First run at"}
                     type="datetime-local"
                     value={newRunAt}
                     onChange={(event) => setNewRunAt(event.target.value)}
                   />
                 </div>
-                {error ? <p className="scheduled-error">{error}</p> : null}
+                <Reveal show={Boolean(error)} motionScale={motionScale}>
+                  <p className="scheduled-error">{error}</p>
+                </Reveal>
                 <footer>
                   <button type="button" onClick={() => setCreating(false)}>
                     Cancel

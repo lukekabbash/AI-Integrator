@@ -160,6 +160,40 @@ describe("ScheduledView", () => {
     );
   });
 
+  it("uses the themed dropdown for every choice control instead of native selects", async () => {
+    const update = vi.spyOn(bridge, "updateAutomation").mockResolvedValue(automation);
+    const { container } = renderScheduled(1);
+    fireEvent.click(await screen.findByRole("button", { name: /Dependency audit/ }));
+
+    // Rail: interval unit is a listbox trigger, not a <select>.
+    const unit = screen.getByRole("button", { name: "Repeat interval unit" });
+    expect(unit).toHaveAttribute("aria-haspopup", "listbox");
+    fireEvent.click(unit);
+    fireEvent.click(screen.getByRole("option", { name: "days" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(update).toHaveBeenCalledWith(
+        "automation-1",
+        expect.objectContaining({
+          trigger: expect.objectContaining({ everySeconds: 86_400 }),
+        }),
+      ),
+    );
+
+    // Create sheet: target chat and repeat unit are dropdowns too.
+    fireEvent.click(screen.getByRole("button", { name: "Repeat" }));
+    expect(screen.getByRole("button", { name: "Continue in" })).toHaveAttribute(
+      "aria-haspopup",
+      "listbox",
+    );
+    expect(screen.getByRole("button", { name: "Repeat unit" })).toHaveAttribute(
+      "aria-haspopup",
+      "listbox",
+    );
+    expect(container.querySelector("select")).toBeNull();
+    expect(document.querySelector(".scheduled-create-sheet select")).toBeNull();
+  });
+
   it("portals the create dialog above the complete app shell", async () => {
     const { container } = renderScheduled(1);
     const dialog = await screen.findByRole("dialog", { name: "New scheduled task" });
