@@ -587,6 +587,23 @@ fn validate_route(route: &AutomationRoute) -> Result<()> {
             "automation route supports at most four fallbacks".into(),
         ));
     }
+    if let Some(tools) = &route.tools {
+        if tools.mcp_servers.len() + tools.skills.len() > 256 {
+            return Err(IntegratorError::InvalidInput(
+                "automation tool scope names too many tools".into(),
+            ));
+        }
+        if tools
+            .mcp_servers
+            .iter()
+            .chain(tools.skills.iter())
+            .any(|name| name.trim().is_empty() || name.len() > 200)
+        {
+            return Err(IntegratorError::InvalidInput(
+                "automation tool scope entries must be non-empty names".into(),
+            ));
+        }
+    }
     if route
         .fallbacks
         .iter()
@@ -742,6 +759,7 @@ mod tests {
             fallbacks: Vec::new(),
             permission: "read-only".into(),
             delegation: "balanced".into(),
+            tools: None,
         }
     }
 

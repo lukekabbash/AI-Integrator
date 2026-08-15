@@ -371,6 +371,25 @@ pub fn enabled_servers(app: &tauri::AppHandle, store: &LocalStore) -> Vec<Integr
         .collect()
 }
 
+/// Enabled servers narrowed by an optional schedule tool scope. `None` keeps
+/// the full enabled set; a scope keeps only the named servers that are still
+/// enabled, so a globally disabled server silently drops out of the schedule
+/// instead of failing the unattended run.
+pub fn scoped_enabled_servers(
+    app: &tauri::AppHandle,
+    store: &LocalStore,
+    scope: Option<&integrator_core::AutomationToolScope>,
+) -> Vec<IntegratorMcpServer> {
+    let enabled = enabled_servers(app, store);
+    match scope {
+        None => enabled,
+        Some(scope) => enabled
+            .into_iter()
+            .filter(|server| scope.mcp_servers.contains(&server.name))
+            .collect(),
+    }
+}
+
 /// Resolve only the MCP servers named by a delegation snapshot. Globally
 /// disabling or removing one revokes future launches/resumes for that child.
 pub fn selected_enabled_servers(

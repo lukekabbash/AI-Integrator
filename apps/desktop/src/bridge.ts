@@ -869,6 +869,15 @@ export interface SendTurnInput extends Omit<StartTaskInput, "projectId"> {
   nativeActionId?: string;
   /** Continue a transport-interrupted turn from its provider-owned session. */
   resumeInterrupted?: boolean;
+  /** Narrow the MCP servers / skills this turn may use (scheduled runs). Absent = all enabled. */
+  toolScope?: AutomationToolScope;
+}
+
+/** Named subset of the globally enabled MCP servers and skills a schedule may
+ * use. Intersected with the enabled set at launch; absent means "everything". */
+export interface AutomationToolScope {
+  mcpServers: string[];
+  skills: string[];
 }
 
 export interface AutomationRoute {
@@ -878,6 +887,7 @@ export interface AutomationRoute {
   fallbacks: AutomationFallback[];
   permission: ComposerDraftValue["permission"];
   delegation: ComposerDraftValue["delegation"];
+  tools?: AutomationToolScope;
 }
 
 export interface AutomationFallback {
@@ -3194,6 +3204,7 @@ async function ensureCursorSessionForTaskUnlocked(
   taskId: string,
   delegation?: StartTaskInput["delegation"],
   permission?: StartTaskInput["permission"],
+  toolScope?: AutomationToolScope,
 ): Promise<string> {
   const nativeTaskId = await ensureNativeTask(taskId);
   const cwd = repositoryForTask(taskId);
@@ -3215,6 +3226,7 @@ async function ensureCursorSessionForTaskUnlocked(
           cwd,
           delegation: delegationMode,
           permission,
+          toolScope,
         });
       let session: unknown;
       if (resumable) {
@@ -3222,6 +3234,7 @@ async function ensureCursorSessionForTaskUnlocked(
           session = await nativeInvoke<unknown>("acp_resume_session", {
             taskId: nativeTaskId,
             cwd,
+            toolScope,
           });
         } catch (error) {
           if (!isStaleProviderResumeError(error)) throw error;
@@ -3336,6 +3349,7 @@ async function ensureStandardAcpSessionUnlocked(
         cwd,
         delegation: input.delegation,
         permission: input.permission,
+        toolScope: input.toolScope,
       });
     let session: unknown;
     if (resumable) {
@@ -3343,6 +3357,7 @@ async function ensureStandardAcpSessionUnlocked(
         session = await nativeInvoke<unknown>("acp_resume_session", {
           taskId: nativeTaskId,
           cwd,
+          toolScope: input.toolScope,
         });
       } catch (error) {
         if (!isStaleProviderResumeError(error)) throw error;
@@ -3890,6 +3905,7 @@ async function startNewCodexThread(
     effort: input.effort,
     permission: input.permission,
     delegation: input.delegation,
+    toolScope: input.toolScope,
   });
   const threadId = extractThreadId(started);
   if (!threadId) throw new Error("Codex did not return a thread identifier");
@@ -6274,6 +6290,7 @@ export const bridge: AppBridge = {
             delegation: routedInput.delegation,
             contextReferences: routedInput.contextReferences,
             resumeInterrupted: routedInput.resumeInterrupted,
+            toolScope: routedInput.toolScope,
             ...attachmentArgs,
           });
         try {
@@ -6301,6 +6318,7 @@ export const bridge: AppBridge = {
               routedInput.taskId,
               routedInput.delegation,
               routedInput.permission,
+              routedInput.toolScope,
             );
             await applyCursorSelection(taskId, routedInput);
             await nativeInvoke("acp_send_turn", {
@@ -6310,6 +6328,7 @@ export const bridge: AppBridge = {
               nativeActionId: routedInput.nativeActionId,
               contextReferences: routedInput.contextReferences,
               resumeInterrupted: routedInput.resumeInterrupted,
+              toolScope: routedInput.toolScope,
               ...attachmentArgs,
             });
           } catch (error) {
@@ -6335,6 +6354,7 @@ export const bridge: AppBridge = {
                 nativeActionId: routedInput.nativeActionId,
                 contextReferences: routedInput.contextReferences,
                 resumeInterrupted: routedInput.resumeInterrupted,
+                toolScope: routedInput.toolScope,
                 ...attachmentArgs,
               }),
             reset: () => resetStandardAcpAfterFailure(routedInput, runtime),
@@ -6354,6 +6374,7 @@ export const bridge: AppBridge = {
           nativeActionId: routedInput.nativeActionId,
           contextReferences: routedInput.contextReferences,
           resumeInterrupted: routedInput.resumeInterrupted,
+          toolScope: routedInput.toolScope,
           ...attachmentArgs,
         });
       } else {

@@ -2422,6 +2422,243 @@ kbd {
   transform-origin: top left;
 }
 
+.scheduled-create-route .scheduled-policy-row {
+  margin-top: 0;
+}
+
+/* Tool scope: MCP servers + skills a schedule may use. Trigger reads as a
+   dropdown; the menu is a small checklist dialog with the same spring. */
+.scheduled-tools-row {
+  display: grid;
+  gap: 7px;
+  margin-top: 18px;
+}
+
+.scheduled-tools-row > span {
+  color: var(--color-text-tertiary);
+  font-size: 9.5px;
+  font-weight: 560;
+}
+
+.tool-scope {
+  width: 100%;
+  min-width: 0;
+}
+
+.tool-scope .dropdown-trigger {
+  width: 100%;
+  height: 32px;
+  justify-content: flex-start;
+  gap: 7px;
+  padding: 0 9px;
+  font-size: 11px;
+}
+
+.scheduled-tools-row .tool-scope .dropdown-trigger {
+  height: 29px;
+  border-color: transparent;
+  background: var(--color-surface-layer2);
+  font-size: 10.5px;
+}
+
+.scheduled-tools-row .tool-scope .dropdown-trigger:hover,
+.scheduled-tools-row .tool-scope[data-open="true"] .dropdown-trigger {
+  border-color: var(--color-border-base);
+}
+
+.scheduled-create-tools .dropdown-trigger {
+  border-color: transparent;
+  background: var(--color-surface-layer1);
+}
+
+.scheduled-create-tools .dropdown-trigger:hover,
+.scheduled-create-tools[data-open="true"] .dropdown-trigger {
+  border-color: var(--color-border-base);
+  background: var(--color-surface-layer2);
+}
+
+.tool-scope-glyph {
+  width: 13px;
+  flex: 0 0 auto;
+  color: var(--color-text-tertiary);
+}
+
+.tool-scope[data-restricted="true"] .tool-scope-glyph {
+  color: var(--color-accent);
+}
+
+.tool-scope .dropdown-chevron {
+  margin-left: auto;
+}
+
+.tool-scope-menu {
+  left: 0;
+  right: 0;
+  min-width: min(360px, 100%);
+  max-height: min(420px, calc(100vh - 48px));
+  padding: 8px;
+  transform-origin: top left;
+}
+
+.tool-scope-menu.dropdown-menu--up {
+  transform-origin: bottom left;
+}
+
+.tool-scope-mode {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 4px 10px;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+.tool-scope-mode > span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.tool-scope-mode strong {
+  color: var(--color-text-primary);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.tool-scope-mode small,
+.tool-scope-footnote,
+.tool-scope-empty {
+  color: var(--color-text-tertiary);
+  font-size: 9.5px;
+  line-height: 1.4;
+}
+
+.tool-scope-mode .switch {
+  flex: 0 0 auto;
+  transform: scale(0.82);
+  transform-origin: right center;
+}
+
+.tool-scope-groups {
+  display: grid;
+  gap: 8px;
+  padding-top: 8px;
+  transition: opacity var(--duration-fast) var(--ease-standard);
+}
+
+.tool-scope-groups[data-disabled="true"] {
+  opacity: 0.55;
+}
+
+.tool-scope-group > header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 2px 4px 4px;
+  color: var(--color-text-tertiary);
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.tool-scope-group > header small {
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.tool-scope-option {
+  width: 100%;
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: calc(var(--radius-control) - 2px);
+  color: var(--color-text-secondary);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.tool-scope-option:hover:not(:disabled) {
+  color: var(--color-text-primary);
+  background: color-mix(in srgb, var(--color-layer-2) 70%, transparent);
+}
+
+.tool-scope-option:disabled {
+  cursor: default;
+}
+
+.tool-scope-box {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 4px;
+  background: var(--color-surface-layer1);
+  transition:
+    background var(--duration-fast) var(--ease-standard),
+    border-color var(--duration-fast) var(--ease-standard);
+}
+
+.tool-scope-box svg {
+  width: 10px;
+  color: var(--color-accent-contrast);
+  stroke-width: 3;
+}
+
+.tool-scope-option[data-checked="true"] .tool-scope-box {
+  border-color: var(--color-accent);
+  background: var(--color-accent);
+}
+
+.tool-scope-copy {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+
+.tool-scope-copy strong {
+  overflow: hidden;
+  font-size: 10.5px;
+  font-weight: 560;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-scope-copy small {
+  overflow: hidden;
+  color: var(--color-text-tertiary);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-scope-empty {
+  margin: 0;
+  padding: 2px 6px 4px;
+}
+
+.tool-scope-footnote {
+  margin: 8px 0 0;
+  padding: 8px 4px 0;
+  border-top: 1px solid var(--color-border-subtle);
+}
+
+.scheduled-create-route .scheduled-policy-row .dropdown--compact .dropdown-trigger {
+  width: 100%;
+  height: 32px;
+  justify-content: flex-start;
+  background: var(--color-surface-layer1);
+  font-size: 11px;
+}
+
 .scheduled-create-route .scheduled-route-label > span {
   color: var(--color-text-secondary);
   font-size: 10.5px;

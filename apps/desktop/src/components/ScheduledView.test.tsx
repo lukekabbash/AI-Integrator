@@ -93,6 +93,40 @@ beforeEach(() => {
   vi.spyOn(bridge, "listAutomations").mockResolvedValue([automation]);
   vi.spyOn(bridge, "listAutomationRuns").mockResolvedValue([]);
   vi.spyOn(bridge, "subscribeAutomationChanges").mockResolvedValue(() => undefined);
+  vi.spyOn(bridge, "listIntegratorMcps").mockResolvedValue({
+    mcpsRoot: "/tmp/mcps",
+    servers: [
+      {
+        name: "github",
+        source: "user",
+        origin: "MCPs folder",
+        enabled: true,
+        transport: "stdio",
+      },
+      {
+        name: "notion",
+        source: "user",
+        origin: "MCPs folder",
+        enabled: false,
+        transport: "remote",
+      },
+    ],
+  });
+  vi.spyOn(bridge, "listIntegratorSkills").mockResolvedValue({
+    skillsRoot: "/tmp/skills",
+    pluginsRoot: "/tmp/plugins",
+    bundledAvailable: true,
+    skills: [
+      {
+        name: "integrator-authoring:skill-creator",
+        description: "Create a skill",
+        source: "first-party",
+        enabled: true,
+        defaultEnabled: true,
+        invocationCount: 0,
+      },
+    ],
+  });
   vi.spyOn(bridge, "listModelCatalog").mockResolvedValue([
     { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", efforts: [{ id: "medium", label: "Medium" }] },
   ]);
@@ -248,6 +282,42 @@ describe("ScheduledView", () => {
         route: expect.objectContaining({ runtime: "codex", model: "gpt-5.6-sol" }),
       }),
     );
+  });
+
+  it("narrows a schedule to named MCP servers and skills, and persists the scope", async () => {
+    const update = vi.spyOn(bridge, "updateAutomation").mockResolvedValue(automation);
+    renderScheduled();
+    fireEvent.click(await screen.findByRole("button", { name: /Dependency audit/ }));
+
+    const tools = await screen.findByRole("button", { name: "Tools" });
+    await waitFor(() => expect(tools).toHaveTextContent("All enabled tools · 2"));
+    fireEvent.click(tools);
+    // Only enabled tools are offered; the disabled notion server is absent.
+    expect(screen.getByRole("checkbox", { name: "github" })).toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: "notion" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("switch", { name: "Use every enabled tool" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "skill-creator" }));
+    expect(tools).toHaveTextContent("1 MCP");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(update).toHaveBeenCalledWith(
+        "automation-1",
+        expect.objectContaining({
+          route: expect.objectContaining({
+            tools: { mcpServers: ["github"], skills: [] },
+          }),
+        }),
+      ),
+    );
+
+    // Restricting and then returning to "every enabled tool" drops the scope
+    // entirely, so there is nothing to save.
+    fireEvent.click(screen.getByRole("switch", { name: "Use every enabled tool" }));
+    expect(tools).toHaveTextContent("1 MCP · 1 skill");
+    fireEvent.click(screen.getByRole("switch", { name: "Use every enabled tool" }));
+    expect(tools).toHaveTextContent("All enabled tools · 2");
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
   });
 
   it("portals the create dialog above the complete app shell", async () => {

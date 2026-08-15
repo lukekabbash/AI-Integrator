@@ -1225,6 +1225,7 @@ fn create_agent_automation(
         fallbacks: Vec::new(),
         permission: resume.permission,
         delegation: resume.delegation,
+        tools: None,
     };
     let automation = state.store.create_automation(NewAutomation {
         task_id,

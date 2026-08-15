@@ -133,6 +133,24 @@ pub fn enabled_skills(app: &tauri::AppHandle, store: &LocalStore) -> Vec<Integra
         .collect()
 }
 
+/// Enabled skills narrowed by an optional schedule tool scope. `None` keeps
+/// the full enabled set; a scope keeps only the named skills that are still
+/// enabled (see `integrator_mcp::scoped_enabled_servers`).
+pub fn scoped_enabled_skills(
+    app: &tauri::AppHandle,
+    store: &LocalStore,
+    scope: Option<&integrator_core::AutomationToolScope>,
+) -> Vec<IntegratorSkillEntry> {
+    let enabled = enabled_skills(app, store);
+    match scope {
+        None => enabled,
+        Some(scope) => enabled
+            .into_iter()
+            .filter(|entry| scope.skills.contains(&entry.name))
+            .collect(),
+    }
+}
+
 fn select_installed_skills(
     installed: &[IntegratorSkillEntry],
     names: &[String],

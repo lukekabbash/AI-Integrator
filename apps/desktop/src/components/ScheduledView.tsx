@@ -34,12 +34,16 @@ import {
   type ProjectSummary,
   type RuntimeConnection,
   type RuntimeId,
+  type AutomationToolScope,
+  type IntegratorMcpServer,
+  type IntegratorSkillInfo,
   type TaskSummary,
 } from "../bridge";
 import { prettyModelLabel } from "../modelLabel";
 import { Dropdown, ProviderIcon, type DropdownOption } from "./Dropdown";
 import { RightRailShell } from "./RightRail";
 import { SlidingPanelSlot } from "./SlidingPanelSlot";
+import { ToolScopePicker } from "./ToolScopePicker";
 import { TravelingSelection } from "./TravelingSelection";
 
 type ScheduleFilter = "all" | "active" | "paused" | "needs-attention";
@@ -493,12 +497,21 @@ export function ScheduledView({
   const [selectedId, setSelectedId] = useState("");
   const [draftState, setDraftState] = useState<{ id: string; value: ScheduleDraft } | null>(null);
   const [catalogs, setCatalogs] = useState<Partial<Record<RuntimeId, ModelCatalogEntry[]>>>({});
+  const [toolInventory, setToolInventory] = useState<{
+    mcps: IntegratorMcpServer[];
+    skills: IntegratorSkillInfo[];
+    loaded: boolean;
+  }>({ mcps: [], skills: [], loaded: false });
   const [filter, setFilter] = useState<ScheduleFilter>("all");
   const [query, setQuery] = useState("");
   const [view, setView] = useState<MainView>({ kind: "browser" });
   const [creating, setCreating] = useState(false);
   const [createTarget, setCreateTarget] = useState(defaultTask?.id ?? NEW_CHAT_TARGET);
   const [createRouteOverride, setCreateRouteOverride] = useState<RouteCandidate | null>(null);
+  const [createPermission, setCreatePermission] =
+    useState<AutomationRoute["permission"]>("read-only");
+  const [createDelegation, setCreateDelegation] = useState<AutomationRoute["delegation"]>("off");
+  const [createTools, setCreateTools] = useState<AutomationToolScope | undefined>(undefined);
   const [newTitle, setNewTitle] = useState("");
   const [newPrompt, setNewPrompt] = useState("");
   const [newKind, setNewKind] = useState<"once" | "repeat">("once");
@@ -560,6 +573,39 @@ export function ScheduledView({
     // eslint-disable-next-line react-hooks/set-state-in-effect
     if (createRequest > 0) setCreating(true);
   }, [createRequest]);
+
+  useEffect(() => {
+    if (!creating) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      // An open menu inside the sheet owns Escape; the sheet closes on the next one.
+      if (document.querySelector('.scheduled-create-sheet [data-open="true"]')) return;
+      setCreating(false);
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [creating]);
+
+  const needsToolInventory = creating || Boolean(selected);
+  useEffect(() => {
+    if (!needsToolInventory || toolInventory.loaded) return;
+    let active = true;
+    void Promise.all([bridge.listIntegratorMcps(), bridge.listIntegratorSkills()])
+      .then(([mcpOverview, skillOverview]) => {
+        if (active)
+          setToolInventory({
+            mcps: mcpOverview.servers,
+            skills: skillOverview.skills,
+            loaded: true,
+          });
+      })
+      .catch(() => {
+        if (active) setToolInventory((current) => ({ ...current, loaded: true }));
+      });
+    return () => {
+      active = false;
+    };
+  }, [needsToolInventory, toolInventory.loaded]);
 
   useEffect(() => {
     // Run history is external state keyed by the selected automation.
@@ -681,8 +727,9 @@ export function ScheduledView({
           model: createRoute.model || "Provider default",
           effort: createRoute.effort,
           fallbacks: [],
-          permission: "read-only",
-          delegation: "off",
+          permission: createPermission,
+          delegation: createDelegation,
+          ...(createTools ? { tools: createTools } : {}),
         },
         recurrenceUserRequest: newKind === "repeat" ? `Every ${newEvery} ${newUnit}` : undefined,
         iterationNotes: newKind === "repeat" && newIterationNotes,
@@ -693,6 +740,7 @@ export function ScheduledView({
       setNewPrompt("");
       setNewIterationNotes(true);
       setCreateRouteOverride(null);
+      setCreateTools(undefined);
       if (createTargetIsNew) setCreateTarget(taskId);
       onRailOpenChange(true);
     });
@@ -857,6 +905,21 @@ export function ScheduledView({
                 route: { ...draft.route, delegation: delegation as AutomationRoute["delegation"] },
               })
             }
+          />
+        </div>
+        <div className="scheduled-tools-row">
+          <span>Tools</span>
+          <ToolScopePicker
+            aria-label="Tools"
+            value={draft.route.tools}
+            mcps={toolInventory.mcps}
+            skills={toolInventory.skills}
+            loading={!toolInventory.loaded}
+            onChange={(tools) => {
+              const rest = { ...draft.route };
+              delete rest.tools;
+              setDraft({ ...draft, route: tools ? { ...rest, tools } : rest });
+            }}
           />
         </div>
         <Reveal show={Boolean(error)} motionScale={motionScale}>
@@ -1223,6 +1286,35 @@ export function ScheduledView({
                     runtimes={runtimes}
                     catalogs={catalogs}
                     onChange={setCreateRouteOverride}
+                  />
+                  <div className="scheduled-policy-row">
+                    <Dropdown
+                      compact
+                      aria-label="Permission ceiling"
+                      value={createPermission}
+                      options={PERMISSIONS}
+                      onChange={(value) =>
+                        setCreatePermission(value as AutomationRoute["permission"])
+                      }
+                    />
+                    <Dropdown
+                      compact
+                      aria-label="Delegation"
+                      value={createDelegation}
+                      options={DELEGATION}
+                      onChange={(value) =>
+                        setCreateDelegation(value as AutomationRoute["delegation"])
+                      }
+                    />
+                  </div>
+                  <ToolScopePicker
+                    aria-label="Tools"
+                    className="scheduled-create-tools"
+                    value={createTools}
+                    mcps={toolInventory.mcps}
+                    skills={toolInventory.skills}
+                    loading={!toolInventory.loaded}
+                    onChange={setCreateTools}
                   />
                 </div>
                 <div className="scheduled-create-timing">

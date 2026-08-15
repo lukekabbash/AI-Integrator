@@ -16,7 +16,7 @@ use adapter_codex::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::Utc;
 use integrator_core::{
-    ApprovalDecision, ApprovalKind, ApprovalProjection, ChatContextReference,
+    ApprovalDecision, ApprovalKind, ApprovalProjection, AutomationToolScope, ChatContextReference,
     ComposerDraftAttachment, ConnectionState, IntegratorError, ItemKind, ItemProjection,
     ItemStatus, ModeProjection, ProjectId, ProviderKind, ProviderResumeState, RuntimeBinding,
     RuntimeProjection, StopRequestResult, Task, TaskId, TaskKind, TaskSnapshot, TaskSnapshotQuery,
@@ -3407,6 +3407,7 @@ pub async fn codex_start_thread(
     effort: Option<String>,
     permission: Option<String>,
     delegation: Option<String>,
+    tool_scope: Option<AutomationToolScope>,
 ) -> CommandResult<Value> {
     let task = state.store.get_task(task_id).map_err(CommandError::from)?;
     let is_chat = task.kind == TaskKind::Chat;
@@ -3479,9 +3480,14 @@ pub async fn codex_start_thread(
     } else {
         let mcp_app = app.clone();
         let mcp_store = Arc::clone(&state.store);
+        let mcp_scope = tool_scope.clone();
         let codex_config = Some(
             tauri::async_runtime::spawn_blocking(move || {
-                let enabled_servers = crate::integrator_mcp::enabled_servers(&mcp_app, &mcp_store);
+                let enabled_servers = crate::integrator_mcp::scoped_enabled_servers(
+                    &mcp_app,
+                    &mcp_store,
+                    mcp_scope.as_ref(),
+                );
                 crate::integrator_mcp::merge_codex_mcp_config(base_config, &enabled_servers)
             })
             .await
@@ -3857,6 +3863,7 @@ pub async fn codex_start_turn(
     context_references: Option<Vec<ChatContextReference>>,
     resume_interrupted: Option<bool>,
     attachments: Option<Vec<ComposerDraftAttachment>>,
+    tool_scope: Option<AutomationToolScope>,
 ) -> CommandResult<Value> {
     let task = state.store.get_task(task_id).map_err(CommandError::from)?;
     let is_chat = task.kind == TaskKind::Chat;
@@ -4046,7 +4053,11 @@ pub async fn codex_start_turn(
     // thread, repeated only when the enabled-skill set changes (the thread
     // keeps its history).
     if !is_chat && native_action_id.is_none() {
-        let skills = crate::integrator_skills::enabled_skills(&app, &state.store);
+        let skills = crate::integrator_skills::scoped_enabled_skills(
+            &app,
+            &state.store,
+            tool_scope.as_ref(),
+        );
         if let Some(index) = crate::integrator_skills::skill_index_block(&skills) {
             let mut sent = runtime.sent_skill_index.lock().expect("index lock");
             if sent.as_deref() != Some(index.as_str()) {
@@ -4851,6 +4862,7 @@ pub async fn acp_start_session(
     cwd: PathBuf,
     delegation: Option<String>,
     permission: Option<String>,
+    tool_scope: Option<AutomationToolScope>,
 ) -> CommandResult<Value> {
     let task = state.store.get_task(task_id).map_err(CommandError::from)?;
     let is_chat = task.kind == TaskKind::Chat;
@@ -4892,9 +4904,16 @@ pub async fn acp_start_session(
     let provider_name = provider.as_str().to_owned();
     // Delegation broker injection: ACP's `session/new` carries MCP servers
     // natively. The tool preamble is queued one-shot for the first turn.
-    let mcp_servers =
-        acp_session_mcp_servers(&app, &state, &runtime, task_id, &cwd, delegation.as_deref())
-            .await?;
+    let mcp_servers = acp_session_mcp_servers(
+        &app,
+        &state,
+        &runtime,
+        task_id,
+        &cwd,
+        delegation.as_deref(),
+        tool_scope.as_ref(),
+    )
+    .await?;
     if let Some(mode) = delegation.as_deref().filter(|mode| *mode != "off") {
         *runtime.delegation_preamble.lock().expect("preamble lock") =
             Some(crate::delegation::orchestrator_preamble(&state.store, mode));
@@ -4967,6 +4986,7 @@ async fn acp_session_mcp_servers(
     task_id: TaskId,
     cwd: &Path,
     delegation: Option<&str>,
+    tool_scope: Option<&AutomationToolScope>,
 ) -> CommandResult<Vec<Value>> {
     let task = state.store.get_task(task_id).map_err(CommandError::from)?;
     let is_chat = task.kind == TaskKind::Chat;
@@ -5017,8 +5037,13 @@ async fn acp_session_mcp_servers(
     let mcp_store = Arc::clone(&state.store);
     let capabilities = runtime.client.session_capabilities().await;
     let mcp_cwd = cwd.to_path_buf();
+    let mcp_scope = tool_scope.cloned();
     let projected = tauri::async_runtime::spawn_blocking(move || {
-        let enabled_servers = crate::integrator_mcp::enabled_servers(&mcp_app, &mcp_store);
+        let enabled_servers = crate::integrator_mcp::scoped_enabled_servers(
+            &mcp_app,
+            &mcp_store,
+            mcp_scope.as_ref(),
+        );
         crate::integrator_mcp::acp_mcp_server_entries(&enabled_servers, capabilities, &mcp_cwd)
     })
     .await
@@ -5064,6 +5089,7 @@ pub async fn acp_resume_session(
     state: State<'_, AppState>,
     task_id: TaskId,
     cwd: PathBuf,
+    tool_scope: Option<AutomationToolScope>,
 ) -> CommandResult<Value> {
     let is_chat = state
         .store
@@ -5100,6 +5126,7 @@ pub async fn acp_resume_session(
         task_id,
         &cwd,
         Some(&saved.delegation),
+        tool_scope.as_ref(),
     )
     .await?;
     let binding = bind_acp_session(&state, &runtime, task_id, &saved.session_ref).await?;
@@ -5256,6 +5283,7 @@ pub async fn acp_send_turn(
     context_references: Option<Vec<ChatContextReference>>,
     resume_interrupted: Option<bool>,
     attachments: Option<Vec<ComposerDraftAttachment>>,
+    tool_scope: Option<AutomationToolScope>,
 ) -> CommandResult<Value> {
     let task = state.store.get_task(task_id).map_err(CommandError::from)?;
     let is_chat = task.kind == TaskKind::Chat;
@@ -5499,7 +5527,11 @@ pub async fn acp_send_turn(
     // bounded index rides the wire — once per session, repeated only when
     // the enabled-skill set changes (the session keeps its history).
     if !is_chat && native_action_id.is_none() {
-        let skills = crate::integrator_skills::enabled_skills(&app, &state.store);
+        let skills = crate::integrator_skills::scoped_enabled_skills(
+            &app,
+            &state.store,
+            tool_scope.as_ref(),
+        );
         if let Some(index) = crate::integrator_skills::skill_index_block(&skills) {
             let mut sent = runtime.sent_skill_index.lock().expect("index lock");
             if sent.as_deref() != Some(index.as_str()) {
@@ -5652,6 +5684,7 @@ pub async fn structured_cli_start_turn(
     context_references: Option<Vec<ChatContextReference>>,
     resume_interrupted: Option<bool>,
     attachments: Option<Vec<ComposerDraftAttachment>>,
+    tool_scope: Option<AutomationToolScope>,
 ) -> CommandResult<Value> {
     let task = state.store.get_task(task_id).map_err(CommandError::from)?;
     let is_chat = task.kind == TaskKind::Chat;
@@ -5974,8 +6007,13 @@ pub async fn structured_cli_start_turn(
             StructuredCliProvider::Claude => "claude",
             StructuredCliProvider::Antigravity => "antigravity",
         };
+        let skills_scope = tool_scope.clone();
         let projection = tauri::async_runtime::spawn_blocking(move || {
-            let skills = crate::integrator_skills::enabled_skills(&skills_app, &skills_store);
+            let skills = crate::integrator_skills::scoped_enabled_skills(
+                &skills_app,
+                &skills_store,
+                skills_scope.as_ref(),
+            );
             crate::integrator_skills::write_projection(&data_directory, provider_label, &skills)
         })
         .await
@@ -6006,11 +6044,12 @@ pub async fn structured_cli_start_turn(
 
     let mcp_app = app.clone();
     let mcp_store = Arc::clone(&state.store);
+    let mcp_scope = tool_scope.clone();
     let enabled_mcp_servers = if is_chat {
         Vec::new()
     } else {
         tauri::async_runtime::spawn_blocking(move || {
-            crate::integrator_mcp::enabled_servers(&mcp_app, &mcp_store)
+            crate::integrator_mcp::scoped_enabled_servers(&mcp_app, &mcp_store, mcp_scope.as_ref())
         })
         .await
         .map_err(|_| worker_error())?

@@ -2550,7 +2550,7 @@ export default function App() {
           dispatchRef = `delegation:${automation.target.delegationId}`;
         } else {
           const prompt = automationTurnPrompt(automation);
-          const { fallbacks, ...primary } = automation.route;
+          const { fallbacks, tools, ...primary } = automation.route;
           const routes = [
             primary,
             ...(fallbacks ?? []).map((fallback) => ({ ...primary, ...fallback })),
@@ -2562,6 +2562,7 @@ export default function App() {
                 taskId: automation.taskId,
                 prompt,
                 ...route,
+                ...(tools ? { toolScope: tools } : {}),
               });
               dispatchRef = `task:${automation.taskId}`;
               break;

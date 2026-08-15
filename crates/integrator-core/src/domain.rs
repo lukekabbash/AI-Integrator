@@ -506,6 +506,19 @@ pub struct AutomationFallback {
     pub effort: Option<String>,
 }
 
+/// Named subset of the globally enabled MCP servers and skills a schedule may
+/// use. Absent (`None` on the route) means "everything currently enabled";
+/// present lists are intersected with the enabled set at launch, so globally
+/// disabling a tool revokes it from every schedule that named it.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationToolScope {
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutomationRoute {
@@ -517,6 +530,8 @@ pub struct AutomationRoute {
     pub fallbacks: Vec<AutomationFallback>,
     pub permission: String,
     pub delegation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<AutomationToolScope>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1172,6 +1187,7 @@ mod tests {
             fallbacks: Vec::new(),
             permission: "read-only".into(),
             delegation: "off".into(),
+            tools: None,
         };
         let route_json = serde_json::to_value(route).expect("serialize automation route");
         assert_eq!(route_json["fallbacks"], json!([]));
