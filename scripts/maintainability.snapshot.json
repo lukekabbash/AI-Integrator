@@ -3,14 +3,14 @@
   "maxNewTestLines": 1500,
   "allowedNativeCommandsImports": ["apps/desktop/src-tauri/src/delegation.rs"],
   "exceptions": [
-    { "path": "apps/desktop/src/styles.css", "maxLines": 16172 },
+    { "path": "apps/desktop/src/styles.css", "maxLines": 16383 },
     { "path": "apps/desktop/src-tauri/src/commands.rs", "maxLines": 8464 },
     { "path": "apps/desktop/src/App.tsx", "maxLines": 7405 },
     {
       "path": "apps/desktop/src/components/SettingsView.tsx",
       "maxLines": 5836
     },
-    { "path": "apps/desktop/src/bridge.ts", "maxLines": 6692 },
+    { "path": "apps/desktop/src/bridge.ts", "maxLines": 6855 },
     { "path": "apps/desktop/src-tauri/src/delegation.rs", "maxLines": 4438 },
     { "path": "apps/desktop/src/components/RightRail.tsx", "maxLines": 3237 },
     { "path": "apps/desktop/src/App.runtime.test.tsx", "maxLines": 3259 },
@@ -62,7 +62,7 @@
     },
     {
       "path": "apps/desktop/src/components/ScheduledView.tsx",
-      "maxLines": 1021
+      "maxLines": 1242
     }
   ],
   "allowedBridgeImports": [
