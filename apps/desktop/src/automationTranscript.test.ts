@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Automation, AutomationTimelineEntry, TranscriptEvent } from "./bridge";
-import { mergeSchedulingTranscript } from "./automationTranscript";
+import { eventsForRun, mergeSchedulingTranscript } from "./automationTranscript";
 import { automationTurnPrompt } from "./automationTurnPrompt";
 
 const automation: Automation = {
@@ -180,5 +180,45 @@ describe("mergeSchedulingTranscript", () => {
       body: "Runtime unavailable",
       status: "error",
     });
+  });
+});
+
+describe("eventsForRun", () => {
+  const run = {
+    id: "run-1",
+    automationId: automation.id,
+    scheduledFor: "2026-07-19T16:20:00Z",
+    status: "dispatched" as const,
+    claimedAt: "2026-07-19T16:20:00Z",
+    finishedAt: "2026-07-19T16:20:02Z",
+  };
+  const assistant = (id: string, body: string, timestamp: string): TranscriptEvent => ({
+    id,
+    kind: "assistant",
+    body,
+    timestamp,
+  });
+
+  it("returns the run's prompt and everything up to the next user prompt", () => {
+    const events = [
+      user("earlier", automation.prompt, "2026-07-19T15:00:00Z"),
+      assistant("earlier-reply", "Old reply", "2026-07-19T15:00:05Z"),
+      user("prompt", automation.prompt, "2026-07-19T16:20:01Z"),
+      assistant("reply", "Build looks green.", "2026-07-19T16:20:20Z"),
+      { id: "tool", kind: "activity", title: "Ran checks", timestamp: "2026-07-19T16:20:25Z" },
+      user("next", "Something else", "2026-07-19T17:00:00Z"),
+      assistant("next-reply", "Sure", "2026-07-19T17:00:05Z"),
+    ] as TranscriptEvent[];
+
+    expect(eventsForRun(events, automation, run).map((event) => event.id)).toEqual([
+      "prompt",
+      "reply",
+      "tool",
+    ]);
+  });
+
+  it("is empty until the dispatched prompt has landed in the chat", () => {
+    const events = [user("earlier", automation.prompt, "2026-07-19T15:00:00Z")];
+    expect(eventsForRun(events, automation, run)).toEqual([]);
   });
 });

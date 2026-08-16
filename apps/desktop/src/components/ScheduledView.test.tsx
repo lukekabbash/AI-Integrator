@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bridge, type Automation, type TaskSummary } from "../bridge";
 import { ScheduledView } from "./ScheduledView";
@@ -68,9 +68,15 @@ const runtimes = [
 function renderScheduled(createRequest = 0, onTaskCreated?: (task: TaskSummary) => void) {
   function Harness() {
     const [railOpen, setRailOpen] = useState(false);
+    // The titlebar "New" button only exists while this screen is mounted, so a
+    // request always arrives as a change after mount — never as the initial value.
+    const [request, setRequest] = useState(0);
+    useEffect(() => {
+      if (createRequest > 0) setRequest(createRequest);
+    }, []);
     return (
       <ScheduledView
-        createRequest={createRequest}
+        createRequest={request}
         railOpen={railOpen}
         onRailOpenChange={setRailOpen}
         rightRailWidth={356}
@@ -318,6 +324,36 @@ describe("ScheduledView", () => {
     fireEvent.click(screen.getByRole("switch", { name: "Use every enabled tool" }));
     expect(tools).toHaveTextContent("All enabled tools · 2");
     expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+  });
+
+  it("does not reopen the create sheet when the screen remounts with a stale request", async () => {
+    // First mount with an already-consumed counter (user opened New earlier,
+    // closed it, navigated away, and came back).
+    const { unmount } = renderScheduled(1);
+    expect(screen.getByRole("dialog", { name: "New scheduled task" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "New scheduled task" })).toBeNull(),
+    );
+    unmount();
+
+    // Coming back to the screen: the shell still holds the consumed counter.
+    render(
+      <ScheduledView
+        createRequest={1}
+        railOpen={false}
+        onRailOpenChange={() => undefined}
+        rightRailWidth={356}
+        onResizeRail={() => undefined}
+        motionScale={0}
+        projects={projects}
+        tasks={tasks}
+        runtimes={runtimes}
+        onOpenTask={() => undefined}
+      />,
+    );
+    await screen.findByRole("button", { name: /Dependency audit/ });
+    expect(screen.queryByRole("dialog", { name: "New scheduled task" })).toBeNull();
   });
 
   it("portals the create dialog above the complete app shell", async () => {

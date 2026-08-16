@@ -1,7 +1,10 @@
 import {
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type CSSProperties,
   type ReactNode,
@@ -37,13 +40,138 @@ import {
   type AutomationToolScope,
   type IntegratorMcpServer,
   type IntegratorSkillInfo,
+  type RuntimeProjectionEvent,
   type TaskSummary,
+  type TranscriptEvent,
 } from "../bridge";
+import { eventsForRun } from "../automationTranscript";
+import {
+  applyRuntimeProjectionBatch,
+  createRuntimeProjectionState,
+  hydrateRuntimeProjectionState,
+  isFrameBatchableRuntimeProjection,
+  runtimeTranscript,
+  type RuntimeProjectionState,
+} from "../runtimeProjection";
 import { prettyModelLabel } from "../modelLabel";
 import { Dropdown, ProviderIcon, type DropdownOption } from "./Dropdown";
 import { RightRailShell } from "./RightRail";
 import { SlidingPanelSlot } from "./SlidingPanelSlot";
 import { ToolScopePicker } from "./ToolScopePicker";
+
+const Transcript = lazy(() =>
+  import("./Transcript").then((module) => ({ default: module.Transcript })),
+);
+
+/* Read-only view of a chat's projection so a run can show the messages it
+   produced. Mirrors the subagent conversation loader: hydrate once, then
+   fold live projection events (batched per frame) on top. */
+function useTaskTranscript(taskId: string | undefined): {
+  events: TranscriptEvent[];
+  loading: boolean;
+  running: boolean;
+  error: string;
+} {
+  const [state, setState] = useState<RuntimeProjectionState | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const stateRef = useRef<RuntimeProjectionState | null>(null);
+
+  useEffect(() => {
+    stateRef.current = null;
+    // Task switch resets the read-only projection this effect owns.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setState(null);
+    setError("");
+    if (!taskId) {
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    let disposed = false;
+    let ready = false;
+    let unlisten: (() => void) | undefined;
+    let frame: number | undefined;
+    const buffered: RuntimeProjectionEvent[] = [];
+    const frameEvents: RuntimeProjectionEvent[] = [];
+    const apply = (events: RuntimeProjectionEvent[]) => {
+      if (!events.length) return;
+      const next = applyRuntimeProjectionBatch(
+        stateRef.current ?? createRuntimeProjectionState(taskId),
+        events,
+      );
+      stateRef.current = next;
+      setState(next);
+    };
+    const flush = () => {
+      frame = undefined;
+      apply(frameEvents.splice(0));
+    };
+    void (async () => {
+      try {
+        unlisten = await bridge.subscribeRuntimeProjections((event) => {
+          if (event.taskId !== taskId) return;
+          if (!ready) {
+            buffered.push(event);
+            return;
+          }
+          if (isFrameBatchableRuntimeProjection(event)) {
+            frameEvents.push(event);
+            frame ??= window.requestAnimationFrame(flush);
+            return;
+          }
+          if (frame !== undefined) {
+            window.cancelAnimationFrame(frame);
+            frame = undefined;
+          }
+          apply([...frameEvents.splice(0), event]);
+        });
+        if (disposed) {
+          unlisten();
+          return;
+        }
+        const snapshot = await bridge.loadTaskProjection(taskId, { skipRuntimeCheck: true });
+        let next = hydrateRuntimeProjectionState(
+          taskId,
+          snapshot.hydrate ?? {
+            items: [],
+            plan: [],
+            planTruncated: false,
+            approvals: [],
+            firstSeen: {},
+            hasMoreOlder: false,
+          },
+          snapshot.watermarkSeq,
+          snapshot.resetSeq,
+        );
+        next = applyRuntimeProjectionBatch(
+          next,
+          buffered
+            .filter((candidate) => candidate.seq > snapshot.watermarkSeq)
+            .sort((left, right) => left.seq - right.seq),
+        );
+        if (!disposed) {
+          ready = true;
+          stateRef.current = next;
+          setState(next);
+        }
+      } catch (cause) {
+        if (!disposed)
+          setError(cause instanceof Error ? cause.message : "Could not load this chat");
+      } finally {
+        if (!disposed) setLoading(false);
+      }
+    })();
+    return () => {
+      disposed = true;
+      if (frame !== undefined) window.cancelAnimationFrame(frame);
+      unlisten?.();
+    };
+  }, [taskId]);
+
+  const events = useMemo(() => (state ? runtimeTranscript(state) : []), [state]);
+  return { events, loading, running: state?.turn?.status === "inProgress", error };
+}
 import { TravelingSelection } from "./TravelingSelection";
 
 type ScheduleFilter = "all" | "active" | "paused" | "needs-attention";
@@ -534,6 +662,12 @@ export function ScheduledView({
     if (selected) setDraftState({ id: selected.id, value });
   };
   const selectedRun = view.kind === "run" ? runs.find((run) => run.id === view.id) : undefined;
+  const runTranscript = useTaskTranscript(selectedRun ? selected?.taskId : undefined);
+  const runEvents = useMemo(
+    () =>
+      selected && selectedRun ? eventsForRun(runTranscript.events, selected, selectedRun) : [],
+    [runTranscript.events, selected, selectedRun],
+  );
   const draftTrigger = draft?.trigger;
   const draftInterval =
     draftTrigger?.kind === "interval" ? intervalParts(draftTrigger.everySeconds) : undefined;
@@ -568,10 +702,14 @@ export function ScheduledView({
     };
   }, [refresh]);
 
+  // The titlebar counter is an explicit open request from the parent shell.
+  // Remounting with a stale counter (navigating back to Scheduled) must not
+  // reopen the sheet, so only a change since mount counts.
+  const handledCreateRequest = useRef(createRequest);
   useEffect(() => {
-    // The titlebar counter is an explicit open request from the parent shell.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    if (createRequest > 0) setCreating(true);
+    if (createRequest === handledCreateRequest.current) return;
+    handledCreateRequest.current = createRequest;
+    setCreating(true);
   }, [createRequest]);
 
   useEffect(() => {
@@ -1047,30 +1185,61 @@ export function ScheduledView({
               >
                 <ArrowLeft aria-hidden="true" /> Back to scheduled tasks
               </button>
-              <span className="scheduled-eyebrow">Run · {runLabel(selectedRun)}</span>
-              <h2>{selected.title}</h2>
-              <p className="scheduled-summary">
-                {statusLabel(selectedRun.status as Automation["status"])} ·{" "}
-                {runtimeName(selected.route.runtime, runtimes)} ·{" "}
-                {prettyModelLabel(selected.route.model)}
-              </p>
-              <section className="scheduled-run-copy">
-                <span>Scheduled prompt</span>
-                <p>{selected.prompt}</p>
-              </section>
+              <div className="scheduled-run-header">
+                <div>
+                  <span className="scheduled-eyebrow">Run · {runLabel(selectedRun)}</span>
+                  <h2>{selected.title}</h2>
+                  <p className="scheduled-summary">
+                    {statusLabel(selectedRun.status as Automation["status"])} ·{" "}
+                    {runtimeName(selected.route.runtime, runtimes)} ·{" "}
+                    {prettyModelLabel(selected.route.model)} · {taskLabel(selected.taskId)}
+                  </p>
+                </div>
+                <button
+                  className="scheduled-open-chat"
+                  type="button"
+                  onClick={() => onOpenTask(selected.taskId)}
+                >
+                  Open chat <ExternalLink />
+                </button>
+              </div>
               {selectedRun.error ? (
                 <section className="scheduled-run-error">
                   <span>Could not start</span>
                   <p>{selectedRun.error}</p>
                 </section>
               ) : null}
-              <button
-                className="scheduled-open-chat"
-                type="button"
-                onClick={() => onOpenTask(selected.taskId)}
-              >
-                Open chat <ExternalLink />
-              </button>
+              <section className="scheduled-run-transcript" aria-label="Run messages">
+                {runEvents.length ? (
+                  <Suspense fallback={<p className="scheduled-muted">Rendering messages…</p>}>
+                    <Transcript
+                      ownerKey={`scheduled-run:${selectedRun.id}`}
+                      events={runEvents}
+                      running={runTranscript.running}
+                      virtualizationEnabled={false}
+                      modelForEvent={() => prettyModelLabel(selected.route.model)}
+                    />
+                  </Suspense>
+                ) : runTranscript.loading ? (
+                  <p className="scheduled-muted">Loading messages…</p>
+                ) : runTranscript.error ? (
+                  <p className="scheduled-error">{runTranscript.error}</p>
+                ) : (
+                  <div className="scheduled-run-pending">
+                    <span>
+                      {selectedRun.status === "failed"
+                        ? "This run never reached the chat."
+                        : selectedRun.dispatchRef?.startsWith("queue:")
+                          ? "Queued behind an active turn — messages appear once it starts."
+                          : "The messages for this run aren't in the chat yet."}
+                    </span>
+                    <section className="scheduled-run-copy">
+                      <span>Scheduled prompt</span>
+                      <p>{selected.prompt}</p>
+                    </section>
+                  </div>
+                )}
+              </section>
             </motion.div>
           ) : (
             <motion.div

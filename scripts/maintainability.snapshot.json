@@ -3,7 +3,7 @@
   "maxNewTestLines": 1500,
   "allowedNativeCommandsImports": ["apps/desktop/src-tauri/src/delegation.rs"],
   "exceptions": [
-    { "path": "apps/desktop/src/styles.css", "maxLines": 16669 },
+    { "path": "apps/desktop/src/styles.css", "maxLines": 16714 },
     { "path": "apps/desktop/src-tauri/src/commands.rs", "maxLines": 8503 },
     { "path": "apps/desktop/src/App.tsx", "maxLines": 7421 },
     {
@@ -62,7 +62,7 @@
     },
     {
       "path": "apps/desktop/src/components/ScheduledView.tsx",
-      "maxLines": 1408
+      "maxLines": 1577
     }
   ],
   "allowedBridgeImports": [

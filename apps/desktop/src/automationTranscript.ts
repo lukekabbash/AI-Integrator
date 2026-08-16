@@ -74,6 +74,29 @@ function schedulingEvent(
   };
 }
 
+/**
+ * The transcript slice one scheduled run produced: its dispatched prompt and
+ * everything up to (not including) the next user prompt. Empty when the run's
+ * prompt has not landed in the chat yet.
+ */
+export function eventsForRun(
+  events: TranscriptEvent[],
+  automation: Automation,
+  run: AutomationRun,
+): TranscriptEvent[] {
+  const prompt = firstPromptForRun(events, automation, run, new Set());
+  if (!prompt) return [];
+  const start = events.indexOf(prompt);
+  let end = events.length;
+  for (let index = start + 1; index < events.length; index += 1) {
+    if (events[index].kind === "user") {
+      end = index;
+      break;
+    }
+  }
+  return events.slice(start, end);
+}
+
 function firstPromptForRun(
   events: TranscriptEvent[],
   automation: Automation,
