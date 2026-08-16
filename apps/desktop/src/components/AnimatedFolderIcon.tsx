@@ -42,8 +42,28 @@ export function AnimatedFolderIcon({ open, className }: { open: boolean; classNa
       className={className}
       aria-hidden="true"
     >
-      <motion.path animate={{ d: open ? BACK_OPEN : BACK_CLOSED }} transition={transition} />
-      <motion.path animate={{ d: open ? FLAP_OPEN : FLAP_CLOSED }} transition={transition} />
+      {/* `initial` is what gets painted, and it has to be here: Motion owns the
+          `d` attribute, so without it the browser parses the string
+          "undefined" and the icon renders nothing at all.
+
+          The key is what keeps the icon truthful. Motion in this version never
+          writes `d` again after mount — `animate` updates are dropped, so a
+          folder would keep the geometry it was born with while the project
+          under it opened and closed. Remounting on the state flip paints the
+          right shape every time; `animate` stays so the morph starts working
+          the day Motion interpolates path data. */}
+      <motion.path
+        key={`back-${open}`}
+        initial={{ d: open ? BACK_OPEN : BACK_CLOSED }}
+        animate={{ d: open ? BACK_OPEN : BACK_CLOSED }}
+        transition={transition}
+      />
+      <motion.path
+        key={`flap-${open}`}
+        initial={{ d: open ? FLAP_OPEN : FLAP_CLOSED }}
+        animate={{ d: open ? FLAP_OPEN : FLAP_CLOSED }}
+        transition={transition}
+      />
     </svg>
   );
 }
