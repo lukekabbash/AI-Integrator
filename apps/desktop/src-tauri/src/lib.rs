@@ -39,6 +39,7 @@ mod state;
 mod structured_projection;
 mod task_commands;
 mod terminal_process;
+mod usage_history;
 
 use app_commands::{app_bootstrap, open_external_url, open_task_window};
 use automations::{
@@ -80,6 +81,7 @@ use specialist_generator::specialist_generate;
 use state::AppState;
 use task_commands::*;
 use tauri::Manager;
+use usage_history::usage_history;
 
 /// `--broker-mcp` mode: run the stdio MCP bridge instead of the app. Spawned
 /// by provider CLIs; must never touch Tauri or the local store.
@@ -208,6 +210,7 @@ pub fn run() {
             local_clear,
             storage_totals,
             usage_summary,
+            usage_history,
             voice_typing_credential_status,
             voice_typing_credential_set,
             voice_typing_credential_clear,

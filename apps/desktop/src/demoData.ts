@@ -5,11 +5,47 @@ import type {
   DiffFile,
   GitSnapshot,
   ProjectSummary,
+  ProviderUsageSummary,
   RuntimeConnection,
+  RuntimeId,
   TaskSummary,
   TranscriptEvent,
   UsageSnapshot,
+  UsageSummary,
 } from "./bridge";
+
+/** Browser-preview stand-in for the native `usage_summary` command. */
+export function createDemoUsageSummary(snapshot: WorkspaceSnapshot): UsageSummary {
+  const grouped = new Map<RuntimeId | "unknown", ProviderUsageSummary>();
+  for (const task of snapshot.tasks) {
+    const provider = task.runtime ?? "unknown";
+    const events = snapshot.taskContexts[task.id]?.usage.localObserved?.events ?? [];
+    const inputTokens = events.reduce((total, event) => total + event.estimatedInputTokens, 0);
+    const existing = grouped.get(provider) ?? {
+      provider,
+      taskCount: 0,
+      turnCount: 0,
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      reasoningOutputTokens: 0,
+      totalTokens: 0,
+      provenance: "unavailable",
+      detail: "No provider token usage is available in the browser preview.",
+    };
+    existing.taskCount += 1;
+    existing.turnCount += events.length;
+    existing.inputTokens += inputTokens;
+    existing.totalTokens += inputTokens;
+    if (events.length > 0) {
+      existing.provenance = "estimated";
+      existing.detail =
+        "Input tokens are estimated from locally recorded prompts; provider output is unavailable in the browser preview.";
+    }
+    grouped.set(provider, existing);
+  }
+  return { providers: [...grouped.values()], measuredAt: new Date().toISOString() };
+}
 
 export interface WorkspaceSnapshot {
   projects: ProjectSummary[];

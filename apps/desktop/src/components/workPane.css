@@ -1,0 +1,269 @@
+/* Work pane: the tabbed secondary surface between the transcript and the
+   right rail. It reuses the subagent pane's silhouette (hairline on the
+   left, canvas fill, resize grip inside) and the titlebar file-tab look for
+   its strip. Chrome has a body; the surfaces inside are flat. */
+
+/* Specificity beats `.subagent-workspace-pane > *` regardless of load order. */
+.work-pane.subagent-workspace-pane {
+  width: var(--work-pane-width, 460px);
+  display: flex;
+  flex-direction: column;
+}
+.work-pane.subagent-workspace-pane > * {
+  height: auto;
+}
+.work-pane.subagent-workspace-pane > .resize-handle--horizontal {
+  height: 100%;
+}
+.work-pane-subheader {
+  flex: none;
+}
+.work-pane-subheader[data-visible="true"] {
+  min-height: 38px;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+.work-pane-content {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.work-pane-content > * {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* Tab strip — lives in the titlebar slice above the pane. */
+.work-pane-strip {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  padding: 0 112px 0 8px;
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+}
+.work-pane-strip-tabs {
+  min-width: 0;
+  flex: 1 1 auto;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.work-pane-strip-tabs::-webkit-scrollbar {
+  display: none;
+}
+.work-pane-tab {
+  flex: 0 1 160px;
+  max-width: 180px;
+}
+.work-pane-tab[data-kind="subagent"] > button[role="tab"] svg,
+.work-pane-tab[data-kind="review"] > button[role="tab"] svg,
+.work-pane-tab[data-kind="browser"] > button[role="tab"] svg {
+  width: 12px;
+  height: 12px;
+  stroke-width: 1.8;
+  color: var(--color-text-tertiary);
+}
+.work-pane-tab[data-active="true"] > button[role="tab"] svg {
+  color: var(--color-text-secondary);
+}
+.work-pane-strip-close-all {
+  flex: none;
+  margin-bottom: 4px;
+  color: var(--color-text-tertiary);
+}
+/* The pane can also host the strip inline when no titlebar slice exists. */
+.work-pane > .work-pane-strip {
+  height: 34px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+/* Launcher — the empty pane offers what can open here (modal-option rows). */
+.work-pane-launcher {
+  padding: 18px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+}
+.work-pane-launcher-eyebrow {
+  height: 26px;
+  display: flex;
+  align-items: center;
+  color: color-mix(in srgb, var(--color-text-tertiary) 88%, transparent);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+.work-pane-launcher-list {
+  margin: 0 0 8px;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.work-pane-launcher-option {
+  width: 100%;
+  padding: 11px 13px;
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  border: 1px solid transparent;
+  border-radius: 11px;
+  background: transparent;
+  color: var(--color-text-secondary);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  transition:
+    background var(--duration-fast) var(--ease-standard),
+    border-color var(--duration-fast) var(--ease-standard),
+    color var(--duration-fast) var(--ease-standard);
+}
+.work-pane-launcher-option:hover:not(:disabled) {
+  color: var(--color-text-primary);
+  background: color-mix(in srgb, var(--color-accent) 8%, transparent);
+  border-color: color-mix(in srgb, var(--color-accent) 55%, transparent);
+}
+.work-pane-launcher-option:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+.work-pane-launcher-option:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+.work-pane-launcher-option > span:last-child {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.work-pane-launcher-option strong {
+  color: var(--color-text-primary);
+  font-size: 12.5px;
+  font-weight: 580;
+  letter-spacing: -0.01em;
+}
+.work-pane-launcher-option small {
+  color: var(--color-text-tertiary);
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+.work-pane-launcher-icon {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  color: var(--color-text-secondary);
+}
+.work-pane-launcher-icon svg {
+  width: 17px;
+  height: 17px;
+  stroke-width: 1.7;
+}
+.work-pane-launcher-list--compact .work-pane-launcher-option {
+  padding: 8px 13px;
+}
+.work-pane-launcher-list--compact strong {
+  font-size: 12px;
+}
+.work-pane-notice {
+  padding: 24px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--color-text-secondary);
+}
+.work-pane-notice strong {
+  font-size: 12px;
+  font-weight: 650;
+}
+.work-pane-notice small {
+  color: var(--color-text-tertiary);
+  font-size: 10.5px;
+}
+
+/* Titlebar toggle: outline square + divider, right half fills when open. */
+.work-pane-toggle {
+  position: relative;
+}
+.work-pane-toggle svg {
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linejoin: round;
+}
+.work-pane-toggle-fill {
+  fill: currentColor;
+  fill-opacity: 0.28;
+  stroke: none;
+  transition: opacity var(--duration-fast) var(--ease-emphasized);
+}
+.work-pane-toggle-bead {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--color-accent);
+  box-shadow: 0 0 0 2px var(--color-canvas);
+  opacity: 0;
+  transform: scale(0.6);
+  transition:
+    opacity var(--duration-fast) var(--ease-standard),
+    transform var(--duration-fast) var(--ease-emphasized);
+}
+.work-pane-toggle[data-alive="true"] .work-pane-toggle-bead {
+  opacity: 1;
+  transform: scale(1);
+}
+.work-pane-toggle[data-attention="true"] .work-pane-toggle-bead {
+  background: var(--color-status-warning);
+  animation: work-pane-bead-throb 1.5s ease-in-out infinite;
+}
+@keyframes work-pane-bead-throb {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 2px var(--color-canvas),
+      0 0 0 0 color-mix(in srgb, var(--color-status-warning) 45%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 0 2px var(--color-canvas),
+      0 0 0 4px color-mix(in srgb, var(--color-status-warning) 16%, transparent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .work-pane-toggle-fill,
+  .work-pane-toggle-bead,
+  .work-pane-launcher-option {
+    transition: none;
+  }
+  .work-pane-toggle[data-attention="true"] .work-pane-toggle-bead {
+    animation: none;
+  }
+}
+
+.work-pane-strip-trailing {
+  flex: none;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.work-pane-strip-trailing .icon-button {
+  width: 26px;
+  height: 26px;
+}

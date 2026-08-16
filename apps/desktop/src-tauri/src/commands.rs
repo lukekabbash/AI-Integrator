@@ -5039,11 +5039,8 @@ async fn acp_session_mcp_servers(
     let mcp_cwd = cwd.to_path_buf();
     let mcp_scope = tool_scope.cloned();
     let projected = tauri::async_runtime::spawn_blocking(move || {
-        let enabled_servers = crate::integrator_mcp::scoped_enabled_servers(
-            &mcp_app,
-            &mcp_store,
-            mcp_scope.as_ref(),
-        );
+        let enabled_servers =
+            crate::integrator_mcp::scoped_enabled_servers(&mcp_app, &mcp_store, mcp_scope.as_ref());
         crate::integrator_mcp::acp_mcp_server_entries(&enabled_servers, capabilities, &mcp_cwd)
     })
     .await

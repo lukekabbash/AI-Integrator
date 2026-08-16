@@ -127,7 +127,9 @@
   --color-layer-1: var(--color-surface-layer1);
   --color-layer-2: var(--color-surface-layer2);
   --color-overlay: var(--color-surface-overlay);
+  --color-surface-raised: var(--color-surface-elevated);
   --color-text-tertiary: var(--color-text-muted);
+  --color-text-disabled: color-mix(in srgb, var(--color-text-muted) 58%, var(--color-surface-panel));
   --color-border-base: color-mix(
     in srgb,
     var(--color-border-subtle) 45%,

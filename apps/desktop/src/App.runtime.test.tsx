@@ -2204,37 +2204,53 @@ describe("native runtime recovery UI", () => {
     expect(appRoot).toHaveAttribute("data-subagent-visible", "true");
     expect(appRoot).toHaveAttribute("data-subagent-layout-ready", "true");
     expect(document.querySelector(".conversation-header")).not.toBeInTheDocument();
-    expect(
-      within(titlebar!).getByRole("heading", { name: "Polish the interaction" }),
-    ).toBeInTheDocument();
+    // The titlebar slice over the pane carries the tab strip; the subagent's
+    // own header sits in the pane's subheader row beneath it.
     expect(titlebar!.querySelector(".titlebar-subagent-slot")).toContainElement(
-      titlebar!.querySelector(".titlebar-subagent-header"),
+      titlebar!.querySelector(".work-pane-strip"),
     );
+    const subheader = document.querySelector<HTMLElement>(".work-pane-subheader");
+    expect(subheader).toHaveAttribute("data-visible", "true");
+    expect(
+      within(subheader!).getByRole("heading", { name: "Polish the interaction" }),
+    ).toBeInTheDocument();
 
+    // The shared controls live once, in the work pane's strip.
     expect(screen.getAllByRole("button", { name: /chat navigation/i })).toHaveLength(1);
     expect(within(titlebar!).getByRole("button", { name: /chat navigation/i })).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: "Toggle terminal" })).toHaveLength(1);
     expect(screen.getAllByRole("button", { name: "Close task tools" })).toHaveLength(1);
-    expect(within(titlebar!).getByRole("button", { name: "Toggle terminal" })).toBeInTheDocument();
-    expect(within(titlebar!).getByRole("button", { name: "Close task tools" })).toBeInTheDocument();
+    const strip = titlebar!.querySelector<HTMLElement>(".work-pane-strip-trailing");
+    expect(within(strip!).getByRole("button", { name: "Toggle terminal" })).toBeInTheDocument();
+    expect(within(strip!).getByRole("button", { name: "Close task tools" })).toBeInTheDocument();
 
-    const stablePane = document.querySelector(".subagent-workspace-pane");
+    // A second subagent is a peer tab in the same pane, never a second pane.
+    const stablePane = document.querySelector(".work-pane");
     fireEvent.click(screen.getByRole("treeitem", { name: /Inspect the interaction/ }));
     await screen.findByLabelText("Inspect the interaction transcript");
-    expect(document.querySelectorAll(".subagent-workspace-pane")).toHaveLength(1);
-    expect(document.querySelector(".subagent-workspace-pane")).toBe(stablePane);
+    expect(document.querySelectorAll(".work-pane")).toHaveLength(1);
+    expect(document.querySelector(".work-pane")).toBe(stablePane);
+    const surfaces = screen.getByRole("tablist", { name: "Open surfaces" });
+    expect(
+      within(surfaces)
+        .getAllByRole("tab")
+        .map((tab) => tab.textContent),
+    ).toEqual(["Polish the interaction", "Inspect the interaction"]);
 
-    fireEvent.click(screen.getByRole("treeitem", { name: /Polish the interaction/ }));
+    fireEvent.click(within(surfaces).getByRole("tab", { name: "Polish the interaction" }));
     await screen.findByLabelText("Polish the interaction transcript");
-    expect(document.querySelectorAll(".subagent-workspace-pane")).toHaveLength(1);
-    expect(document.querySelector(".subagent-workspace-pane")).toBe(stablePane);
+    expect(document.querySelectorAll(".work-pane")).toHaveLength(1);
+    expect(document.querySelector(".work-pane")).toBe(stablePane);
 
-    fireEvent.click(within(titlebar!).getByRole("button", { name: "Close subagent transcript" }));
+    // Closing every tab leaves the pane open on its launcher; the toggle hides it.
+    fireEvent.click(screen.getByRole("button", { name: "Close all tabs" }));
     await waitFor(() =>
       expect(screen.queryByLabelText("Polish the interaction transcript")).not.toBeInTheDocument(),
     );
+    expect(appRoot).toHaveAttribute("data-subagent-visible", "true");
+    fireEvent.click(within(titlebar!).getByRole("button", { name: "Close work pane" }));
+    await waitFor(() => expect(document.querySelector(".work-pane")).not.toBeInTheDocument());
     expect(appRoot).toHaveAttribute("data-subagent-visible", "false");
-    expect(appRoot).not.toHaveAttribute("data-subagent-layout-ready");
     expect(within(titlebar!).getByRole("button", { name: "Toggle terminal" })).toBeInTheDocument();
     expect(within(titlebar!).getByRole("button", { name: "Close task tools" })).toBeInTheDocument();
   });

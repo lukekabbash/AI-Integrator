@@ -9,6 +9,7 @@ import {
   contrastRatio,
   deriveTerminalColors,
   normalizeThemePreferences,
+  readXtermTheme,
 } from "./theme";
 
 describe("semantic theme catalog", () => {
@@ -139,7 +140,37 @@ describe("terminal surface", () => {
           `${preset.id}: terminal ${token} ${terminal[token]} on ${terminal.surface} is ${ratio.toFixed(2)}:1`,
         ).toBeGreaterThanOrEqual(4.5);
       }
+      const firstForeground = preset.appearance === "dark" ? 1 : 0;
+      for (let slot = firstForeground; slot < 16; slot += 1) {
+        const ratio = contrastRatio(terminal.ansi[slot], terminal.surface);
+        expect(
+          ratio,
+          `${preset.id}: terminal ansi${slot} ${terminal.ansi[slot]} on ${terminal.surface} is ${ratio.toFixed(2)}:1`,
+        ).toBeGreaterThanOrEqual(4.5);
+      }
     }
+  });
+
+  it("applies the remapped ANSI ramp so typed shell colors pick up the contrast pass", () => {
+    const root = document.createElement("div");
+    applyThemePreferences({ ...DEFAULT_THEME_PREFERENCES, themeId: "paper" }, root);
+    const surface = root.style.getPropertyValue("--color-terminal-surface");
+    const yellow = root.style.getPropertyValue("--color-terminal-ansi3");
+    const dim = root.style.getPropertyValue("--color-terminal-ansi8");
+    const white = root.style.getPropertyValue("--color-terminal-ansi7");
+    expect(contrastRatio(yellow, surface)).toBeGreaterThanOrEqual(4.5);
+    expect(contrastRatio(dim, surface)).toBeGreaterThanOrEqual(4.5);
+    expect(contrastRatio(white, surface)).toBeGreaterThanOrEqual(4.5);
+  });
+
+  it("reads the applied terminal tokens into an xterm theme with selection ink", () => {
+    const root = document.createElement("div");
+    applyThemePreferences({ ...DEFAULT_THEME_PREFERENCES, themeId: "paper" }, root);
+    const theme = readXtermTheme(root.style);
+    expect(theme.foreground).toBe(root.style.getPropertyValue("--color-terminal-text"));
+    expect(theme.cursorAccent).toBe(root.style.getPropertyValue("--color-terminal-surface"));
+    expect(theme.selectionForeground).toBe(root.style.getPropertyValue("--color-selection-text"));
+    expect(theme.yellow).toBe(root.style.getPropertyValue("--color-terminal-ansi3"));
   });
 
   it("keeps the terminal surface derivation stable for unparseable overrides", () => {

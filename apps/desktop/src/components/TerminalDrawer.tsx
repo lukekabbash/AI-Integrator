@@ -25,6 +25,7 @@ import {
   type TerminalOutputEvent,
   type TerminalSessionInfo,
 } from "../bridge";
+import { readXtermTheme } from "../theme";
 import { Tooltip } from "./Tooltip";
 
 const DEFAULT_TERMINAL_HEIGHT_PX = 300;
@@ -48,30 +49,7 @@ function maximumTerminalHeight(): number {
 }
 
 function terminalTheme(): NonNullable<ConstructorParameters<typeof Terminal>[0]>["theme"] {
-  const styles = getComputedStyle(document.documentElement);
-  const color = (name: string) => styles.getPropertyValue(name).trim();
-  return {
-    background: color("--color-terminal-surface"),
-    foreground: color("--color-terminal-text"),
-    cursor: color("--color-terminal-text"),
-    selectionBackground: color("--color-selection-active"),
-    black: color("--color-terminal-ansi0"),
-    red: color("--color-terminal-ansi1"),
-    green: color("--color-terminal-ansi2"),
-    yellow: color("--color-terminal-ansi3"),
-    blue: color("--color-terminal-ansi4"),
-    magenta: color("--color-terminal-ansi5"),
-    cyan: color("--color-terminal-ansi6"),
-    white: color("--color-terminal-ansi7"),
-    brightBlack: color("--color-terminal-ansi8"),
-    brightRed: color("--color-terminal-ansi9"),
-    brightGreen: color("--color-terminal-ansi10"),
-    brightYellow: color("--color-terminal-ansi11"),
-    brightBlue: color("--color-terminal-ansi12"),
-    brightMagenta: color("--color-terminal-ansi13"),
-    brightCyan: color("--color-terminal-ansi14"),
-    brightWhite: color("--color-terminal-ansi15"),
-  };
+  return readXtermTheme(getComputedStyle(document.documentElement));
 }
 
 function errorMessage(error: unknown, fallback: string): string {

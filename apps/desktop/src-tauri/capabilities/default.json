@@ -65,6 +65,7 @@
     "allow-local-clear",
     "allow-storage-totals",
     "allow-usage-summary",
+    "allow-usage-history",
     "allow-voice-typing-credential-status",
     "allow-voice-typing-credential-set",
     "allow-voice-typing-credential-clear",

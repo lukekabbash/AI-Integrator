@@ -77,7 +77,7 @@ const GitRemoteDialog = lazy(() =>
   loadGitRemoteDialog().then((module) => ({ default: module.GitRemoteDialog })),
 );
 
-type RailTab = "git" | "agents" | "files" | "usage";
+export type RailTab = "git" | "agents" | "files" | "usage";
 
 const INITIAL_FILE_TREE_ENTRIES = 300;
 const FILE_TREE_CHUNK = 300;
@@ -121,6 +121,8 @@ interface RightRailProps {
   onNudgeDelegation?: (delegationId: string, message: string) => Promise<void>;
   onStopDelegation?: (delegationId: string) => Promise<void>;
   selectedDelegationId?: string;
+  /** Switches to a tab from outside (e.g. the work-pane launcher); a new id re-applies it. */
+  requestedTab?: { tab: RailTab; id: number };
   onSelectDelegation?: (delegationId: string) => void;
   usage: UsageSnapshot;
   /** Active runtime and its provider-reported plan windows, when exposed. */
@@ -3151,7 +3153,12 @@ export function RightRailShell({
 }
 
 export function RightRail(props: RightRailProps) {
-  const [tab, setTab] = useState<RailTab>("git");
+  const [chosen, setChosen] = useState<{ tab: RailTab; requestId: number }>({
+    tab: "git",
+    requestId: 0,
+  });
+  const requested = props.requestedTab;
+  const tab: RailTab = requested && requested.id !== chosen.requestId ? requested.tab : chosen.tab;
   const { onRequestDelegations, onRequestProjectFiles } = props;
   // Browser snapshots and test fixtures from before the Git state migration
   // may not yet carry the discriminator or remote list.
@@ -3226,11 +3233,12 @@ export function RightRail(props: RightRailProps) {
   ];
   return (
     <RightRailShell
+      key={`rail-${requested?.id ?? 0}`}
       tabs={tabs}
-      initialTab="git"
+      initialTab={tab}
       label="Task tools"
       onResize={props.onResize}
-      onTabChange={(next) => setTab(next as RailTab)}
+      onTabChange={(next) => setChosen({ tab: next as RailTab, requestId: requested?.id ?? 0 })}
       conversationOpen={Boolean(props.selectedDelegationId)}
     />
   );

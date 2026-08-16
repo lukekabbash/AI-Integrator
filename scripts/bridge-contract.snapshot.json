@@ -157,6 +157,7 @@
     "terminal_open(repository:PathBuf,cols:u16,rows:u16)->CommandResult<TerminalSessionInfo>",
     "terminal_resize(sessionId:String,cols:u16,rows:u16)->CommandResult<()>",
     "terminal_write(sessionId:String,data:String)->CommandResult<()>",
+    "usage_history(sinceMs:i64,untilMs:i64)->CommandResult<UsageHistoryReport>",
     "usage_summary()->CommandResult<UsageSummary>",
     "voice_typing_credential_clear()->CommandResult<()>",
     "voice_typing_credential_set(apiKey:String)->CommandResult<VoiceTypingCredentialStatus>",

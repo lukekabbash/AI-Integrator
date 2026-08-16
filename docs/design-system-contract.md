@@ -1,6 +1,6 @@
 # AI Integrator v1 design-system contract
 
-This document freezes the latest visual and interaction decisions. Detailed component/state/accessibility primitives remain in the main UI/UX catalog.
+This document freezes the latest visual and interaction decisions. Detailed component/state/accessibility primitives remain in the main UI/UX catalog. The portable material and motion recipes — the tactile / jelly chrome — live in [soft-tactile-design-language.md](soft-tactile-design-language.md).
 
 ## 1. Experience character
 

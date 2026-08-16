@@ -675,20 +675,14 @@ body[data-resizing="true"] .task-sidebar,
 [data-motion="none"] .task-sidebar {
   transition: none;
 }
-/* Scrollbar rides the left edge so chat rows stay flush with the New chat
-   button on the right. direction:rtl moves the native lane; children reset
-   to ltr so labels and chevrons keep reading left-to-right. */
+/* A 3px hairline lane on the right edge, always reserved, so rows sit at
+   the same x whether or not the list overflows. The global
+   `* { scrollbar-width: thin }` in theme.css makes Chromium ignore
+   ::-webkit-scrollbar and draw its own 10px lane; resetting both standard
+   properties to auto here hands the lane back to the 3px rules below. */
 .task-sidebar .sidebar-scroll {
-  direction: rtl;
-  scrollbar-width: thin;
-  scrollbar-color: transparent transparent;
-}
-.task-sidebar .sidebar-scroll * {
-  direction: ltr;
-}
-.task-sidebar .sidebar-scroll:hover,
-.task-sidebar .sidebar-scroll:focus-within {
-  scrollbar-color: color-mix(in srgb, var(--color-text-muted) 45%, transparent) transparent;
+  scrollbar-width: auto;
+  scrollbar-color: auto;
 }
 .task-sidebar .sidebar-scroll::-webkit-scrollbar {
   width: 3px;
@@ -2524,6 +2518,7 @@ kbd {
 
 .tool-scope-glyph {
   width: 13px;
+  height: 13px;
   flex: 0 0 auto;
   color: var(--color-text-tertiary);
 }
@@ -2653,7 +2648,11 @@ kbd {
 }
 
 .tool-scope-box svg {
+  /* Both axes: lucide ships width/height="24" attributes, so width alone
+     leaves a 10×24 icon that overflows the 14px box and parks the tick in
+     the bottom-left corner. */
   width: 10px;
+  height: 10px;
   color: var(--color-accent-contrast);
   stroke-width: 3;
 }
@@ -2812,9 +2811,12 @@ kbd {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  /* Pull the lane out to the panel edge; padding keeps chat rows aligned. */
-  margin-left: calc(-1 * var(--sidebar-pad-x));
-  padding-left: var(--sidebar-pad-x);
+  /* Pull the lane out into the right panel padding and reserve it even when
+     nothing overflows: rows keep the same x and stay flush with the New chat
+     button whether or not the scrollbar is showing. */
+  scrollbar-gutter: stable;
+  margin-right: calc(-1 * var(--sidebar-pad-x));
+  padding-right: calc(var(--sidebar-pad-x) - 3px);
   display: flex;
   flex-direction: column;
   gap: 1px;
@@ -4345,7 +4347,10 @@ kbd {
   overscroll-behavior: contain;
   scroll-padding-bottom: 30px;
   scrollbar-gutter: stable;
-  scrollbar-color: transparent transparent;
+  /* Reset the global `* { scrollbar-width: thin }` so the ::-webkit-scrollbar
+     rules below own the lane (12px, hairline thumb, transparent until hover). */
+  scrollbar-width: auto;
+  scrollbar-color: auto;
   -webkit-mask-image: linear-gradient(
     to bottom,
     transparent 0,
@@ -4360,10 +4365,6 @@ kbd {
     black calc(100% - 22px),
     transparent 100%
   );
-}
-.transcript-scroll:hover,
-.transcript-scroll:focus-within {
-  scrollbar-color: color-mix(in srgb, var(--color-text-muted) 45%, transparent) transparent;
 }
 .transcript-scroll::-webkit-scrollbar {
   width: 12px;
@@ -12976,7 +12977,8 @@ button.explain-fallback-step:hover .explain-fallback-role {
   align-items: center;
   gap: 12px;
   border-bottom: 1px solid var(--color-border-subtle);
-  background: color-mix(in srgb, var(--color-terminal-surface) 92%, var(--color-surface-raised));
+  background: color-mix(in srgb, var(--color-terminal-surface) 88%, var(--color-surface-elevated));
+  color: var(--color-terminal-text);
   font-size: 10px;
 }
 .terminal-title {
@@ -13099,7 +13101,8 @@ button.explain-fallback-step:hover .explain-fallback-role {
   flex-direction: column;
   overflow: hidden;
   border-left: 1px solid var(--color-border-subtle);
-  background: color-mix(in srgb, var(--color-terminal-surface) 94%, var(--color-surface-raised));
+  background: color-mix(in srgb, var(--color-terminal-surface) 88%, var(--color-surface-elevated));
+  color: var(--color-terminal-text);
   transition: width var(--duration-moderate) var(--ease-standard);
 }
 .terminal-session-rail[data-collapsed="true"] {
@@ -13123,6 +13126,7 @@ button.explain-fallback-step:hover .explain-fallback-role {
 }
 .terminal-session-rail button:disabled {
   color: var(--color-text-disabled);
+  opacity: 0.55;
   cursor: default;
 }
 .terminal-session-rail-header {
@@ -13143,7 +13147,6 @@ button.explain-fallback-step:hover .explain-fallback-role {
   border-radius: var(--radius-control);
 }
 .terminal-session-rail-header svg,
-.terminal-session-new svg,
 .terminal-session-select svg {
   width: 13px;
   height: 13px;
@@ -13238,18 +13241,30 @@ button.explain-fallback-step:hover .explain-fallback-role {
 .terminal-session-row[data-active="true"] .terminal-session-remove {
   opacity: 1;
 }
-.terminal-session-new {
-  min-height: 34px;
-  margin: 5px;
-  padding: 0 7px;
+.terminal-session-rail button.terminal-session-new {
+  height: 26px;
+  min-height: 26px;
+  margin: 0;
+  padding: 0 8px;
   flex: none;
   display: flex;
   align-items: center;
-  gap: 7px;
-  border-radius: var(--radius-control);
-  color: var(--color-terminal-command);
+  gap: 6px;
+  border: 0;
+  border-top: 1px solid var(--color-border-subtle);
+  border-radius: 0;
+  color: var(--color-terminal-text-muted);
   font-size: 10px;
   white-space: nowrap;
+}
+.terminal-session-new svg {
+  width: 12px;
+  height: 12px;
+}
+.terminal-session-rail button.terminal-session-new:hover:not(:disabled),
+.terminal-session-rail button.terminal-session-new:focus-visible {
+  color: var(--color-terminal-text);
+  background: color-mix(in srgb, var(--color-terminal-text) 7%, transparent);
 }
 .terminal-session-rail[data-collapsed="true"] .terminal-session-rail-header {
   padding: 0 6px;
@@ -13271,7 +13286,7 @@ button.explain-fallback-step:hover .explain-fallback-role {
 }
 .terminal-session-rail[data-collapsed="true"] .terminal-session-new {
   justify-content: center;
-  margin: 5px 4px;
+  margin: 0;
   padding: 0;
 }
 

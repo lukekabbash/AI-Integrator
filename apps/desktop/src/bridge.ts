@@ -9,12 +9,14 @@ import {
 } from "./bridgeErrors";
 import {
   createDemoSnapshot,
+  createDemoUsageSummary,
   createEmptySnapshot,
   DEMO_GIT_RECENT_COMMITS,
   demoGitHistoryArchive,
 } from "./demoData";
 import { prettyModelLabel, resolveModelLabel } from "./modelLabel";
 import type { SpecialistSetting } from "./subagentSettings";
+import { createDemoUsageHistoryReport, type UsageHistoryReport } from "./usageHistory";
 
 export { formatBridgeError };
 
@@ -1260,6 +1262,8 @@ export interface AppBridge {
   pruneLogs(): Promise<void>;
   reportDiagnostic(channel: DiagnosticChannel, record: DiagnosticRecord): Promise<void>;
   getUsageSummary(): Promise<UsageSummary>;
+  /** Hourly usage slices scanned from the installed CLIs' local transcripts. */
+  getUsageHistory(sinceMs: number, untilMs: number): Promise<UsageHistoryReport>;
   listSettings(): Promise<LocalSetting[]>;
   setSetting(key: string, value: unknown): Promise<LocalSetting>;
   getVoiceTypingCredentialStatus?(): Promise<VoiceTypingCredentialStatus>;
@@ -4274,36 +4278,12 @@ export const bridge: AppBridge = {
 
   getUsageSummary: async () => {
     if (isTauri()) return nativeInvoke<UsageSummary>("usage_summary");
-    const snapshot = readDemoSnapshot();
-    const grouped = new Map<RuntimeId | "unknown", ProviderUsageSummary>();
-    for (const task of snapshot.tasks) {
-      const provider = task.runtime ?? "unknown";
-      const events = snapshot.taskContexts[task.id]?.usage.localObserved?.events ?? [];
-      const inputTokens = events.reduce((total, event) => total + event.estimatedInputTokens, 0);
-      const existing = grouped.get(provider) ?? {
-        provider,
-        taskCount: 0,
-        turnCount: 0,
-        inputTokens: 0,
-        cachedInputTokens: 0,
-        outputTokens: 0,
-        reasoningOutputTokens: 0,
-        totalTokens: 0,
-        provenance: "unavailable",
-        detail: "No provider token usage is available in the browser preview.",
-      };
-      existing.taskCount += 1;
-      existing.turnCount += events.length;
-      existing.inputTokens += inputTokens;
-      existing.totalTokens += inputTokens;
-      if (events.length > 0) {
-        existing.provenance = "estimated";
-        existing.detail =
-          "Input tokens are estimated from locally recorded prompts; provider output is unavailable in the browser preview.";
-      }
-      grouped.set(provider, existing);
-    }
-    return { providers: [...grouped.values()], measuredAt: new Date().toISOString() };
+    return createDemoUsageSummary(readDemoSnapshot());
+  },
+
+  getUsageHistory: async (sinceMs, untilMs) => {
+    if (isTauri()) return nativeInvoke<UsageHistoryReport>("usage_history", { sinceMs, untilMs });
+    return createDemoUsageHistoryReport();
   },
 
   listSettings: async () => {

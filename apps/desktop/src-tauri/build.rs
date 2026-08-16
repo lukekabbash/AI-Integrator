@@ -50,6 +50,7 @@ const APP_COMMANDS: &[&str] = &[
     "local_clear",
     "storage_totals",
     "usage_summary",
+    "usage_history",
     "voice_typing_credential_status",
     "voice_typing_credential_set",
     "voice_typing_credential_clear",

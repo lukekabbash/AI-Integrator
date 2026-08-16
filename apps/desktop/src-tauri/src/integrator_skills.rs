@@ -41,6 +41,16 @@ const BUNDLED_PLUGINS_RESOURCE_DIR: &str = "first-party-plugins";
 const MAX_PROJECTED_FILES: usize = 64;
 const MAX_PROJECTED_FILE_BYTES: u64 = 512 * 1024;
 const MAX_PROJECTED_DEPTH: usize = 4;
+/// Skill-index disclosure bounds for runtimes without native skill loading.
+/// A plugin with more skills than the threshold collapses to one line naming
+/// the plugin and a sample of its skills, so a large vendor pack (dozens of
+/// skills) costs the prompt one line while small plugins stay fully listed.
+const INDEX_COLLAPSE_THRESHOLD: usize = 15;
+const INDEX_COLLAPSED_SAMPLE: usize = 6;
+const INDEX_DESCRIPTION_CHARS: usize = 240;
+/// Soft ceiling for the whole block. Over budget, the largest still-flat
+/// plugins collapse too; nothing is ever silently dropped.
+const INDEX_MAX_BYTES: usize = 24 * 1024;
 
 pub fn skills_root(documents: &Path) -> PathBuf {
     documents.join("AI Integrator").join("Skills")
@@ -727,28 +737,125 @@ fn skill_file(entry: &IntegratorSkillEntry) -> PathBuf {
 }
 
 /// A compact always-in-context index for runtimes without native skill
-/// loading (Codex, Antigravity, ACP). One bounded line per enabled skill;
-/// bodies and resources stay on disk until the agent reads them, preserving
-/// progressive disclosure.
+/// loading (Codex, Antigravity, ACP). Bodies and resources stay on disk until
+/// the agent reads them, preserving progressive disclosure in two tiers:
+/// small plugins list one bounded line per skill; a plugin with more than
+/// [`INDEX_COLLAPSE_THRESHOLD`] skills collapses to one line naming the plugin,
+/// its skill count, a sample of skill names, and the directory to browse.
+/// If the block still exceeds [`INDEX_MAX_BYTES`], the largest flat plugins
+/// collapse next. Every enabled skill is always reachable from the index.
 pub fn skill_index_block(skills: &[IntegratorSkillEntry]) -> Option<String> {
     if skills.is_empty() {
         return None;
     }
+    // Group by namespace (`<plugin>:<skill>`), preserving first-seen order.
+    let mut groups: Vec<(&str, Vec<&IntegratorSkillEntry>)> = Vec::new();
+    for entry in skills {
+        let namespace = entry
+            .name
+            .split_once(':')
+            .map_or(entry.name.as_str(), |(ns, _)| ns);
+        match groups.iter_mut().find(|(name, _)| *name == namespace) {
+            Some((_, members)) => members.push(entry),
+            None => groups.push((namespace, vec![entry])),
+        }
+    }
+    let mut collapsed: Vec<bool> = groups
+        .iter()
+        .map(|(_, members)| members.len() > INDEX_COLLAPSE_THRESHOLD)
+        .collect();
+    let mut block = render_index(&groups, &collapsed);
+    // Budget backstop: collapse the largest still-flat plugin until it fits.
+    while block.len() > INDEX_MAX_BYTES {
+        let Some(largest) = (0..groups.len())
+            .filter(|&index| !collapsed[index])
+            .max_by_key(|&index| groups[index].1.len())
+        else {
+            eprintln!(
+                "skill index exceeds {INDEX_MAX_BYTES} bytes with every plugin collapsed ({} plugins)",
+                groups.len()
+            );
+            break;
+        };
+        collapsed[largest] = true;
+        block = render_index(&groups, &collapsed);
+    }
+    Some(block)
+}
+
+fn render_index(groups: &[(&str, Vec<&IntegratorSkillEntry>)], collapsed: &[bool]) -> String {
+    let any_collapsed = collapsed.iter().any(|&flag| flag);
     let mut block = String::from(
         "<integrator-skills>\nThe user enabled these skills. When a request matches one, \
          read its SKILL.md file first and follow it. Invoke none of them otherwise.\n",
     );
-    for entry in skills.iter().take(64) {
-        let description = entry.description.chars().take(160).collect::<String>();
-        block.push_str(&format!(
-            "- {} — {} — {}\n",
-            entry.name,
-            description,
-            skill_file(entry).to_string_lossy()
-        ));
+    if any_collapsed {
+        block.push_str(
+            "Large plugins are listed as one line with a sample of their skills; when one \
+             looks relevant, browse its directory for the SKILL.md files it holds.\n",
+        );
+    }
+    for ((namespace, members), &is_collapsed) in groups.iter().zip(collapsed) {
+        if is_collapsed {
+            block.push_str(&collapsed_plugin_line(namespace, members));
+            continue;
+        }
+        for entry in members {
+            let description = entry
+                .description
+                .chars()
+                .take(INDEX_DESCRIPTION_CHARS)
+                .collect::<String>();
+            block.push_str(&format!(
+                "- {} — {} — {}\n",
+                entry.name,
+                description,
+                skill_file(entry).to_string_lossy()
+            ));
+        }
     }
     block.push_str("</integrator-skills>\n\n");
-    Some(block)
+    block
+}
+
+/// `- google (plugin, 42 skills: bigquery, vertex-ai, … +36) — <dir>`
+fn collapsed_plugin_line(namespace: &str, members: &[&IntegratorSkillEntry]) -> String {
+    let short_names = members
+        .iter()
+        .take(INDEX_COLLAPSED_SAMPLE)
+        .map(|entry| {
+            entry
+                .name
+                .split_once(':')
+                .map_or(entry.name.as_str(), |(_, name)| name)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remainder = members.len().saturating_sub(INDEX_COLLAPSED_SAMPLE);
+    let more = if remainder > 0 {
+        format!(" +{remainder}")
+    } else {
+        String::new()
+    };
+    let directory = common_ancestor(members.iter().map(|entry| entry.path.as_path()))
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!(
+        "- {namespace} (plugin, {} skills: {short_names}{more}) — {directory}\n",
+        members.len()
+    )
+}
+
+/// Deepest directory containing every given skill path (the plugin root, or
+/// its `skills/` folder when every skill sits directly under it).
+fn common_ancestor<'a>(mut paths: impl Iterator<Item = &'a Path>) -> Option<PathBuf> {
+    let mut ancestor = paths.next()?.parent()?.to_path_buf();
+    for path in paths {
+        while !path.starts_with(&ancestor) {
+            ancestor = ancestor.parent()?.to_path_buf();
+        }
+    }
+    Some(ancestor)
 }
 
 /// The wire text for an explicit `/skill` invocation on a runtime that does
@@ -1086,6 +1193,88 @@ mod tests {
         assert!(block.contains("/skills/fred"));
         // Descriptions are truncated so one skill cannot flood the index.
         assert!(block.len() < 600);
+    }
+
+    fn fixture_skills(namespace: &str, count: usize) -> Vec<IntegratorSkillEntry> {
+        (0..count)
+            .map(|index| IntegratorSkillEntry {
+                name: format!("{namespace}:skill-{index}"),
+                description: format!("Does thing {index} for {namespace}"),
+                source: "plugin".into(),
+                path: PathBuf::from(format!("/plugins/{namespace}/skills/skill-{index}")),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn index_collapses_large_plugins_and_keeps_small_ones_flat() {
+        let mut skills = fixture_skills("gov-data", 5);
+        skills.extend(fixture_skills("google", INDEX_COLLAPSE_THRESHOLD + 27));
+        skills.extend(fixture_skills("tauri", INDEX_COLLAPSE_THRESHOLD));
+        let block = skill_index_block(&skills).expect("index");
+        // Small and at-threshold plugins list every skill.
+        for index in 0..5 {
+            assert!(block.contains(&format!("- gov-data:skill-{index} — ")));
+        }
+        for index in 0..INDEX_COLLAPSE_THRESHOLD {
+            assert!(block.contains(&format!("- tauri:skill-{index} — ")));
+        }
+        // The large plugin is one line: count, sample, remainder, directory.
+        assert!(!block.contains("google:skill-"));
+        assert!(block.contains("- google (plugin, 42 skills: skill-0, skill-1, skill-2, skill-3, skill-4, skill-5 +36) — "));
+        assert!(block.contains("/plugins/google/skills\n"));
+        assert!(block.contains("browse its directory"));
+        // Group order follows first appearance, so the collapsed line sits
+        // between the two flat plugins.
+        let google = block.find("- google (plugin").expect("google line");
+        assert!(block.find("- gov-data:skill-0").expect("gov-data") < google);
+        assert!(google < block.find("- tauri:skill-0").expect("tauri"));
+        // Well under any budget: 20 flat lines + 1 collapsed line.
+        assert!(block.len() < 4 * 1024);
+    }
+
+    #[test]
+    fn index_never_collapses_when_nothing_is_large() {
+        let mut skills = fixture_skills("a", 3);
+        skills.extend(fixture_skills("b", 3));
+        let block = skill_index_block(&skills).expect("index");
+        assert!(!block.contains("(plugin,"));
+        assert!(!block.contains("browse its directory"));
+        assert_eq!(block.matches("\n- ").count(), 6);
+    }
+
+    #[test]
+    fn index_budget_collapses_largest_flat_plugins_instead_of_dropping() {
+        // 30 plugins × 12 skills: each under the collapse threshold, ~40 KB
+        // flat. Nothing may vanish; the largest flat plugins collapse until
+        // the block fits the budget.
+        let mut skills = Vec::new();
+        for plugin in 0..30 {
+            skills.extend(fixture_skills(&format!("pack-{plugin:02}"), 12));
+        }
+        let block = skill_index_block(&skills).expect("index");
+        assert!(
+            block.len() <= INDEX_MAX_BYTES,
+            "block is {} bytes",
+            block.len()
+        );
+        assert!(block.contains("(plugin, 12 skills:"));
+        for plugin in 0..30 {
+            let namespace = format!("pack-{plugin:02}");
+            let flat = block.contains(&format!("- {namespace}:skill-0 — "));
+            let collapsed = block.contains(&format!("- {namespace} (plugin, 12 skills:"));
+            assert!(flat || collapsed, "{namespace} disappeared from the index");
+        }
+        // Some plugins are still flat: the backstop collapses only as needed.
+        assert!(block.contains(":skill-0 — "));
+    }
+
+    #[test]
+    fn collapsed_line_directory_is_the_common_ancestor() {
+        let mut skills = fixture_skills("mixed", INDEX_COLLAPSE_THRESHOLD + 1);
+        skills[0].path = PathBuf::from("/plugins/mixed/nested/deeper/skill-0");
+        let block = skill_index_block(&skills).expect("index");
+        assert!(block.contains(") — /plugins/mixed\n"));
     }
 
     #[test]

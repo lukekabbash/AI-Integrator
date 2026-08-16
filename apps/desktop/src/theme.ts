@@ -1359,6 +1359,25 @@ function ensureContrast(color: Rgb, background: Rgb, minimum: number): Rgb {
   return candidate;
 }
 
+export type TerminalAnsiRamp = readonly [
+  string,
+  string,
+  string,
+  string,
+  string,
+  string,
+  string,
+  string,
+  string,
+  string,
+  string,
+  string,
+  string,
+  string,
+  string,
+  string,
+];
+
 export interface TerminalColors {
   readonly surface: string;
   readonly text: string;
@@ -1367,6 +1386,7 @@ export interface TerminalColors {
   readonly success: string;
   readonly error: string;
   readonly warning: string;
+  readonly ansi: TerminalAnsiRamp;
 }
 
 export function deriveTerminalColors(
@@ -1394,11 +1414,23 @@ export function deriveTerminalColors(
     return ensureContrast(candidates[0], surface, TERMINAL_MIN_CONTRAST);
   };
 
+  // Prefer the product's primary ink so default typed text matches the UI.
+  // Shells such as PowerShell still color tokens with the ANSI ramp.
   const text = pick(
     appearance === "light"
-      ? [ansi(0), resolve("text.primary")]
-      : [ansi(7), resolve("text.primary"), ansi(15)],
+      ? [resolve("text.primary"), ansi(0)]
+      : [resolve("text.primary"), ansi(15), ansi(7)],
   );
+
+  // ANSI 0 stays a near-surface black on dark themes so programs can still
+  // paint a true black cell. Every other slot is used as typed/prompt text
+  // (DarkYellow, DarkGray, Gray, …) and must clear AA against the surface.
+  const remappedAnsi = Array.from({ length: 16 }, (_, slot) => {
+    const color = ansi(slot);
+    if (slot === 0 && appearance === "dark") return rgbToHex(color);
+    return rgbToHex(ensureContrast(color, surface, TERMINAL_MIN_CONTRAST));
+  }) as unknown as TerminalAnsiRamp;
+
   return {
     surface: rgbToHex(surface),
     text: rgbToHex(text),
@@ -1407,6 +1439,36 @@ export function deriveTerminalColors(
     success: rgbToHex(pick([ansi(2), ansi(10)])),
     error: rgbToHex(pick(appearance === "light" ? [ansi(1), ansi(9)] : [ansi(9), ansi(1)])),
     warning: rgbToHex(pick([resolve("status.warning"), ansi(3), ansi(11)])),
+    ansi: remappedAnsi,
+  };
+}
+
+/** xterm theme object read from the applied CSS variables. */
+export function readXtermTheme(styles: CSSStyleDeclaration) {
+  const color = (name: string) => styles.getPropertyValue(name).trim();
+  return {
+    background: color("--color-terminal-surface"),
+    foreground: color("--color-terminal-text"),
+    cursor: color("--color-terminal-text"),
+    cursorAccent: color("--color-terminal-surface"),
+    selectionBackground: color("--color-selection-active"),
+    selectionForeground: color("--color-selection-text"),
+    black: color("--color-terminal-ansi0"),
+    red: color("--color-terminal-ansi1"),
+    green: color("--color-terminal-ansi2"),
+    yellow: color("--color-terminal-ansi3"),
+    blue: color("--color-terminal-ansi4"),
+    magenta: color("--color-terminal-ansi5"),
+    cyan: color("--color-terminal-ansi6"),
+    white: color("--color-terminal-ansi7"),
+    brightBlack: color("--color-terminal-ansi8"),
+    brightRed: color("--color-terminal-ansi9"),
+    brightGreen: color("--color-terminal-ansi10"),
+    brightYellow: color("--color-terminal-ansi11"),
+    brightBlue: color("--color-terminal-ansi12"),
+    brightMagenta: color("--color-terminal-ansi13"),
+    brightCyan: color("--color-terminal-ansi14"),
+    brightWhite: color("--color-terminal-ansi15"),
   };
 }
 
@@ -1720,6 +1782,9 @@ export function applyThemePreferences(
   root.style.setProperty("--color-terminal-success", terminal.success);
   root.style.setProperty("--color-terminal-error", terminal.error);
   root.style.setProperty("--color-terminal-warning", terminal.warning);
+  terminal.ansi.forEach((value, slot) => {
+    root.style.setProperty(`--color-terminal-ansi${slot}`, value);
+  });
 
   root.dataset.theme = preset.id;
   root.dataset.appearance = preset.appearance;

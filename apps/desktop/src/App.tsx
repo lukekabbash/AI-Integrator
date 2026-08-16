@@ -3,7 +3,6 @@ import {
   Suspense,
   useCallback,
   useEffect,
-  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -117,13 +116,13 @@ import {
 import { resolveExplainConfig, resolveExplainRoute } from "./explainSettings";
 import { resolveCommitMessageRoute } from "./commitMessageSettings";
 import { decorateCommitMessage, readGitDecorationSettings, readPushForce } from "./gitDecoration";
-import { TitlebarFileTabs } from "./components/TitlebarFileTabs";
+import { WorkPaneToggle, type WorkPaneLaunchKind } from "./components/WorkPaneToggle";
+import { useWorkPane, useWorkPaneHeaderAlignment, fileSurfaceId } from "./useWorkPane";
 import { resolveRequestedFile, type ProjectFileLocation } from "./components/fileViewSupport";
 import { TaskStatusPill } from "./components/TaskStatusPill";
 import { SubagentProjectionCache } from "./components/subagentProjectionCache";
 import { QueuedMessages } from "./components/QueuedMessages";
 import { formatCompactTokenCount } from "./components/conversationFormatting";
-import { ResizeHandle } from "./components/ResizeHandle";
 import { SlidingTabIndicator } from "./components/SlidingTabIndicator";
 import { TaskSidebar } from "./components/TaskSidebar";
 import {
@@ -165,10 +164,11 @@ const SubagentConversation = lazy(() =>
   })),
 );
 
-const DiffView = lazy(() =>
-  import("./components/DiffView").then((module) => ({
-    default: module.DiffView,
-  })),
+const WorkPane = lazy(() =>
+  import("./components/WorkPane").then((module) => ({ default: module.WorkPane })),
+);
+const ReviewSurface = lazy(() =>
+  import("./components/ReviewSurface").then((module) => ({ default: module.ReviewSurface })),
 );
 const TerminalDrawer = lazy(() =>
   import("./components/TerminalDrawer").then((module) => ({
@@ -301,56 +301,6 @@ const Transcript = lazy(() =>
 type Screen = "workspace" | "scheduled" | "settings" | "setup";
 type CenterView = "task" | "review";
 
-function ReviewEmptyState({
-  onBack,
-  onRefresh,
-  refreshing = false,
-}: {
-  onBack: () => void;
-  onRefresh?: () => void;
-  refreshing?: boolean;
-}) {
-  return (
-    <section className="review-empty" aria-label="Review changes">
-      <div className="review-empty-icon">
-        <FileDiff />
-      </div>
-      <h2>No changes to review</h2>
-      <p>When the agent or you change this worktree, the unified review will appear here.</p>
-      <div className="review-empty-actions">
-        {onRefresh ? (
-          <button
-            className="secondary-button"
-            type="button"
-            onClick={onRefresh}
-            disabled={refreshing}
-          >
-            {refreshing ? "Checking…" : "Check again"}
-          </button>
-        ) : null}
-        <button className="secondary-button" type="button" onClick={onBack}>
-          Back to task
-        </button>
-      </div>
-    </section>
-  );
-}
-
-function ReviewLoadErrorState({ message, onRetry }: { message: string; onRetry: () => void }) {
-  return (
-    <section className="review-empty" aria-label="Review unavailable">
-      <div className="review-empty-icon">
-        <FileDiff />
-      </div>
-      <h2>Could not load this diff</h2>
-      <p role="alert">{message}</p>
-      <button className="secondary-button" type="button" onClick={onRetry}>
-        Retry
-      </button>
-    </section>
-  );
-}
-
 interface ComposerErrorState {
   id: string;
   taskId: string;
@@ -359,7 +309,6 @@ interface ComposerErrorState {
 
 const SIDEBAR_WIDTH_STORAGE_KEY = "aiintegrator.sidebar-width.v1";
 const RIGHT_RAIL_WIDTH_STORAGE_KEY = "aiintegrator.right-rail-width.v1";
-const SUBAGENT_PANE_RATIO_STORAGE_KEY = "aiintegrator.subagent-pane-ratio.v1";
 const PROJECT_SIDEBAR_META_KEY = "projects.sidebarMeta";
 const GIT_CACHE_TTL_MS = 5_000;
 
@@ -1552,7 +1501,16 @@ export default function App() {
   const draftWriterRunning = useRef(false);
   const [delegations, setDelegations] = useState<DelegationView[]>([]);
   const [automationTimeline, setAutomationTimeline] = useState<AutomationTimelineEntry[]>([]);
-  const [selectedDelegationId, setSelectedDelegationId] = useState<string | undefined>();
+  // The work pane (files, review, subagents, browser tabs) is owned by the
+  // active task, or by the project while drafting a new chat.
+  const workPaneOwnerKey = snapshot.activeTaskId
+    ? snapshot.activeTaskId
+    : snapshot.activeProjectId
+      ? `project:${snapshot.activeProjectId}`
+      : "";
+  const workPane = useWorkPane(workPaneOwnerKey);
+  const selectedDelegationId =
+    workPane.active?.kind === "subagent" ? workPane.active.delegationId : undefined;
   // Provider-reported subscription quota keyed by runtime (Codex today).
   // Refreshed per active-task switch; never inferred when a provider is silent.
   const [providerQuota, setProviderQuota] = useState<Record<string, SubscriptionQuota>>({});
@@ -1630,7 +1588,6 @@ export default function App() {
   // First-class canvas file tabs, shown beside the chat title. Contents live
   // here; per-task paths persist through snapshot.openFilesByTask.
   const [openFileTabs, setOpenFileTabs] = useState<ProjectFileContent[]>([]);
-  const [activeFileTabPath, setActiveFileTabPath] = useState("");
   const [activeFileLocation, setActiveFileLocation] = useState<ProjectFileLocation | null>(null);
   const [fileTabOpeningPath, setFileTabOpeningPath] = useState("");
   const fileTabsCache = useRef(new Map<string, { tabs: ProjectFileContent[]; active: string }>());
@@ -1643,9 +1600,6 @@ export default function App() {
   );
   const [rightRailWidth, setRightRailWidth] = useState(() =>
     storedDimension(RIGHT_RAIL_WIDTH_STORAGE_KEY, 356, 300, 520),
-  );
-  const [subagentPaneRatio, setSubagentPaneRatio] = useState(() =>
-    storedDimension(SUBAGENT_PANE_RATIO_STORAGE_KEY, 0.5, 0.3, 0.7),
   );
   const [terminalOpen, setTerminalOpen] = useState(false);
   const [terminalSurfaceActivated, setTerminalSurfaceActivated] = useState(false);
@@ -1912,14 +1866,6 @@ export default function App() {
     );
     return () => window.clearTimeout(timeout);
   }, [rightRailWidth]);
-
-  useEffect(() => {
-    const timeout = window.setTimeout(
-      () => window.localStorage.setItem(SUBAGENT_PANE_RATIO_STORAGE_KEY, String(subagentPaneRatio)),
-      150,
-    );
-    return () => window.clearTimeout(timeout);
-  }, [subagentPaneRatio]);
 
   const loadPersistedTaskProjection = useCallback(async (taskId: string) => {
     const loaded = await bridge.loadTaskProjection(taskId, { skipRuntimeCheck: true });
@@ -2957,37 +2903,9 @@ export default function App() {
   const selectedDelegation = delegations.find(
     (delegation) => delegation.id === selectedDelegationId && delegation.childTaskId,
   );
-  const subagentOpen = Boolean(selectedDelegation);
-
-  useLayoutEffect(() => {
-    const root = appRootRef.current;
-    const pane = subagentPaneRef.current;
-    if (!root || !pane || !subagentOpen) return;
-
-    const alignHeader = () => {
-      const rootRect = root.getBoundingClientRect();
-      const paneRect = pane.getBoundingClientRect();
-      root.style.setProperty(
-        "--subagent-pane-left",
-        `${Math.max(0, paneRect.left - rootRect.left)}px`,
-      );
-      root.dataset.subagentLayoutReady = "true";
-    };
-
-    alignHeader();
-    const observer =
-      typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(alignHeader);
-    observer?.observe(root);
-    observer?.observe(pane);
-    window.addEventListener("resize", alignHeader);
-
-    return () => {
-      observer?.disconnect();
-      window.removeEventListener("resize", alignHeader);
-      delete root.dataset.subagentLayoutReady;
-      root.style.removeProperty("--subagent-pane-left");
-    };
-  }, [subagentOpen, subagentPaneRatio]);
+  const subagentOpen = workPane.state.open;
+  const activeFileTabPath = workPane.active?.kind === "file" ? workPane.active.path : "";
+  useWorkPaneHeaderAlignment(appRootRef, subagentPaneRef, subagentOpen, workPane.state.width);
   const titleContext =
     screen === "settings"
       ? undefined
@@ -3095,7 +3013,6 @@ export default function App() {
     activeTaskIdRef.current = taskId;
     setOperationError("");
     setRuntimeState(cachedRuntime ?? null);
-    setSelectedDelegationId(undefined);
     setCenterView(restoredView);
     const firstCachedFile = cachedGit?.files[0] ?? cached?.git.files[0];
     setActiveFileKey(firstCachedFile ? diffFileKey(firstCachedFile) : "");
@@ -3416,7 +3333,6 @@ export default function App() {
           ...(settingsDefaultRoute.effort ? { effort: settingsDefaultRoute.effort } : {}),
         });
         ++navigationGeneration.current;
-        setSelectedDelegationId(undefined);
         setScreen("workspace");
         appendTask(task);
         window.setTimeout(
@@ -3436,7 +3352,6 @@ export default function App() {
     ++navigationGeneration.current;
     const empty = createEmptySnapshot();
     setRuntimeState(null);
-    setSelectedDelegationId(undefined);
     setCenterView("task");
     setScreen("workspace");
     setActiveFileKey("");
@@ -4046,9 +3961,8 @@ export default function App() {
 
   const changeCenterView = (view: CenterView) => {
     setCenterView(view);
-    // Picking a task view mode always surfaces the task itself; open file
-    // tabs stay open but release the canvas.
-    setActiveFileTabPath("");
+    // The transcript always owns the canvas; Review opens in the work pane.
+    if (view === "review") workPane.openReview();
     if (!activeTask) return;
     setSnapshot((current) => ({
       ...current,
@@ -4726,11 +4640,7 @@ export default function App() {
 
   /** Tabs belong to the active task, or to the project while drafting a new
    * chat, matching how centerView is remembered per task. */
-  const fileTabOwnerKey = snapshot.activeTaskId
-    ? snapshot.activeTaskId
-    : snapshot.activeProjectId
-      ? `project:${snapshot.activeProjectId}`
-      : "";
+  const fileTabOwnerKey = workPaneOwnerKey;
   const fileTabOwnerRef = useRef(fileTabOwnerKey);
   const fileTabRestoreGeneration = useRef(0);
   const activeFileTab = activeFileTabPath
@@ -4743,11 +4653,9 @@ export default function App() {
       if (!project) return;
       setOperationError("");
       const existing = openFileTabs.find((tab) => tab.path === file.path);
-      if (existing) {
-        setActiveFileTabPath(existing.path);
-        setActiveFileLocation(location ? { ...location, path: existing.path } : null);
-        return;
-      }
+      workPane.openFile(file.path, location?.startLine ?? null);
+      setActiveFileLocation(location ? { ...location, path: file.path } : null);
+      if (existing) return;
       setFileTabOpeningPath(file.path);
       try {
         const content = await bridge.readProjectFile(project.id, file.path);
@@ -4755,9 +4663,8 @@ export default function App() {
           ...current.filter((tab) => tab.path !== content.path),
           content,
         ]);
-        setActiveFileTabPath(content.path);
-        setActiveFileLocation(location ? { ...location, path: content.path } : null);
       } catch (error) {
+        failedFileOpens.current.add(file.path);
         setOperationError(
           error instanceof Error ? error.message : "Could not open that project file.",
         );
@@ -4765,17 +4672,24 @@ export default function App() {
         setFileTabOpeningPath("");
       }
     },
-    [activeProject, openFileTabs, setActiveFileLocation, setActiveFileTabPath],
+    [activeProject, openFileTabs, setActiveFileLocation, workPane],
   );
+  // A restored or re-activated file tab whose content is not loaded yet reads
+  // it on demand; a failed read is not retried until the tab is reopened.
+  const failedFileOpens = useRef(new Set<string>());
+  useEffect(() => {
+    const surface = workPane.active;
+    if (surface?.kind !== "file" || fileTabOpeningPath) return;
+    if (openFileTabs.some((tab) => tab.path === surface.path)) return;
+    if (failedFileOpens.current.has(surface.path)) return;
+    void openFileInCanvas({ path: surface.path });
+  }, [workPane.active, openFileTabs, fileTabOpeningPath, openFileInCanvas]);
 
   const closeFileTab = (path: string) => {
-    const closingIndex = openFileTabs.findIndex((tab) => tab.path === path);
-    const next = openFileTabs.filter((tab) => tab.path !== path);
-    setOpenFileTabs(next);
+    setOpenFileTabs((current) => current.filter((tab) => tab.path !== path));
+    failedFileOpens.current.delete(path);
     if (activeFileLocation?.path === path) setActiveFileLocation(null);
-    if (activeFileTabPath === path) {
-      setActiveFileTabPath(next[closingIndex]?.path ?? next[closingIndex - 1]?.path ?? "");
-    }
+    workPane.close(fileSurfaceId(path));
   };
   useEffect(() => {
     activeFileTabPathRef.current = activeFileTabPath;
@@ -4793,11 +4707,9 @@ export default function App() {
     const cached = fileTabsCache.current.get(fileTabOwnerKey);
     if (cached) {
       setOpenFileTabs(cached.tabs);
-      setActiveFileTabPath(cached.active);
       return;
     }
     setOpenFileTabs([]);
-    setActiveFileTabPath("");
     const stored = snapshot.openFilesByTask[fileTabOwnerKey];
     const project = activeProject;
     if (!stored?.paths.length || !project) return;
@@ -4809,7 +4721,6 @@ export default function App() {
       const tabs = contents.filter((content): content is ProjectFileContent => Boolean(content));
       if (!tabs.length) return;
       setOpenFileTabs(tabs);
-      setActiveFileTabPath(tabs.some((tab) => tab.path === stored.active) ? stored.active : "");
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fileTabOwnerKey]);
@@ -4957,7 +4868,11 @@ export default function App() {
     setOpenFileTabs((current) =>
       current.map((tab) => (tab.path === file.path ? { ...tab, path: nextPath } : tab)),
     );
-    setActiveFileTabPath((current) => (current === file.path ? nextPath : current));
+    if (workPane.state.surfaces.some((surface) => surface.id === fileSurfaceId(file.path))) {
+      const wasActive = workPane.active?.id === fileSurfaceId(file.path);
+      workPane.close(fileSurfaceId(file.path));
+      workPane.openFile(nextPath, null, { activate: wasActive });
+    }
     try {
       const files = await bridge.listProjectFiles(activeProject.id);
       projectFilesCache.current.set(activeProject.id, files);
@@ -4977,7 +4892,6 @@ export default function App() {
   const insertIntoComposer = (text: string) => {
     composerInsertSequence.current += 1;
     setComposerInsert({ id: composerInsertSequence.current, text });
-    setActiveFileTabPath("");
     changeCenterView("task");
     setScreen("workspace");
   };
@@ -5008,7 +4922,6 @@ export default function App() {
         },
       },
     });
-    setActiveFileTabPath("");
     changeCenterView("task");
     setScreen("workspace");
   };
@@ -6306,6 +6219,106 @@ export default function App() {
           (preferences.motion === "system" && prefersReducedMotion)
         ? 0.35
         : preferences.motionScale;
+  // Work-pane surfaces. The pane owns tabs; App still owns the data behind them.
+  const [railTabRequest, setRailTabRequest] = useState<{
+    tab: "git" | "agents" | "files" | "usage";
+    id: number;
+  }>();
+  const openWorkPaneLaunch = (kind: WorkPaneLaunchKind) => {
+    if (kind === "review") return workPane.openReview();
+    if (kind === "browser") return;
+    setRightRailOpen(true);
+    setRailTabRequest({ tab: kind === "files" ? "files" : "agents", id: Date.now() });
+  };
+  const renderWorkPaneFile = (surface: { path: string; revealLine: number | null }) => {
+    const tab = openFileTabs.find((candidate) => candidate.path === surface.path);
+    if (!tab) {
+      return (
+        <div className="route-loading" role="status" aria-live="polite">
+          Opening {surface.path.split("/").at(-1)}…
+        </div>
+      );
+    }
+    return (
+      <FileWorkspace
+        key={tab.path}
+        file={tab}
+        target={activeFileLocation?.path === tab.path ? activeFileLocation : undefined}
+        editable={nativeHost}
+        onSave={(content) => saveFileTab(tab.path, content)}
+        onExplainSelection={explainFileSelection}
+        onAddComposerContext={addSelectionAsComposerContext}
+        explainAgentLabel={runtimeLabel(explainRoute.runtime)}
+      />
+    );
+  };
+  const renderWorkPaneReview = () => (
+    <ReviewSurface
+      file={activeFile}
+      viewMode={diffView}
+      onViewModeChange={setDiffView}
+      onRefresh={() => void refreshReview()}
+      refreshing={reviewRefreshing}
+      reviewedKeys={reviewedFiles}
+      taskId={activeTask?.id}
+      onMarkReviewed={(file) => {
+        if (!activeTask) return;
+        setReviewedFiles((current) => ({
+          ...current,
+          [`${activeTask.id}:${diffFileKey(file)}`]: true,
+        }));
+        setOperationStatus(`${file.path} marked reviewed for this session`);
+      }}
+      onAddSelection={(payload) => addSelectionToChat(payload, "diff")}
+      loadError={reviewLoadError}
+      onRetry={() => {
+        setReviewLoadError(null);
+        setReviewRetryVersion((current) => current + 1);
+      }}
+      onBack={() => workPane.close("review")}
+    />
+  );
+  const renderWorkPaneSubagent = (delegationId: string, headerHost: HTMLElement | null) => {
+    const delegation = delegations.find((candidate) => candidate.id === delegationId);
+    if (!delegation?.childTaskId) {
+      return (
+        <div className="route-loading" role="status" aria-live="polite">
+          This subagent is no longer available.
+        </div>
+      );
+    }
+    return (
+      <SubagentConversation
+        key={delegation.id}
+        delegation={delegation}
+        headerTarget={headerHost}
+        projectionCache={subagentProjectionCache}
+        runtimes={snapshot.runtimes}
+        contextFiles={contextFilePaths}
+        onRequestContextFiles={requestProjectFiles}
+        enterToSend={localSettings["composer.enterToSend"] !== false}
+        autoResumeInterrupted={localSettings["general.autoResumeInterruptedTurns"] === true}
+        rightRailOpen={rightRailOpen}
+        terminalOpen={terminalOpen}
+        onClose={() => workPane.close(`subagent:${delegation.id}`)}
+        onSend={async (id: string, message: string, routing: DelegationRouting) => {
+          await bridge.sendDelegationMessage(id, message, routing);
+          await refreshDelegations(activeTaskIdRef.current);
+        }}
+        onStop={async (id) => {
+          await bridge.stopDelegation(id);
+          await refreshDelegations(activeTaskIdRef.current);
+        }}
+      />
+    );
+  };
+  const workPaneAttention = delegations.some(
+    (delegation) =>
+      (delegation.pendingQuestions?.length ?? 0) > 0 &&
+      workPane.state.surfaces.some(
+        (surface) => surface.kind === "subagent" && surface.delegationId === delegation.id,
+      ),
+  );
   const panelTransition = {
     width: { duration: 0.34 * motionScale, ease: [0.33, 1, 0.15, 1] as const },
     opacity: { duration: 0.22 * motionScale, ease: "easeOut" as const },
@@ -6323,6 +6336,34 @@ export default function App() {
     setTerminalSurfaceActivated(true);
     setTerminalOpen((current) => !current);
   };
+  const workspaceToggles = (
+    <>
+      <button
+        className="icon-button subtle"
+        type="button"
+        onClick={toggleTerminal}
+        aria-label="Toggle terminal"
+        aria-pressed={terminalOpen}
+      >
+        <TerminalSquare />
+      </button>
+      <WorkPaneToggle
+        open={workPane.state.open}
+        alive={workPane.state.surfaces.length > 0}
+        attention={workPaneAttention}
+        onClick={() => workPane.toggle()}
+      />
+      <button
+        className="icon-button subtle"
+        type="button"
+        onClick={() => setRightRailOpen((value) => !value)}
+        aria-label={rightRailOpen ? "Close task tools" : "Open task tools"}
+        aria-pressed={rightRailOpen}
+      >
+        {rightRailOpen ? <PanelRightClose /> : <PanelRightOpen />}
+      </button>
+    </>
+  );
   const primarySidebar = (activeDestination: "chats" | "scheduled") => (
     <motion.div
       className="panel-slot panel-slot--left"
@@ -6382,7 +6423,7 @@ export default function App() {
         data-rail-visible={
           (screen === "workspace" && showRightRail) || (screen === "scheduled" && scheduledRailOpen)
         }
-        data-subagent-visible={screen === "workspace" && Boolean(selectedDelegation)}
+        data-subagent-visible={screen === "workspace" && subagentOpen}
         data-file-active={screen === "workspace" && Boolean(activeFileTab)}
         style={
           {
@@ -6407,24 +6448,10 @@ export default function App() {
           onTitleSelect={
             screen === "workspace"
               ? () => {
-                  setActiveFileTabPath("");
                   setActiveFileLocation(null);
                   changeCenterView("task");
                 }
               : undefined
-          }
-          resourceTabs={
-            screen === "workspace" && !selectedDelegation && openFileTabs.length ? (
-              <TitlebarFileTabs
-                tabs={openFileTabs}
-                activePath={activeFileTab?.path ?? ""}
-                onSelect={(path) => {
-                  setActiveFileTabPath(path);
-                  setActiveFileLocation(null);
-                }}
-                onClose={closeFileTab}
-              />
-            ) : undefined
           }
           motionScale={motionScale}
           subagentHeaderRef={setSubagentHeaderTarget}
@@ -6450,7 +6477,7 @@ export default function App() {
             ) : undefined
           }
           tabs={
-            screen === "workspace" && !selectedDelegation && activeTask?.kind !== "chat" ? (
+            screen === "workspace" && !subagentOpen && activeTask?.kind !== "chat" ? (
               <div className="titlebar-view-tabs" role="tablist" aria-label="Task view">
                 <button
                   type="button"
@@ -6504,7 +6531,7 @@ export default function App() {
                   {scheduledRailOpen ? <PanelRightClose /> : <PanelRightOpen />}
                 </button>
               </>
-            ) : screen === "workspace" && !selectedDelegation ? (
+            ) : screen === "workspace" && !subagentOpen ? (
               <>
                 <Tooltip label={usagePillTitle} placement="bottom">
                   <button className="usage-compact" type="button" aria-label={usagePillTitle}>
@@ -6515,28 +6542,7 @@ export default function App() {
                     <span className="sr-only"> tokens</span>
                   </button>
                 </Tooltip>
-                {activeTask?.kind !== "chat" ? (
-                  <>
-                    <button
-                      className="icon-button subtle"
-                      type="button"
-                      onClick={toggleTerminal}
-                      aria-label="Toggle terminal"
-                      aria-pressed={terminalOpen}
-                    >
-                      <TerminalSquare />
-                    </button>
-                    <button
-                      className="icon-button subtle"
-                      type="button"
-                      onClick={() => setRightRailOpen((value) => !value)}
-                      aria-label={rightRailOpen ? "Close task tools" : "Open task tools"}
-                      aria-pressed={rightRailOpen}
-                    >
-                      {rightRailOpen ? <PanelRightClose /> : <PanelRightOpen />}
-                    </button>
-                  </>
-                ) : null}
+                {activeTask?.kind !== "chat" ? workspaceToggles : null}
               </>
             ) : undefined
           }
@@ -6725,7 +6731,7 @@ export default function App() {
                   <div
                     ref={conversationWorkspaceRef}
                     className="conversation-workspace"
-                    data-subagent-open={Boolean(selectedDelegation)}
+                    data-subagent-open={subagentOpen}
                   >
                     <div className="conversation-workspace-row">
                       <section className="workspace-main">
@@ -6764,28 +6770,7 @@ export default function App() {
                               busy={openingProject}
                               onOpenProject={() => setAddProjectOpen(true)}
                             />
-                          ) : activeFileTabPath ? (
-                            activeFileTab ? (
-                              <FileWorkspace
-                                key={activeFileTab.path}
-                                file={activeFileTab}
-                                target={
-                                  activeFileLocation?.path === activeFileTab.path
-                                    ? activeFileLocation
-                                    : undefined
-                                }
-                                editable={nativeHost}
-                                onSave={(content) => saveFileTab(activeFileTab.path, content)}
-                                onExplainSelection={explainFileSelection}
-                                onAddComposerContext={addSelectionAsComposerContext}
-                                explainAgentLabel={runtimeLabel(explainRoute.runtime)}
-                              />
-                            ) : (
-                              <div className="route-loading" role="status" aria-live="polite">
-                                Opening {activeFileTabPath.split("/").at(-1)}…
-                              </div>
-                            )
-                          ) : centerView === "task" ? (
+                          ) : (
                             <>
                               <div className="transcript-scroll" ref={transcriptScrollRef}>
                                 {nativeHost && runtimeState && !activeProjectionUnavailable ? (
@@ -7118,126 +7103,26 @@ export default function App() {
                                 }
                               />
                             </>
-                          ) : reviewRefreshing && !activeFile ? (
-                            <div className="route-loading" role="status" aria-live="polite">
-                              Checking this worktree for changes…
-                            </div>
-                          ) : activeFile && reviewLoadError?.fileKey === diffFileKey(activeFile) ? (
-                            <ReviewLoadErrorState
-                              message={reviewLoadError.message}
-                              onRetry={() => {
-                                setReviewLoadError(null);
-                                setReviewRetryVersion((current) => current + 1);
-                              }}
-                            />
-                          ) : activeFile ? (
-                            <Suspense
-                              fallback={
-                                <div className="route-loading" role="status" aria-live="polite">
-                                  Loading review…
-                                </div>
-                              }
-                            >
-                              <DiffView
-                                file={activeFile}
-                                viewMode={diffView}
-                                onViewModeChange={setDiffView}
-                                onRefresh={() => void refreshReview()}
-                                refreshing={reviewRefreshing}
-                                reviewed={Boolean(
-                                  activeTask &&
-                                  reviewedFiles[`${activeTask.id}:${diffFileKey(activeFile)}`],
-                                )}
-                                onMarkReviewed={() => {
-                                  if (!activeTask) return;
-                                  setReviewedFiles((current) => ({
-                                    ...current,
-                                    [`${activeTask.id}:${diffFileKey(activeFile)}`]: true,
-                                  }));
-                                  setOperationStatus(
-                                    `${activeFile.path} marked reviewed for this session`,
-                                  );
-                                }}
-                                onAddSelection={(payload) => addSelectionToChat(payload, "diff")}
-                              />
-                            </Suspense>
-                          ) : (
-                            <ReviewEmptyState
-                              onBack={() => changeCenterView("task")}
-                              onRefresh={() => void refreshReview()}
-                              refreshing={reviewRefreshing}
-                            />
                           )}
                         </div>
                       </section>
                       <AnimatePresence initial={false}>
-                        {selectedDelegation ? (
-                          <motion.div
-                            ref={subagentPaneRef}
-                            className="subagent-workspace-pane"
-                            style={{ width: `${subagentPaneRatio * 100}%` }}
-                            initial={{ opacity: 0 }}
-                            animate={{ opacity: 1 }}
-                            exit={{ opacity: 0 }}
-                            transition={panelTransition}
-                          >
-                            <ResizeHandle
-                              axis="horizontal"
-                              label="Resize subagent conversation"
-                              onResize={(delta) => {
-                                const width =
-                                  conversationWorkspaceRef.current?.getBoundingClientRect().width;
-                                if (!width) return;
-                                setSubagentPaneRatio((current) =>
-                                  clampDimension(current - delta / width, 0.3, 0.7),
-                                );
-                              }}
-                            />
-                            <Suspense
-                              fallback={
-                                <div className="route-loading" role="status" aria-live="polite">
-                                  Loading subagent conversation…
-                                </div>
-                              }
-                            >
-                              <SubagentConversation
-                                key={selectedDelegation.id}
-                                delegation={selectedDelegation}
-                                headerTarget={subagentHeaderTarget}
-                                projectionCache={subagentProjectionCache}
-                                runtimes={snapshot.runtimes}
-                                contextFiles={contextFilePaths}
-                                onRequestContextFiles={requestProjectFiles}
-                                enterToSend={localSettings["composer.enterToSend"] !== false}
-                                autoResumeInterrupted={
-                                  localSettings["general.autoResumeInterruptedTurns"] === true
-                                }
-                                rightRailOpen={rightRailOpen}
-                                terminalOpen={terminalOpen}
-                                onClose={() => {
-                                  setSelectedDelegationId(undefined);
-                                }}
-                                onToggleRightRail={() => setRightRailOpen((value) => !value)}
-                                onToggleTerminal={toggleTerminal}
-                                onSend={async (
-                                  delegationId: string,
-                                  message: string,
-                                  routing: DelegationRouting,
-                                ) => {
-                                  await bridge.sendDelegationMessage(
-                                    delegationId,
-                                    message,
-                                    routing,
-                                  );
-                                  await refreshDelegations(activeTaskIdRef.current);
-                                }}
-                                onStop={async (delegationId) => {
-                                  await bridge.stopDelegation(delegationId);
-                                  await refreshDelegations(activeTaskIdRef.current);
-                                }}
-                              />
-                            </Suspense>
-                          </motion.div>
+                        {subagentOpen ? (
+                          <WorkPane
+                            key="work-pane"
+                            controller={workPane}
+                            headerTarget={subagentHeaderTarget}
+                            paneRef={subagentPaneRef}
+                            rowRef={conversationWorkspaceRef}
+                            panelTransition={panelTransition}
+                            delegations={delegations}
+                            browserAvailable={false}
+                            trailing={activeTask?.kind !== "chat" ? workspaceToggles : null}
+                            onLaunch={openWorkPaneLaunch}
+                            renderFile={renderWorkPaneFile}
+                            renderReview={renderWorkPaneReview}
+                            renderSubagent={renderWorkPaneSubagent}
+                          />
                         ) : null}
                       </AnimatePresence>
                     </div>
@@ -7282,8 +7167,9 @@ export default function App() {
                         delegations={nativeHost ? delegations : undefined}
                         onRequestDelegations={nativeHost ? requestActiveDelegations : undefined}
                         selectedDelegationId={selectedDelegation?.id}
+                        requestedTab={railTabRequest}
                         onSelectDelegation={(delegationId) => {
-                          setSelectedDelegationId(delegationId);
+                          workPane.openSubagent(delegationId);
                         }}
                         onApproveDelegation={async (delegationId) => {
                           await bridge.approveDelegation(delegationId);
