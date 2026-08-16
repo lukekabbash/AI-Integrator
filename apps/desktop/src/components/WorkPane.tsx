@@ -1,8 +1,9 @@
 import { Bot, FileDiff, Globe, X } from "lucide-react";
-import { m as motion, useReducedMotion } from "motion/react";
+import { m as motion, usePresence, useReducedMotion } from "motion/react";
 import {
   Suspense,
   useCallback,
+  useEffect,
   useLayoutEffect,
   useState,
   type CSSProperties,
@@ -22,6 +23,8 @@ import type { WorkPaneLaunchKind } from "./WorkPaneToggle";
 import "./workPane.css";
 
 const railItemSpring = { type: "spring" as const, stiffness: 560, damping: 34, mass: 0.7 };
+/** Matches the opacity leg of the shared panel transition. */
+const EXIT_MS = 220;
 
 export interface WorkPaneProps {
   controller: WorkPaneController;
@@ -69,6 +72,16 @@ export function WorkPane({
   const [subagentHeaderHost, setSubagentHeaderHost] = useState<HTMLDivElement | null>(null);
   const reduceMotion = Boolean(useReducedMotion());
   const [maxWidth, setMaxWidth] = useState<number | null>(null);
+  // This component returns a fragment (the titlebar portal plus the pane), so
+  // AnimatePresence cannot infer when the exit finished and would leave a
+  // faded-out pane holding its width forever. Own the departure instead: play
+  // the fade, then release the node on a timer we control.
+  const [present, safeToRemove] = usePresence();
+  useEffect(() => {
+    if (present) return;
+    const timeout = window.setTimeout(() => safeToRemove?.(), reduceMotion ? 0 : EXIT_MS);
+    return () => window.clearTimeout(timeout);
+  }, [present, safeToRemove, reduceMotion]);
 
   useLayoutEffect(() => {
     const row = rowRef.current;
@@ -171,8 +184,7 @@ export function WorkPane({
         data-empty={state.surfaces.length === 0 ? "true" : undefined}
         style={style}
         initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        exit={{ opacity: 0 }}
+        animate={{ opacity: present ? 1 : 0 }}
         transition={panelTransition}
       >
         <ResizeHandle

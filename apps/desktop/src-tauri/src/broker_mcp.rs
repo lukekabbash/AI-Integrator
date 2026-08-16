@@ -284,6 +284,103 @@ fn tool_definitions(role: &str, mode: &str, harness_instructions: Option<&str>) 
                         "automationId": { "type": "string" }
                     }), &["automationId"]),
                 }),
+                json!({
+                    "name": "browser_open",
+                    "description": "Open a browser tab the user can see and drive too. Pass a url, or omit it for a blank tab. Returns a tabId to pass to the other browser tools. Prefer reusing an existing tab from browser_list over opening more.",
+                    "annotations": tool_annotations(false, false),
+                    "inputSchema": text_schema(json!({
+                    "url": { "type": "string", "description": "Address to open. A bare host resolves to https, loopback to http." }
+                    }), &[]),
+                }),
+                json!({
+                    "name": "browser_list",
+                    "description": "List this task's browser tabs with their id, url, title and loading state.",
+                    "annotations": tool_annotations(true, false),
+                    "inputSchema": text_schema(json!({}), &[]),
+                }),
+                json!({
+                    "name": "browser_navigate",
+                    "description": "Point one browser tab at a URL.",
+                    "annotations": tool_annotations(false, false),
+                    "inputSchema": text_schema(json!({
+                    "tabId": { "type": "string" },
+                    "url": { "type": "string" }
+                    }), &["tabId", "url"]),
+                }),
+                json!({
+                    "name": "browser_snapshot",
+                    "description": "Read a page before acting on it: url, title, viewport, visible text, and the interactive elements with a stable ref, role, name and selector for each. Use the returned refs with browser_click and browser_type instead of guessing selectors.",
+                    "annotations": tool_annotations(true, false),
+                    "inputSchema": text_schema(json!({
+                    "tabId": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 500 }
+                    }), &["tabId"]),
+                }),
+                json!({
+                    "name": "browser_click",
+                    "description": "Click one element in a browser tab. Target it by ref from browser_snapshot, or by selector, or by text plus optional role.",
+                    "annotations": tool_annotations(false, true),
+                    "inputSchema": text_schema(json!({
+                    "tabId": { "type": "string" },
+                    "ref": { "type": "string" },
+                    "selector": { "type": "string" },
+                    "text": { "type": "string" },
+                    "role": { "type": "string" }
+                    }), &["tabId"]),
+                }),
+                json!({
+                    "name": "browser_type",
+                    "description": "Type text into one field. Target it like browser_click; set clear to replace the current value.",
+                    "annotations": tool_annotations(false, true),
+                    "inputSchema": text_schema(json!({
+                    "tabId": { "type": "string" },
+                    "text": { "type": "string" },
+                    "ref": { "type": "string" },
+                    "selector": { "type": "string" },
+                    "clear": { "type": "boolean" }
+                    }), &["tabId", "text"]),
+                }),
+                json!({
+                    "name": "browser_press",
+                    "description": "Press one key in a browser tab, for example Enter or Escape. Modifiers are any of Control, Shift, Alt, Meta.",
+                    "annotations": tool_annotations(false, true),
+                    "inputSchema": text_schema(json!({
+                    "tabId": { "type": "string" },
+                    "key": { "type": "string" },
+                    "modifiers": { "type": "array", "items": { "type": "string" } }
+                    }), &["tabId", "key"]),
+                }),
+                json!({
+                    "name": "browser_scroll",
+                    "description": "Scroll a browser tab, or a container inside it. Positive deltaY scrolls down.",
+                    "annotations": tool_annotations(false, false),
+                    "inputSchema": text_schema(json!({
+                    "tabId": { "type": "string" },
+                    "deltaX": { "type": "number" },
+                    "deltaY": { "type": "number" },
+                    "selector": { "type": "string" }
+                    }), &["tabId"]),
+                }),
+                json!({
+                    "name": "browser_wait_for",
+                    "description": "Check whether a page condition holds yet: a selector or text being present, or the URL containing a fragment. Returns matched:false rather than blocking, so poll it between other work.",
+                    "annotations": tool_annotations(true, false),
+                    "inputSchema": text_schema(json!({
+                    "tabId": { "type": "string" },
+                    "selector": { "type": "string" },
+                    "text": { "type": "string" },
+                    "urlIncludes": { "type": "string" }
+                    }), &["tabId"]),
+                }),
+                json!({
+                    "name": "browser_evaluate",
+                    "description": "Evaluate one JavaScript expression in a browser tab and return its JSON result, up to 64 KB. The expression may change page state.",
+                    "annotations": tool_annotations(false, true),
+                    "inputSchema": text_schema(json!({
+                    "tabId": { "type": "string" },
+                    "expression": { "type": "string" }
+                    }), &["tabId", "expression"]),
+                }),
             ];
             if mode == "off" {
                 return tools;
@@ -516,6 +613,16 @@ mod tests {
                 "automation_list",
                 "automation_leave_note",
                 "automation_cancel",
+                "browser_open",
+                "browser_list",
+                "browser_navigate",
+                "browser_snapshot",
+                "browser_click",
+                "browser_type",
+                "browser_press",
+                "browser_scroll",
+                "browser_wait_for",
+                "browser_evaluate",
             ]
         );
 
@@ -531,6 +638,16 @@ mod tests {
                 "automation_list",
                 "automation_leave_note",
                 "automation_cancel",
+                "browser_open",
+                "browser_list",
+                "browser_navigate",
+                "browser_snapshot",
+                "browser_click",
+                "browser_type",
+                "browser_press",
+                "browser_scroll",
+                "browser_wait_for",
+                "browser_evaluate",
             ]
         );
         let chat_enabled: Vec<String> = tool_definitions("chat", "memory-on", None)
@@ -546,6 +663,16 @@ mod tests {
                 "automation_list",
                 "automation_leave_note",
                 "automation_cancel",
+                "browser_open",
+                "browser_list",
+                "browser_navigate",
+                "browser_snapshot",
+                "browser_click",
+                "browser_type",
+                "browser_press",
+                "browser_scroll",
+                "browser_wait_for",
+                "browser_evaluate",
             ]
         );
     }

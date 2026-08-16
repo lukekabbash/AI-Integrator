@@ -106,6 +106,22 @@ describe("AI Integrator desktop workspace", () => {
     expect(screen.getByRole("textbox", { name: "Task message" })).toBeInTheDocument();
   });
 
+  it("takes the work pane off screen when it is closed", async () => {
+    // Regression: the pane used to animate out and then stay mounted, holding
+    // its width while every control reported it closed.
+    render(<App />);
+    const tabs = await screen.findByRole("tablist", { name: "Task view" });
+    fireEvent.click(within(tabs).getByRole("tab", { name: "Review" }));
+    await screen.findByRole("tablist", { name: "Open surfaces" });
+    const appRoot = document.querySelector<HTMLElement>(".app-root");
+    expect(appRoot).toHaveAttribute("data-subagent-visible", "true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Close work pane" }));
+    await waitFor(() => expect(document.querySelector(".work-pane")).toBeNull());
+    expect(appRoot).toHaveAttribute("data-subagent-visible", "false");
+    expect(screen.getByRole("button", { name: "Open work pane" })).toBeInTheDocument();
+  });
+
   it("collapses and reopens both sidebars from the header corner buttons", async () => {
     render(<App />);
     const appRoot = document.querySelector<HTMLElement>(".app-root");
@@ -310,6 +326,7 @@ describe("AI Integrator desktop workspace", () => {
       "Subagents",
       "Permissions",
       "Git",
+      "Browser",
       "Explain",
       "Usage and Budgets",
       "Archives",

@@ -31,7 +31,7 @@ serde.workspace = true
 serde_json.workspace = true
 session-store = { path = "../../../crates/session-store" }
 sha2.workspace = true
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["unstable"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
 tokio.workspace = true
@@ -39,6 +39,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 url.workspace = true
 uuid.workspace = true
 which.workspace = true
+xcap = "0.9"
+image = { version = "0.25", default-features = false, features = ["png"] }
 zeroize.workspace = true
 
 [lints]

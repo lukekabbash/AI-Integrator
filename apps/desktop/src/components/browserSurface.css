@@ -1,0 +1,348 @@
+/* Browser surface: chrome around a native webview. The page is not in the
+   DOM — the native tab is positioned over `.browser-viewport` — so nothing
+   may render on top of that rectangle. Chrome carries the gel; the viewport
+   is a plain recess. */
+
+.browser-surface {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-canvas);
+}
+
+.browser-chrome {
+  flex: none;
+  height: 38px;
+  padding: 0 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+.browser-chrome-history,
+.browser-chrome-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+.browser-chrome .icon-button.tiny svg {
+  width: 13px;
+  height: 13px;
+  stroke-width: 1.8;
+}
+
+.browser-address {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+.browser-address input {
+  width: 100%;
+  min-width: 0;
+  height: 26px;
+  padding: 0 26px 0 10px;
+  border: 1px solid color-mix(in srgb, var(--color-border-base) 70%, transparent);
+  border-radius: var(--radius-control);
+  background: var(--color-layer-1);
+  color: var(--color-text-primary);
+  font-size: 11px;
+  font-family: inherit;
+}
+.browser-address input:hover {
+  border-color: var(--color-border-strong);
+}
+.browser-address input:focus {
+  outline: none;
+  border-color: var(--color-border-strong);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-accent) 14%, transparent);
+}
+.browser-address input::placeholder {
+  color: var(--color-text-tertiary);
+}
+.browser-address-external {
+  position: absolute;
+  right: 3px;
+  opacity: 0;
+  transition: opacity var(--duration-fast) var(--ease-standard);
+}
+.browser-address:hover .browser-address-external,
+.browser-address:focus-within .browser-address-external {
+  opacity: 1;
+}
+
+.browser-record[data-recording="true"] {
+  color: var(--color-status-danger);
+}
+.browser-record[data-recording="true"] svg {
+  fill: currentColor;
+  animation: browser-record-pulse 1.6s ease-in-out infinite;
+}
+@keyframes browser-record-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.browser-more {
+  position: relative;
+}
+.browser-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  min-width: 210px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-panel);
+  background: var(--color-surface-elevated, var(--color-layer-2));
+  box-shadow: var(--shadow-elevated);
+}
+.browser-menu button {
+  min-height: 30px;
+  padding: 0 9px;
+  display: flex;
+  align-items: center;
+  border: 0;
+  border-radius: var(--radius-row);
+  background: transparent;
+  color: var(--color-text-secondary);
+  text-align: left;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.browser-menu button:hover {
+  color: var(--color-text-primary);
+  background: color-mix(in srgb, var(--color-layer-2) 72%, transparent);
+}
+
+.browser-message {
+  flex: none;
+  margin: 0;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--color-border-subtle);
+  color: var(--color-text-secondary);
+  font-size: 10.5px;
+}
+
+/* The native tab is painted over this rectangle. */
+.browser-viewport {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  background: color-mix(in srgb, var(--color-layer-1) 60%, var(--color-canvas));
+  /* The native tab is placed over this box, and a native surface always paints
+     above the page — including over the pane's grab strip, which would make the
+     edge undraggable while a page is showing. A margin (not padding) keeps the
+     strip clear, because the reported bounds are this element's border box. */
+  margin-left: 8px;
+}
+.browser-viewport-note {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 20px;
+  text-align: center;
+  color: var(--color-text-secondary);
+}
+.browser-viewport-note strong {
+  color: var(--color-text-primary);
+  font-size: 12px;
+  font-weight: 650;
+}
+.browser-viewport-note small {
+  color: var(--color-text-tertiary);
+  font-size: 10.5px;
+}
+.browser-viewport-note .secondary-button {
+  margin-top: 6px;
+}
+
+.browser-annotating {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  padding: 4px 6px 4px 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: var(--radius-full);
+  background: var(--color-layer-2);
+  color: var(--color-text-primary);
+  font-size: 10.5px;
+  box-shadow: var(--shadow-elevated);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .browser-address-external {
+    transition: none;
+  }
+  .browser-record[data-recording="true"] svg {
+    animation: none;
+  }
+}
+
+/* Start page — what a blank tab offers. Quiet rows in the launcher's idiom,
+   not cards: the port badge carries the identity, the row carries the hit. */
+.browser-start {
+  position: absolute;
+  inset: 0;
+  padding: 18px 16px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow-y: auto;
+}
+.browser-start section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.browser-start-eyebrow {
+  height: 26px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: color-mix(in srgb, var(--color-text-tertiary) 88%, transparent);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+.browser-start-eyebrow svg {
+  width: 12px;
+  height: 12px;
+  stroke-width: 1.8;
+}
+.browser-start-rescan {
+  margin-left: auto;
+}
+.browser-start-rescan svg {
+  width: 12px;
+  height: 12px;
+}
+.browser-start-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.browser-start-list button {
+  width: 100%;
+  min-height: 44px;
+  padding: 6px 10px;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-row);
+  background: transparent;
+  color: var(--color-text-secondary);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  transition:
+    background var(--duration-fast) var(--ease-standard),
+    border-color var(--duration-fast) var(--ease-standard);
+}
+.browser-start-list button:hover {
+  color: var(--color-text-primary);
+  background: color-mix(in srgb, var(--color-accent) 8%, transparent);
+  border-color: color-mix(in srgb, var(--color-accent) 55%, transparent);
+}
+.browser-start-list button:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+.browser-start-list button[data-quiet="true"] {
+  opacity: 0.72;
+}
+.browser-start-list button > span:last-child {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.browser-start-list strong {
+  overflow: hidden;
+  color: var(--color-text-primary);
+  font-size: 12px;
+  font-weight: 570;
+  letter-spacing: -0.01em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.browser-start-list small {
+  overflow: hidden;
+  color: var(--color-text-tertiary);
+  font-size: 9.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.browser-start-mark {
+  width: 32px;
+  height: 26px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-control);
+  background: var(--color-layer-1);
+  color: var(--color-text-tertiary);
+}
+.browser-start-mark[data-web="true"] {
+  border-color: color-mix(in srgb, var(--color-accent) 45%, transparent);
+  background: color-mix(in srgb, var(--color-accent) 12%, var(--color-layer-1));
+  color: var(--color-accent);
+}
+.browser-start-mark svg {
+  width: 14px;
+  height: 14px;
+  stroke-width: 1.7;
+}
+.browser-start-port {
+  font-size: 9.5px;
+  font-weight: 620;
+  font-variant-numeric: tabular-nums;
+}
+.browser-start-quiet {
+  margin: 0;
+  padding: 4px 2px;
+  color: var(--color-text-tertiary);
+  font-size: 10.5px;
+}
+.browser-start-more {
+  align-self: flex-start;
+  margin-top: 4px;
+  padding: 4px 2px;
+  border: 0;
+  background: transparent;
+  color: var(--color-text-tertiary);
+  font: inherit;
+  font-size: 10px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.browser-start-more:hover {
+  color: var(--color-text-secondary);
+}

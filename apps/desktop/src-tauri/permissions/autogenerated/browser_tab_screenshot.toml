@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-browser-tab-screenshot"
+description = "Enables the browser_tab_screenshot command without any pre-configured scope."
+commands.allow = ["browser_tab_screenshot"]
+
+[[permission]]
+identifier = "deny-browser-tab-screenshot"
+description = "Denies the browser_tab_screenshot command without any pre-configured scope."
+commands.deny = ["browser_tab_screenshot"]

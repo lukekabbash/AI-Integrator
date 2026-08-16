@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-browser-sites"
+description = "Enables the browser_sites command without any pre-configured scope."
+commands.allow = ["browser_sites"]
+
+[[permission]]
+identifier = "deny-browser-sites"
+description = "Denies the browser_sites command without any pre-configured scope."
+commands.deny = ["browser_sites"]

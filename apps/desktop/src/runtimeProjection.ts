@@ -493,6 +493,16 @@ const INTEGRATOR_TOOL_COPY: Readonly<Record<string, readonly [string, string]>> 
   schedule_wakeup: ["Scheduling a wake-up", "Wake-up scheduled"],
   schedule_recurring: ["Scheduling a recurring task", "Recurring task scheduled"],
   automation_cancel: ["Cancelling a scheduled task", "Scheduled task cancelled"],
+  browser_open: ["Opening a browser tab", "Opened a browser tab"],
+  browser_list: ["Checking open browser tabs", "Checked open browser tabs"],
+  browser_navigate: ["Opening a page", "Opened a page"],
+  browser_snapshot: ["Reading the page", "Read the page"],
+  browser_click: ["Clicking on the page", "Clicked on the page"],
+  browser_type: ["Typing on the page", "Typed on the page"],
+  browser_press: ["Pressing a key on the page", "Pressed a key on the page"],
+  browser_scroll: ["Scrolling the page", "Scrolled the page"],
+  browser_wait_for: ["Waiting on the page", "Checked the page"],
+  browser_evaluate: ["Running script on the page", "Ran script on the page"],
 };
 
 const PROVIDER_TOOL_COPY: Readonly<Record<string, readonly [string, string]>> = {

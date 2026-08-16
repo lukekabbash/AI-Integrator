@@ -52,6 +52,7 @@ import {
   FolderOpen,
   FolderSearch,
   ScrollText,
+  Globe,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import {
@@ -96,6 +97,7 @@ import { Slider } from "./Slider";
 import { RuntimeSetupTerminal } from "./RuntimeSetupTerminal";
 import { McpActivationDialog, type McpActivationRequest } from "./McpActivationDialog";
 import { PermissionsSettings } from "./PermissionsSettings";
+import { BrowserSettings, BROWSER_SETTINGS } from "./BrowserSettings";
 import { SubagentsSettings } from "./SubagentsSettings";
 import { UsageSettings } from "./UsageSettings";
 import { SettingRow, Switch } from "./SettingControls";
@@ -157,6 +159,7 @@ export type SettingsSection =
   | "composer"
   | "explain"
   | "git"
+  | "browser"
   | "models-runtimes"
   | "permissions"
   | "skills"
@@ -229,6 +232,12 @@ const settingsNav: Array<{ id: SettingsSection; label: string; hint: string; ico
     hint: "Commit messages, trailers, and push safety",
     icon: GitBranch,
   },
+  {
+    id: "browser",
+    label: "Browser",
+    hint: "Agent access, sign-in, and site data",
+    icon: Globe,
+  },
   { id: "explain", label: "Explain", hint: "Ask about a selection", icon: Lightbulb },
   { id: "usage", label: "Usage and Budgets", hint: "Local usage evidence", icon: CircleDollarSign },
   { id: "archive", label: "Archives", hint: "Browse, restore, and clean up", icon: Archive },
@@ -241,6 +250,9 @@ const settingsNav: Array<{ id: SettingsSection; label: string; hint: string; ico
  * not belong in this map or in the UI.
  */
 const DEFAULT_SETTINGS: SettingsMap = {
+  [BROWSER_SETTINGS.agentAccess]: true,
+  [BROWSER_SETTINGS.keepSignedIn]: true,
+  [BROWSER_SETTINGS.blockNewWindows]: true,
   "general.openLastWorkspace": true,
   "general.autoResumeInterruptedTurns": false,
   "general.confirmExternalActions": true,
@@ -5314,6 +5326,9 @@ export function SettingsView(props: SettingsViewProps) {
               runtimes={props.runtimes}
               projectName={props.projects?.find((project) => !project.archived)?.name}
             />
+          ) : null}
+          {section === "browser" ? (
+            <BrowserSettings settings={settings} setSetting={setSetting} />
           ) : null}
           {section === "git" ? (
             <GitSettings settings={settings} setSetting={setSetting} runtimes={props.runtimes} />

@@ -13,7 +13,9 @@ import {
   Square,
   Users,
   X,
+  MousePointerClick,
 } from "lucide-react";
+import { isAnnotationAttachment } from "../browserAnnotation";
 import { FileIcon } from "./FileIcon";
 import {
   bridge,
@@ -1608,9 +1610,12 @@ export function Composer({
               <div
                 className={`composer-attachment${
                   attachment.dataUrl ? " composer-attachment--image" : ""
-                }`}
+                }${isAnnotationAttachment(attachment.name) ? " composer-attachment--annotation" : ""}`}
                 key={attachmentIdentity(attachment)}
               >
+                {isAnnotationAttachment(attachment.name) ? (
+                  <MousePointerClick className="file-type-icon" aria-hidden="true" />
+                ) : null}
                 {attachment.dataUrl ? (
                   <img src={attachment.dataUrl} alt={attachment.name} />
                 ) : attachment.entry === "folder" ? (

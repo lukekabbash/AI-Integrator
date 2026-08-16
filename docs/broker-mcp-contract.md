@@ -30,6 +30,17 @@ The local desktop/broker remains authoritative for task identity, policy interse
 | `child_transcript_read` | No | Read an authorized, redacted observable transcript range on demand |
 | `child_stop` | Yes | Stop the selected child; descendants require explicit separate scope |
 | `child_result` | No | Read the structured result/evidence envelope |
+| `browser_open` | Yes | Open a browser tab owned by the calling task |
+| `browser_list` | No | List the calling task's browser tabs |
+| `browser_navigate` | Yes | Point one of those tabs at a URL |
+| `browser_snapshot` | No | Read a page: url, title, viewport, text, and interactive elements with stable refs |
+| `browser_click` / `browser_type` / `browser_press` / `browser_scroll` | Yes | Synthesise one interaction in a tab |
+| `browser_wait_for` | No | Test one page condition without blocking |
+| `browser_evaluate` | Yes | Evaluate one expression in a tab, bounded to 64 KB of result |
+
+Browser tools are scoped to the calling task: a tab records the task that
+opened it, and a call naming another task's tab is refused. Delegated children
+have no browser tools; a child that needs a page asks its orchestrator.
 
 `child_close`, archive, cleanup, merge, commit, push, deployment, and external actions are not MCP MVP tools. They remain user/broker/Git UI operations with their own authority and preview.
 

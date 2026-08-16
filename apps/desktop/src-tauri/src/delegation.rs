@@ -624,14 +624,34 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "schedule_recurring",
             "automation_list",
             "automation_leave_note",
-            "automation_cancel"
+            "automation_cancel",
+            "browser_open",
+            "browser_list",
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "browser_type",
+            "browser_press",
+            "browser_scroll",
+            "browser_wait_for",
+            "browser_evaluate",
         ]),
         "chat" => json!([
             "schedule_wakeup",
             "schedule_recurring",
             "automation_list",
             "automation_leave_note",
-            "automation_cancel"
+            "automation_cancel",
+            "browser_open",
+            "browser_list",
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "browser_type",
+            "browser_press",
+            "browser_scroll",
+            "browser_wait_for",
+            "browser_evaluate",
         ]),
         "child" => json!([
             "skill_data_request",
@@ -645,7 +665,17 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "schedule_recurring",
             "automation_list",
             "automation_leave_note",
-            "automation_cancel"
+            "automation_cancel",
+            "browser_open",
+            "browser_list",
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "browser_type",
+            "browser_press",
+            "browser_scroll",
+            "browser_wait_for",
+            "browser_evaluate",
         ]),
         _ => json!([
             "skill_data_request",
@@ -661,6 +691,16 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "delegation_thread",
             "delegation_result",
             "delegation_stop",
+            "browser_open",
+            "browser_list",
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "browser_type",
+            "browser_press",
+            "browser_scroll",
+            "browser_wait_for",
+            "browser_evaluate",
         ]),
     };
     Ok(json!({
@@ -993,6 +1033,19 @@ async fn dispatch_tool(
             let automation = state.store.cancel_automation(id)?;
             state.automation_notify.notify_one();
             Ok(json!({ "automation": automation }))
+        }
+        (_, method) if method.starts_with("browser_") => {
+            let task_id = match session.role.as_str() {
+                "child" => {
+                    return Err(IntegratorError::Unauthorized(
+                        "browser tools are not available to delegated children".into(),
+                    ));
+                }
+                _ => session.scope.parse::<TaskId>().map_err(|_| {
+                    IntegratorError::Unauthorized("invalid task scope for browser tools".into())
+                })?,
+            };
+            browser_tool(app, task_id, method, params).await
         }
         ("orchestrator", "peers_list") => {
             let task_id = orchestrator_scope(session)?;
@@ -1352,6 +1405,103 @@ fn scoped_delegation(
         ));
     }
     Ok(delegation)
+}
+
+/// Routes a `browser_*` tool to the task's own browser tabs. Tabs are scoped
+/// to the task, so an agent can never reach another task's pages, and every
+/// action goes through the same guest runtime the user's toolbar uses.
+async fn browser_tool(
+    app: &AppHandle<tauri::Wry>,
+    task_id: TaskId,
+    method: &str,
+    params: &Value,
+) -> Result<Value> {
+    use crate::browser::{BrowserTabs, agent_invoke, tabs_for_task};
+
+    let tabs = app.state::<std::sync::Arc<BrowserTabs>>();
+    let task = task_id.to_string();
+    let text = |key: &str| -> Option<String> {
+        params
+            .get(key)
+            .and_then(Value::as_str)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let tab_id = || -> Result<String> {
+        text("tabId").ok_or_else(|| IntegratorError::InvalidInput("tabId is required".into()))
+    };
+    // Targets accept a ref from a snapshot, a selector, or text plus a role.
+    let target = || {
+        json!({
+            "ref": params.get("ref"),
+            "selector": params.get("selector"),
+            "text": params.get("text"),
+            "role": params.get("role"),
+        })
+    };
+    let call = async |method: &str, args: Vec<Value>| -> Result<Value> {
+        let id = tab_id()?;
+        agent_invoke(app, &tabs, &task, &id, method, args)
+            .await
+            .map_err(|error| IntegratorError::Unavailable(error.message))
+    };
+
+    match method {
+        "browser_open" => {
+            let url = text("url");
+            let tab = crate::browser::open_for_agent(app, &tabs, &task, url).await?;
+            Ok(json!({ "tab": tab }))
+        }
+        "browser_list" => Ok(json!({ "tabs": tabs_for_task(&tabs, &task) })),
+        "browser_navigate" => {
+            let id = tab_id()?;
+            let url = text("url")
+                .ok_or_else(|| IntegratorError::InvalidInput("url is required".into()))?;
+            let tab = crate::browser::navigate_for_agent(app, &tabs, &task, &id, &url).await?;
+            Ok(json!({ "tab": tab }))
+        }
+        "browser_snapshot" => {
+            let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(200);
+            call("snapshot", vec![json!({ "limit": limit })]).await
+        }
+        "browser_click" => call("click", vec![target(), json!({})]).await,
+        "browser_type" => {
+            let value = text("text")
+                .ok_or_else(|| IntegratorError::InvalidInput("text is required".into()))?;
+            let clear = params
+                .get("clear")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            call(
+                "type",
+                vec![target(), Value::String(value), json!({ "clear": clear })],
+            )
+            .await
+        }
+        "browser_press" => {
+            let key = text("key")
+                .ok_or_else(|| IntegratorError::InvalidInput("key is required".into()))?;
+            let modifiers = params
+                .get("modifiers")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+            call("press", vec![Value::String(key), modifiers]).await
+        }
+        "browser_scroll" => {
+            let delta_x = params.get("deltaX").and_then(Value::as_f64).unwrap_or(0.0);
+            let delta_y = params.get("deltaY").and_then(Value::as_f64).unwrap_or(0.0);
+            call("scroll", vec![target(), json!(delta_x), json!(delta_y)]).await
+        }
+        "browser_wait_for" => call("waitFor", vec![params.clone()]).await,
+        "browser_evaluate" => {
+            let expression = text("expression")
+                .ok_or_else(|| IntegratorError::InvalidInput("expression is required".into()))?;
+            call("evaluate", vec![Value::String(expression)]).await
+        }
+        other => Err(IntegratorError::InvalidInput(format!(
+            "unknown browser tool '{other}'"
+        ))),
+    }
 }
 
 fn peers_list(app: &AppHandle<tauri::Wry>, task_id: TaskId, mode: &str) -> Result<Value> {
@@ -3905,6 +4055,16 @@ mod tests {
                 "delegation_thread",
                 "delegation_result",
                 "delegation_stop",
+                "browser_open",
+                "browser_list",
+                "browser_navigate",
+                "browser_snapshot",
+                "browser_click",
+                "browser_type",
+                "browser_press",
+                "browser_scroll",
+                "browser_wait_for",
+                "browser_evaluate",
             ])
         );
         assert_eq!(
@@ -3954,7 +4114,17 @@ mod tests {
                 "schedule_recurring",
                 "automation_list",
                 "automation_leave_note",
-                "automation_cancel"
+                "automation_cancel",
+                "browser_open",
+                "browser_list",
+                "browser_navigate",
+                "browser_snapshot",
+                "browser_click",
+                "browser_type",
+                "browser_press",
+                "browser_scroll",
+                "browser_wait_for",
+                "browser_evaluate",
             ])
         );
     }
@@ -3970,7 +4140,17 @@ mod tests {
                 "schedule_recurring",
                 "automation_list",
                 "automation_leave_note",
-                "automation_cancel"
+                "automation_cancel",
+                "browser_open",
+                "browser_list",
+                "browser_navigate",
+                "browser_snapshot",
+                "browser_click",
+                "browser_type",
+                "browser_press",
+                "browser_scroll",
+                "browser_wait_for",
+                "browser_evaluate",
             ])
         );
 
@@ -3984,7 +4164,17 @@ mod tests {
                 "schedule_recurring",
                 "automation_list",
                 "automation_leave_note",
-                "automation_cancel"
+                "automation_cancel",
+                "browser_open",
+                "browser_list",
+                "browser_navigate",
+                "browser_snapshot",
+                "browser_click",
+                "browser_type",
+                "browser_press",
+                "browser_scroll",
+                "browser_wait_for",
+                "browser_evaluate",
             ])
         );
     }

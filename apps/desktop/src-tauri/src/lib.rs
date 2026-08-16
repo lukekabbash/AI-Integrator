@@ -5,6 +5,7 @@ mod antigravity_hooks;
 mod app_commands;
 mod automations;
 mod broker_mcp;
+mod browser;
 mod chat_title;
 mod code_explain;
 mod command_api;
@@ -46,6 +47,11 @@ use automations::{
     automation_cancel, automation_create, automation_finish_run, automation_list,
     automation_pending_dispatches, automation_run_list, automation_run_now, automation_set_paused,
     automation_timeline, automation_update,
+};
+use browser::{
+    BrowserTabs, browser_clear_data, browser_local_servers, browser_sites, browser_tab_close,
+    browser_tab_history, browser_tab_invoke, browser_tab_list, browser_tab_navigate,
+    browser_tab_open, browser_tab_screenshot, browser_tab_set_bounds, browser_tab_set_popped_out,
 };
 use chat_title::task_generate_title;
 use code_explain::{selection_explain, selection_explain_preview};
@@ -147,6 +153,7 @@ pub fn run() {
                 }
             }
             app.manage(state);
+            app.manage(std::sync::Arc::new(BrowserTabs::new()));
             if let Err(error) = integrator_skills::ensure_roots(app.handle()) {
                 eprintln!("skills root creation failed: {error}");
             }
@@ -211,6 +218,18 @@ pub fn run() {
             storage_totals,
             usage_summary,
             usage_history,
+            browser_local_servers,
+            browser_sites,
+            browser_clear_data,
+            browser_tab_open,
+            browser_tab_list,
+            browser_tab_close,
+            browser_tab_set_bounds,
+            browser_tab_navigate,
+            browser_tab_history,
+            browser_tab_invoke,
+            browser_tab_screenshot,
+            browser_tab_set_popped_out,
             voice_typing_credential_status,
             voice_typing_credential_set,
             voice_typing_credential_clear,

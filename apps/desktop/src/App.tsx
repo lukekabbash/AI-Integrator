@@ -117,7 +117,12 @@ import { resolveExplainConfig, resolveExplainRoute } from "./explainSettings";
 import { resolveCommitMessageRoute } from "./commitMessageSettings";
 import { decorateCommitMessage, readGitDecorationSettings, readPushForce } from "./gitDecoration";
 import { WorkPaneToggle, type WorkPaneLaunchKind } from "./components/WorkPaneToggle";
+// Eager on purpose: AnimatePresence must see a real motion component as its
+// direct child. A lazy element there never finishes its exit, which left a
+// closed work pane painted on screen while every other control read "closed".
+import { WorkPane } from "./components/WorkPane";
 import { useWorkPane, useWorkPaneHeaderAlignment, fileSurfaceId } from "./useWorkPane";
+import { useBrowserTabs } from "./useBrowserTabs";
 import { resolveRequestedFile, type ProjectFileLocation } from "./components/fileViewSupport";
 import { TaskStatusPill } from "./components/TaskStatusPill";
 import { SubagentProjectionCache } from "./components/subagentProjectionCache";
@@ -164,8 +169,8 @@ const SubagentConversation = lazy(() =>
   })),
 );
 
-const WorkPane = lazy(() =>
-  import("./components/WorkPane").then((module) => ({ default: module.WorkPane })),
+const BrowserSurface = lazy(() =>
+  import("./components/BrowserSurface").then((module) => ({ default: module.BrowserSurface })),
 );
 const ReviewSurface = lazy(() =>
   import("./components/ReviewSurface").then((module) => ({ default: module.ReviewSurface })),
@@ -1511,6 +1516,19 @@ export default function App() {
   const workPane = useWorkPane(workPaneOwnerKey);
   const selectedDelegationId =
     workPane.active?.kind === "subagent" ? workPane.active.delegationId : undefined;
+  // Browser tabs are native surfaces the pane hosts; captures land in the composer.
+  const browser = useBrowserTabs({
+    attachImage: async (file, name) => {
+      const attachment = await bridge.savePastedImageAttachment?.(file, name, undefined);
+      if (!attachment) return;
+      composerAttachmentSequence.current += 1;
+      setComposerAttachment({ id: composerAttachmentSequence.current, attachment });
+    },
+    insertText: (text) => {
+      composerInsertSequence.current += 1;
+      setComposerInsert({ id: composerInsertSequence.current, text });
+    },
+  });
   // Provider-reported subscription quota keyed by runtime (Codex today).
   // Refreshed per active-task switch; never inferred when a provider is silent.
   const [providerQuota, setProviderQuota] = useState<Record<string, SubscriptionQuota>>({});
@@ -6226,7 +6244,13 @@ export default function App() {
   }>();
   const openWorkPaneLaunch = (kind: WorkPaneLaunchKind) => {
     if (kind === "review") return workPane.openReview();
-    if (kind === "browser") return;
+    if (kind === "browser") {
+      const owner = snapshot.activeTaskId ?? workPaneOwnerKey;
+      void browser.open(owner).then((tab) => {
+        if (tab) workPane.openBrowser(tab.id);
+      });
+      return;
+    }
     setRightRailOpen(true);
     setRailTabRequest({ tab: kind === "files" ? "files" : "agents", id: Date.now() });
   };
@@ -6278,6 +6302,36 @@ export default function App() {
       onBack={() => workPane.close("review")}
     />
   );
+  const renderWorkPaneBrowser = (tabId: string) => {
+    const tab = browser.byId[tabId];
+    if (!tab) {
+      return (
+        <div className="route-loading" role="status" aria-live="polite">
+          Opening a browser tab…
+        </div>
+      );
+    }
+    return (
+      <BrowserSurface
+        tab={tab}
+        message={browser.message}
+        recording={browser.recordingTabId === tabId}
+        annotating={browser.annotatingTabId === tabId}
+        onBoundsChange={(rect) => browser.setBounds(tabId, rect)}
+        onNavigate={(url) => browser.navigate(tabId, url)}
+        onHistory={(action) => browser.history(tabId, action)}
+        onScreenshot={() => browser.screenshot(tabId)}
+        onRecordToggle={() => browser.toggleRecording(tabId)}
+        onAnnotate={() => browser.toggleAnnotate(tabId)}
+        onPopOut={(popped) => browser.setPoppedOut(tabId, popped)}
+        onOpenExternally={() => browser.openExternally(tabId)}
+        onClose={() => {
+          workPane.close(`browser:${tabId}`);
+          void browser.close(tabId);
+        }}
+      />
+    );
+  };
   const renderWorkPaneSubagent = (delegationId: string, headerHost: HTMLElement | null) => {
     const delegation = delegations.find((candidate) => candidate.id === delegationId);
     if (!delegation?.childTaskId) {
@@ -7116,7 +7170,14 @@ export default function App() {
                             rowRef={conversationWorkspaceRef}
                             panelTransition={panelTransition}
                             delegations={delegations}
-                            browserAvailable={false}
+                            browserAvailable={browser.available}
+                            browserTitles={Object.fromEntries(
+                              browser.tabs.map((tab) => [
+                                tab.id,
+                                tab.title || tab.url.replace(/^https?:\/\//, ""),
+                              ]),
+                            )}
+                            renderBrowser={renderWorkPaneBrowser}
                             trailing={activeTask?.kind !== "chat" ? workspaceToggles : null}
                             onLaunch={openWorkPaneLaunch}
                             renderFile={renderWorkPaneFile}

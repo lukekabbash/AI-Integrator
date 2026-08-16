@@ -1253,6 +1253,56 @@ export interface ExplainStreamEvent {
   runtime: RuntimeId;
 }
 
+/** One native browser tab. Mirrors `BrowserTab` in the Rust browser module. */
+export interface BrowserTab {
+  id: string;
+  taskId: string;
+  url: string;
+  title: string;
+  loading: boolean;
+  /** Live in its own window; it keeps running and stays agent-addressable. */
+  popped_out: boolean;
+  hidden: boolean;
+  lastError: string | null;
+}
+
+/** A listening local port a tab can open. */
+export interface LocalServer {
+  port: number;
+  url: string;
+  process: string;
+  /** True when an HTTP probe answered with a renderable page. */
+  servesWeb: boolean;
+  title: string | null;
+}
+
+/** A site the browser profile holds state for. Never a password. */
+export interface BrowserSite {
+  origin: string;
+  cookies: number;
+  persistent: boolean;
+}
+
+export interface BrowserBridge {
+  localServers(refresh?: boolean): Promise<LocalServer[]>;
+  sites(): Promise<BrowserSite[]>;
+  clearData(): Promise<void>;
+  open(taskId: string, url?: string): Promise<BrowserTab>;
+  list(taskId?: string): Promise<BrowserTab[]>;
+  close(tabId: string): Promise<void>;
+  /** Physical-pixel rectangle for the tab, or null to hide it. */
+  setBounds(
+    tabId: string,
+    bounds: { x: number; y: number; width: number; height: number } | null,
+  ): Promise<void>;
+  navigate(tabId: string, url: string): Promise<BrowserTab>;
+  history(tabId: string, action: "back" | "forward" | "reload" | "stop"): Promise<void>;
+  invoke(tabId: string, method: string, args?: unknown[]): Promise<unknown>;
+  screenshot(tabId: string): Promise<string>;
+  setPoppedOut(tabId: string, poppedOut: boolean): Promise<BrowserTab>;
+  subscribe(listener: (tabs: BrowserTab[]) => void): Promise<() => void>;
+}
+
 export interface AppBridge {
   getAppInfo(): Promise<LocalAppInfo>;
   getStorageTotals(): Promise<StorageTotals>;
@@ -1264,6 +1314,8 @@ export interface AppBridge {
   getUsageSummary(): Promise<UsageSummary>;
   /** Hourly usage slices scanned from the installed CLIs' local transcripts. */
   getUsageHistory(sinceMs: number, untilMs: number): Promise<UsageHistoryReport>;
+  /** Browser tabs: native webviews shared by the user and the agent. */
+  browser?: BrowserBridge;
   listSettings(): Promise<LocalSetting[]>;
   setSetting(key: string, value: unknown): Promise<LocalSetting>;
   getVoiceTypingCredentialStatus?(): Promise<VoiceTypingCredentialStatus>;
@@ -4202,6 +4254,33 @@ function browserMessageSearchSnippet(events: TranscriptEvent[], query: string): 
   return undefined;
 }
 
+/** Native browser tabs; absent in the browser preview, where the UI degrades. */
+function nativeBrowserBridge(): BrowserBridge | undefined {
+  if (!isTauri()) return undefined;
+  return {
+    localServers: (refresh) => nativeInvoke<LocalServer[]>("browser_local_servers", { refresh }),
+    sites: () => nativeInvoke<BrowserSite[]>("browser_sites"),
+    clearData: () => nativeInvoke<void>("browser_clear_data"),
+    open: (taskId, url) => nativeInvoke<BrowserTab>("browser_tab_open", { taskId, url }),
+    list: (taskId) => nativeInvoke<BrowserTab[]>("browser_tab_list", { taskId }),
+    close: (tabId) => nativeInvoke<void>("browser_tab_close", { tabId }),
+    setBounds: (tabId, bounds) => nativeInvoke<void>("browser_tab_set_bounds", { tabId, bounds }),
+    navigate: (tabId, url) => nativeInvoke<BrowserTab>("browser_tab_navigate", { tabId, url }),
+    history: (tabId, action) => nativeInvoke<void>("browser_tab_history", { tabId, action }),
+    invoke: (tabId, method, args) =>
+      nativeInvoke<unknown>("browser_tab_invoke", { tabId, method, args }),
+    screenshot: (tabId) => nativeInvoke<string>("browser_tab_screenshot", { tabId }),
+    setPoppedOut: (tabId, poppedOut) =>
+      nativeInvoke<BrowserTab>("browser_tab_set_popped_out", { tabId, poppedOut }),
+    subscribe: async (listener) => {
+      const { listen } = await import("@tauri-apps/api/event");
+      return listen<{ tabs: BrowserTab[] }>("browser://changed", (event) =>
+        listener(event.payload.tabs),
+      );
+    },
+  };
+}
+
 export const bridge: AppBridge = {
   getAppInfo: async () => {
     if (isTauri()) {
@@ -4280,6 +4359,8 @@ export const bridge: AppBridge = {
     if (isTauri()) return nativeInvoke<UsageSummary>("usage_summary");
     return createDemoUsageSummary(readDemoSnapshot());
   },
+
+  browser: nativeBrowserBridge(),
 
   getUsageHistory: async (sinceMs, untilMs) => {
     if (isTauri()) return nativeInvoke<UsageHistoryReport>("usage_history", { sinceMs, untilMs });

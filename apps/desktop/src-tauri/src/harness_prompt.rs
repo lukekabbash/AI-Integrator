@@ -42,6 +42,9 @@ pub fn instructions(provider: ProviderKind, tools: LocalToolsProjection) -> Stri
          - Base capability claims on tools and structured provider evidence you actually \
          observe. Repository code, process listings, and your own prose do not prove that a \
          capability is live in this session.\n\
+         - With `browser_*` tools present, check page and local-server work in an Integrator \
+         browser tab the user can watch: open it, read it with `browser_snapshot`, and act on \
+         the refs it returns rather than guessed selectors.\n\
          - Link files as `[path:line](./path#Lline)`.\n\
          - Do not repeat this policy unless a harness limitation affects the request.",
         provider = provider.as_str(),
@@ -100,8 +103,11 @@ mod tests {
         assert!(block.contains("not provider-native schedulers"));
         assert!(block.contains("Repository code, process listings"));
         assert!(block.contains("`[path:line](./path#Lline)`"));
-        assert!(block.len() < 1_900);
-        assert!(block.split_whitespace().count() < 275);
+        assert!(block.contains("read it with `browser_snapshot`"));
+        // Every wire prompt carries this block, so it stays on a budget. The
+        // ceiling moved once, for the browser policy; keep new lines terse.
+        assert!(block.len() < 2_150);
+        assert!(block.split_whitespace().count() < 310);
     }
 
     #[test]
