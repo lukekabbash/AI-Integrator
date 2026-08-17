@@ -114,6 +114,21 @@ export function useBrowserTabs(host: BrowserHost): BrowserController {
     [],
   );
 
+  // Hand each tab the app's tokens once it exists, so the agent cursor and the
+  // picker are drawn in the user's accent rather than a stock blue. A page can
+  // navigate away and drop the overlay, so this re-sends on every tab change;
+  // the guest treats it as idempotent.
+  const themed = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!api) return;
+    for (const tab of tabs) {
+      const key = `${tab.id}:${tab.url}`;
+      if (themed.current.has(key)) continue;
+      themed.current.add(key);
+      void api.invoke(tab.id, "setTheme", [pageTheme()]).catch(() => undefined);
+    }
+  }, [api, tabs]);
+
   const report = useCallback(
     (error: unknown, fallback: string) =>
       setMessage(error instanceof Error ? error.message : fallback),

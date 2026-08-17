@@ -1263,7 +1263,6 @@ export interface BrowserTab {
   /** Live in its own window; it keeps running and stays agent-addressable. */
   popped_out: boolean;
   hidden: boolean;
-  lastError: string | null;
 }
 
 /** A listening local port a tab can open. */

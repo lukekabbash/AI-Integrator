@@ -1542,6 +1542,18 @@ export default function App() {
       setComposerInsert({ id: composerInsertSequence.current, text });
     },
   });
+  // A tab an agent opened gets a pane tab of its own, so its browsing is
+  // something the user watches rather than something happening off screen.
+  // It does not steal the foreground: whatever surface is active stays active.
+  const surfacedBrowserTabs = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    for (const tab of browser.tabs) {
+      if (tab.taskId !== snapshot.activeTaskId) continue;
+      if (surfacedBrowserTabs.current.has(tab.id)) continue;
+      surfacedBrowserTabs.current.add(tab.id);
+      workPane.openBrowser(tab.id, { activate: false, show: true });
+    }
+  }, [browser.tabs, snapshot.activeTaskId, workPane]);
   // Provider-reported subscription quota keyed by runtime (Codex today).
   // Refreshed per active-task switch; never inferred when a provider is silent.
   const [providerQuota, setProviderQuota] = useState<Record<string, SubscriptionQuota>>({});

@@ -89,7 +89,6 @@ pub struct BrowserTab {
     pub popped_out: bool,
     /// True while the tab has no visible host (pane closed); it keeps running.
     pub hidden: bool,
-    pub last_error: Option<String>,
 }
 
 struct Tab {
@@ -302,9 +301,6 @@ async fn create_tab(
                 .update(&load_id, |tab| {
                     tab.loading = loading;
                     tab.url = url.clone();
-                    if !loading {
-                        tab.last_error = None;
-                    }
                 })
                 .is_some()
             {
@@ -344,7 +340,6 @@ async fn create_tab(
         loading: !is_blank(&target),
         popped_out: false,
         hidden: false,
-        last_error: None,
     };
     {
         let mut tabs = state.tabs.lock().unwrap_or_else(|error| error.into_inner());
@@ -477,7 +472,6 @@ pub async fn browser_tab_navigate(
         .update(&tab_id, |tab| {
             tab.url = target.to_string();
             tab.loading = !is_blank(&target);
-            tab.last_error = None;
         })
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
     emit_changed(&app, &state);
@@ -520,6 +514,7 @@ pub async fn browser_tab_invoke(
 ) -> CommandResult<Value> {
     const ALLOWED: &[&str] = &[
         "snapshot",
+        "setTheme",
         "click",
         "type",
         "press",
@@ -871,6 +866,16 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_tab_is_never_loading() {
+        // about:blank reports no page load, so calling it "loading" leaves the
+        // reload control spinning over a tab that is only waiting for an address.
+        assert!(is_blank(&Url::parse("about:blank").unwrap()));
+        assert!(is_blank(&Url::parse("about:srcdoc").unwrap()));
+        assert!(!is_blank(&Url::parse("https://example.com").unwrap()));
+        assert!(!is_blank(&Url::parse("http://localhost:5173/").unwrap()));
+    }
+
+    #[test]
     fn rejects_non_web_schemes_and_junk() {
         assert!(normalize_url("file:///etc/passwd").is_err());
         assert!(normalize_url("javascript:alert(1)").is_err());
@@ -899,7 +904,6 @@ mod tests {
                             loading: false,
                             popped_out: false,
                             hidden: false,
-                            last_error: None,
                         },
                         label: format!("browser-{id}"),
                     },
@@ -920,6 +924,7 @@ mod tests {
         // The dispatcher allowlist and the runtime must not drift apart.
         for method in [
             "snapshot",
+            "setTheme",
             "click",
             "type",
             "press",
@@ -940,6 +945,20 @@ mod tests {
         }
         // It must define exactly one global and never leak a second one.
         assert!(GUEST_RUNTIME.contains("window.__integrator = api;"));
+    }
+
+    #[test]
+    fn every_agent_action_shows_the_cursor_that_performed_it() {
+        // A page driven from the outside moves by itself; the cursor is what
+        // makes that legible, so no action may quietly skip it.
+        for action in ["click", "typing", "scroll"] {
+            assert!(
+                GUEST_RUNTIME.contains(action),
+                "guest runtime never shows the cursor for {action}"
+            );
+        }
+        // One definition plus a call from click, type, press and scroll.
+        assert_eq!(GUEST_RUNTIME.matches("agentCursor(").count(), 5);
     }
 
     #[test]

@@ -284,7 +284,35 @@
                            color:var(--accent-ink,#fff);font-weight:600}
       .note button.primary:hover{filter:brightness(1.06)}
       .note small{display:block;margin-top:8px;color:var(--muted,#96a0ab);font-size:10px}
-    </style><svg><g id="strokes"></g></svg><div id="marks"></div>`;
+      /* The agent's own cursor. A page driven from the outside otherwise moves
+         by itself with nothing to watch; this shows where the work is landing,
+         the way a person's pointer would. It never takes pointer events and it
+         is not part of #marks, so clearing annotations leaves it alone. */
+      #agent{position:fixed;left:0;top:0;pointer-events:none;opacity:0;
+             transition:opacity .18s ease}
+      #agent[data-live="true"]{opacity:1}
+      #agent .point{position:absolute;left:0;top:0;width:22px;height:22px;
+                    transform:translate(-2px,-2px);
+                    transition:translate .26s cubic-bezier(.22,1,.28,1)}
+      #agent .point svg{display:block;width:22px;height:22px;
+                        filter:drop-shadow(0 2px 5px rgba(0,0,0,.35))}
+      #agent .ring{position:absolute;left:0;top:0;width:16px;height:16px;margin:-8px 0 0 -8px;
+                   border:2px solid var(--accent,#4c8dff);border-radius:99px;opacity:0;
+                   animation:integrator-tap .5s cubic-bezier(.22,1,.28,1) forwards}
+      #agent .label{position:absolute;left:18px;top:16px;padding:2px 7px;border-radius:99px;
+                    background:var(--accent,#4c8dff);color:var(--accent-ink,#fff);
+                    font:10px/1.5 var(--font,ui-sans-serif,system-ui,sans-serif);
+                    font-weight:650;white-space:nowrap;
+                    box-shadow:0 2px 8px rgba(0,0,0,.28)}
+      @keyframes integrator-tap{
+        0%{opacity:.9;transform:scale(.4)}
+        100%{opacity:0;transform:scale(2.6)}
+      }
+      @media (prefers-reduced-motion: reduce){
+        #agent .point{transition:none}
+        #agent .ring{animation-duration:.01s}
+      }
+    </style><svg><g id="strokes"></g></svg><div id="marks"></div><div id="agent"></div>`;
     document.documentElement.appendChild(overlayHost);
     return overlayRoot;
   }
@@ -293,6 +321,57 @@
     overlayHost?.remove();
     overlayHost = null;
     overlayRoot = null;
+  }
+
+  /* ------------------------------------------------------------- cursor */
+
+  const CURSOR_GLYPH =
+    '<svg viewBox="0 0 24 24" fill="none"><path d="M5 3l13 8.2-5.7 1.1L9.9 18 5 3z" ' +
+    'fill="var(--accent,#4c8dff)" stroke="var(--accent-ink,#fff)" stroke-width="1.4" ' +
+    'stroke-linejoin="round"/></svg>';
+  let cursorIdle = 0;
+  let cursorAt = { x: 0, y: 0 };
+
+  /**
+   * Shows the agent's pointer at a point and, for anything that lands, a tap
+   * ring. `label` names the action so a person watching can follow along.
+   * Sync on purpose: the host's entry points return a value, so the animation
+   * plays alongside the real event rather than delaying it.
+   */
+  function agentCursor(point, label) {
+    const root = ensureOverlay();
+    const layer = root.getElementById("agent");
+    if (!layer) return;
+    const x = Math.round(point?.x ?? cursorAt.x);
+    const y = Math.round(point?.y ?? cursorAt.y);
+    cursorAt = { x, y };
+    let pointer = layer.querySelector(".point");
+    if (!pointer) {
+      pointer = document.createElement("div");
+      pointer.className = "point";
+      pointer.innerHTML = `${CURSOR_GLYPH}<span class="label"></span>`;
+      layer.appendChild(pointer);
+    }
+    pointer.style.translate = `${x}px ${y}px`;
+    const caption = pointer.querySelector(".label");
+    if (caption) {
+      caption.textContent = label ?? "";
+      caption.style.display = label ? "" : "none";
+    }
+    if (label) {
+      const ring = document.createElement("div");
+      ring.className = "ring";
+      ring.style.translate = `${x}px ${y}px`;
+      layer.appendChild(ring);
+      ring.addEventListener("animationend", () => ring.remove());
+    }
+    layer.dataset.live = "true";
+    clearTimeout(cursorIdle);
+    // Fades on its own so a finished run does not leave a pointer parked on
+    // the page for the user to wonder about.
+    cursorIdle = setTimeout(() => {
+      if (layer.isConnected) layer.dataset.live = "false";
+    }, 2600);
   }
 
   function outline(element, label) {
@@ -387,6 +466,14 @@
   const api = {
     version: 1,
 
+    /** Hands the overlay the app's own tokens, so the cursor, the picker and
+     *  the note box match the theme the user is looking at. */
+    setTheme(theme) {
+      ensureOverlay();
+      applyTheme(theme);
+      return ok({ themed: true });
+    },
+
     snapshot(options = {}) {
       const limit = Math.min(options.limit ?? 200, 500);
       const elements = [];
@@ -412,6 +499,7 @@
       if (!element) return err("not-found", "No element matched that target.");
       element.scrollIntoView({ block: "center", inline: "center" });
       const point = target.x != null && target.y != null ? { x: target.x, y: target.y } : centreOf(element);
+      agentCursor(point, "click");
       pointerSequence(element, point, options);
       return ok({ clicked: describe(element) });
     },
@@ -423,6 +511,7 @@
         return err("not-editable", "That element does not accept text.");
       }
       element.scrollIntoView({ block: "center" });
+      agentCursor(centreOf(element), text.length > 12 ? "typing" : `typing “${text}”`);
       element.focus({ preventScroll: true });
       if (element.contentEditable === "true") {
         if (options.clear) element.textContent = "";
@@ -437,6 +526,7 @@
 
     press(key, modifiers = []) {
       const element = document.activeElement ?? document.body;
+      agentCursor(centreOf(element), [...modifiers, key].join("+"));
       const init = {
         key,
         code: key.length === 1 ? `Key${key.toUpperCase()}` : key,
@@ -455,6 +545,7 @@
 
     scroll(target, deltaX = 0, deltaY = 0) {
       const element = target ? resolve(target) : null;
+      agentCursor(element ? centreOf(element) : { x: innerWidth / 2, y: innerHeight / 2 }, "scroll");
       (element ?? window).scrollBy({ left: deltaX, top: deltaY, behavior: "instant" });
       return ok({ scrollY: Math.round(scrollY) });
     },
