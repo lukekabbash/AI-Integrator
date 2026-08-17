@@ -61,11 +61,29 @@ export function BrowserSurface({
   const [menuOpen, setMenuOpen] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
+  const popped = tab.popped_out;
+  const blank = !tab.url || tab.url === "about:blank";
+  // The caller passes a fresh arrow every render. Reach it through a ref so
+  // the placement effect below survives its parent re-rendering: keyed on the
+  // callback it tore the tab off screen and put it back several times a
+  // second, which is the flicker.
+  const boundsRef = useRef(onBoundsChange);
+  useEffect(() => {
+    boundsRef.current = onBoundsChange;
+  }, [onBoundsChange]);
+
   // Keep the native tab glued to this slot: observe the box, the scroll
   // ancestors and the window, and report physical pixels.
   useLayoutEffect(() => {
     const node = viewportRef.current;
-    if (!node) return;
+    const onBounds = (rect: DOMRect | null) => boundsRef.current(rect);
+    // A blank or popped-out tab has nothing worth showing here, and leaving
+    // the native surface parked over the slot would bury the start page under
+    // an empty white page.
+    if (!node || blank || popped) {
+      boundsRef.current(null);
+      return;
+    }
     let frame = 0;
     let settle = 0;
     let first = true;
@@ -79,14 +97,14 @@ export function BrowserSurface({
         // A paused drag must not bring the tab back under the cursor.
         if (document.body.dataset.resizing === "true") return;
         const rect = node.getBoundingClientRect();
-        onBoundsChange(rect.width > 0 && rect.height > 0 ? rect : null);
+        onBounds(rect.width > 0 && rect.height > 0 ? rect : null);
       };
       if (first) {
         first = false;
         frame = requestAnimationFrame(place);
         return;
       }
-      onBoundsChange(null);
+      onBounds(null);
       settle = window.setTimeout(() => {
         frame = requestAnimationFrame(place);
       }, 90);
@@ -105,7 +123,7 @@ export function BrowserSurface({
       if (dragging()) {
         cancelAnimationFrame(frame);
         window.clearTimeout(settle);
-        onBoundsChange(null);
+        onBounds(null);
       } else {
         report();
       }
@@ -120,9 +138,9 @@ export function BrowserSurface({
       dragObserver?.disconnect();
       window.removeEventListener("resize", report);
       window.removeEventListener("scroll", report, true);
-      onBoundsChange(null);
+      onBounds(null);
     };
-  }, [onBoundsChange]);
+  }, [blank, popped]);
 
   const submit = useCallback(
     (event: React.FormEvent) => {
@@ -133,8 +151,6 @@ export function BrowserSurface({
     [draft, onNavigate],
   );
 
-  const popped = tab.popped_out;
-  const blank = !tab.url || tab.url === "about:blank";
   useEffect(() => {
     if (!blank && !tab.loading) rememberBrowserVisit(tab.url, tab.title);
   }, [blank, tab.loading, tab.url, tab.title]);
@@ -330,7 +346,7 @@ export function BrowserSurface({
       <div
         className="browser-viewport"
         ref={viewportRef}
-        data-hidden={popped || blank ? "true" : undefined}
+        data-native={popped || blank ? undefined : "true"}
       >
         {blank && !popped ? <BrowserStart onOpen={(url) => void onNavigate(url)} /> : null}
         {popped ? (

@@ -40,6 +40,8 @@ export interface WorkPaneController {
   closeAll: () => void;
   toggle: (open?: boolean) => void;
   setWidth: (width: number) => void;
+  /** Widen or narrow by a pointer delta, read against the live width. */
+  nudgeWidth: (delta: number) => void;
   reorder: (from: number, to: number) => void;
   prune: (keep: (surface: WorkSurface) => boolean) => void;
 }
@@ -104,6 +106,10 @@ export function useWorkPane(ownerKey: string): WorkPaneController {
       closeAll: () => update(closeAllSurfaces),
       toggle: (open) => update((current) => togglePane(current, open)),
       setWidth: (width) => update((current) => setPaneWidth(current, width)),
+      // A drag reads the width inside the update, never from a snapshot the
+      // pointer listener captured when the gesture started — that snapshot
+      // goes stale on the first move and the pane snaps back to it.
+      nudgeWidth: (delta) => update((current) => setPaneWidth(current, current.width - delta)),
       reorder: (from, to) => update((current) => reorderSurfaces(current, from, to)),
       prune: (keep) => update((current) => pruneSurfaces(current, keep)),
     }),

@@ -56,6 +56,11 @@ const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
 const EVAL_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_EVAL_BYTES: usize = 96 * 1024;
 
+/// A tab with no page: the start page shows instead of a native surface.
+fn is_blank(url: &Url) -> bool {
+    url.scheme() == "about" || url.as_str() == "about:blank"
+}
+
 fn invalid(message: impl Into<String>) -> CommandError {
     CommandError {
         code: "invalid-input",
@@ -333,7 +338,10 @@ async fn create_tab(
         task_id,
         url: target.to_string(),
         title: String::new(),
-        loading: true,
+        // about:blank has nothing to fetch and never reports a page load, so
+        // calling it "loading" leaves the reload control spinning forever on
+        // a tab that is simply waiting for an address.
+        loading: !is_blank(&target),
         popped_out: false,
         hidden: false,
         last_error: None,
@@ -458,7 +466,7 @@ pub async fn browser_tab_navigate(
     let tab = state
         .update(&tab_id, |tab| {
             tab.url = target.to_string();
-            tab.loading = true;
+            tab.loading = !is_blank(&target);
             tab.last_error = None;
         })
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
@@ -620,11 +628,12 @@ pub async fn browser_tab_set_popped_out(
             .map_err(|error| unavailable(format!("could not dock the tab: {error}")))?;
     }
 
+    let loading = !is_blank(&target);
     let tab = state
         .update(&tab_id, |tab| {
             tab.popped_out = popped_out;
             tab.url = url;
-            tab.loading = true;
+            tab.loading = loading;
         })
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
     emit_changed(&app, &state);
@@ -799,7 +808,7 @@ pub async fn navigate_for_agent(
     let tab = tabs
         .update(tab_id, |tab| {
             tab.url = target.to_string();
-            tab.loading = true;
+            tab.loading = !is_blank(&target);
         })
         .ok_or_else(|| IntegratorError::NotFound("that browser tab is no longer open".into()))?;
     emit_changed(app, tabs);

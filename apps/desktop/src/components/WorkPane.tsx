@@ -96,7 +96,7 @@ export function WorkPane({
 
   const width = Math.min(state.width, maxWidth ?? state.width);
   const onResize = useCallback(
-    (delta: number) => controller.setWidth(controller.state.width - delta),
+    (delta: number) => controller.nudgeWidth(delta),
     [controller],
   );
 
