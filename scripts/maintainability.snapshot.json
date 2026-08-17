@@ -19,7 +19,7 @@
     },
     {
       "path": "apps/desktop/src/components/SettingsView.tsx",
-      "maxLines": 5430
+      "maxLines": 5404
     },
     {
       "path": "apps/desktop/src/bridge.ts",
@@ -31,7 +31,7 @@
     },
     {
       "path": "apps/desktop/src/components/RightRail.tsx",
-      "maxLines": 3249
+      "maxLines": 3245
     },
     {
       "path": "apps/desktop/src/App.runtime.test.tsx",
@@ -67,7 +67,7 @@
     },
     {
       "path": "apps/desktop/src/components/TaskSidebar.tsx",
-      "maxLines": 1726
+      "maxLines": 1691
     },
     {
       "path": "crates/adapter-acp/src/lib.rs",
