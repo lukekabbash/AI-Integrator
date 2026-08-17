@@ -22,8 +22,8 @@ use super::{
     invalid, is_blank, normalize_url, setting_enabled, unavailable, webview_of,
 };
 
-pub async fn agent_invoke<R: Runtime>(
-    app: &AppHandle<R>,
+pub async fn agent_invoke(
+    app: &AppHandle,
     tabs: &Arc<BrowserTabs>,
     task_id: &str,
     tab_id: &str,
@@ -36,6 +36,7 @@ pub async fn agent_invoke<R: Runtime>(
         Some(_) => return Err(unavailable("that browser tab belongs to another task")),
         None => return Err(unavailable("that browser tab is no longer open")),
     }
+    super::remember::ensure_awake(app, tabs, tab_id).await;
     let label = tabs
         .label_for(tab_id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
@@ -61,7 +62,7 @@ pub async fn agent_invoke<R: Runtime>(
 }
 
 /// Guest actions that change the page rather than read it.
-const WRITES: &[&str] = &["click", "type", "press", "scroll", "evaluate"];
+const WRITES: &[&str] = &["click", "type", "press", "scroll", "drag", "evaluate"];
 
 /// Opens a tab on the agent's behalf, owned by its task.
 pub fn ensure_agent_access<R: Runtime>(app: &AppHandle<R>) -> Result<(), CommandError> {
@@ -122,6 +123,7 @@ pub async fn navigate_for_agent(
     tabs.mark_held(tab_id, task_id);
     let target =
         normalize_url(url).map_err(|error| IntegratorError::InvalidInput(error.message))?;
+    super::remember::ensure_awake(app, tabs, tab_id).await;
     let label = tabs
         .label_for(tab_id)
         .ok_or_else(|| IntegratorError::NotFound("that browser tab is no longer open".into()))?;

@@ -31,7 +31,8 @@ The local desktop/broker remains authoritative for task identity, policy interse
 | `child_stop` | Yes | Stop the selected child; descendants require explicit separate scope |
 | `child_result` | No | Read the structured result/evidence envelope |
 | `browser_open` | Yes | Open a browser tab owned by the calling task |
-| `browser_list` | No | List the calling task's browser tabs |
+| `browser_list` | No | List the calling task's browser tabs, including which are asleep and who is driving one |
+| `browser_drag` | No | Press at one element or point, move, and release at another |
 | `browser_close` | No | Close one of the calling task's tabs when the agent is done with it |
 | `browser_navigate` | Yes | Point one of those tabs at a URL |
 | `browser_snapshot` | No | Read a page: url, title, viewport, text, and interactive elements with stable refs |
@@ -42,6 +43,16 @@ The local desktop/broker remains authoritative for task identity, policy interse
 Browser tools are scoped to the calling task: a tab records the task that
 opened it, and a call naming another task's tab is refused. Delegated children
 have no browser tools; a child that needs a page asks its orchestrator.
+
+Two things a caller sees in `browser_list` and should act on:
+
+- `heldBy` names an agent that drove the tab in the last 45 seconds. Reads are
+  always allowed, but a write to someone else's tab is refused with that name in
+  the message. Open your own tab rather than taking the page out from under a
+  run in flight.
+- `sleeping` marks a tab remembered from an earlier session: it has an address
+  and a title but no page loaded yet. Addressing it loads it first, so nothing
+  special is required — it costs one page load the first time.
 
 `child_close`, archive, cleanup, merge, commit, push, deployment, and external actions are not MCP MVP tools. They remain user/broker/Git UI operations with their own authority and preview.
 

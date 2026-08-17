@@ -78,6 +78,17 @@ pub fn restore(app: &AppHandle, tabs: &Arc<BrowserTabs>, task_id: &str) -> usize
     added
 }
 
+/// Loads a tab if it is still asleep, then hands back nothing: callers only
+/// need to know the webview exists before they reach for it. Anything that
+/// drives a page — history, navigation, a guest call, a capture — goes through
+/// here first, so a remembered tab behaves like any other the moment it is
+/// addressed rather than reporting itself as gone.
+pub async fn ensure_awake(app: &AppHandle, tabs: &Arc<BrowserTabs>, tab_id: &str) {
+    if tabs.sleeping_target(tab_id).is_some() {
+        let _ = wake(app, tabs, tab_id).await;
+    }
+}
+
 /// Gives a sleeping tab its webview, at the address it was remembered with.
 /// Called when the tab is first shown or an agent addresses it.
 pub async fn wake(

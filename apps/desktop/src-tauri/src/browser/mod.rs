@@ -528,6 +528,7 @@ pub async fn browser_tab_set_bounds(
     tab_id: String,
     bounds: Option<TabBounds>,
 ) -> CommandResult<()> {
+    remember::ensure_awake(&app, &state, &tab_id).await;
     let label = state
         .label_for(&tab_id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
@@ -583,6 +584,7 @@ pub async fn browser_tab_navigate(
     tab_id: String,
     url: String,
 ) -> CommandResult<BrowserTab> {
+    remember::ensure_awake(&app, &state, &tab_id).await;
     let label = state
         .label_for(&tab_id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
@@ -608,6 +610,7 @@ pub async fn browser_tab_history(
     tab_id: String,
     action: String,
 ) -> CommandResult<()> {
+    remember::ensure_awake(&app, &state, &tab_id).await;
     let label = state
         .label_for(&tab_id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
@@ -654,6 +657,7 @@ pub async fn browser_tab_invoke(
     if !ALLOWED.contains(&method.as_str()) {
         return Err(invalid(format!("unknown browser action '{method}'")));
     }
+    remember::ensure_awake(&app, &state, &tab_id).await;
     let label = state
         .label_for(&tab_id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
@@ -674,6 +678,7 @@ pub async fn browser_tab_screenshot(
     state: tauri::State<'_, Arc<BrowserTabs>>,
     tab_id: String,
 ) -> CommandResult<String> {
+    remember::ensure_awake(&app, &state, &tab_id).await;
     let label = state
         .label_for(&tab_id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
