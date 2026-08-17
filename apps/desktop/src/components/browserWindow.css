@@ -1,0 +1,73 @@
+/* The pop-out browser window. Chromeless at the OS level, so the strip is
+   both the tab row and the drag handle, and the surface below is the same
+   BrowserSurface the pane uses. */
+
+.browser-window {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-canvas);
+  color: var(--color-text-primary);
+}
+
+.browser-window-strip {
+  flex: none;
+  height: 38px;
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-bottom: 1px solid var(--color-border-subtle);
+  background: var(--color-chrome-background, var(--color-canvas));
+}
+
+.browser-window-tabs {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.browser-window-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.browser-window-tab {
+  max-width: 220px;
+}
+.browser-window-tab .file-reader-tab-close {
+  font-size: 13px;
+  line-height: 1;
+}
+
+.browser-window-body {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.browser-window-body > .browser-surface {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.browser-window-empty {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: var(--color-text-secondary);
+}
+.browser-window-empty strong {
+  color: var(--color-text-primary);
+  font-size: 12px;
+  font-weight: 650;
+}
+.browser-window-empty small {
+  font-size: 11px;
+}

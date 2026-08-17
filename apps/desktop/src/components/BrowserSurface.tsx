@@ -33,6 +33,8 @@ export interface BrowserSurfaceProps {
   onAnnotate: () => Promise<void>;
   annotating: boolean;
   onPopOut: (popped: boolean) => Promise<void>;
+  /** Sends every tab in this task to the pop-out window at once. */
+  onPopOutAll?: () => Promise<void>;
   onOpenExternally: () => Promise<void>;
   onClose: () => void;
   message?: string | null;
@@ -54,6 +56,7 @@ export function BrowserSurface({
   onAnnotate,
   annotating,
   onPopOut,
+  onPopOutAll,
   onOpenExternally,
   onClose,
   message,
@@ -104,7 +107,9 @@ export function BrowserSurface({
       const distance = node.getBoundingClientRect().left - event.clientX;
       // Hysteresis: opening early and closing late keeps the edge from
       // flickering when the pointer hovers right on the threshold.
-      setNearEdge((current) => (current ? distance > -4 && distance < 40 : distance > 0 && distance < 18));
+      setNearEdge((current) =>
+        current ? distance > -4 && distance < 40 : distance > 0 && distance < 18,
+      );
     };
     window.addEventListener("pointermove", onMove);
     return () => window.removeEventListener("pointermove", onMove);
@@ -340,6 +345,18 @@ export function BrowserSurface({
                 >
                   Open in your system browser
                 </button>
+                {onPopOutAll ? (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      void onPopOutAll();
+                    }}
+                  >
+                    Pop out every tab
+                  </button>
+                ) : null}
                 <button
                   type="button"
                   role="menuitem"

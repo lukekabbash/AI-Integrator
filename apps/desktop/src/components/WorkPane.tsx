@@ -36,6 +36,8 @@ export interface WorkPaneProps {
   panelTransition: object;
   delegations: DelegationView[];
   browserTitles?: Record<string, string>;
+  /** Tabs an agent is driving right now, keyed by tab id. */
+  browserBusy?: Record<string, string>;
   renderFile: (surface: Extract<WorkSurface, { kind: "file" }>) => ReactNode;
   renderReview: () => ReactNode;
   renderSubagent: (delegationId: string, headerHost: HTMLElement | null) => ReactNode;
@@ -60,6 +62,7 @@ export function WorkPane({
   panelTransition,
   delegations,
   browserTitles,
+  browserBusy,
   renderFile,
   renderReview,
   renderSubagent,
@@ -130,6 +133,16 @@ export function WorkPane({
               className="file-reader-tab work-pane-tab"
               data-active={activeTab ? "true" : undefined}
               data-kind={surface.kind}
+              // A tab an agent is working in says so, so the user can watch
+              // that one rather than wonder which page is moving.
+              data-busy={
+                surface.kind === "browser" && browserBusy?.[surface.tabId] ? "true" : undefined
+              }
+              title={
+                surface.kind === "browser" && browserBusy?.[surface.tabId]
+                  ? `${browserBusy[surface.tabId]} is working in this tab`
+                  : undefined
+              }
               initial={reduceMotion ? false : { opacity: 0, y: 3 }}
               animate={{ opacity: 1, y: 0 }}
               transition={

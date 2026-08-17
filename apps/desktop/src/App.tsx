@@ -6341,6 +6341,13 @@ export default function App() {
         onRecordToggle={() => browser.toggleRecording(tabId)}
         onAnnotate={() => browser.toggleAnnotate(tabId)}
         onPopOut={(popped) => browser.setPoppedOut(tabId, popped)}
+        onPopOutAll={async () => {
+          // One window holding every tab of this task, which is the point of
+          // popping out in the first place.
+          for (const open of browser.tabs.filter((candidate) => !candidate.popped_out)) {
+            await browser.setPoppedOut(open.id, true);
+          }
+        }}
         onOpenExternally={() => browser.openExternally(tabId)}
         onClose={() => {
           workPane.close(`browser:${tabId}`);
@@ -7193,6 +7200,11 @@ export default function App() {
                                 tab.id,
                                 tab.title || tab.url.replace(/^https?:\/\//, ""),
                               ]),
+                            )}
+                            browserBusy={Object.fromEntries(
+                              browser.tabs
+                                .filter((tab) => tab.heldBy)
+                                .map((tab) => [tab.id, tab.heldBy as string]),
                             )}
                             renderBrowser={renderWorkPaneBrowser}
                             trailing={activeTask?.kind !== "chat" ? workspaceToggles : null}

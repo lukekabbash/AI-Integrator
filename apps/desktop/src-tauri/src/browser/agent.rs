@@ -39,6 +39,18 @@ pub async fn agent_invoke<R: Runtime>(
     let label = tabs
         .label_for(tab_id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
+    // Reading a page is harmless when someone else is mid-flow; changing it is
+    // not. A tab another agent is working in refuses writes rather than letting
+    // two runs undo each other, and says who has it so the caller can open its
+    // own tab instead.
+    if WRITES.contains(&method)
+        && let Some(holder) = tabs.held_by_other(tab_id, task_id)
+    {
+        return Err(unavailable(format!(
+            "{holder} is working in that tab right now — open your own with browser_open, or wait for it to finish"
+        )));
+    }
+    tabs.mark_held(tab_id, task_id);
     let args = serde_json::to_string(&args).map_err(|error| invalid(error.to_string()))?;
     eval_json(
         app,
@@ -47,6 +59,9 @@ pub async fn agent_invoke<R: Runtime>(
     )
     .await
 }
+
+/// Guest actions that change the page rather than read it.
+const WRITES: &[&str] = &["click", "type", "press", "scroll", "evaluate"];
 
 /// Opens a tab on the agent's behalf, owned by its task.
 pub fn ensure_agent_access<R: Runtime>(app: &AppHandle<R>) -> Result<(), CommandError> {
@@ -99,6 +114,12 @@ pub async fn navigate_for_agent(
             ));
         }
     }
+    if let Some(holder) = tabs.held_by_other(tab_id, task_id) {
+        return Err(IntegratorError::Unavailable(format!(
+            "{holder} is working in that tab right now — open your own with browser_open"
+        )));
+    }
+    tabs.mark_held(tab_id, task_id);
     let target =
         normalize_url(url).map_err(|error| IntegratorError::InvalidInput(error.message))?;
     let label = tabs

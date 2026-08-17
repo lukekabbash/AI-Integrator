@@ -39,17 +39,46 @@ export interface BrowserHost {
   insertText: (text: string) => void;
 }
 
+/** Rough luminance read of the app's own canvas, for themes that do not say. */
+function isDarkCanvas(color: string): boolean {
+  const hex = /^#([0-9a-f]{6})$/i.exec(color.trim())?.[1];
+  if (hex) {
+    const value = Number.parseInt(hex, 16);
+    const [r, g, b] = [(value >> 16) & 255, (value >> 8) & 255, value & 255];
+    return (r * 299 + g * 587 + b * 114) / 1000 < 128;
+  }
+  const rgb = /rgba?\(([^)]+)\)/i.exec(color);
+  if (!rgb) return true;
+  const [r = 0, g = 0, b = 0] = rgb[1].split(",").map((part) => Number.parseFloat(part));
+  return (r * 299 + g * 587 + b * 114) / 1000 < 128;
+}
+
 /**
  * The overlay the guest draws lives in a page we do not control, so it cannot
  * inherit the app's stylesheet. Resolve the tokens it needs here and hand them
- * over, so the picker and its note box wear the user's theme — including a
- * light one — rather than a hardcoded dark card.
+ * over, so the picker, its note box, the agent cursor and the page's own
+ * scrollbar wear the user's theme rather than a hardcoded dark card.
  */
 function pageTheme(): Record<string, string> {
   if (typeof document === "undefined") return {};
   const style = getComputedStyle(document.documentElement);
   const token = (name: string, fallback: string) => style.getPropertyValue(name).trim() || fallback;
+  // Sites get the app's mode and its scrollbar, so a page inside a dark
+  // Integrator does not come up with a white gutter down the side.
+  const dark =
+    document.documentElement.dataset.theme?.includes("light") === false ||
+    style.getPropertyValue("--color-scheme").trim() === "dark" ||
+    isDarkCanvas(token("--color-canvas", "#101216"));
   return {
+    scheme: dark ? "dark" : "light",
+    scrollThumb: token(
+      "--color-scrollbar-thumb",
+      dark ? "rgba(255,255,255,.22)" : "rgba(0,0,0,.22)",
+    ),
+    scrollThumbHover: token(
+      "--color-scrollbar-thumb-hover",
+      dark ? "rgba(255,255,255,.34)" : "rgba(0,0,0,.34)",
+    ),
     accent: token("--color-accent", "#4c8dff"),
     accentInk: token("--color-accent-contrast", "#ffffff"),
     surface: token("--color-elevated", token("--color-layer-1", "#16191d")),
@@ -83,7 +112,8 @@ export function useBrowserTabs(host: BrowserHost): BrowserController {
   const [message, setMessage] = useState<string | null>(null);
   const [recordingTabId, setRecordingTabId] = useState<string | null>(null);
   const [annotatingTabId, setAnnotatingTabId] = useState<string | null>(null);
-  const boundsFrame = useRef<number>(0);
+  /** One pending placement per tab; see setBounds for why it cannot be shared. */
+  const boundsFrames = useRef<Map<string, number>>(new Map());
   const recorder = useRef<{ timer: number; frames: string[] } | null>(null);
   const picker = useRef<number | null>(null);
   const hostRef = useRef(host);
@@ -138,23 +168,37 @@ export function useBrowserTabs(host: BrowserHost): BrowserController {
   const setBounds = useCallback(
     (tabId: string, rect: DOMRect | null) => {
       if (!api) return;
-      cancelAnimationFrame(boundsFrame.current);
-      boundsFrame.current = requestAnimationFrame(() => {
-        const ratio = window.devicePixelRatio || 1;
-        void api
-          .setBounds(
-            tabId,
-            rect
-              ? {
-                  x: Math.round(rect.x * ratio),
-                  y: Math.round(rect.y * ratio),
-                  width: Math.round(rect.width * ratio),
-                  height: Math.round(rect.height * ratio),
-                }
-              : null,
-          )
-          .catch(() => undefined);
-      });
+      const ratio = window.devicePixelRatio || 1;
+      // Hiding happens now, never on a later frame. Switching tabs unmounts one
+      // surface and mounts the next in the same tick, and a deferred hide was
+      // being cancelled by the incoming tab's placement — which left the tab
+      // you just left painted on top of the one you opened, and left the last
+      // page on screen after the pane closed.
+      if (!rect) {
+        const pending = boundsFrames.current.get(tabId);
+        if (pending !== undefined) cancelAnimationFrame(pending);
+        boundsFrames.current.delete(tabId);
+        void api.setBounds(tabId, null).catch(() => undefined);
+        return;
+      }
+      // Placement is coalesced per tab, so one tab's frame never cancels
+      // another's.
+      const pending = boundsFrames.current.get(tabId);
+      if (pending !== undefined) cancelAnimationFrame(pending);
+      boundsFrames.current.set(
+        tabId,
+        requestAnimationFrame(() => {
+          boundsFrames.current.delete(tabId);
+          void api
+            .setBounds(tabId, {
+              x: Math.round(rect.x * ratio),
+              y: Math.round(rect.y * ratio),
+              width: Math.round(rect.width * ratio),
+              height: Math.round(rect.height * ratio),
+            })
+            .catch(() => undefined);
+        }),
+      );
     },
     [api],
   );
@@ -270,7 +314,9 @@ export function useBrowserTabs(host: BrowserHost): BrowserController {
                     picked.name ? ` name=${JSON.stringify(picked.name)}` : ""
                   }`,
                   `Selector: ${picked.selector}`,
-                  ...((result.comment ?? "").trim() ? ["Note:", (result.comment ?? "").trim()] : []),
+                  ...((result.comment ?? "").trim()
+                    ? ["Note:", (result.comment ?? "").trim()]
+                    : []),
                   "</browser_annotation>",
                   "",
                 ].join("\n"),

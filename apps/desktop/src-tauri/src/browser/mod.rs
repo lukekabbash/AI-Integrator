@@ -33,6 +33,7 @@ use crate::command_api::{CommandError, CommandResult};
 
 mod agent;
 mod capture;
+mod popout;
 mod servers;
 
 pub use servers::browser_local_servers;
@@ -88,13 +89,24 @@ pub struct BrowserTab {
     pub popped_out: bool,
     /// True while the tab has no visible host (pane closed); it keeps running.
     pub hidden: bool,
+    /// Set while an agent is driving this tab, so a second one can see that
+    /// someone is mid-flow here and open its own rather than take the wheel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub held_by: Option<String>,
 }
 
 struct Tab {
     state: BrowserTab,
     /// Label of the webview; also the pop-out window label when popped out.
     label: String,
+    /// Who last drove this tab through the broker, and when. A page can only
+    /// be in one state at a time, so two agents taking turns on one tab undo
+    /// each other's work; this is what lets the second one notice.
+    held: Option<(String, std::time::Instant)>,
 }
+
+/// How long after an agent's last action the tab still reads as theirs.
+const HOLD_TTL: Duration = Duration::from_secs(45);
 
 #[derive(Default)]
 pub struct BrowserTabs {
@@ -112,10 +124,37 @@ impl BrowserTabs {
         let mut list: Vec<BrowserTab> = tabs
             .values()
             .filter(|tab| task_id.is_none_or(|task| tab.state.task_id == task))
-            .map(|tab| tab.state.clone())
+            .map(|tab| {
+                let mut state = tab.state.clone();
+                // A hold is reported only while it is fresh, so nothing has to
+                // remember to release one when a run ends or an agent dies.
+                state.held_by = tab
+                    .held
+                    .as_ref()
+                    .filter(|(_, at)| at.elapsed() < HOLD_TTL)
+                    .map(|(who, _)| who.clone());
+                state
+            })
             .collect();
         list.sort_by(|a, b| a.id.cmp(&b.id));
         list
+    }
+
+    /// Records that `holder` just drove this tab.
+    pub(super) fn mark_held(&self, id: &str, holder: &str) {
+        let mut tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(tab) = tabs.get_mut(id) {
+            tab.held = Some((holder.to_string(), std::time::Instant::now()));
+        }
+    }
+
+    /// Who is driving this tab right now, if anyone other than `asker`.
+    pub(super) fn held_by_other(&self, id: &str, asker: &str) -> Option<String> {
+        let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        tabs.get(id)
+            .and_then(|tab| tab.held.as_ref())
+            .filter(|(who, at)| who != asker && at.elapsed() < HOLD_TTL)
+            .map(|(who, _)| who.clone())
     }
 
     fn label_for(&self, id: &str) -> Option<String> {
@@ -273,7 +312,7 @@ fn profile_directory<R: Runtime>(app: &AppHandle<R>) -> Option<std::path::PathBu
 /// The one place a tab's webview is described. A tab that pops out and comes
 /// back has to arrive with the same runtime, profile and reporting it left
 /// with, or it returns as a page that never updates its address or title.
-fn tab_webview_builder(
+pub(super) fn tab_webview_builder(
     app: &AppHandle,
     state: &Arc<BrowserTabs>,
     id: &str,
@@ -320,7 +359,7 @@ fn tab_webview_builder(
 
 /// Puts a tab's webview back inside the main window. Shared by the dock
 /// control and by a pop-out window closing, so both land in the same state.
-fn dock_tab(
+pub(super) fn dock_tab(
     app: &AppHandle,
     state: &Arc<BrowserTabs>,
     id: &str,
@@ -382,6 +421,7 @@ pub(super) async fn create_tab(
         loading: !is_blank(&target),
         popped_out: false,
         hidden: false,
+        held_by: None,
     };
     {
         let mut tabs = state.tabs.lock().unwrap_or_else(|error| error.into_inner());
@@ -390,6 +430,7 @@ pub(super) async fn create_tab(
             Tab {
                 state: tab.clone(),
                 label,
+                held: None,
             },
         );
     }
@@ -641,53 +682,10 @@ pub async fn browser_tab_set_popped_out(
     // user agent and guest runtime — otherwise a tab would sign itself out of
     // every site simply by moving to its own window.
     if popped_out {
-        let profile = profile_directory(&app);
-        let close_app = app.clone();
-        let close_state = Arc::clone(&state);
-        let close_id = tab_id.clone();
-        let close_label = label.clone();
-        let close_target = target.clone();
-        let mut builder =
-            tauri::WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(target.clone()))
-                .title(if current.title.is_empty() {
-                    "Browser".to_string()
-                } else {
-                    current.title.clone()
-                })
-                .inner_size(1100.0, 780.0)
-                .min_inner_size(420.0, 320.0)
-                .initialization_script(guest_runtime(&app))
-                .user_agent(BROWSER_USER_AGENT);
-        if let Some(profile) = profile {
-            builder = builder.data_directory(profile);
-        }
-        let window = builder
-            .build()
-            .map_err(|error| unavailable(format!("could not pop out the tab: {error}")))?;
-        // Closing the window sends the tab home rather than destroying it. The
-        // page keeps running either way, and a tab that vanished from both
-        // places would strand whatever was using it.
-        window.on_window_event(move |event| {
-            if !matches!(event, tauri::WindowEvent::Destroyed) {
-                return;
-            }
-            let app = close_app.clone();
-            let state = Arc::clone(&close_state);
-            let id = close_id.clone();
-            let label = close_label.clone();
-            let target = close_target.clone();
-            // Child webviews are built off the main thread on Windows.
-            tauri::async_runtime::spawn(async move {
-                if state.task_of(&id).is_none() {
-                    return; // the tab was closed outright, not undocked
-                }
-                let _ = dock_tab(&app, &state, &id, &label, &target);
-            });
-        });
+        popout::adopt(&app, &state, &tab_id, &label, &target)?;
         let loading = !is_blank(&target);
         let tab = state
             .update(&tab_id, |tab| {
-                tab.popped_out = true;
                 tab.url = url;
                 tab.loading = loading;
             })
@@ -837,8 +835,10 @@ mod tests {
                             loading: false,
                             popped_out: false,
                             hidden: false,
+                            held_by: None,
                         },
                         label: format!("browser-{id}"),
+                        held: None,
                     },
                 );
             }

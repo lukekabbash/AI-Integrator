@@ -416,6 +416,41 @@
     ]) {
       if (theme[key]) overlayHost.style.setProperty(custom, theme[key]);
     }
+    applyPageChrome(theme);
+  }
+
+  const PAGE_CHROME_ID = "__integrator_page_chrome";
+
+  /**
+   * Dresses the page's own chrome to match the app: a thin scrollbar in the
+   * user's palette instead of the platform's wide default, and a colour scheme
+   * so form controls and any site that honours `color-scheme` come up in the
+   * same mode Integrator is in.
+   *
+   * This is the honest limit of what a guest script can do: it cannot fake
+   * `prefers-color-scheme`, so a site that only reads that media query still
+   * decides for itself. Everything the user agent draws follows along.
+   */
+  function applyPageChrome(theme) {
+    const scheme = theme?.scheme === "dark" || theme?.scheme === "light" ? theme.scheme : null;
+    if (scheme) document.documentElement.style.colorScheme = scheme;
+    const thumb = theme?.scrollThumb || theme?.muted;
+    if (!thumb) return;
+    let style = document.getElementById(PAGE_CHROME_ID);
+    if (!style) {
+      style = document.createElement("style");
+      style.id = PAGE_CHROME_ID;
+      (document.head ?? document.documentElement).appendChild(style);
+    }
+    style.textContent = `
+      *{scrollbar-width:thin;scrollbar-color:${thumb} transparent}
+      ::-webkit-scrollbar{width:10px;height:10px}
+      ::-webkit-scrollbar-track{background:transparent}
+      ::-webkit-scrollbar-thumb{background:${thumb};border:3px solid transparent;
+        background-clip:content-box;border-radius:99px;min-height:32px}
+      ::-webkit-scrollbar-thumb:hover{background:${theme?.scrollThumbHover || thumb};
+        border:2px solid transparent;background-clip:content-box}
+      ::-webkit-scrollbar-corner{background:transparent}`;
   }
 
   /** Floating note anchored beside the picked element. */
