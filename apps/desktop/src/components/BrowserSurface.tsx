@@ -18,6 +18,9 @@ import { rememberBrowserVisit } from "./browserRecents";
 import { Tooltip } from "./Tooltip";
 import "./browserSurface.css";
 
+/** How far the native tab stands off a moving edge, in CSS pixels. */
+const DRAG_SAFE_INSET = 24;
+
 export interface BrowserSurfaceProps {
   tab: BrowserTab;
   /** Reports the slot rectangle so the native tab can sit exactly over it. */
@@ -85,55 +88,52 @@ export function BrowserSurface({
       return;
     }
     let frame = 0;
-    let settle = 0;
-    let first = true;
-    // A moving slot repaints the native surface every frame, which reads as a
-    // flicker. Hide it while the geometry is changing and place it once, after
-    // it settles; the first placement is immediate so opening feels instant.
-    const report = () => {
-      cancelAnimationFrame(frame);
-      window.clearTimeout(settle);
-      const place = () => {
-        // A paused drag must not bring the tab back under the cursor.
-        if (document.body.dataset.resizing === "true") return;
-        const rect = node.getBoundingClientRect();
-        onBounds(rect.width > 0 && rect.height > 0 ? rect : null);
-      };
-      if (first) {
-        first = false;
-        frame = requestAnimationFrame(place);
+    let last = "";
+    // The tab follows its slot instead of being taken off screen and put back:
+    // hiding it for even a frame reads as a flash, and the scroll listener
+    // below fires for every scrollable box in the window, so a blink here
+    // would follow the transcript's scrolling too. Reports the window and its
+    // scrollers generate are almost always no-ops, and a rectangle that has
+    // not moved is dropped rather than sent.
+    const place = () => {
+      const rect = node.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) {
+        if (last === "") return;
+        last = "";
+        onBounds(null);
         return;
       }
-      onBounds(null);
-      settle = window.setTimeout(() => {
-        frame = requestAnimationFrame(place);
-      }, 90);
+      // A native surface paints above the page, so during a drag it stands off
+      // the moving edge far enough that the pointer stays on the app's own
+      // grip. Losing the pointer to the tab would strand the gesture.
+      const inset = document.body.dataset.resizing === "true" ? DRAG_SAFE_INSET : 0;
+      const placed = new DOMRect(
+        rect.x + inset,
+        rect.y,
+        Math.max(1, rect.width - inset),
+        rect.height,
+      );
+      const key = `${Math.round(placed.x)}:${Math.round(placed.y)}:${Math.round(placed.width)}:${Math.round(placed.height)}`;
+      if (key === last) return;
+      last = key;
+      onBounds(placed);
+    };
+    const report = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(place);
     };
     report();
     const observer = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(report);
     observer?.observe(node);
     window.addEventListener("resize", report);
     window.addEventListener("scroll", report, true);
-    // A native tab swallows the pointer events a drag needs, so any panel
-    // resize anywhere in the window takes the tab off screen for the whole
-    // gesture and places it once on release. `data-resizing` is set by every
-    // resize handle in the app.
-    const dragging = () => document.body.dataset.resizing === "true";
-    const onDragChange = () => {
-      if (dragging()) {
-        cancelAnimationFrame(frame);
-        window.clearTimeout(settle);
-        onBounds(null);
-      } else {
-        report();
-      }
-    };
+    // Starting and ending a drag changes the inset, not the slot, so neither
+    // observer above would notice.
     const dragObserver =
-      typeof MutationObserver === "undefined" ? undefined : new MutationObserver(onDragChange);
+      typeof MutationObserver === "undefined" ? undefined : new MutationObserver(report);
     dragObserver?.observe(document.body, { attributeFilter: ["data-resizing"] });
     return () => {
       cancelAnimationFrame(frame);
-      window.clearTimeout(settle);
       observer?.disconnect();
       dragObserver?.disconnect();
       window.removeEventListener("resize", report);

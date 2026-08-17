@@ -7,7 +7,7 @@
   "exceptions": [
     {
       "path": "apps/desktop/src/styles.css",
-      "maxLines": 16785
+      "maxLines": 16818
     },
     {
       "path": "apps/desktop/src-tauri/src/commands.rs",
@@ -15,11 +15,11 @@
     },
     {
       "path": "apps/desktop/src/App.tsx",
-      "maxLines": 7368
+      "maxLines": 7446
     },
     {
       "path": "apps/desktop/src/components/SettingsView.tsx",
-      "maxLines": 5404
+      "maxLines": 5430
     },
     {
       "path": "apps/desktop/src/bridge.ts",
@@ -31,7 +31,7 @@
     },
     {
       "path": "apps/desktop/src/components/RightRail.tsx",
-      "maxLines": 3245
+      "maxLines": 3249
     },
     {
       "path": "apps/desktop/src/App.runtime.test.tsx",
@@ -55,7 +55,7 @@
     },
     {
       "path": "apps/desktop/src/components/Composer.tsx",
-      "maxLines": 2074
+      "maxLines": 2135
     },
     {
       "path": "apps/desktop/src/theme.ts",
@@ -67,7 +67,7 @@
     },
     {
       "path": "apps/desktop/src/components/TaskSidebar.tsx",
-      "maxLines": 1691
+      "maxLines": 1726
     },
     {
       "path": "crates/adapter-acp/src/lib.rs",

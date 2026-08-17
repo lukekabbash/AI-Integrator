@@ -39,6 +39,29 @@ export interface BrowserHost {
   insertText: (text: string) => void;
 }
 
+/**
+ * The overlay the guest draws lives in a page we do not control, so it cannot
+ * inherit the app's stylesheet. Resolve the tokens it needs here and hand them
+ * over, so the picker and its note box wear the user's theme — including a
+ * light one — rather than a hardcoded dark card.
+ */
+function pageTheme(): Record<string, string> {
+  if (typeof document === "undefined") return {};
+  const style = getComputedStyle(document.documentElement);
+  const token = (name: string, fallback: string) => style.getPropertyValue(name).trim() || fallback;
+  return {
+    accent: token("--color-accent", "#4c8dff"),
+    accentInk: token("--color-accent-contrast", "#ffffff"),
+    surface: token("--color-elevated", token("--color-layer-1", "#16191d")),
+    ink: token("--color-text-primary", "#e7ebf0"),
+    muted: token("--color-text-muted", "#96a0ab"),
+    line: token("--color-border-subtle", "rgba(255,255,255,.14)"),
+    field: token("--color-canvas", "rgba(255,255,255,.05)"),
+    radius: token("--radius-row", "10px"),
+    font: token("--font-sans", "ui-sans-serif, system-ui, sans-serif"),
+  };
+}
+
 const RECORDING_INTERVAL_MS = 700;
 const RECORDING_MAX_FRAMES = 600;
 
@@ -189,7 +212,7 @@ export function useBrowserTabs(host: BrowserHost): BrowserController {
       }
       setMessage(null);
       try {
-        await api.invoke(tabId, "startPick", [{ accent: "#4c8dff" }]);
+        await api.invoke(tabId, "startPick", [pageTheme()]);
         setAnnotatingTabId(tabId);
         picker.current = window.setInterval(() => {
           void api

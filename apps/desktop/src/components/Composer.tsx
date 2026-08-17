@@ -15,7 +15,12 @@ import {
   X,
   MousePointerClick,
 } from "lucide-react";
-import { isAnnotationAttachment } from "../browserAnnotation";
+import {
+  isAnnotationAttachment,
+  isAnnotationBlock,
+  parseAnnotationBlock,
+  type PendingAnnotation,
+} from "../browserAnnotation";
 import { FileIcon } from "./FileIcon";
 import {
   bridge,
@@ -256,6 +261,11 @@ export function Composer({
   const [contextReferences, setContextReferences] = useState<ChatContextReference[]>(
     () => initialDraft?.contextReferences ?? [],
   );
+  // Browser annotations live beside the draft, not inside it, and rejoin the
+  // text on send. They are deliberately not persisted with the draft: the tab
+  // they point at belongs to this session.
+  const [annotations, setAnnotations] = useState<PendingAnnotation[]>([]);
+  const annotationSequence = useRef(0);
   const [attachmentError, setAttachmentError] = useState("");
   const providerCatalogLoads = useRef(new Set<RuntimeId>());
   const [nativeActionsByKey, setNativeActionsByKey] = useState<
@@ -380,7 +390,10 @@ export function Composer({
     (document.documentElement.dataset.motion === "none" ||
       window.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
   const draftPresent =
-    Boolean(prompt.trim()) || attachments.length > 0 || contextReferences.length > 0;
+    Boolean(prompt.trim()) ||
+    attachments.length > 0 ||
+    contextReferences.length > 0 ||
+    annotations.length > 0;
 
   useEffect(() => {
     onDraftChangeRef.current = onDraftChange;
@@ -676,6 +689,17 @@ export function Composer({
     const textarea = textareaRef.current;
     const start = textarea?.selectionStart ?? prompt.length;
     const end = textarea?.selectionEnd ?? start;
+    // A browser annotation is context, not prose: it becomes a chip like an
+    // attachment and rejoins the message on send, instead of dropping a block
+    // of markup into the middle of whatever the user was typing.
+    if (isAnnotationBlock(insertRequest.text)) {
+      annotationSequence.current += 1;
+      const annotation = parseAnnotationBlock(insertRequest.text, annotationSequence.current);
+      queueMicrotask(() => setAnnotations((current) => [...current, annotation]));
+      onInsertHandled?.(insertRequest.id);
+      textarea?.focus();
+      return;
+    }
     const exactReference = /^@([^\s]+)\s*$/.exec(insertRequest.text)?.[1];
     const attachment = exactReference ? projectReference(exactReference, contextIndex) : null;
     if (attachment) {
@@ -1146,7 +1170,10 @@ export function Composer({
   const submit = async () => {
     const trimmed = prompt.trim();
     if (
-      (!trimmed && attachments.length === 0 && contextReferences.length === 0) ||
+      (!trimmed &&
+        attachments.length === 0 &&
+        contextReferences.length === 0 &&
+        annotations.length === 0) ||
       !activeModel ||
       sendDisabled ||
       sending ||
@@ -1159,6 +1186,7 @@ export function Composer({
     const submittedDraft = trimmed;
     const submittedAttachments = attachments;
     const submittedContextReferences = contextReferences;
+    const submittedAnnotations = annotations;
     let draftCleared = false;
     const restoreDraft = () => {
       setPrompt((current) => (current.trim() ? current : submittedDraft));
@@ -1166,6 +1194,7 @@ export function Composer({
       setContextReferences((current) =>
         current.length > 0 ? current : submittedContextReferences,
       );
+      setAnnotations((current) => (current.length > 0 ? current : submittedAnnotations));
     };
     // Picker attachments and committed @references share one plain-text
     // context block. Providers retain the same path context, while the
@@ -1200,7 +1229,10 @@ export function Composer({
           .map((reference) => `- @${reference.sourceTitle}`)
           .join("\n")}`
       : "";
-    const outgoing = [trimmed, attachmentBlock, chatReferenceBlock].filter(Boolean).join("\n\n");
+    const annotationBlock = submittedAnnotations.map((entry) => entry.raw).join("\n\n");
+    const outgoing = [trimmed, attachmentBlock, chatReferenceBlock, annotationBlock]
+      .filter(Boolean)
+      .join("\n\n");
     try {
       const cachedNativeAction = completedNativeAction(trimmed, nativeActions);
       const builtInAction = codexGoalAction(trimmed, runtime);
@@ -1235,6 +1267,7 @@ export function Composer({
       setPrompt("");
       setAttachments([]);
       setContextReferences([]);
+      setAnnotations([]);
       draftCleared = true;
       const accepted = await onSend({
         prompt: outgoing,
@@ -1598,6 +1631,34 @@ export function Composer({
                       draftTouchedRef.current = true;
                       setContextReferences((current) =>
                         current.filter((item) => item.id !== reference.id),
+                      );
+                    }}
+                  >
+                    <X aria-hidden="true" />
+                  </button>
+                </Tooltip>
+              </div>
+            ))}
+            {annotations.map((annotation) => (
+              <div
+                className="composer-attachment composer-annotation"
+                key={`annotation-${annotation.id}`}
+                title={annotation.note || annotation.origin}
+              >
+                <MousePointerClick className="file-type-icon" aria-hidden="true" />
+                <span className="composer-annotation-copy">
+                  <strong>{annotation.label}</strong>
+                  <small>{annotation.note || annotation.origin || "Marked on the page"}</small>
+                </span>
+                <Tooltip label="Remove annotation" placement="top">
+                  <button
+                    className="composer-attachment-remove"
+                    type="button"
+                    aria-label={`Remove annotation ${annotation.label}`}
+                    onClick={() => {
+                      draftTouchedRef.current = true;
+                      setAnnotations((current) =>
+                        current.filter((item) => item.id !== annotation.id),
                       );
                     }}
                   >

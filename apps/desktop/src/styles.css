@@ -16737,6 +16737,39 @@ button.explain-fallback-step:hover .explain-fallback-role {
 .composer-attachment--annotation .file-type-icon {
   color: var(--color-accent);
 }
+/* A marked element waiting to be sent: the element on top, where it came from
+   or what was said about it underneath. Wider than a file chip because the
+   second line is the whole point. */
+.composer-annotation {
+  align-items: flex-start;
+  max-width: 320px;
+  padding-block: 6px;
+  border-color: color-mix(in srgb, var(--color-accent) 55%, transparent);
+  background: color-mix(in srgb, var(--color-accent) 8%, transparent);
+}
+.composer-annotation .file-type-icon {
+  margin-top: 1px;
+  color: var(--color-accent);
+}
+.composer-annotation-copy {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+.composer-annotation-copy strong {
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-annotation-copy small {
+  overflow: hidden;
+  color: var(--color-text-muted);
+  font-size: 11px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* Browser settings: sites holding sign-in state. Quiet rows, no card. */
 .browser-sites-header {

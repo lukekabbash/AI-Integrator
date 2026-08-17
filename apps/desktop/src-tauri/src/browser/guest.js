@@ -259,21 +259,31 @@
               background:rgba(76,141,255,.10);pointer-events:none}
       svg{position:fixed;inset:0;width:100vw;height:100vh;pointer-events:none}
       path{fill:none;stroke:var(--accent,#4c8dff);stroke-width:3;stroke-linecap:round;stroke-linejoin:round}
-      .note{position:fixed;z-index:2;width:280px;padding:10px;border-radius:10px;pointer-events:auto;
+      .note{position:fixed;z-index:2;width:296px;padding:12px;pointer-events:auto;
+            border-radius:var(--radius,12px);
             background:var(--surface,#16191d);color:var(--ink,#e7ebf0);
             border:1px solid var(--line,rgba(255,255,255,.14));
-            box-shadow:0 12px 34px rgba(0,0,0,.32);font:12px/1.45 ui-sans-serif,system-ui,sans-serif}
-      .note b{display:block;margin-bottom:6px;font-size:10px;letter-spacing:.06em;text-transform:uppercase;
+            box-shadow:0 1px 2px rgba(0,0,0,.10),0 18px 44px rgba(0,0,0,.28);
+            font:12px/1.45 var(--font,ui-sans-serif,system-ui,sans-serif)}
+      .note b{display:block;margin-bottom:8px;font-size:10px;letter-spacing:.07em;text-transform:uppercase;
               font-weight:650;color:var(--muted,#96a0ab)}
-      .note textarea{width:100%;min-height:64px;padding:7px 8px;border-radius:7px;resize:vertical;
+      .note textarea{width:100%;min-height:68px;padding:8px 9px;border-radius:calc(var(--radius,12px) - 4px);
+                     resize:vertical;box-sizing:border-box;
                      background:var(--field,rgba(255,255,255,.05));color:inherit;
                      border:1px solid var(--line,rgba(255,255,255,.14));font:inherit}
-      .note textarea:focus{outline:none;border-color:var(--accent,#4c8dff)}
-      .note .row{margin-top:8px;display:flex;gap:6px;justify-content:flex-end}
-      .note button{padding:5px 10px;border-radius:7px;border:1px solid var(--line,rgba(255,255,255,.14));
-                   background:transparent;color:inherit;font:inherit;font-size:11px;cursor:pointer}
-      .note button.primary{background:var(--accent,#4c8dff);border-color:transparent;color:#fff;font-weight:600}
-      .note small{display:block;margin-top:6px;color:var(--muted,#96a0ab);font-size:10px}
+      .note textarea::placeholder{color:var(--muted,#96a0ab)}
+      .note textarea:focus{outline:none;border-color:var(--accent,#4c8dff);
+                           box-shadow:0 0 0 3px color-mix(in srgb,var(--accent,#4c8dff) 22%,transparent)}
+      .note .row{margin-top:10px;display:flex;gap:6px;justify-content:flex-end}
+      .note button{padding:6px 12px;border-radius:calc(var(--radius,12px) - 5px);
+                   border:1px solid var(--line,rgba(255,255,255,.14));
+                   background:transparent;color:inherit;font:inherit;font-size:11px;font-weight:550;
+                   cursor:pointer;transition:background-color .14s ease,border-color .14s ease}
+      .note button:hover{background:color-mix(in srgb,var(--ink,#e7ebf0) 8%,transparent)}
+      .note button.primary{background:var(--accent,#4c8dff);border-color:transparent;
+                           color:var(--accent-ink,#fff);font-weight:600}
+      .note button.primary:hover{filter:brightness(1.06)}
+      .note small{display:block;margin-top:8px;color:var(--muted,#96a0ab);font-size:10px}
     </style><svg><g id="strokes"></g></svg><div id="marks"></div>`;
     document.documentElement.appendChild(overlayHost);
     return overlayRoot;
@@ -297,8 +307,35 @@
       const tag = document.createElement("div");
       tag.className = "label";
       tag.textContent = label;
-      tag.style.cssText = `left:${rect.left}px;top:${Math.max(0, rect.top - 20)}px`;
+      // Above the element, or under it when the element is near the top of the
+      // viewport — never across the thing the user is trying to look at.
+      const above = rect.top >= 26;
+      tag.style.cssText = `left:${Math.max(4, rect.left)}px;top:${
+        above ? rect.top - 22 : Math.min(window.innerHeight - 22, rect.bottom + 4)
+      }px`;
       marks.appendChild(tag);
+    }
+  }
+
+  /**
+   * The host resolves the app's own tokens and passes them in; the overlay
+   * carries them so the picker and its note box match the app rather than a
+   * fixed dark palette that reads as someone else's UI on a light theme.
+   */
+  function applyTheme(theme) {
+    if (!overlayHost || !theme) return;
+    for (const [key, custom] of [
+      ["accent", "--accent"],
+      ["accentInk", "--accent-ink"],
+      ["surface", "--surface"],
+      ["ink", "--ink"],
+      ["muted", "--muted"],
+      ["line", "--line"],
+      ["field", "--field"],
+      ["radius", "--radius"],
+      ["font", "--font"],
+    ]) {
+      if (theme[key]) overlayHost.style.setProperty(custom, theme[key]);
     }
   }
 
@@ -312,15 +349,19 @@
       <textarea placeholder="What should change here?"></textarea>
       <div class="row"><button data-cancel>Cancel</button><button class="primary" data-attach>Attach</button></div>
       <small>Enter attaches · Shift+Enter for a new line · Esc cancels</small>`;
-    const top = Math.min(window.innerHeight - 190, Math.max(8, rect.bottom + 10));
-    const left = Math.min(window.innerWidth - 296, Math.max(8, rect.left));
+    // Under the element by preference, above it when the element sits low
+    // enough that the box would be cut off, and never off either edge.
+    const height = 196;
+    const width = 296;
+    const below = rect.bottom + 10;
+    const top =
+      below + height <= window.innerHeight - 8
+        ? below
+        : Math.max(8, Math.min(rect.top - height - 10, window.innerHeight - height - 8));
+    const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
     note.style.top = `${top}px`;
     note.style.left = `${left}px`;
-    if (theme?.surface) note.style.setProperty("--surface", theme.surface);
-    if (theme?.ink) note.style.setProperty("--ink", theme.ink);
-    if (theme?.muted) note.style.setProperty("--muted", theme.muted);
-    if (theme?.line) note.style.setProperty("--line", theme.line);
-    if (theme?.field) note.style.setProperty("--field", theme.field);
+    applyTheme(theme);
     root.getElementById("marks").appendChild(note);
     overlayHost.style.pointerEvents = "auto";
     const textarea = note.querySelector("textarea");
@@ -460,7 +501,7 @@
     startPick(theme) {
       api.cancelPick();
       const root = ensureOverlay();
-      if (theme?.accent) overlayHost.style.setProperty("--accent", theme.accent);
+      applyTheme(theme);
       overlayHost.style.pointerEvents = "auto";
       overlayHost.style.cursor = "crosshair";
       const marks = root.getElementById("marks");
