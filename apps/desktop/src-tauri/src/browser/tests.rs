@@ -266,6 +266,44 @@ fn consent_dialogs_are_matched_by_vendor_not_by_words() {
 }
 
 #[test]
+fn a_page_dialog_is_answered_rather_than_left_to_block() {
+    // `prompt` blocks the page's main thread, and a child webview has no dialog
+    // UI to unblock it: the tab froze outright and every later call timed out
+    // until it was navigated away. All three are replaced with stubs that
+    // record the question and answer it, the same way `window.open` is
+    // replaced — a page can call `prompt` for entirely ordinary reasons.
+    for stub in ["window.alert =", "window.confirm =", "window.prompt ="] {
+        assert!(
+            GUEST_RUNTIME.contains(stub),
+            "the guest still lets {stub} block"
+        );
+    }
+    assert!(GUEST_RUNTIME.contains("dialogs: takeDialogs()"));
+}
+
+#[test]
+fn every_verb_answers_for_the_mechanism_the_page_actually_uses() {
+    // Each of these is a case where the obvious implementation reports success
+    // over a page that did not move.
+    //
+    // A <select> has a value but throws on the input setter; typing at one
+    // chooses the option instead.
+    assert!(GUEST_RUNTIME.contains("element instanceof HTMLSelectElement"));
+    // A printable key inserts no character of its own.
+    assert!(GUEST_RUNTIME.contains("insertText(element, typed)"));
+    assert!(GUEST_RUNTIME.contains("key === \"Space\" ? \" \" : key"));
+    // HTML5 drag-and-drop never sees a pointer, so both are performed.
+    assert!(GUEST_RUNTIME.contains("function dragSequence("));
+    assert!(GUEST_RUNTIME.contains("dragstart"));
+    assert!(GUEST_RUNTIME.contains("kind: html5 ? \"html5-drag\" : \"pointer-drag\""));
+    // A CSS :hover menu cannot be opened by any event; say so rather than
+    // reporting a hover that did nothing.
+    assert!(GUEST_RUNTIME.contains("cssHoverOnly"));
+    // A snapshot that stops at an iframe border reports an empty page.
+    assert!(GUEST_RUNTIME.contains("function describeFrames("));
+}
+
+#[test]
 fn guest_runtime_exposes_every_method_the_host_may_call() {
     // The dispatcher allowlist and the runtime must not drift apart.
     for method in [

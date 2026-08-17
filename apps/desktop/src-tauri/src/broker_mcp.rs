@@ -256,7 +256,7 @@ fn browser_tools(role: &str) -> Vec<Value> {
         }),
         json!({
             "name": "browser_snapshot",
-            "description": "Read a page before acting on it: url, title, viewport, visible text, and the interactive elements with a stable ref, role, name and selector for each. Use the returned refs with browser_click and browser_type instead of guessing selectors.",
+            "description": "Read a page before acting on it: url, title, viewport, visible text, and the interactive elements with a stable ref, role, name and selector for each. Descends into same-origin iframes and names the ones another origin owns. Use the returned refs with browser_click and browser_type instead of guessing selectors.",
             "annotations": tool_annotations(true, false),
             "inputSchema": text_schema(json!({
                 "tabId": { "type": "string" },
@@ -277,7 +277,7 @@ fn browser_tools(role: &str) -> Vec<Value> {
         }),
         json!({
             "name": "browser_hover",
-            "description": "Move the pointer over one element without pressing. Menus and tooltips that open on hover need this before their contents exist to click.",
+            "description": "Move the pointer over one element without pressing. Menus that open from a mouseenter listener need this. A menu drawn by a CSS :hover rule cannot be opened by anything but a real pointer, and the reply says so rather than reporting a hover that did nothing.",
             "annotations": tool_annotations(false, false),
             "inputSchema": text_schema(json!({
                 "tabId": { "type": "string" },
@@ -289,7 +289,7 @@ fn browser_tools(role: &str) -> Vec<Value> {
         }),
         json!({
             "name": "browser_type",
-            "description": "Type text into one field. Target it like browser_click; set clear to replace the current value.",
+            "description": "Type text into one field. Target it like browser_click; set clear to replace the current value. Aimed at a <select>, this chooses the option whose label, value or index matches the text instead — native dropdowns are drawn by the operating system and have nothing to click open.",
             "annotations": tool_annotations(false, true),
             "inputSchema": text_schema(json!({
                 "tabId": { "type": "string" },
@@ -322,7 +322,7 @@ fn browser_tools(role: &str) -> Vec<Value> {
         }),
         json!({
             "name": "browser_drag",
-            "description": "Press at one element or point, move, and release at another: reordering a list, moving a slider, drawing on a canvas. Targets take the same ref/selector/text as browser_click, or explicit x and y.",
+            "description": "Press at one element or point, move, and release at another: reordering a list, moving a slider, drawing on a canvas. Targets take the same ref/selector/text as browser_click, or explicit x and y. Performs both a pointer drag and, for a draggable element, the HTML5 drag-and-drop handshake, and the reply says which kind it was.",
             "annotations": tool_annotations(false, false),
             "inputSchema": text_schema(json!({
                 "tabId": { "type": "string" },
@@ -332,13 +332,14 @@ fn browser_tools(role: &str) -> Vec<Value> {
         }),
         json!({
             "name": "browser_wait_for",
-            "description": "Check whether a page condition holds yet: a selector or text being present, or the URL containing a fragment. Returns matched:false rather than blocking, so poll it between other work.",
+            "description": "Wait for a page condition: a selector or text being present, or the URL containing a fragment. Waits up to five seconds by default, re-checking as it goes; raise timeoutMs for a slow page, or pass 0 for a single check you poll yourself. Answers matched:false when the condition never held.",
             "annotations": tool_annotations(true, false),
             "inputSchema": text_schema(json!({
                 "tabId": { "type": "string" },
                 "selector": { "type": "string" },
                 "text": { "type": "string" },
-                "urlIncludes": { "type": "string" }
+                "urlIncludes": { "type": "string" },
+                "timeoutMs": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 5000 }
             }), &["tabId"]),
         }),
         json!({

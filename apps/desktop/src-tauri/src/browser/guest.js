@@ -222,7 +222,75 @@
 
   function centreOf(element) {
     const rect = element.getBoundingClientRect();
-    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    // An element inside an iframe measures against that frame's viewport, and
+    // the cursor overlay is drawn in this one. Without the frame's own offset
+    // the pointer lands somewhere near the top-left of the page instead of on
+    // the thing being clicked.
+    const offset = frameOffset(element);
+    return {
+      x: rect.left + rect.width / 2 + offset.x,
+      y: rect.top + rect.height / 2 + offset.y,
+    };
+  }
+
+  /** An element's nearest ancestors, for events that do not bubble. */
+  function ancestors(element, depth) {
+    const chain = [];
+    let node = element.parentElement;
+    while (node && chain.length < depth) {
+      chain.push(node);
+      node = node.parentElement;
+    }
+    return chain;
+  }
+
+  /**
+   * Whether a stylesheet on this page reveals something on `:hover` near this
+   * element. Read from the rules rather than guessed: a page whose menu is a
+   * CSS rule cannot be opened by any event, and the caller deserves to be told
+   * that outright instead of watching a hover appear to succeed.
+   */
+  function cssHoverOnly(element) {
+    const scope = [element, ...ancestors(element, 3)];
+    for (const sheet of document.styleSheets) {
+      let rules;
+      try {
+        rules = sheet.cssRules;
+      } catch {
+        // A cross-origin stylesheet cannot be read; it may or may not have one.
+        continue;
+      }
+      for (const rule of rules) {
+        const selector = rule.selectorText;
+        if (!selector || !selector.includes(":hover")) continue;
+        // Only the rules that make something appear count. A colour change on
+        // hover is not a menu, and reporting it would cry wolf on every link.
+        const text = rule.style?.cssText ?? "";
+        if (!/display|visibility|opacity|transform|height/.test(text)) continue;
+        const head = selector.split(":hover")[0].split(",").pop()?.trim();
+        if (!head) continue;
+        try {
+          if (scope.some((node) => node.matches(head))) return true;
+        } catch {
+          // An unparseable selector fragment is not evidence either way.
+        }
+      }
+    }
+    return false;
+  }
+
+  /** Where an element's document sits inside this one, if it is in a frame. */
+  function frameOffset(element) {
+    const view = element.ownerDocument?.defaultView;
+    if (!view || view === window) return { x: 0, y: 0 };
+    let offset = { x: 0, y: 0 };
+    let frame = view.frameElement;
+    while (frame) {
+      const box = frame.getBoundingClientRect();
+      offset = { x: offset.x + box.left, y: offset.y + box.top };
+      frame = frame.ownerDocument?.defaultView?.frameElement ?? null;
+    }
+    return offset;
   }
 
   /* --------------------------------------------------------- the user's turn */
@@ -323,6 +391,10 @@
       // How long ago a real hand touched this page. The host turns a fresh
       // number into `heldBy: "you"` so the tab strip can show it.
       userIdleMs: userIdle(),
+      // Anything the page tried to ask while that action was landing. Riding
+      // along on the reply means a caller learns about a confirm it triggered
+      // without having to know to go looking for one.
+      dialogs: takeDialogs(),
     };
   }
 
@@ -387,6 +459,54 @@
     else element.value = value;
   }
 
+  /* ---------------------------------------------------------------- dialogs */
+
+  /**
+   * `alert`, `confirm` and `prompt`, made answerable instead of fatal.
+   *
+   * A child webview has no dialog UI of its own, so the three of them behaved
+   * three different ways: alert resolved on its own, confirm always came back
+   * cancelled, and prompt blocked the page's main thread — which froze the tab
+   * outright, with every subsequent call timing out until the tab was
+   * navigated away. A page can call `prompt` for entirely ordinary reasons, so
+   * "do not visit such a page" is not an answer.
+   *
+   * The guest replaces all three with non-blocking stubs, the same way it
+   * already replaces `window.open`. Each call is recorded and answered from a
+   * policy the caller can set; the page carries on, and the reply to whatever
+   * action triggered the dialog says what was asked and what it was told.
+   */
+  const DIALOG_LIMIT = 8;
+  const dialogs = [];
+  /** What the next confirm/prompt is answered with. Accepting is the default
+   *  for confirm because a page that asks "are you sure" mid-flow is usually
+   *  asking about the thing the caller just did on purpose. */
+  let dialogPolicy = { confirm: true, prompt: null };
+
+  function recordDialog(kind, message, answer) {
+    dialogs.push({
+      kind,
+      message: String(message ?? "").slice(0, 500),
+      answer: typeof answer === "string" ? answer.slice(0, 200) : answer,
+    });
+    if (dialogs.length > DIALOG_LIMIT) dialogs.shift();
+    return answer;
+  }
+
+  window.alert = (message) => {
+    recordDialog("alert", message, true);
+  };
+  window.confirm = (message) => recordDialog("confirm", message, dialogPolicy.confirm !== false);
+  window.prompt = (message, fallback) => {
+    const answer = dialogPolicy.prompt ?? (fallback == null ? null : String(fallback));
+    return recordDialog("prompt", message, answer);
+  };
+  /** Dialogs since the last read, and then forgotten. */
+  function takeDialogs() {
+    if (!dialogs.length) return undefined;
+    return dialogs.splice(0, dialogs.length);
+  }
+
   /* -------------------------------------------------------- consent dialogs */
 
   /**
@@ -449,6 +569,182 @@
       return field;
     }
     return null;
+  }
+
+  /**
+   * Walks the page's iframes, appending what is inside a same-origin one to
+   * the element list and describing the rest.
+   *
+   * Refs inside a frame are ordinary refs — they resolve against that frame's
+   * document through the same WeakRef map — so a caller clicks them exactly as
+   * it clicks anything else. Coordinates are offset by the frame's own
+   * position, so a rect means the same thing wherever it came from.
+   */
+  function describeFrames(elements, limit) {
+    const frames = [];
+    for (const frame of document.querySelectorAll("iframe,frame")) {
+      if (!visible(frame)) continue;
+      const box = frame.getBoundingClientRect();
+      const entry = {
+        ref: refFor(frame),
+        src: frame.getAttribute("src") ?? "",
+        name: frame.getAttribute("name") ?? frame.getAttribute("title") ?? "",
+        rect: {
+          x: Math.round(box.x),
+          y: Math.round(box.y),
+          width: Math.round(box.width),
+          height: Math.round(box.height),
+        },
+        readable: false,
+      };
+      let inner = null;
+      try {
+        // Cross-origin access throws rather than returning null, and it throws
+        // on the property read itself.
+        inner = frame.contentDocument;
+      } catch {
+        inner = null;
+      }
+      if (inner) {
+        entry.readable = true;
+        entry.title = inner.title || undefined;
+        for (const element of inner.querySelectorAll(INTERACTIVE)) {
+          if (elements.length >= limit) break;
+          if (!visible(element)) continue;
+          const described = describe(element);
+          described.rect.x += entry.rect.x;
+          described.rect.y += entry.rect.y;
+          described.frame = entry.ref;
+          elements.push(described);
+        }
+        const text = (inner.body?.innerText ?? "").trim();
+        if (text) entry.text = text.length > 4000 ? `${text.slice(0, 4000)}…` : text;
+      } else {
+        entry.note =
+          "another origin owns this frame, so nothing inside it can be read or clicked from here";
+      }
+      frames.push(entry);
+      if (frames.length >= 8) break;
+    }
+    return frames;
+  }
+
+  /** The draggable ancestor of an element, if this is an HTML5 drag source. */
+  function draggableFrom(element) {
+    const draggable = element.closest?.("[draggable='true'],[draggable]");
+    return draggable?.draggable ? draggable : null;
+  }
+
+  /**
+   * The HTML5 drag-and-drop handshake, with one DataTransfer carried through
+   * it the way the browser would.
+   *
+   * `dragover` must be cancelled for a drop to be allowed — that is the
+   * protocol, and a page that forgets it is a page that cannot be dropped on
+   * by a real mouse either. Calling `preventDefault` on the page's behalf
+   * would make a broken target look like a working one, so the drop is only
+   * dispatched when the target actually accepts.
+   */
+  function dragSequence(source, over, base, start, end) {
+    const data = new DataTransfer();
+    data.effectAllowed = "all";
+    const event = (type, point, cancelable = true) =>
+      new DragEvent(type, { ...base(point, 1), cancelable, dataTransfer: data });
+    source.dispatchEvent(event("dragstart", start, false));
+    const destination = over ?? source;
+    destination.dispatchEvent(event("dragenter", end));
+    const dragover = event("dragover", end);
+    const accepted = !destination.dispatchEvent(dragover);
+    if (accepted) destination.dispatchEvent(event("drop", end));
+    source.dispatchEvent(event("dragend", end, false));
+    return accepted;
+  }
+
+  /**
+   * Picks an option in a dropdown by its label, its value, or its position.
+   *
+   * Native select menus are drawn by the operating system, so there is nothing
+   * on the page to click open and no list to click inside — the only honest
+   * way to work one is to set the selection and fire the events a page listens
+   * for.
+   */
+  function chooseOption(select, wanted) {
+    const text = String(wanted ?? "").trim();
+    const lower = text.toLowerCase();
+    const options = [...select.options];
+    const index = Number.parseInt(text, 10);
+    const match =
+      options.find((option) => option.value === text) ??
+      options.find((option) => option.label.trim().toLowerCase() === lower) ??
+      options.find((option) => option.text.trim().toLowerCase().includes(lower)) ??
+      (/^\d+$/.test(text) ? options[index] : undefined);
+    if (!match) {
+      return err(
+        "not-found",
+        `no option matched "${text}". This dropdown offers: ${options
+          .map((option) => option.text.trim())
+          .filter(Boolean)
+          .slice(0, 20)
+          .join(", ")}`,
+      );
+    }
+    agentCursor(centreOf(select), `choose “${match.text.trim()}”`);
+    agentTap();
+    select.value = match.value;
+    select.dispatchEvent(new Event("input", { bubbles: true }));
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    return ok({
+      chose: match.text.trim(),
+      value: match.value,
+      selectedIndex: select.selectedIndex,
+      ...pageState(),
+    });
+  }
+
+  /** The `code` for a key: the physical key, not the character it produces. */
+  function keyCode(key) {
+    if (key === " " || key === "Space") return "Space";
+    if (key.length !== 1) return key;
+    if (/[a-z]/i.test(key)) return `Key${key.toUpperCase()}`;
+    if (/[0-9]/.test(key)) return `Digit${key}`;
+    return key;
+  }
+
+  /** Modifiers that turn a keypress into a shortcut rather than a character. */
+  function isChording(modifier) {
+    return modifier === "Control" || modifier === "Alt" || modifier === "Meta";
+  }
+
+  /**
+   * Writes one character into whatever is focused, the way the browser would
+   * have if the key had been real. Synthesized keys run no default action, so
+   * without this a printable keypress is a sound with no effect.
+   */
+  function insertText(element, text) {
+    if (element.contentEditable === "true") {
+      element.textContent = `${element.textContent ?? ""}${text}`;
+    } else if ("value" in element && typeof element.value === "string") {
+      const at = element.selectionStart;
+      const to = element.selectionEnd;
+      const current = element.value;
+      if (typeof at === "number" && typeof to === "number") {
+        setValue(element, current.slice(0, at) + text + current.slice(to));
+        const caret = at + text.length;
+        try {
+          element.setSelectionRange(caret, caret);
+        } catch {
+          // Number and email inputs refuse a selection range; the value stuck.
+        }
+      } else {
+        setValue(element, current + text);
+      }
+    } else {
+      return false;
+    }
+    element.dispatchEvent(
+      new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }),
+    );
+    return true;
   }
 
   /** The events a framework-backed field needs to believe a value changed. */
@@ -903,8 +1199,13 @@
     },
 
     /**
-     * Moves the pointer over an element without pressing. Menus that open on
-     * hover need this, and there was no way to ask for it.
+     * Moves the pointer over an element without pressing.
+     *
+     * This reaches a menu that listens for `mouseenter` and cannot reach one
+     * that is drawn by a CSS `:hover` rule — that state belongs to the real
+     * pointer, and no event a page can be sent will turn it on. The two look
+     * identical from outside, so the reply says which kind this element is
+     * rather than reporting success over a menu that never opened.
      */
     hover(target) {
       const element = resolve(target);
@@ -914,11 +1215,29 @@
       const point = centreOf(element);
       agentCursor(point, "hover");
       const base = { bubbles: true, cancelable: true, composed: true, clientX: point.x, clientY: point.y };
-      element.dispatchEvent(new PointerEvent("pointerover", { ...base, pointerId: 1, isPrimary: true }));
-      element.dispatchEvent(new MouseEvent("mouseover", base));
-      element.dispatchEvent(new PointerEvent("pointermove", { ...base, pointerId: 1, isPrimary: true }));
-      element.dispatchEvent(new MouseEvent("mousemove", base));
-      return ok({ hovered: describe(element), ...pageState() });
+      const chain = [element, ...ancestors(element, 4)];
+      // Menus usually open from a listener on the wrapper rather than on the
+      // link itself, and mouseenter does not bubble, so each is told directly.
+      for (const node of chain) {
+        node.dispatchEvent(new PointerEvent("pointerover", { ...base, pointerId: 1, isPrimary: true }));
+        node.dispatchEvent(new MouseEvent("mouseover", base));
+        node.dispatchEvent(new MouseEvent("mouseenter", { ...base, bubbles: false }));
+        node.dispatchEvent(new PointerEvent("pointermove", { ...base, pointerId: 1, isPrimary: true }));
+        node.dispatchEvent(new MouseEvent("mousemove", base));
+      }
+      return ok({
+        hovered: describe(element),
+        ...(cssHoverOnly(element)
+          ? {
+              cssHoverOnly: true,
+              note:
+                "this element's menu opens from a CSS :hover rule, which only a real pointer can set. " +
+                "Nothing here can open it — read the markup with browser_evaluate, or click the trigger " +
+                "if it has one.",
+            }
+          : {}),
+        ...pageState(),
+      });
     },
 
     snapshot(options = {}) {
@@ -937,6 +1256,12 @@
         elements.push(describe(element));
         if (elements.length >= limit) break;
       }
+      // Editors, payment fields and half the widgets on the web live in an
+      // iframe, and a snapshot that stops at its border reports an empty page
+      // with a rectangle in it. Same-origin frames are walked; cross-origin
+      // ones are named and marked, because nothing can read into them and
+      // saying so beats leaving a hole.
+      const frames = consent ? [] : describeFrames(elements, limit);
       const source = consent ? consent.root : document.body;
       const text = (source?.innerText ?? "").replace(/\n{3,}/g, "\n\n");
       return ok({
@@ -955,6 +1280,7 @@
             }
           : {}),
         elements,
+        ...(frames.length ? { frames } : {}),
         text: text.length > 20000 ? `${text.slice(0, 20000)}…` : text,
       });
     },
@@ -998,6 +1324,11 @@
       const element = target ? resolve(target) : document.activeElement;
       if (element === STALE) return err("stale-ref", STALE_MESSAGE);
       if (!element) return err("not-found", "No element matched that target.");
+      // A <select> has a value but no text to type into it, and setting that
+      // value through the input setter threw "Illegal invocation". Typing at a
+      // dropdown means choosing the option that reads like what was typed,
+      // which is what a person does with a dropdown anyway.
+      if (element instanceof HTMLSelectElement) return chooseOption(element, text);
       if (!("value" in element) && element.contentEditable !== "true") {
         return err("not-editable", "That element does not accept text.");
       }
@@ -1023,9 +1354,13 @@
     press(key, modifiers = []) {
       const element = document.activeElement ?? document.body;
       const delay = agentCursor(centreOf(element), [...modifiers, key].join("+"));
+      // "Space" is what a caller naturally writes and what `code` calls the
+      // key; `key` itself is a single space, and getting that wrong meant
+      // pressing Space typed nothing at all.
+      const typed = key === "Space" ? " " : key;
       const init = {
-        key,
-        code: key.length === 1 ? `Key${key.toUpperCase()}` : key,
+        key: typed,
+        code: keyCode(key),
         bubbles: true,
         cancelable: true,
         ctrlKey: modifiers.includes("Control"),
@@ -1042,9 +1377,15 @@
         // element — checking `instanceof HTMLFormElement` meant this never
         // fired for the input a person would actually be typing in.
         if (key === "Enter" && delivered && !modifiers.length) submitFrom(element);
+        // Nor does a synthesized key insert its own character. A printable one
+        // pressed into a field has to be written in, or `press("Space")`
+        // reports success over a field that never changed.
+        else if (delivered && typed.length === 1 && !modifiers.some(isChording)) {
+          insertText(element, typed);
+        }
         element.dispatchEvent(new KeyboardEvent("keyup", init));
       });
-      return ok({ key, ...pageState() });
+      return ok({ key, value: readValue(element), ...pageState() });
     },
 
     /**
@@ -1078,10 +1419,20 @@
         isPrimary: true,
       });
 
+      // Two entirely separate mechanisms wear the word "drag". A slider or a
+      // canvas listens for pointer movement; a list built on the HTML5
+      // drag-and-drop API listens for dragstart/dragover/drop and never sees a
+      // pointer at all — which is why reordering columns reported success and
+      // left them exactly as they were. A page cannot be asked which it uses,
+      // so both are performed: the pointer path for one, the drag events for
+      // the other, and each ignores the events meant for the other.
+      const html5 = draggableFrom(source);
+
       schedule(agentCursor(start, "drag"), () => {
         agentTap();
         source.dispatchEvent(new PointerEvent("pointerdown", base(start, 1)));
         source.dispatchEvent(new MouseEvent("mousedown", base(start, 1)));
+        if (html5) dragSequence(html5, target ?? document.elementFromPoint(end.x, end.y), base, start, end);
         const hop = (index) => {
           const ratio = index / steps;
           const at = {
@@ -1106,7 +1457,13 @@
         };
         hop(1);
       });
-      return ok({ from: describe(source), to: target ? describe(target) : end });
+      return ok({
+        from: describe(source),
+        to: target ? describe(target) : end,
+        // Which mechanism was used, so a caller reading "moved nothing" knows
+        // whether to look at the page or at the gesture.
+        kind: html5 ? "html5-drag" : "pointer-drag",
+      });
     },
 
     scroll(target, deltaX = 0, deltaY = 0) {

@@ -1469,6 +1469,14 @@ fn scoped_delegation(
     Ok(delegation)
 }
 
+/// How long `browser_wait_for` waits for its condition before answering, and
+/// the ceiling a caller may raise it to. The page is asked afresh each time
+/// rather than being asked to block, so a slow wait costs one small call every
+/// quarter second and never holds the tab.
+const WAIT_FOR_DEFAULT_MS: u64 = 5_000;
+const WAIT_FOR_MAX_MS: u64 = 30_000;
+const WAIT_FOR_POLL: Duration = Duration::from_millis(250);
+
 /// Routes a `browser_*` tool to the task's own browser tabs. Tabs are scoped
 /// to the task, so an agent can never reach another task's pages, and every
 /// action goes through the same guest runtime the user's toolbar uses.
@@ -1618,7 +1626,35 @@ async fn browser_tool(
             let delta_y = params.get("deltaY").and_then(Value::as_f64).unwrap_or(0.0);
             call("scroll", vec![target(), json!(delta_x), json!(delta_y)]).await
         }
-        "browser_wait_for" => call("waitFor", vec![params.clone()]).await,
+        "browser_wait_for" => {
+            // Waiting is what the name promises, and asking once was not it:
+            // a control that appears after five seconds could only be caught
+            // by a caller that knew to keep asking, and the guest cannot block
+            // for it — a page's main thread is where every other call lands.
+            // So the host does the waiting, and the page is asked afresh each
+            // time. A caller wanting the old single check passes timeoutMs 0.
+            let budget = params
+                .get("timeoutMs")
+                .and_then(Value::as_u64)
+                .unwrap_or(WAIT_FOR_DEFAULT_MS)
+                .min(WAIT_FOR_MAX_MS);
+            let deadline = std::time::Instant::now() + Duration::from_millis(budget);
+            loop {
+                let seen = call("waitFor", vec![params.clone()]).await?;
+                if seen.get("matched").and_then(Value::as_bool) == Some(true) {
+                    return Ok(seen);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Ok(json!({
+                        "matched": false,
+                        "waitedMs": budget,
+                        "note": "the condition never held. Raise timeoutMs if the page is slow, \
+                                 or take a snapshot to see what is actually there.",
+                    }));
+                }
+                tokio::time::sleep(WAIT_FOR_POLL).await;
+            }
+        }
         "browser_evaluate" => {
             let expression = text("expression")
                 .ok_or_else(|| IntegratorError::InvalidInput("expression is required".into()))?;

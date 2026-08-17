@@ -72,6 +72,20 @@ happen; it can never learn a credential. If the user has not allowed sign-ins on
 that origin the call returns `needs-user-approval`, they are asked, and the
 right move is to carry on with something else and try again later.
 
+Some things a page does cannot be reached by a synthesised event, and the
+tools say so rather than reporting success over a page that did not move:
+
+- A menu drawn by a CSS `:hover` rule belongs to the real pointer. `browser_hover`
+  reaches a `mouseenter` listener and marks `cssHoverOnly` when it cannot.
+- A native `<select>` is drawn by the operating system. `browser_type` aimed at
+  one chooses the matching option instead of typing into it.
+- HTML5 drag-and-drop never sees a pointer, so `browser_drag` performs both
+  that handshake and a pointer drag, and reports which it was.
+- `alert`, `confirm` and `prompt` are answered rather than shown — a child
+  webview has no dialog UI, and `prompt` would otherwise block the page's main
+  thread and freeze the tab. What was asked and what it was told ride back on
+  the reply that triggered it.
+
 `browser_focus` asks the app to show a tab and reports whether it landed:
 `focused: false` means the pane is closed or the user is in another chat. The
 tab is still yours to drive either way — a tab nothing is showing keeps a full

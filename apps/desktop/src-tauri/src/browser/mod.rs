@@ -17,7 +17,7 @@ use std::{
 };
 
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tauri::{
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize,
     Runtime, WebviewUrl,
@@ -336,35 +336,6 @@ pub(super) fn tab_webview_builder(
         builder = builder.data_directory(profile);
     }
     builder
-}
-
-/// Puts a tab's webview back inside the main window. Shared by the dock
-/// control and by a pop-out window closing, so both land in the same state.
-pub(super) fn dock_tab(
-    app: &AppHandle,
-    state: &Arc<BrowserTabs>,
-    id: &str,
-    label: &str,
-    target: &Url,
-) -> Result<(), CommandError> {
-    let window = app
-        .get_window("main")
-        .ok_or_else(|| unavailable("the main window is not available"))?;
-    window
-        .add_child(
-            tab_webview_builder(app, state, id, label, target),
-            parked().0,
-            parked().1,
-        )
-        .map_err(|error| unavailable(format!("could not dock the tab: {error}")))?;
-    state.update(id, |tab| {
-        tab.popped_out = false;
-        // The renderer re-places it as soon as it sees the change; until then
-        // a one-pixel webview in the corner is better than a stale rectangle.
-        tab.hidden = true;
-    });
-    emit_changed(app, state);
-    Ok(())
 }
 
 /// Creates a tab and registers it. Child webviews must be built off the main
