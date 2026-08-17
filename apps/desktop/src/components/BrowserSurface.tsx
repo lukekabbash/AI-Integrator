@@ -18,8 +18,11 @@ import { rememberBrowserVisit } from "./browserRecents";
 import { Tooltip } from "./Tooltip";
 import "./browserSurface.css";
 
-/** Width of the pane grip the tab steps aside for, matching .resize-handle. */
-const GRIP_WIDTH = 8;
+/** Room the overflow menu needs below the toolbar, in CSS pixels. */
+const MENU_CLEARANCE = 184;
+/** The couple of pixels the pane's hairline and drag pill occupy at the seam.
+ *  A native surface would paint over them, so the tab starts just inside. */
+const SEAM_CLEARANCE = 3;
 
 export interface BrowserSurfaceProps {
   tab: BrowserTab;
@@ -78,42 +81,12 @@ export function BrowserSurface({
     boundsRef.current = onBoundsChange;
   }, [onBoundsChange]);
 
-  // A drag anywhere in the window steps the tab aside until the pointer is
-  // released. The pane edge cannot keep up with a fast pointer, and the moment
-  // the cursor crosses onto a native surface the gesture is stranded: no more
-  // pointer moves, no pointerup, a handle left armed. Once out and once back is
-  // nothing like the per-frame blinking this used to do.
-  const [dragging, setDragging] = useState(false);
-  useEffect(() => {
-    const read = () => setDragging(document.body.dataset.resizing === "true");
-    read();
-    const observer =
-      typeof MutationObserver === "undefined" ? undefined : new MutationObserver(read);
-    observer?.observe(document.body, { attributeFilter: ["data-resizing"] });
-    return () => observer?.disconnect();
-  }, []);
-
-  // The pane's grab grip lives in its left few pixels, and a native surface
-  // paints above it — so with the page filling the pane there is nothing to
-  // take hold of. Rather than keep a standing gutter, the tab yields that
-  // strip only as the pointer comes near the edge, and takes it back when the
-  // pointer leaves. The approach is made across the transcript, which is
-  // ordinary HTML, so the moves arrive before the cursor reaches the page.
-  const [nearEdge, setNearEdge] = useState(false);
-  useEffect(() => {
-    const node = viewportRef.current;
-    if (!node || blank || popped) return;
-    const onMove = (event: PointerEvent) => {
-      const distance = node.getBoundingClientRect().left - event.clientX;
-      // Hysteresis: opening early and closing late keeps the edge from
-      // flickering when the pointer hovers right on the threshold.
-      setNearEdge((current) =>
-        current ? distance > -4 && distance < 40 : distance > 0 && distance < 18,
-      );
-    };
-    window.addEventListener("pointermove", onMove);
-    return () => window.removeEventListener("pointermove", onMove);
-  }, [blank, popped]);
+  // How much of the tab's top the open dropdown needs. A native surface paints
+  // above HTML, so a menu over the page would be invisible; while one is open
+  // the tab gives up this much of its top and the menu sits in real space. Held
+  // as a constant rather than measured, so opening the menu is one placement
+  // instead of a render, a measure and a second placement.
+  const menuInset = menuOpen ? MENU_CLEARANCE : 0;
 
   // Keep the native tab glued to this slot: observe the box, the scroll
   // ancestors and the window, and report physical pixels.
@@ -122,9 +95,8 @@ export function BrowserSurface({
     const onBounds = (rect: DOMRect | null) => boundsRef.current(rect);
     // A blank or popped-out tab has nothing worth showing here, and leaving
     // the native surface parked over the slot would bury the start page under
-    // an empty white page. A drag holds it off screen for the same reason the
-    // placeholder appears.
-    if (!node || blank || popped || dragging) {
+    // an empty white page.
+    if (!node || blank || popped) {
       boundsRef.current(null);
       return;
     }
@@ -144,12 +116,11 @@ export function BrowserSurface({
         onBounds(null);
         return;
       }
-      const inset = nearEdge ? GRIP_WIDTH : 0;
       const placed = new DOMRect(
-        rect.x + inset,
-        rect.y,
-        Math.max(1, rect.width - inset),
-        rect.height,
+        rect.x + SEAM_CLEARANCE,
+        rect.y + menuInset,
+        Math.max(1, rect.width - SEAM_CLEARANCE),
+        Math.max(1, rect.height - menuInset),
       );
       const key = `${Math.round(placed.x)}:${Math.round(placed.y)}:${Math.round(placed.width)}:${Math.round(placed.height)}`;
       if (key === last) return;
@@ -172,7 +143,7 @@ export function BrowserSurface({
       window.removeEventListener("scroll", report, true);
       onBounds(null);
     };
-  }, [blank, popped, dragging, nearEdge]);
+  }, [blank, popped, menuInset]);
 
   const submit = useCallback(
     (event: React.FormEvent) => {
@@ -191,7 +162,7 @@ export function BrowserSurface({
     <div className="browser-surface" data-popped={popped ? "true" : undefined}>
       <form className="browser-chrome" onSubmit={submit}>
         <div className="browser-chrome-history">
-          <Tooltip label="Back" placement="bottom">
+          <Tooltip label="Back" placement="top">
             <button
               type="button"
               className="icon-button subtle tiny"
@@ -201,7 +172,7 @@ export function BrowserSurface({
               <ArrowLeft aria-hidden="true" />
             </button>
           </Tooltip>
-          <Tooltip label="Forward" placement="bottom">
+          <Tooltip label="Forward" placement="top">
             <button
               type="button"
               className="icon-button subtle tiny"
@@ -211,7 +182,7 @@ export function BrowserSurface({
               <ArrowRight aria-hidden="true" />
             </button>
           </Tooltip>
-          <Tooltip label={tab.loading ? "Stop loading" : "Reload"} placement="bottom">
+          <Tooltip label={tab.loading ? "Stop loading" : "Reload"} placement="top">
             <button
               type="button"
               className="icon-button subtle tiny"
@@ -244,7 +215,7 @@ export function BrowserSurface({
               }
             }}
           />
-          <Tooltip label="Open in your system browser" placement="bottom">
+          <Tooltip label="Open in your system browser" placement="top">
             <button
               type="button"
               className="icon-button subtle tiny browser-address-external"
@@ -259,7 +230,7 @@ export function BrowserSurface({
           <Tooltip
             label={annotating ? "Cancel annotation" : "Annotate this page"}
             hint={annotating ? "Esc" : "Pick an element to send to the chat"}
-            placement="bottom"
+            placement="top"
           >
             <button
               type="button"
@@ -271,7 +242,7 @@ export function BrowserSurface({
               <MousePointerClick aria-hidden="true" />
             </button>
           </Tooltip>
-          <Tooltip label="Screenshot" hint="Attaches to the composer" placement="bottom">
+          <Tooltip label="Screenshot" hint="Attaches to the composer" placement="top">
             <button
               type="button"
               className="icon-button subtle tiny"
@@ -284,7 +255,7 @@ export function BrowserSurface({
           <Tooltip
             label={recording ? "Stop recording" : "Record"}
             hint={recording ? undefined : "Frames are captured locally"}
-            placement="bottom"
+            placement="top"
           >
             <button
               type="button"
@@ -299,7 +270,7 @@ export function BrowserSurface({
           </Tooltip>
           <Tooltip
             label={popped ? "Dock back into the pane" : "Pop out into its own window"}
-            placement="bottom"
+            placement="top"
           >
             <button
               type="button"
@@ -312,7 +283,7 @@ export function BrowserSurface({
             </button>
           </Tooltip>
           <div className="browser-more">
-            <Tooltip label="More" placement="bottom">
+            <Tooltip label="More" placement="top">
               <button
                 type="button"
                 className="icon-button subtle tiny"
@@ -324,7 +295,11 @@ export function BrowserSurface({
               </button>
             </Tooltip>
             {menuOpen ? (
-              <div className="browser-menu" role="menu" onMouseLeave={() => setMenuOpen(false)}>
+              <div
+                className="browser-menu"
+                role="menu"
+                onMouseLeave={() => setMenuOpen(false)}
+              >
                 <button
                   type="button"
                   role="menuitem"
@@ -404,11 +379,6 @@ export function BrowserSurface({
             >
               Dock it back
             </button>
-          </div>
-        ) : null}
-        {dragging && !popped && !blank ? (
-          <div className="browser-resizing" aria-hidden="true">
-            <span>{tab.title || tab.url.replace(/^https?:\/\//, "")}</span>
           </div>
         ) : null}
         {annotating && !popped ? (

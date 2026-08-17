@@ -15,14 +15,50 @@
 .work-pane.subagent-workspace-pane > .resize-handle--horizontal {
   height: 100%;
 }
-/* No standing seam between the transcript and the pane. The page behind it is
-   its own surface, so a full-height hairline only reads as a thick edge; the
-   shared grip — a short pill that scales up under the pointer — is the whole
-   divider, and it appears only when you go looking for it. The border keeps
-   its width so nothing shifts when it is not being drawn. */
+/* The seam between the transcript and the pane: one hairline, with the drag
+   pill centred on it. Both live in the row rather than inside the pane, because
+   a native browser surface always paints above HTML and would bury anything
+   drawn at the pane's own edge. The strip straddles the line so the pill has
+   room on both sides; the tab gives up those couple of pixels (SEAM_CLEARANCE
+   in BrowserSurface) so nothing covers them. */
+.work-pane-grip {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  /* Reaches out of the pane and over the transcript, so the strip straddles the
+     seam: eight pixels outside, two inside. */
+  left: -8px;
+  width: 10px;
+  z-index: 13;
+}
+.work-pane-grip::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 2px;
+  bottom: 0;
+  width: 1px;
+  background: var(--color-border-subtle);
+}
+.work-pane-grip > .resize-handle--horizontal {
+  right: 0;
+  left: 0;
+  width: auto;
+}
+/* Centre the shared pill on the hairline instead of in the strip. */
+.work-pane-grip > .resize-handle--horizontal::after {
+  left: auto;
+  right: 2px;
+  margin-left: 0;
+  margin-right: -1px;
+}
+
+/* The pane draws no border of its own; the hairline above is the whole seam.
+   It also stops clipping, so the grip can hang past its left edge — the
+   surfaces inside manage their own overflow. */
 .work-pane.subagent-workspace-pane {
   border-left-color: transparent;
-  transition: border-left-color var(--motion-fast) var(--ease-emphasized);
+  overflow: visible;
 }
 /* A tab an agent is driving. The dot breathes rather than blinks — it marks
    which page is moving on its own without pulling the eye off the work. */
@@ -61,6 +97,16 @@
   min-height: 38px;
   border-bottom: 1px solid var(--color-border-subtle);
 }
+/* While the pane slides open or shut its box narrows, but its contents keep
+   their full width and are clipped by the pane. Without this the toolbar and
+   the launcher reflow through every intermediate width, which reads as the
+   panel churning rather than moving. */
+.work-pane.subagent-workspace-pane > .work-pane-subheader,
+.work-pane.subagent-workspace-pane > .work-pane-content,
+.work-pane.subagent-workspace-pane > .work-pane-strip {
+  min-width: var(--work-pane-width, 460px);
+}
+
 .work-pane-content {
   position: relative;
   flex: 1 1 auto;

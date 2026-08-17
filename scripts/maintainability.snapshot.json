@@ -7,7 +7,7 @@
   "exceptions": [
     {
       "path": "apps/desktop/src/styles.css",
-      "maxLines": 16818
+      "maxLines": 16821
     },
     {
       "path": "apps/desktop/src-tauri/src/commands.rs",

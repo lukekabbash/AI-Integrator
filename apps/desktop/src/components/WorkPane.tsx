@@ -208,14 +208,19 @@ export function WorkPane({
         animate={{ opacity: present ? 1 : 0 }}
         transition={panelTransition}
       >
-        <ResizeHandle
-          axis="horizontal"
-          label="Resize work pane"
-          valueNow={Math.round(width)}
-          valueMin={WORK_PANE_MIN_WIDTH}
-          valueMax={maxWidth ? Math.round(maxWidth) : undefined}
-          onResize={onResize}
-        />
+        {/* The seam: one hairline with the drag pill centred on it. It hangs
+            past the pane's left edge into the row, because a native browser
+            surface paints above HTML and would bury anything drawn inside. */}
+        <div className="work-pane-grip">
+          <ResizeHandle
+            axis="horizontal"
+            label="Resize work pane"
+            valueNow={Math.round(width)}
+            valueMin={WORK_PANE_MIN_WIDTH}
+            valueMax={maxWidth ? Math.round(maxWidth) : undefined}
+            onResize={onResize}
+          />
+        </div>
         {!headerTarget ? strip : null}
         <div
           className="work-pane-subheader"

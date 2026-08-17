@@ -474,6 +474,9 @@ select:focus-visible,
   flex-direction: column;
 }
 .conversation-workspace-row {
+  /* Anchors the work pane's grip, which lives beside the pane rather than
+     inside it; see workPane.css. */
+  position: relative;
   min-width: 0;
   min-height: 0;
   flex: 1 1 auto;
