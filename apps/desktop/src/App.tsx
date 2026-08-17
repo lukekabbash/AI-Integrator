@@ -115,14 +115,6 @@ import {
 } from "./components/FileView";
 import { resolveExplainConfig, resolveExplainRoute } from "./explainSettings";
 import { resolveCommitMessageRoute } from "./commitMessageSettings";
-import { useKeybindings } from "./useKeybindings";
-import { KEYBINDINGS_SETTING } from "./components/KeybindingsSettings";
-import { detectMac, keycaps, readOverrides, resolveKeybindings } from "./keybindings";
-import {
-  ARROW_NAVIGATION_SETTING,
-  WRAP_NAVIGATION_SETTING,
-  focusRegion,
-} from "./spatialNavigation";
 import { decorateCommitMessage, readGitDecorationSettings, readPushForce } from "./gitDecoration";
 import { WorkPaneToggle, type WorkPaneLaunchKind } from "./components/WorkPaneToggle";
 // Eager on purpose: AnimatePresence must see a real motion component as its
@@ -1604,10 +1596,6 @@ export default function App() {
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
   const [screen, setScreen] = useState<Screen>(initialScreen);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
-  // Settings stays mounted behind the workspace, so the section it should show
-  // cannot be read from a prop on mount alone. Every request bumps this, and
-  // Settings re-reads the section whenever the number moves.
-  const [settingsSectionRequest, setSettingsSectionRequest] = useState(0);
   const [runtimeActionRequest, setRuntimeActionRequest] = useState<RuntimeActionRequest | null>(
     null,
   );
@@ -3431,6 +3419,31 @@ export default function App() {
     window.setTimeout(() => composer?.focus(), 0);
   };
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey)) return;
+      const key = event.key.toLowerCase();
+      if (key === "n") {
+        event.preventDefault();
+        void newTask();
+      } else if (key === "w" && activeFileTabPathRef.current) {
+        // Cmd/Ctrl+W closes the active canvas file tab; without one the
+        // shortcut keeps its native window meaning.
+        event.preventDefault();
+        closeFileTabRef.current(activeFileTabPathRef.current);
+      } else if (key === "k") {
+        event.preventDefault();
+        setSidebarCollapsed(false);
+        window.setTimeout(() => {
+          document.querySelector<HTMLButtonElement>(".sidebar-search-button")?.click();
+        }, 0);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProject?.id, nativeHost]);
+
   const sendTurn = async (
     input: ComposerTurnInput,
     options?: { resumeInterrupted?: boolean },
@@ -4249,22 +4262,6 @@ export default function App() {
     forkTask,
     updateProjectMetadata,
   };
-  // The rail advertises two shortcuts; read them from the same table the
-  // dispatcher uses so a rebind cannot leave the hint saying something else.
-  const storedKeybindings = localSettings[KEYBINDINGS_SETTING];
-  const shortcutHints = useMemo(() => {
-    const isMac = detectMac(navigator.platform || navigator.userAgent);
-    const table = new Map(
-      resolveKeybindings(readOverrides(storedKeybindings)).map((entry) => [
-        entry.command.id,
-        entry.binding,
-      ]),
-    );
-    return {
-      newChat: keycaps(table.get("navigation.newChat") ?? null, isMac),
-      searchChats: keycaps(table.get("navigation.searchChats") ?? null, isMac),
-    };
-  }, [storedKeybindings]);
   const handleSidebarSelectProject = useCallback((projectId: string) => {
     sidebarHandlersRef.current.selectProject(projectId);
   }, []);
@@ -4316,13 +4313,11 @@ export default function App() {
   const handleSidebarOpenSettings = useCallback(() => {
     setRuntimeActionRequest(null);
     setSettingsSection("general");
-    setSettingsSectionRequest((request) => request + 1);
     setScreen("settings");
   }, []);
   const handleSidebarOpenSettingsSection = useCallback((section: SettingsSection) => {
     setRuntimeActionRequest(null);
     setSettingsSection(section);
-    setSettingsSectionRequest((request) => request + 1);
     setScreen("settings");
   }, []);
   const handleSidebarOpenCapabilities = useCallback(
@@ -6484,74 +6479,9 @@ export default function App() {
         activeDestination={activeDestination}
         onResize={handleSidebarResize}
         sidebarMenuDirection={preferences.sidebarMenuDirection}
-        shortcutHints={shortcutHints}
-        arrowNavigation={localSettings[ARROW_NAVIGATION_SETTING] !== false}
-        wrapNavigation={localSettings[WRAP_NAVIGATION_SETTING] !== false}
       />
     </motion.div>
   );
-
-  // Every global shortcut lands here. A command with no entry is simply not
-  // dispatched, so the Settings list and the behavior cannot drift apart.
-  const selectAdjacentChat = (step: 1 | -1) => {
-    if (sidebarTasks.length === 0) return;
-    const current = sidebarTasks.findIndex((task) => task.id === snapshot.activeTaskId);
-    const next = current < 0 ? 0 : current + step;
-    const task = sidebarTasks[Math.min(Math.max(next, 0), sidebarTasks.length - 1)];
-    if (task && task.id !== snapshot.activeTaskId) handleSidebarSelectTask(task.id);
-  };
-  useKeybindings(localSettings[KEYBINDINGS_SETTING], {
-    "navigation.newChat": handleSidebarNewTask,
-    "navigation.nextChat": () => selectAdjacentChat(1),
-    "navigation.previousChat": () => selectAdjacentChat(-1),
-    "navigation.toggleSidebar": () => setSidebarCollapsed((value) => !value),
-    "navigation.searchChats": () => {
-      setScreen("workspace");
-      setSidebarCollapsed(false);
-      // The search modal is owned by the sidebar; opening it means pressing
-      // the same button the user would, once the sidebar has mounted.
-      window.setTimeout(
-        () => document.querySelector<HTMLButtonElement>(".sidebar-search-button")?.click(),
-        0,
-      );
-    },
-    "navigation.openScheduled": handleSidebarOpenScheduled,
-    "navigation.openSettings": handleSidebarOpenSettings,
-    "panes.focusSidebar": () => {
-      setScreen("workspace");
-      setSidebarCollapsed(false);
-      window.setTimeout(() => focusRegion("sidebar"), 0);
-    },
-    "panes.focusTranscript": () => {
-      setScreen("workspace");
-      window.setTimeout(() => focusRegion("transcript"), 0);
-    },
-    "panes.focusComposer": focusComposer,
-    "panes.focusWorkPane": () => {
-      setScreen("workspace");
-      setRightRailOpen(true);
-      // The tab strip when a surface is open, otherwise the rail's own tabs;
-      // either way the cursor lands on a strip Left and Right already walk.
-      window.setTimeout(() => {
-        if (!focusRegion("workPane")) focusRegion("rightRail");
-      }, 0);
-    },
-    "chat.stopTurn": () => void stopTurn(),
-    "chat.copyConversation": () => void copyConversation(),
-    "workPane.toggle": () => setRightRailOpen((value) => !value),
-    "workPane.review": () => openWorkPaneLaunch("review"),
-    "workPane.files": () => openWorkPaneLaunch("files"),
-    "workPane.agents": () => openWorkPaneLaunch("subagents"),
-    "workPane.browser": () => openWorkPaneLaunch("browser"),
-    "workPane.terminal": toggleTerminal,
-    "workPane.closeFile": () => {
-      // With no file open, Mod+W keeps its native window meaning.
-      const path = activeFileTabPathRef.current;
-      if (!path) return false;
-      closeFileTabRef.current(path);
-    },
-    "application.openKeybindings": () => handleSidebarOpenSettingsSection("keybindings"),
-  });
 
   return (
     <LazyMotion features={domMax} strict>
@@ -6760,7 +6690,6 @@ export default function App() {
                     onResetPreferences={resetTheme}
                     runtimeActionRequest={runtimeActionRequest}
                     initialSection={settingsSection}
-                    sectionRequest={settingsSectionRequest}
                     onRefreshRuntimes={refreshRuntimes}
                     onSettingChanged={handleLocalSettingChanged}
                     onBack={() => setScreen("workspace")}
@@ -6914,12 +6843,7 @@ export default function App() {
                             />
                           ) : (
                             <>
-                              <div
-                                className="transcript-scroll"
-                                ref={transcriptScrollRef}
-                                data-nav-region="transcript"
-                                tabIndex={-1}
-                              >
+                              <div className="transcript-scroll" ref={transcriptScrollRef}>
                                 {nativeHost && runtimeState && !activeProjectionUnavailable ? (
                                   <ConnectionNotice
                                     state={runtimeState.connection}
@@ -7258,8 +7182,6 @@ export default function App() {
                           <WorkPane
                             key="work-pane"
                             controller={workPane}
-                            arrowNavigation={localSettings[ARROW_NAVIGATION_SETTING] !== false}
-                            wrapNavigation={localSettings[WRAP_NAVIGATION_SETTING] !== false}
                             headerTarget={subagentHeaderTarget}
                             paneRef={subagentPaneRef}
                             rowRef={conversationWorkspaceRef}

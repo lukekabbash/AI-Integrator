@@ -5,7 +5,6 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
-  useRef,
   useState,
   type CSSProperties,
   type MouseEvent as ReactMouseEvent,
@@ -21,7 +20,6 @@ import { FileIcon } from "./FileIcon";
 import { ResizeHandle } from "./ResizeHandle";
 import { Tooltip } from "./Tooltip";
 import type { WorkPaneLaunchKind } from "./WorkPaneToggle";
-import { useRailCursor } from "../useRailCursor";
 import "./workPane.css";
 
 const railItemSpring = { type: "spring" as const, stiffness: 560, damping: 34, mass: 0.7 };
@@ -46,10 +44,6 @@ export interface WorkPaneProps {
   onLaunch: (kind: WorkPaneLaunchKind) => void;
   /** Controls docked at the end of the strip (the titlebar cluster the pane covers). */
   trailing?: ReactNode;
-  /** Left/Right cursor across the tab strip; see `spatialNavigation.ts`. */
-  arrowNavigation?: boolean;
-  /** Whether that cursor wraps past the first and last tab. */
-  wrapNavigation?: boolean;
 }
 
 /**
@@ -73,17 +67,8 @@ export function WorkPane({
   browserAvailable,
   onLaunch,
   trailing,
-  arrowNavigation = true,
-  wrapNavigation = true,
 }: WorkPaneProps) {
   const { state, active } = controller;
-  const stripRef = useRef<HTMLDivElement>(null);
-  // The strip is this pane's bezel row: Left and Right walk the open surfaces.
-  const onStripKeyDown = useRailCursor(stripRef, {
-    enabled: arrowNavigation,
-    wrap: wrapNavigation,
-    orientation: "horizontal",
-  });
   const [subagentHeaderHost, setSubagentHeaderHost] = useState<HTMLDivElement | null>(null);
   const reduceMotion = Boolean(useReducedMotion());
   const [maxWidth, setMaxWidth] = useState<number | null>(null);
@@ -110,7 +95,10 @@ export function WorkPane({
   }, [rowRef, state.open]);
 
   const width = Math.min(state.width, maxWidth ?? state.width);
-  const onResize = useCallback((delta: number) => controller.nudgeWidth(delta), [controller]);
+  const onResize = useCallback(
+    (delta: number) => controller.nudgeWidth(delta),
+    [controller],
+  );
 
   // Middle-click closes, like the file tabs.
   const onTabAuxClick = (event: ReactMouseEvent, id: string) => {
@@ -125,9 +113,6 @@ export function WorkPane({
       className="work-pane-strip"
       role="tablist"
       aria-label="Open surfaces"
-      ref={stripRef}
-      data-nav-region="workPane"
-      onKeyDown={onStripKeyDown}
       // The strip sits in the titlebar, so its empty space moves the window
       // like the rest of the bar. A press only starts a drag on the element
       // holding the attribute, which leaves the tabs clickable.
@@ -156,9 +141,6 @@ export function WorkPane({
                 type="button"
                 role="tab"
                 aria-selected={activeTab}
-                data-nav-item
-                data-nav-label={label}
-                data-nav-active={activeTab ? "true" : undefined}
                 title={surfaceTitle(surface, label)}
                 onClick={() => controller.activate(surface.id)}
                 onAuxClick={(event) => onTabAuxClick(event, surface.id)}

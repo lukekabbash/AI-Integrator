@@ -15,7 +15,7 @@
     },
     {
       "path": "apps/desktop/src/App.tsx",
-      "maxLines": 7463
+      "maxLines": 7385
     },
     {
       "path": "apps/desktop/src/components/SettingsView.tsx",
