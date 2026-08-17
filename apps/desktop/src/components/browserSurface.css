@@ -141,11 +141,6 @@
   flex: 1 1 auto;
   min-height: 0;
   background: color-mix(in srgb, var(--color-layer-1) 60%, var(--color-canvas));
-  /* The native tab is placed over this box, and a native surface always paints
-     above the page — including over the pane's grab strip, which would make the
-     edge undraggable while a page is showing. A margin (not padding) keeps the
-     strip clear, because the reported bounds are this element's border box. */
-  margin-left: 8px;
 }
 /* Shown while a drag holds the native tab off screen: the page's own recess
    with its name, so resizing reads as the pane moving rather than the page

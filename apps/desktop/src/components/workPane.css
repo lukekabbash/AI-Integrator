@@ -15,6 +15,15 @@
 .work-pane.subagent-workspace-pane > .resize-handle--horizontal {
   height: 100%;
 }
+/* No standing seam between the transcript and the pane. The page behind it is
+   its own surface, so a full-height hairline only reads as a thick edge; the
+   shared grip — a short pill that scales up under the pointer — is the whole
+   divider, and it appears only when you go looking for it. The border keeps
+   its width so nothing shifts when it is not being drawn. */
+.work-pane.subagent-workspace-pane {
+  border-left-color: transparent;
+  transition: border-left-color var(--motion-fast) var(--ease-emphasized);
+}
 .work-pane-subheader {
   flex: none;
 }

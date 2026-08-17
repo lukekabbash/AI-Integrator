@@ -29,10 +29,9 @@ use tauri::{
 use tokio::sync::oneshot;
 use url::Url;
 
-use integrator_core::IntegratorError;
-
 use crate::command_api::{CommandError, CommandResult};
 
+mod agent;
 mod capture;
 mod servers;
 
@@ -57,18 +56,18 @@ const EVAL_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_EVAL_BYTES: usize = 96 * 1024;
 
 /// A tab with no page: the start page shows instead of a native surface.
-fn is_blank(url: &Url) -> bool {
+pub(super) fn is_blank(url: &Url) -> bool {
     url.scheme() == "about" || url.as_str() == "about:blank"
 }
 
-fn invalid(message: impl Into<String>) -> CommandError {
+pub(super) fn invalid(message: impl Into<String>) -> CommandError {
     CommandError {
         code: "invalid-input",
         message: message.into(),
     }
 }
 
-fn unavailable(message: impl Into<String>) -> CommandError {
+pub(super) fn unavailable(message: impl Into<String>) -> CommandError {
     CommandError {
         code: "unavailable",
         message: message.into(),
@@ -137,12 +136,12 @@ impl BrowserTabs {
     }
 }
 
-fn emit_changed<R: Runtime>(app: &AppHandle<R>, tabs: &BrowserTabs) {
+pub(super) fn emit_changed<R: Runtime>(app: &AppHandle<R>, tabs: &BrowserTabs) {
     let _ = app.emit(BROWSER_EVENT, json!({ "tabs": tabs.snapshot(None) }));
 }
 
 /// Accepts only http(s); a bare host defaults to https, loopback to http.
-fn normalize_url(input: &str) -> Result<Url, CommandError> {
+pub(super) fn normalize_url(input: &str) -> Result<Url, CommandError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(invalid("enter a URL"));
@@ -167,7 +166,7 @@ fn normalize_url(input: &str) -> Result<Url, CommandError> {
     }
 }
 
-fn webview_of<R: Runtime>(
+pub(super) fn webview_of<R: Runtime>(
     app: &AppHandle<R>,
     label: &str,
 ) -> Result<tauri::Webview<R>, CommandError> {
@@ -179,7 +178,7 @@ fn webview_of<R: Runtime>(
 }
 
 /// Runs an expression in the guest and returns its JSON result.
-async fn eval_json<R: Runtime>(
+pub(super) async fn eval_json<R: Runtime>(
     app: &AppHandle<R>,
     label: &str,
     script: String,
@@ -242,7 +241,7 @@ pub struct TabBounds {
 }
 
 /// True unless the user has explicitly turned the setting off.
-pub fn setting_enabled<R: Runtime>(app: &AppHandle<R>, key: &str) -> bool {
+pub(super) fn setting_enabled<R: Runtime>(app: &AppHandle<R>, key: &str) -> bool {
     app.try_state::<crate::state::AppState>()
         .and_then(|state| state.store.get_setting(key).ok().flatten())
         .and_then(|setting| setting.value.as_bool())
@@ -271,28 +270,24 @@ fn profile_directory<R: Runtime>(app: &AppHandle<R>) -> Option<std::path::PathBu
     Some(directory)
 }
 
-/// Creates a tab and registers it. Child webviews must be built off the main
-/// thread on Windows, so every caller is async.
-async fn create_tab(
+/// The one place a tab's webview is described. A tab that pops out and comes
+/// back has to arrive with the same runtime, profile and reporting it left
+/// with, or it returns as a page that never updates its address or title.
+fn tab_webview_builder(
     app: &AppHandle,
     state: &Arc<BrowserTabs>,
-    task_id: String,
-    target: Url,
-) -> Result<BrowserTab, CommandError> {
-    let id = format!("tab-{}", state.sequence.fetch_add(1, Ordering::Relaxed) + 1);
-    let label = format!("browser-{id}");
-    let window = app
-        .get_window("main")
-        .ok_or_else(|| unavailable("the main window is not available"))?;
-
+    id: &str,
+    label: &str,
+    target: &Url,
+) -> WebviewBuilder<tauri::Wry> {
     let tabs = Arc::clone(state);
     let load_app = app.clone();
-    let load_id = id.clone();
+    let load_id = id.to_string();
     let title_tabs = Arc::clone(state);
     let title_app = app.clone();
-    let title_id = id.clone();
+    let title_id = id.to_string();
 
-    let mut builder = WebviewBuilder::new(&label, WebviewUrl::External(target.clone()))
+    let mut builder = WebviewBuilder::new(label, WebviewUrl::External(target.clone()))
         .initialization_script(guest_runtime(app))
         .on_page_load(move |_, payload| {
             let loading = matches!(payload.event(), PageLoadEvent::Started);
@@ -320,6 +315,53 @@ async fn create_tab(
     if let Some(profile) = profile_directory(app) {
         builder = builder.data_directory(profile);
     }
+    builder
+}
+
+/// Puts a tab's webview back inside the main window. Shared by the dock
+/// control and by a pop-out window closing, so both land in the same state.
+fn dock_tab(
+    app: &AppHandle,
+    state: &Arc<BrowserTabs>,
+    id: &str,
+    label: &str,
+    target: &Url,
+) -> Result<(), CommandError> {
+    let window = app
+        .get_window("main")
+        .ok_or_else(|| unavailable("the main window is not available"))?;
+    window
+        .add_child(
+            tab_webview_builder(app, state, id, label, target),
+            LogicalPosition::new(0.0, 0.0),
+            LogicalSize::new(1.0, 1.0),
+        )
+        .map_err(|error| unavailable(format!("could not dock the tab: {error}")))?;
+    state.update(id, |tab| {
+        tab.popped_out = false;
+        // The renderer re-places it as soon as it sees the change; until then
+        // a one-pixel webview in the corner is better than a stale rectangle.
+        tab.hidden = true;
+    });
+    emit_changed(app, state);
+    Ok(())
+}
+
+/// Creates a tab and registers it. Child webviews must be built off the main
+/// thread on Windows, so every caller is async.
+pub(super) async fn create_tab(
+    app: &AppHandle,
+    state: &Arc<BrowserTabs>,
+    task_id: String,
+    target: Url,
+) -> Result<BrowserTab, CommandError> {
+    let id = format!("tab-{}", state.sequence.fetch_add(1, Ordering::Relaxed) + 1);
+    let label = format!("browser-{id}");
+    let window = app
+        .get_window("main")
+        .ok_or_else(|| unavailable("the main window is not available"))?;
+
+    let builder = tab_webview_builder(app, state, &id, &label, &target);
 
     window
         .add_child(
@@ -388,7 +430,11 @@ pub async fn browser_tab_close(
 
 /// Tears down a tab's webview (or its pop-out window) and forgets it. Shared
 /// so a tab the user closes and one an agent closes end the same way.
-fn close_tab(app: &AppHandle, state: &Arc<BrowserTabs>, tab_id: &str) -> Result<(), CommandError> {
+pub(super) fn close_tab(
+    app: &AppHandle,
+    state: &Arc<BrowserTabs>,
+    tab_id: &str,
+) -> Result<(), CommandError> {
     let label = state
         .label_for(tab_id)
         .ok_or_else(|| unavailable("that browser tab is already closed"))?;
@@ -594,8 +640,13 @@ pub async fn browser_tab_set_popped_out(
     // Popping out rebuilds the webview, so it has to carry the same profile,
     // user agent and guest runtime — otherwise a tab would sign itself out of
     // every site simply by moving to its own window.
-    let profile = profile_directory(&app);
     if popped_out {
+        let profile = profile_directory(&app);
+        let close_app = app.clone();
+        let close_state = Arc::clone(&state);
+        let close_id = tab_id.clone();
+        let close_label = label.clone();
+        let close_target = target.clone();
         let mut builder =
             tauri::WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(target.clone()))
                 .title(if current.title.is_empty() {
@@ -610,33 +661,45 @@ pub async fn browser_tab_set_popped_out(
         if let Some(profile) = profile {
             builder = builder.data_directory(profile);
         }
-        builder
+        let window = builder
             .build()
             .map_err(|error| unavailable(format!("could not pop out the tab: {error}")))?;
-    } else {
-        let window = app
-            .get_window("main")
-            .ok_or_else(|| unavailable("the main window is not available"))?;
-        let mut builder = WebviewBuilder::new(&label, WebviewUrl::External(target.clone()))
-            .initialization_script(guest_runtime(&app))
-            .on_navigation(|url| matches!(url.scheme(), "http" | "https" | "about"))
-            .user_agent(BROWSER_USER_AGENT);
-        if let Some(profile) = profile {
-            builder = builder.data_directory(profile);
-        }
-        window
-            .add_child(
-                builder,
-                LogicalPosition::new(0.0, 0.0),
-                LogicalSize::new(1.0, 1.0),
-            )
-            .map_err(|error| unavailable(format!("could not dock the tab: {error}")))?;
+        // Closing the window sends the tab home rather than destroying it. The
+        // page keeps running either way, and a tab that vanished from both
+        // places would strand whatever was using it.
+        window.on_window_event(move |event| {
+            if !matches!(event, tauri::WindowEvent::Destroyed) {
+                return;
+            }
+            let app = close_app.clone();
+            let state = Arc::clone(&close_state);
+            let id = close_id.clone();
+            let label = close_label.clone();
+            let target = close_target.clone();
+            // Child webviews are built off the main thread on Windows.
+            tauri::async_runtime::spawn(async move {
+                if state.task_of(&id).is_none() {
+                    return; // the tab was closed outright, not undocked
+                }
+                let _ = dock_tab(&app, &state, &id, &label, &target);
+            });
+        });
+        let loading = !is_blank(&target);
+        let tab = state
+            .update(&tab_id, |tab| {
+                tab.popped_out = true;
+                tab.url = url;
+                tab.loading = loading;
+            })
+            .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
+        emit_changed(&app, &state);
+        return Ok(tab);
     }
 
+    dock_tab(&app, &state, &tab_id, &label, &target)?;
     let loading = !is_blank(&target);
     let tab = state
         .update(&tab_id, |tab| {
-            tab.popped_out = popped_out;
             tab.url = url;
             tab.loading = loading;
         })
@@ -718,137 +781,7 @@ pub async fn browser_clear_data(
     }
     Ok(())
 }
-
-/* -------------------------------------------------------------------------- */
-/* Agent-facing helpers (used by the broker; no Tauri command surface)        */
-/* -------------------------------------------------------------------------- */
-
-/// Runs a guest action for an agent, checking the tab belongs to its task.
-pub async fn agent_invoke<R: Runtime>(
-    app: &AppHandle<R>,
-    tabs: &Arc<BrowserTabs>,
-    task_id: &str,
-    tab_id: &str,
-    method: &str,
-    args: Vec<Value>,
-) -> Result<Value, CommandError> {
-    ensure_agent_access(app)?;
-    match tabs.task_of(tab_id) {
-        Some(owner) if owner == task_id => {}
-        Some(_) => return Err(unavailable("that browser tab belongs to another task")),
-        None => return Err(unavailable("that browser tab is no longer open")),
-    }
-    let label = tabs
-        .label_for(tab_id)
-        .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
-    let args = serde_json::to_string(&args).map_err(|error| invalid(error.to_string()))?;
-    eval_json(
-        app,
-        &label,
-        format!("window.__integrator.{method}(...{args})"),
-    )
-    .await
-}
-
-/// Opens a tab on the agent's behalf, owned by its task.
-pub fn ensure_agent_access<R: Runtime>(app: &AppHandle<R>) -> Result<(), CommandError> {
-    if setting_enabled(app, AGENT_ACCESS_SETTING) {
-        return Ok(());
-    }
-    Err(CommandError {
-        code: "unauthorized",
-        message: "browser access for agents is turned off in Settings → Browser".into(),
-    })
-}
-
-pub async fn open_for_agent(
-    app: &AppHandle,
-    tabs: &Arc<BrowserTabs>,
-    task_id: &str,
-    url: Option<String>,
-) -> Result<BrowserTab, IntegratorError> {
-    ensure_agent_access(app).map_err(|error| IntegratorError::Unauthorized(error.message))?;
-    let target = match url.as_deref() {
-        Some(raw) if !raw.trim().is_empty() => {
-            normalize_url(raw).map_err(|error| IntegratorError::InvalidInput(error.message))?
-        }
-        _ => Url::parse("about:blank").expect("about:blank parses"),
-    };
-    create_tab(app, tabs, task_id.to_string(), target)
-        .await
-        .map_err(|error| IntegratorError::Unavailable(error.message))
-}
-
-/// Navigates one of the task's own tabs.
-pub async fn navigate_for_agent(
-    app: &AppHandle,
-    tabs: &Arc<BrowserTabs>,
-    task_id: &str,
-    tab_id: &str,
-    url: &str,
-) -> Result<BrowserTab, IntegratorError> {
-    ensure_agent_access(app).map_err(|error| IntegratorError::Unauthorized(error.message))?;
-    match tabs.task_of(tab_id) {
-        Some(owner) if owner == task_id => {}
-        Some(_) => {
-            return Err(IntegratorError::Unauthorized(
-                "that browser tab belongs to another task".into(),
-            ));
-        }
-        None => {
-            return Err(IntegratorError::NotFound(
-                "that browser tab is no longer open".into(),
-            ));
-        }
-    }
-    let target =
-        normalize_url(url).map_err(|error| IntegratorError::InvalidInput(error.message))?;
-    let label = tabs
-        .label_for(tab_id)
-        .ok_or_else(|| IntegratorError::NotFound("that browser tab is no longer open".into()))?;
-    webview_of(app, &label)
-        .map_err(|error| IntegratorError::Unavailable(error.message))?
-        .navigate(target.clone())
-        .map_err(|error| IntegratorError::Unavailable(error.to_string()))?;
-    let tab = tabs
-        .update(tab_id, |tab| {
-            tab.url = target.to_string();
-            tab.loading = !is_blank(&target);
-        })
-        .ok_or_else(|| IntegratorError::NotFound("that browser tab is no longer open".into()))?;
-    emit_changed(app, tabs);
-    Ok(tab)
-}
-
-/// Closes one of this task's tabs. An agent juggling several pages should be
-/// able to put one down; without this the only way a tab ever closes is the
-/// user closing it by hand.
-pub async fn close_for_agent(
-    app: &AppHandle,
-    tabs: &Arc<BrowserTabs>,
-    task_id: &str,
-    tab_id: &str,
-) -> Result<(), IntegratorError> {
-    ensure_agent_access(app).map_err(|error| IntegratorError::Unauthorized(error.message))?;
-    match tabs.task_of(tab_id) {
-        Some(owner) if owner == task_id => {}
-        Some(_) => {
-            return Err(IntegratorError::Unauthorized(
-                "that browser tab belongs to another task".into(),
-            ));
-        }
-        None => {
-            return Err(IntegratorError::NotFound(
-                "that browser tab is no longer open".into(),
-            ));
-        }
-    }
-    close_tab(app, tabs, tab_id).map_err(|error| IntegratorError::Unavailable(error.message))
-}
-
-pub fn tabs_for_task(tabs: &BrowserTabs, task_id: &str) -> Vec<BrowserTab> {
-    tabs.snapshot(Some(task_id))
-}
+pub use agent::{agent_invoke, close_for_agent, navigate_for_agent, open_for_agent, tabs_for_task};
 
 #[cfg(test)]
 mod tests {

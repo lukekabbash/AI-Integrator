@@ -18,6 +18,9 @@ import { rememberBrowserVisit } from "./browserRecents";
 import { Tooltip } from "./Tooltip";
 import "./browserSurface.css";
 
+/** Width of the pane grip the tab steps aside for, matching .resize-handle. */
+const GRIP_WIDTH = 8;
+
 export interface BrowserSurfaceProps {
   tab: BrowserTab;
   /** Reports the slot rectangle so the native tab can sit exactly over it. */
@@ -87,6 +90,26 @@ export function BrowserSurface({
     return () => observer?.disconnect();
   }, []);
 
+  // The pane's grab grip lives in its left few pixels, and a native surface
+  // paints above it — so with the page filling the pane there is nothing to
+  // take hold of. Rather than keep a standing gutter, the tab yields that
+  // strip only as the pointer comes near the edge, and takes it back when the
+  // pointer leaves. The approach is made across the transcript, which is
+  // ordinary HTML, so the moves arrive before the cursor reaches the page.
+  const [nearEdge, setNearEdge] = useState(false);
+  useEffect(() => {
+    const node = viewportRef.current;
+    if (!node || blank || popped) return;
+    const onMove = (event: PointerEvent) => {
+      const distance = node.getBoundingClientRect().left - event.clientX;
+      // Hysteresis: opening early and closing late keeps the edge from
+      // flickering when the pointer hovers right on the threshold.
+      setNearEdge((current) => (current ? distance > -4 && distance < 40 : distance > 0 && distance < 18));
+    };
+    window.addEventListener("pointermove", onMove);
+    return () => window.removeEventListener("pointermove", onMove);
+  }, [blank, popped]);
+
   // Keep the native tab glued to this slot: observe the box, the scroll
   // ancestors and the window, and report physical pixels.
   useLayoutEffect(() => {
@@ -116,10 +139,17 @@ export function BrowserSurface({
         onBounds(null);
         return;
       }
-      const key = `${Math.round(rect.x)}:${Math.round(rect.y)}:${Math.round(rect.width)}:${Math.round(rect.height)}`;
+      const inset = nearEdge ? GRIP_WIDTH : 0;
+      const placed = new DOMRect(
+        rect.x + inset,
+        rect.y,
+        Math.max(1, rect.width - inset),
+        rect.height,
+      );
+      const key = `${Math.round(placed.x)}:${Math.round(placed.y)}:${Math.round(placed.width)}:${Math.round(placed.height)}`;
       if (key === last) return;
       last = key;
-      onBounds(rect);
+      onBounds(placed);
     };
     const report = () => {
       cancelAnimationFrame(frame);
@@ -137,7 +167,7 @@ export function BrowserSurface({
       window.removeEventListener("scroll", report, true);
       onBounds(null);
     };
-  }, [blank, popped, dragging]);
+  }, [blank, popped, dragging, nearEdge]);
 
   const submit = useCallback(
     (event: React.FormEvent) => {
