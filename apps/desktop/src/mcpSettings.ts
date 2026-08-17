@@ -101,9 +101,12 @@ export const CURATED_MCP_SERVERS: CuratedMcpServer[] = [
     name: "chrome-devtools",
     label: "Chrome DevTools",
     description:
-      "Google's official DevTools server — drive Chrome, inspect the DOM, network, and performance traces (Apache-2.0).",
+      "Google's official DevTools server — drive a separate Chrome, inspect the DOM, network, and performance traces (Apache-2.0). Integrator's own browser tabs are the shared, watchable option; this one is for Chrome-specific work.",
     icon: "google",
-    config: { command: "npx", args: ["-y", "chrome-devtools-mcp@latest"], env: {} },
+    // --isolated gives it a throwaway profile. Without it the server attaches
+    // to the user's own Chrome, and every call fails with a locked profile the
+    // moment that Chrome is already running — which is most of the time.
+    config: { command: "npx", args: ["-y", "chrome-devtools-mcp@latest", "--isolated"], env: {} },
   },
   {
     name: "vercel",

@@ -15,7 +15,7 @@
     },
     {
       "path": "apps/desktop/src/App.tsx",
-      "maxLines": 7483
+      "maxLines": 7617
     },
     {
       "path": "apps/desktop/src/components/SettingsView.tsx",
@@ -23,11 +23,11 @@
     },
     {
       "path": "apps/desktop/src/bridge.ts",
-      "maxLines": 6954
+      "maxLines": 7013
     },
     {
       "path": "apps/desktop/src-tauri/src/delegation.rs",
-      "maxLines": 4663
+      "maxLines": 4783
     },
     {
       "path": "apps/desktop/src/components/RightRail.tsx",
@@ -83,7 +83,7 @@
     },
     {
       "path": "apps/desktop/src/runtimeProjection.ts",
-      "maxLines": 1405
+      "maxLines": 1409
     },
     {
       "path": "crates/adapter-codex/src/lib.rs",
@@ -107,7 +107,7 @@
     },
     {
       "path": "apps/desktop/src-tauri/src/chat_title.rs",
-      "maxLines": 1130
+      "maxLines": 1218
     },
     {
       "path": "apps/desktop/src/components/FileView.tsx",
@@ -137,9 +137,11 @@
     "apps/desktop/src/automationTurnPrompt.ts",
     "apps/desktop/src/commitMessageSettings.ts",
     "apps/desktop/src/components/AgentGlyph.tsx",
+    "apps/desktop/src/components/BrowserDeck.tsx",
     "apps/desktop/src/components/BrowserSettings.tsx",
     "apps/desktop/src/components/BrowserStart.tsx",
     "apps/desktop/src/components/BrowserSurface.tsx",
+    "apps/desktop/src/components/BrowserWindowShell.tsx",
     "apps/desktop/src/components/Composer.tsx",
     "apps/desktop/src/components/DeleteArchivedChatsModal.tsx",
     "apps/desktop/src/components/DeleteChatModal.tsx",

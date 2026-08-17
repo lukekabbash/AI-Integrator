@@ -11,6 +11,14 @@
 (() => {
   if (window.__integrator) return;
 
+  // The prelude the host writes just above this script. It is read once and
+  // removed before any page script runs, so a page can neither read the
+  // host's key nor rewrite the settings the guest was launched with.
+  const CONFIG = window.__integratorBrowser ?? {};
+  delete window.__integratorBrowser;
+  /** Proves a call came from the app rather than from the page or an agent. */
+  const HOST_KEY = String(CONFIG.hostKey ?? "");
+
   const REFS = new Map(); // ref -> WeakRef<Element>
   const BY_ELEMENT = new WeakMap(); // Element -> ref
   let refSeq = 0;
@@ -217,6 +225,84 @@
     return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
   }
 
+  /* --------------------------------------------------------- the user's turn */
+
+  /**
+   * The hold, in the direction the host cannot see.
+   *
+   * An agent's gestures are synthesized, so they carry `isTrusted: false`; only
+   * a real hand moves this. While the person is working in a page, an agent
+   * writing to it would be taking the cursor out of their hands — so the guest
+   * refuses, the same way one agent stands off another's tab. Reads are always
+   * fine: watching over a shoulder costs the person nothing.
+   *
+   * It has to live here rather than in the host, because a click inside a child
+   * webview never reaches the app.
+   */
+  const USER_HOLD_MS = 45000;
+  const AGENT_WRITES = new Set(["click", "type", "press", "scroll", "drag", "evaluate"]);
+  let userAt = 0;
+
+  for (const type of ["pointerdown", "keydown", "wheel", "touchstart"]) {
+    addEventListener(
+      type,
+      (event) => {
+        if (event.isTrusted) userAt = Date.now();
+      },
+      { capture: true, passive: true },
+    );
+  }
+
+  /** Milliseconds since the person last touched this page, or null if never. */
+  function userIdle() {
+    return userAt ? Date.now() - userAt : null;
+  }
+
+  /* ------------------------------------------------------- a filled secret */
+
+  /**
+   * When the app last typed a saved password into this page.
+   *
+   * From that moment until the page navigates, reading it back is refused:
+   * `evaluate` could read the field's value, and a snapshot could pick up a
+   * page that has helpfully switched the field to `type="text"`. The lockout is
+   * keyed on "a credential was filled here", never on what the field says it is
+   * now, because the page controls that and the page is not trusted.
+   *
+   * A new document gets a new guest with this unset, which is exactly right:
+   * navigating away is the end of the secret being on screen.
+   */
+  let credentialAt = 0;
+  const CREDENTIAL_TTL_MS = 300000;
+  const CREDENTIAL_READS = new Set(["evaluate", "snapshot"]);
+
+  function credentialInFlight() {
+    return credentialAt > 0 && Date.now() - credentialAt < CREDENTIAL_TTL_MS;
+  }
+
+  /**
+   * The veto the host consults before every agent action. It evaluates
+   * `blocked(method) || method(...)`, so an error envelope returned here
+   * refuses the action without dispatching it, and `null` lets it through.
+   */
+  function blocked(method) {
+    if (credentialInFlight() && CREDENTIAL_READS.has(method)) {
+      return err(
+        "credential-in-flight",
+        "a saved password is filled in on this page, so reading it is refused until " +
+          "the form is submitted or the tab navigates. Clicking and typing still work.",
+      );
+    }
+    if (!AGENT_WRITES.has(method)) return null;
+    const idle = userIdle();
+    if (idle === null || idle >= USER_HOLD_MS) return null;
+    return err(
+      "user-holding",
+      `the person is working in this tab — they touched it ${Math.round(idle / 1000)}s ago. ` +
+        "Wait for them to finish, or open your own tab.",
+    );
+  }
+
   /**
    * What the page looks like now that the action has landed. Every mutating
    * entry point returns this, so a caller does not have to follow one tool call
@@ -234,6 +320,9 @@
       // page is tiny. Saying so keeps the caller from trusting the geometry.
       offscreen: innerWidth <= 16 || innerHeight <= 16,
       focusedRef: focused && focused !== document.body ? refFor(focused) : null,
+      // How long ago a real hand touched this page. The host turns a fresh
+      // number into `heldBy: "you"` so the tab strip can show it.
+      userIdleMs: userIdle(),
     };
   }
 
@@ -296,6 +385,76 @@
     const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
     if (setter) setter.call(element, value);
     else element.value = value;
+  }
+
+  /* -------------------------------------------------------- consent dialogs */
+
+  /**
+   * Marketing-consent dialogs, by vendor rather than by guesswork.
+   *
+   * A snapshot that lists the page *behind* one of these is a snapshot of a
+   * page nobody can click, which is how an agent ends up reporting a button at
+   * coordinates it can never reach. So a snapshot taken while one is up returns
+   * the dialog and nothing else, and says which vendor it is.
+   *
+   * The matcher is an allowlist of vendor markup, never words like "accept": a
+   * login wall, an age gate and a terms dialog wear the same shape and mean
+   * entirely different things, and clicking through those is not ours to do.
+   */
+  const CONSENT_VENDORS = [
+    { name: "Cookiebot", root: "#CybotCookiebotDialog", reject: "#CybotCookiebotDialogBodyButtonDecline" },
+    { name: "OneTrust", root: "#onetrust-consent-sdk", reject: "#onetrust-reject-all-handler,.ot-pc-refuse-all-handler" },
+    { name: "Didomi", root: "#didomi-host", reject: "#didomi-notice-disagree-button" },
+    { name: "Usercentrics", root: "#usercentrics-root", reject: "[data-testid='uc-deny-all-button']" },
+    { name: "Quantcast", root: ".qc-cmp2-container", reject: ".qc-cmp2-summary-buttons button[mode='secondary']" },
+    { name: "consentmanager", root: "#cmpwrapper,#cmpbox", reject: "#cmpbntnotxt,.cmpboxbtnno" },
+  ];
+
+  /** The consent dialog on screen right now, if any. */
+  function consentDialog() {
+    for (const vendor of CONSENT_VENDORS) {
+      for (const root of document.querySelectorAll(vendor.root)) {
+        if (visible(root)) return { vendor, root };
+      }
+    }
+    return null;
+  }
+
+  /* ------------------------------------------------------------ login form */
+
+  /** The password field a person would be typing in: visible, and enabled. */
+  function passwordField() {
+    for (const field of document.querySelectorAll("input[type='password']")) {
+      if (!field.disabled && !field.readOnly && visible(field)) return field;
+    }
+    return null;
+  }
+
+  /**
+   * The account field belonging to that password field. Sites disagree wildly
+   * about markup, so this walks the form the password is in and takes the last
+   * text-shaped field before it — which is where the username sits on every
+   * sign-in form worth supporting.
+   */
+  function usernameFieldFor(secretField) {
+    if (!secretField) return null;
+    const scope = secretField.form ?? secretField.closest("form") ?? document;
+    const fields = [...scope.querySelectorAll("input")];
+    const at = fields.indexOf(secretField);
+    const before = at === -1 ? fields : fields.slice(0, at);
+    for (const field of before.reverse()) {
+      const type = (field.type || "text").toLowerCase();
+      if (!["text", "email", "tel", "username"].includes(type)) continue;
+      if (field.disabled || field.readOnly || !visible(field)) continue;
+      return field;
+    }
+    return null;
+  }
+
+  /** The events a framework-backed field needs to believe a value changed. */
+  function fieldChanged(field) {
+    field.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText" }));
+    field.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
   /* ---------------------------------------------------------------- picker */
@@ -668,6 +827,59 @@
   const api = {
     version: 1,
 
+    /** Whether an agent action should be refused before it is dispatched.
+     *  Returns an error envelope, or null when the way is clear. */
+    blocked,
+
+    /**
+     * Types a saved login into this page's own form.
+     *
+     * Host-only: the key is written into the prelude and removed before any
+     * page script runs, so neither the page nor an agent's `evaluate` can call
+     * this — an agent asks the app to fill, and the app decides. The value
+     * arrives, goes into the field, and is never returned.
+     */
+    fillLogin(key, username, password, submit) {
+      if (!HOST_KEY || key !== HOST_KEY) {
+        return err("unauthorized", "only the app can fill a saved login");
+      }
+      const secretField = passwordField();
+      if (!secretField) return err("not-found", "this page has no password field");
+      const nameField = usernameFieldFor(secretField);
+      if (nameField && username) {
+        nameField.focus({ preventScroll: true });
+        setValue(nameField, username);
+        fieldChanged(nameField);
+      }
+      secretField.focus({ preventScroll: true });
+      setValue(secretField, password);
+      fieldChanged(secretField);
+      credentialAt = Date.now();
+      const submitted = submit === false ? false : submitFrom(secretField);
+      return ok({ filled: true, submitted, username: username ?? null });
+    },
+
+    /**
+     * Reads back what the person typed into this page's login form, so the app
+     * can offer to remember it. Host-only for the same reason as `fillLogin`,
+     * and never called for a form the app itself just filled — there is nothing
+     * to learn from handing back what we already know.
+     */
+    captureLogin(key) {
+      if (!HOST_KEY || key !== HOST_KEY) {
+        return err("unauthorized", "only the app can read a login form");
+      }
+      const secretField = passwordField();
+      const password = secretField?.value ?? "";
+      if (!password) return err("not-found", "there is no filled-in password on this page");
+      const nameField = usernameFieldFor(secretField);
+      return ok({
+        origin: location.origin,
+        username: nameField?.value?.trim() ?? "",
+        password,
+      });
+    },
+
     /** Hands the overlay the app's own tokens, so the cursor, the picker and
      *  the note box match the theme the user is looking at. */
     setTheme(theme) {
@@ -714,22 +926,58 @@
       // caller never reads the page mid-gesture.
       flushPending();
       const limit = Math.min(options.limit ?? 200, 500);
+      // A consent dialog owns the page while it is up, so it is what a snapshot
+      // describes. Reporting the page behind it hands back geometry for
+      // controls nothing can reach.
+      const consent = consentDialog();
+      const scope = consent?.root ?? document;
       const elements = [];
-      for (const element of document.querySelectorAll(INTERACTIVE)) {
+      for (const element of scope.querySelectorAll(INTERACTIVE)) {
         if (!visible(element)) continue;
         elements.push(describe(element));
         if (elements.length >= limit) break;
       }
-      const text = (document.body?.innerText ?? "").replace(/\n{3,}/g, "\n\n");
+      const source = consent ? consent.root : document.body;
+      const text = (source?.innerText ?? "").replace(/\n{3,}/g, "\n\n");
       return ok({
         url: location.href,
         title: document.title,
         generation,
         loading: document.readyState !== "complete",
         viewport: { width: innerWidth, height: innerHeight, scrollY: Math.round(scrollY) },
+        ...(consent
+          ? {
+              kind: "consent-dialog",
+              vendor: consent.vendor.name,
+              note:
+                "a cookie-consent dialog is covering the page — these are its controls. " +
+                "Deal with it first; the page behind it cannot be clicked.",
+            }
+          : {}),
         elements,
         text: text.length > 20000 ? `${text.slice(0, 20000)}…` : text,
       });
+    },
+
+    /**
+     * Declines the consent dialog on screen, if it is one we recognise and the
+     * user has asked for this. Reject only: accepting on someone's behalf is
+     * not a thing an agent gets to do.
+     */
+    dismissConsent() {
+      const consent = consentDialog();
+      if (!consent) return ok({ dismissed: false, reason: "no consent dialog is on screen" });
+      const button = consent.root.querySelector(consent.vendor.reject);
+      if (!button || !visible(button)) {
+        return ok({
+          dismissed: false,
+          vendor: consent.vendor.name,
+          reason: "that dialog has no reject control to click",
+        });
+      }
+      agentCursor(centreOf(button), "reject");
+      button.click();
+      return ok({ dismissed: true, vendor: consent.vendor.name });
     },
 
     click(target, options = {}) {
@@ -1034,6 +1282,18 @@
     },
   };
 
+  // Only when the user has asked for it, and only ever the reject control.
+  if (CONFIG.dismissConsent) {
+    const decline = () => {
+      if (consentDialog()) api.dismissConsent();
+    };
+    if (document.readyState === "loading") {
+      addEventListener("DOMContentLoaded", () => setTimeout(decline, 400), { once: true });
+    } else {
+      setTimeout(decline, 400);
+    }
+  }
+
   addEventListener("pagehide", clearOverlay);
   addEventListener("popstate", () => {
     generation += 1;
@@ -1047,7 +1307,7 @@
   // app cannot place, watch or close. Turning the request into a navigation in
   // this tab keeps the flow — including OAuth sign-in hops — inside a tab the
   // user and the agent can both see.
-  if (window.__integratorBrowser?.keepPopupsInside) {
+  if (CONFIG.keepPopupsInside) {
     window.open = (url) => {
       if (url) location.assign(String(url));
       return null;

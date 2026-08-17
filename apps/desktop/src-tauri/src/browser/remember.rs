@@ -15,12 +15,14 @@ use std::sync::Arc;
 use session_store::StoredBrowserTab;
 use std::sync::atomic::Ordering;
 
-use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager};
+use tauri::{AppHandle, Manager};
 use url::Url;
 
 use integrator_core::TaskId;
 
 use crate::command_api::CommandError;
+
+use std::collections::HashMap;
 
 use super::{
     BrowserTab, BrowserTabs, Tab, emit_changed, is_blank, tab_webview_builder, unavailable,
@@ -78,6 +80,54 @@ pub fn restore(app: &AppHandle, tabs: &Arc<BrowserTabs>, task_id: &str) -> usize
     added
 }
 
+/// How many tabs one task keeps loaded at once. Each live tab is a WebView2
+/// process holding a full-size page, so a run that opens twenty of them would
+/// cost more than the machine can spare. Past the cap the least-recently
+/// touched one goes back to sleep, keeping its place in the strip and its
+/// address; addressing it wakes it again.
+const LIVE_TAB_CAP: usize = 6;
+
+/// Puts a loaded tab back to sleep: the webview goes, the row stays.
+pub(super) fn sleep(app: &AppHandle, tabs: &Arc<BrowserTabs>, tab_id: &str) {
+    let Some(label) = tabs.label_for(tab_id) else {
+        return;
+    };
+    if let Ok(webview) = super::webview_of(app, &label) {
+        let _ = webview.close();
+    }
+    tabs.update(tab_id, |tab| {
+        tab.sleeping = true;
+        tab.loading = false;
+        tab.hidden = true;
+    });
+}
+
+/// Sleeps this task's oldest loaded tabs until it is back under the cap.
+///
+/// Only tabs nothing is looking at are candidates: whatever is on screen, in a
+/// pop-out window, or is the tab that just opened stays loaded however old it
+/// is — a cap that closed the page the user was reading would be worse than no
+/// cap at all.
+pub(super) fn enforce_cap(app: &AppHandle, tabs: &Arc<BrowserTabs>, task_id: &str, keep: &str) {
+    let live = tabs
+        .snapshot(Some(task_id))
+        .into_iter()
+        .filter(|tab| !tab.sleeping)
+        .count();
+    let over = live.saturating_sub(LIVE_TAB_CAP);
+    if over == 0 {
+        return;
+    }
+    let mut slept = 0;
+    for id in tabs.sleepable(task_id, keep).into_iter().take(over) {
+        sleep(app, tabs, &id);
+        slept += 1;
+    }
+    if slept > 0 {
+        emit_changed(app, tabs);
+    }
+}
+
 /// Loads a tab if it is still asleep, then hands back nothing: callers only
 /// need to know the webview exists before they reach for it. Anything that
 /// drives a page — history, navigation, a guest call, a capture — goes through
@@ -133,10 +183,15 @@ impl BrowserTabs {
                     hidden: true,
                     held_by: None,
                     sleeping: true,
+                    delegation_id: None,
                 },
                 label,
                 held: None,
+                user_at: None,
+                grants: HashMap::new(),
                 generation: 0,
+                touched: std::time::Instant::now(),
+                credential_at: None,
             },
         );
         true
@@ -169,8 +224,8 @@ pub(super) async fn adopt_sleeping(
     window
         .add_child(
             tab_webview_builder(app, state, tab_id, &label, target),
-            LogicalPosition::new(0.0, 0.0),
-            LogicalSize::new(1.0, 1.0),
+            super::parked().0,
+            super::parked().1,
         )
         .map_err(|error| unavailable(format!("could not open that tab: {error}")))?;
     let tab = state

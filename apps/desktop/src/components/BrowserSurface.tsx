@@ -18,8 +18,12 @@ import { rememberBrowserVisit } from "./browserRecents";
 import { Tooltip } from "./Tooltip";
 import "./browserSurface.css";
 
-/** Room the overflow menu needs below the toolbar, in CSS pixels. */
-const MENU_CLEARANCE = 184;
+/** Room the overflow menu needs below the toolbar, in CSS pixels. Grows with
+ *  the menu: every item added has to be counted here, because the tab gives up
+ *  exactly this much of its top and a native surface would paint over the rest. */
+const MENU_CLEARANCE = 250;
+/** Room for a downward toolbar tooltip before the native page begins. */
+const TOOLTIP_CLEARANCE = 44;
 /** The couple of pixels the pane's hairline and drag pill occupy at the seam.
  *  A native surface would paint over them, so the tab starts just inside. */
 const SEAM_CLEARANCE = 3;
@@ -38,8 +42,13 @@ export interface BrowserSurfaceProps {
   onPopOut: (popped: boolean) => Promise<void>;
   /** Sends every tab in this task to the pop-out window at once. */
   onPopOutAll?: () => Promise<void>;
+  allowExternalOpen: boolean;
   onOpenExternally: () => Promise<void>;
   onClose: () => void;
+  /** Remembers the login the person has just typed into this page. */
+  onSaveLogin?: () => Promise<void>;
+  /** Types a login already saved for this site. */
+  onFillLogin?: () => Promise<void>;
   message?: string | null;
 }
 
@@ -60,17 +69,21 @@ export function BrowserSurface({
   annotating,
   onPopOut,
   onPopOutAll,
+  allowExternalOpen,
   onOpenExternally,
   onClose,
+  onSaveLogin,
+  onFillLogin,
   message,
 }: BrowserSurfaceProps) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const [draft, setDraft] = useState(tab.url);
   const [focused, setFocused] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [toolbarTooltipOpen, setToolbarTooltipOpen] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const popped = tab.popped_out;
+  const popped = tab.poppedOut;
   const blank = !tab.url || tab.url === "about:blank";
   // The caller passes a fresh arrow every render. Reach it through a ref so
   // the placement effect below survives its parent re-rendering: keyed on the
@@ -86,7 +99,10 @@ export function BrowserSurface({
   // the tab gives up this much of its top and the menu sits in real space. Held
   // as a constant rather than measured, so opening the menu is one placement
   // instead of a render, a measure and a second placement.
-  const menuInset = menuOpen ? MENU_CLEARANCE : 0;
+  const overlayInset = Math.max(
+    menuOpen ? MENU_CLEARANCE : 0,
+    toolbarTooltipOpen ? TOOLTIP_CLEARANCE : 0,
+  );
 
   // Keep the native tab glued to this slot: observe the box, the scroll
   // ancestors and the window, and report physical pixels.
@@ -118,9 +134,9 @@ export function BrowserSurface({
       }
       const placed = new DOMRect(
         rect.x + SEAM_CLEARANCE,
-        rect.y + menuInset,
+        rect.y + overlayInset,
         Math.max(1, rect.width - SEAM_CLEARANCE),
-        Math.max(1, rect.height - menuInset),
+        Math.max(1, rect.height - overlayInset),
       );
       const key = `${Math.round(placed.x)}:${Math.round(placed.y)}:${Math.round(placed.width)}:${Math.round(placed.height)}`;
       if (key === last) return;
@@ -143,7 +159,7 @@ export function BrowserSurface({
       window.removeEventListener("scroll", report, true);
       onBounds(null);
     };
-  }, [blank, popped, menuInset]);
+  }, [blank, popped, overlayInset]);
 
   const submit = useCallback(
     (event: React.FormEvent) => {
@@ -162,7 +178,7 @@ export function BrowserSurface({
     <div className="browser-surface" data-popped={popped ? "true" : undefined}>
       <form className="browser-chrome" onSubmit={submit}>
         <div className="browser-chrome-history">
-          <Tooltip label="Back" placement="top">
+          <Tooltip label="Back" placement="bottom" onOpenChange={setToolbarTooltipOpen}>
             <button
               type="button"
               className="icon-button subtle tiny"
@@ -172,7 +188,7 @@ export function BrowserSurface({
               <ArrowLeft aria-hidden="true" />
             </button>
           </Tooltip>
-          <Tooltip label="Forward" placement="top">
+          <Tooltip label="Forward" placement="bottom" onOpenChange={setToolbarTooltipOpen}>
             <button
               type="button"
               className="icon-button subtle tiny"
@@ -182,7 +198,11 @@ export function BrowserSurface({
               <ArrowRight aria-hidden="true" />
             </button>
           </Tooltip>
-          <Tooltip label={tab.loading ? "Stop loading" : "Reload"} placement="top">
+          <Tooltip
+            label={tab.loading ? "Stop loading" : "Reload"}
+            placement="bottom"
+            onOpenChange={setToolbarTooltipOpen}
+          >
             <button
               type="button"
               className="icon-button subtle tiny"
@@ -215,22 +235,29 @@ export function BrowserSurface({
               }
             }}
           />
-          <Tooltip label="Open in your system browser" placement="top">
-            <button
-              type="button"
-              className="icon-button subtle tiny browser-address-external"
-              aria-label="Open in your system browser"
-              onClick={() => void onOpenExternally()}
+          {allowExternalOpen ? (
+            <Tooltip
+              label="Open in your system browser"
+              placement="bottom"
+              onOpenChange={setToolbarTooltipOpen}
             >
-              <ExternalLink aria-hidden="true" />
-            </button>
-          </Tooltip>
+              <button
+                type="button"
+                className="icon-button subtle tiny browser-address-external"
+                aria-label="Open in your system browser"
+                onClick={() => void onOpenExternally()}
+              >
+                <ExternalLink aria-hidden="true" />
+              </button>
+            </Tooltip>
+          ) : null}
         </div>
         <div className="browser-chrome-actions">
           <Tooltip
             label={annotating ? "Cancel annotation" : "Annotate this page"}
             hint={annotating ? "Esc" : "Pick an element to send to the chat"}
-            placement="top"
+            placement="bottom"
+            onOpenChange={setToolbarTooltipOpen}
           >
             <button
               type="button"
@@ -242,7 +269,12 @@ export function BrowserSurface({
               <MousePointerClick aria-hidden="true" />
             </button>
           </Tooltip>
-          <Tooltip label="Screenshot" hint="Attaches to the composer" placement="top">
+          <Tooltip
+            label="Screenshot"
+            hint="Attaches to the composer"
+            placement="bottom"
+            onOpenChange={setToolbarTooltipOpen}
+          >
             <button
               type="button"
               className="icon-button subtle tiny"
@@ -255,7 +287,8 @@ export function BrowserSurface({
           <Tooltip
             label={recording ? "Stop recording" : "Record"}
             hint={recording ? undefined : "Frames are captured locally"}
-            placement="top"
+            placement="bottom"
+            onOpenChange={setToolbarTooltipOpen}
           >
             <button
               type="button"
@@ -270,7 +303,8 @@ export function BrowserSurface({
           </Tooltip>
           <Tooltip
             label={popped ? "Dock back into the pane" : "Pop out into its own window"}
-            placement="top"
+            placement="bottom"
+            onOpenChange={setToolbarTooltipOpen}
           >
             <button
               type="button"
@@ -283,7 +317,7 @@ export function BrowserSurface({
             </button>
           </Tooltip>
           <div className="browser-more">
-            <Tooltip label="More" placement="top">
+            <Tooltip label="More" placement="bottom" onOpenChange={setToolbarTooltipOpen}>
               <button
                 type="button"
                 className="icon-button subtle tiny"
@@ -310,16 +344,18 @@ export function BrowserSurface({
                 >
                   Reload
                 </button>
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    void onOpenExternally();
-                  }}
-                >
-                  Open in your system browser
-                </button>
+                {allowExternalOpen ? (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      void onOpenExternally();
+                    }}
+                  >
+                    Open in your system browser
+                  </button>
+                ) : null}
                 {onPopOutAll ? (
                   <button
                     type="button"
@@ -332,6 +368,31 @@ export function BrowserSurface({
                     Pop out every tab
                   </button>
                 ) : null}
+                {/* Saving reads the form the person just filled in; filling
+                    types a saved password back. Both happen entirely on the
+                    native side, so the value never reaches this window. */}
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={blank}
+                  onClick={() => {
+                    setMenuOpen(false);
+                    void onSaveLogin?.();
+                  }}
+                >
+                  Save this login
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={blank}
+                  onClick={() => {
+                    setMenuOpen(false);
+                    void onFillLogin?.();
+                  }}
+                >
+                  Sign in with a saved login
+                </button>
                 <button
                   type="button"
                   role="menuitem"

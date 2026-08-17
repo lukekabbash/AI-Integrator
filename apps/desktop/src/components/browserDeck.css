@@ -1,0 +1,160 @@
+/* The card deck: browser tabs the work pane is not showing, stacked in the
+   bottom-right corner of the main window.
+
+   One rule shapes all of this — a native webview always paints above HTML — so
+   the raised card's page rectangle is left completely clear and every control
+   lives outside it: the title strip above, the count below, the cards behind
+   peeking out from under. Nothing is ever drawn on top of a card. */
+
+.browser-deck {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  pointer-events: none;
+}
+.browser-deck > * {
+  pointer-events: auto;
+}
+
+.browser-deck-stack {
+  position: relative;
+  width: 320px;
+}
+
+.browser-deck-card {
+  width: 320px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-row, 10px);
+  background: var(--color-elevated, var(--color-layer-1));
+  box-shadow: var(--shadow-elevated, 0 10px 30px rgb(0 0 0 / 0.28));
+  overflow: hidden;
+}
+
+/* The cards under the raised one: chrome only, offset up and to the left so
+   the deck reads as a deck rather than one card. */
+.browser-deck-card.behind {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 36px;
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  text-align: left;
+  color: var(--color-text-muted);
+  font-size: 12px;
+  cursor: pointer;
+  transform: translate(calc(var(--depth) * -6px), calc(var(--depth) * -6px));
+  transition:
+    transform var(--duration-fast, 120ms) var(--ease-emphasized),
+    color var(--duration-fast, 120ms) var(--ease-emphasized);
+}
+.browser-deck-card.behind:hover {
+  color: var(--color-text-primary);
+  transform: translate(calc(var(--depth) * -6px), calc(var(--depth) * -6px - 2px));
+}
+.browser-deck-behind-label {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.browser-deck-card.raised {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.browser-deck-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 4px 0 10px;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+.browser-deck-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 12px;
+  color: var(--color-text-primary);
+}
+/* Which tab the agent is in, named rather than merely marked: with the pane
+   closed this corner is the only place the user can see it. */
+.browser-deck-who {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 42%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 11px;
+  color: var(--color-accent);
+}
+.browser-deck-who > i {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 99px;
+  background: var(--color-accent);
+  animation: browser-deck-breath 1.9s var(--ease-emphasized) infinite;
+}
+@keyframes browser-deck-breath {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.browser-deck-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* The page's rectangle. Kept empty on purpose: the webview is placed over it. */
+.browser-deck-page {
+  position: relative;
+  height: 200px;
+  background: var(--color-canvas);
+}
+.browser-deck-empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.browser-deck-more {
+  padding: 2px 8px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 99px;
+  background: var(--color-elevated, var(--color-layer-1));
+  color: var(--color-text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+.browser-deck-more:hover {
+  color: var(--color-text-primary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .browser-deck-card.behind,
+  .browser-deck-who > i {
+    transition: none;
+    animation: none;
+  }
+}

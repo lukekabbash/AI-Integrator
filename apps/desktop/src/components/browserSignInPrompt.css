@@ -1,0 +1,50 @@
+/* The sign-in request card. Sits above the card deck in the same corner, so
+   the two never overlap: this is a question, and the deck is the answer to
+   "where did my tabs go". */
+
+.browser-signin {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 41;
+  width: 340px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-row, 10px);
+  background: var(--color-elevated, var(--color-layer-1));
+  box-shadow: var(--shadow-elevated, 0 10px 30px rgb(0 0 0 / 0.28));
+}
+
+.browser-signin-head {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+.browser-signin-head > svg {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  color: var(--color-accent);
+}
+.browser-signin-head strong {
+  display: block;
+  font-size: 13px;
+  color: var(--color-text-primary);
+}
+.browser-signin-head small {
+  display: block;
+  margin-top: 3px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--color-text-muted);
+}
+
+.browser-signin-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}

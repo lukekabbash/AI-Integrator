@@ -24,6 +24,8 @@ interface TooltipProps {
   /** Delay before showing, in ms. Hiding is immediate. */
   delay?: number;
   disabled?: boolean;
+  /** Reports the real bubble, after its hover/focus delay, opening or closing. */
+  onOpenChange?: (open: boolean) => void;
   children: ReactElement;
 }
 
@@ -69,6 +71,7 @@ export function Tooltip({
   placement = "top",
   delay = 420,
   disabled = false,
+  onOpenChange,
   children,
 }: TooltipProps) {
   const [anchor, setAnchor] = useState<DOMRect | null>(null);
@@ -98,6 +101,14 @@ export function Tooltip({
   }, [cancelHide, interactive]);
 
   useEffect(() => () => cancelHide(), [cancelHide]);
+
+  useEffect(() => {
+    const open = Boolean(anchor);
+    onOpenChange?.(open);
+    return () => {
+      if (open) onOpenChange?.(false);
+    };
+  }, [anchor, onOpenChange]);
 
   useEffect(() => {
     if (disabled || !pendingTarget) return;

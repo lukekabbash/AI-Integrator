@@ -628,6 +628,10 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_open",
             "browser_list",
             "browser_close",
+            "browser_grant",
+            "browser_focus",
+            "browser_fill_login",
+            "browser_cookies",
             "browser_navigate",
             "browser_snapshot",
             "browser_click",
@@ -648,6 +652,10 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_open",
             "browser_list",
             "browser_close",
+            "browser_grant",
+            "browser_focus",
+            "browser_fill_login",
+            "browser_cookies",
             "browser_navigate",
             "browser_snapshot",
             "browser_click",
@@ -659,11 +667,29 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_wait_for",
             "browser_evaluate",
         ]),
+        // A child browses inside its parent's task, owning what it opens. It
+        // never gets browser_grant: a tab it was handed is not its to pass on.
         "child" => json!([
             "skill_data_request",
             "task_complete",
             "orchestrator_ask",
-            "orchestrator_report"
+            "orchestrator_report",
+            "browser_open",
+            "browser_list",
+            "browser_close",
+            "browser_focus",
+            "browser_fill_login",
+            "browser_cookies",
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "browser_hover",
+            "browser_type",
+            "browser_press",
+            "browser_scroll",
+            "browser_drag",
+            "browser_wait_for",
+            "browser_evaluate",
         ]),
         _ if mode == "off" => json!([
             "skill_data_request",
@@ -675,6 +701,10 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_open",
             "browser_list",
             "browser_close",
+            "browser_grant",
+            "browser_focus",
+            "browser_fill_login",
+            "browser_cookies",
             "browser_navigate",
             "browser_snapshot",
             "browser_click",
@@ -703,6 +733,10 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_open",
             "browser_list",
             "browser_close",
+            "browser_grant",
+            "browser_focus",
+            "browser_fill_login",
+            "browser_cookies",
             "browser_navigate",
             "browser_snapshot",
             "browser_click",
@@ -1047,17 +1081,33 @@ async fn dispatch_tool(
             Ok(json!({ "automation": automation }))
         }
         (_, method) if method.starts_with("browser_") => {
-            let task_id = match session.role.as_str() {
+            // A delegated child browses too, inside its parent's task and owning
+            // whatever it opens. Its scope is its delegation id, so the parent
+            // task comes from the delegation record rather than from the child.
+            let caller = match session.role.as_str() {
                 "child" => {
-                    return Err(IntegratorError::Unauthorized(
-                        "browser tools are not available to delegated children".into(),
-                    ));
+                    let delegation_id = child_scope(session)?;
+                    let state = app.state::<AppState>();
+                    let delegation = state.store.get_delegation(delegation_id)?;
+                    crate::browser::Caller {
+                        task_id: delegation.parent_task_id.to_string(),
+                        delegation_id: Some(delegation_id.to_string()),
+                    }
                 }
-                _ => session.scope.parse::<TaskId>().map_err(|_| {
-                    IntegratorError::Unauthorized("invalid task scope for browser tools".into())
-                })?,
+                _ => crate::browser::Caller {
+                    task_id: session
+                        .scope
+                        .parse::<TaskId>()
+                        .map_err(|_| {
+                            IntegratorError::Unauthorized(
+                                "invalid task scope for browser tools".into(),
+                            )
+                        })?
+                        .to_string(),
+                    delegation_id: None,
+                },
             };
-            browser_tool(app, task_id, method, params).await
+            browser_tool(app, caller, method, params).await
         }
         ("orchestrator", "peers_list") => {
             let task_id = orchestrator_scope(session)?;
@@ -1424,14 +1474,13 @@ fn scoped_delegation(
 /// action goes through the same guest runtime the user's toolbar uses.
 async fn browser_tool(
     app: &AppHandle<tauri::Wry>,
-    task_id: TaskId,
+    caller: crate::browser::Caller,
     method: &str,
     params: &Value,
 ) -> Result<Value> {
-    use crate::browser::{BrowserTabs, agent_invoke, tabs_for_task};
+    use crate::browser::{BrowserTabs, agent_invoke, tabs_for_caller};
 
     let tabs = app.state::<std::sync::Arc<BrowserTabs>>();
-    let task = task_id.to_string();
     let text = |key: &str| -> Option<String> {
         params
             .get(key)
@@ -1453,7 +1502,7 @@ async fn browser_tool(
     };
     let call = async |method: &str, args: Vec<Value>| -> Result<Value> {
         let id = tab_id()?;
-        agent_invoke(app, &tabs, &task, &id, method, args)
+        agent_invoke(app, &tabs, &caller, &id, method, args)
             .await
             .map_err(|error| IntegratorError::Unavailable(error.message))
     };
@@ -1461,21 +1510,76 @@ async fn browser_tool(
     match method {
         "browser_open" => {
             let url = text("url");
-            let tab = crate::browser::open_for_agent(app, &tabs, &task, url).await?;
+            let tab = crate::browser::open_for_agent(app, &tabs, &caller, url).await?;
             Ok(json!({ "tab": tab }))
         }
-        "browser_list" => Ok(json!({ "tabs": tabs_for_task(&tabs, &task) })),
+        "browser_list" => Ok(json!({ "tabs": tabs_for_caller(&tabs, &caller) })),
         "browser_close" => {
             let id = tab_id()?;
-            crate::browser::close_for_agent(app, &tabs, &task, &id).await?;
-            Ok(json!({ "closed": id, "tabs": tabs_for_task(&tabs, &task) }))
+            crate::browser::close_for_agent(app, &tabs, &caller, &id).await?;
+            Ok(json!({ "closed": id, "tabs": tabs_for_caller(&tabs, &caller) }))
         }
         "browser_navigate" => {
             let id = tab_id()?;
             let url = text("url")
                 .ok_or_else(|| IntegratorError::InvalidInput("url is required".into()))?;
-            let tab = crate::browser::navigate_for_agent(app, &tabs, &task, &id, &url).await?;
+            let tab = crate::browser::navigate_for_agent(app, &tabs, &caller, &id, &url).await?;
             Ok(json!({ "tab": tab }))
+        }
+        "browser_grant" => {
+            let id = tab_id()?;
+            let delegation = text("delegationId")
+                .ok_or_else(|| IntegratorError::InvalidInput("delegationId is required".into()))?;
+            let mode = match text("mode").as_deref() {
+                Some("read") => crate::browser::GrantMode::Read,
+                Some("drive") | None => crate::browser::GrantMode::Drive,
+                Some(other) => {
+                    return Err(IntegratorError::InvalidInput(format!(
+                        "mode must be read or drive, not {other}"
+                    )));
+                }
+            };
+            // Share only with a child of this task. Without this, a caller
+            // could name any delegation id and hand its page to a run it has
+            // nothing to do with.
+            let scoped = DelegationId::from_str(&delegation)
+                .map_err(|_| IntegratorError::InvalidInput("invalid delegationId".into()))?;
+            let record = app.state::<AppState>().store.get_delegation(scoped)?;
+            if record.parent_task_id.to_string() != caller.task_id {
+                return Err(IntegratorError::Unauthorized(
+                    "that subagent belongs to another task".into(),
+                ));
+            }
+            let tab = crate::browser::grant_for_agent(app, &tabs, &caller, &id, &delegation, mode)?;
+            Ok(json!({ "tab": tab }))
+        }
+        "browser_focus" => {
+            let id = tab_id()?;
+            crate::browser::focus_for_agent(app, &tabs, &caller, &id)
+                .await
+                .map_err(|error| IntegratorError::Unavailable(error.message))
+        }
+        "browser_cookies" => {
+            let id = tab_id()?;
+            crate::browser::cookies_for_agent(app, &tabs, &caller, &id)
+                .await
+                .map_err(|error| IntegratorError::Unavailable(error.message))
+        }
+        "browser_fill_login" => {
+            let id = tab_id()?;
+            crate::browser::fill_login_for_agent(
+                app,
+                &tabs,
+                &caller,
+                &id,
+                text("username").as_deref(),
+            )
+            .await
+            .map_err(|error| match error.code {
+                "invalid-input" => IntegratorError::InvalidInput(error.message),
+                "unauthorized" => IntegratorError::Unauthorized(error.message),
+                _ => IntegratorError::Unavailable(error.message),
+            })
         }
         "browser_snapshot" => {
             let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(200);
@@ -4080,6 +4184,10 @@ mod tests {
                 "browser_open",
                 "browser_list",
                 "browser_close",
+                "browser_grant",
+                "browser_focus",
+                "browser_fill_login",
+                "browser_cookies",
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",
@@ -4143,6 +4251,10 @@ mod tests {
                 "browser_open",
                 "browser_list",
                 "browser_close",
+                "browser_grant",
+                "browser_focus",
+                "browser_fill_login",
+                "browser_cookies",
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",
@@ -4172,6 +4284,10 @@ mod tests {
                 "browser_open",
                 "browser_list",
                 "browser_close",
+                "browser_grant",
+                "browser_focus",
+                "browser_fill_login",
+                "browser_cookies",
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",
@@ -4199,6 +4315,10 @@ mod tests {
                 "browser_open",
                 "browser_list",
                 "browser_close",
+                "browser_grant",
+                "browser_focus",
+                "browser_fill_login",
+                "browser_cookies",
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",

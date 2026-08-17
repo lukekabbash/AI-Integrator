@@ -1261,10 +1261,14 @@ export interface BrowserTab {
   title: string;
   loading: boolean;
   /** Live in its own window; it keeps running and stays agent-addressable. */
-  popped_out: boolean;
+  poppedOut: boolean;
   hidden: boolean;
   /** Set while an agent is driving this tab; clears itself when it goes quiet. */
   heldBy?: string;
+  /** Delegated child that owns the tab; absent for the task's lead agent. */
+  delegationId?: string;
+  /** Remembered for this task but not loaded until it is shown or addressed. */
+  sleeping: boolean;
 }
 
 /** A listening local port a tab can open. */
@@ -1289,21 +1293,52 @@ export interface BrowserBridge {
   sites(): Promise<BrowserSite[]>;
   clearData(): Promise<void>;
   open(taskId: string, url?: string): Promise<BrowserTab>;
-  list(taskId?: string): Promise<BrowserTab[]>;
+  list(taskId: string): Promise<BrowserTab[]>;
   /** Brings back the tabs this chat had open, asleep until one is shown. */
   restore(taskId: string): Promise<BrowserTab[]>;
-  close(tabId: string): Promise<void>;
+  close(taskId: string, tabId: string): Promise<void>;
   /** Physical-pixel rectangle for the tab, or null to hide it. */
   setBounds(
+    taskId: string,
     tabId: string,
     bounds: { x: number; y: number; width: number; height: number } | null,
+    poppedOutHost: boolean,
   ): Promise<void>;
-  navigate(tabId: string, url: string): Promise<BrowserTab>;
-  history(tabId: string, action: "back" | "forward" | "reload" | "stop"): Promise<void>;
-  invoke(tabId: string, method: string, args?: unknown[]): Promise<unknown>;
-  screenshot(tabId: string): Promise<string>;
-  setPoppedOut(tabId: string, poppedOut: boolean): Promise<BrowserTab>;
-  subscribe(listener: (tabs: BrowserTab[]) => void): Promise<() => void>;
+  navigate(taskId: string, tabId: string, url: string): Promise<BrowserTab>;
+  history(
+    taskId: string,
+    tabId: string,
+    action: "back" | "forward" | "reload" | "stop",
+  ): Promise<void>;
+  invoke(taskId: string, tabId: string, method: string, args?: unknown[]): Promise<unknown>;
+  screenshot(taskId: string, tabId: string): Promise<string>;
+  setPoppedOut(taskId: string, tabId: string, poppedOut: boolean): Promise<BrowserTab>;
+  subscribe(listener: () => void): Promise<() => void>;
+  /** An agent asking that a tab be brought to the front for the user to watch. */
+  onFocusRequest(listener: (tabId: string) => void): Promise<() => void>;
+  /** Saved logins, without passwords — there is no call that returns one. */
+  savedLogins(): Promise<SavedLogin[]>;
+  /** Saves the login typed into the page, from the page into the OS store. */
+  saveLogin(tabId: string, taskId: string, allProjects?: boolean): Promise<SavedLogin>;
+  /** Types a saved login into the tab. The value never comes back. */
+  fillLogin(tabId: string, taskId: string, username?: string): Promise<unknown>;
+  forgetLogin(projectId: string, origin: string, username: string): Promise<SavedLogin[]>;
+  forgetAllLogins(): Promise<SavedLogin[]>;
+  /** Remembers whether agents may sign in on one origin without asking. */
+  allowAgentSignIn(origin: string, allowed: boolean): Promise<void>;
+  /** An agent asking to sign in somewhere it has not been allowed yet. */
+  onFillRequest(
+    listener: (request: { tabId: string; origin: string; username: string }) => void,
+  ): Promise<() => void>;
+}
+
+/** One saved login as Settings sees it: everything but the password. */
+export interface SavedLogin {
+  projectId: string;
+  origin: string;
+  username: string;
+  savedAt: string;
+  lastUsedAt?: string;
 }
 
 export interface AppBridge {
@@ -4267,19 +4302,42 @@ function nativeBrowserBridge(): BrowserBridge | undefined {
     open: (taskId, url) => nativeInvoke<BrowserTab>("browser_tab_open", { taskId, url }),
     list: (taskId) => nativeInvoke<BrowserTab[]>("browser_tab_list", { taskId }),
     restore: (taskId) => nativeInvoke<BrowserTab[]>("browser_tabs_restore", { taskId }),
-    close: (tabId) => nativeInvoke<void>("browser_tab_close", { tabId }),
-    setBounds: (tabId, bounds) => nativeInvoke<void>("browser_tab_set_bounds", { tabId, bounds }),
-    navigate: (tabId, url) => nativeInvoke<BrowserTab>("browser_tab_navigate", { tabId, url }),
-    history: (tabId, action) => nativeInvoke<void>("browser_tab_history", { tabId, action }),
-    invoke: (tabId, method, args) =>
-      nativeInvoke<unknown>("browser_tab_invoke", { tabId, method, args }),
-    screenshot: (tabId) => nativeInvoke<string>("browser_tab_screenshot", { tabId }),
-    setPoppedOut: (tabId, poppedOut) =>
-      nativeInvoke<BrowserTab>("browser_tab_set_popped_out", { tabId, poppedOut }),
+    close: (taskId, tabId) => nativeInvoke<void>("browser_tab_close", { taskId, tabId }),
+    setBounds: (taskId, tabId, bounds, poppedOutHost) =>
+      nativeInvoke<void>("browser_tab_set_bounds", { taskId, tabId, bounds, poppedOutHost }),
+    navigate: (taskId, tabId, url) =>
+      nativeInvoke<BrowserTab>("browser_tab_navigate", { taskId, tabId, url }),
+    history: (taskId, tabId, action) =>
+      nativeInvoke<void>("browser_tab_history", { taskId, tabId, action }),
+    invoke: (taskId, tabId, method, args) =>
+      nativeInvoke<unknown>("browser_tab_invoke", { taskId, tabId, method, args }),
+    screenshot: (taskId, tabId) =>
+      nativeInvoke<string>("browser_tab_screenshot", { taskId, tabId }),
+    setPoppedOut: (taskId, tabId, poppedOut) =>
+      nativeInvoke<BrowserTab>("browser_tab_set_popped_out", { taskId, tabId, poppedOut }),
     subscribe: async (listener) => {
       const { listen } = await import("@tauri-apps/api/event");
-      return listen<{ tabs: BrowserTab[] }>("browser://changed", (event) =>
-        listener(event.payload.tabs),
+      return listen("browser://changed", () => listener());
+    },
+    onFocusRequest: async (listener) => {
+      const { listen } = await import("@tauri-apps/api/event");
+      return listen<{ tabId: string }>("browser://focus", (event) => listener(event.payload.tabId));
+    },
+    savedLogins: () => nativeInvoke<SavedLogin[]>("browser_saved_logins"),
+    saveLogin: (tabId, taskId, allProjects) =>
+      nativeInvoke<SavedLogin>("browser_save_login", { tabId, taskId, allProjects }),
+    fillLogin: (tabId, taskId, username) =>
+      nativeInvoke<unknown>("browser_fill_login", { tabId, taskId, username }),
+    forgetLogin: (projectId, origin, username) =>
+      nativeInvoke<SavedLogin[]>("browser_forget_login", { projectId, origin, username }),
+    forgetAllLogins: () => nativeInvoke<SavedLogin[]>("browser_forget_all_logins"),
+    allowAgentSignIn: (origin, allowed) =>
+      nativeInvoke<void>("browser_allow_agent_sign_in", { origin, allowed }),
+    onFillRequest: async (listener) => {
+      const { listen } = await import("@tauri-apps/api/event");
+      return listen<{ tabId: string; origin: string; username: string }>(
+        "browser://fill-request",
+        (event) => listener(event.payload),
       );
     },
   };

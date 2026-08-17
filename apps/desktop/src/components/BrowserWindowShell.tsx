@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+import { bridge } from "../bridge";
 import { useBrowserTabs } from "../useBrowserTabs";
+import { BROWSER_SETTINGS } from "./BrowserSettings";
 import { BrowserSurface } from "./BrowserSurface";
 import "./browserWindow.css";
 
@@ -17,14 +19,47 @@ import "./browserWindow.css";
  * the native side, so it holds even if this renderer never gets the chance.
  */
 export function BrowserWindowShell() {
-  const browser = useBrowserTabs({
-    // A capture taken out here has no composer to land in. The native side
-    // still writes the file, and the toolbar reports what happened.
-    attachImage: async () => undefined,
-    insertText: () => undefined,
-  });
-  const tabs = useMemo(() => browser.tabs.filter((tab) => tab.popped_out), [browser.tabs]);
+  const [allowExternalOpen, setAllowExternalOpen] = useState(false);
+  const taskId =
+    typeof window === "undefined"
+      ? null
+      : new URLSearchParams(window.location.search).get("taskId");
+  const browser = useBrowserTabs(
+    {
+      // A capture taken out here has no composer to land in. The native side
+      // still writes the file, and the toolbar reports what happened.
+      attachImage: async () => undefined,
+      insertText: () => undefined,
+    },
+    { taskId, allowExternalOpen, poppedOutHost: true },
+  );
+  const tabs = useMemo(() => browser.tabs.filter((tab) => tab.poppedOut), [browser.tabs]);
   const [activeId, setActiveId] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    const refresh = () => {
+      void bridge
+        .listSettings()
+        .then((settings) => {
+          if (!active) return;
+          setAllowExternalOpen(
+            settings.find(
+              (setting) =>
+                setting.key === `settings.${BROWSER_SETTINGS.externalOpen}` ||
+                setting.key === BROWSER_SETTINGS.externalOpen,
+            )?.value === true,
+          );
+        })
+        .catch(() => undefined);
+    };
+    refresh();
+    window.addEventListener("focus", refresh);
+    return () => {
+      active = false;
+      window.removeEventListener("focus", refresh);
+    };
+  }, []);
 
   useEffect(() => {
     if (tabs.length === 0) {
@@ -80,7 +115,10 @@ export function BrowserWindowShell() {
             onRecordToggle={() => browser.toggleRecording(active.id)}
             onAnnotate={() => browser.toggleAnnotate(active.id)}
             onPopOut={() => browser.setPoppedOut(active.id, false)}
+            allowExternalOpen={browser.allowExternalOpen}
             onOpenExternally={() => browser.openExternally(active.id)}
+            onSaveLogin={() => browser.saveLogin(active.id, active.taskId)}
+            onFillLogin={() => browser.fillLogin(active.id, active.taskId)}
             onClose={() => browser.close(active.id)}
           />
         ) : (

@@ -48,8 +48,6 @@ export interface WorkPaneProps {
   renderBrowser?: (tabId: string) => ReactNode;
   browserAvailable: boolean;
   onLaunch: (kind: WorkPaneLaunchKind) => void;
-  /** Controls docked at the end of the strip (the titlebar cluster the pane covers). */
-  trailing?: ReactNode;
   /** Left/Right cursor across the tab strip; see `spatialNavigation.ts`. */
   arrowNavigation?: boolean;
   /** Whether that cursor wraps past the first and last tab. */
@@ -77,7 +75,6 @@ export function WorkPane({
   renderBrowser,
   browserAvailable,
   onLaunch,
-  trailing,
   arrowNavigation = true,
   wrapNavigation = true,
 }: WorkPaneProps) {
@@ -159,6 +156,11 @@ export function WorkPane({
           // Files close by path so two same-named files stay distinguishable.
           const closeLabel = surface.kind === "file" ? surface.path : label;
           const activeTab = surface.id === state.activeId;
+          // A tab reports whoever has it, and that includes the user when they
+          // are the one typing in the page. Only an agent's turn is worth a
+          // marker: the person already knows where their own hands are.
+          const heldBy = surface.kind === "browser" ? browserBusy?.[surface.tabId] : undefined;
+          const agentAt = heldBy && heldBy !== "you" ? heldBy : undefined;
           return (
             <motion.div
               key={surface.id}
@@ -167,14 +169,8 @@ export function WorkPane({
               data-kind={surface.kind}
               // A tab an agent is working in says so, so the user can watch
               // that one rather than wonder which page is moving.
-              data-busy={
-                surface.kind === "browser" && browserBusy?.[surface.tabId] ? "true" : undefined
-              }
-              title={
-                surface.kind === "browser" && browserBusy?.[surface.tabId]
-                  ? `${browserBusy[surface.tabId]} is working in this tab`
-                  : undefined
-              }
+              data-busy={agentAt ? "true" : undefined}
+              title={agentAt ? `${agentAt} is working in this tab` : undefined}
               initial={reduceMotion ? false : { opacity: 0, y: 3 }}
               animate={{ opacity: 1, y: 0 }}
               transition={
@@ -221,21 +217,6 @@ export function WorkPane({
           </button>
         </Tooltip>
       </div>
-      <div className="work-pane-strip-trailing">
-        {state.surfaces.length > 0 ? (
-          <Tooltip label="Close all tabs" hint="Processes keep running" placement="bottom">
-            <button
-              type="button"
-              className="icon-button subtle tiny work-pane-strip-close-all"
-              aria-label="Close all tabs"
-              onClick={() => controller.closeAll()}
-            >
-              <X aria-hidden="true" />
-            </button>
-          </Tooltip>
-        ) : null}
-        {trailing}
-      </div>
     </div>
   ) : null;
 
@@ -281,7 +262,7 @@ export function WorkPane({
         </div>
         {!headerTarget ? strip : null}
         <div className="work-pane-content" data-kind={active?.kind ?? "launcher"}>
-          {active ? (
+          {!present ? null : active ? (
             <Suspense
               fallback={
                 <div className="route-loading" role="status" aria-live="polite">

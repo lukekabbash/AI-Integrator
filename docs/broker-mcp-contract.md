@@ -33,8 +33,12 @@ The local desktop/broker remains authoritative for task identity, policy interse
 | `browser_open` | Yes | Open a browser tab owned by the calling task |
 | `browser_list` | No | List the calling task's browser tabs, including which are asleep and who is driving one |
 | `browser_drag` | No | Press at one element or point, move, and release at another |
-| `browser_close` | No | Close one of the calling task's tabs when the agent is done with it |
+| `browser_close` | No | Close one of your own tabs when you are done with it |
 | `browser_hover` | No | Move the pointer over an element, for menus that open on hover |
+| `browser_grant` | No | Hand one of your tabs to a subagent, read-only or to drive |
+| `browser_focus` | No | Ask for a tab to be brought to the front for the user to watch |
+| `browser_fill_login` | Yes | Sign in with a login the user saved for that exact site |
+| `browser_cookies` | No | List a tab's cookies — names, flags and expiry, never values |
 | `browser_navigate` | Yes | Point one of those tabs at a URL |
 | `browser_snapshot` | No | Read a page: url, title, viewport, text, and interactive elements with stable refs |
 | `browser_click` / `browser_type` / `browser_press` / `browser_scroll` | Yes | Synthesise one interaction in a tab |
@@ -42,15 +46,46 @@ The local desktop/broker remains authoritative for task identity, policy interse
 | `browser_evaluate` | Yes | Evaluate one expression in a tab, bounded to 64 KB of result |
 
 Browser tools are scoped to the calling task: a tab records the task that
-opened it, and a call naming another task's tab is refused. Delegated children
-have no browser tools; a child that needs a page asks its orchestrator.
+opened it, and a call naming another task's tab is refused. That boundary has
+no grant and no exception.
+
+Inside a task, reach has three layers:
+
+- **Task** — the outer boundary above.
+- **Owner** — a tab a delegated child opened belongs to that child. Siblings
+  cannot see it in `browser_list` and cannot address it; the orchestrator can.
+  A child closes only its own tabs and never grants a tab onward.
+- **Hold** — whoever last drove the tab keeps it for 45 seconds, so two runs do
+  not undo each other mid-flow. Advisory, and it expires on its own.
+
+`browser_grant(tabId, delegationId, mode)` hands one of the orchestrator's tabs
+to a child: `read` allows snapshot, wait and evaluate, `drive` adds the verbs
+that change the page.
+
+Saved logins are a capability, never a secret. `browser_fill_login` causes the
+app to type a password the user saved for that exact origin — scheme, host and
+port, with no subdomain widening and no following a redirect. The reply names
+the username and nothing else, and from the fill until the form is submitted or
+the tab navigates, `browser_snapshot`, `browser_evaluate` and any capture of
+that tab are refused with `credential-in-flight`. An agent can cause a login to
+happen; it can never learn a credential. If the user has not allowed sign-ins on
+that origin the call returns `needs-user-approval`, they are asked, and the
+right move is to carry on with something else and try again later.
+
+`browser_focus` asks the app to show a tab and reports whether it landed:
+`focused: false` means the pane is closed or the user is in another chat. The
+tab is still yours to drive either way — a tab nothing is showing keeps a full
+1280×800 viewport, so its geometry is as true off screen as on.
 
 Two things a caller sees in `browser_list` and should act on:
 
-- `heldBy` names an agent that drove the tab in the last 45 seconds. Reads are
-  always allowed, but a write to someone else's tab is refused with that name in
+- `heldBy` names whoever drove the tab in the last 45 seconds — an agent, or
+  `you` when the person using the app is working in it. Reads are always
+  allowed, but a write to a tab someone else has is refused with that name in
   the message. Open your own tab rather than taking the page out from under a
-  run in flight.
+  run in flight, and never try to work around the person: their hold is
+  enforced by the page itself, which is the only place a real keystroke is
+  distinguishable from a synthesised one.
 - `sleeping` marks a tab remembered from an earlier session: it has an address
   and a title but no page loaded yet. Addressing it loads it first, so nothing
   special is required — it costs one page load the first time.

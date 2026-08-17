@@ -177,6 +177,183 @@ fn skill_data_tool(harness_instructions: Option<&str>) -> Value {
     })
 }
 
+/// The browser surface, shared by every role that gets one.
+///
+/// A delegated child browses too — it owns whatever it opens and its siblings
+/// never see those tabs — but it cannot hand a tab on to anyone else, so
+/// `browser_grant` is the orchestrator's alone.
+fn browser_tools(role: &str) -> Vec<Value> {
+    let mut tools = vec![
+        json!({
+            "name": "browser_open",
+            "description": "Open a browser tab the user can see and drive too. Pass a url, or omit it for a blank tab. Returns a tabId to pass to the other browser tools. Prefer reusing an existing tab from browser_list over opening more.",
+            "annotations": tool_annotations(false, false),
+            "inputSchema": text_schema(json!({
+                "url": { "type": "string", "description": "Address to open. A bare host resolves to https, loopback to http." }
+            }), &[]),
+        }),
+        json!({
+            "name": "browser_list",
+            "description": "List the browser tabs you can reach, with their id, url, title, loading state, and who is currently working in each. Use it to keep track when you are working across several pages at once.",
+            "annotations": tool_annotations(true, false),
+            "inputSchema": text_schema(json!({}), &[]),
+        }),
+        json!({
+            "name": "browser_close",
+            "description": "Close one of your own browser tabs when you are done with it. A tab someone shared with you is theirs to close. The user can also close tabs themselves; leaving a page open is fine if they will want to look at it.",
+            "annotations": tool_annotations(false, true),
+            "inputSchema": text_schema(json!({
+                "tabId": { "type": "string" }
+            }), &["tabId"]),
+        }),
+    ];
+    if role != "child" {
+        tools.push(json!({
+            "name": "browser_grant",
+            "description": "Hand one of your browser tabs to a subagent you started, so it can work the page you already opened. mode 'read' allows snapshot and evaluate; 'drive' allows clicking and typing too. A subagent cannot pass a tab on to anyone else.",
+            "annotations": tool_annotations(false, false),
+            "inputSchema": text_schema(json!({
+                "tabId": { "type": "string" },
+                "delegationId": { "type": "string", "description": "The subagent to share it with." },
+                "mode": { "type": "string", "enum": ["read", "drive"], "default": "drive" }
+            }), &["tabId", "delegationId"]),
+        }));
+    }
+    tools.extend([
+        json!({
+            "name": "browser_focus",
+            "description": "Ask for one of your tabs to be brought to the front so the user can watch it. Use it before a step you want them to see, or when you need them to sign in or answer a challenge. Returns focused:false if the pane is closed or they are looking at another chat — the tab still works either way.",
+            "annotations": tool_annotations(false, false),
+            "inputSchema": text_schema(json!({
+                "tabId": { "type": "string" }
+            }), &["tabId"]),
+        }),
+        json!({
+            "name": "browser_fill_login",
+            "description": "Sign in to the page in a tab using a login the user has saved for that exact site. You never see the password: the app types it and the reply names only the username. Reading the page — snapshot and evaluate — is refused from the fill until the form is submitted or the tab navigates. If the user has not allowed sign-ins on that site, this returns needs-user-approval, asks them, and you try again later.",
+            "annotations": tool_annotations(false, true),
+            "inputSchema": text_schema(json!({
+                "tabId": { "type": "string" },
+                "username": { "type": "string", "description": "Required only when that site has more than one saved login." }
+            }), &["tabId"]),
+        }),
+        json!({
+            "name": "browser_cookies",
+            "description": "List the cookies the site in a tab holds: name, domain, path, expiry, and the Secure/HttpOnly/SameSite flags. Values are never returned, for any cookie, which makes this the safe way to check whether a session exists or when it expires.",
+            "annotations": tool_annotations(true, false),
+            "inputSchema": text_schema(json!({
+                "tabId": { "type": "string" }
+            }), &["tabId"]),
+        }),
+        json!({
+            "name": "browser_navigate",
+            "description": "Point one browser tab at a URL.",
+            "annotations": tool_annotations(false, false),
+            "inputSchema": text_schema(json!({
+                "tabId": { "type": "string" },
+                "url": { "type": "string" }
+            }), &["tabId", "url"]),
+        }),
+        json!({
+            "name": "browser_snapshot",
+            "description": "Read a page before acting on it: url, title, viewport, visible text, and the interactive elements with a stable ref, role, name and selector for each. Use the returned refs with browser_click and browser_type instead of guessing selectors.",
+            "annotations": tool_annotations(true, false),
+            "inputSchema": text_schema(json!({
+                "tabId": { "type": "string" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 500 }
+            }), &["tabId"]),
+        }),
+        json!({
+            "name": "browser_click",
+            "description": "Click one element in a browser tab. Target it by ref from browser_snapshot, or by selector, or by text plus optional role.",
+            "annotations": tool_annotations(false, true),
+            "inputSchema": text_schema(json!({
+                "tabId": { "type": "string" },
+                "ref": { "type": "string" },
+                "selector": { "type": "string" },
+                "text": { "type": "string" },
+                "role": { "type": "string" }
+            }), &["tabId"]),
+        }),
+        json!({
+            "name": "browser_hover",
+            "description": "Move the pointer over one element without pressing. Menus and tooltips that open on hover need this before their contents exist to click.",
+            "annotations": tool_annotations(false, false),
+            "inputSchema": text_schema(json!({
+                "tabId": { "type": "string" },
+                "ref": { "type": "string" },
+                "selector": { "type": "string" },
+                "text": { "type": "string" },
+                "role": { "type": "string" }
+            }), &["tabId"]),
+        }),
+        json!({
+            "name": "browser_type",
+            "description": "Type text into one field. Target it like browser_click; set clear to replace the current value.",
+            "annotations": tool_annotations(false, true),
+            "inputSchema": text_schema(json!({
+                "tabId": { "type": "string" },
+                "text": { "type": "string" },
+                "ref": { "type": "string" },
+                "selector": { "type": "string" },
+                "clear": { "type": "boolean" }
+            }), &["tabId", "text"]),
+        }),
+        json!({
+            "name": "browser_press",
+            "description": "Press one key in a browser tab, for example Enter or Escape. Modifiers are any of Control, Shift, Alt, Meta.",
+            "annotations": tool_annotations(false, true),
+            "inputSchema": text_schema(json!({
+                "tabId": { "type": "string" },
+                "key": { "type": "string" },
+                "modifiers": { "type": "array", "items": { "type": "string" } }
+            }), &["tabId", "key"]),
+        }),
+        json!({
+            "name": "browser_scroll",
+            "description": "Scroll a browser tab, or a container inside it. Positive deltaY scrolls down.",
+            "annotations": tool_annotations(false, false),
+            "inputSchema": text_schema(json!({
+                "tabId": { "type": "string" },
+                "deltaX": { "type": "number" },
+                "deltaY": { "type": "number" },
+                "selector": { "type": "string" }
+            }), &["tabId"]),
+        }),
+        json!({
+            "name": "browser_drag",
+            "description": "Press at one element or point, move, and release at another: reordering a list, moving a slider, drawing on a canvas. Targets take the same ref/selector/text as browser_click, or explicit x and y.",
+            "annotations": tool_annotations(false, false),
+            "inputSchema": text_schema(json!({
+                "tabId": { "type": "string" },
+                "from": { "type": "object", "description": "Start: { ref } | { selector } | { text, role } | { x, y }" },
+                "to": { "type": "object", "description": "End: { ref } | { selector } | { text, role } | { x, y }" }
+            }), &["tabId", "from", "to"]),
+        }),
+        json!({
+            "name": "browser_wait_for",
+            "description": "Check whether a page condition holds yet: a selector or text being present, or the URL containing a fragment. Returns matched:false rather than blocking, so poll it between other work.",
+            "annotations": tool_annotations(true, false),
+            "inputSchema": text_schema(json!({
+                "tabId": { "type": "string" },
+                "selector": { "type": "string" },
+                "text": { "type": "string" },
+                "urlIncludes": { "type": "string" }
+            }), &["tabId"]),
+        }),
+        json!({
+            "name": "browser_evaluate",
+            "description": "Evaluate one JavaScript expression in a browser tab and return its JSON result, up to 64 KB. The expression may change page state.",
+            "annotations": tool_annotations(false, true),
+            "inputSchema": text_schema(json!({
+                "tabId": { "type": "string" },
+                "expression": { "type": "string" }
+            }), &["tabId", "expression"]),
+        }),
+    ]);
+    tools
+}
+
 fn tool_definitions(role: &str, mode: &str, harness_instructions: Option<&str>) -> Vec<Value> {
     let data_tool = skill_data_tool(harness_instructions);
     match role {
@@ -195,33 +372,37 @@ fn tool_definitions(role: &str, mode: &str, harness_instructions: Option<&str>) 
             }
             tools
         }
-        "child" => vec![
-            data_tool,
-            json!({
-                "name": "task_complete",
-                "description": "Report that your delegated assignment is finished. The summary is your deliverable — include what you did, files touched, and caveats. Always call this exactly once when done.",
-                "annotations": tool_annotations(false, false),
-                "inputSchema": text_schema(json!({
-                    "summary": { "type": "string", "description": "Concise deliverable summary for the orchestrator." }
-                }), &["summary"]),
-            }),
-            json!({
-                "name": "orchestrator_ask",
-                "description": "Queue a question for the orchestrator that delegated this work. Asynchronous: the answer arrives in a later turn, so keep making progress on whatever does not depend on it.",
-                "annotations": tool_annotations(false, false),
-                "inputSchema": text_schema(json!({
-                    "message": { "type": "string", "description": "Your question, with enough context to answer without seeing your transcript." }
-                }), &["message"]),
-            }),
-            json!({
-                "name": "orchestrator_report",
-                "description": "Queue a progress note for the orchestrator on long-running work. Fire and forget.",
-                "annotations": tool_annotations(false, false),
-                "inputSchema": text_schema(json!({
-                    "message": { "type": "string", "description": "Short progress update." }
-                }), &["message"]),
-            }),
-        ],
+        "child" => {
+            let mut tools = vec![
+                data_tool,
+                json!({
+                    "name": "task_complete",
+                    "description": "Report that your delegated assignment is finished. The summary is your deliverable — include what you did, files touched, and caveats. Always call this exactly once when done.",
+                    "annotations": tool_annotations(false, false),
+                    "inputSchema": text_schema(json!({
+                        "summary": { "type": "string", "description": "Concise deliverable summary for the orchestrator." }
+                    }), &["summary"]),
+                }),
+                json!({
+                    "name": "orchestrator_ask",
+                    "description": "Queue a question for the orchestrator that delegated this work. Asynchronous: the answer arrives in a later turn, so keep making progress on whatever does not depend on it.",
+                    "annotations": tool_annotations(false, false),
+                    "inputSchema": text_schema(json!({
+                        "message": { "type": "string", "description": "Your question, with enough context to answer without seeing your transcript." }
+                    }), &["message"]),
+                }),
+                json!({
+                    "name": "orchestrator_report",
+                    "description": "Queue a progress note for the orchestrator on long-running work. Fire and forget.",
+                    "annotations": tool_annotations(false, false),
+                    "inputSchema": text_schema(json!({
+                        "message": { "type": "string", "description": "Short progress update." }
+                    }), &["message"]),
+                }),
+            ];
+            tools.extend(browser_tools(role));
+            tools
+        }
         _ => {
             let mut tools = vec![
                 data_tool,
@@ -284,134 +465,8 @@ fn tool_definitions(role: &str, mode: &str, harness_instructions: Option<&str>) 
                         "automationId": { "type": "string" }
                     }), &["automationId"]),
                 }),
-                json!({
-                    "name": "browser_open",
-                    "description": "Open a browser tab the user can see and drive too. Pass a url, or omit it for a blank tab. Returns a tabId to pass to the other browser tools. Prefer reusing an existing tab from browser_list over opening more.",
-                    "annotations": tool_annotations(false, false),
-                    "inputSchema": text_schema(json!({
-                    "url": { "type": "string", "description": "Address to open. A bare host resolves to https, loopback to http." }
-                    }), &[]),
-                }),
-                json!({
-                    "name": "browser_list",
-                    "description": "List this task's browser tabs with their id, url, title and loading state. Use it to keep track when you are working across several pages at once.",
-                    "annotations": tool_annotations(true, false),
-                    "inputSchema": text_schema(json!({}), &[]),
-                }),
-                json!({
-                    "name": "browser_close",
-                    "description": "Close one of this task's browser tabs when you are done with it. The user can also close tabs themselves; leaving a page open is fine if they will want to look at it.",
-                    "annotations": tool_annotations(false, true),
-                    "inputSchema": text_schema(json!({
-                    "tabId": { "type": "string" }
-                    }), &["tabId"]),
-                }),
-                json!({
-                    "name": "browser_navigate",
-                    "description": "Point one browser tab at a URL.",
-                    "annotations": tool_annotations(false, false),
-                    "inputSchema": text_schema(json!({
-                    "tabId": { "type": "string" },
-                    "url": { "type": "string" }
-                    }), &["tabId", "url"]),
-                }),
-                json!({
-                    "name": "browser_snapshot",
-                    "description": "Read a page before acting on it: url, title, viewport, visible text, and the interactive elements with a stable ref, role, name and selector for each. Use the returned refs with browser_click and browser_type instead of guessing selectors.",
-                    "annotations": tool_annotations(true, false),
-                    "inputSchema": text_schema(json!({
-                    "tabId": { "type": "string" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 500 }
-                    }), &["tabId"]),
-                }),
-                json!({
-                    "name": "browser_click",
-                    "description": "Click one element in a browser tab. Target it by ref from browser_snapshot, or by selector, or by text plus optional role.",
-                    "annotations": tool_annotations(false, true),
-                    "inputSchema": text_schema(json!({
-                    "tabId": { "type": "string" },
-                    "ref": { "type": "string" },
-                    "selector": { "type": "string" },
-                    "text": { "type": "string" },
-                    "role": { "type": "string" }
-                    }), &["tabId"]),
-                }),
-                json!({
-                    "name": "browser_hover",
-                    "description": "Move the pointer over one element without pressing. Menus and tooltips that open on hover need this before their contents exist to click.",
-                    "annotations": tool_annotations(false, false),
-                    "inputSchema": text_schema(json!({
-                    "tabId": { "type": "string" },
-                    "ref": { "type": "string" },
-                    "selector": { "type": "string" },
-                    "text": { "type": "string" },
-                    "role": { "type": "string" }
-                    }), &["tabId"]),
-                }),
-                json!({
-                    "name": "browser_type",
-                    "description": "Type text into one field. Target it like browser_click; set clear to replace the current value.",
-                    "annotations": tool_annotations(false, true),
-                    "inputSchema": text_schema(json!({
-                    "tabId": { "type": "string" },
-                    "text": { "type": "string" },
-                    "ref": { "type": "string" },
-                    "selector": { "type": "string" },
-                    "clear": { "type": "boolean" }
-                    }), &["tabId", "text"]),
-                }),
-                json!({
-                    "name": "browser_press",
-                    "description": "Press one key in a browser tab, for example Enter or Escape. Modifiers are any of Control, Shift, Alt, Meta.",
-                    "annotations": tool_annotations(false, true),
-                    "inputSchema": text_schema(json!({
-                    "tabId": { "type": "string" },
-                    "key": { "type": "string" },
-                    "modifiers": { "type": "array", "items": { "type": "string" } }
-                    }), &["tabId", "key"]),
-                }),
-                json!({
-                    "name": "browser_scroll",
-                    "description": "Scroll a browser tab, or a container inside it. Positive deltaY scrolls down.",
-                    "annotations": tool_annotations(false, false),
-                    "inputSchema": text_schema(json!({
-                    "tabId": { "type": "string" },
-                    "deltaX": { "type": "number" },
-                    "deltaY": { "type": "number" },
-                    "selector": { "type": "string" }
-                    }), &["tabId"]),
-                }),
-                json!({
-                    "name": "browser_drag",
-                    "description": "Press at one element or point, move, and release at another: reordering a list, moving a slider, drawing on a canvas. Targets take the same ref/selector/text as browser_click, or explicit x and y.",
-                    "annotations": tool_annotations(false, false),
-                    "inputSchema": text_schema(json!({
-                    "tabId": { "type": "string" },
-                    "from": { "type": "object", "description": "Start: { ref } | { selector } | { text, role } | { x, y }" },
-                    "to": { "type": "object", "description": "End: { ref } | { selector } | { text, role } | { x, y }" }
-                    }), &["tabId", "from", "to"]),
-                }),
-                json!({
-                    "name": "browser_wait_for",
-                    "description": "Check whether a page condition holds yet: a selector or text being present, or the URL containing a fragment. Returns matched:false rather than blocking, so poll it between other work.",
-                    "annotations": tool_annotations(true, false),
-                    "inputSchema": text_schema(json!({
-                    "tabId": { "type": "string" },
-                    "selector": { "type": "string" },
-                    "text": { "type": "string" },
-                    "urlIncludes": { "type": "string" }
-                    }), &["tabId"]),
-                }),
-                json!({
-                    "name": "browser_evaluate",
-                    "description": "Evaluate one JavaScript expression in a browser tab and return its JSON result, up to 64 KB. The expression may change page state.",
-                    "annotations": tool_annotations(false, true),
-                    "inputSchema": text_schema(json!({
-                    "tabId": { "type": "string" },
-                    "expression": { "type": "string" }
-                    }), &["tabId", "expression"]),
-                }),
             ];
+            tools.extend(browser_tools(role));
             if mode == "off" {
                 return tools;
             }
@@ -646,6 +701,10 @@ mod tests {
                 "browser_open",
                 "browser_list",
                 "browser_close",
+                "browser_grant",
+                "browser_focus",
+                "browser_fill_login",
+                "browser_cookies",
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",
@@ -674,6 +733,10 @@ mod tests {
                 "browser_open",
                 "browser_list",
                 "browser_close",
+                "browser_grant",
+                "browser_focus",
+                "browser_fill_login",
+                "browser_cookies",
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",
@@ -702,6 +765,10 @@ mod tests {
                 "browser_open",
                 "browser_list",
                 "browser_close",
+                "browser_grant",
+                "browser_focus",
+                "browser_fill_login",
+                "browser_cookies",
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",

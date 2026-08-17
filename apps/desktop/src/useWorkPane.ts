@@ -130,7 +130,6 @@ export function useWorkPaneHeaderAlignment(
   rootRef: RefObject<HTMLElement | null>,
   paneRef: RefObject<HTMLElement | null>,
   open: boolean,
-  width: number,
 ) {
   useLayoutEffect(() => {
     const root = rootRef.current;
@@ -165,5 +164,5 @@ export function useWorkPaneHeaderAlignment(
       root.style.removeProperty("--subagent-pane-left");
       root.style.removeProperty("--titlebar-end-width");
     };
-  }, [rootRef, paneRef, open, width]);
+  }, [rootRef, paneRef, open]);
 }

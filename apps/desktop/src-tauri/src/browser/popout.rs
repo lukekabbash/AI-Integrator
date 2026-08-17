@@ -11,33 +11,64 @@
 //! popping out changes what an agent may do: the tabs keep their ids and their
 //! task, so a run in flight carries on across the move.
 
-use std::sync::Arc;
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
-use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, WebviewUrl};
-use url::Url;
+use tauri::{AppHandle, Manager, WebviewUrl};
+use url::form_urlencoded;
 
-use crate::command_api::CommandError;
+use crate::command_api::{CommandError, CommandResult};
 
-use super::{BrowserTabs, dock_tab, tab_webview_builder, unavailable};
+use super::{BrowserTab, BrowserTabs, emit_changed, parked, require_task, unavailable, webview_of};
 
 /// Label of the window that hosts popped-out tabs. Scoped in
 /// `capabilities/default.json` so its renderer reaches the app commands.
-pub const POPOUT_WINDOW: &str = "browser-window";
+pub const POPOUT_WINDOW_PREFIX: &str = "browser-window-";
 
-/// Creates the window on first use and returns it. The renderer decides what
-/// to draw from the window label, so nothing has to be passed in.
-pub fn ensure_window(app: &AppHandle) -> Result<tauri::Window, CommandError> {
-    if let Some(window) = app.get_window(POPOUT_WINDOW) {
-        let _ = window.show();
-        let _ = window.set_focus();
+/// One popout window per task prevents two chats from sharing a tab strip.
+pub(crate) fn window_label(task_id: &str) -> String {
+    let mut hash = DefaultHasher::new();
+    task_id.hash(&mut hash);
+    format!("{POPOUT_WINDOW_PREFIX}{:016x}", hash.finish())
+}
+
+fn focus_window(window: &tauri::Window) -> Result<(), CommandError> {
+    if window
+        .is_minimized()
+        .map_err(|error| unavailable(format!("could not inspect the browser window: {error}")))?
+    {
+        window
+            .unminimize()
+            .map_err(|error| unavailable(format!("could not restore the browser window: {error}")))?;
+    }
+    window
+        .show()
+        .map_err(|error| unavailable(format!("could not show the browser window: {error}")))?;
+    window
+        .set_focus()
+        .map_err(|error| unavailable(format!("could not focus the browser window: {error}")))
+}
+
+/// Creates this task's window on first use and brings an existing one forward.
+pub fn ensure_window(app: &AppHandle, task_id: &str) -> Result<tauri::Window, CommandError> {
+    let label = window_label(task_id);
+    if let Some(window) = app.get_window(&label) {
+        focus_window(&window)?;
         return Ok(window);
     }
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair("surface", "browser")
+        .append_pair("taskId", task_id)
+        .finish();
     let window =
         // The query tells the renderer which surface to draw before React runs.
         tauri::WebviewWindowBuilder::new(
             app,
-            POPOUT_WINDOW,
-            WebviewUrl::App("index.html?surface=browser".into()),
+            &label,
+            WebviewUrl::App(format!("index.html?{query}").into()),
         )
             .title("Integrator Browser")
             .inner_size(1180.0, 820.0)
@@ -47,58 +78,105 @@ pub fn ensure_window(app: &AppHandle) -> Result<tauri::Window, CommandError> {
             .map_err(|error| unavailable(format!("could not open the browser window: {error}")))?;
 
     let close_app = app.clone();
+    let close_task_id = task_id.to_string();
     window.on_window_event(move |event| {
         if !matches!(event, tauri::WindowEvent::Destroyed) {
             return;
         }
         let app = close_app.clone();
+        let task_id = close_task_id.clone();
         tauri::async_runtime::spawn(async move {
-            dock_all_popped_out(&app);
+            dock_popped_out_for_task(&app, &task_id);
         });
     });
-    Ok(window.as_ref().window())
+    let window = window.as_ref().window();
+    focus_window(&window)?;
+    Ok(window)
 }
 
-/// Sends every popped-out tab back to the pane. Used when the window closes,
-/// by the control that closes it, and on the way out of a session.
-pub fn dock_all_popped_out(app: &AppHandle) {
+/// Sends this task's popped tabs back when its browser window closes.
+pub fn dock_popped_out_for_task(app: &AppHandle, task_id: &str) {
     let Some(state) = app.try_state::<Arc<BrowserTabs>>() else {
         return;
     };
     let tabs = Arc::clone(&state);
-    for tab in tabs.snapshot(None).into_iter().filter(|tab| tab.popped_out) {
-        let Some(label) = tabs.label_for(&tab.id) else {
-            continue;
-        };
-        let Ok(target) = Url::parse(&tab.url) else {
-            continue;
-        };
-        let _ = dock_tab(app, &tabs, &tab.id, &label, &target);
+    for tab in tabs
+        .snapshot(Some(task_id))
+        .into_iter()
+        .filter(|tab| tab.popped_out)
+    {
+        let _ = move_tab(app, &tabs, &tab.id, false, false);
     }
 }
 
-/// Moves one tab's webview from the pane into the pop-out window.
-pub fn adopt(
+/// Moves one live child webview without navigating or rebuilding it. If
+/// parking fails after reparenting, it is returned to its original host.
+fn move_tab(
     app: &AppHandle,
     state: &Arc<BrowserTabs>,
     id: &str,
-    label: &str,
-    target: &Url,
-) -> Result<(), CommandError> {
-    let window = ensure_window(app)?;
-    window
-        .add_child(
-            tab_webview_builder(app, state, id, label, target),
-            // The shell reports the real rectangle as soon as it mounts; until
-            // then the tab sits out of the way rather than covering the chrome.
-            LogicalPosition::new(0.0, 0.0),
-            LogicalSize::new(1.0, 1.0),
-        )
+    popped_out: bool,
+    focus: bool,
+) -> Result<BrowserTab, CommandError> {
+    let current = state
+        .snapshot(None)
+        .into_iter()
+        .find(|tab| tab.id == id)
+        .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
+    if current.popped_out == popped_out {
+        if popped_out && focus {
+            let _ = ensure_window(app, &current.task_id)?;
+        }
+        return Ok(current);
+    }
+    let label = state
+        .label_for(id)
+        .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
+    let source = if current.popped_out {
+        app.get_window(&window_label(&current.task_id))
+    } else {
+        app.get_window("main")
+    }
+    .ok_or_else(|| unavailable("the browser tab's current window is not available"))?;
+    let target = if popped_out {
+        ensure_window(app, &current.task_id)?
+    } else {
+        app.get_window("main")
+            .ok_or_else(|| unavailable("the main window is not available"))?
+    };
+    let webview = webview_of(app, &label)?;
+    webview
+        .reparent(&target)
         .map_err(|error| unavailable(format!("could not move the tab: {error}")))?;
-    state.update(id, |tab| {
-        tab.popped_out = true;
-        tab.hidden = true;
-    });
-    super::emit_changed(app, state);
-    Ok(())
+    let (position, size) = parked();
+    if let Err(error) = webview.set_bounds(tauri::Rect {
+        position: position.into(),
+        size: size.into(),
+    }) {
+        let _ = webview.reparent(&source);
+        return Err(unavailable(format!("could not park the moved tab: {error}")));
+    }
+    let tab = state
+        .update(id, |tab| {
+            tab.popped_out = popped_out;
+            tab.hidden = true;
+        })
+        .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
+    emit_changed(app, state);
+    Ok(tab)
+}
+
+/// Moves a tab without losing history, scroll position, form state, or an
+/// in-flight agent interaction.
+#[tauri::command]
+pub async fn browser_tab_set_popped_out(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<BrowserTabs>>,
+    task_id: String,
+    tab_id: String,
+    popped_out: bool,
+) -> CommandResult<BrowserTab> {
+    require_task(&state, &task_id, &tab_id)?;
+    super::remember::ensure_awake(&app, &state, &tab_id).await;
+    move_tab(&app, &state, &tab_id, popped_out, true)
 }

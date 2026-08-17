@@ -36,6 +36,10 @@
 
 .browser-window-tab {
   max-width: 220px;
+  border-color: var(--color-border-subtle);
+}
+.browser-window-tab[data-active="true"] {
+  border-color: var(--color-border-strong);
 }
 .browser-window-tab .file-reader-tab-close {
   font-size: 13px;

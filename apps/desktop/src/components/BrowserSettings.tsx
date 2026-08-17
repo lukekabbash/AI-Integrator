@@ -1,7 +1,7 @@
-import { Globe, RotateCw, Trash2 } from "lucide-react";
+import { Globe, KeyRound, RotateCw, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 
-import { bridge, type BrowserSite } from "../bridge";
+import { bridge, type BrowserSite, type SavedLogin } from "../bridge";
 import { SettingRow, Switch } from "./SettingControls";
 import { readSetting, type SettingsMap } from "./settingsModel";
 
@@ -9,6 +9,8 @@ export const BROWSER_SETTINGS = {
   agentAccess: "browser.agentAccess",
   keepSignedIn: "browser.keepSignedIn",
   blockNewWindows: "browser.blockNewWindows",
+  externalOpen: "browser.externalOpen",
+  dismissConsent: "browser.dismissConsent",
 } as const;
 
 /**
@@ -25,6 +27,7 @@ export function BrowserSettings({
   setSetting: (key: string, value: unknown) => void;
 }) {
   const [sites, setSites] = useState<BrowserSite[]>([]);
+  const [logins, setLogins] = useState<SavedLogin[]>([]);
   const [message, setMessage] = useState("");
   const [generation, setGeneration] = useState(0);
   const [loaded, setLoaded] = useState<number | null>(null);
@@ -45,6 +48,16 @@ export function BrowserSettings({
         setSites([]);
         setLoaded(generation);
       });
+    return () => {
+      active = false;
+    };
+  }, [generation]);
+
+  useEffect(() => {
+    let active = true;
+    (bridge.browser?.savedLogins() ?? Promise.resolve<SavedLogin[]>([]))
+      .then((next) => active && setLogins(next))
+      .catch(() => active && setLogins([]));
     return () => {
       active = false;
     };
@@ -93,6 +106,16 @@ export function BrowserSettings({
           />
         </SettingRow>
         <SettingRow
+          label="Decline cookie banners automatically"
+          description="Clicks the reject control on consent dialogs from vendors Integrator recognises — Cookiebot, OneTrust, Didomi and a few more. Never accepts, and never touches a login wall, an age gate or a terms dialog, which wear the same shape and mean something else."
+        >
+          <Switch
+            checked={readSetting(settings, BROWSER_SETTINGS.dismissConsent, false) === true}
+            onChange={(next) => setSetting(BROWSER_SETTINGS.dismissConsent, next)}
+            label="Decline cookie banners automatically"
+          />
+        </SettingRow>
+        <SettingRow
           label="Keep pop-ups inside Integrator"
           description="A page that opens a new window loads it in the same tab, so a sign-in hop stays somewhere you can watch."
         >
@@ -100,6 +123,16 @@ export function BrowserSettings({
             checked={flag(BROWSER_SETTINGS.blockNewWindows, true)}
             onChange={(next) => setSetting(BROWSER_SETTINGS.blockNewWindows, next)}
             label="Keep pop-ups inside Integrator"
+          />
+        </SettingRow>
+        <SettingRow
+          label="Allow opening tabs in an external browser"
+          description="Shows the external-browser action in embedded tabs. Off keeps every browser handoff inside Integrator."
+        >
+          <Switch
+            checked={flag(BROWSER_SETTINGS.externalOpen, false)}
+            onChange={(next) => setSetting(BROWSER_SETTINGS.externalOpen, next)}
+            label="Allow opening tabs in an external browser"
           />
         </SettingRow>
       </section>
@@ -173,6 +206,81 @@ export function BrowserSettings({
           <p className="settings-action-message" role="status">
             {message}
           </p>
+        ) : null}
+      </section>
+
+      <section className="settings-section">
+        <header>
+          <h2>Saved logins</h2>
+          <p>
+            Passwords you have asked Integrator to remember. Each one lives in this computer&apos;s
+            credential store and is only ever typed into the exact site it was saved for — never a
+            subdomain, never after a redirect. Save one from a browser tab: sign in, then choose
+            <strong> Save this login</strong> from the tab&apos;s menu.
+          </p>
+        </header>
+        {logins.length === 0 ? (
+          <div className="settings-empty">
+            {available
+              ? "Nothing saved yet."
+              : "Saved logins need the desktop app and its credential store."}
+          </div>
+        ) : (
+          <ul className="browser-sites-list">
+            {logins.map((login) => (
+              <li key={`${login.projectId}:${login.origin}:${login.username}`}>
+                <span>
+                  <strong>
+                    <KeyRound aria-hidden="true" /> {login.origin}
+                  </strong>
+                  <small>
+                    {login.username} ·{" "}
+                    {login.projectId === "*" ? "every project" : "this project only"}
+                    {login.lastUsedAt
+                      ? ` · last used ${new Date(login.lastUsedAt).toLocaleDateString()}`
+                      : " · never used"}
+                  </small>
+                </span>
+                <button
+                  className="icon-button subtle tiny"
+                  type="button"
+                  aria-label={`Forget the login for ${login.username} on ${login.origin}`}
+                  onClick={() => {
+                    void bridge.browser
+                      ?.forgetLogin(login.projectId, login.origin, login.username)
+                      .then(setLogins)
+                      .catch(() => setMessage("Could not forget that login."));
+                  }}
+                >
+                  <Trash2 aria-hidden="true" />
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        {/* Said plainly rather than quietly omitted: a reveal is only worth
+            anything behind an OS re-authentication gate, and that is its own
+            piece of work. */}
+        <p className="settings-hint">
+          A saved password cannot be shown back to you, and no agent can read one. An agent may ask
+          to sign in; you decide per site, and it is told the username at most.
+        </p>
+        {logins.length > 0 ? (
+          <div className="settings-action-row">
+            <button
+              className="secondary-button small"
+              type="button"
+              onClick={() => {
+                void bridge.browser
+                  ?.forgetAllLogins()
+                  .then(setLogins)
+                  .catch(() => setMessage("Could not forget those logins."));
+              }}
+            >
+              <Trash2 aria-hidden="true" />
+              Forget every saved login
+            </button>
+          </div>
         ) : null}
       </section>
     </>

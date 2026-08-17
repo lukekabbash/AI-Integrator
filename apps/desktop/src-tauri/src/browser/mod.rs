@@ -12,14 +12,11 @@
 
 use std::{
     collections::HashMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, atomic::Ordering},
     time::Duration,
 };
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tauri::{
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize,
@@ -34,18 +31,35 @@ use crate::command_api::{CommandError, CommandResult};
 mod agent;
 mod capture;
 mod popout;
+mod registry;
 mod remember;
 mod servers;
+pub(crate) mod sites;
+mod vault;
 
+pub use popout::browser_tab_set_popped_out;
+pub use registry::{BrowserTab, BrowserTabs, Caller, GrantMode};
+pub(crate) use registry::{Tab, USER_HOLDER, note_user_activity};
 pub use servers::browser_local_servers;
+pub use sites::{browser_clear_data, browser_sites};
 
 pub const BROWSER_EVENT: &str = "browser://changed";
+/// An agent asking the renderer to bring one tab to the front. The renderer
+/// owns layout, so this is a request, and `browser_focus` reports what came of
+/// it rather than pretending it landed.
+pub const BROWSER_FOCUS_EVENT: &str = "browser://focus";
+/// An agent asking to sign in on a site the user has not allowed it to. The
+/// app asks; the agent is told to try again rather than being made to wait.
+pub const BROWSER_FILL_REQUEST_EVENT: &str = "browser://fill-request";
 /// Sites stay signed in between runs unless the user turns this off.
 pub const KEEP_SIGNED_IN_SETTING: &str = "settings.browser.keepSignedIn";
 /// Whether agents may open and drive browser tabs for this installation.
 pub const AGENT_ACCESS_SETTING: &str = "settings.browser.agentAccess";
 /// Whether a page's `window.open` becomes a navigation in the same tab.
 pub const KEEP_POPUPS_INSIDE_SETTING: &str = "settings.browser.blockNewWindows";
+/// Whether a recognised cookie-consent dialog is declined automatically. Off
+/// unless asked for: it is a preference, and both answers are legitimate.
+pub const DISMISS_CONSENT_SETTING: &str = "settings.browser.dismissConsent";
 const GUEST_RUNTIME: &str = include_str!("guest.js");
 /// WebView2 reports itself as Edge with a `WebView2` product token, and several
 /// large identity providers — Google's among them — refuse to accept a sign-in
@@ -59,6 +73,18 @@ const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
 const OFFSCREEN_SIZE: (f64, f64) = (1280.0, 800.0);
 const EVAL_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_EVAL_BYTES: usize = 96 * 1024;
+
+/// Where a tab waits when nothing is showing it: outside the window's client
+/// area, at a size a site serves its desktop layout to. A new tab starts here
+/// rather than as a pixel in the corner, so a page that loads before the
+/// renderer has placed it still measures itself honestly — an agent working
+/// with the pane closed is the normal case, not the exception.
+pub(super) fn parked() -> (LogicalPosition<f64>, LogicalSize<f64>) {
+    (
+        LogicalPosition::new(-(OFFSCREEN_SIZE.0 + 200.0), 0.0),
+        LogicalSize::new(OFFSCREEN_SIZE.0, OFFSCREEN_SIZE.1),
+    )
+}
 
 /// A tab with no page: the start page shows instead of a native surface.
 pub(super) fn is_blank(url: &Url) -> bool {
@@ -79,124 +105,23 @@ pub(super) fn unavailable(message: impl Into<String>) -> CommandError {
     }
 }
 
-/// One tab's user-visible state. The renderer renders from this; the agent
-/// reads the same fields through the broker.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BrowserTab {
-    pub id: String,
-    /// Task that owns the tab, so agent tools cannot address another task's tabs.
-    pub task_id: String,
-    pub url: String,
-    pub title: String,
-    pub loading: bool,
-    pub popped_out: bool,
-    /// True while the tab has no visible host (pane closed); it keeps running.
-    pub hidden: bool,
-    /// Set while an agent is driving this tab, so a second one can see that
-    /// someone is mid-flow here and open its own rather than take the wheel.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub held_by: Option<String>,
-    /// Remembered from a previous session and not yet loaded. It has an address
-    /// and a title but no webview, so a chat can come back with a dozen tabs
-    /// without fetching a dozen pages.
-    pub sleeping: bool,
-}
-
-struct Tab {
-    state: BrowserTab,
-    /// Label of the webview; also the pop-out window label when popped out.
-    label: String,
-    /// Who last drove this tab through the broker, and when. A page can only
-    /// be in one state at a time, so two agents taking turns on one tab undo
-    /// each other's work; this is what lets the second one notice.
-    held: Option<(String, std::time::Instant)>,
-    /// How many documents this tab has loaded. The guest is rebuilt per
-    /// document and cannot count them itself, so the host does and pushes the
-    /// number in; refs carry it, and one from an earlier page reads as stale.
-    generation: u64,
-}
-
-/// How long after an agent's last action the tab still reads as theirs.
-const HOLD_TTL: Duration = Duration::from_secs(45);
-
-#[derive(Default)]
-pub struct BrowserTabs {
-    tabs: Mutex<HashMap<String, Tab>>,
-    sequence: AtomicU64,
-}
-
-impl BrowserTabs {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn snapshot(&self, task_id: Option<&str>) -> Vec<BrowserTab> {
-        let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
-        let mut list: Vec<BrowserTab> = tabs
-            .values()
-            .filter(|tab| task_id.is_none_or(|task| tab.state.task_id == task))
-            .map(|tab| {
-                let mut state = tab.state.clone();
-                // A hold is reported only while it is fresh, so nothing has to
-                // remember to release one when a run ends or an agent dies.
-                state.held_by = tab
-                    .held
-                    .as_ref()
-                    .filter(|(_, at)| at.elapsed() < HOLD_TTL)
-                    .map(|(who, _)| who.clone());
-                state
-            })
-            .collect();
-        list.sort_by(|a, b| a.id.cmp(&b.id));
-        list
-    }
-
-    /// Counts a fresh document and returns the new generation.
-    fn bump_generation(&self, id: &str) -> Option<u64> {
-        let mut tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
-        let tab = tabs.get_mut(id)?;
-        tab.generation += 1;
-        Some(tab.generation)
-    }
-
-    /// Records that `holder` just drove this tab.
-    pub(super) fn mark_held(&self, id: &str, holder: &str) {
-        let mut tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(tab) = tabs.get_mut(id) {
-            tab.held = Some((holder.to_string(), std::time::Instant::now()));
-        }
-    }
-
-    /// Who is driving this tab right now, if anyone other than `asker`.
-    pub(super) fn held_by_other(&self, id: &str, asker: &str) -> Option<String> {
-        let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
-        tabs.get(id)
-            .and_then(|tab| tab.held.as_ref())
-            .filter(|(who, at)| who != asker && at.elapsed() < HOLD_TTL)
-            .map(|(who, _)| who.clone())
-    }
-
-    fn label_for(&self, id: &str) -> Option<String> {
-        let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
-        tabs.get(id).map(|tab| tab.label.clone())
-    }
-
-    fn task_of(&self, id: &str) -> Option<String> {
-        let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
-        tabs.get(id).map(|tab| tab.state.task_id.clone())
-    }
-
-    fn update(&self, id: &str, apply: impl FnOnce(&mut BrowserTab)) -> Option<BrowserTab> {
-        let mut tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
-        let tab = tabs.get_mut(id)?;
-        apply(&mut tab.state);
-        Some(tab.state.clone())
-    }
-}
-
 pub(super) fn emit_changed<R: Runtime>(app: &AppHandle<R>, tabs: &BrowserTabs) {
-    let _ = app.emit(BROWSER_EVENT, json!({ "tabs": tabs.snapshot(None) }));
+    let _ = tabs;
+    let _ = app.emit(BROWSER_EVENT, ());
+}
+
+/// The renderer must name the task it is displaying for every tab operation.
+/// A mismatched tab is reported as absent so one window cannot probe another
+/// chat's browser state by id.
+pub(super) fn require_task(
+    tabs: &BrowserTabs,
+    task_id: &str,
+    tab_id: &str,
+) -> Result<(), CommandError> {
+    if tabs.task_of(tab_id).as_deref() == Some(task_id) {
+        return Ok(());
+    }
+    Err(unavailable("that browser tab is no longer open"))
 }
 
 /// Accepts only http(s); a bare host defaults to https, loopback to http.
@@ -275,7 +200,13 @@ pub(super) async fn eval_json<R: Runtime>(
     if value.get("ok").and_then(Value::as_bool) == Some(false) {
         let error = value.get("error").cloned().unwrap_or_default();
         return Err(CommandError {
-            code: "provider-protocol",
+            // Most guest refusals are protocol-shaped, but "someone else has
+            // this page" is the same answer the host gives for an agent hold
+            // and deserves the same code, so a caller can treat it as one case.
+            code: match error.get("code").and_then(Value::as_str) {
+                Some("user-holding") => "unavailable",
+                _ => "provider-protocol",
+            },
             message: error
                 .get("message")
                 .and_then(Value::as_str)
@@ -300,6 +231,14 @@ pub struct TabBounds {
 }
 
 /// True unless the user has explicitly turned the setting off.
+/// One boolean setting, with the default to fall back on when it is unset.
+pub(super) fn setting_is<R: Runtime>(app: &AppHandle<R>, key: &str, default: bool) -> bool {
+    app.try_state::<crate::state::AppState>()
+        .and_then(|state| state.store.get_setting(key).ok().flatten())
+        .and_then(|setting| setting.value.as_bool())
+        .unwrap_or(default)
+}
+
 pub(super) fn setting_enabled<R: Runtime>(app: &AppHandle<R>, key: &str) -> bool {
     app.try_state::<crate::state::AppState>()
         .and_then(|state| state.store.get_setting(key).ok().flatten())
@@ -309,9 +248,16 @@ pub(super) fn setting_enabled<R: Runtime>(app: &AppHandle<R>, key: &str) -> bool
 
 /// The injected runtime, prefixed with the per-launch settings it reads. The
 /// prelude runs before page scripts, so a page cannot see it change.
-fn guest_runtime<R: Runtime>(app: &AppHandle<R>) -> String {
+fn guest_runtime<R: Runtime>(app: &AppHandle<R>, tabs: &BrowserTabs) -> String {
     let keep_popups_inside = setting_enabled(app, KEEP_POPUPS_INSIDE_SETTING);
-    format!("window.__integratorBrowser={{keepPopupsInside:{keep_popups_inside}}};{GUEST_RUNTIME}")
+    // Default off, unlike the other two: nothing should be clicked on the
+    // user's behalf unless they asked for it.
+    let dismiss_consent = setting_is(app, DISMISS_CONSENT_SETTING, false);
+    let host_key = tabs.host_key();
+    format!(
+        "window.__integratorBrowser={{keepPopupsInside:{keep_popups_inside},\
+         dismissConsent:{dismiss_consent},hostKey:{host_key:?}}};{GUEST_RUNTIME}"
+    )
 }
 
 /// Where cookies and local storage live. One shared profile keeps sites signed
@@ -347,10 +293,13 @@ pub(super) fn tab_webview_builder(
     let title_id = id.to_string();
 
     let mut builder = WebviewBuilder::new(label, WebviewUrl::External(target.clone()))
-        .initialization_script(guest_runtime(app))
+        .initialization_script(guest_runtime(app, state))
         .on_page_load(move |webview, payload| {
             let loading = matches!(payload.event(), PageLoadEvent::Started);
             let url = payload.url().to_string();
+            // Leaving the page ends the secret being on it: the form is gone
+            // and the new document's guest has nothing filled in.
+            tabs.clear_credential(&load_id);
             // A finished load is a new document with a fresh guest that starts
             // at generation zero. Tell it which document it is, so refs handed
             // out before the navigation can be recognised as stale rather than
@@ -404,8 +353,8 @@ pub(super) fn dock_tab(
     window
         .add_child(
             tab_webview_builder(app, state, id, label, target),
-            LogicalPosition::new(0.0, 0.0),
-            LogicalSize::new(1.0, 1.0),
+            parked().0,
+            parked().1,
         )
         .map_err(|error| unavailable(format!("could not dock the tab: {error}")))?;
     state.update(id, |tab| {
@@ -435,11 +384,7 @@ pub(super) async fn create_tab(
     let builder = tab_webview_builder(app, state, &id, &label, &target);
 
     window
-        .add_child(
-            builder,
-            LogicalPosition::new(0.0, 0.0),
-            LogicalSize::new(1.0, 1.0),
-        )
+        .add_child(builder, parked().0, parked().1)
         .map_err(|error| unavailable(format!("could not open a browser tab: {error}")))?;
 
     let tab = BrowserTab {
@@ -452,9 +397,10 @@ pub(super) async fn create_tab(
         // a tab that is simply waiting for an address.
         loading: !is_blank(&target),
         popped_out: false,
-        hidden: false,
+        hidden: true,
         held_by: None,
         sleeping: false,
+        delegation_id: None,
     };
     {
         let mut tabs = state.tabs.lock().unwrap_or_else(|error| error.into_inner());
@@ -464,10 +410,17 @@ pub(super) async fn create_tab(
                 state: tab.clone(),
                 label,
                 held: None,
+                user_at: None,
+                grants: HashMap::new(),
                 generation: 0,
+                touched: std::time::Instant::now(),
+                credential_at: None,
             },
         );
     }
+    // One more tab may be one too many: put the task back under its live cap
+    // before telling anyone the new tab exists.
+    remember::enforce_cap(app, state, &tab.task_id, &tab.id);
     emit_changed(app, state);
     remember::remember(app, state, &tab.task_id);
     Ok(tab)
@@ -502,17 +455,19 @@ pub async fn browser_tabs_restore(
 #[tauri::command]
 pub async fn browser_tab_list(
     state: tauri::State<'_, Arc<BrowserTabs>>,
-    task_id: Option<String>,
+    task_id: String,
 ) -> CommandResult<Vec<BrowserTab>> {
-    Ok(state.snapshot(task_id.as_deref()))
+    Ok(state.snapshot(Some(&task_id)))
 }
 
 #[tauri::command]
 pub async fn browser_tab_close(
     app: AppHandle,
     state: tauri::State<'_, Arc<BrowserTabs>>,
+    task_id: String,
     tab_id: String,
 ) -> CommandResult<()> {
+    require_task(&state, &task_id, &tab_id)?;
     close_tab(&app, &state, &tab_id)
 }
 
@@ -550,20 +505,22 @@ pub(super) fn close_tab(
 pub async fn browser_tab_set_bounds(
     app: AppHandle,
     state: tauri::State<'_, Arc<BrowserTabs>>,
+    task_id: String,
     tab_id: String,
     bounds: Option<TabBounds>,
+    popped_out_host: bool,
 ) -> CommandResult<()> {
-    remember::ensure_awake(&app, &state, &tab_id).await;
-    let label = state
-        .label_for(&tab_id)
-        .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
+    require_task(&state, &task_id, &tab_id)?;
     let popped_out = state
         .tabs
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .get(&tab_id)
         .is_some_and(|tab| tab.state.popped_out);
-    if popped_out {
+    // Only the renderer that owns the tab's current host may place it. A late
+    // main-window resize cannot pull a popped tab back over the pane, and the
+    // popout renderer is still allowed to give that same tab its rectangle.
+    if popped_out != popped_out_host {
         return Ok(());
     }
     if state.sleeping_target(&tab_id).is_some() {
@@ -575,6 +532,9 @@ pub async fn browser_tab_set_bounds(
             return Ok(());
         }
     }
+    let label = state
+        .label_for(&tab_id)
+        .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
     let webview = webview_of(&app, &label)?;
     match bounds {
         Some(bounds) if bounds.width >= 1.0 && bounds.height >= 1.0 => {
@@ -592,6 +552,9 @@ pub async fn browser_tab_set_bounds(
                 })
                 .map_err(|error| unavailable(error.to_string()))?;
             let _ = webview.show();
+            // Being on screen counts as being reached for: the cap must never
+            // sleep the page the user is looking at.
+            state.touch(&tab_id);
             state.update(&tab_id, |tab| tab.hidden = false);
         }
         _ => {
@@ -618,9 +581,11 @@ pub async fn browser_tab_set_bounds(
 pub async fn browser_tab_navigate(
     app: AppHandle,
     state: tauri::State<'_, Arc<BrowserTabs>>,
+    task_id: String,
     tab_id: String,
     url: String,
 ) -> CommandResult<BrowserTab> {
+    require_task(&state, &task_id, &tab_id)?;
     remember::ensure_awake(&app, &state, &tab_id).await;
     let label = state
         .label_for(&tab_id)
@@ -644,9 +609,11 @@ pub async fn browser_tab_navigate(
 pub async fn browser_tab_history(
     app: AppHandle,
     state: tauri::State<'_, Arc<BrowserTabs>>,
+    task_id: String,
     tab_id: String,
     action: String,
 ) -> CommandResult<()> {
+    require_task(&state, &task_id, &tab_id)?;
     remember::ensure_awake(&app, &state, &tab_id).await;
     let label = state
         .label_for(&tab_id)
@@ -670,6 +637,7 @@ pub async fn browser_tab_history(
 pub async fn browser_tab_invoke(
     app: AppHandle,
     state: tauri::State<'_, Arc<BrowserTabs>>,
+    task_id: String,
     tab_id: String,
     method: String,
     args: Option<Vec<Value>>,
@@ -692,22 +660,29 @@ pub async fn browser_tab_invoke(
         "cancelPick",
         "annotate",
         "clearAnnotations",
+        "dismissConsent",
     ];
     if !ALLOWED.contains(&method.as_str()) {
         return Err(invalid(format!("unknown browser action '{method}'")));
     }
+    require_task(&state, &task_id, &tab_id)?;
     remember::ensure_awake(&app, &state, &tab_id).await;
     let label = state
         .label_for(&tab_id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
     let args = serde_json::to_string(&args.unwrap_or_default())
         .map_err(|error| invalid(error.to_string()))?;
-    eval_json(
+    let reply = eval_json(
         &app,
         &label,
         format!("window.__integrator.{method}(...{args})"),
     )
-    .await
+    .await?;
+    // The renderer's replies carry the same `userIdleMs` an agent's do, so the
+    // pane's own polling keeps the host's picture of who has the tab fresh even
+    // while no agent is calling.
+    note_user_activity(&state, &tab_id, &reply);
+    Ok(reply)
 }
 
 /// Captures the tab's viewport as PNG bytes, base64 for the renderer.
@@ -715,9 +690,22 @@ pub async fn browser_tab_invoke(
 pub async fn browser_tab_screenshot(
     app: AppHandle,
     state: tauri::State<'_, Arc<BrowserTabs>>,
+    task_id: String,
     tab_id: String,
 ) -> CommandResult<String> {
+    require_task(&state, &task_id, &tab_id)?;
     remember::ensure_awake(&app, &state, &tab_id).await;
+    // A password field renders as dots; a "show password" toggle does not, and
+    // the page owns that toggle. So the lockout is keyed on a credential having
+    // been filled here, never on what the field currently says it is.
+    if state.credential_in_flight(&tab_id) {
+        return Err(CommandError {
+            code: "unavailable",
+            message: "a saved password is filled in on this page — capture is refused until it \
+                      navigates or the form is submitted"
+                .into(),
+        });
+    }
     let label = state
         .label_for(&tab_id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
@@ -725,141 +713,14 @@ pub async fn browser_tab_screenshot(
     capture::capture_png(&webview).await
 }
 
-/// Moves a tab between the pane and its own window. WebView2 cannot reparent
-/// a live webview, so the session is recreated at the same URL.
-#[tauri::command]
-pub async fn browser_tab_set_popped_out(
-    app: AppHandle,
-    state: tauri::State<'_, Arc<BrowserTabs>>,
-    tab_id: String,
-    popped_out: bool,
-) -> CommandResult<BrowserTab> {
-    let (label, current) = {
-        let tabs = state.tabs.lock().unwrap_or_else(|error| error.into_inner());
-        let tab = tabs
-            .get(&tab_id)
-            .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
-        (tab.label.clone(), tab.state.clone())
-    };
-    if current.popped_out == popped_out {
-        return Ok(current);
-    }
-    let url = webview_of(&app, &label)
-        .ok()
-        .and_then(|webview| webview.url().ok())
-        .map(|url| url.to_string())
-        .unwrap_or_else(|| current.url.clone());
-
-    if let Ok(webview) = webview_of(&app, &label) {
-        let _ = webview.close();
-    }
-    if let Some(window) = app.get_webview_window(&label) {
-        let _ = window.close();
-    }
-
-    let target = Url::parse(&url).map_err(|_| invalid("that tab has no address to restore"))?;
-    // Popping out rebuilds the webview, so it has to carry the same profile,
-    // user agent and guest runtime — otherwise a tab would sign itself out of
-    // every site simply by moving to its own window.
-    if popped_out {
-        popout::adopt(&app, &state, &tab_id, &label, &target)?;
-        let loading = !is_blank(&target);
-        let tab = state
-            .update(&tab_id, |tab| {
-                tab.url = url;
-                tab.loading = loading;
-            })
-            .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
-        emit_changed(&app, &state);
-        return Ok(tab);
-    }
-
-    dock_tab(&app, &state, &tab_id, &label, &target)?;
-    let loading = !is_blank(&target);
-    let tab = state
-        .update(&tab_id, |tab| {
-            tab.url = url;
-            tab.loading = loading;
-        })
-        .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
-    emit_changed(&app, &state);
-    Ok(tab)
-}
-
-/// One site the browser profile is holding state for. Derived from cookie
-/// presence only: Integrator never reads, stores or shows a password, and the
-/// vendor's own sign-in stays between you and that site.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BrowserSite {
-    pub origin: String,
-    pub cookies: usize,
-    /// True when the profile survives a restart, i.e. you stay signed in.
-    pub persistent: bool,
-}
-
-#[tauri::command]
-pub async fn browser_sites(
-    app: AppHandle,
-    state: tauri::State<'_, Arc<BrowserTabs>>,
-) -> CommandResult<Vec<BrowserSite>> {
-    let persistent = setting_enabled(&app, KEEP_SIGNED_IN_SETTING);
-    let label = {
-        let tabs = state.tabs.lock().unwrap_or_else(|error| error.into_inner());
-        tabs.values().next().map(|tab| tab.label.clone())
-    };
-    // Cookies are readable through a live webview in the profile; with no tab
-    // open there is nothing to ask, which is honest rather than a guess.
-    let Some(label) = label else {
-        return Ok(Vec::new());
-    };
-    let webview = webview_of(&app, &label)?;
-    let cookies = webview
-        .cookies()
-        .map_err(|error| unavailable(error.to_string()))?;
-    let mut by_origin: HashMap<String, usize> = HashMap::new();
-    for cookie in cookies {
-        let domain = cookie
-            .domain()
-            .map(|domain| domain.trim_start_matches('.').to_string())
-            .unwrap_or_default();
-        if domain.is_empty() {
-            continue;
-        }
-        *by_origin.entry(domain).or_default() += 1;
-    }
-    let mut sites: Vec<BrowserSite> = by_origin
-        .into_iter()
-        .map(|(origin, cookies)| BrowserSite {
-            origin,
-            cookies,
-            persistent,
-        })
-        .collect();
-    sites.sort_by(|a, b| b.cookies.cmp(&a.cookies).then(a.origin.cmp(&b.origin)));
-    Ok(sites)
-}
-
-/// Clears everything the browser profile holds: cookies, storage and cache.
-#[tauri::command]
-pub async fn browser_clear_data(
-    app: AppHandle,
-    state: tauri::State<'_, Arc<BrowserTabs>>,
-) -> CommandResult<()> {
-    let labels: Vec<String> = {
-        let tabs = state.tabs.lock().unwrap_or_else(|error| error.into_inner());
-        tabs.values().map(|tab| tab.label.clone()).collect()
-    };
-    for label in labels {
-        if let Ok(webview) = webview_of(&app, &label) {
-            webview
-                .clear_all_browsing_data()
-                .map_err(|error| unavailable(error.to_string()))?;
-        }
-    }
-    Ok(())
-}
-pub use agent::{agent_invoke, close_for_agent, navigate_for_agent, open_for_agent, tabs_for_task};
+pub use agent::{
+    agent_invoke, close_for_agent, cookies_for_agent, focus_for_agent, grant_for_agent,
+    navigate_for_agent, open_for_agent, tabs_for_caller,
+};
+pub use vault::{
+    browser_allow_agent_sign_in, browser_fill_login, browser_forget_all_logins,
+    browser_forget_login, browser_save_login, browser_saved_logins, fill_login_for_agent,
+};
 
 #[cfg(test)]
 mod tests;

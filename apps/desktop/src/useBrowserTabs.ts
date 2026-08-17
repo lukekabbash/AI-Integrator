@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { bridge, openExternalLink, type BrowserTab } from "./bridge";
 import { annotationAttachmentName } from "./browserAnnotation";
+import { BrowserBoundsCoordinator } from "./browserBounds";
 
 /** A picked element, as the guest runtime describes it. */
 export interface PickedElement {
@@ -15,18 +16,25 @@ export interface PickedElement {
 
 export interface BrowserController {
   available: boolean;
+  ready: boolean;
+  taskId: string | null;
+  allowExternalOpen: boolean;
   tabs: BrowserTab[];
   byId: Record<string, BrowserTab>;
   message: string | null;
   recordingTabId: string | null;
   annotatingTabId: string | null;
-  open: (taskId: string, url?: string) => Promise<BrowserTab | null>;
+  open: (url?: string) => Promise<BrowserTab | null>;
   close: (tabId: string) => Promise<void>;
   navigate: (tabId: string, url: string) => Promise<void>;
   history: (tabId: string, action: "back" | "forward" | "reload" | "stop") => Promise<void>;
   setBounds: (tabId: string, rect: DOMRect | null) => void;
   setPoppedOut: (tabId: string, popped: boolean) => Promise<void>;
   openExternally: (tabId: string) => Promise<void>;
+  /** Remembers the login on the page in this tab, natively. */
+  saveLogin: (tabId: string, taskId: string) => Promise<void>;
+  /** Types a saved login into this tab. The value never reaches this window. */
+  fillLogin: (tabId: string, taskId: string) => Promise<void>;
   screenshot: (tabId: string) => Promise<void>;
   toggleRecording: (tabId: string) => Promise<void>;
   toggleAnnotate: (tabId: string) => Promise<void>;
@@ -37,6 +45,15 @@ export interface BrowserHost {
   attachImage: (file: Blob, name: string) => Promise<void>;
   /** Puts text into the composer, e.g. an annotated element's context. */
   insertText: (text: string) => void;
+}
+
+export interface BrowserControllerOptions {
+  /** The only task whose tabs this renderer instance may observe or control. */
+  taskId?: string | null;
+  /** External-browser handoff is an explicit Browser setting, off by default. */
+  allowExternalOpen?: boolean;
+  /** Whether this controller is rendered inside the task's popout window. */
+  poppedOutHost?: boolean;
 }
 
 /** Rough luminance read of the app's own canvas, for themes that do not say. */
@@ -106,14 +123,28 @@ function pngBlob(base64: string): Blob {
  * each one is pinned to, and the capture/annotate flows that end in the
  * composer. Tabs outlive the pane, so nothing here closes a tab implicitly.
  */
-export function useBrowserTabs(host: BrowserHost): BrowserController {
+export function useBrowserTabs(
+  host: BrowserHost,
+  {
+    taskId: requestedTaskId,
+    allowExternalOpen = false,
+    poppedOutHost = false,
+  }: BrowserControllerOptions,
+): BrowserController {
   const api = bridge.browser;
-  const [tabs, setTabs] = useState<BrowserTab[]>([]);
+  const taskId = requestedTaskId?.trim() || null;
+  const [tabSnapshot, setTabSnapshot] = useState<{
+    taskId: string | null;
+    tabs: BrowserTab[];
+    ready: boolean;
+  }>({ taskId: null, tabs: [], ready: !api });
   const [message, setMessage] = useState<string | null>(null);
   const [recordingTabId, setRecordingTabId] = useState<string | null>(null);
   const [annotatingTabId, setAnnotatingTabId] = useState<string | null>(null);
-  /** One pending placement per tab; see setBounds for why it cannot be shared. */
-  const boundsFrames = useRef<Map<string, number>>(new Map());
+  const boundsCoordinator = useMemo(
+    () => (api ? new BrowserBoundsCoordinator(api, poppedOutHost) : null),
+    [api, poppedOutHost],
+  );
   const recorder = useRef<{ timer: number; frames: string[] } | null>(null);
   const picker = useRef<number | null>(null);
   const hostRef = useRef(host);
@@ -122,18 +153,34 @@ export function useBrowserTabs(host: BrowserHost): BrowserController {
   });
 
   useEffect(() => {
-    if (!api) return;
+    if (!api || !taskId) {
+      setTabSnapshot({ taskId, tabs: [], ready: true });
+      return;
+    }
     let active = true;
+    setTabSnapshot({ taskId, tabs: [], ready: false });
+    const accept = (tabs: BrowserTab[]) => {
+      if (active) setTabSnapshot({ taskId, tabs, ready: true });
+    };
+    const refresh = () => {
+      void api
+        .list(taskId)
+        .then(accept)
+        .catch(() => active && setTabSnapshot({ taskId, tabs: [], ready: true }));
+    };
     void api
-      .list()
-      .then((next) => active && setTabs(next))
-      .catch(() => undefined);
-    const unlisten = api.subscribe((next) => active && setTabs(next));
+      .restore(taskId)
+      .then(accept)
+      .catch(refresh);
+    const unlisten = api.subscribe(refresh);
     return () => {
       active = false;
       void unlisten.then((stop) => stop()).catch(() => undefined);
     };
-  }, [api]);
+  }, [api, taskId]);
+
+  const tabs = tabSnapshot.taskId === taskId ? tabSnapshot.tabs : [];
+  const ready = tabSnapshot.taskId === taskId && tabSnapshot.ready;
 
   // Stop background work when the window goes away; tabs themselves persist.
   useEffect(
@@ -150,14 +197,14 @@ export function useBrowserTabs(host: BrowserHost): BrowserController {
   // the guest treats it as idempotent.
   const themed = useRef<Set<string>>(new Set());
   useEffect(() => {
-    if (!api) return;
+    if (!api || !taskId) return;
     for (const tab of tabs) {
       const key = `${tab.id}:${tab.url}`;
       if (themed.current.has(key)) continue;
       themed.current.add(key);
-      void api.invoke(tab.id, "setTheme", [pageTheme()]).catch(() => undefined);
+      void api.invoke(taskId, tab.id, "setTheme", [pageTheme()]).catch(() => undefined);
     }
-  }, [api, tabs]);
+  }, [api, tabs, taskId]);
 
   const report = useCallback(
     (error: unknown, fallback: string) =>
@@ -167,55 +214,39 @@ export function useBrowserTabs(host: BrowserHost): BrowserController {
 
   const setBounds = useCallback(
     (tabId: string, rect: DOMRect | null) => {
-      if (!api) return;
+      if (!boundsCoordinator || !taskId) return;
       const ratio = window.devicePixelRatio || 1;
-      // Hiding happens now, never on a later frame. Switching tabs unmounts one
-      // surface and mounts the next in the same tick, and a deferred hide was
-      // being cancelled by the incoming tab's placement — which left the tab
-      // you just left painted on top of the one you opened, and left the last
-      // page on screen after the pane closed.
       if (!rect) {
-        const pending = boundsFrames.current.get(tabId);
-        if (pending !== undefined) cancelAnimationFrame(pending);
-        boundsFrames.current.delete(tabId);
-        void api.setBounds(tabId, null).catch(() => undefined);
+        boundsCoordinator.place(taskId, tabId, null);
         return;
       }
-      // Placement is coalesced per tab, so one tab's frame never cancels
-      // another's.
-      const pending = boundsFrames.current.get(tabId);
-      if (pending !== undefined) cancelAnimationFrame(pending);
-      boundsFrames.current.set(
+      boundsCoordinator.place(
+        taskId,
         tabId,
-        requestAnimationFrame(() => {
-          boundsFrames.current.delete(tabId);
-          void api
-            .setBounds(tabId, {
-              x: Math.round(rect.x * ratio),
-              y: Math.round(rect.y * ratio),
-              width: Math.round(rect.width * ratio),
-              height: Math.round(rect.height * ratio),
-            })
-            .catch(() => undefined);
-        }),
+        {
+          x: Math.round(rect.x * ratio),
+          y: Math.round(rect.y * ratio),
+          width: Math.round(rect.width * ratio),
+          height: Math.round(rect.height * ratio),
+        },
       );
     },
-    [api],
+    [boundsCoordinator, taskId],
   );
 
   const screenshot = useCallback(
     async (tabId: string) => {
-      if (!api) return;
+      if (!api || !taskId) return;
       setMessage(null);
       try {
-        const base64 = await api.screenshot(tabId);
+        const base64 = await api.screenshot(taskId, tabId);
         await hostRef.current.attachImage(pngBlob(base64), `browser-${Date.now()}.png`);
         setMessage("Screenshot attached to the composer.");
       } catch (error) {
         report(error, "Could not capture that page.");
       }
     },
-    [api, report],
+    [api, report, taskId],
   );
 
   const stopRecording = useCallback(async () => {
@@ -236,7 +267,7 @@ export function useBrowserTabs(host: BrowserHost): BrowserController {
 
   const toggleRecording = useCallback(
     async (tabId: string) => {
-      if (!api) return;
+      if (!api || !taskId) return;
       if (recorder.current) {
         await stopRecording();
         return;
@@ -245,7 +276,7 @@ export function useBrowserTabs(host: BrowserHost): BrowserController {
       const frames: string[] = [];
       const timer = window.setInterval(() => {
         void api
-          .screenshot(tabId)
+          .screenshot(taskId, tabId)
           .then((frame) => {
             frames.push(frame);
             if (frames.length >= RECORDING_MAX_FRAMES) void stopRecording();
@@ -256,26 +287,26 @@ export function useBrowserTabs(host: BrowserHost): BrowserController {
       setRecordingTabId(tabId);
       setMessage("Recording this tab.");
     },
-    [api, stopRecording],
+    [api, stopRecording, taskId],
   );
 
   const toggleAnnotate = useCallback(
     async (tabId: string) => {
-      if (!api) return;
+      if (!api || !taskId) return;
       if (picker.current) {
         window.clearInterval(picker.current);
         picker.current = null;
         setAnnotatingTabId(null);
-        await api.invoke(tabId, "cancelPick").catch(() => undefined);
+        await api.invoke(taskId, tabId, "cancelPick").catch(() => undefined);
         return;
       }
       setMessage(null);
       try {
-        await api.invoke(tabId, "startPick", [pageTheme()]);
+        await api.invoke(taskId, tabId, "startPick", [pageTheme()]);
         setAnnotatingTabId(tabId);
         picker.current = window.setInterval(() => {
           void api
-            .invoke(tabId, "pickResult")
+            .invoke(taskId, tabId, "pickResult")
             .then(async (raw) => {
               const result = raw as {
                 picking: boolean;
@@ -291,12 +322,12 @@ export function useBrowserTabs(host: BrowserHost): BrowserController {
               const tab = tabs.find((candidate) => candidate.id === tabId);
               const picked = result.picked;
               await api
-                .invoke(tabId, "annotate", [
+                .invoke(taskId, tabId, "annotate", [
                   [{ kind: "element", ref: picked.ref, label: picked.name }],
                 ])
                 .catch(() => undefined);
               try {
-                const base64 = await api.screenshot(tabId);
+                const base64 = await api.screenshot(taskId, tabId);
                 await hostRef.current.attachImage(
                   pngBlob(base64),
                   annotationAttachmentName(picked.name || picked.tag),
@@ -304,7 +335,9 @@ export function useBrowserTabs(host: BrowserHost): BrowserController {
               } catch {
                 // The context below still stands on its own without the image.
               }
-              await api.invoke(tabId, "clearAnnotations").catch(() => undefined);
+              await api
+                .invoke(taskId, tabId, "clearAnnotations")
+                .catch(() => undefined);
               hostRef.current.insertText(
                 [
                   "<browser_annotation>",
@@ -328,7 +361,7 @@ export function useBrowserTabs(host: BrowserHost): BrowserController {
         report(error, "Could not start annotating that page.");
       }
     },
-    [api, report, tabs],
+    [api, report, tabs, taskId],
   );
 
   return useMemo<BrowserController>(() => {
@@ -336,13 +369,16 @@ export function useBrowserTabs(host: BrowserHost): BrowserController {
     for (const tab of tabs) byId[tab.id] = tab;
     return {
       available: Boolean(api),
+      ready,
+      taskId,
+      allowExternalOpen,
       tabs,
       byId,
       message,
       recordingTabId,
       annotatingTabId,
-      open: async (taskId, url) => {
-        if (!api) return null;
+      open: async (url) => {
+        if (!api || !taskId) return null;
         setMessage(null);
         try {
           return await api.open(taskId, url);
@@ -352,24 +388,58 @@ export function useBrowserTabs(host: BrowserHost): BrowserController {
         }
       },
       close: async (tabId) => {
-        await api?.close(tabId).catch((error) => report(error, "Could not close that tab."));
+        if (!api || !taskId || !byId[tabId]) return;
+        await api
+          .close(taskId, tabId)
+          .catch((error) => report(error, "Could not close that tab."));
       },
       navigate: async (tabId, url) => {
+        if (!api || !taskId || !byId[tabId]) return;
         setMessage(null);
-        await api?.navigate(tabId, url).catch((error) => report(error, "Could not open that URL."));
+        await api
+          .navigate(taskId, tabId, url)
+          .catch((error) => report(error, "Could not open that URL."));
       },
       history: async (tabId, action) => {
-        await api?.history(tabId, action).catch(() => undefined);
+        if (!api || !taskId || !byId[tabId]) return;
+        await api.history(taskId, tabId, action).catch(() => undefined);
       },
       setBounds,
       setPoppedOut: async (tabId, popped) => {
+        if (!api || !taskId || !byId[tabId]) return;
         await api
-          ?.setPoppedOut(tabId, popped)
+          .setPoppedOut(taskId, tabId, popped)
           .catch((error) => report(error, "Could not move that tab."));
       },
       openExternally: async (tabId) => {
+        if (!allowExternalOpen) {
+          setMessage("Opening tabs in an external browser is turned off in Settings → Browser.");
+          return;
+        }
         const tab = tabs.find((candidate) => candidate.id === tabId);
         if (tab?.url) await openExternalLink(tab.url).catch(() => undefined);
+      },
+      // Both of these are one native call and a message: the password moves
+      // between the page and the OS credential store without passing through
+      // the renderer, so there is nothing here to hold or leak.
+      saveLogin: async (tabId, requestedTaskId) => {
+        if (!api || !taskId || requestedTaskId !== taskId || !byId[tabId]) return;
+        setMessage(null);
+        try {
+          const saved = await api.saveLogin(tabId, taskId);
+          if (saved) setMessage(`Saved the login for ${saved.username} on ${saved.origin}.`);
+        } catch (error) {
+          report(error, "Could not save that login.");
+        }
+      },
+      fillLogin: async (tabId, requestedTaskId) => {
+        if (!api || !taskId || requestedTaskId !== taskId || !byId[tabId]) return;
+        setMessage(null);
+        try {
+          await api.fillLogin(tabId, taskId);
+        } catch (error) {
+          report(error, "Could not sign in with a saved login.");
+        }
       },
       screenshot,
       toggleRecording,
@@ -377,6 +447,9 @@ export function useBrowserTabs(host: BrowserHost): BrowserController {
     };
   }, [
     api,
+    ready,
+    taskId,
+    allowExternalOpen,
     tabs,
     message,
     recordingTabId,

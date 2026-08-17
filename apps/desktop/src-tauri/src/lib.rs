@@ -49,10 +49,12 @@ use automations::{
     automation_timeline, automation_update,
 };
 use browser::{
-    BrowserTabs, browser_clear_data, browser_local_servers, browser_sites, browser_tab_close,
-    browser_tab_history, browser_tab_invoke, browser_tab_list, browser_tab_navigate,
+    BrowserTabs, browser_allow_agent_sign_in, browser_clear_data, browser_fill_login,
+    browser_forget_all_logins, browser_forget_login, browser_local_servers, browser_save_login,
+    browser_saved_logins, browser_sites, browser_tab_close, browser_tab_history,
+    browser_tab_invoke, browser_tab_list, browser_tab_navigate, browser_tab_open,
+    browser_tab_screenshot, browser_tab_set_bounds, browser_tab_set_popped_out,
     browser_tabs_restore,
-    browser_tab_open, browser_tab_screenshot, browser_tab_set_bounds, browser_tab_set_popped_out,
 };
 use chat_title::task_generate_title;
 use code_explain::{selection_explain, selection_explain_preview};
@@ -232,6 +234,12 @@ pub fn run() {
             browser_tab_invoke,
             browser_tab_screenshot,
             browser_tab_set_popped_out,
+            browser_saved_logins,
+            browser_save_login,
+            browser_fill_login,
+            browser_forget_login,
+            browser_forget_all_logins,
+            browser_allow_agent_sign_in,
             voice_typing_credential_status,
             voice_typing_credential_set,
             voice_typing_credential_clear,

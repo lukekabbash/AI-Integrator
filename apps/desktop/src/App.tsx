@@ -50,6 +50,7 @@ import {
   type ApprovalProjection,
   type AutomationDispatch,
   type AutomationTimelineEntry,
+  type BrowserTab,
   type ComposerDraft,
   type ComposerDraftOwner,
   type ComposerDraftValue,
@@ -117,6 +118,7 @@ import { resolveExplainConfig, resolveExplainRoute } from "./explainSettings";
 import { resolveCommitMessageRoute } from "./commitMessageSettings";
 import { useKeybindings } from "./useKeybindings";
 import { KEYBINDINGS_SETTING } from "./components/KeybindingsSettings";
+import { BROWSER_SETTINGS } from "./components/BrowserSettings";
 import { detectMac, keycaps, readOverrides, resolveKeybindings } from "./keybindings";
 import {
   ARROW_NAVIGATION_SETTING,
@@ -179,6 +181,14 @@ const SubagentConversation = lazy(() =>
 
 const BrowserSurface = lazy(() =>
   import("./components/BrowserSurface").then((module) => ({ default: module.BrowserSurface })),
+);
+const BrowserDeck = lazy(() =>
+  import("./components/BrowserDeck").then((module) => ({ default: module.BrowserDeck })),
+);
+const BrowserSignInPrompt = lazy(() =>
+  import("./components/BrowserSignInPrompt").then((module) => ({
+    default: module.BrowserSignInPrompt,
+  })),
 );
 const ReviewSurface = lazy(() =>
   import("./components/ReviewSurface").then((module) => ({ default: module.ReviewSurface })),
@@ -1472,6 +1482,7 @@ function ApprovalControl({
 export default function App() {
   const nativeHost = isNativeHost();
   const [snapshot, setSnapshot] = useState<WorkspaceSnapshot>(initialSnapshot);
+  const [localSettings, setLocalSettings] = useState<Record<string, unknown>>({});
   const [workspaceLoading, setWorkspaceLoading] = useState(isNativeHost);
   const [gitLoading, setGitLoading] = useState(isNativeHost);
   const [openingProject, setOpeningProject] = useState(false);
@@ -1530,30 +1541,87 @@ export default function App() {
   const selectedDelegationId =
     workPane.active?.kind === "subagent" ? workPane.active.delegationId : undefined;
   // Browser tabs are native surfaces the pane hosts; captures land in the composer.
-  const browser = useBrowserTabs({
-    attachImage: async (file, name) => {
-      const attachment = await bridge.savePastedImageAttachment?.(file, name, undefined);
-      if (!attachment) return;
-      composerAttachmentSequence.current += 1;
-      setComposerAttachment({ id: composerAttachmentSequence.current, attachment });
+  const browser = useBrowserTabs(
+    {
+      attachImage: async (file, name) => {
+        const attachment = await bridge.savePastedImageAttachment?.(file, name, undefined);
+        if (!attachment) return;
+        composerAttachmentSequence.current += 1;
+        setComposerAttachment({ id: composerAttachmentSequence.current, attachment });
+      },
+      insertText: (text) => {
+        composerInsertSequence.current += 1;
+        setComposerInsert({ id: composerInsertSequence.current, text });
+      },
     },
-    insertText: (text) => {
-      composerInsertSequence.current += 1;
-      setComposerInsert({ id: composerInsertSequence.current, text });
+    {
+      taskId: snapshot.activeTaskId ?? workPaneOwnerKey,
+      allowExternalOpen: localSettings[BROWSER_SETTINGS.externalOpen] === true,
     },
-  });
+  );
   // A tab an agent opened gets a pane tab of its own, so its browsing is
   // something the user watches rather than something happening off screen.
   // It does not steal the foreground: whatever surface is active stays active.
   const surfacedBrowserTabs = useRef<Set<string>>(new Set());
   useEffect(() => {
     for (const tab of browser.tabs) {
-      if (tab.taskId !== snapshot.activeTaskId) continue;
       if (surfacedBrowserTabs.current.has(tab.id)) continue;
       surfacedBrowserTabs.current.add(tab.id);
       workPane.openBrowser(tab.id, { activate: false, show: true });
     }
   }, [browser.tabs, snapshot.activeTaskId, workPane]);
+  useEffect(() => {
+    if (!browser.ready) return;
+    workPane.prune(
+      (surface) => surface.kind !== "browser" || Boolean(browser.byId[surface.tabId]),
+    );
+  }, [browser.byId, browser.ready, workPane]);
+  // An agent asking to be watched — before a step the user should see, or when
+  // it needs them to sign in. Unlike a tab merely opening, this one does take
+  // the foreground, because being looked at is the whole request. It stops at
+  // the chat boundary: a tab in another chat is not worth pulling them out of
+  // the one they are reading, and browser_focus answers honestly when it fails.
+  const focusable = useRef<{ tabs: BrowserTab[]; taskId: string | null }>({
+    tabs: [],
+    taskId: null,
+  });
+  useEffect(() => {
+    focusable.current = { tabs: browser.tabs, taskId: browser.taskId };
+  });
+  // An agent asking to sign in somewhere it has not been allowed. It is told to
+  // try again rather than made to wait, so this prompt can sit unanswered
+  // without holding a run open.
+  const [signInRequest, setSignInRequest] = useState<{
+    tabId: string;
+    origin: string;
+    username: string;
+  } | null>(null);
+  useEffect(() => {
+    if (!bridge.browser?.onFillRequest) return;
+    let active = true;
+    const unlisten = bridge.browser.onFillRequest((request) => {
+      if (active) setSignInRequest(request);
+    });
+    return () => {
+      active = false;
+      void unlisten.then((stop) => stop()).catch(() => undefined);
+    };
+  }, []);
+  useEffect(() => {
+    if (!bridge.browser?.onFocusRequest) return;
+    let active = true;
+    const unlisten = bridge.browser.onFocusRequest((tabId) => {
+      if (!active) return;
+      const { tabs, taskId } = focusable.current;
+      const tab = tabs.find((candidate) => candidate.id === tabId);
+      if (!tab || tab.taskId !== taskId) return;
+      workPane.openBrowser(tabId, { activate: true, show: true });
+    });
+    return () => {
+      active = false;
+      void unlisten.then((stop) => stop()).catch(() => undefined);
+    };
+  }, [workPane]);
   // Provider-reported subscription quota keyed by runtime (Codex today).
   // Refreshed per active-task switch; never inferred when a provider is silent.
   const [providerQuota, setProviderQuota] = useState<Record<string, SubscriptionQuota>>({});
@@ -1613,7 +1681,6 @@ export default function App() {
   );
   const runtimeActionSequence = useRef(0);
   const [centerView, setCenterView] = useState<CenterView>(initialCenterView);
-  const [localSettings, setLocalSettings] = useState<Record<string, unknown>>({});
   const taskPermissionsRef = useRef(taskPermissions);
   taskPermissionsRef.current = taskPermissions;
   const autoApprovalFailuresRef = useRef(autoApprovalFailures);
@@ -2951,8 +3018,33 @@ export default function App() {
     (delegation) => delegation.id === selectedDelegationId && delegation.childTaskId,
   );
   const subagentOpen = workPane.state.open;
+  // What the corner deck holds: this chat's loaded tabs that the pane is not
+  // carrying — everything when it is closed, and anything whose surface was
+  // closed while the page kept running. A tab with a place in the strip is
+  // already visible, so it never doubles up as a card; a sleeping tab has no
+  // page behind it yet, so it stays a row rather than becoming one.
+  const paneBrowserIds = useMemo(
+    () =>
+      new Set(
+        workPane.state.surfaces.flatMap((surface) =>
+          surface.kind === "browser" ? [surface.tabId] : [],
+        ),
+      ),
+    [workPane.state.surfaces],
+  );
+  const deckTabs = useMemo(
+    () =>
+      browser.tabs.filter(
+        (tab) =>
+          tab.taskId === snapshot.activeTaskId &&
+          !tab.sleeping &&
+          !tab.poppedOut &&
+          (!subagentOpen || !paneBrowserIds.has(tab.id)),
+      ),
+    [browser.tabs, paneBrowserIds, snapshot.activeTaskId, subagentOpen],
+  );
   const activeFileTabPath = workPane.active?.kind === "file" ? workPane.active.path : "";
-  useWorkPaneHeaderAlignment(appRootRef, subagentPaneRef, subagentOpen, workPane.state.width);
+  useWorkPaneHeaderAlignment(appRootRef, subagentPaneRef, subagentOpen);
   const titleContext =
     screen === "settings"
       ? undefined
@@ -6273,8 +6365,7 @@ export default function App() {
       return replaceBlank();
     }
     if (kind === "browser") {
-      const owner = snapshot.activeTaskId ?? workPaneOwnerKey;
-      void browser.open(owner).then((tab) => {
+      void browser.open().then((tab) => {
         if (tab) workPane.openBrowser(tab.id);
         replaceBlank();
       });
@@ -6343,6 +6434,7 @@ export default function App() {
     }
     return (
       <BrowserSurface
+        key={tab.id}
         tab={tab}
         message={browser.message}
         recording={browser.recordingTabId === tabId}
@@ -6357,11 +6449,14 @@ export default function App() {
         onPopOutAll={async () => {
           // One window holding every tab of this task, which is the point of
           // popping out in the first place.
-          for (const open of browser.tabs.filter((candidate) => !candidate.popped_out)) {
+          for (const open of browser.tabs.filter((candidate) => !candidate.poppedOut)) {
             await browser.setPoppedOut(open.id, true);
           }
         }}
+        allowExternalOpen={browser.allowExternalOpen}
         onOpenExternally={() => browser.openExternally(tabId)}
+        onSaveLogin={() => browser.saveLogin(tabId, tab.taskId)}
+        onFillLogin={() => browser.fillLogin(tabId, tab.taskId)}
         onClose={() => {
           workPane.close(`browser:${tabId}`);
           void browser.close(tabId);
@@ -6698,7 +6793,7 @@ export default function App() {
                     <span className="sr-only"> tokens</span>
                   </button>
                 </Tooltip>
-                {activeTask?.kind !== "chat" && !subagentOpen ? workspaceToggles : null}
+                {activeTask?.kind !== "chat" ? workspaceToggles : null}
               </>
             ) : undefined
           }
@@ -7293,7 +7388,6 @@ export default function App() {
                                 .map((tab) => [tab.id, tab.heldBy as string]),
                             )}
                             renderBrowser={renderWorkPaneBrowser}
-                            trailing={activeTask?.kind !== "chat" ? workspaceToggles : null}
                             onLaunch={openWorkPaneLaunch}
                             renderFile={renderWorkPaneFile}
                             renderReview={renderWorkPaneReview}
@@ -7302,6 +7396,46 @@ export default function App() {
                         ) : null}
                       </AnimatePresence>
                     </div>
+                    {/* Closing the pane does not stop an agent mid-page, so the
+                        pages it is still working in collect in the corner
+                        rather than disappearing. */}
+                    {signInRequest ? (
+                      <Suspense fallback={null}>
+                        <BrowserSignInPrompt
+                          request={signInRequest}
+                          onDismiss={() => setSignInRequest(null)}
+                          onAllow={(remember) => {
+                            const request = signInRequest;
+                            setSignInRequest(null);
+                            const tab = browser.byId[request.tabId];
+                            if (!tab) return;
+                            void (async () => {
+                              if (remember) {
+                                await bridge.browser
+                                  ?.allowAgentSignIn(request.origin, true)
+                                  .catch(() => undefined);
+                              }
+                              await browser.fillLogin(request.tabId, tab.taskId);
+                            })();
+                          }}
+                        />
+                      </Suspense>
+                    ) : null}
+                    {deckTabs.length > 0 ? (
+                      <Suspense fallback={null}>
+                        <BrowserDeck
+                          tabs={deckTabs}
+                          onBoundsChange={browser.setBounds}
+                          onExpand={(tabId) =>
+                            workPane.openBrowser(tabId, { activate: true, show: true })
+                          }
+                          onClose={(tabId) => {
+                            workPane.close(`browser:${tabId}`);
+                            void browser.close(tabId);
+                          }}
+                        />
+                      </Suspense>
+                    ) : null}
                     {activeProject && terminalSurfaceActivated ? (
                       <Suspense
                         fallback={
