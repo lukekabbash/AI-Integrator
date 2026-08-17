@@ -32,6 +32,7 @@ The local desktop/broker remains authoritative for task identity, policy interse
 | `child_result` | No | Read the structured result/evidence envelope |
 | `browser_open` | Yes | Open a browser tab owned by the calling task |
 | `browser_list` | No | List the calling task's browser tabs |
+| `browser_close` | No | Close one of the calling task's tabs when the agent is done with it |
 | `browser_navigate` | Yes | Point one of those tabs at a URL |
 | `browser_snapshot` | No | Read a page: url, title, viewport, text, and interactive elements with stable refs |
 | `browser_click` / `browser_type` / `browser_press` / `browser_scroll` | Yes | Synthesise one interaction in a tab |

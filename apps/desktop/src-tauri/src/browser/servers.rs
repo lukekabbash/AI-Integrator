@@ -171,10 +171,18 @@ fn process_names() -> HashMap<u32, String> {
 }
 
 fn run(program: &str, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new(program)
-        .args(args)
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    // Without this the scan pops a console window on screen for each helper it
+    // runs — a black rectangle flashing over the app every time a blank tab
+    // looks for dev servers.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }

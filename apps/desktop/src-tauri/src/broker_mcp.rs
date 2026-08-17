@@ -294,9 +294,17 @@ fn tool_definitions(role: &str, mode: &str, harness_instructions: Option<&str>) 
                 }),
                 json!({
                     "name": "browser_list",
-                    "description": "List this task's browser tabs with their id, url, title and loading state.",
+                    "description": "List this task's browser tabs with their id, url, title and loading state. Use it to keep track when you are working across several pages at once.",
                     "annotations": tool_annotations(true, false),
                     "inputSchema": text_schema(json!({}), &[]),
+                }),
+                json!({
+                    "name": "browser_close",
+                    "description": "Close one of this task's browser tabs when you are done with it. The user can also close tabs themselves; leaving a page open is fine if they will want to look at it.",
+                    "annotations": tool_annotations(false, true),
+                    "inputSchema": text_schema(json!({
+                    "tabId": { "type": "string" }
+                    }), &["tabId"]),
                 }),
                 json!({
                     "name": "browser_navigate",
@@ -615,6 +623,7 @@ mod tests {
                 "automation_cancel",
                 "browser_open",
                 "browser_list",
+                "browser_close",
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",
@@ -640,6 +649,7 @@ mod tests {
                 "automation_cancel",
                 "browser_open",
                 "browser_list",
+                "browser_close",
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",
@@ -665,6 +675,7 @@ mod tests {
                 "automation_cancel",
                 "browser_open",
                 "browser_list",
+                "browser_close",
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",

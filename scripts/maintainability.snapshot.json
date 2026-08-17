@@ -27,7 +27,7 @@
     },
     {
       "path": "apps/desktop/src-tauri/src/delegation.rs",
-      "maxLines": 4629
+      "maxLines": 4642
     },
     {
       "path": "apps/desktop/src/components/RightRail.tsx",
@@ -83,7 +83,7 @@
     },
     {
       "path": "apps/desktop/src/runtimeProjection.ts",
-      "maxLines": 1402
+      "maxLines": 1403
     },
     {
       "path": "crates/adapter-codex/src/lib.rs",

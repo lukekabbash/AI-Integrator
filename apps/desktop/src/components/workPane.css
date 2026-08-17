@@ -89,6 +89,11 @@
   padding: 18px 16px;
   display: flex;
   flex-direction: column;
+  /* The offer sits in the middle of the empty pane rather than hanging from
+     the top, so a tall pane does not strand it under the tab strip. `safe`
+     keeps a short pane scrollable from the top instead of clipping the first
+     row above the scroll origin. */
+  justify-content: safe center;
   gap: 8px;
   overflow-y: auto;
 }

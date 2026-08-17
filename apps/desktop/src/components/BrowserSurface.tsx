@@ -18,9 +18,6 @@ import { rememberBrowserVisit } from "./browserRecents";
 import { Tooltip } from "./Tooltip";
 import "./browserSurface.css";
 
-/** How far the native tab stands off a moving edge, in CSS pixels. */
-const DRAG_SAFE_INSET = 24;
-
 export interface BrowserSurfaceProps {
   tab: BrowserTab;
   /** Reports the slot rectangle so the native tab can sit exactly over it. */
@@ -75,6 +72,21 @@ export function BrowserSurface({
     boundsRef.current = onBoundsChange;
   }, [onBoundsChange]);
 
+  // A drag anywhere in the window steps the tab aside until the pointer is
+  // released. The pane edge cannot keep up with a fast pointer, and the moment
+  // the cursor crosses onto a native surface the gesture is stranded: no more
+  // pointer moves, no pointerup, a handle left armed. Once out and once back is
+  // nothing like the per-frame blinking this used to do.
+  const [dragging, setDragging] = useState(false);
+  useEffect(() => {
+    const read = () => setDragging(document.body.dataset.resizing === "true");
+    read();
+    const observer =
+      typeof MutationObserver === "undefined" ? undefined : new MutationObserver(read);
+    observer?.observe(document.body, { attributeFilter: ["data-resizing"] });
+    return () => observer?.disconnect();
+  }, []);
+
   // Keep the native tab glued to this slot: observe the box, the scroll
   // ancestors and the window, and report physical pixels.
   useLayoutEffect(() => {
@@ -82,8 +94,9 @@ export function BrowserSurface({
     const onBounds = (rect: DOMRect | null) => boundsRef.current(rect);
     // A blank or popped-out tab has nothing worth showing here, and leaving
     // the native surface parked over the slot would bury the start page under
-    // an empty white page.
-    if (!node || blank || popped) {
+    // an empty white page. A drag holds it off screen for the same reason the
+    // placeholder appears.
+    if (!node || blank || popped || dragging) {
       boundsRef.current(null);
       return;
     }
@@ -103,20 +116,10 @@ export function BrowserSurface({
         onBounds(null);
         return;
       }
-      // A native surface paints above the page, so during a drag it stands off
-      // the moving edge far enough that the pointer stays on the app's own
-      // grip. Losing the pointer to the tab would strand the gesture.
-      const inset = document.body.dataset.resizing === "true" ? DRAG_SAFE_INSET : 0;
-      const placed = new DOMRect(
-        rect.x + inset,
-        rect.y,
-        Math.max(1, rect.width - inset),
-        rect.height,
-      );
-      const key = `${Math.round(placed.x)}:${Math.round(placed.y)}:${Math.round(placed.width)}:${Math.round(placed.height)}`;
+      const key = `${Math.round(rect.x)}:${Math.round(rect.y)}:${Math.round(rect.width)}:${Math.round(rect.height)}`;
       if (key === last) return;
       last = key;
-      onBounds(placed);
+      onBounds(rect);
     };
     const report = () => {
       cancelAnimationFrame(frame);
@@ -127,20 +130,14 @@ export function BrowserSurface({
     observer?.observe(node);
     window.addEventListener("resize", report);
     window.addEventListener("scroll", report, true);
-    // Starting and ending a drag changes the inset, not the slot, so neither
-    // observer above would notice.
-    const dragObserver =
-      typeof MutationObserver === "undefined" ? undefined : new MutationObserver(report);
-    dragObserver?.observe(document.body, { attributeFilter: ["data-resizing"] });
     return () => {
       cancelAnimationFrame(frame);
       observer?.disconnect();
-      dragObserver?.disconnect();
       window.removeEventListener("resize", report);
       window.removeEventListener("scroll", report, true);
       onBounds(null);
     };
-  }, [blank, popped]);
+  }, [blank, popped, dragging]);
 
   const submit = useCallback(
     (event: React.FormEvent) => {
@@ -360,6 +357,11 @@ export function BrowserSurface({
             >
               Dock it back
             </button>
+          </div>
+        ) : null}
+        {dragging && !popped && !blank ? (
+          <div className="browser-resizing" aria-hidden="true">
+            <span>{tab.title || tab.url.replace(/^https?:\/\//, "")}</span>
           </div>
         ) : null}
         {annotating && !popped ? (

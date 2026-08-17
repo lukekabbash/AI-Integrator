@@ -388,10 +388,16 @@ pub async fn browser_tab_close(
     state: tauri::State<'_, Arc<BrowserTabs>>,
     tab_id: String,
 ) -> CommandResult<()> {
+    close_tab(&app, &state, &tab_id)
+}
+
+/// Tears down a tab's webview (or its pop-out window) and forgets it. Shared
+/// so a tab the user closes and one an agent closes end the same way.
+fn close_tab(app: &AppHandle, state: &Arc<BrowserTabs>, tab_id: &str) -> Result<(), CommandError> {
     let label = state
-        .label_for(&tab_id)
+        .label_for(tab_id)
         .ok_or_else(|| unavailable("that browser tab is already closed"))?;
-    if let Ok(webview) = webview_of(&app, &label) {
+    if let Ok(webview) = webview_of(app, &label) {
         let _ = webview.close();
     }
     if let Some(window) = app.get_webview_window(&label) {
@@ -399,9 +405,9 @@ pub async fn browser_tab_close(
     }
     {
         let mut tabs = state.tabs.lock().unwrap_or_else(|error| error.into_inner());
-        tabs.remove(&tab_id);
+        tabs.remove(tab_id);
     }
-    emit_changed(&app, &state);
+    emit_changed(app, state);
     Ok(())
 }
 
@@ -429,14 +435,18 @@ pub async fn browser_tab_set_bounds(
     let webview = webview_of(&app, &label)?;
     match bounds {
         Some(bounds) if bounds.width >= 1.0 && bounds.height >= 1.0 => {
+            // One call, not a move followed by a resize: two dispatches per
+            // frame let the tab paint at a half-applied geometry, which is
+            // what makes a pane drag look like it is tearing.
             webview
-                .set_position(PhysicalPosition::new(bounds.x as i32, bounds.y as i32))
-                .map_err(|error| unavailable(error.to_string()))?;
-            webview
-                .set_size(PhysicalSize::new(
-                    bounds.width.max(1.0) as u32,
-                    bounds.height.max(1.0) as u32,
-                ))
+                .set_bounds(tauri::Rect {
+                    position: PhysicalPosition::new(bounds.x as i32, bounds.y as i32).into(),
+                    size: PhysicalSize::new(
+                        bounds.width.max(1.0) as u32,
+                        bounds.height.max(1.0) as u32,
+                    )
+                    .into(),
+                })
                 .map_err(|error| unavailable(error.to_string()))?;
             let _ = webview.show();
             state.update(&tab_id, |tab| tab.hidden = false);
@@ -813,6 +823,32 @@ pub async fn navigate_for_agent(
         .ok_or_else(|| IntegratorError::NotFound("that browser tab is no longer open".into()))?;
     emit_changed(app, tabs);
     Ok(tab)
+}
+
+/// Closes one of this task's tabs. An agent juggling several pages should be
+/// able to put one down; without this the only way a tab ever closes is the
+/// user closing it by hand.
+pub async fn close_for_agent(
+    app: &AppHandle,
+    tabs: &Arc<BrowserTabs>,
+    task_id: &str,
+    tab_id: &str,
+) -> Result<(), IntegratorError> {
+    ensure_agent_access(app).map_err(|error| IntegratorError::Unauthorized(error.message))?;
+    match tabs.task_of(tab_id) {
+        Some(owner) if owner == task_id => {}
+        Some(_) => {
+            return Err(IntegratorError::Unauthorized(
+                "that browser tab belongs to another task".into(),
+            ));
+        }
+        None => {
+            return Err(IntegratorError::NotFound(
+                "that browser tab is no longer open".into(),
+            ));
+        }
+    }
+    close_tab(app, tabs, tab_id).map_err(|error| IntegratorError::Unavailable(error.message))
 }
 
 pub fn tabs_for_task(tabs: &BrowserTabs, task_id: &str) -> Vec<BrowserTab> {

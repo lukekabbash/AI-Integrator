@@ -147,6 +147,27 @@
      strip clear, because the reported bounds are this element's border box. */
   margin-left: 8px;
 }
+/* Shown while a drag holds the native tab off screen: the page's own recess
+   with its name, so resizing reads as the pane moving rather than the page
+   blinking out. */
+.browser-resizing {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: color-mix(in srgb, var(--color-layer-1) 60%, var(--color-canvas));
+}
+.browser-resizing span {
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .browser-viewport-note {
   position: absolute;
   inset: 0;

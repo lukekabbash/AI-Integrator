@@ -627,6 +627,7 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "automation_cancel",
             "browser_open",
             "browser_list",
+            "browser_close",
             "browser_navigate",
             "browser_snapshot",
             "browser_click",
@@ -644,6 +645,7 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "automation_cancel",
             "browser_open",
             "browser_list",
+            "browser_close",
             "browser_navigate",
             "browser_snapshot",
             "browser_click",
@@ -668,6 +670,7 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "automation_cancel",
             "browser_open",
             "browser_list",
+            "browser_close",
             "browser_navigate",
             "browser_snapshot",
             "browser_click",
@@ -693,6 +696,7 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "delegation_stop",
             "browser_open",
             "browser_list",
+            "browser_close",
             "browser_navigate",
             "browser_snapshot",
             "browser_click",
@@ -1453,6 +1457,11 @@ async fn browser_tool(
             Ok(json!({ "tab": tab }))
         }
         "browser_list" => Ok(json!({ "tabs": tabs_for_task(&tabs, &task) })),
+        "browser_close" => {
+            let id = tab_id()?;
+            crate::browser::close_for_agent(app, &tabs, &task, &id).await?;
+            Ok(json!({ "closed": id, "tabs": tabs_for_task(&tabs, &task) }))
+        }
         "browser_navigate" => {
             let id = tab_id()?;
             let url = text("url")
@@ -4057,6 +4066,7 @@ mod tests {
                 "delegation_stop",
                 "browser_open",
                 "browser_list",
+                "browser_close",
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",
@@ -4117,6 +4127,7 @@ mod tests {
                 "automation_cancel",
                 "browser_open",
                 "browser_list",
+                "browser_close",
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",
@@ -4143,6 +4154,7 @@ mod tests {
                 "automation_cancel",
                 "browser_open",
                 "browser_list",
+                "browser_close",
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",
@@ -4167,6 +4179,7 @@ mod tests {
                 "automation_cancel",
                 "browser_open",
                 "browser_list",
+                "browser_close",
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",
