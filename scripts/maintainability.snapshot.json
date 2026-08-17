@@ -7,7 +7,7 @@
   "exceptions": [
     {
       "path": "apps/desktop/src/styles.css",
-      "maxLines": 16821
+      "maxLines": 16818
     },
     {
       "path": "apps/desktop/src-tauri/src/commands.rs",
@@ -15,7 +15,7 @@
     },
     {
       "path": "apps/desktop/src/App.tsx",
-      "maxLines": 7397
+      "maxLines": 7463
     },
     {
       "path": "apps/desktop/src/components/SettingsView.tsx",
@@ -43,7 +43,7 @@
     },
     {
       "path": "crates/session-store/src/tests.rs",
-      "maxLines": 2465
+      "maxLines": 2541
     },
     {
       "path": "apps/desktop/src/components/Transcript.tsx",

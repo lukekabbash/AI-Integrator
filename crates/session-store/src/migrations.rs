@@ -922,4 +922,21 @@ pub(super) const MIGRATIONS: &[(i64, &str)] = &[
         ALTER TABLE automations ADD COLUMN next_run_note TEXT;
         "#,
     ),
+    (
+        25,
+        r#"
+        -- Browser tabs a chat had open, so returning to it does not mean
+        -- looking every page up again. Only the address and title are kept:
+        -- page state belongs to the site and its cookies, not to us. Rows die
+        -- with their task.
+        CREATE TABLE browser_tabs (
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL,
+            url TEXT NOT NULL,
+            title TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (task_id, ordinal)
+        );
+        "#,
+    ),
 ];

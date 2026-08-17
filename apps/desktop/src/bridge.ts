@@ -1290,6 +1290,8 @@ export interface BrowserBridge {
   clearData(): Promise<void>;
   open(taskId: string, url?: string): Promise<BrowserTab>;
   list(taskId?: string): Promise<BrowserTab[]>;
+  /** Brings back the tabs this chat had open, asleep until one is shown. */
+  restore(taskId: string): Promise<BrowserTab[]>;
   close(tabId: string): Promise<void>;
   /** Physical-pixel rectangle for the tab, or null to hide it. */
   setBounds(
@@ -4264,6 +4266,7 @@ function nativeBrowserBridge(): BrowserBridge | undefined {
     clearData: () => nativeInvoke<void>("browser_clear_data"),
     open: (taskId, url) => nativeInvoke<BrowserTab>("browser_tab_open", { taskId, url }),
     list: (taskId) => nativeInvoke<BrowserTab[]>("browser_tab_list", { taskId }),
+    restore: (taskId) => nativeInvoke<BrowserTab[]>("browser_tabs_restore", { taskId }),
     close: (tabId) => nativeInvoke<void>("browser_tab_close", { tabId }),
     setBounds: (tabId, bounds) => nativeInvoke<void>("browser_tab_set_bounds", { tabId, bounds }),
     navigate: (tabId, url) => nativeInvoke<BrowserTab>("browser_tab_navigate", { tabId, url }),

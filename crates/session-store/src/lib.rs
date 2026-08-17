@@ -21,6 +21,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 mod automation_store;
+mod browser_store;
 mod context_store;
 mod delegation_store;
 mod draft_store;
@@ -34,6 +35,7 @@ mod settings_store;
 mod task_store;
 mod usage_store;
 pub use automation_store::{NewAutomation, UpdateAutomation};
+pub use browser_store::StoredBrowserTab;
 pub use delegation_store::NewDelegation;
 pub use projection_store::{
     HANDOFF_CHILD_MAX_TOKENS, HANDOFF_DEFAULT_MAX_IMAGES, HANDOFF_DEFAULT_MAX_TOKENS,

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-browser-tabs-restore"
+description = "Enables the browser_tabs_restore command without any pre-configured scope."
+commands.allow = ["browser_tabs_restore"]
+
+[[permission]]
+identifier = "deny-browser-tabs-restore"
+description = "Denies the browser_tabs_restore command without any pre-configured scope."
+commands.deny = ["browser_tabs_restore"]

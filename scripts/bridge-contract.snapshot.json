@@ -36,6 +36,7 @@
     "browser_tab_screenshot(tabId:String)->CommandResult<String>",
     "browser_tab_set_bounds(tabId:String,bounds?:Option<TabBounds>)->CommandResult<()>",
     "browser_tab_set_popped_out(tabId:String,poppedOut:bool)->CommandResult<BrowserTab>",
+    "browser_tabs_restore(taskId:String)->CommandResult<Vec<BrowserTab>>",
     "chat_attachment_pick(chatTaskId:TaskId)->CommandResult<Option<Vec<ChatPickedAttachment>>>",
     "claude_list_models()->CommandResult<Vec<ClaudeModelEntry>>",
     "codex_connect(workingDirectory?:Option<PathBuf>,taskId?:Option<TaskId>)->CommandResult<()>",

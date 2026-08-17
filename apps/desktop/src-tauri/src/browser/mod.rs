@@ -34,6 +34,7 @@ use crate::command_api::{CommandError, CommandResult};
 mod agent;
 mod capture;
 mod popout;
+mod remember;
 mod servers;
 
 pub use servers::browser_local_servers;
@@ -93,6 +94,10 @@ pub struct BrowserTab {
     /// someone is mid-flow here and open its own rather than take the wheel.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub held_by: Option<String>,
+    /// Remembered from a previous session and not yet loaded. It has an address
+    /// and a title but no webview, so a chat can come back with a dozen tabs
+    /// without fetching a dozen pages.
+    pub sleeping: bool,
 }
 
 struct Tab {
@@ -339,6 +344,9 @@ pub(super) fn tab_webview_builder(
                 .is_some()
             {
                 emit_changed(&load_app, &tabs);
+                if !loading && let Some(task) = tabs.task_of(&load_id) {
+                    remember::remember(&load_app, &tabs, &task);
+                }
             }
         })
         .on_document_title_changed(move |_, title| {
@@ -422,6 +430,7 @@ pub(super) async fn create_tab(
         popped_out: false,
         hidden: false,
         held_by: None,
+        sleeping: false,
     };
     {
         let mut tabs = state.tabs.lock().unwrap_or_else(|error| error.into_inner());
@@ -435,6 +444,7 @@ pub(super) async fn create_tab(
         );
     }
     emit_changed(app, state);
+    remember::remember(app, state, &tab.task_id);
     Ok(tab)
 }
 
@@ -450,6 +460,18 @@ pub async fn browser_tab_open(
         _ => Url::parse("about:blank").expect("about:blank parses"),
     };
     create_tab(&app, &state, task_id, target).await
+}
+
+/// Brings back the tabs this chat had open, asleep. Called when a task becomes
+/// active; a task that already has tabs in this session is left alone.
+#[tauri::command]
+pub async fn browser_tabs_restore(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<BrowserTabs>>,
+    task_id: String,
+) -> CommandResult<Vec<BrowserTab>> {
+    remember::restore(&app, &state, &task_id);
+    Ok(state.snapshot(Some(&task_id)))
 }
 
 #[tauri::command]
@@ -485,11 +507,15 @@ pub(super) fn close_tab(
     if let Some(window) = app.get_webview_window(&label) {
         let _ = window.close();
     }
+    let task = state.task_of(tab_id);
     {
         let mut tabs = state.tabs.lock().unwrap_or_else(|error| error.into_inner());
         tabs.remove(tab_id);
     }
     emit_changed(app, state);
+    if let Some(task) = task {
+        remember::remember(app, state, &task);
+    }
     Ok(())
 }
 
@@ -513,6 +539,15 @@ pub async fn browser_tab_set_bounds(
         .is_some_and(|tab| tab.state.popped_out);
     if popped_out {
         return Ok(());
+    }
+    if state.sleeping_target(&tab_id).is_some() {
+        // The renderer only reports a rectangle for a tab it is showing, so this
+        // is the moment a remembered tab is actually wanted.
+        if bounds.is_some() {
+            let _ = remember::wake(&app, &state, &tab_id).await;
+        } else {
+            return Ok(());
+        }
     }
     let webview = webview_of(&app, &label)?;
     match bounds {
@@ -606,6 +641,7 @@ pub async fn browser_tab_invoke(
         "type",
         "press",
         "scroll",
+        "drag",
         "waitFor",
         "evaluate",
         "highlight",
@@ -836,6 +872,7 @@ mod tests {
                             popped_out: false,
                             hidden: false,
                             held_by: None,
+                            sleeping: false,
                         },
                         label: format!("browser-{id}"),
                         held: None,
@@ -862,6 +899,7 @@ mod tests {
             "type",
             "press",
             "scroll",
+            "drag",
             "waitFor",
             "evaluate",
             "highlight",
@@ -890,8 +928,12 @@ mod tests {
                 "guest runtime never shows the cursor for {action}"
             );
         }
-        // One definition plus a call from click, type, press and scroll.
-        assert_eq!(GUEST_RUNTIME.matches("agentCursor(").count(), 5);
+        // One definition, plus a call from click, type, press, scroll and both
+        // ends of a drag. The count is asserted so a new action cannot be added
+        // without deciding whether it shows itself.
+        assert_eq!(GUEST_RUNTIME.matches("agentCursor(").count(), 7);
+        // The press waits for the pointer to arrive rather than landing first.
+        assert!(GUEST_RUNTIME.contains("schedule(agentCursor("));
     }
 
     #[test]

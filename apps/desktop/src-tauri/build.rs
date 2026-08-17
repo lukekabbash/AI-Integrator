@@ -56,6 +56,7 @@ const APP_COMMANDS: &[&str] = &[
     "browser_clear_data",
     "browser_tab_open",
     "browser_tab_list",
+    "browser_tabs_restore",
     "browser_tab_close",
     "browser_tab_set_bounds",
     "browser_tab_navigate",

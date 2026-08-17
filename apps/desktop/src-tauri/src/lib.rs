@@ -51,6 +51,7 @@ use automations::{
 use browser::{
     BrowserTabs, browser_clear_data, browser_local_servers, browser_sites, browser_tab_close,
     browser_tab_history, browser_tab_invoke, browser_tab_list, browser_tab_navigate,
+    browser_tabs_restore,
     browser_tab_open, browser_tab_screenshot, browser_tab_set_bounds, browser_tab_set_popped_out,
 };
 use chat_title::task_generate_title;
@@ -223,6 +224,7 @@ pub fn run() {
             browser_clear_data,
             browser_tab_open,
             browser_tab_list,
+            browser_tabs_restore,
             browser_tab_close,
             browser_tab_set_bounds,
             browser_tab_navigate,

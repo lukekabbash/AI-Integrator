@@ -75,6 +75,7 @@
     "allow-browser-clear-data",
     "allow-browser-tab-open",
     "allow-browser-tab-list",
+    "allow-browser-tabs-restore",
     "allow-browser-tab-close",
     "allow-browser-tab-set-bounds",
     "allow-browser-tab-navigate",

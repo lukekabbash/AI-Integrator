@@ -2463,3 +2463,79 @@ fn memory_enforces_twenty_active_entry_limit() {
         })
         .expect("reuse capacity");
 }
+
+#[test]
+fn browser_tabs_are_remembered_per_task_and_die_with_it() {
+    let store = LocalStore::open_in_memory().expect("open store");
+    let task = fork_source(&store);
+    let other = store
+        .create_task(NewTask {
+            kind: TaskKind::Code,
+            title: "Another chat".into(),
+            repository_path: Some(PathBuf::from("/repo")),
+            worktree_path: None,
+            runtime: None,
+            model: None,
+            effort: None,
+            parent_task_id: None,
+        })
+        .expect("create second task");
+
+    store
+        .set_browser_tabs(
+            task.id,
+            &[
+                StoredBrowserTab {
+                    url: "https://example.com/docs".into(),
+                    title: "Docs".into(),
+                },
+                // Nothing to reopen: a blank tab and an oversized address are
+                // dropped rather than stored.
+                StoredBrowserTab {
+                    url: "about:blank".into(),
+                    title: String::new(),
+                },
+                StoredBrowserTab {
+                    url: format!("https://example.com/{}", "x".repeat(2100)),
+                    title: "Too long".into(),
+                },
+                StoredBrowserTab {
+                    url: "http://localhost:5173/".into(),
+                    title: "Vite".into(),
+                },
+            ],
+        )
+        .expect("remember tabs");
+
+    // Order is the order they were in, and one task never sees another's tabs.
+    assert_eq!(
+        store.browser_tabs(task.id).expect("read tabs"),
+        vec![
+            StoredBrowserTab {
+                url: "https://example.com/docs".into(),
+                title: "Docs".into(),
+            },
+            StoredBrowserTab {
+                url: "http://localhost:5173/".into(),
+                title: "Vite".into(),
+            },
+        ]
+    );
+    assert!(store.browser_tabs(other.id).expect("read tabs").is_empty());
+
+    // Writing again replaces the list rather than appending to it.
+    store
+        .set_browser_tabs(
+            task.id,
+            &[StoredBrowserTab {
+                url: "https://example.com/other".into(),
+                title: "Other".into(),
+            }],
+        )
+        .expect("replace tabs");
+    assert_eq!(store.browser_tabs(task.id).expect("read tabs").len(), 1);
+
+    // A deleted chat takes its remembered tabs with it.
+    store.remove_task(task.id).expect("remove task");
+    assert!(store.browser_tabs(task.id).expect("read tabs").is_empty());
+}
