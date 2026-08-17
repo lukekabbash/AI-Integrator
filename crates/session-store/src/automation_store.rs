@@ -568,7 +568,7 @@ fn validate_route(route: &AutomationRoute) -> Result<()> {
     }
     if !matches!(
         route.permission.as_str(),
-        "read-only" | "project-write" | "ask" | "full-access"
+        "read-only" | "project-write" | "ask" | "auto" | "full-access"
     ) {
         return Err(IntegratorError::InvalidInput(
             "unknown automation permission ceiling".into(),

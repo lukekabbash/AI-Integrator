@@ -33,6 +33,61 @@ fn rejects_non_web_schemes_and_junk() {
     assert!(normalize_url(&"a".repeat(3000)).is_err());
 }
 
+fn context_action_url(key: &str, action: &str, target: &str, text: &str) -> Url {
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("key", key)
+        .append_pair("action", action)
+        .append_pair("url", target)
+        .append_pair("text", text)
+        .finish();
+    Url::parse(&format!("{BROWSER_CONTEXT_SCHEME}://action?{query}")).unwrap()
+}
+
+#[test]
+fn context_actions_are_authenticated_task_scoped_and_web_only() {
+    let tabs = registry(&[("tab-1", "task-a", None), ("tab-2", "task-b", None)]);
+    let key = tabs.host_key();
+    let action = context_action_from_url(
+        &tabs,
+        "task-a",
+        "tab-1",
+        &context_action_url(&key, "open-tab", "https://example.com/a", "selected"),
+    )
+    .expect("the guest's authenticated action should parse");
+    assert_eq!(action.task_id, "task-a");
+    assert_eq!(action.tab_id, "tab-1");
+    assert_eq!(action.target_url.as_deref(), Some("https://example.com/a"));
+    assert_eq!(action.text.as_deref(), Some("selected"));
+
+    assert!(
+        context_action_from_url(
+            &tabs,
+            "task-a",
+            "tab-1",
+            &context_action_url("wrong", "open-tab", "https://example.com", ""),
+        )
+        .is_none()
+    );
+    assert!(
+        context_action_from_url(
+            &tabs,
+            "task-a",
+            "tab-1",
+            &context_action_url(&key, "open-tab", "javascript:alert(1)", ""),
+        )
+        .is_none()
+    );
+    assert!(
+        context_action_from_url(
+            &tabs,
+            "task-b",
+            "tab-1",
+            &context_action_url(&key, "send-chat", "", "text"),
+        )
+        .is_none()
+    );
+}
+
 /// A registry holding one tab per `(id, task, owner)`, where `owner` is the
 /// delegated child that opened it, or `None` for the orchestrator's own.
 fn registry(rows: &[(&str, &str, Option<&str>)]) -> BrowserTabs {
@@ -56,6 +111,7 @@ fn registry(rows: &[(&str, &str, Option<&str>)]) -> BrowserTabs {
                         delegation_id: owner.map(str::to_owned),
                     },
                     label: format!("browser-{id}"),
+                    placement_slot: Some(PlacementSlot::Pane),
                     held: None,
                     user_at: None,
                     grants: HashMap::new(),
@@ -90,6 +146,49 @@ fn snapshot_filters_by_task_and_sorts() {
     );
     assert_eq!(tabs.snapshot(None).len(), 3);
     assert_eq!(tabs.task_of("tab-3").as_deref(), Some("task-b"));
+}
+
+#[test]
+fn visible_peers_stay_inside_one_host_slot() {
+    let tabs = registry(&[
+        ("keep", "task-a", None),
+        ("main-peer", "task-a", None),
+        ("popout-peer", "task-a", None),
+        ("other-task", "task-b", None),
+    ]);
+    tabs.update("popout-peer", |tab| tab.popped_out = true);
+    tabs.update("other-task", |tab| tab.popped_out = false);
+
+    assert_eq!(
+        tabs.visible_peers("task-a", "keep", false, PlacementSlot::Pane),
+        ["main-peer", "other-task"]
+    );
+    assert_eq!(
+        tabs.visible_peers("task-a", "keep", true, PlacementSlot::Pane),
+        ["popout-peer"]
+    );
+    tabs.set_placement("main-peer", Some(PlacementSlot::Deck));
+    assert_eq!(
+        tabs.visible_peers("task-a", "keep", false, PlacementSlot::Pane),
+        ["other-task"]
+    );
+}
+
+#[test]
+fn renderer_tab_commands_refuse_another_task() {
+    let tabs = registry(&[("tab-a", "task-a", None), ("tab-b", "task-b", None)]);
+    assert!(require_task(&tabs, "task-a", "tab-a").is_ok());
+    let error = require_task(&tabs, "task-a", "tab-b").expect_err("cross-task tab must fail");
+    assert_eq!(error.code, "unavailable");
+    assert_eq!(error.message, "that browser tab is no longer open");
+}
+
+#[test]
+fn popout_window_identity_is_task_scoped_and_stable() {
+    let first = popout::window_label("task-a");
+    assert_eq!(first, popout::window_label("task-a"));
+    assert_ne!(first, popout::window_label("task-b"));
+    assert!(first.starts_with(popout::POPOUT_WINDOW_PREFIX));
 }
 
 #[test]
@@ -377,6 +476,17 @@ fn the_guest_reads_the_prelude_once_and_takes_it_off_the_page() {
     assert!(GUEST_RUNTIME.contains("delete window.__integratorBrowser;"));
     assert!(GUEST_RUNTIME.contains("CONFIG.keepPopupsInside"));
     assert!(GUEST_RUNTIME.contains("CONFIG.dismissConsent"));
+}
+
+#[test]
+fn the_guest_context_menu_is_trusted_and_never_opens_a_real_window() {
+    assert!(GUEST_RUNTIME.contains("const HOST_OPEN ="));
+    assert!(GUEST_RUNTIME.contains("if (!event.isTrusted || pickState) return"));
+    assert!(GUEST_RUNTIME.contains("Open link in new tab"));
+    assert!(GUEST_RUNTIME.contains("Copy link address"));
+    assert!(GUEST_RUNTIME.contains("Add to chat"));
+    assert!(GUEST_RUNTIME.contains("Refresh page"));
+    assert!(GUEST_RUNTIME.contains("integrator-browser-context://action"));
 }
 
 #[test]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-project-search-contents"
+description = "Enables the project_search_contents command without any pre-configured scope."
+commands.allow = ["project_search_contents"]
+
+[[permission]]
+identifier = "deny-project-search-contents"
+description = "Denies the project_search_contents command without any pre-configured scope."
+commands.deny = ["project_search_contents"]

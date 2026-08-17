@@ -186,6 +186,7 @@ impl BrowserTabs {
                     delegation_id: None,
                 },
                 label,
+                placement_slot: None,
                 held: None,
                 user_at: None,
                 grants: HashMap::new(),
@@ -221,9 +222,12 @@ pub(super) async fn adopt_sleeping(
     let window = app
         .get_window("main")
         .ok_or_else(|| unavailable("the main window is not available"))?;
+    let task_id = state
+        .task_of(tab_id)
+        .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
     window
         .add_child(
-            tab_webview_builder(app, state, tab_id, &label, target),
+            tab_webview_builder(app, state, tab_id, &label, target, &task_id),
             super::parked().0,
             super::parked().1,
         )

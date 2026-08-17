@@ -11,23 +11,23 @@
     },
     {
       "path": "apps/desktop/src-tauri/src/commands.rs",
-      "maxLines": 8500
+      "maxLines": 9497
     },
     {
       "path": "apps/desktop/src/App.tsx",
-      "maxLines": 7617
+      "maxLines": 7658
     },
     {
       "path": "apps/desktop/src/components/SettingsView.tsx",
-      "maxLines": 5430
+      "maxLines": 5431
     },
     {
       "path": "apps/desktop/src/bridge.ts",
-      "maxLines": 7013
+      "maxLines": 7241
     },
     {
       "path": "apps/desktop/src-tauri/src/delegation.rs",
-      "maxLines": 4783
+      "maxLines": 4819
     },
     {
       "path": "apps/desktop/src/components/RightRail.tsx",
@@ -35,7 +35,7 @@
     },
     {
       "path": "apps/desktop/src/App.runtime.test.tsx",
-      "maxLines": 3274
+      "maxLines": 3282
     },
     {
       "path": "apps/desktop/src/bridge.test.ts",
@@ -67,7 +67,7 @@
     },
     {
       "path": "apps/desktop/src/components/TaskSidebar.tsx",
-      "maxLines": 1726
+      "maxLines": 1879
     },
     {
       "path": "crates/adapter-acp/src/lib.rs",
@@ -91,7 +91,7 @@
     },
     {
       "path": "apps/desktop/src-tauri/src/commands_tests.rs",
-      "maxLines": 1286
+      "maxLines": 1732
     },
     {
       "path": "apps/desktop/src/components/SubagentsSettings.tsx",
@@ -133,6 +133,7 @@
   "allowedBridgeImports": [
     "apps/desktop/src/App.tsx",
     "apps/desktop/src/appTurnState.ts",
+    "apps/desktop/src/autoReviewSettings.ts",
     "apps/desktop/src/automationTranscript.ts",
     "apps/desktop/src/automationTurnPrompt.ts",
     "apps/desktop/src/commitMessageSettings.ts",
@@ -150,6 +151,7 @@
     "apps/desktop/src/components/FileView.tsx",
     "apps/desktop/src/components/GitRemoteDialog.tsx",
     "apps/desktop/src/components/McpActivationDialog.tsx",
+    "apps/desktop/src/components/PermissionsSettings.tsx",
     "apps/desktop/src/components/ReviewSurface.tsx",
     "apps/desktop/src/components/RightRail.tsx",
     "apps/desktop/src/components/RuntimeSetupTerminal.tsx",
@@ -165,6 +167,8 @@
     "apps/desktop/src/components/UsageSettings.tsx",
     "apps/desktop/src/components/WorkPane.tsx",
     "apps/desktop/src/components/commitGraphModel.ts",
+    "apps/desktop/src/components/browserDeckModel.ts",
+    "apps/desktop/src/components/browserWindowTabs.ts",
     "apps/desktop/src/components/composerModel.ts",
     "apps/desktop/src/components/fileViewSupport.ts",
     "apps/desktop/src/components/nativeActionCache.ts",

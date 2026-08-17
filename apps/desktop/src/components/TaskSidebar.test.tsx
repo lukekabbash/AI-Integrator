@@ -2,6 +2,7 @@
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { PathHit, SearchOutcome } from "../bridge";
 import { createDemoSnapshot } from "../demoData";
 import { TaskSidebar } from "./TaskSidebar";
 
@@ -439,6 +440,156 @@ describe("TaskSidebar", () => {
     });
     expect(within(result).getByText(/orchestrated emerald/i)).toBeInTheDocument();
     expect(within(result).getByText(/AI Integrator/i)).toBeInTheDocument();
+  });
+
+  it("adds repository files and file text as their own result groups", async () => {
+    const onSearchProjectPaths = vi.fn().mockResolvedValue({
+      hits: [{ path: "apps/desktop/src/spatialNavigation.ts", score: 90 }],
+      truncated: false,
+      scanned: 1480,
+      elapsedMs: 6,
+    });
+    const onSearchProjectContents = vi.fn().mockResolvedValue({
+      hits: [
+        {
+          path: "apps/desktop/src/useRailCursor.ts",
+          line: 57,
+          column: 21,
+          text: "const cells = navCells(container);",
+        },
+      ],
+      truncated: false,
+      scanned: 1480,
+      elapsedMs: 213,
+    });
+    setup({ onSearchProjectPaths, onSearchProjectContents });
+    fireEvent.click(screen.getByRole("button", { name: "Search chats" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Search chats" }), {
+      target: { value: "navCells" },
+    });
+
+    const dialog = screen.getByRole("dialog", { name: "Search chats" });
+    expect(await within(dialog).findByText("Files")).toBeInTheDocument();
+    expect(within(dialog).getByText("In files")).toBeInTheDocument();
+    await waitFor(() => expect(onSearchProjectPaths).toHaveBeenCalledWith("navCells"));
+    // No `literal` override: the bridge already defaults to a literal search,
+    // so `foo(` finds `foo(` rather than failing as a malformed regex.
+    expect(onSearchProjectContents).toHaveBeenCalledWith({ pattern: "navCells" });
+    const file = within(dialog).getByRole("button", { name: /spatialNavigation\.ts/ });
+    expect(within(file).getByText("apps/desktop/src")).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: /useRailCursor\.ts:57/ }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows the file group without waiting for the slower content walk", async () => {
+    const onSearchProjectPaths = vi.fn().mockResolvedValue({
+      hits: [{ path: "src/quick.ts", score: 12 }],
+      truncated: false,
+      scanned: 40,
+      elapsedMs: 4,
+    });
+    const onSearchProjectContents = vi.fn().mockReturnValue(new Promise(() => {}));
+    setup({ onSearchProjectPaths, onSearchProjectContents });
+    fireEvent.click(screen.getByRole("button", { name: "Search chats" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Search chats" }), {
+      target: { value: "quick" },
+    });
+
+    const dialog = screen.getByRole("dialog", { name: "Search chats" });
+    expect(await within(dialog).findByRole("button", { name: /quick\.ts/ })).toBeInTheDocument();
+    expect(within(dialog).queryByText("In files")).toBeNull();
+  });
+
+  it("says how much of a truncated result it is actually showing", async () => {
+    const onSearchProjectPaths = vi.fn().mockResolvedValue({
+      hits: [
+        { path: "src/alpha.ts", score: 30 },
+        { path: "src/beta.ts", score: 29 },
+      ],
+      truncated: true,
+      scanned: 5000,
+      elapsedMs: 44,
+    });
+    setup({ onSearchProjectPaths });
+    fireEvent.click(screen.getByRole("button", { name: "Search chats" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Search chats" }), {
+      target: { value: "alpha" },
+    });
+
+    const dialog = screen.getByRole("dialog", { name: "Search chats" });
+    expect(await within(dialog).findByText("Showing the first 2")).toBeInTheDocument();
+  });
+
+  it("opens a content hit at the line it matched", async () => {
+    const onOpenProjectFile = vi.fn();
+    const onSearchProjectContents = vi.fn().mockResolvedValue({
+      hits: [
+        {
+          path: "apps/desktop/src/App.tsx",
+          line: 412,
+          column: 8,
+          text: 'focusRegion("sidebar");',
+        },
+      ],
+      truncated: false,
+      scanned: 900,
+      elapsedMs: 180,
+    });
+    setup({ onSearchProjectContents, onOpenProjectFile });
+    fireEvent.click(screen.getByRole("button", { name: "Search chats" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Search chats" }), {
+      target: { value: "focusRegion" },
+    });
+
+    const dialog = screen.getByRole("dialog", { name: "Search chats" });
+    const hit = await within(dialog).findByRole("button", { name: /App\.tsx:412/ });
+    fireEvent.click(hit);
+
+    expect(onOpenProjectFile).toHaveBeenCalledWith({
+      path: "apps/desktop/src/App.tsx",
+      startLine: 412,
+      endLine: 412,
+    });
+    expect(screen.queryByRole("dialog", { name: "Search chats" })).not.toBeInTheDocument();
+  });
+
+  it("lets the newest keystroke win when an older search is still in flight", async () => {
+    const pending: Array<(outcome: SearchOutcome<PathHit>) => void> = [];
+    const onSearchProjectPaths = vi.fn().mockImplementation(
+      () =>
+        new Promise<SearchOutcome<PathHit>>((resolve) => {
+          pending.push(resolve);
+        }),
+    );
+    setup({ onSearchProjectPaths });
+    fireEvent.click(screen.getByRole("button", { name: "Search chats" }));
+    const input = screen.getByRole("textbox", { name: "Search chats" });
+
+    fireEvent.change(input, { target: { value: "stale" } });
+    await waitFor(() => expect(onSearchProjectPaths).toHaveBeenCalledWith("stale"));
+    fireEvent.change(input, { target: { value: "fresh" } });
+    await waitFor(() => expect(onSearchProjectPaths).toHaveBeenCalledWith("fresh"));
+
+    const outcome = (path: string): SearchOutcome<PathHit> => ({
+      hits: [{ path, score: 10 }],
+      truncated: false,
+      scanned: 10,
+      elapsedMs: 5,
+    });
+    // The newer query answers first; the older one straggles in behind it and
+    // must not repaint the list the user is looking at.
+    await act(async () => {
+      pending[1]?.(outcome("src/fresh.ts"));
+    });
+    const dialog = screen.getByRole("dialog", { name: "Search chats" });
+    expect(within(dialog).getByRole("button", { name: /fresh\.ts/ })).toBeInTheDocument();
+
+    await act(async () => {
+      pending[0]?.(outcome("src/stale.ts"));
+    });
+    expect(within(dialog).queryByRole("button", { name: /stale\.ts/ })).toBeNull();
+    expect(within(dialog).getByRole("button", { name: /fresh\.ts/ })).toBeInTheDocument();
   });
 
   it("keeps search compact in the brand row and opens a focused modal", () => {

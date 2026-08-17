@@ -263,7 +263,10 @@ pub async fn focus_for_agent(
     let label = tabs
         .label_for(tab_id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
-    let _ = app.emit(super::BROWSER_FOCUS_EVENT, json!({ "tabId": tab_id }));
+    let _ = app.emit(
+        super::BROWSER_FOCUS_EVENT,
+        json!({ "taskId": caller.task_id.as_str(), "tabId": tab_id }),
+    );
     // A tab parked off screen still measures 1280×800, so its own geometry
     // cannot answer this. What can is the renderer's placement: it reports a
     // rectangle when a tab is on screen and hides it when it is not. Wait

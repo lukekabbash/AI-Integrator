@@ -1,7 +1,8 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs,
     io::{Read, Write},
+    net::SocketAddr,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -41,6 +42,11 @@ use tauri_plugin_dialog::DialogExt;
 use tokio::time::{Duration, timeout};
 use zeroize::Zeroizing;
 
+use crate::auto_review::{
+    self, BoundaryKind, BoundaryRequest, Fallback, Outcome, ReviewerConfig, ReviewerMode,
+    ReviewerRoute, TranscriptLine, TranscriptSpeaker,
+};
+use crate::chat_title::{HelperRoute, generate_isolated_provider_text_routed};
 use crate::command_api::{CommandError, CommandResult, worker_error};
 #[cfg(test)]
 use crate::context_primer::format_context_reference_primer;
@@ -49,6 +55,9 @@ use crate::context_primer::{
     should_load_handoff_digest, take_context_primer,
 };
 use crate::credential_store::{self, CredentialStorage};
+use crate::dev_server::{
+    self, DevServerEvent, DevServers, LogLine, ServerId, ServerSpec, ServerState, ServerView,
+};
 use crate::diagnostic_commands::{detailed_logging_enabled, log_task_folder_event};
 #[cfg(test)]
 use crate::interrupted_turn::{
@@ -83,6 +92,9 @@ use crate::state::{
 use crate::structured_projection::{
     claude_mode_projection, structured_item, structured_json_detail, structured_provider,
     structured_result_status, structured_usage_delta,
+};
+use crate::workspace_search::{
+    self, ContentHit, ContentOptions, PathHit, SearchLimits, SearchOutcome,
 };
 
 #[tauri::command]
@@ -1596,6 +1608,85 @@ pub async fn project_file_list(
         .map_err(Into::into)
 }
 
+/// Finds files by name across the whole repository.
+///
+/// This lives here rather than beside `workspace_search` because
+/// `authorized_project_directory` is the gate that keeps a renderer inside a
+/// project the user actually added, and a module that reached for it would have
+/// to import the commands facade — which the maintainability contract forbids
+/// for exactly this reason. The search itself owns no authorization: it is
+/// handed a root that has already been proven.
+#[tauri::command]
+pub async fn project_search_paths(
+    state: State<'_, AppState>,
+    repository: PathBuf,
+    query: String,
+    limit: Option<usize>,
+) -> CommandResult<SearchOutcome<PathHit>> {
+    let root = authorized_project_directory(&state, repository).await?;
+    let limits = search_limits(limit);
+    tauri::async_runtime::spawn_blocking(move || workspace_search::search_paths(&root, &query, &limits))
+        .await
+        .map_err(|_| worker_error())?
+        .map_err(Into::into)
+}
+
+/// Finds text inside the repository's files. Same authorization story as
+/// `project_search_paths`; the walk additionally refuses secret-shaped files,
+/// because a content hit would print the secret line itself into a result row.
+#[tauri::command]
+pub async fn project_search_contents(
+    state: State<'_, AppState>,
+    repository: PathBuf,
+    input: ProjectSearchContentsInput,
+) -> CommandResult<SearchOutcome<ContentHit>> {
+    let root = authorized_project_directory(&state, repository).await?;
+    let limits = search_limits(input.limit);
+    let options = ContentOptions {
+        globs: input.globs,
+        case_sensitive: input.case_sensitive,
+        literal: input.literal,
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        workspace_search::search_contents(&root, &input.pattern, &options, &limits)
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
+}
+
+/// A renderer may ask for fewer results than the default but never for more:
+/// the ceiling is what keeps one keystroke from walking an unbounded tree.
+fn search_limits(limit: Option<usize>) -> SearchLimits {
+    let defaults = SearchLimits::default();
+    match limit {
+        Some(requested) if requested > 0 => SearchLimits {
+            max_results: requested.min(defaults.max_results),
+            ..defaults
+        },
+        _ => defaults,
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSearchContentsInput {
+    pattern: String,
+    #[serde(default)]
+    globs: Vec<String>,
+    #[serde(default)]
+    case_sensitive: bool,
+    /// Defaults to a literal search: the box the user types into is a search
+    /// box, so `foo(` should find `foo(` rather than fail as a bad regex.
+    #[serde(default = "default_literal_search")]
+    literal: bool,
+    limit: Option<usize>,
+}
+
+fn default_literal_search() -> bool {
+    true
+}
+
 #[tauri::command]
 pub async fn project_file_read(
     state: State<'_, AppState>,
@@ -1732,6 +1823,254 @@ pub async fn project_path_resolve(
         .await
         .map_err(|_| worker_error())?
         .map_err(Into::into)
+}
+
+// ---------------------------------------------------------------------------
+// Managed dev servers
+// ---------------------------------------------------------------------------
+//
+// `dev_server` owns the processes and knows nothing about Tauri. This is the
+// wire, and the authorization lives here: every command that names a folder
+// proves it through `authorized_project_directory` first, so a renderer can
+// only run a child inside a project the user explicitly added. The commands
+// that name a server instead take an opaque id, and an id is only ever handed
+// out by a list or a start that already passed that gate.
+
+/// State and output, on the app's usual `domain://event` shape. One topic for
+/// both because both mean the same thing to a subscriber: re-read the server.
+pub const DEV_SERVER_EVENT: &str = "dev-server://changed";
+
+/// Announced once per start, when a server's declared port begins answering.
+/// Separate from the state topic because it is not a state change the UI should
+/// re-render: it is a one-shot invitation to open the page.
+pub const DEV_SERVER_LISTENING_EVENT: &str = "dev-server://listening";
+
+/// How much of a `package.json` is worth reading before deciding it is not a
+/// manifest. Candidate detection is a convenience, not a parser, and a file
+/// this size is already something else wearing the name.
+const DEV_SERVER_MANIFEST_LIMIT: u64 = 1024 * 1024;
+
+/// How long a port probe waits before deciding a server is not up yet. Short on
+/// purpose: a server still booting is asked again on the next list, and this
+/// runs while the user is looking at the row.
+const DEV_SERVER_PROBE_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// Ports one list call may probe. The registry already caps how many servers
+/// can run at once; this keeps the command's cost fixed regardless.
+const DEV_SERVER_PROBE_LIMIT: usize = 12;
+
+/// One announcement that something about a server changed, and where to read
+/// the rest. The log itself is fetched with `dev_server_log` rather than
+/// carried here: a server that prints per frame must not turn into a flood of
+/// large IPC messages.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevServerChanged {
+    id: String,
+    /// Present on an output notice: the sequence a reader should resume from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_seq: Option<u64>,
+    /// Present on a lifecycle change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<ServerState>,
+}
+
+/// Turn the registry's observer into app events. Installed once at startup,
+/// from `lib.rs`, because the registry outlives any one window.
+pub(crate) fn install_dev_server_observer(app: &AppHandle<tauri::Wry>, servers: &Arc<DevServers>) {
+    let app = app.clone();
+    servers.set_observer(Arc::new(move |event| {
+        let payload = match event {
+            DevServerEvent::Output { id, next_seq } => DevServerChanged {
+                id: id.as_str().to_owned(),
+                next_seq: Some(next_seq),
+                state: None,
+            },
+            DevServerEvent::State { id, state } => DevServerChanged {
+                id: id.as_str().to_owned(),
+                next_seq: None,
+                state: Some(state),
+            },
+        };
+        let _ = app.emit(DEV_SERVER_EVENT, payload);
+    }));
+}
+
+/// One server whose port has just started answering, and the page to open.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevServerListening {
+    id: String,
+    url: String,
+}
+
+/// The dev servers this app started for one trusted project.
+///
+/// Scoped by the authorized root rather than returning the whole registry: a
+/// window showing one project has no business enumerating the command lines
+/// another project is running.
+///
+/// Listing is also where a started server becomes a *listening* one. A declared
+/// port that accepts a connection is the only evidence we have that the child
+/// finished booting, and probing it here rather than from a watcher thread
+/// keeps the cost tied to someone actually looking at the rows.
+#[tauri::command]
+pub async fn dev_server_list(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    servers: State<'_, Arc<DevServers>>,
+    repository: PathBuf,
+) -> CommandResult<Vec<ServerView>> {
+    let root = authorized_project_directory(&state, repository).await?;
+    let servers = Arc::clone(&servers);
+    let (views, listening) = tauri::async_runtime::spawn_blocking(move || {
+        let mine = |view: &ServerView| view.spec.cwd == root;
+        let pending: Vec<(ServerId, u16)> = servers
+            .list()
+            .into_iter()
+            .filter(mine)
+            .filter(|view| matches!(view.state, ServerState::Starting | ServerState::Running))
+            .filter_map(|view| view.spec.port.map(|port| (view.id, port)))
+            .take(DEV_SERVER_PROBE_LIMIT)
+            .collect();
+        let listening: Vec<DevServerListening> = pending
+            .into_iter()
+            .filter(|(_, port)| port_is_listening(*port))
+            .filter_map(|(id, port)| {
+                // `mark_listening` hands back a URL only the first time per
+                // start, so a page the user closed stays closed.
+                servers
+                    .mark_listening(&id, port)
+                    .map(|url| DevServerListening {
+                        id: id.as_str().to_owned(),
+                        url,
+                    })
+            })
+            .collect();
+        (
+            servers.list().into_iter().filter(mine).collect::<Vec<_>>(),
+            listening,
+        )
+    })
+    .await
+    .map_err(|_| worker_error())?;
+    for announcement in listening {
+        let _ = app.emit(DEV_SERVER_LISTENING_EVENT, announcement);
+    }
+    Ok(views)
+}
+
+/// Whether something accepts connections on a loopback port. A connect is the
+/// cheapest honest answer: it says the child bound the port, which is all
+/// "listening" claims here — whether it serves a page is the browser's problem.
+fn port_is_listening(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], port)),
+        DEV_SERVER_PROBE_TIMEOUT,
+    )
+    .is_ok()
+}
+
+/// The dev-server commands this project's `package.json` offers.
+#[tauri::command]
+pub async fn dev_server_candidates(
+    state: State<'_, AppState>,
+    repository: PathBuf,
+) -> CommandResult<Vec<ServerSpec>> {
+    let root = authorized_project_directory(&state, repository).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let manifest = root.join("package.json");
+        // A project with no manifest, or one too large to be a manifest, offers
+        // nothing — which is a real answer, not an error to raise at the user.
+        let readable = fs::metadata(&manifest)
+            .is_ok_and(|meta| meta.is_file() && meta.len() <= DEV_SERVER_MANIFEST_LIMIT);
+        let source = if readable {
+            fs::read_to_string(&manifest).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        dev_server::candidates(&source, &root)
+    })
+    .await
+    .map_err(|_| worker_error())
+}
+
+/// The renderer's half of a server spec.
+///
+/// Deliberately not `ServerSpec`: the working directory is not the renderer's
+/// to name, so it is absent from the wire shape rather than present and quietly
+/// discarded. The only folder a child may run in is the root
+/// `authorized_project_directory` just proved.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevServerStartInput {
+    label: String,
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default)]
+    port: Option<u16>,
+}
+
+/// Start one dev server inside a trusted project.
+#[tauri::command]
+pub async fn dev_server_start(
+    state: State<'_, AppState>,
+    servers: State<'_, Arc<DevServers>>,
+    repository: PathBuf,
+    spec: DevServerStartInput,
+) -> CommandResult<ServerId> {
+    let cwd = authorized_project_directory(&state, repository).await?;
+    let servers = Arc::clone(&servers);
+    tauri::async_runtime::spawn_blocking(move || {
+        servers.start(ServerSpec {
+            label: spec.label,
+            program: spec.program,
+            args: spec.args,
+            cwd,
+            env: spec.env,
+            port: spec.port,
+        })
+    })
+    .await
+    .map_err(|_| worker_error())?
+}
+
+/// Stop a server and wait for the kill to land. On a worker because reaping the
+/// child is a short blocking wait, and the answer is worth having: a stop that
+/// reports success while the port stays held is the failure this whole module
+/// exists to prevent.
+#[tauri::command]
+pub async fn dev_server_stop(servers: State<'_, Arc<DevServers>>, id: String) -> CommandResult<()> {
+    let servers = Arc::clone(&servers);
+    tauri::async_runtime::spawn_blocking(move || servers.stop(&ServerId::new(id)))
+        .await
+        .map_err(|_| worker_error())?
+}
+
+#[tauri::command]
+pub async fn dev_server_restart(
+    servers: State<'_, Arc<DevServers>>,
+    id: String,
+) -> CommandResult<()> {
+    let servers = Arc::clone(&servers);
+    tauri::async_runtime::spawn_blocking(move || servers.restart(&ServerId::new(id)))
+        .await
+        .map_err(|_| worker_error())?
+}
+
+/// The log since a sequence number, so a reader resumes without double-reading
+/// or skipping. `ServerView::dropped_lines` is how it learns the ring evicted
+/// lines it never saw.
+#[tauri::command]
+pub async fn dev_server_log(
+    servers: State<'_, Arc<DevServers>>,
+    id: String,
+    since: u64,
+) -> CommandResult<Vec<LogLine>> {
+    Ok(servers.log(&ServerId::new(id), since))
 }
 
 /// Reveals an absolute directory or file that belongs to a trusted project or
@@ -3428,6 +3767,12 @@ pub async fn codex_start_thread(
             None | Some("project-write") => ("on-request", "workspace-write"),
             Some("read-only") => ("on-request", "read-only"),
             Some("ask") => ("untrusted", "workspace-write"),
+            // Auto deliberately rides the same pair as project-write. Codex's
+            // own reviewer only engages while approvals are interactive, so
+            // "never" or "untrusted" would switch the whole feature off without
+            // reporting anything; what makes `auto` different is the
+            // thread-scoped config it carries, not the sandbox it runs in.
+            Some(AUTO_PERMISSION_PROFILE) => ("on-request", "workspace-write"),
             Some("full-access") => ("never", "danger-full-access"),
             Some(_) => {
                 return Err(CommandError {
@@ -3463,7 +3808,7 @@ pub async fn codex_start_thread(
         },
     )
     .map_err(CommandError::from)?;
-    let (codex_config, developer_instructions) = if is_chat {
+    let (mut codex_config, developer_instructions) = if is_chat {
         // Thread overrides merge with the user's effective Codex config. Read
         // only the server names so Chat can explicitly close every inherited
         // MCP surface without copying commands, URLs, env, or credentials.
@@ -3506,6 +3851,19 @@ pub async fn codex_start_thread(
             ),
         )
     };
+    // Codex reviews natively, so `auto` is two keys in the thread-scoped config
+    // rather than a decision we make per request. Merged into whatever is
+    // already there — the object carries the delegation broker's MCP server
+    // definitions, and replacing it would unwire the broker while still
+    // starting a thread that looks healthy.
+    if !is_chat
+        && permission.as_deref() == Some(AUTO_PERMISSION_PROFILE)
+        && let Some(plan) = auto_review_plan(&state.store, ProviderKind::Codex)
+        && plan.mode == ReviewerMode::Native
+        && let Some(config) = codex_config.as_mut()
+    {
+        merge_codex_auto_review(config, &plan.config);
+    }
     let response = runtime
         .client
         .start_thread_with_policies_and_overrides(
@@ -4890,6 +5248,11 @@ pub async fn acp_start_session(
             None | Some("project-write") => "project-write",
             Some("read-only") => "read-only",
             Some("ask") => "ask",
+            // Persisted, not just accepted: the pump reads the profile back
+            // out of the resume record when a `session/request_permission`
+            // arrives, so a session that survives a resume keeps its reviewer
+            // instead of quietly reverting to project-write.
+            Some(AUTO_PERMISSION_PROFILE) => AUTO_PERMISSION_PROFILE,
             Some("full-access") => "full-access",
             Some(_) => {
                 return Err(CommandError {
@@ -5816,6 +6179,23 @@ pub async fn structured_cli_start_turn(
                     });
                 }
             },
+            // Auto runs Claude in the same mode as project-write: routine edits
+            // proceed and everything else still arrives as a `can_use_tool`
+            // control request, which is exactly the set the reviewer answers in
+            // `spawn_structured_cli_pump`. agy reaches its decisions through the
+            // hook file instead and has no channel we can answer, so the profile
+            // is refused there rather than silently becoming project-write.
+            AUTO_PERMISSION_PROFILE => match structured_provider {
+                StructuredCliProvider::Claude => StructuredPermissionMode::AcceptEdits,
+                StructuredCliProvider::Antigravity => {
+                    return Err(CommandError {
+                        code: "invalid-input",
+                        message: "the Antigravity CLI has no approval channel for the Auto \
+                              reviewer; choose Read only, Project write, or Full access"
+                            .into(),
+                    });
+                }
+            },
             // The user explicitly picked the "Full access" profile; map it onto
             // each vendor's skip-approvals flag.
             "full-access" => StructuredPermissionMode::BypassPermissions,
@@ -6548,6 +6928,57 @@ pub(crate) fn spawn_structured_cli_pump(
                             .await;
                         continue;
                     }
+                    // The `auto` profile answers this request itself. Anything
+                    // short of a verdict — no reviewer configured, a reviewer
+                    // that failed, timed out, or wrote prose — falls through to
+                    // the approval card below and reaches the user exactly as it
+                    // would have without the profile. That fall-through is the
+                    // fail-closed path and there is no branch here that turns
+                    // silence into an approval.
+                    if runtime
+                        .resume_context
+                        .as_ref()
+                        .is_some_and(|context| context.permission == AUTO_PERMISSION_PROFILE)
+                        && let Some(plan) = auto_review_plan(&store, binding.provider)
+                    {
+                        let request = structured_boundary_request(
+                            &tool_name,
+                            &input,
+                            description.as_deref(),
+                            runtime
+                                .resume_context
+                                .as_ref()
+                                .map_or(Path::new(""), |context| context.repository.as_path()),
+                        );
+                        let transcript = auto_review_transcript(&store, binding.task_id);
+                        // Scoped so the state guard is gone before the await:
+                        // the reviewer runs on its own route, never the task's.
+                        let reviewer = IsolatedReviewer {
+                            data_directory: { app.state::<AppState>().data_directory.clone() },
+                        };
+                        let outcome =
+                            auto_review_outcome(&reviewer, &plan, &request, &transcript).await;
+                        emit_auto_review_audit(
+                            &app,
+                            &store,
+                            &binding,
+                            &thread_id,
+                            &event.turn_id,
+                            &request_id,
+                            &request,
+                            &outcome,
+                        );
+                        if let Some(response) =
+                            structured_auto_review_response(&outcome, input.clone())
+                        {
+                            had_denied_tool |= matches!(outcome, Outcome::Reject { .. });
+                            let _ = runtime
+                                .client
+                                .respond_permission(&request_id, response)
+                                .await;
+                            continue;
+                        }
+                    }
                     let command = input
                         .get("command")
                         .and_then(Value::as_str)
@@ -6963,6 +7394,28 @@ pub(crate) fn spawn_acp_pump(
                         continue;
                     };
                     let request_id = acp_transport_id(&id);
+                    // The `auto` profile answers this request itself, the same
+                    // way it answers Claude's `can_use_tool`. Anything short of
+                    // a verdict — profile not in force, no reviewer configured,
+                    // a reviewer that failed, timed out or wrote prose, or an
+                    // agent that advertised no option carrying the decision —
+                    // returns `None` and falls through to the approval card
+                    // below, reaching the user exactly as it would have without
+                    // the profile. That fall-through is the fail-closed path.
+                    if let Some(response) = acp_auto_review_response(
+                        &app,
+                        &store,
+                        binding,
+                        session_id,
+                        turn_id,
+                        &transport_key(&request_id),
+                        &params,
+                    )
+                    .await
+                    {
+                        let _ = runtime.client.respond_to_server_request(&id, response).await;
+                        continue;
+                    }
                     let options = params
                         .get("options")
                         .and_then(Value::as_array)
@@ -7251,9 +7704,7 @@ fn structured_permission_response(
         ApprovalDecision::Accept | ApprovalDecision::AcceptForSession => {
             let mut response = serde_json::json!({ "behavior": "allow" });
             if let Some(pending) = pending {
-                if !pending.input.is_null() {
-                    response["updatedInput"] = pending.input;
-                }
+                echo_tool_input(&mut response, pending.input);
                 if matches!(decision, ApprovalDecision::AcceptForSession)
                     && pending
                         .suggestions
@@ -7275,6 +7726,552 @@ fn structured_permission_response(
             })
         }
     }
+}
+
+/// Claude blocks until it is told whether the tool may run, and an allow has to
+/// hand the input back or the tool runs with nothing. Shared by both answers so
+/// the reviewer's allow and the user's allow cannot drift apart.
+fn echo_tool_input(response: &mut Value, input: Value) {
+    if !input.is_null() {
+        response["updatedInput"] = input;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The `auto` permission profile
+// ---------------------------------------------------------------------------
+//
+// Every decision lives in `auto_review`; this section is only the wire between
+// that module and the two places a runtime actually asks whether an action may
+// cross the workspace boundary. Codex is answered once, at thread start, with a
+// config that turns its own reviewer on. Claude is answered per request, here.
+
+/// The fifth permission profile, mirrored from `AUTO_REVIEW_PROFILE` in
+/// `autoReviewSettings.ts`.
+const AUTO_PERMISSION_PROFILE: &str = "auto";
+
+/// Stored settings keys, mirrored from `autoReviewSettings.ts`. They are read
+/// from the store rather than taken as command arguments on purpose: a
+/// permission decision must not be steerable by whatever the last `invoke`
+/// happened to carry.
+const AUTO_REVIEW_SETTING: &str = "permissions.autoReviewByRuntime";
+const AUTO_REVIEW_POLICY_SETTING: &str = "permissions.autoReviewPolicy";
+const AUTO_REVIEW_FALLBACK_SETTING: &str = "permissions.autoReviewFallback";
+const AUTO_REVIEW_TIMEOUT_SETTING: &str = "permissions.autoReviewTimeoutMs";
+
+/// The policy the app ships, verbatim.
+///
+/// The Permissions editor asks the user to replace this document, and until it
+/// can show the document there is nothing on screen to replace: an empty box
+/// invites a policy written from memory, over a shipped one nobody read. Not a
+/// `CommandResult` because reading a compiled-in constant has no failure to
+/// report.
+#[tauri::command]
+pub fn auto_review_default_policy() -> String {
+    auto_review::DEFAULT_POLICY.to_owned()
+}
+
+/// How many projected items the reviewer's transcript is drawn from.
+/// `auto_review::prompt` bounds the assembled text itself; this only bounds how
+/// many rows leave SQLite while a turn is parked on the answer.
+const AUTO_REVIEW_TRANSCRIPT_ITEMS: usize = 30;
+
+/// The stored auto-review settings for one task runtime, with every inheritance
+/// already applied. Mirrors `readAutoReviewRoute` in `autoReviewSettings.ts`.
+struct AutoReviewPlan {
+    mode: ReviewerMode,
+    config: ReviewerConfig,
+    fallback: Fallback,
+}
+
+/// Resolve the reviewer configured for one task runtime.
+///
+/// `None` means the user has not switched the reviewer on for this runtime, and
+/// the caller then behaves as though the profile were ordinary interactive
+/// approvals. That is the direction to be wrong in: an unconfigured `auto` asks
+/// the user rather than proceeding on its own.
+fn auto_review_plan(store: &LocalStore, task_runtime: ProviderKind) -> Option<AutoReviewPlan> {
+    let read = |key: &str| {
+        store
+            .get_setting(key)
+            .ok()
+            .flatten()
+            .map(|setting| setting.value)
+    };
+    let by_runtime = read(AUTO_REVIEW_SETTING)?;
+    let stored = by_runtime.get(auto_review_runtime_key(task_runtime))?;
+    // Anything other than a literal `true` is off, matching the normalizer on
+    // the renderer side: an imported setting reading `"enabled": "yes"` must not
+    // switch a reviewer on by accident.
+    if stored.get("enabled") != Some(&Value::Bool(true)) {
+        return None;
+    }
+
+    let mode = ReviewerMode::resolve(
+        task_runtime,
+        match stored.get("reviewer").and_then(Value::as_str) {
+            Some("native") => Some(ReviewerMode::Native),
+            Some("delegated") => Some(ReviewerMode::Delegated),
+            _ => None,
+        },
+    );
+    // A native reviewer is the task runtime reviewing itself, so a stored
+    // reviewer runtime only means anything on the delegated path.
+    let reviewer_runtime = if mode == ReviewerMode::Native {
+        task_runtime
+    } else {
+        stored
+            .get("reviewerRuntime")
+            .and_then(Value::as_str)
+            .and_then(auto_review_runtime_id)
+            .unwrap_or(task_runtime)
+    };
+    let route = ReviewerRoute {
+        model: auto_review_text(stored.get("model")),
+        effort: auto_review_text(stored.get("effort")),
+        ..ReviewerRoute::new(reviewer_runtime)
+    };
+    // Route policy, then the global one, then the shipped default that
+    // `ReviewerConfig` falls back to on its own.
+    let policy = auto_review_text(stored.get("policy"))
+        .or_else(|| auto_review_text(read(AUTO_REVIEW_POLICY_SETTING).as_ref()));
+    Some(AutoReviewPlan {
+        mode,
+        config: ReviewerConfig::new(route)
+            .with_policy(policy.as_deref())
+            .with_timeout_ms(
+                read(AUTO_REVIEW_TIMEOUT_SETTING)
+                    .as_ref()
+                    .and_then(Value::as_u64),
+            ),
+        fallback: match read(AUTO_REVIEW_FALLBACK_SETTING)
+            .as_ref()
+            .and_then(Value::as_str)
+        {
+            Some("deny") => Fallback::Deny,
+            // Anything unreadable resolves to the default rather than to the
+            // stricter option, so a corrupt settings row cannot quietly start
+            // denying work the user expected to be asked about.
+            _ => Fallback::Ask,
+        },
+    })
+}
+
+/// The key one runtime is stored under. `RuntimeId` on the renderer side says
+/// `"custom"` where `ProviderKind::as_str` says `"custom-acp"`, and a settings
+/// bag written by the renderer is the thing being read.
+fn auto_review_runtime_key(runtime: ProviderKind) -> &'static str {
+    match runtime {
+        ProviderKind::CustomAcp => "custom",
+        other => other.as_str(),
+    }
+}
+
+fn auto_review_runtime_id(value: &str) -> Option<ProviderKind> {
+    match value {
+        "custom" => Some(ProviderKind::CustomAcp),
+        other => other.parse().ok(),
+    }
+}
+
+/// A stored string, or nothing. An empty dropdown is an unset dropdown, never a
+/// model named `""`.
+fn auto_review_text(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
+/// Merge the reviewer keys into a Codex thread config. Merge, never replace:
+/// the object already carries the delegation broker's MCP server definitions,
+/// and dropping them would unwire the broker while still starting a thread that
+/// looks perfectly healthy.
+fn merge_codex_auto_review(config: &mut Value, reviewer: &ReviewerConfig) {
+    let (Some(target), Some(fields)) = (
+        config.as_object_mut(),
+        auto_review::codex_thread_config(&reviewer.policy, &reviewer.route)
+            .as_object()
+            .cloned(),
+    ) else {
+        return;
+    };
+    target.extend(fields);
+}
+
+/// The app's own one-shot generation path, wearing the module's seam.
+///
+/// The reviewer runs exactly the way chat titles and commit subjects do — a
+/// fresh scratch directory, no tools, no access to the repository it is judging
+/// — and on its own route: `ReviewerRoute::runtime` is whatever the user
+/// configured, which is what makes a Claude task guarded by a cheap Codex model
+/// a first-class arrangement rather than an accident.
+struct IsolatedReviewer {
+    data_directory: PathBuf,
+}
+
+impl auto_review::Reviewer for IsolatedReviewer {
+    fn ask<'a>(
+        &'a self,
+        route: &'a ReviewerRoute,
+        message: &'a str,
+    ) -> auto_review::ReviewerAnswer<'a> {
+        Box::pin(async move {
+            generate_isolated_provider_text_routed(
+                &self.data_directory,
+                route.runtime,
+                message,
+                &HelperRoute {
+                    model: route.model.clone(),
+                    effort: route.effort.clone(),
+                },
+            )
+            .await
+            // The message becomes the `Unavailable` reason, which the user
+            // reads, so the provider's own wording is more use than ours.
+            .map_err(|error| error.message)
+        })
+    }
+}
+
+/// Review one boundary request and apply the user's fallback.
+///
+/// Kept as one named step so the fail-closed rule is testable with a canned
+/// reviewer instead of only through a live provider: a reviewer that fails,
+/// hangs, or answers in prose can never leave here as `Approve`.
+async fn auto_review_outcome(
+    reviewer: &dyn auto_review::Reviewer,
+    plan: &AutoReviewPlan,
+    request: &BoundaryRequest,
+    transcript: &[TranscriptLine],
+) -> Outcome {
+    auto_review::resolve(
+        auto_review::review(reviewer, &plan.config, request, transcript).await,
+        plan.fallback,
+    )
+}
+
+/// Describe one `can_use_tool` request in the terms the reviewer reads.
+///
+/// The detail comes from `structured_json_detail`, which redacts and bounds it
+/// first: the reviewer is a model call like any other and has no business
+/// receiving a secret the transcript would have hidden.
+fn structured_boundary_request(
+    tool_name: &str,
+    input: &Value,
+    description: Option<&str>,
+    cwd: &Path,
+) -> BoundaryRequest {
+    let kind = match tool_name {
+        "Bash" | "BashOutput" | "KillShell" => BoundaryKind::Shell,
+        "WebFetch" | "WebSearch" => BoundaryKind::Network,
+        "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => BoundaryKind::FileOutsideRoot,
+        _ => BoundaryKind::ToolCall,
+    };
+    let summary = [input.get("command").and_then(Value::as_str), description]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|text| !text.is_empty())
+        .map_or_else(|| format!("Use the {tool_name} tool"), str::to_owned);
+    BoundaryRequest {
+        kind,
+        summary,
+        detail: format!(
+            "tool: {tool_name}\ninput:\n{}",
+            structured_json_detail(input).unwrap_or_else(|| "(none)".into())
+        ),
+        cwd: cwd.to_path_buf(),
+    }
+}
+
+/// The recent session, as the reviewer sees it.
+///
+/// Reasoning summaries are dropped: Codex's own reviewer is not shown hidden
+/// reasoning either, and a boundary decision that turned on something the user
+/// never saw would be one nobody could audit afterwards.
+fn auto_review_transcript(store: &LocalStore, task_id: TaskId) -> Vec<TranscriptLine> {
+    let query = TaskSnapshotQuery {
+        known_watermark: None,
+        known_reset_seq: None,
+        before_seq: None,
+        limit: Some(AUTO_REVIEW_TRANSCRIPT_ITEMS),
+    };
+    let Ok(Some(hydrate)) = store
+        .task_snapshot_with(task_id, query)
+        .map(|snapshot| snapshot.hydrate)
+    else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    for item in &hydrate.items {
+        push_auto_review_lines(&mut lines, item);
+    }
+    lines
+}
+
+/// One projected item as up to two transcript lines: what was done, and what
+/// came back. A tool's output is labelled as its own speaker rather than folded
+/// into the agent's words because it is the part most likely to carry text
+/// addressed at the reviewer, and the reviewer is told to weigh the two
+/// differently.
+fn push_auto_review_lines(lines: &mut Vec<TranscriptLine>, item: &ItemProjection) {
+    let speaker = match item.kind {
+        ItemKind::UserMessage => TranscriptSpeaker::User,
+        ItemKind::AgentMessage => TranscriptSpeaker::Agent,
+        ItemKind::CommandExecution | ItemKind::FileChange | ItemKind::McpTool => {
+            TranscriptSpeaker::Tool
+        }
+        ItemKind::ReasoningSummary | ItemKind::Unknown => return,
+    };
+    let action = [
+        item.title.as_deref(),
+        item.command.as_deref(),
+        item.body.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n");
+    if !action.is_empty() {
+        lines.push(TranscriptLine {
+            speaker,
+            text: action,
+        });
+    }
+    let output = item.output.as_deref().map(str::trim).unwrap_or_default();
+    if speaker == TranscriptSpeaker::Tool && !output.is_empty() {
+        lines.push(TranscriptLine {
+            speaker: TranscriptSpeaker::Output,
+            text: output.to_owned(),
+        });
+    }
+}
+
+/// Land the verdict in the transcript.
+///
+/// `auto_review::audit_summary` writes the sentence; the only decision here is
+/// where it goes — a neutral item, the same channel the app already uses for
+/// content it authored itself. A profile that acts on the user's behalf is only
+/// trustworthy if the session reads back afterwards as one story, so this is
+/// emitted for every outcome, including the ones the user was asked about.
+#[allow(clippy::too_many_arguments)]
+fn emit_auto_review_audit(
+    app: &AppHandle<tauri::Wry>,
+    store: &LocalStore,
+    binding: &RuntimeBinding,
+    thread_id: &str,
+    turn_id: &str,
+    request_key: &str,
+    request: &BoundaryRequest,
+    outcome: &Outcome,
+) {
+    let now = Utc::now();
+    let mut item = structured_item(
+        thread_id,
+        turn_id,
+        &format!("auto-review-{request_key}"),
+        ItemKind::McpTool,
+        Some(auto_review::audit_summary(request, outcome)),
+        None,
+        None,
+        None,
+        match outcome {
+            Outcome::Approve { .. } => ItemStatus::Completed,
+            Outcome::Reject { .. } => ItemStatus::Declined,
+            // Still open: the approval card the fall-through raises is what
+            // settles it.
+            Outcome::AskTheUser { .. } => ItemStatus::Pending,
+        },
+        now,
+    );
+    item.mcp_server = Some("Auto review".into());
+    item.mcp_tool = Some(request.kind.as_str().to_owned());
+    apply_and_emit(
+        app,
+        store,
+        binding,
+        &ReducedProviderEvent {
+            method: "client/autoReview/verdict".into(),
+            thread_id: thread_id.to_owned(),
+            turn_id: Some(turn_id.to_owned()),
+            audit_json: "{}".into(),
+            audit_truncated: false,
+            mutation: ProjectionMutation::NeutralItem(item),
+            occurred_at: now,
+        },
+    );
+}
+
+/// The `can_use_tool` control response for a decision the *reviewer* made.
+///
+/// The deny message is the reviewer's own sentence rather than the
+/// user-declined text `structured_permission_response` sends, because Claude
+/// shows `message` to the agent: that is how a denial steers the next attempt
+/// toward a safer route instead of toward a retry. `None` means no verdict was
+/// reached and the request goes to the user unchanged — the fail-closed path,
+/// and the only reason this returns an `Option` at all.
+fn structured_auto_review_response(outcome: &Outcome, input: Value) -> Option<Value> {
+    let mut response = auto_review::claude_permission_response(outcome)?;
+    // The module deliberately never sees the tool input, so the echo is ours to
+    // merge. No `updatedPermissions`: a reviewer decides one action, and
+    // persisting a standing rule is the user's to give.
+    if response.get("behavior").and_then(Value::as_str) == Some("allow") {
+        echo_tool_input(&mut response, input);
+    }
+    Some(response)
+}
+
+/// Review one ACP `session/request_permission` and answer it, or hand it back.
+///
+/// This is the same decision the structured-CLI `can_use_tool` arm makes, on
+/// the runtimes that speak ACP: Cursor, Grok and Kimi. Every early return is a
+/// fall-through to the ordinary approval card, which is why the profile can
+/// only ever cost the user a question they would have been asked anyway.
+#[allow(clippy::too_many_arguments)]
+async fn acp_auto_review_response(
+    app: &AppHandle<tauri::Wry>,
+    store: &LocalStore,
+    binding: &RuntimeBinding,
+    session_id: &str,
+    turn_id: &str,
+    request_key: &str,
+    params: &Value,
+) -> Option<Value> {
+    // The profile is read from the persisted resume record rather than from a
+    // command argument, for the same reason the settings are: a permission
+    // decision must not be steerable by whatever the renderer last sent.
+    let resume = store.provider_resume_state(binding.task_id).ok().flatten()?;
+    if resume.permission != AUTO_PERMISSION_PROFILE {
+        return None;
+    }
+    // A repeated option kind means the agent is using this channel to ask a
+    // multiple-choice question rather than to gate an action — the shape
+    // `reduce_acp_permission_request` surfaces as `ApprovalKind::Question`. A
+    // reviewer judges boundaries; it does not answer questions put to the user.
+    if acp_permission_is_question(params) {
+        return None;
+    }
+    let plan = auto_review_plan(store, binding.provider)?;
+    let request = acp_boundary_request(params, &resume.repository_root);
+    let transcript = auto_review_transcript(store, binding.task_id);
+    // Scoped so the state guard is gone before the await: the reviewer runs on
+    // its own route, never the task's.
+    let reviewer = IsolatedReviewer {
+        data_directory: { app.state::<AppState>().data_directory.clone() },
+    };
+    let verdict = auto_review_outcome(&reviewer, &plan, &request, &transcript).await;
+    let response = acp_auto_review_outcome(&verdict, params);
+    // The audit has to describe what actually happened. When the agent offered
+    // no single-use option carrying the verdict there is nothing to answer
+    // with — a standing `allow_always` is the user's to give, not ours — so the
+    // request goes to the user and the audit says that, rather than recording a
+    // decision that never took effect.
+    let outcome = match (&response, verdict) {
+        (Some(_), verdict) | (None, verdict @ Outcome::AskTheUser { .. }) => verdict,
+        (None, Outcome::Approve { reason } | Outcome::Reject { reason }) => Outcome::AskTheUser {
+            reason: format!("{reason} This agent offered no single-use option to answer with."),
+        },
+    };
+    emit_auto_review_audit(
+        app,
+        store,
+        binding,
+        session_id,
+        turn_id,
+        request_key,
+        &request,
+        &outcome,
+    );
+    response
+}
+
+/// True when the advertised options repeat a `kind`, which is how an agent
+/// bridges its own "ask the user" tool onto the permission channel.
+fn acp_permission_is_question(params: &Value) -> bool {
+    let mut seen: HashSet<&str> = HashSet::new();
+    params
+        .get("options")
+        .and_then(Value::as_array)
+        .is_some_and(|options| {
+            options.iter().any(|option| {
+                !seen.insert(
+                    option
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )
+            })
+        })
+}
+
+/// Describe one ACP permission request in the terms the reviewer reads.
+///
+/// ACP names the action by `toolCall.kind` rather than by a tool name, and the
+/// arguments arrive as `rawInput`, which goes through `structured_json_detail`
+/// so the reviewer — a model call like any other — never receives a secret the
+/// transcript itself would have hidden.
+fn acp_boundary_request(params: &Value, cwd: &Path) -> BoundaryRequest {
+    let tool_call = params.get("toolCall");
+    let field = |name: &str| tool_call.and_then(|call| call.get(name));
+    let tool_kind = field("kind").and_then(Value::as_str).unwrap_or_default();
+    let kind = match tool_kind {
+        "execute" => BoundaryKind::Shell,
+        "fetch" => BoundaryKind::Network,
+        "edit" | "delete" | "move" => BoundaryKind::FileOutsideRoot,
+        _ => BoundaryKind::ToolCall,
+    };
+    let raw_input = field("rawInput").cloned().unwrap_or(Value::Null);
+    let title = field("title").and_then(Value::as_str);
+    let summary = [raw_input.get("command").and_then(Value::as_str), title]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|text| !text.is_empty())
+        .map_or_else(|| format!("Use a {} tool", kind.as_str()), str::to_owned);
+    BoundaryRequest {
+        kind,
+        summary,
+        detail: format!(
+            "tool: {}\nacp kind: {}\ninput:\n{}",
+            title.unwrap_or("(unnamed)"),
+            if tool_kind.is_empty() {
+                "(unstated)"
+            } else {
+                tool_kind
+            },
+            structured_json_detail(&raw_input).unwrap_or_else(|| "(none)".into())
+        ),
+        cwd: cwd.to_path_buf(),
+    }
+}
+
+/// Map a reviewer verdict onto the options this agent advertised.
+///
+/// Only the single-use kinds are eligible. ACP's `allow_always` and
+/// `reject_always` install a standing rule for the rest of the session, and a
+/// reviewer decides one action — so an agent that offers nothing else is
+/// answered by the user instead. `None` also covers `AskTheUser`, which is the
+/// fail-closed path and the reason this returns an `Option` at all.
+fn acp_auto_review_outcome(outcome: &Outcome, params: &Value) -> Option<Value> {
+    let wanted = match outcome {
+        Outcome::Approve { .. } => "allow_once",
+        Outcome::Reject { .. } => "reject_once",
+        Outcome::AskTheUser { .. } => return None,
+    };
+    let option_id = params
+        .get("options")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|option| option.get("kind").and_then(Value::as_str) == Some(wanted))?
+        .get("optionId")
+        .and_then(Value::as_str)?;
+    Some(serde_json::json!({
+        "outcome": { "outcome": "selected", "optionId": option_id }
+    }))
 }
 
 /// Build the response for a Cursor `cursor/create_plan` extension request.

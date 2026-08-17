@@ -427,6 +427,19 @@ describe("native runtime recovery UI", () => {
     expect(within(sidebar).queryByText("New chat", { selector: ".chat-row-title" })).toBeNull();
     expect(screen.queryByRole("tab", { name: "Review" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Permission" })).not.toBeInTheDocument();
+    const titlebar = document.querySelector<HTMLElement>(".native-titlebar");
+    expect(titlebar).not.toBeNull();
+    expect(within(titlebar!).getByRole("button", { name: "Open work pane" })).toBeVisible();
+    expect(within(titlebar!).queryByRole("button", { name: "Toggle terminal" })).toBeNull();
+    expect(within(titlebar!).queryByRole("button", { name: "Open task tools" })).toBeNull();
+
+    fireEvent.click(within(titlebar!).getByRole("button", { name: "Open work pane" }));
+    const workPane = document.querySelector<HTMLElement>(".work-pane");
+    expect(workPane).not.toBeNull();
+    expect(await within(workPane!).findByRole("button", { name: /^Browser/ })).toBeDisabled();
+    expect(within(workPane!).queryByRole("button", { name: /^Review changes/ })).toBeNull();
+    expect(within(workPane!).queryByRole("button", { name: /^Files/ })).toBeNull();
+    expect(within(workPane!).queryByRole("button", { name: /^Subagents/ })).toBeNull();
   });
 
   it("sends Chat through the selected runtime without relaxing its safety route", async () => {
@@ -2140,7 +2153,7 @@ describe("native runtime recovery UI", () => {
     expect(bridgeMock.loadTaskGitFile).toHaveBeenCalledTimes(2);
   });
 
-  it("moves the shared terminal and task-tools controls to the rightmost conversation", async () => {
+  it("keeps Task and Review left of the shared controls while the work pane is open", async () => {
     rightRailProbe.enabled = true;
     bridgeMock.listDelegations.mockImplementation(async (taskId: string) =>
       taskId === "task-1"
@@ -2214,14 +2227,18 @@ describe("native runtime recovery UI", () => {
     const subagentTab = within(strip!).getByRole("tab", { name: /Polish the interaction/ });
     expect(subagentTab.getAttribute("title")).toContain("Polish the interaction");
 
-    // The shared controls live once, in the work pane's strip.
+    // The shared controls stay in the titlebar end. Opening the pane must not
+    // move Task and Review to the far side of them.
     expect(screen.getAllByRole("button", { name: /chat navigation/i })).toHaveLength(1);
     expect(within(titlebar!).getByRole("button", { name: /chat navigation/i })).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: "Toggle terminal" })).toHaveLength(1);
     expect(screen.getAllByRole("button", { name: "Close task tools" })).toHaveLength(1);
-    const trailing = titlebar!.querySelector<HTMLElement>(".work-pane-strip-trailing");
-    expect(within(trailing!).getByRole("button", { name: "Toggle terminal" })).toBeInTheDocument();
-    expect(within(trailing!).getByRole("button", { name: "Close task tools" })).toBeInTheDocument();
+    expect(titlebar!.querySelector(".work-pane-strip-trailing")).not.toBeInTheDocument();
+    const taskTab = within(titlebar!).getByRole("tab", { name: "Task" });
+    const terminalToggle = within(titlebar!).getByRole("button", { name: "Toggle terminal" });
+    expect(
+      taskTab.compareDocumentPosition(terminalToggle) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
 
     // A second subagent is a peer tab in the same pane, never a second pane.
     const stablePane = document.querySelector(".work-pane");
@@ -2241,8 +2258,12 @@ describe("native runtime recovery UI", () => {
     expect(document.querySelectorAll(".work-pane")).toHaveLength(1);
     expect(document.querySelector(".work-pane")).toBe(stablePane);
 
-    // Closing every tab leaves the pane open on its launcher; the toggle hides it.
-    fireEvent.click(screen.getByRole("button", { name: "Close all tabs" }));
+    // There is no redundant close-all X; each tab keeps its own explicit X.
+    expect(screen.queryByRole("button", { name: "Close all tabs" })).not.toBeInTheDocument();
+    fireEvent.click(within(surfaces).getByRole("button", { name: "Close Polish the interaction" }));
+    fireEvent.click(
+      within(surfaces).getByRole("button", { name: "Close Inspect the interaction" }),
+    );
     await waitFor(() =>
       expect(screen.queryByLabelText("Polish the interaction transcript")).not.toBeInTheDocument(),
     );

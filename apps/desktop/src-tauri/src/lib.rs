@@ -3,6 +3,7 @@
 
 mod antigravity_hooks;
 mod app_commands;
+mod auto_review;
 mod automations;
 mod broker_mcp;
 mod browser;
@@ -14,6 +15,7 @@ mod commit_message;
 mod context_primer;
 mod credential_store;
 mod delegation;
+mod dev_server;
 mod diagnostic_commands;
 mod diagnostic_log;
 mod explain_context;
@@ -40,7 +42,9 @@ mod state;
 mod structured_projection;
 mod task_commands;
 mod terminal_process;
+mod text_policy;
 mod usage_history;
+mod workspace_search;
 
 use app_commands::{app_bootstrap, open_external_url, open_task_window};
 use automations::{
@@ -64,6 +68,7 @@ use delegation::{
     delegation_approve, delegation_deny, delegation_list, delegation_send_message,
     delegation_stop_cmd,
 };
+use dev_server::DevServers;
 use diagnostic_commands::{
     diagnostics_report, logs_clear, logs_open_folder, logs_prune, logs_totals,
 };
@@ -157,6 +162,12 @@ pub fn run() {
             }
             app.manage(state);
             app.manage(std::sync::Arc::new(BrowserTabs::new()));
+            // Dev servers outlive any one window, so the registry is app-wide
+            // like the browser tabs are, and its observer is installed once —
+            // a server started from one window still reports to all of them.
+            let dev_servers = std::sync::Arc::new(DevServers::default());
+            commands::install_dev_server_observer(app.handle(), &dev_servers);
+            app.manage(dev_servers);
             if let Err(error) = integrator_skills::ensure_roots(app.handle()) {
                 eprintln!("skills root creation failed: {error}");
             }
@@ -199,6 +210,7 @@ pub fn run() {
             task_remove,
             setting_list,
             setting_set,
+            auto_review_default_policy,
             integrator_skills_overview,
             integrator_skills_install,
             integrator_skills_uninstall,
@@ -256,11 +268,19 @@ pub fn run() {
             git_worktrees,
             git_worktree_create,
             project_file_list,
+            project_search_paths,
+            project_search_contents,
             project_file_read,
             project_file_write,
             project_file_rename,
             repository_watch_start,
             repository_watch_stop,
+            dev_server_list,
+            dev_server_candidates,
+            dev_server_start,
+            dev_server_stop,
+            dev_server_restart,
+            dev_server_log,
             selection_explain,
             selection_explain_preview,
             project_file_opener_list,

@@ -2,7 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { bridge, openExternalLink, type BrowserTab } from "./bridge";
 import { annotationAttachmentName } from "./browserAnnotation";
-import { BrowserBoundsCoordinator } from "./browserBounds";
+import {
+  BrowserBoundsCoordinator,
+  toNativeBrowserBounds,
+  type BrowserPlacementSlot,
+} from "./browserBounds";
 
 /** A picked element, as the guest runtime describes it. */
 export interface PickedElement {
@@ -28,7 +32,7 @@ export interface BrowserController {
   close: (tabId: string) => Promise<void>;
   navigate: (tabId: string, url: string) => Promise<void>;
   history: (tabId: string, action: "back" | "forward" | "reload" | "stop") => Promise<void>;
-  setBounds: (tabId: string, rect: DOMRect | null) => void;
+  setBounds: (tabId: string, rect: DOMRect | null, placementSlot: BrowserPlacementSlot) => void;
   setPoppedOut: (tabId: string, popped: boolean) => Promise<void>;
   openExternally: (tabId: string) => Promise<void>;
   /** Remembers the login on the page in this tab, natively. */
@@ -42,9 +46,9 @@ export interface BrowserController {
 
 export interface BrowserHost {
   /** Attaches a PNG to the composer, e.g. a screenshot or an annotation crop. */
-  attachImage: (file: Blob, name: string) => Promise<void>;
+  attachImage: (file: Blob, name: string, taskId: string) => Promise<void>;
   /** Puts text into the composer, e.g. an annotated element's context. */
-  insertText: (text: string) => void;
+  insertText: (text: string, taskId: string) => void;
 }
 
 export interface BrowserControllerOptions {
@@ -54,6 +58,23 @@ export interface BrowserControllerOptions {
   allowExternalOpen?: boolean;
   /** Whether this controller is rendered inside the task's popout window. */
   poppedOutHost?: boolean;
+}
+
+export interface BrowserTaskRequest {
+  taskId: string;
+  tabId: string;
+}
+
+/** One task may react only to requests for a tab in its own scoped snapshot. */
+export function browserRequestBelongsToTask(
+  taskId: string | null,
+  tabs: BrowserTab[],
+  request: BrowserTaskRequest,
+): boolean {
+  return (
+    request.taskId === taskId &&
+    tabs.some((tab) => tab.id === request.tabId && tab.taskId === taskId)
+  );
 }
 
 /** Rough luminance read of the app's own canvas, for themes that do not say. */
@@ -110,6 +131,20 @@ function pageTheme(): Record<string, string> {
 
 const RECORDING_INTERVAL_MS = 700;
 const RECORDING_MAX_FRAMES = 600;
+const NO_BROWSER_TABS: BrowserTab[] = [];
+
+interface ActiveRecording {
+  timer: number;
+  frames: string[];
+  taskId: string;
+  tabId: string;
+}
+
+interface ActivePicker {
+  timer: number;
+  taskId: string;
+  tabId: string;
+}
 
 function pngBlob(base64: string): Blob {
   const binary = atob(base64);
@@ -138,27 +173,32 @@ export function useBrowserTabs(
     tabs: BrowserTab[];
     ready: boolean;
   }>({ taskId: null, tabs: [], ready: !api });
-  const [message, setMessage] = useState<string | null>(null);
-  const [recordingTabId, setRecordingTabId] = useState<string | null>(null);
-  const [annotatingTabId, setAnnotatingTabId] = useState<string | null>(null);
+  const [messageSnapshot, setMessageSnapshot] = useState<{
+    taskId: string;
+    text: string;
+  } | null>(null);
+  const [recordingState, setRecordingState] = useState<{
+    taskId: string;
+    tabId: string;
+  } | null>(null);
+  const [annotatingState, setAnnotatingState] = useState<{
+    taskId: string;
+    tabId: string;
+  } | null>(null);
   const boundsCoordinator = useMemo(
     () => (api ? new BrowserBoundsCoordinator(api, poppedOutHost) : null),
     [api, poppedOutHost],
   );
-  const recorder = useRef<{ timer: number; frames: string[] } | null>(null);
-  const picker = useRef<number | null>(null);
+  const recorder = useRef<ActiveRecording | null>(null);
+  const picker = useRef<ActivePicker | null>(null);
   const hostRef = useRef(host);
   useEffect(() => {
     hostRef.current = host;
   });
 
   useEffect(() => {
-    if (!api || !taskId) {
-      setTabSnapshot({ taskId, tabs: [], ready: true });
-      return;
-    }
+    if (!api || !taskId) return;
     let active = true;
-    setTabSnapshot({ taskId, tabs: [], ready: false });
     const accept = (tabs: BrowserTab[]) => {
       if (active) setTabSnapshot({ taskId, tabs, ready: true });
     };
@@ -168,10 +208,7 @@ export function useBrowserTabs(
         .then(accept)
         .catch(() => active && setTabSnapshot({ taskId, tabs: [], ready: true }));
     };
-    void api
-      .restore(taskId)
-      .then(accept)
-      .catch(refresh);
+    void api.restore(taskId).then(accept).catch(refresh);
     const unlisten = api.subscribe(refresh);
     return () => {
       active = false;
@@ -179,17 +216,33 @@ export function useBrowserTabs(
     };
   }, [api, taskId]);
 
-  const tabs = tabSnapshot.taskId === taskId ? tabSnapshot.tabs : [];
-  const ready = tabSnapshot.taskId === taskId && tabSnapshot.ready;
+  const tabs = tabSnapshot.taskId === taskId ? tabSnapshot.tabs : NO_BROWSER_TABS;
+  const ready = !api || !taskId || (tabSnapshot.taskId === taskId && tabSnapshot.ready);
+  const message = messageSnapshot?.taskId === taskId ? messageSnapshot.text : null;
+  const activeRecordingTabId = recordingState?.taskId === taskId ? recordingState.tabId : null;
+  const activeAnnotatingTabId = annotatingState?.taskId === taskId ? annotatingState.tabId : null;
 
-  // Stop background work when the window goes away; tabs themselves persist.
-  useEffect(
-    () => () => {
-      if (recorder.current) window.clearInterval(recorder.current.timer);
-      if (picker.current) window.clearInterval(picker.current);
-    },
-    [],
-  );
+  // A capture belongs to the task that started it. Stop its timers when that
+  // task leaves this renderer so an old page can never write into the next
+  // chat's composer. Tabs themselves still persist.
+  useEffect(() => {
+    return () => {
+      if (recorder.current?.taskId === taskId) {
+        window.clearInterval(recorder.current.timer);
+        recorder.current = null;
+        setRecordingState((current) => (current?.taskId === taskId ? null : current));
+      }
+      if (picker.current?.taskId === taskId) {
+        const activePicker = picker.current;
+        window.clearInterval(activePicker.timer);
+        picker.current = null;
+        setAnnotatingState((current) => (current?.taskId === taskId ? null : current));
+        if (api && taskId) {
+          void api.invoke(taskId, activePicker.tabId, "cancelPick").catch(() => undefined);
+        }
+      }
+    };
+  }, [api, taskId]);
 
   // Hand each tab the app's tokens once it exists, so the agent cursor and the
   // picker are drawn in the user's accent rather than a stock blue. A page can
@@ -206,29 +259,30 @@ export function useBrowserTabs(
     }
   }, [api, tabs, taskId]);
 
+  const setTaskMessage = useCallback((messageTaskId: string, text: string | null) => {
+    setMessageSnapshot((current) => {
+      if (text !== null) return { taskId: messageTaskId, text };
+      return current?.taskId === messageTaskId ? null : current;
+    });
+  }, []);
   const report = useCallback(
-    (error: unknown, fallback: string) =>
-      setMessage(error instanceof Error ? error.message : fallback),
-    [],
+    (messageTaskId: string, error: unknown, fallback: string) =>
+      setTaskMessage(messageTaskId, error instanceof Error ? error.message : fallback),
+    [setTaskMessage],
   );
 
   const setBounds = useCallback(
-    (tabId: string, rect: DOMRect | null) => {
+    (tabId: string, rect: DOMRect | null, placementSlot: BrowserPlacementSlot) => {
       if (!boundsCoordinator || !taskId) return;
-      const ratio = window.devicePixelRatio || 1;
       if (!rect) {
-        boundsCoordinator.place(taskId, tabId, null);
+        boundsCoordinator.place(taskId, tabId, null, placementSlot);
         return;
       }
       boundsCoordinator.place(
         taskId,
         tabId,
-        {
-          x: Math.round(rect.x * ratio),
-          y: Math.round(rect.y * ratio),
-          width: Math.round(rect.width * ratio),
-          height: Math.round(rect.height * ratio),
-        },
+        toNativeBrowserBounds(rect, window.devicePixelRatio || 1),
+        placementSlot,
       );
     },
     [boundsCoordinator, taskId],
@@ -237,33 +291,41 @@ export function useBrowserTabs(
   const screenshot = useCallback(
     async (tabId: string) => {
       if (!api || !taskId) return;
-      setMessage(null);
+      setTaskMessage(taskId, null);
       try {
         const base64 = await api.screenshot(taskId, tabId);
-        await hostRef.current.attachImage(pngBlob(base64), `browser-${Date.now()}.png`);
-        setMessage("Screenshot attached to the composer.");
+        await hostRef.current.attachImage(pngBlob(base64), `browser-${Date.now()}.png`, taskId);
+        setTaskMessage(taskId, "Screenshot attached to the composer.");
       } catch (error) {
-        report(error, "Could not capture that page.");
+        report(taskId, error, "Could not capture that page.");
       }
     },
-    [api, report, taskId],
+    [api, report, setTaskMessage, taskId],
   );
 
-  const stopRecording = useCallback(async () => {
-    if (!recorder.current) return;
-    window.clearInterval(recorder.current.timer);
-    const frames = recorder.current.frames;
-    recorder.current = null;
-    setRecordingTabId(null);
-    if (frames.length === 0) return;
-    // The last frame is the artifact the composer can carry today; the rest
-    // stay in memory only, so a long recording cannot grow without bound.
-    await hostRef.current.attachImage(
-      pngBlob(frames[frames.length - 1]),
-      `browser-recording-${Date.now()}.png`,
-    );
-    setMessage(`Recording stopped after ${frames.length} frames; last frame attached.`);
-  }, []);
+  const stopRecording = useCallback(
+    async (expected?: ActiveRecording) => {
+      const recording = recorder.current;
+      if (!recording || (expected && recording !== expected)) return;
+      window.clearInterval(recording.timer);
+      const frames = recording.frames;
+      recorder.current = null;
+      setRecordingState((current) => (current?.taskId === recording.taskId ? null : current));
+      if (frames.length === 0) return;
+      // The last frame is the artifact the composer can carry today; the rest
+      // stay in memory only, so a long recording cannot grow without bound.
+      await hostRef.current.attachImage(
+        pngBlob(frames[frames.length - 1]),
+        `browser-recording-${Date.now()}.png`,
+        recording.taskId,
+      );
+      setTaskMessage(
+        recording.taskId,
+        `Recording stopped after ${frames.length} frames; last frame attached.`,
+      );
+    },
+    [setTaskMessage],
+  );
 
   const toggleRecording = useCallback(
     async (tabId: string) => {
@@ -272,42 +334,50 @@ export function useBrowserTabs(
         await stopRecording();
         return;
       }
-      setMessage(null);
-      const frames: string[] = [];
-      const timer = window.setInterval(() => {
+      setTaskMessage(taskId, null);
+      const recording: ActiveRecording = { timer: 0, frames: [], taskId, tabId };
+      recording.timer = window.setInterval(() => {
         void api
           .screenshot(taskId, tabId)
           .then((frame) => {
-            frames.push(frame);
-            if (frames.length >= RECORDING_MAX_FRAMES) void stopRecording();
+            if (recorder.current !== recording) return;
+            recording.frames.push(frame);
+            if (recording.frames.length >= RECORDING_MAX_FRAMES) {
+              void stopRecording(recording);
+            }
           })
           .catch(() => undefined);
       }, RECORDING_INTERVAL_MS);
-      recorder.current = { timer, frames };
-      setRecordingTabId(tabId);
-      setMessage("Recording this tab.");
+      recorder.current = recording;
+      setRecordingState({ taskId, tabId });
+      setTaskMessage(taskId, "Recording this tab.");
     },
-    [api, stopRecording, taskId],
+    [api, setTaskMessage, stopRecording, taskId],
   );
 
   const toggleAnnotate = useCallback(
     async (tabId: string) => {
       if (!api || !taskId) return;
       if (picker.current) {
-        window.clearInterval(picker.current);
+        const activePicker = picker.current;
+        window.clearInterval(activePicker.timer);
         picker.current = null;
-        setAnnotatingTabId(null);
-        await api.invoke(taskId, tabId, "cancelPick").catch(() => undefined);
+        setAnnotatingState((current) => (current?.taskId === activePicker.taskId ? null : current));
+        await api
+          .invoke(activePicker.taskId, activePicker.tabId, "cancelPick")
+          .catch(() => undefined);
         return;
       }
-      setMessage(null);
+      setTaskMessage(taskId, null);
       try {
         await api.invoke(taskId, tabId, "startPick", [pageTheme()]);
-        setAnnotatingTabId(tabId);
-        picker.current = window.setInterval(() => {
+        setAnnotatingState({ taskId, tabId });
+        const activePicker: ActivePicker = { timer: 0, taskId, tabId };
+        activePicker.timer = window.setInterval(() => {
           void api
             .invoke(taskId, tabId, "pickResult")
             .then(async (raw) => {
+              if (picker.current !== activePicker) return;
               const result = raw as {
                 picking: boolean;
                 picked: PickedElement | null;
@@ -315,9 +385,9 @@ export function useBrowserTabs(
                 cancelled: boolean;
               };
               if (result.picking) return;
-              if (picker.current) window.clearInterval(picker.current);
+              window.clearInterval(activePicker.timer);
               picker.current = null;
-              setAnnotatingTabId(null);
+              setAnnotatingState((current) => (current?.taskId === taskId ? null : current));
               if (!result.picked) return;
               const tab = tabs.find((candidate) => candidate.id === tabId);
               const picked = result.picked;
@@ -331,13 +401,12 @@ export function useBrowserTabs(
                 await hostRef.current.attachImage(
                   pngBlob(base64),
                   annotationAttachmentName(picked.name || picked.tag),
+                  taskId,
                 );
               } catch {
                 // The context below still stands on its own without the image.
               }
-              await api
-                .invoke(taskId, tabId, "clearAnnotations")
-                .catch(() => undefined);
+              await api.invoke(taskId, tabId, "clearAnnotations").catch(() => undefined);
               hostRef.current.insertText(
                 [
                   "<browser_annotation>",
@@ -353,15 +422,17 @@ export function useBrowserTabs(
                   "</browser_annotation>",
                   "",
                 ].join("\n"),
+                taskId,
               );
             })
             .catch(() => undefined);
         }, 250);
+        picker.current = activePicker;
       } catch (error) {
-        report(error, "Could not start annotating that page.");
+        report(taskId, error, "Could not start annotating that page.");
       }
     },
-    [api, report, tabs, taskId],
+    [api, report, setTaskMessage, tabs, taskId],
   );
 
   return useMemo<BrowserController>(() => {
@@ -375,15 +446,15 @@ export function useBrowserTabs(
       tabs,
       byId,
       message,
-      recordingTabId,
-      annotatingTabId,
+      recordingTabId: activeRecordingTabId,
+      annotatingTabId: activeAnnotatingTabId,
       open: async (url) => {
         if (!api || !taskId) return null;
-        setMessage(null);
+        setTaskMessage(taskId, null);
         try {
           return await api.open(taskId, url);
         } catch (error) {
-          report(error, "Could not open a browser tab.");
+          report(taskId, error, "Could not open a browser tab.");
           return null;
         }
       },
@@ -391,14 +462,14 @@ export function useBrowserTabs(
         if (!api || !taskId || !byId[tabId]) return;
         await api
           .close(taskId, tabId)
-          .catch((error) => report(error, "Could not close that tab."));
+          .catch((error) => report(taskId, error, "Could not close that tab."));
       },
       navigate: async (tabId, url) => {
         if (!api || !taskId || !byId[tabId]) return;
-        setMessage(null);
+        setTaskMessage(taskId, null);
         await api
           .navigate(taskId, tabId, url)
-          .catch((error) => report(error, "Could not open that URL."));
+          .catch((error) => report(taskId, error, "Could not open that URL."));
       },
       history: async (tabId, action) => {
         if (!api || !taskId || !byId[tabId]) return;
@@ -409,11 +480,16 @@ export function useBrowserTabs(
         if (!api || !taskId || !byId[tabId]) return;
         await api
           .setPoppedOut(taskId, tabId, popped)
-          .catch((error) => report(error, "Could not move that tab."));
+          .catch((error) => report(taskId, error, "Could not move that tab."));
       },
       openExternally: async (tabId) => {
         if (!allowExternalOpen) {
-          setMessage("Opening tabs in an external browser is turned off in Settings → Browser.");
+          if (taskId) {
+            setTaskMessage(
+              taskId,
+              "Opening tabs in an external browser is turned off in Settings → Browser.",
+            );
+          }
           return;
         }
         const tab = tabs.find((candidate) => candidate.id === tabId);
@@ -424,21 +500,23 @@ export function useBrowserTabs(
       // the renderer, so there is nothing here to hold or leak.
       saveLogin: async (tabId, requestedTaskId) => {
         if (!api || !taskId || requestedTaskId !== taskId || !byId[tabId]) return;
-        setMessage(null);
+        setTaskMessage(taskId, null);
         try {
           const saved = await api.saveLogin(tabId, taskId);
-          if (saved) setMessage(`Saved the login for ${saved.username} on ${saved.origin}.`);
+          if (saved) {
+            setTaskMessage(taskId, `Saved the login for ${saved.username} on ${saved.origin}.`);
+          }
         } catch (error) {
-          report(error, "Could not save that login.");
+          report(taskId, error, "Could not save that login.");
         }
       },
       fillLogin: async (tabId, requestedTaskId) => {
         if (!api || !taskId || requestedTaskId !== taskId || !byId[tabId]) return;
-        setMessage(null);
+        setTaskMessage(taskId, null);
         try {
           await api.fillLogin(tabId, taskId);
         } catch (error) {
-          report(error, "Could not sign in with a saved login.");
+          report(taskId, error, "Could not sign in with a saved login.");
         }
       },
       screenshot,
@@ -452,12 +530,13 @@ export function useBrowserTabs(
     allowExternalOpen,
     tabs,
     message,
-    recordingTabId,
-    annotatingTabId,
+    activeRecordingTabId,
+    activeAnnotatingTabId,
     setBounds,
     screenshot,
     toggleRecording,
     toggleAnnotate,
     report,
+    setTaskMessage,
   ]);
 }

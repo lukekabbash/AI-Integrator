@@ -326,7 +326,12 @@ pub(super) async fn fill_login(
         let _ = tauri::Emitter::emit(
             app,
             super::BROWSER_FILL_REQUEST_EVENT,
-            json!({ "tabId": tab_id, "origin": origin, "username": entry.username }),
+            json!({
+                "taskId": task_id,
+                "tabId": tab_id,
+                "origin": origin,
+                "username": entry.username,
+            }),
         );
         return Ok(json!({
             "filled": false,

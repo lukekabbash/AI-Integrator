@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-auto-review-default-policy"
+description = "Enables the auto_review_default_policy command without any pre-configured scope."
+commands.allow = ["auto_review_default_policy"]
+
+[[permission]]
+identifier = "deny-auto-review-default-policy"
+description = "Denies the auto_review_default_policy command without any pre-configured scope."
+commands.deny = ["auto_review_default_policy"]

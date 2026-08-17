@@ -52,12 +52,12 @@ zeroize.workspace = true
 # A dev server the app started must die with the app even when the app is
 # killed, so `dev_server::guard` puts every child in a job object that the OS
 # reaps when our handle closes. `Drop` alone never runs on a force-kill.
+#
+# `win32job` rather than raw `windows` bindings on purpose: the crate forbids
+# unsafe, and `forbid` cannot be relaxed by an inner `allow`. A safe wrapper
+# keeps that guarantee whole instead of carving an exception into it.
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = [
-  "Win32_Foundation",
-  "Win32_System_JobObjects",
-  "Win32_System_Threading",
-] }
+win32job = "2"
 
 [lints]
 workspace = true

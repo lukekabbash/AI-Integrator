@@ -47,6 +47,8 @@ export interface WorkPaneProps {
   renderSubagent: (delegationId: string, headerHost: HTMLElement | null) => ReactNode;
   renderBrowser?: (tabId: string) => ReactNode;
   browserAvailable: boolean;
+  /** Accountless chats expose only their task-scoped browser here. */
+  browserOnly?: boolean;
   onLaunch: (kind: WorkPaneLaunchKind) => void;
   /** Left/Right cursor across the tab strip; see `spatialNavigation.ts`. */
   arrowNavigation?: boolean;
@@ -74,6 +76,7 @@ export function WorkPane({
   renderSubagent,
   renderBrowser,
   browserAvailable,
+  browserOnly = false,
   onLaunch,
   arrowNavigation = true,
   wrapNavigation = true,
@@ -101,10 +104,6 @@ export function WorkPane({
   // the same slide the closing side uses.
   const [shown, setShown] = useState(false);
   useEffect(() => {
-    if (reduceMotion) {
-      setShown(true);
-      return;
-    }
     const frame = requestAnimationFrame(() => setShown(true));
     return () => cancelAnimationFrame(frame);
   }, [reduceMotion]);
@@ -280,6 +279,7 @@ export function WorkPane({
                   <WorkPaneLauncher
                     delegations={delegations}
                     browserAvailable={browserAvailable}
+                    browserOnly={browserOnly}
                     onLaunch={onLaunch}
                     onOpenSubagent={(id) => controller.openSubagent(id)}
                     reduceMotion={reduceMotion}
@@ -291,6 +291,7 @@ export function WorkPane({
             <WorkPaneLauncher
               delegations={delegations}
               browserAvailable={browserAvailable}
+              browserOnly={browserOnly}
               onLaunch={onLaunch}
               onOpenSubagent={(id) => controller.openSubagent(id)}
               reduceMotion={reduceMotion}
@@ -430,17 +431,19 @@ function SurfaceGlyph({
 function WorkPaneLauncher({
   delegations,
   browserAvailable,
+  browserOnly,
   onLaunch,
   onOpenSubagent,
   reduceMotion,
 }: {
   delegations: DelegationView[];
   browserAvailable: boolean;
+  browserOnly: boolean;
   onLaunch: (kind: WorkPaneLaunchKind) => void;
   onOpenSubagent: (delegationId: string) => void;
   reduceMotion: boolean;
 }) {
-  const live = delegations.filter((d) => d.childTaskId);
+  const live = browserOnly ? [] : delegations.filter((d) => d.childTaskId);
   const options: Array<{
     kind: WorkPaneLaunchKind;
     icon: ReactNode;
@@ -457,24 +460,34 @@ function WorkPaneLauncher({
         : "Available in the desktop app",
       disabled: !browserAvailable,
     },
-    {
-      kind: "review",
-      icon: <FileDiff aria-hidden="true" />,
-      title: "Review changes",
-      hint: "The unified diff for this worktree",
-    },
-    {
-      kind: "files",
-      icon: <FileIcon fileName="index.ts" />,
-      title: "Files",
-      hint: "Browse the project tree in the rail and open files here",
-    },
-    {
-      kind: "subagents",
-      icon: <Bot aria-hidden="true" />,
-      title: "Subagents",
-      hint: live.length ? `${live.length} running` : "See the agents rail",
-    },
+    ...(browserOnly
+      ? []
+      : ([
+          {
+            kind: "review",
+            icon: <FileDiff aria-hidden="true" />,
+            title: "Review changes",
+            hint: "The unified diff for this worktree",
+          },
+          {
+            kind: "files",
+            icon: <FileIcon fileName="index.ts" />,
+            title: "Files",
+            hint: "Browse the project tree in the rail and open files here",
+          },
+          {
+            kind: "subagents",
+            icon: <Bot aria-hidden="true" />,
+            title: "Subagents",
+            hint: live.length ? `${live.length} running` : "See the agents rail",
+          },
+        ] satisfies Array<{
+          kind: WorkPaneLaunchKind;
+          icon: ReactNode;
+          title: string;
+          hint: string;
+          disabled?: boolean;
+        }>)),
   ];
   return (
     <div className="work-pane-launcher">

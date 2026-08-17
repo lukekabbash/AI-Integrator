@@ -1,8 +1,16 @@
-import { Maximize2, Shuffle, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, Maximize2, X } from "lucide-react";
 import { m as motion, useReducedMotion } from "motion/react";
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type WheelEvent as ReactWheelEvent,
+} from "react";
 
 import type { BrowserTab } from "../bridge";
+import { adjacentDeckTabId, resolveDeckRaisedId } from "./browserDeckModel";
 import { Tooltip } from "./Tooltip";
 import "./browserDeck.css";
 
@@ -17,6 +25,8 @@ export interface BrowserDeckProps {
   /** Puts the card back in the work pane, at full size. */
   onExpand: (tabId: string) => void;
   onClose: (tabId: string) => void;
+  /** Active browser when closing the whole pane, if there was one. */
+  preferredTabId?: string | null;
 }
 
 /**
@@ -31,16 +41,48 @@ export interface BrowserDeckProps {
  * That same constraint puts every control *outside* the page rectangle: the
  * title strip above it, the count below. Nothing is ever drawn over a card.
  */
-export function BrowserDeck({ tabs, onBoundsChange, onExpand, onClose }: BrowserDeckProps) {
-  const [raisedId, setRaisedId] = useState<string | null>(null);
+export function BrowserDeck({
+  tabs,
+  onBoundsChange,
+  onExpand,
+  onClose,
+  preferredTabId = null,
+}: BrowserDeckProps) {
+  const tabIdsKey = tabs.map((tab) => tab.id).join("\0");
+  const [selection, setSelection] = useState(() => ({
+    tabIdsKey,
+    knownIds: tabs.map((tab) => tab.id),
+    raisedId: resolveDeckRaisedId(tabs, new Set(), null, preferredTabId),
+  }));
   const pageRef = useRef<HTMLDivElement>(null);
   const reduceMotion = useReducedMotion();
 
-  // The deck follows the tab list: a tab that closes takes its card with it,
-  // and a new one arrives on top, which is where an agent's newest page is.
-  const raised = tabs.find((tab) => tab.id === raisedId) ?? tabs.at(-1) ?? null;
+  let currentSelection = selection;
+  if (selection.tabIdsKey !== tabIdsKey) {
+    currentSelection = {
+      tabIdsKey,
+      knownIds: tabs.map((tab) => tab.id),
+      raisedId: resolveDeckRaisedId(
+        tabs,
+        new Set(selection.knownIds),
+        selection.raisedId,
+        preferredTabId,
+      ),
+    };
+    // React's previous-props state pattern: this rerenders immediately, before
+    // a newly exposed native page can paint the card that used to be raised.
+    setSelection(currentSelection);
+  }
+  const resolvedRaisedId = currentSelection.raisedId;
+  const raised = tabs.find((tab) => tab.id === resolvedRaisedId) ?? null;
   const behind = tabs.filter((tab) => tab.id !== raised?.id).slice(-(VISIBLE_CARDS - 1));
   const hidden = Math.max(0, tabs.length - behind.length - (raised ? 1 : 0));
+
+  const select = useCallback((tabId: string) => {
+    setSelection((current) =>
+      current.raisedId === tabId ? current : { ...current, raisedId: tabId },
+    );
+  }, []);
 
   const boundsRef = useRef(onBoundsChange);
   useEffect(() => {
@@ -70,7 +112,8 @@ export function BrowserDeck({ tabs, onBoundsChange, onExpand, onClose }: Browser
       frame = requestAnimationFrame(place);
     };
     schedule();
-    const observer = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(schedule);
+    const observer =
+      typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(schedule);
     observer?.observe(node);
     window.addEventListener("resize", schedule);
     return () => {
@@ -83,11 +126,24 @@ export function BrowserDeck({ tabs, onBoundsChange, onExpand, onClose }: Browser
     };
   }, [raisedTabId, blank]);
 
-  const cycle = useCallback(() => {
-    if (tabs.length < 2) return;
-    const at = tabs.findIndex((tab) => tab.id === raised?.id);
-    setRaisedId(tabs[(at + 1) % tabs.length]?.id ?? null);
-  }, [raised?.id, tabs]);
+  const cycle = useCallback(
+    (direction: -1 | 1) => {
+      if (!raised) return;
+      const nextId = adjacentDeckTabId(tabs, raised.id, direction);
+      if (nextId) select(nextId);
+    },
+    [raised, select, tabs],
+  );
+  const onWheel = useCallback(
+    (event: ReactWheelEvent) => {
+      const primaryDelta =
+        Math.abs(event.deltaY) >= Math.abs(event.deltaX) ? event.deltaY : event.deltaX;
+      if (Math.abs(primaryDelta) < 4) return;
+      event.preventDefault();
+      cycle(primaryDelta > 0 ? 1 : -1);
+    },
+    [cycle],
+  );
 
   if (!raised) return null;
 
@@ -97,14 +153,24 @@ export function BrowserDeck({ tabs, onBoundsChange, onExpand, onClose }: Browser
 
   return (
     <div className="browser-deck" data-count={tabs.length}>
-      <div className="browser-deck-stack">
+      <div
+        className="browser-deck-stack"
+        role="group"
+        onWheel={onWheel}
+        aria-label={`${tabs.length} compact browser ${tabs.length === 1 ? "tab" : "tabs"}`}
+      >
         {behind.map((tab, index) => (
           <button
             type="button"
             key={tab.id}
             className="browser-deck-card behind"
-            style={{ "--depth": String(behind.length - index) } as React.CSSProperties}
-            onClick={() => setRaisedId(tab.id)}
+            style={
+              {
+                "--depth": String(behind.length - index),
+                "--card-layer": String(index + 1),
+              } as React.CSSProperties
+            }
+            onClick={() => select(tab.id)}
             title={tab.title || tab.url}
           >
             <span className="browser-deck-behind-label">
@@ -120,8 +186,8 @@ export function BrowserDeck({ tabs, onBoundsChange, onExpand, onClose }: Browser
           key={raised.id}
           className="browser-deck-card raised"
           data-busy={agentAt ? "true" : undefined}
-          initial={reduceMotion ? false : { opacity: 0, y: 6 }}
-          animate={{ opacity: 1, y: 0 }}
+          initial={reduceMotion ? false : { opacity: 0 }}
+          animate={{ opacity: 1 }}
           transition={
             reduceMotion ? { duration: 0 } : { type: "spring", stiffness: 420, damping: 34 }
           }
@@ -138,16 +204,28 @@ export function BrowserDeck({ tabs, onBoundsChange, onExpand, onClose }: Browser
             ) : null}
             <div className="browser-deck-actions">
               {tabs.length > 1 ? (
-                <Tooltip label="Next tab" placement="top">
-                  <button
-                    type="button"
-                    className="icon-button subtle tiny"
-                    aria-label="Next browser tab"
-                    onClick={cycle}
-                  >
-                    <Shuffle aria-hidden="true" />
-                  </button>
-                </Tooltip>
+                <>
+                  <Tooltip label="Previous tab" placement="top">
+                    <button
+                      type="button"
+                      className="icon-button subtle tiny"
+                      aria-label="Previous browser tab"
+                      onClick={() => cycle(-1)}
+                    >
+                      <ChevronLeft aria-hidden="true" />
+                    </button>
+                  </Tooltip>
+                  <Tooltip label="Next tab" placement="top">
+                    <button
+                      type="button"
+                      className="icon-button subtle tiny"
+                      aria-label="Next browser tab"
+                      onClick={() => cycle(1)}
+                    >
+                      <ChevronRight aria-hidden="true" />
+                    </button>
+                  </Tooltip>
+                </>
               ) : null}
               <Tooltip label="Open in the pane" placement="top">
                 <button
@@ -178,7 +256,12 @@ export function BrowserDeck({ tabs, onBoundsChange, onExpand, onClose }: Browser
         </motion.div>
       </div>
       {hidden > 0 ? (
-        <button type="button" className="browser-deck-more" onClick={cycle}>
+        <button
+          type="button"
+          className="browser-deck-more"
+          onClick={() => cycle(1)}
+          onWheel={onWheel}
+        >
           +{hidden} more
         </button>
       ) : null}

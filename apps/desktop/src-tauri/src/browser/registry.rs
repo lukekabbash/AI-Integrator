@@ -47,6 +47,10 @@ pub(crate) struct Tab {
     pub(crate) state: BrowserTab,
     /// Label of the webview; also the pop-out window label when popped out.
     pub(crate) label: String,
+    /// Which intentional rectangle in that native host currently owns it.
+    /// The pane and compact deck may both be visible without evicting each
+    /// other; two tabs claiming the same slot may not.
+    pub(crate) placement_slot: Option<PlacementSlot>,
     /// Who last drove this tab through the broker, and when. A page can only
     /// be in one state at a time, so two agents taking turns on one tab undo
     /// each other's work; this is what lets the second one notice.
@@ -69,6 +73,14 @@ pub(crate) struct Tab {
     /// When the app typed a saved password into this page. While it is set,
     /// reading the page back is refused; see `vault`.
     pub(crate) credential_at: Option<std::time::Instant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PlacementSlot {
+    Pane,
+    Deck,
+    Popout,
 }
 
 /// What a child may do with a tab it was handed.
@@ -309,6 +321,40 @@ impl BrowserTabs {
         let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
         tabs.get(id)
             .is_some_and(|tab| !tab.state.hidden && !tab.state.sleeping)
+    }
+
+    /// The visible siblings competing for one rectangle in the same native
+    /// host. A pane and compact deck are separate slots and may coexist.
+    pub(crate) fn visible_peers(
+        &self,
+        task_id: &str,
+        keep: &str,
+        popped_out: bool,
+        placement_slot: PlacementSlot,
+    ) -> Vec<String> {
+        let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        let mut peers: Vec<String> = tabs
+            .values()
+            .filter(|tab| {
+                tab.state.id != keep
+                    && tab.state.popped_out == popped_out
+                    && (!popped_out || tab.state.task_id == task_id)
+                    && !tab.state.sleeping
+                    && !tab.state.hidden
+                    && tab.placement_slot == Some(placement_slot)
+            })
+            .map(|tab| tab.state.id.clone())
+            .collect();
+        peers.sort();
+        peers
+    }
+
+    pub(crate) fn set_placement(&self, id: &str, placement_slot: Option<PlacementSlot>) {
+        let mut tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(tab) = tabs.get_mut(id) {
+            tab.state.hidden = placement_slot.is_none();
+            tab.placement_slot = placement_slot;
+        }
     }
 
     pub(crate) fn label_for(&self, id: &str) -> Option<String> {

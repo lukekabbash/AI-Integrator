@@ -42,6 +42,8 @@ export interface BrowserSurfaceProps {
   onPopOut: (popped: boolean) => Promise<void>;
   /** Sends every tab in this task to the pop-out window at once. */
   onPopOutAll?: () => Promise<void>;
+  /** True only in the task-scoped pop-out renderer that owns popped tabs. */
+  poppedOutHost?: boolean;
   allowExternalOpen: boolean;
   onOpenExternally: () => Promise<void>;
   onClose: () => void;
@@ -69,6 +71,7 @@ export function BrowserSurface({
   annotating,
   onPopOut,
   onPopOutAll,
+  poppedOutHost = false,
   allowExternalOpen,
   onOpenExternally,
   onClose,
@@ -84,6 +87,7 @@ export function BrowserSurface({
   const inputRef = useRef<HTMLInputElement>(null);
 
   const popped = tab.poppedOut;
+  const hostedHere = popped === poppedOutHost;
   const blank = !tab.url || tab.url === "about:blank";
   // The caller passes a fresh arrow every render. Reach it through a ref so
   // the placement effect below survives its parent re-rendering: keyed on the
@@ -109,10 +113,9 @@ export function BrowserSurface({
   useLayoutEffect(() => {
     const node = viewportRef.current;
     const onBounds = (rect: DOMRect | null) => boundsRef.current(rect);
-    // A blank or popped-out tab has nothing worth showing here, and leaving
-    // the native surface parked over the slot would bury the start page under
-    // an empty white page.
-    if (!node || blank || popped) {
+    // A blank or remotely hosted tab has nothing worth showing here. Popped
+    // tabs are remote in the main window but local in the pop-out renderer.
+    if (!node || blank || !hostedHere) {
       boundsRef.current(null);
       return;
     }
@@ -138,7 +141,10 @@ export function BrowserSurface({
         Math.max(1, rect.width - SEAM_CLEARANCE),
         Math.max(1, rect.height - overlayInset),
       );
-      const key = `${Math.round(placed.x)}:${Math.round(placed.y)}:${Math.round(placed.width)}:${Math.round(placed.height)}`;
+      const ratio = window.devicePixelRatio || 1;
+      const key = [placed.left, placed.top, placed.right, placed.bottom]
+        .map((edge) => Math.round(edge * ratio))
+        .join(":");
       if (key === last) return;
       last = key;
       onBounds(placed);
@@ -159,7 +165,7 @@ export function BrowserSurface({
       window.removeEventListener("scroll", report, true);
       onBounds(null);
     };
-  }, [blank, popped, overlayInset]);
+  }, [blank, hostedHere, overlayInset]);
 
   const submit = useCallback(
     (event: React.FormEvent) => {
@@ -329,11 +335,7 @@ export function BrowserSurface({
               </button>
             </Tooltip>
             {menuOpen ? (
-              <div
-                className="browser-menu"
-                role="menu"
-                onMouseLeave={() => setMenuOpen(false)}
-              >
+              <div className="browser-menu" role="menu" onMouseLeave={() => setMenuOpen(false)}>
                 <button
                   type="button"
                   role="menuitem"
@@ -426,12 +428,12 @@ export function BrowserSurface({
       <div
         className="browser-viewport"
         ref={viewportRef}
-        data-native={popped || blank ? undefined : "true"}
+        data-native={!blank && hostedHere ? "true" : undefined}
       >
-        {blank && !popped ? <BrowserStart onOpen={(url) => void onNavigate(url)} /> : null}
-        {popped ? (
+        {blank && hostedHere ? <BrowserStart onOpen={(url) => void onNavigate(url)} /> : null}
+        {!hostedHere ? (
           <div className="browser-viewport-note">
-            <strong>This tab is in its own window</strong>
+            <strong>{popped ? "This tab is in its own window" : "This tab is docked"}</strong>
             <small>It keeps running and stays available to the agent.</small>
             <button
               className="secondary-button small"
@@ -442,7 +444,7 @@ export function BrowserSurface({
             </button>
           </div>
         ) : null}
-        {annotating && !popped ? (
+        {annotating && hostedHere ? (
           <div className="browser-annotating" role="status">
             <span>Pick an element to send to the chat</span>
             <button

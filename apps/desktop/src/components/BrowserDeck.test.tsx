@@ -13,7 +13,7 @@ function tab(id: string, title: string, heldBy?: string): BrowserTab {
     url: `https://example.com/${id}`,
     title,
     loading: false,
-    popped_out: false,
+    poppedOut: false,
     hidden: true,
     sleeping: false,
     ...(heldBy ? { heldBy } : {}),
@@ -61,6 +61,34 @@ describe("BrowserDeck", () => {
     expect(view.container.querySelector(".browser-deck-card.raised")).toHaveTextContent("One");
     // The tab that lost the slot is parked, not closed.
     expect(onBoundsChange).toHaveBeenCalledWith("t2", null);
+  });
+
+  it("raises a tab on the first frame it leaves the pane", () => {
+    const onBoundsChange = vi.fn();
+    const onExpand = vi.fn();
+    const onClose = vi.fn();
+    const renderDeck = (tabs: BrowserTab[]) => (
+      <LazyMotion features={domMax} strict>
+        <BrowserDeck
+          tabs={tabs}
+          onBoundsChange={onBoundsChange}
+          onExpand={onExpand}
+          onClose={onClose}
+        />
+      </LazyMotion>
+    );
+    const view = render(renderDeck([]));
+    view.rerender(renderDeck([tab("t1", "One")]));
+    view.rerender(renderDeck([tab("t1", "One"), tab("t2", "Two")]));
+    expect(view.container.querySelector(".browser-deck-card.raised")).toHaveTextContent("Two");
+  });
+
+  it("offers previous and next controls for a card stack", () => {
+    const { view } = deck([tab("t1", "One"), tab("t2", "Two")]);
+    fireEvent.click(screen.getByRole("button", { name: "Previous browser tab" }));
+    expect(view.container.querySelector(".browser-deck-card.raised")).toHaveTextContent("One");
+    fireEvent.click(screen.getByRole("button", { name: "Next browser tab" }));
+    expect(view.container.querySelector(".browser-deck-card.raised")).toHaveTextContent("Two");
   });
 
   it("names the agent working in the raised tab, and never the user", () => {

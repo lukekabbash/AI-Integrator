@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-project-search-paths"
+description = "Enables the project_search_paths command without any pre-configured scope."
+commands.allow = ["project_search_paths"]
+
+[[permission]]
+identifier = "deny-project-search-paths"
+description = "Denies the project_search_paths command without any pre-configured scope."
+commands.deny = ["project_search_paths"]

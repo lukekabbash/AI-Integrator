@@ -192,7 +192,7 @@ fn normalize_composer_draft(mut draft: ComposerDraft) -> Result<ComposerDraft> {
     draft.effort = normalize_optional_text(draft.effort, 64)?;
     if !matches!(
         draft.permission.as_str(),
-        "read-only" | "project-write" | "ask" | "full-access"
+        "read-only" | "project-write" | "ask" | "auto" | "full-access"
     ) {
         return Err(IntegratorError::InvalidInput(
             "invalid composer permission profile".into(),

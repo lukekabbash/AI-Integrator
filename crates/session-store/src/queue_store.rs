@@ -229,7 +229,7 @@ fn normalize_queued_message(mut input: NewQueuedMessage) -> Result<NewQueuedMess
     input.native_action_id = normalize_optional_text(input.native_action_id, 512)?;
     if !matches!(
         input.permission.as_str(),
-        "read-only" | "project-write" | "ask" | "full-access"
+        "read-only" | "project-write" | "ask" | "auto" | "full-access"
     ) {
         return Err(IntegratorError::InvalidInput(
             "invalid queued permission profile".into(),

@@ -542,6 +542,40 @@ export interface ProjectFileEntry {
   size: number;
 }
 
+export interface PathHit {
+  path: string;
+  score: number;
+}
+
+export interface ContentHit {
+  path: string;
+  line: number;
+  column: number;
+  /** The matching line, trimmed to a bounded width around the match. */
+  text: string;
+}
+
+/**
+ * A search result that never claims completeness it does not have. `truncated`
+ * means the walk stopped early — at the result ceiling or its deadline — so the
+ * surface can say "showing the first N" instead of implying there are no more.
+ */
+export interface SearchOutcome<T> {
+  hits: T[];
+  truncated: boolean;
+  scanned: number;
+  elapsedMs: number;
+}
+
+export interface ProjectSearchContentsInput {
+  pattern: string;
+  globs?: string[];
+  caseSensitive?: boolean;
+  /** Defaults to a literal search, so typing `foo(` finds it instead of failing. */
+  literal?: boolean;
+  limit?: number;
+}
+
 export interface ProjectFileContent {
   path: string;
   content: string;
@@ -549,6 +583,66 @@ export interface ProjectFileContent {
   /** Inline `data:` URL for image files, so the reader can show a preview. */
   imageDataUrl?: string | null;
 }
+
+/**
+ * What the app needs to run one dev server. The working directory is not part
+ * of it: every child runs in the authorized project root, so naming a folder is
+ * not the renderer's call.
+ */
+export interface DevServerStartInput {
+  label: string;
+  program: string;
+  args?: string[];
+  env?: Record<string, string>;
+  /** Declared port, when the script names one. Absent means we learn it later. */
+  port?: number | null;
+}
+
+/** A candidate, or a running server's spec, as the native side reports it. */
+export interface DevServerSpec extends DevServerStartInput {
+  args: string[];
+  cwd: string;
+  env: Record<string, string>;
+  port: number | null;
+}
+
+export type DevServerState =
+  | { kind: "starting" }
+  | { kind: "listening"; port: number }
+  | { kind: "running" }
+  | { kind: "exited"; code?: number | null }
+  | { kind: "failed"; message: string };
+
+export interface DevServerView {
+  id: string;
+  spec: DevServerSpec;
+  state: DevServerState;
+  startedAtMs: number;
+  pid?: number | null;
+  /** The sequence the next log line will carry, so a reader knows where to resume. */
+  nextSeq: number;
+  /** Lines the ring evicted. A reader that fell behind can say so rather than
+   * showing a log with a silent hole in it. */
+  droppedLines: number;
+}
+
+export interface DevServerLogLine {
+  seq: number;
+  stream: "stdout" | "stderr" | "system";
+  text: string;
+}
+
+/**
+ * What a dev server just did. Output notices carry only a resume point, never
+ * the lines themselves — a server that prints per frame must not become a flood
+ * of large messages — so the reader fetches with `readDevServerLog`.
+ */
+export type DevServerChange =
+  | { kind: "output"; id: string; nextSeq: number }
+  | { kind: "state"; id: string; state: DevServerState }
+  /** One per start: the declared port began answering. Opening the page is the
+   * surface's call, and a page the user closed is not reopened. */
+  | { kind: "listening"; id: string; url: string };
 
 /** A file the user attached to the composer from anywhere on their computer. */
 export interface ContextAttachment {
@@ -1288,6 +1382,17 @@ export interface BrowserSite {
   persistent: boolean;
 }
 
+/** A trusted page-menu action, already validated and bounded by the host. */
+export interface BrowserContextAction {
+  taskId: string;
+  tabId: string;
+  action: "open-tab" | "send-chat";
+  pageUrl: string;
+  pageTitle: string;
+  targetUrl?: string;
+  text?: string;
+}
+
 export interface BrowserBridge {
   localServers(refresh?: boolean): Promise<LocalServer[]>;
   sites(): Promise<BrowserSite[]>;
@@ -1302,6 +1407,7 @@ export interface BrowserBridge {
     taskId: string,
     tabId: string,
     bounds: { x: number; y: number; width: number; height: number } | null,
+    placementSlot: "pane" | "deck" | "popout",
     poppedOutHost: boolean,
   ): Promise<void>;
   navigate(taskId: string, tabId: string, url: string): Promise<BrowserTab>;
@@ -1315,7 +1421,10 @@ export interface BrowserBridge {
   setPoppedOut(taskId: string, tabId: string, poppedOut: boolean): Promise<BrowserTab>;
   subscribe(listener: () => void): Promise<() => void>;
   /** An agent asking that a tab be brought to the front for the user to watch. */
-  onFocusRequest(listener: (tabId: string) => void): Promise<() => void>;
+  onFocusRequest(
+    listener: (request: { taskId: string; tabId: string }) => void,
+  ): Promise<() => void>;
+  onContextAction(listener: (request: BrowserContextAction) => void): Promise<() => void>;
   /** Saved logins, without passwords — there is no call that returns one. */
   savedLogins(): Promise<SavedLogin[]>;
   /** Saves the login typed into the page, from the page into the OS store. */
@@ -1328,7 +1437,12 @@ export interface BrowserBridge {
   allowAgentSignIn(origin: string, allowed: boolean): Promise<void>;
   /** An agent asking to sign in somewhere it has not been allowed yet. */
   onFillRequest(
-    listener: (request: { tabId: string; origin: string; username: string }) => void,
+    listener: (request: {
+      taskId: string;
+      tabId: string;
+      origin: string;
+      username: string;
+    }) => void,
   ): Promise<() => void>;
 }
 
@@ -1466,6 +1580,35 @@ export interface AppBridge {
    */
   trackedPaths(projectId: string, paths: string[]): Promise<string[]>;
   listProjectFiles(projectId: string): Promise<ProjectFileEntry[]>;
+  /** Finds files by name across the whole repository, not just the loaded tree. */
+  searchProjectPaths(
+    projectId: string,
+    query: string,
+    limit?: number,
+  ): Promise<SearchOutcome<PathHit>>;
+  /** Finds text inside the repository's files. */
+  searchProjectContents(
+    projectId: string,
+    input: ProjectSearchContentsInput,
+  ): Promise<SearchOutcome<ContentHit>>;
+  /** The dev servers this app started for one project. Listing is also what
+   * notices a declared port has begun answering, which is when a `listening`
+   * change reaches `subscribeDevServers`. */
+  listDevServers(projectId: string): Promise<DevServerView[]>;
+  /** The dev-server commands this project's `package.json` offers. */
+  devServerCandidates(projectId: string): Promise<DevServerSpec[]>;
+  /** Start one, returning its id. */
+  startDevServer(projectId: string, spec: DevServerStartInput): Promise<string>;
+  stopDevServer(id: string): Promise<void>;
+  restartDevServer(id: string): Promise<void>;
+  /** The log from a sequence number on, so a reader resumes without
+   * double-reading or skipping. */
+  readDevServerLog(id: string, since: number): Promise<DevServerLogLine[]>;
+  /** State, output and first-listen notices for every managed dev server. */
+  subscribeDevServers(listener: (change: DevServerChange) => void): Promise<() => void>;
+  /** The reviewer policy the app ships, so the Permissions editor can show
+   * what a custom policy would replace instead of opening blank. */
+  defaultAutoReviewPolicy(): Promise<string>;
   readProjectFile(projectId: string, path: string): Promise<ProjectFileContent>;
   /** Write manually edited text back to one trusted project file (native builds only). */
   writeProjectFile(projectId: string, path: string, content: string): Promise<ProjectFileContent>;
@@ -4303,8 +4446,14 @@ function nativeBrowserBridge(): BrowserBridge | undefined {
     list: (taskId) => nativeInvoke<BrowserTab[]>("browser_tab_list", { taskId }),
     restore: (taskId) => nativeInvoke<BrowserTab[]>("browser_tabs_restore", { taskId }),
     close: (taskId, tabId) => nativeInvoke<void>("browser_tab_close", { taskId, tabId }),
-    setBounds: (taskId, tabId, bounds, poppedOutHost) =>
-      nativeInvoke<void>("browser_tab_set_bounds", { taskId, tabId, bounds, poppedOutHost }),
+    setBounds: (taskId, tabId, bounds, placementSlot, poppedOutHost) =>
+      nativeInvoke<void>("browser_tab_set_bounds", {
+        taskId,
+        tabId,
+        bounds,
+        placementSlot,
+        poppedOutHost,
+      }),
     navigate: (taskId, tabId, url) =>
       nativeInvoke<BrowserTab>("browser_tab_navigate", { taskId, tabId, url }),
     history: (taskId, tabId, action) =>
@@ -4321,7 +4470,15 @@ function nativeBrowserBridge(): BrowserBridge | undefined {
     },
     onFocusRequest: async (listener) => {
       const { listen } = await import("@tauri-apps/api/event");
-      return listen<{ tabId: string }>("browser://focus", (event) => listener(event.payload.tabId));
+      return listen<{ taskId: string; tabId: string }>("browser://focus", (event) =>
+        listener(event.payload),
+      );
+    },
+    onContextAction: async (listener) => {
+      const { listen } = await import("@tauri-apps/api/event");
+      return listen<BrowserContextAction>("browser://context-action", (event) =>
+        listener(event.payload),
+      );
     },
     savedLogins: () => nativeInvoke<SavedLogin[]>("browser_saved_logins"),
     saveLogin: (tabId, taskId, allProjects) =>
@@ -4335,7 +4492,7 @@ function nativeBrowserBridge(): BrowserBridge | undefined {
       nativeInvoke<void>("browser_allow_agent_sign_in", { origin, allowed }),
     onFillRequest: async (listener) => {
       const { listen } = await import("@tauri-apps/api/event");
-      return listen<{ tabId: string; origin: string; username: string }>(
+      return listen<{ taskId: string; tabId: string; origin: string; username: string }>(
         "browser://fill-request",
         (event) => listener(event.payload),
       );
@@ -5844,6 +6001,103 @@ export const bridge: AppBridge = {
       path: file.path,
       size: file.lines.reduce((total, line) => total + line.content.length + 1, 0),
     }));
+  },
+
+  searchProjectPaths: async (projectId, query, limit) => {
+    if (isTauri()) {
+      return nativeInvoke<SearchOutcome<PathHit>>("project_search_paths", {
+        repository: repositoryForProject(projectId),
+        query,
+        limit,
+      });
+    }
+    // The browser preview has no repository to walk; an honest empty result
+    // beats a fabricated hit list that would make the surface look wired.
+    return { hits: [], truncated: false, scanned: 0, elapsedMs: 0 };
+  },
+
+  searchProjectContents: async (projectId, input) => {
+    if (isTauri()) {
+      return nativeInvoke<SearchOutcome<ContentHit>>("project_search_contents", {
+        repository: repositoryForProject(projectId),
+        input,
+      });
+    }
+    return { hits: [], truncated: false, scanned: 0, elapsedMs: 0 };
+  },
+
+  // Dev servers are real child processes, so the browser preview has none and
+  // says so. A fabricated row here would be worse than an empty list: it would
+  // offer a stop button for a process that does not exist.
+  listDevServers: async (projectId) => {
+    if (!isTauri()) return [];
+    return nativeInvoke<DevServerView[]>("dev_server_list", {
+      repository: repositoryForProject(projectId),
+    });
+  },
+
+  devServerCandidates: async (projectId) => {
+    if (!isTauri()) return [];
+    return nativeInvoke<DevServerSpec[]>("dev_server_candidates", {
+      repository: repositoryForProject(projectId),
+    });
+  },
+
+  startDevServer: async (projectId, spec) => {
+    if (!isTauri()) throw new Error("Running a dev server requires the native desktop app.");
+    return nativeInvoke<string>("dev_server_start", {
+      repository: repositoryForProject(projectId),
+      spec,
+    });
+  },
+
+  stopDevServer: async (id) => {
+    if (!isTauri()) throw new Error("Running a dev server requires the native desktop app.");
+    await nativeInvoke<void>("dev_server_stop", { id });
+  },
+
+  restartDevServer: async (id) => {
+    if (!isTauri()) throw new Error("Running a dev server requires the native desktop app.");
+    await nativeInvoke<void>("dev_server_restart", { id });
+  },
+
+  readDevServerLog: async (id, since) => {
+    if (!isTauri()) return [];
+    return nativeInvoke<DevServerLogLine[]>("dev_server_log", { id, since });
+  },
+
+  subscribeDevServers: async (listener) => {
+    if (!isTauri()) return () => undefined;
+    const { listen } = await import("@tauri-apps/api/event");
+    // Two topics, one stream: a state change and a first-listen notice are
+    // different enough natively to keep apart and identical to a subscriber.
+    const unlistenChanged = await listen<{
+      id: string;
+      nextSeq?: number;
+      state?: DevServerState;
+    }>("dev-server://changed", (event) => {
+      const { id, nextSeq, state } = event.payload;
+      if (state) listener({ kind: "state", id, state });
+      else if (nextSeq !== undefined) listener({ kind: "output", id, nextSeq });
+    });
+    const unlistenListening = await listen<{ id: string; url: string }>(
+      "dev-server://listening",
+      (event) => {
+        listener({ kind: "listening", id: event.payload.id, url: event.payload.url });
+      },
+    );
+    return () => {
+      unlistenChanged();
+      unlistenListening();
+    };
+  },
+
+  defaultAutoReviewPolicy: async () => {
+    // The policy is compiled into the native binary, so the browser preview has
+    // no copy to show. Empty means "not available here" — the editor keeps its
+    // placeholder rather than presenting an invented document as the shipped one.
+    if (!isTauri()) return "";
+    return nativeInvoke<string>("auto_review_default_policy");
   },
 
   readProjectFile: async (projectId, path) => {

@@ -16,12 +16,12 @@ use std::{
     time::Duration,
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize,
     Runtime, WebviewUrl,
-    webview::{PageLoadEvent, WebviewBuilder},
+    webview::{NewWindowResponse, PageLoadEvent, WebviewBuilder},
 };
 use tokio::sync::oneshot;
 use url::Url;
@@ -39,7 +39,7 @@ mod vault;
 
 pub use popout::browser_tab_set_popped_out;
 pub use registry::{BrowserTab, BrowserTabs, Caller, GrantMode};
-pub(crate) use registry::{Tab, USER_HOLDER, note_user_activity};
+pub(crate) use registry::{PlacementSlot, Tab, USER_HOLDER, note_user_activity};
 pub use servers::browser_local_servers;
 pub use sites::{browser_clear_data, browser_sites};
 
@@ -51,6 +51,10 @@ pub const BROWSER_FOCUS_EVENT: &str = "browser://focus";
 /// An agent asking to sign in on a site the user has not allowed it to. The
 /// app asks; the agent is told to try again rather than being made to wait.
 pub const BROWSER_FILL_REQUEST_EVENT: &str = "browser://fill-request";
+/// A trusted click in the guest's closed-shadow context menu. The main
+/// renderer performs the task-scoped action; remote page code cannot emit one
+/// because the command also requires the per-launch host key.
+pub const BROWSER_CONTEXT_ACTION_EVENT: &str = "browser://context-action";
 /// Sites stay signed in between runs unless the user turns this off.
 pub const KEEP_SIGNED_IN_SETTING: &str = "settings.browser.keepSignedIn";
 /// Whether agents may open and drive browser tabs for this installation.
@@ -73,6 +77,8 @@ const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
 const OFFSCREEN_SIZE: (f64, f64) = (1280.0, 800.0);
 const EVAL_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_EVAL_BYTES: usize = 96 * 1024;
+const MAX_CONTEXT_TEXT_CHARS: usize = 4_000;
+const BROWSER_CONTEXT_SCHEME: &str = "integrator-browser-context";
 
 /// Where a tab waits when nothing is showing it: outside the window's client
 /// area, at a size a site serves its desktop layout to. A new tab starts here
@@ -105,8 +111,7 @@ pub(super) fn unavailable(message: impl Into<String>) -> CommandError {
     }
 }
 
-pub(super) fn emit_changed<R: Runtime>(app: &AppHandle<R>, tabs: &BrowserTabs) {
-    let _ = tabs;
+pub(super) fn emit_changed<R: Runtime>(app: &AppHandle<R>, _tabs: &BrowserTabs) {
     let _ = app.emit(BROWSER_EVENT, ());
 }
 
@@ -284,6 +289,7 @@ pub(super) fn tab_webview_builder(
     id: &str,
     label: &str,
     target: &Url,
+    task_id: &str,
 ) -> WebviewBuilder<tauri::Wry> {
     let tabs = Arc::clone(state);
     let load_app = app.clone();
@@ -291,6 +297,10 @@ pub(super) fn tab_webview_builder(
     let title_tabs = Arc::clone(state);
     let title_app = app.clone();
     let title_id = id.to_string();
+    let context_tabs = Arc::clone(state);
+    let context_app = app.clone();
+    let context_id = id.to_string();
+    let context_task_id = task_id.to_string();
 
     let mut builder = WebviewBuilder::new(label, WebviewUrl::External(target.clone()))
         .initialization_script(guest_runtime(app, state))
@@ -330,6 +340,18 @@ pub(super) fn tab_webview_builder(
                 emit_changed(&title_app, &title_tabs);
             }
         })
+        .on_new_window(move |url, _| {
+            if url.scheme() != BROWSER_CONTEXT_SCHEME {
+                return NewWindowResponse::Allow;
+            }
+            if let Some(payload) =
+                context_action_from_url(&context_tabs, &context_task_id, &context_id, &url)
+            {
+                let _ = context_app.emit(BROWSER_CONTEXT_ACTION_EVENT, payload);
+            }
+            // This is a signal, never a browser window.
+            NewWindowResponse::Deny
+        })
         .on_navigation(|url| matches!(url.scheme(), "http" | "https" | "about"))
         .user_agent(BROWSER_USER_AGENT);
     if let Some(profile) = profile_directory(app) {
@@ -352,7 +374,7 @@ pub(super) async fn create_tab(
         .get_window("main")
         .ok_or_else(|| unavailable("the main window is not available"))?;
 
-    let builder = tab_webview_builder(app, state, &id, &label, &target);
+    let builder = tab_webview_builder(app, state, &id, &label, &target, &task_id);
 
     window
         .add_child(builder, parked().0, parked().1)
@@ -380,6 +402,7 @@ pub(super) async fn create_tab(
             Tab {
                 state: tab.clone(),
                 label,
+                placement_slot: None,
                 held: None,
                 user_at: None,
                 grants: HashMap::new(),
@@ -431,6 +454,69 @@ pub async fn browser_tab_list(
     Ok(state.snapshot(Some(&task_id)))
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserContextAction {
+    task_id: String,
+    tab_id: String,
+    action: String,
+    page_url: String,
+    page_title: String,
+    target_url: Option<String>,
+    text: Option<String>,
+}
+
+fn bounded_context_text(value: Option<String>, limit: usize) -> Option<String> {
+    let value = value?.trim().to_string();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.chars().take(limit).collect())
+}
+
+/// Parses the closed-shadow menu's intercepted `window.open`. The captured
+/// native function carries the launch key straight to this handler; no real
+/// window opens and no remote IPC permission is granted to the page.
+fn context_action_from_url(
+    state: &BrowserTabs,
+    task_id: &str,
+    tab_id: &str,
+    url: &Url,
+) -> Option<BrowserContextAction> {
+    if url.scheme() != BROWSER_CONTEXT_SCHEME {
+        return None;
+    }
+    let values: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    if values.get("key")? != &state.host_key() {
+        return None;
+    }
+    let action = values.get("action")?.to_string();
+    let target_url = values
+        .get("url")
+        .filter(|raw| !raw.trim().is_empty())
+        .and_then(|raw| normalize_url(raw).ok())
+        .map(|url| url.to_string());
+    match action.as_str() {
+        "open-tab" if target_url.is_none() => return None,
+        "open-tab" | "send-chat" => {}
+        _ => return None,
+    }
+
+    let tab = state
+        .snapshot(Some(task_id))
+        .into_iter()
+        .find(|tab| tab.id == tab_id)?;
+    Some(BrowserContextAction {
+        task_id: task_id.to_string(),
+        tab_id: tab_id.to_string(),
+        action,
+        page_url: tab.url,
+        page_title: tab.title.chars().take(300).collect(),
+        target_url,
+        text: bounded_context_text(values.get("text").cloned(), MAX_CONTEXT_TEXT_CHARS),
+    })
+}
+
 #[tauri::command]
 pub async fn browser_tab_close(
     app: AppHandle,
@@ -449,6 +535,11 @@ pub(super) fn close_tab(
     state: &Arc<BrowserTabs>,
     tab_id: &str,
 ) -> Result<(), CommandError> {
+    let closing = state
+        .snapshot(None)
+        .into_iter()
+        .find(|tab| tab.id == tab_id)
+        .ok_or_else(|| unavailable("that browser tab is already closed"))?;
     let label = state
         .label_for(tab_id)
         .ok_or_else(|| unavailable("that browser tab is already closed"))?;
@@ -458,15 +549,38 @@ pub(super) fn close_tab(
     if let Some(window) = app.get_webview_window(&label) {
         let _ = window.close();
     }
-    let task = state.task_of(tab_id);
     {
         let mut tabs = state.tabs.lock().unwrap_or_else(|error| error.into_inner());
         tabs.remove(tab_id);
     }
     emit_changed(app, state);
-    if let Some(task) = task {
-        remember::remember(app, state, &task);
+    remember::remember(app, state, &closing.task_id);
+    if closing.popped_out
+        && !state
+            .snapshot(Some(&closing.task_id))
+            .iter()
+            .any(|tab| tab.popped_out)
+        && let Some(window) = app.get_window(&popout::window_label(&closing.task_id))
+    {
+        let _ = window.hide();
     }
+    Ok(())
+}
+
+fn park_tab(app: &AppHandle, state: &BrowserTabs, tab_id: &str) -> Result<(), CommandError> {
+    let label = state
+        .label_for(tab_id)
+        .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
+    let webview = webview_of(app, &label)?;
+    let (position, size) = parked();
+    webview
+        .set_bounds(tauri::Rect {
+            position: position.into(),
+            size: size.into(),
+        })
+        .map_err(|error| unavailable(error.to_string()))?;
+    let _ = webview.show();
+    state.set_placement(tab_id, None);
     Ok(())
 }
 
@@ -479,21 +593,10 @@ pub async fn browser_tab_set_bounds(
     task_id: String,
     tab_id: String,
     bounds: Option<TabBounds>,
+    placement_slot: PlacementSlot,
     popped_out_host: bool,
 ) -> CommandResult<()> {
     require_task(&state, &task_id, &tab_id)?;
-    let popped_out = state
-        .tabs
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .get(&tab_id)
-        .is_some_and(|tab| tab.state.popped_out);
-    // Only the renderer that owns the tab's current host may place it. A late
-    // main-window resize cannot pull a popped tab back over the pane, and the
-    // popout renderer is still allowed to give that same tab its rectangle.
-    if popped_out != popped_out_host {
-        return Ok(());
-    }
     if state.sleeping_target(&tab_id).is_some() {
         // The renderer only reports a rectangle for a tab it is showing, so this
         // is the moment a remembered tab is actually wanted.
@@ -503,12 +606,29 @@ pub async fn browser_tab_set_bounds(
             return Ok(());
         }
     }
+    let popped_out = state
+        .tabs
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&tab_id)
+        .is_some_and(|tab| tab.state.popped_out);
+    // Re-check after a possible wake: pop-out may have moved the webview while
+    // that await was yielding. A late resize from the old host must be inert.
+    if popped_out != popped_out_host {
+        return Ok(());
+    }
     let label = state
         .label_for(&tab_id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
     let webview = webview_of(&app, &label)?;
     match bounds {
         Some(bounds) if bounds.width >= 1.0 && bounds.height >= 1.0 => {
+            // React can retire one surface while mounting the next. Park the
+            // old visible sibling natively before exposing the new one, even
+            // if an earlier renderer promise completed late.
+            for peer_id in state.visible_peers(&task_id, &tab_id, popped_out_host, placement_slot) {
+                park_tab(&app, &state, &peer_id)?;
+            }
             // One call, not a move followed by a resize: two dispatches per
             // frame let the tab paint at a half-applied geometry, which is
             // what makes a pane drag look like it is tearing.
@@ -526,7 +646,7 @@ pub async fn browser_tab_set_bounds(
             // Being on screen counts as being reached for: the cap must never
             // sleep the page the user is looking at.
             state.touch(&tab_id);
-            state.update(&tab_id, |tab| tab.hidden = false);
+            state.set_placement(&tab_id, Some(placement_slot));
         }
         _ => {
             // Parked, not shrunk. A tab the pane is not showing used to be left
@@ -535,14 +655,7 @@ pub async fn browser_tab_set_bounds(
             // reply said the geometry was meaningless. Off to the side at a real
             // size means an agent working a background tab gets numbers that
             // are true, and `pageState().offscreen` says it cannot be seen.
-            webview
-                .set_bounds(tauri::Rect {
-                    position: LogicalPosition::new(-(OFFSCREEN_SIZE.0 + 200.0), 0.0).into(),
-                    size: LogicalSize::new(OFFSCREEN_SIZE.0, OFFSCREEN_SIZE.1).into(),
-                })
-                .map_err(|error| unavailable(error.to_string()))?;
-            let _ = webview.show();
-            state.update(&tab_id, |tab| tab.hidden = true);
+            park_tab(&app, &state, &tab_id)?;
         }
     }
     Ok(())

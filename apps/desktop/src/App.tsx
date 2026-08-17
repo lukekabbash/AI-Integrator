@@ -3,6 +3,7 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -51,6 +52,7 @@ import {
   type AutomationDispatch,
   type AutomationTimelineEntry,
   type BrowserTab,
+  type BrowserContextAction,
   type ComposerDraft,
   type ComposerDraftOwner,
   type ComposerDraftValue,
@@ -77,7 +79,12 @@ import {
   type SubscriptionWindow,
   type TaskSummary,
   type TranscriptEvent,
+  type ContentHit,
+  type PathHit,
+  type ProjectSearchContentsInput,
+  type SearchOutcome,
 } from "./bridge";
+import { browserContextComposerText } from "./browserContext";
 import { mergeSchedulingTranscript } from "./automationTranscript";
 import { automationTurnPrompt } from "./automationTurnPrompt";
 import {
@@ -132,7 +139,7 @@ import { WorkPaneToggle, type WorkPaneLaunchKind } from "./components/WorkPaneTo
 // closed work pane painted on screen while every other control read "closed".
 import { WorkPane } from "./components/WorkPane";
 import { useWorkPane, useWorkPaneHeaderAlignment, fileSurfaceId } from "./useWorkPane";
-import { useBrowserTabs } from "./useBrowserTabs";
+import { browserRequestBelongsToTask, useBrowserTabs } from "./useBrowserTabs";
 import { resolveRequestedFile, type ProjectFileLocation } from "./components/fileViewSupport";
 import { TaskStatusPill } from "./components/TaskStatusPill";
 import { SubagentProjectionCache } from "./components/subagentProjectionCache";
@@ -1479,6 +1486,11 @@ function ApprovalControl({
   );
 }
 
+/** What a repository search returns when there is no repository to search. */
+function emptySearchOutcome<T>(): SearchOutcome<T> {
+  return { hits: [], truncated: false, scanned: 0, elapsedMs: 0 };
+}
+
 export default function App() {
   const nativeHost = isNativeHost();
   const [snapshot, setSnapshot] = useState<WorkspaceSnapshot>(initialSnapshot);
@@ -1540,22 +1552,28 @@ export default function App() {
   const workPane = useWorkPane(workPaneOwnerKey);
   const selectedDelegationId =
     workPane.active?.kind === "subagent" ? workPane.active.delegationId : undefined;
+  const browserTaskId = snapshot.activeTaskId ?? workPaneOwnerKey;
+  const browserTaskIdRef = useRef(browserTaskId);
+  useLayoutEffect(() => {
+    browserTaskIdRef.current = browserTaskId;
+  }, [browserTaskId]);
   // Browser tabs are native surfaces the pane hosts; captures land in the composer.
   const browser = useBrowserTabs(
     {
-      attachImage: async (file, name) => {
+      attachImage: async (file, name, ownerTaskId) => {
         const attachment = await bridge.savePastedImageAttachment?.(file, name, undefined);
-        if (!attachment) return;
+        if (!attachment || browserTaskIdRef.current !== ownerTaskId) return;
         composerAttachmentSequence.current += 1;
         setComposerAttachment({ id: composerAttachmentSequence.current, attachment });
       },
-      insertText: (text) => {
+      insertText: (text, ownerTaskId) => {
+        if (browserTaskIdRef.current !== ownerTaskId) return;
         composerInsertSequence.current += 1;
         setComposerInsert({ id: composerInsertSequence.current, text });
       },
     },
     {
-      taskId: snapshot.activeTaskId ?? workPaneOwnerKey,
+      taskId: browserTaskId,
       allowExternalOpen: localSettings[BROWSER_SETTINGS.externalOpen] === true,
     },
   );
@@ -1572,9 +1590,7 @@ export default function App() {
   }, [browser.tabs, snapshot.activeTaskId, workPane]);
   useEffect(() => {
     if (!browser.ready) return;
-    workPane.prune(
-      (surface) => surface.kind !== "browser" || Boolean(browser.byId[surface.tabId]),
-    );
+    workPane.prune((surface) => surface.kind !== "browser" || Boolean(browser.byId[surface.tabId]));
   }, [browser.byId, browser.ready, workPane]);
   // An agent asking to be watched — before a step the user should see, or when
   // it needs them to sign in. Unlike a tab merely opening, this one does take
@@ -1592,15 +1608,20 @@ export default function App() {
   // try again rather than made to wait, so this prompt can sit unanswered
   // without holding a run open.
   const [signInRequest, setSignInRequest] = useState<{
+    taskId: string;
     tabId: string;
     origin: string;
     username: string;
   } | null>(null);
+  const activeSignInRequest = signInRequest?.taskId === browser.taskId ? signInRequest : null;
   useEffect(() => {
     if (!bridge.browser?.onFillRequest) return;
     let active = true;
     const unlisten = bridge.browser.onFillRequest((request) => {
-      if (active) setSignInRequest(request);
+      if (!active) return;
+      const { tabs, taskId } = focusable.current;
+      if (!browserRequestBelongsToTask(taskId, tabs, request)) return;
+      setSignInRequest(request);
     });
     return () => {
       active = false;
@@ -1610,12 +1631,11 @@ export default function App() {
   useEffect(() => {
     if (!bridge.browser?.onFocusRequest) return;
     let active = true;
-    const unlisten = bridge.browser.onFocusRequest((tabId) => {
+    const unlisten = bridge.browser.onFocusRequest((request) => {
       if (!active) return;
       const { tabs, taskId } = focusable.current;
-      const tab = tabs.find((candidate) => candidate.id === tabId);
-      if (!tab || tab.taskId !== taskId) return;
-      workPane.openBrowser(tabId, { activate: true, show: true });
+      if (!browserRequestBelongsToTask(taskId, tabs, request)) return;
+      workPane.openBrowser(request.tabId, { activate: true, show: true });
     });
     return () => {
       active = false;
@@ -3036,12 +3056,12 @@ export default function App() {
     () =>
       browser.tabs.filter(
         (tab) =>
-          tab.taskId === snapshot.activeTaskId &&
+          tab.taskId === browser.taskId &&
           !tab.sleeping &&
           !tab.poppedOut &&
           (!subagentOpen || !paneBrowserIds.has(tab.id)),
       ),
-    [browser.tabs, paneBrowserIds, snapshot.activeTaskId, subagentOpen],
+    [browser.tabs, browser.taskId, paneBrowserIds, subagentOpen],
   );
   const activeFileTabPath = workPane.active?.kind === "file" ? workPane.active.path : "";
   useWorkPaneHeaderAlignment(appRootRef, subagentPaneRef, subagentOpen);
@@ -4357,6 +4377,20 @@ export default function App() {
       searchChats: keycaps(table.get("navigation.searchChats") ?? null, isMac),
     };
   }, [storedKeybindings]);
+  // Repository search is scoped to the project the rail is showing, read
+  // through the ref the workspace already keeps in step. With no project there
+  // is nothing to walk, so the modal gets an honest empty result rather than a
+  // rejected promise it would have to render as an error.
+  const handleSidebarSearchProjectPaths = useCallback((query: string) => {
+    const projectId = activeProjectIdRef.current;
+    if (!projectId) return Promise.resolve(emptySearchOutcome<PathHit>());
+    return bridge.searchProjectPaths(projectId, query);
+  }, []);
+  const handleSidebarSearchProjectContents = useCallback((input: ProjectSearchContentsInput) => {
+    const projectId = activeProjectIdRef.current;
+    if (!projectId) return Promise.resolve(emptySearchOutcome<ContentHit>());
+    return bridge.searchProjectContents(projectId, input);
+  }, []);
   const handleSidebarSelectProject = useCallback((projectId: string) => {
     sidebarHandlersRef.current.selectProject(projectId);
   }, []);
@@ -6357,6 +6391,10 @@ export default function App() {
     id: number;
   }>();
   const openWorkPaneLaunch = (kind: WorkPaneLaunchKind) => {
+    // Accountless chats have no repository surfaces. They still own an
+    // isolated browser session, but files, review and subagents belong to a
+    // project task and must not be conjured through a shortcut.
+    if (activeTask?.kind === "chat" && kind !== "browser") return;
     // The blank tab is a means, not a destination: whatever is chosen from it
     // takes its place.
     const replaceBlank = () => workPane.close("new");
@@ -6375,6 +6413,41 @@ export default function App() {
     setRailTabRequest({ tab: kind === "files" ? "files" : "agents", id: Date.now() });
     replaceBlank();
   };
+  useEffect(() => {
+    if (!bridge.browser?.onContextAction) return;
+    let active = true;
+    const unlisten = bridge.browser.onContextAction((request: BrowserContextAction) => {
+      if (!active) return;
+      const { tabs, taskId } = focusable.current;
+      if (!browserRequestBelongsToTask(taskId, tabs, request)) return;
+      if (request.action === "open-tab") {
+        if (!request.targetUrl) return;
+        void bridge.browser?.open(request.taskId, request.targetUrl).catch((error: unknown) => {
+          if (!active || browserTaskIdRef.current !== request.taskId) return;
+          setOperationError(
+            error instanceof Error ? error.message : "Could not open that link in a new tab",
+          );
+        });
+        return;
+      }
+      if (browserTaskIdRef.current !== request.taskId) return;
+      composerInsertSequence.current += 1;
+      setComposerInsert({
+        id: composerInsertSequence.current,
+        text: browserContextComposerText(request),
+      });
+      setCenterView("task");
+      setScreen("workspace");
+      setSnapshot((current) => ({
+        ...current,
+        centerViewByTask: { ...current.centerViewByTask, [request.taskId]: "task" },
+      }));
+    });
+    return () => {
+      active = false;
+      void unlisten.then((stop) => stop()).catch(() => undefined);
+    };
+  }, []);
   const renderWorkPaneFile = (surface: { path: string; revealLine: number | null }) => {
     const tab = openFileTabs.find((candidate) => candidate.path === surface.path);
     if (!tab) {
@@ -6439,7 +6512,7 @@ export default function App() {
         message={browser.message}
         recording={browser.recordingTabId === tabId}
         annotating={browser.annotatingTabId === tabId}
-        onBoundsChange={(rect) => browser.setBounds(tabId, rect)}
+        onBoundsChange={(rect) => browser.setBounds(tabId, rect, "pane")}
         onNavigate={(url) => browser.navigate(tabId, url)}
         onHistory={(action) => browser.history(tabId, action)}
         onScreenshot={() => browser.screenshot(tabId)}
@@ -6522,6 +6595,14 @@ export default function App() {
     setTerminalSurfaceActivated(true);
     setTerminalOpen((current) => !current);
   };
+  const browserPaneToggle = (
+    <WorkPaneToggle
+      open={workPane.state.open}
+      alive={workPane.state.surfaces.length > 0 || deckTabs.length > 0}
+      attention={workPaneAttention}
+      onClick={() => workPane.toggle()}
+    />
+  );
   const workspaceToggles = (
     <>
       <button
@@ -6533,12 +6614,7 @@ export default function App() {
       >
         <TerminalSquare />
       </button>
-      <WorkPaneToggle
-        open={workPane.state.open}
-        alive={workPane.state.surfaces.length > 0}
-        attention={workPaneAttention}
-        onClick={() => workPane.toggle()}
-      />
+      {browserPaneToggle}
       <button
         className="icon-button subtle"
         type="button"
@@ -6595,6 +6671,9 @@ export default function App() {
         onResize={handleSidebarResize}
         sidebarMenuDirection={preferences.sidebarMenuDirection}
         shortcutHints={shortcutHints}
+        onSearchProjectPaths={handleSidebarSearchProjectPaths}
+        onSearchProjectContents={handleSidebarSearchProjectContents}
+        onOpenProjectFile={openTranscriptFile}
         arrowNavigation={localSettings[ARROW_NAVIGATION_SETTING] !== false}
         wrapNavigation={localSettings[WRAP_NAVIGATION_SETTING] !== false}
       />
@@ -6648,7 +6727,7 @@ export default function App() {
     },
     "chat.stopTurn": () => void stopTurn(),
     "chat.copyConversation": () => void copyConversation(),
-    "workPane.toggle": () => setRightRailOpen((value) => !value),
+    "workPane.toggle": () => workPane.toggle(),
     "workPane.review": () => openWorkPaneLaunch("review"),
     "workPane.files": () => openWorkPaneLaunch("files"),
     "workPane.agents": () => openWorkPaneLaunch("subagents"),
@@ -6793,7 +6872,7 @@ export default function App() {
                     <span className="sr-only"> tokens</span>
                   </button>
                 </Tooltip>
-                {activeTask?.kind !== "chat" ? workspaceToggles : null}
+                {activeTask?.kind === "chat" ? browserPaneToggle : workspaceToggles}
               </>
             ) : undefined
           }
@@ -7389,6 +7468,7 @@ export default function App() {
                             )}
                             renderBrowser={renderWorkPaneBrowser}
                             onLaunch={openWorkPaneLaunch}
+                            browserOnly={activeTask?.kind === "chat"}
                             renderFile={renderWorkPaneFile}
                             renderReview={renderWorkPaneReview}
                             renderSubagent={renderWorkPaneSubagent}
@@ -7399,13 +7479,13 @@ export default function App() {
                     {/* Closing the pane does not stop an agent mid-page, so the
                         pages it is still working in collect in the corner
                         rather than disappearing. */}
-                    {signInRequest ? (
+                    {activeSignInRequest ? (
                       <Suspense fallback={null}>
                         <BrowserSignInPrompt
-                          request={signInRequest}
+                          request={activeSignInRequest}
                           onDismiss={() => setSignInRequest(null)}
                           onAllow={(remember) => {
-                            const request = signInRequest;
+                            const request = activeSignInRequest;
                             setSignInRequest(null);
                             const tab = browser.byId[request.tabId];
                             if (!tab) return;
@@ -7421,21 +7501,22 @@ export default function App() {
                         />
                       </Suspense>
                     ) : null}
-                    {deckTabs.length > 0 ? (
-                      <Suspense fallback={null}>
-                        <BrowserDeck
-                          tabs={deckTabs}
-                          onBoundsChange={browser.setBounds}
-                          onExpand={(tabId) =>
-                            workPane.openBrowser(tabId, { activate: true, show: true })
-                          }
-                          onClose={(tabId) => {
-                            workPane.close(`browser:${tabId}`);
-                            void browser.close(tabId);
-                          }}
-                        />
-                      </Suspense>
-                    ) : null}
+                    <Suspense fallback={null}>
+                      <BrowserDeck
+                        tabs={deckTabs}
+                        preferredTabId={
+                          workPane.active?.kind === "browser" ? workPane.active.tabId : null
+                        }
+                        onBoundsChange={(tabId, rect) => browser.setBounds(tabId, rect, "deck")}
+                        onExpand={(tabId) =>
+                          workPane.openBrowser(tabId, { activate: true, show: true })
+                        }
+                        onClose={(tabId) => {
+                          workPane.close(`browser:${tabId}`);
+                          void browser.close(tabId);
+                        }}
+                      />
+                    </Suspense>
                     {activeProject && terminalSurfaceActivated ? (
                       <Suspense
                         fallback={

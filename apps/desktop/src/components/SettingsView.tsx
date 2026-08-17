@@ -264,6 +264,7 @@ const DEFAULT_SETTINGS: SettingsMap = {
   [BROWSER_SETTINGS.agentAccess]: true,
   [BROWSER_SETTINGS.keepSignedIn]: true,
   [BROWSER_SETTINGS.blockNewWindows]: true,
+  [BROWSER_SETTINGS.externalOpen]: false,
   "general.openLastWorkspace": true,
   "general.autoResumeInterruptedTurns": false,
   "general.confirmExternalActions": true,

@@ -8,11 +8,13 @@
 
 .browser-deck {
   position: fixed;
+  top: 50px;
   right: 18px;
   bottom: 18px;
   z-index: 40;
   display: flex;
   flex-direction: column;
+  justify-content: flex-end;
   align-items: flex-end;
   gap: 6px;
   pointer-events: none;
@@ -23,7 +25,9 @@
 
 .browser-deck-stack {
   position: relative;
-  width: 320px;
+  width: 338px;
+  padding: 18px 0 0 18px;
+  box-sizing: border-box;
 }
 
 .browser-deck-card {
@@ -39,8 +43,9 @@
    the deck reads as a deck rather than one card. */
 .browser-deck-card.behind {
   position: absolute;
-  left: 0;
-  bottom: 0;
+  z-index: var(--card-layer);
+  top: calc(18px - var(--depth) * 6px);
+  left: calc(18px - var(--depth) * 6px);
   height: 36px;
   padding: 0 10px;
   display: flex;
@@ -49,14 +54,13 @@
   color: var(--color-text-muted);
   font-size: 12px;
   cursor: pointer;
-  transform: translate(calc(var(--depth) * -6px), calc(var(--depth) * -6px));
   transition:
-    transform var(--duration-fast, 120ms) var(--ease-emphasized),
+    translate var(--duration-fast, 120ms) var(--ease-emphasized),
     color var(--duration-fast, 120ms) var(--ease-emphasized);
 }
 .browser-deck-card.behind:hover {
   color: var(--color-text-primary);
-  transform: translate(calc(var(--depth) * -6px), calc(var(--depth) * -6px - 2px));
+  translate: 0 -2px;
 }
 .browser-deck-behind-label {
   overflow: hidden;
@@ -66,6 +70,7 @@
 
 .browser-deck-card.raised {
   position: relative;
+  z-index: 5;
   display: flex;
   flex-direction: column;
 }
@@ -126,7 +131,7 @@
 /* The page's rectangle. Kept empty on purpose: the webview is placed over it. */
 .browser-deck-page {
   position: relative;
-  height: 200px;
+  height: clamp(96px, calc(100vh - 180px), 200px);
   background: var(--color-canvas);
 }
 .browser-deck-empty {

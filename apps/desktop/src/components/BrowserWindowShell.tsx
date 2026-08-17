@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { bridge } from "../bridge";
 import { useBrowserTabs } from "../useBrowserTabs";
 import { BROWSER_SETTINGS } from "./BrowserSettings";
 import { BrowserSurface } from "./BrowserSurface";
+import { nextPoppedTabId } from "./browserWindowTabs";
 import "./browserWindow.css";
 
 /**
@@ -35,6 +36,7 @@ export function BrowserWindowShell() {
   );
   const tabs = useMemo(() => browser.tabs.filter((tab) => tab.poppedOut), [browser.tabs]);
   const [activeId, setActiveId] = useState<string | null>(null);
+  const previousTabIds = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     let active = true;
@@ -62,13 +64,9 @@ export function BrowserWindowShell() {
   }, []);
 
   useEffect(() => {
-    if (tabs.length === 0) {
-      setActiveId(null);
-      return;
-    }
-    setActiveId((current) =>
-      current && tabs.some((tab) => tab.id === current) ? current : tabs[0].id,
-    );
+    const previous = previousTabIds.current;
+    previousTabIds.current = new Set(tabs.map((tab) => tab.id));
+    setActiveId((current) => nextPoppedTabId(current, previous, tabs));
   }, [tabs]);
 
   const active = tabs.find((tab) => tab.id === activeId) ?? null;
@@ -77,14 +75,24 @@ export function BrowserWindowShell() {
   return (
     <div className="browser-window" data-tauri-drag-region>
       <header className="browser-window-strip" data-tauri-drag-region>
-        <div className="browser-window-tabs" data-tauri-drag-region>
+        <div
+          className="browser-window-tabs"
+          role="tablist"
+          aria-label="Popped out browser tabs"
+          data-tauri-drag-region
+        >
           {tabs.map((tab) => (
             <div
               key={tab.id}
               className="file-reader-tab browser-window-tab"
               data-active={tab.id === activeId ? "true" : undefined}
             >
-              <button type="button" onClick={() => setActiveId(tab.id)}>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={tab.id === activeId}
+                onClick={() => setActiveId(tab.id)}
+              >
                 <span>{tab.title || tab.url.replace(/^https?:\/\//, "") || "New tab"}</span>
               </button>
               <button
@@ -108,13 +116,14 @@ export function BrowserWindowShell() {
             message={browser.message}
             recording={browser.recordingTabId === active.id}
             annotating={browser.annotatingTabId === active.id}
-            onBoundsChange={(rect) => browser.setBounds(active.id, rect)}
+            onBoundsChange={(rect) => browser.setBounds(active.id, rect, "popout")}
             onNavigate={(url) => browser.navigate(active.id, url)}
             onHistory={(action) => browser.history(active.id, action)}
             onScreenshot={() => browser.screenshot(active.id)}
             onRecordToggle={() => browser.toggleRecording(active.id)}
             onAnnotate={() => browser.toggleAnnotate(active.id)}
             onPopOut={() => browser.setPoppedOut(active.id, false)}
+            poppedOutHost
             allowExternalOpen={browser.allowExternalOpen}
             onOpenExternally={() => browser.openExternally(active.id)}
             onSaveLogin={() => browser.saveLogin(active.id, active.taskId)}

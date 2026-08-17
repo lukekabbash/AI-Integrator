@@ -93,7 +93,9 @@ export function BrowserSettings({
       <section className="settings-section">
         <header>
           <h2>Agent access</h2>
-          <p>Browser tabs belong to a task, and an agent can only reach its own task&apos;s tabs.</p>
+          <p>
+            Browser tabs belong to a task, and an agent can only reach its own task&apos;s tabs.
+          </p>
         </header>
         <SettingRow
           label="Let agents open and drive browser tabs"
@@ -110,7 +112,7 @@ export function BrowserSettings({
           description="Clicks the reject control on consent dialogs from vendors Integrator recognises — Cookiebot, OneTrust, Didomi and a few more. Never accepts, and never touches a login wall, an age gate or a terms dialog, which wear the same shape and mean something else."
         >
           <Switch
-            checked={readSetting(settings, BROWSER_SETTINGS.dismissConsent, false) === true}
+            checked={readSetting<boolean>(settings, BROWSER_SETTINGS.dismissConsent, false)}
             onChange={(next) => setSetting(BROWSER_SETTINGS.dismissConsent, next)}
             label="Decline cookie banners automatically"
           />

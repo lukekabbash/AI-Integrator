@@ -32,7 +32,15 @@ import {
   Copy,
   FolderSearch,
 } from "lucide-react";
-import type { ProjectSummary, TaskMessageSearchHit, TaskSummary } from "../bridge";
+import type {
+  ContentHit,
+  PathHit,
+  ProjectSearchContentsInput,
+  ProjectSummary,
+  SearchOutcome,
+  TaskMessageSearchHit,
+  TaskSummary,
+} from "../bridge";
 import { parseForkTitle } from "../forkTitle";
 import type { SidebarMenuDirection } from "../theme";
 import { AnimatedFolderIcon } from "./AnimatedFolderIcon";
@@ -42,6 +50,7 @@ import { ProjectChatListClip, SidebarCollectionClip } from "./SidebarCollectionC
 import { Tooltip } from "./Tooltip";
 import { TravelingSelection } from "./TravelingSelection";
 import { useRailCursor } from "../useRailCursor";
+import type { ProjectFileLocation } from "./fileViewSupport";
 import {
   CHAT_DOT_LABEL as chatDotLabel,
   chatDotKind,
@@ -81,6 +90,19 @@ interface TaskSidebarProps {
     query: string,
     options?: { includeArchived?: boolean },
   ) => Promise<TaskMessageSearchHit[]>;
+  /**
+   * Finds files by name across the active project's repository. Omitted when
+   * there is no repository to walk, which is how the group stays absent rather
+   * than showing an empty promise.
+   */
+  onSearchProjectPaths?: (query: string) => Promise<SearchOutcome<PathHit>>;
+  /** Finds text inside those files. Slower than the path walk, so it lands on
+   * its own rather than holding the file list back. */
+  onSearchProjectContents?: (
+    input: ProjectSearchContentsInput,
+  ) => Promise<SearchOutcome<ContentHit>>;
+  /** Opens a repository file in the work pane, scrolled to a line when given. */
+  onOpenProjectFile?: (location: ProjectFileLocation) => void;
   onSelectProject: (projectId: string) => void;
   onSelectTask: (taskId: string) => void;
   onNewTask: () => void;
@@ -141,6 +163,13 @@ const PROJECT_ACTION_MENU_WIDTH = 200;
 
 function copyText(value: string) {
   void navigator.clipboard.writeText(value).catch(() => undefined);
+}
+
+/** The folder a repository path sits in, so a row can lead with the file name
+ * and still say where it lives instead of letting the ellipsis eat the name. */
+function parentPath(path: string): string {
+  const index = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return index > 0 ? path.slice(0, index) : "";
 }
 
 function overflowMenuPlacement(
@@ -216,6 +245,9 @@ export const TaskSidebar = memo(function TaskSidebar({
   metadataActionsEnabled,
   taskActionBusyId,
   onSearchMessages,
+  onSearchProjectPaths,
+  onSearchProjectContents,
+  onOpenProjectFile,
   onSelectProject,
   onSelectTask,
   onNewTask,
@@ -248,6 +280,10 @@ export const TaskSidebar = memo(function TaskSidebar({
   const [searchOpen, setSearchOpen] = useState(false);
   const [messageHits, setMessageHits] = useState<TaskMessageSearchHit[]>([]);
   const [messageSearchLoading, setMessageSearchLoading] = useState(false);
+  const [pathOutcome, setPathOutcome] = useState<SearchOutcome<PathHit> | null>(null);
+  const [contentOutcome, setContentOutcome] = useState<SearchOutcome<ContentHit> | null>(null);
+  const [fileSearchLoading, setFileSearchLoading] = useState(false);
+  const [contentSearchLoading, setContentSearchLoading] = useState(false);
   const [searchResultLimit, setSearchResultLimit] = useState(INITIAL_SEARCH_RESULT_LIMIT);
   const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>(() =>
     activeProjectId ? { [activeProjectId]: true } : {},
@@ -355,26 +391,56 @@ export const TaskSidebar = memo(function TaskSidebar({
   const updateSearch = (value: string) => {
     setQuery(value);
     setMessageHits([]);
+    setPathOutcome(null);
+    setContentOutcome(null);
     setSearchResultLimit(INITIAL_SEARCH_RESULT_LIMIT);
     if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+    // Bumping the generation retires every request already in flight. Without
+    // it a slow reply to an older keystroke lands last and overwrites the
+    // results of the query the user is actually looking at.
     const generation = ++searchGenerationRef.current;
     const normalized = value.trim();
-    if (!onSearchMessages || normalized.length < 2) {
-      setMessageSearchLoading(false);
-      return;
-    }
-    setMessageSearchLoading(true);
-    searchTimerRef.current = setTimeout(() => {
-      void onSearchMessages(normalized, { includeArchived: showArchived })
-        .then((hits) => {
-          if (searchGenerationRef.current === generation) setMessageHits(hits);
+    const long = normalized.length >= 2;
+    const messageSearch = long ? onSearchMessages : undefined;
+    const pathSearch = long ? onSearchProjectPaths : undefined;
+    const contentSearch = long ? onSearchProjectContents : undefined;
+    setMessageSearchLoading(Boolean(messageSearch));
+    setFileSearchLoading(Boolean(pathSearch));
+    setContentSearchLoading(Boolean(contentSearch));
+    if (!messageSearch && !pathSearch && !contentSearch) return;
+    // Each search settles into its own group. Content search walks file bodies
+    // and is the slow one; making the file list wait on it would hide results
+    // that were ready a quarter of a second earlier.
+    const settle = <T,>(request: Promise<T>, apply: (value: T | null) => void, done: () => void) => {
+      void request
+        .then((result) => {
+          if (searchGenerationRef.current === generation) apply(result);
         })
         .catch(() => {
-          if (searchGenerationRef.current === generation) setMessageHits([]);
+          if (searchGenerationRef.current === generation) apply(null);
         })
         .finally(() => {
-          if (searchGenerationRef.current === generation) setMessageSearchLoading(false);
+          if (searchGenerationRef.current === generation) done();
         });
+    };
+    searchTimerRef.current = setTimeout(() => {
+      if (messageSearch) {
+        settle(
+          messageSearch(normalized, { includeArchived: showArchived }),
+          (hits) => setMessageHits(hits ?? []),
+          () => setMessageSearchLoading(false),
+        );
+      }
+      if (pathSearch) {
+        settle(pathSearch(normalized), setPathOutcome, () => setFileSearchLoading(false));
+      }
+      // No `literal` here on purpose: the input already defaults to a literal
+      // search, so typing `foo(` finds `foo(` instead of failing as a regex.
+      if (contentSearch) {
+        settle(contentSearch({ pattern: normalized }), setContentOutcome, () =>
+          setContentSearchLoading(false),
+        );
+      }
     }, 140);
   };
 
@@ -920,6 +986,81 @@ export const TaskSidebar = memo(function TaskSidebar({
       </div>
     );
   };
+
+  /** One repository hit, wearing the same row a chat wears: the modal keeps a
+   * single register, and `data-chat-select` puts it on the same arrow-key
+   * cursor that already walks the chat results. */
+  const renderRepositoryHit = (hit: {
+    key: string;
+    title: string;
+    meta: string;
+    tooltip: string;
+    open: () => void;
+  }) => (
+    <div className="chat-row-shell chat-row-shell--search" key={hit.key}>
+      <Tooltip label={hit.tooltip} hint={hit.meta} placement="right">
+        <button
+          className="chat-row"
+          data-chat-select
+          data-nav-item
+          data-nav-label={hit.title}
+          type="button"
+          onClick={() => {
+            hit.open();
+            closeSearch();
+          }}
+        >
+          <span className="chat-row-copy">
+            <span className="chat-row-title">{hit.title}</span>
+            <small>{hit.meta}</small>
+          </span>
+        </button>
+      </Tooltip>
+    </div>
+  );
+
+  const fileRows = (pathOutcome?.hits ?? []).map((hit) =>
+    renderRepositoryHit({
+      key: `file:${hit.path}`,
+      title: lastPathSegment(hit.path),
+      meta: parentPath(hit.path) || "Repository root",
+      tooltip: hit.path,
+      open: () => onOpenProjectFile?.({ path: hit.path }),
+    }),
+  );
+
+  const contentRows = (contentOutcome?.hits ?? []).map((hit) =>
+    renderRepositoryHit({
+      key: `text:${hit.path}:${hit.line}:${hit.column}`,
+      title: hit.text.trim() || hit.path,
+      meta: `${hit.path}:${hit.line}`,
+      tooltip: `${hit.path}:${hit.line}`,
+      // The line is what makes this hit worth opening, so it travels with the
+      // path rather than dropping the reader at the top of the file.
+      open: () => onOpenProjectFile?.({ path: hit.path, startLine: hit.line, endLine: hit.line }),
+    }),
+  );
+
+  /** A repository result group. Truncation is spoken in the heading, because a
+   * cap that does not announce itself is worse than a smaller cap that does. */
+  const renderRepositoryGroup = (
+    label: string,
+    rows: ReactElement[],
+    outcome: SearchOutcome<unknown> | null,
+  ) =>
+    rows.length ? (
+      <>
+        <div className="search-modal-results-heading">
+          <span>{label}</span>
+          <small>{outcome?.truncated ? `Showing the first ${rows.length}` : rows.length}</small>
+        </div>
+        <div className="search-modal-result-list">{rows}</div>
+      </>
+    ) : null;
+
+  const searchBusy = messageSearchLoading || fileSearchLoading || contentSearchLoading;
+  const searchFoundNothing =
+    searchResults.length === 0 && fileRows.length === 0 && contentRows.length === 0;
 
   return (
     <>
@@ -1647,14 +1788,14 @@ export const TaskSidebar = memo(function TaskSidebar({
                             focusRelativeChat(1, searchResultsRef.current);
                           }
                         }}
-                        placeholder="Search chats, projects, and messages"
+                        placeholder="Search chats, messages, and this project's files"
                       />
                       {searchHint ? <kbd>{searchHint}</kbd> : null}
                     </label>
                     <div
                       className="search-modal-results"
                       ref={searchResultsRef}
-                      aria-busy={messageSearchLoading}
+                      aria-busy={searchBusy}
                       onKeyDown={(event) => {
                         if (event.key === "ArrowDown" || event.key === "ArrowUp") {
                           event.preventDefault();
@@ -1667,50 +1808,62 @@ export const TaskSidebar = memo(function TaskSidebar({
                     >
                       {normalizedQuery ? (
                         <>
-                          <div className="search-modal-results-heading">
-                            <span>Results</span>
-                            <small>
-                              {messageSearchLoading ? "Searching…" : searchResults.length}
-                            </small>
-                          </div>
                           {searchResults.length ? (
-                            <div className="search-modal-result-list">
-                              {visibleSearchResults.map((task) =>
-                                renderChat(task, {
-                                  showProject: true,
-                                  searchResult: true,
-                                  snippet: messageHitByTask.get(task.id),
-                                }),
-                              )}
-                              {searchResults.length > searchResultLimit ? (
-                                <button
-                                  className="project-chat-more"
-                                  type="button"
-                                  onClick={() => setSearchResultLimit((current) => current + 120)}
-                                >
-                                  Show more results
-                                </button>
-                              ) : null}
-                            </div>
-                          ) : messageSearchLoading ? (
+                            <>
+                              <div className="search-modal-results-heading">
+                                <span>Chats</span>
+                                <small>
+                                  {messageSearchLoading ? "Searching…" : searchResults.length}
+                                </small>
+                              </div>
+                              <div className="search-modal-result-list">
+                                {visibleSearchResults.map((task) =>
+                                  renderChat(task, {
+                                    showProject: true,
+                                    searchResult: true,
+                                    snippet: messageHitByTask.get(task.id),
+                                  }),
+                                )}
+                                {searchResults.length > searchResultLimit ? (
+                                  <button
+                                    className="project-chat-more"
+                                    type="button"
+                                    onClick={() => setSearchResultLimit((current) => current + 120)}
+                                  >
+                                    Show more results
+                                  </button>
+                                ) : null}
+                              </div>
+                            </>
+                          ) : null}
+                          {/* Each group appears the moment its own search
+                              lands, so the near-instant file list is never
+                              held behind the slower walk through file text. */}
+                          {renderRepositoryGroup("Files", fileRows, pathOutcome)}
+                          {renderRepositoryGroup("In files", contentRows, contentOutcome)}
+                          {!searchFoundNothing ? null : searchBusy ? (
                             <div className="search-modal-state" role="status">
                               <Search aria-hidden="true" />
                               <strong>Searching…</strong>
-                              <span>Looking through your chat history.</span>
+                              <span>Looking through your chats and this project's files.</span>
                             </div>
                           ) : (
                             <div className="search-modal-state" role="status">
                               <History aria-hidden="true" />
-                              <strong>No matching chats</strong>
-                              <span>Try a chat title, project, or words from a message.</span>
+                              <strong>Nothing matches that yet</strong>
+                              <span>
+                                Try a chat title, a file name, or a phrase from inside a file.
+                              </span>
                             </div>
                           )}
                         </>
                       ) : (
                         <div className="search-modal-state search-modal-state--idle">
                           <Search aria-hidden="true" />
-                          <strong>Find any conversation</strong>
-                          <span>Search by chat title, project, or message text.</span>
+                          <strong>Find any conversation or file</strong>
+                          <span>
+                            Search chat titles, message text, file names, and the text inside them.
+                          </span>
                         </div>
                       )}
                     </div>

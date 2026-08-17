@@ -40,9 +40,9 @@ fn focus_window(window: &tauri::Window) -> Result<(), CommandError> {
         .is_minimized()
         .map_err(|error| unavailable(format!("could not inspect the browser window: {error}")))?
     {
-        window
-            .unminimize()
-            .map_err(|error| unavailable(format!("could not restore the browser window: {error}")))?;
+        window.unminimize().map_err(|error| {
+            unavailable(format!("could not restore the browser window: {error}"))
+        })?;
     }
     window
         .show()
@@ -80,9 +80,12 @@ pub fn ensure_window(app: &AppHandle, task_id: &str) -> Result<tauri::Window, Co
     let close_app = app.clone();
     let close_task_id = task_id.to_string();
     window.on_window_event(move |event| {
-        if !matches!(event, tauri::WindowEvent::Destroyed) {
+        let tauri::WindowEvent::CloseRequested { api, .. } = event else {
             return;
-        }
+        };
+        // Reparent while the source HWND/NSWindow still exists. Destroying the
+        // host first also destroys its children and makes docking impossible.
+        api.prevent_close();
         let app = close_app.clone();
         let task_id = close_task_id.clone();
         tauri::async_runtime::spawn(async move {
@@ -154,7 +157,9 @@ fn move_tab(
         size: size.into(),
     }) {
         let _ = webview.reparent(&source);
-        return Err(unavailable(format!("could not park the moved tab: {error}")));
+        return Err(unavailable(format!(
+            "could not park the moved tab: {error}"
+        )));
     }
     let tab = state
         .update(id, |tab| {
@@ -163,6 +168,15 @@ fn move_tab(
         })
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
     emit_changed(app, state);
+    if !popped_out
+        && !state
+            .snapshot(Some(&current.task_id))
+            .iter()
+            .any(|candidate| candidate.popped_out)
+        && let Some(window) = app.get_window(&window_label(&current.task_id))
+    {
+        let _ = window.hide();
+    }
     Ok(tab)
 }
 

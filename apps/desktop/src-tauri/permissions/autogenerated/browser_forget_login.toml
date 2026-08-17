@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-browser-forget-login"
+description = "Enables the browser_forget_login command without any pre-configured scope."
+commands.allow = ["browser_forget_login"]
+
+[[permission]]
+identifier = "deny-browser-forget-login"
+description = "Denies the browser_forget_login command without any pre-configured scope."
+commands.deny = ["browser_forget_login"]

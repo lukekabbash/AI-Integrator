@@ -18,6 +18,10 @@
   delete window.__integratorBrowser;
   /** Proves a call came from the app rather than from the page or an agent. */
   const HOST_KEY = String(CONFIG.hostKey ?? "");
+  // Captured before page scripts can replace it. Context-menu actions use a
+  // denied new-window request as a private guest-to-host signal; no page is
+  // navigated and no remote IPC capability is exposed.
+  const HOST_OPEN = typeof window.open === "function" ? window.open.bind(window) : null;
 
   const REFS = new Map(); // ref -> WeakRef<Element>
   const BY_ELEMENT = new WeakMap(); // Element -> ref
@@ -27,8 +31,7 @@
   const ok = (value) => ({ ok: true, value: value ?? null });
   /** Returned by `resolve` for a ref issued by a document that has since gone. */
   const STALE = Symbol("stale-ref");
-  const STALE_MESSAGE =
-    "That ref came from a page this tab has since left. Take a fresh snapshot.";
+  const STALE_MESSAGE = "That ref came from a page this tab has since left. Take a fresh snapshot.";
   const err = (code, message) => ({ ok: false, error: { code, message: String(message) } });
 
   function refFor(element) {
@@ -121,7 +124,10 @@
       if (text) return text;
     }
     if (element.labels?.length) {
-      const text = [...element.labels].map((l) => l.textContent ?? "").join(" ").trim();
+      const text = [...element.labels]
+        .map((l) => l.textContent ?? "")
+        .join(" ")
+        .trim();
       if (text) return text;
     }
     const attr =
@@ -209,7 +215,10 @@
     if (target.text) {
       const wanted = String(target.text).toLowerCase();
       const role = target.role ? String(target.role).toLowerCase() : null;
-      const candidates = [...document.querySelectorAll(INTERACTIVE), ...document.querySelectorAll("*")];
+      const candidates = [
+        ...document.querySelectorAll(INTERACTIVE),
+        ...document.querySelectorAll("*"),
+      ];
       for (const element of candidates) {
         if (!visible(element)) continue;
         if (role && roleOf(element).toLowerCase() !== role) continue;
@@ -441,10 +450,14 @@
       altKey: Boolean(options.altKey),
       metaKey: Boolean(options.metaKey),
     };
-    element.dispatchEvent(new PointerEvent("pointerdown", { ...base, pointerId: 1, isPrimary: true }));
+    element.dispatchEvent(
+      new PointerEvent("pointerdown", { ...base, pointerId: 1, isPrimary: true }),
+    );
     element.dispatchEvent(new MouseEvent("mousedown", base));
     if (typeof element.focus === "function") element.focus({ preventScroll: true });
-    element.dispatchEvent(new PointerEvent("pointerup", { ...base, buttons: 0, pointerId: 1, isPrimary: true }));
+    element.dispatchEvent(
+      new PointerEvent("pointerup", { ...base, buttons: 0, pointerId: 1, isPrimary: true }),
+    );
     element.dispatchEvent(new MouseEvent("mouseup", { ...base, buttons: 0 }));
     element.dispatchEvent(new MouseEvent("click", { ...base, buttons: 0, detail: 1 }));
   }
@@ -522,11 +535,27 @@
    * entirely different things, and clicking through those is not ours to do.
    */
   const CONSENT_VENDORS = [
-    { name: "Cookiebot", root: "#CybotCookiebotDialog", reject: "#CybotCookiebotDialogBodyButtonDecline" },
-    { name: "OneTrust", root: "#onetrust-consent-sdk", reject: "#onetrust-reject-all-handler,.ot-pc-refuse-all-handler" },
+    {
+      name: "Cookiebot",
+      root: "#CybotCookiebotDialog",
+      reject: "#CybotCookiebotDialogBodyButtonDecline",
+    },
+    {
+      name: "OneTrust",
+      root: "#onetrust-consent-sdk",
+      reject: "#onetrust-reject-all-handler,.ot-pc-refuse-all-handler",
+    },
     { name: "Didomi", root: "#didomi-host", reject: "#didomi-notice-disagree-button" },
-    { name: "Usercentrics", root: "#usercentrics-root", reject: "[data-testid='uc-deny-all-button']" },
-    { name: "Quantcast", root: ".qc-cmp2-container", reject: ".qc-cmp2-summary-buttons button[mode='secondary']" },
+    {
+      name: "Usercentrics",
+      root: "#usercentrics-root",
+      reject: "[data-testid='uc-deny-all-button']",
+    },
+    {
+      name: "Quantcast",
+      root: ".qc-cmp2-container",
+      reject: ".qc-cmp2-summary-buttons button[mode='secondary']",
+    },
     { name: "consentmanager", root: "#cmpwrapper,#cmpbox", reject: "#cmpbntnotxt,.cmpboxbtnno" },
   ];
 
@@ -759,6 +788,8 @@
   let overlayHost = null;
   let overlayRoot = null;
   let pickState = null;
+  let contextMenu = null;
+  let overlayTheme = null;
 
   function ensureOverlay() {
     if (overlayHost?.isConnected) return overlayRoot;
@@ -802,6 +833,24 @@
                            color:var(--accent-ink,#fff);font-weight:600}
       .note button.primary:hover{filter:brightness(1.06)}
       .note small{display:block;margin-top:8px;color:var(--muted,#96a0ab);font-size:10px}
+      .context-menu{position:fixed;z-index:4;min-width:224px;max-width:292px;padding:6px;
+                    pointer-events:auto;box-sizing:border-box;
+                    border:1px solid var(--line,rgba(255,255,255,.14));
+                    border-radius:var(--radius,12px);background:var(--surface,#16191d);
+                    color:var(--ink,#e7ebf0);
+                    box-shadow:0 2px 5px rgba(0,0,0,.16),0 18px 48px rgba(0,0,0,.30);
+                    font:12px/1.35 var(--font,ui-sans-serif,system-ui,sans-serif)}
+      .context-menu .context-label{padding:5px 9px 7px;overflow:hidden;white-space:nowrap;
+                                   text-overflow:ellipsis;color:var(--muted,#96a0ab);
+                                   font-size:10px;font-weight:620;letter-spacing:.03em}
+      .context-menu button{display:flex;width:100%;align-items:center;justify-content:space-between;
+                           gap:14px;padding:7px 9px;border:0;border-radius:calc(var(--radius,12px) - 5px);
+                           background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
+      .context-menu button:hover,.context-menu button:focus-visible{
+                           outline:none;background:color-mix(in srgb,var(--ink,#e7ebf0) 8%,transparent)}
+      .context-menu button:active{background:color-mix(in srgb,var(--ink,#e7ebf0) 13%,transparent)}
+      .context-menu button small{flex:none;color:var(--muted,#96a0ab);font-size:10px}
+      .context-menu hr{height:1px;margin:5px 6px;border:0;background:var(--line,rgba(255,255,255,.14))}
       /* The agent's own cursor. A page driven from the outside otherwise moves
          by itself with nothing to watch; this shows where the work is landing,
          the way a person's pointer would. It never takes pointer events and it
@@ -854,6 +903,7 @@
       }
     </style><svg><g id="strokes"></g></svg><div id="marks"></div><div id="agent"></div>`;
     document.documentElement.appendChild(overlayHost);
+    if (overlayTheme) applyTheme(overlayTheme);
     return overlayRoot;
   }
 
@@ -861,6 +911,7 @@
     overlayHost?.remove();
     overlayHost = null;
     overlayRoot = null;
+    contextMenu = null;
   }
 
   /* ------------------------------------------------------------- cursor */
@@ -1024,6 +1075,7 @@
    * fixed dark palette that reads as someone else's UI on a light theme.
    */
   function applyTheme(theme) {
+    overlayTheme = theme ?? overlayTheme;
     if (!overlayHost || !theme) return;
     for (const [key, custom] of [
       ["accent", "--accent"],
@@ -1073,6 +1125,148 @@
       ::-webkit-scrollbar-thumb:hover{background:${theme?.scrollThumbHover || thumb};
         border:2px solid transparent;background-clip:content-box}
       ::-webkit-scrollbar-corner{background:transparent}`;
+  }
+
+  /* --------------------------------------------------------- context menu */
+
+  function contextLink(event) {
+    for (const node of event.composedPath()) {
+      if (!(node instanceof Element) || node === overlayHost) continue;
+      const anchor = node.closest?.("a[href]");
+      if (!anchor) continue;
+      try {
+        const url = new URL(anchor.href, location.href);
+        if (url.protocol === "http:" || url.protocol === "https:") return url.href;
+      } catch {
+        // A malformed or non-web link is not offered to the host.
+      }
+    }
+    return null;
+  }
+
+  function contextSelection(target) {
+    if (
+      (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) &&
+      target.type !== "password" &&
+      typeof target.selectionStart === "number" &&
+      typeof target.selectionEnd === "number"
+    ) {
+      return target.value.slice(target.selectionStart, target.selectionEnd).trim().slice(0, 1600);
+    }
+    return String(getSelection()?.toString() ?? "")
+      .trim()
+      .slice(0, 1600);
+  }
+
+  function dismissContextMenu() {
+    contextMenu?.remove();
+    contextMenu = null;
+  }
+
+  function signalContextAction(action, url, text) {
+    if (!HOST_OPEN || !HOST_KEY) return;
+    const query = new URLSearchParams({ key: HOST_KEY, action });
+    if (url) query.set("url", url);
+    if (text) query.set("text", text);
+    // `on_new_window` consumes and denies this request. Capturing the native
+    // function before the page loaded keeps the key out of page-owned hooks.
+    HOST_OPEN(`integrator-browser-context://action?${query}`, "_blank", "noopener");
+  }
+
+  async function copyContextValue(value, button) {
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch {
+      const field = document.createElement("textarea");
+      field.value = value;
+      field.setAttribute("readonly", "");
+      field.style.cssText = "position:fixed;left:-9999px;top:0";
+      document.documentElement.appendChild(field);
+      field.select();
+      document.execCommand("copy");
+      field.remove();
+    }
+    const label = button.querySelector("span");
+    if (label) label.textContent = "Copied";
+    setTimeout(dismissContextMenu, 480);
+  }
+
+  function contextMenuButton(menu, label, hint, run) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.setAttribute("role", "menuitem");
+    const name = document.createElement("span");
+    name.textContent = label;
+    button.appendChild(name);
+    if (hint) {
+      const detail = document.createElement("small");
+      detail.textContent = hint;
+      button.appendChild(detail);
+    }
+    button.addEventListener("click", (event) => {
+      if (!event.isTrusted) return;
+      event.preventDefault();
+      event.stopPropagation();
+      run(button);
+    });
+    menu.appendChild(button);
+  }
+
+  function showContextMenu(event) {
+    const link = contextLink(event);
+    const selection = contextSelection(event.target);
+    const pageUrl = location.href;
+    const root = ensureOverlay();
+    dismissContextMenu();
+
+    const menu = document.createElement("div");
+    menu.className = "context-menu";
+    menu.setAttribute("role", "menu");
+    menu.setAttribute("aria-label", "Browser page actions");
+    const caption = document.createElement("div");
+    caption.className = "context-label";
+    try {
+      caption.textContent = link ? new URL(link).hostname : document.title || location.hostname;
+    } catch {
+      caption.textContent = "Browser page";
+    }
+    menu.appendChild(caption);
+
+    if (link) {
+      contextMenuButton(menu, "Open link in new tab", "New tab", () => {
+        signalContextAction("open-tab", link, "");
+        dismissContextMenu();
+      });
+    }
+    contextMenuButton(menu, link ? "Copy link address" : "Copy page address", "Copy", (button) => {
+      void copyContextValue(link ?? pageUrl, button);
+    });
+    if (selection) {
+      contextMenuButton(menu, "Copy selected text", "Copy", (button) => {
+        void copyContextValue(selection, button);
+      });
+    }
+    contextMenuButton(menu, "Add to chat", "Agent context", () => {
+      signalContextAction("send-chat", link ?? "", selection);
+      dismissContextMenu();
+    });
+    const divider = document.createElement("hr");
+    menu.appendChild(divider);
+    contextMenuButton(menu, "Refresh page", "Reload", () => {
+      dismissContextMenu();
+      location.reload();
+    });
+
+    menu.style.visibility = "hidden";
+    root.appendChild(menu);
+    const rect = menu.getBoundingClientRect();
+    const left = Math.max(8, Math.min(event.clientX, innerWidth - rect.width - 8));
+    const top = Math.max(8, Math.min(event.clientY, innerHeight - rect.height - 8));
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+    menu.style.visibility = "visible";
+    contextMenu = menu;
+    menu.querySelector("button")?.focus({ preventScroll: true });
   }
 
   /** Floating note anchored beside the picked element. */
@@ -1214,15 +1408,25 @@
       element.scrollIntoView({ block: "center", inline: "center" });
       const point = centreOf(element);
       agentCursor(point, "hover");
-      const base = { bubbles: true, cancelable: true, composed: true, clientX: point.x, clientY: point.y };
+      const base = {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        clientX: point.x,
+        clientY: point.y,
+      };
       const chain = [element, ...ancestors(element, 4)];
       // Menus usually open from a listener on the wrapper rather than on the
       // link itself, and mouseenter does not bubble, so each is told directly.
       for (const node of chain) {
-        node.dispatchEvent(new PointerEvent("pointerover", { ...base, pointerId: 1, isPrimary: true }));
+        node.dispatchEvent(
+          new PointerEvent("pointerover", { ...base, pointerId: 1, isPrimary: true }),
+        );
         node.dispatchEvent(new MouseEvent("mouseover", base));
         node.dispatchEvent(new MouseEvent("mouseenter", { ...base, bubbles: false }));
-        node.dispatchEvent(new PointerEvent("pointermove", { ...base, pointerId: 1, isPrimary: true }));
+        node.dispatchEvent(
+          new PointerEvent("pointermove", { ...base, pointerId: 1, isPrimary: true }),
+        );
         node.dispatchEvent(new MouseEvent("mousemove", base));
       }
       return ok({
@@ -1311,7 +1515,8 @@
       if (element === STALE) return err("stale-ref", STALE_MESSAGE);
       if (!element) return err("not-found", "No element matched that target.");
       element.scrollIntoView({ block: "center", inline: "center" });
-      const point = target.x != null && target.y != null ? { x: target.x, y: target.y } : centreOf(element);
+      const point =
+        target.x != null && target.y != null ? { x: target.x, y: target.y } : centreOf(element);
       // The press lands as the pointer arrives, not before it sets off.
       schedule(agentCursor(point, "click"), () => {
         agentTap();
@@ -1406,7 +1611,10 @@
         to?.x != null && to?.y != null ? { x: to.x, y: to.y } : target ? centreOf(target) : null;
       if (!end) return err("not-found", "No element or point matched the end of the drag.");
 
-      const steps = Math.max(6, Math.min(24, Math.round(Math.hypot(end.x - start.x, end.y - start.y) / 24)));
+      const steps = Math.max(
+        6,
+        Math.min(24, Math.round(Math.hypot(end.x - start.x, end.y - start.y) / 24)),
+      );
       const base = (point, buttons) => ({
         bubbles: true,
         cancelable: true,
@@ -1432,7 +1640,8 @@
         agentTap();
         source.dispatchEvent(new PointerEvent("pointerdown", base(start, 1)));
         source.dispatchEvent(new MouseEvent("mousedown", base(start, 1)));
-        if (html5) dragSequence(html5, target ?? document.elementFromPoint(end.x, end.y), base, start, end);
+        if (html5)
+          dragSequence(html5, target ?? document.elementFromPoint(end.x, end.y), base, start, end);
         const hop = (index) => {
           const ratio = index / steps;
           const at = {
@@ -1638,6 +1847,37 @@
       return ok({ cleared: true });
     },
   };
+
+  addEventListener(
+    "contextmenu",
+    (event) => {
+      if (event.composedPath().includes(overlayHost)) {
+        event.preventDefault();
+        return;
+      }
+      if (!event.isTrusted || pickState) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      showContextMenu(event);
+    },
+    true,
+  );
+  addEventListener(
+    "pointerdown",
+    (event) => {
+      if (contextMenu && !event.composedPath().includes(overlayHost)) dismissContextMenu();
+    },
+    true,
+  );
+  addEventListener(
+    "keydown",
+    (event) => {
+      if (event.key === "Escape") dismissContextMenu();
+    },
+    true,
+  );
+  addEventListener("scroll", dismissContextMenu, true);
+  addEventListener("resize", dismissContextMenu);
 
   // Only when the user has asked for it, and only ever the reject control.
   if (CONFIG.dismissConsent) {
