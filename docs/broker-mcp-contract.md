@@ -34,6 +34,7 @@ The local desktop/broker remains authoritative for task identity, policy interse
 | `browser_list` | No | List the calling task's browser tabs, including which are asleep and who is driving one |
 | `browser_drag` | No | Press at one element or point, move, and release at another |
 | `browser_close` | No | Close one of the calling task's tabs when the agent is done with it |
+| `browser_hover` | No | Move the pointer over an element, for menus that open on hover |
 | `browser_navigate` | Yes | Point one of those tabs at a URL |
 | `browser_snapshot` | No | Read a page: url, title, viewport, text, and interactive elements with stable refs |
 | `browser_click` / `browser_type` / `browser_press` / `browser_scroll` | Yes | Synthesise one interaction in a tab |

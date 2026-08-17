@@ -321,6 +321,7 @@ describe("AI Integrator desktop workspace", () => {
       "Personalization",
       "Appearance",
       "Composer",
+      "Keyboard",
       "Runtimes and Models",
       "Skills and Plugins",
       "Subagents",

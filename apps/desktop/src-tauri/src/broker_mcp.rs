@@ -337,6 +337,18 @@ fn tool_definitions(role: &str, mode: &str, harness_instructions: Option<&str>) 
                     }), &["tabId"]),
                 }),
                 json!({
+                    "name": "browser_hover",
+                    "description": "Move the pointer over one element without pressing. Menus and tooltips that open on hover need this before their contents exist to click.",
+                    "annotations": tool_annotations(false, false),
+                    "inputSchema": text_schema(json!({
+                    "tabId": { "type": "string" },
+                    "ref": { "type": "string" },
+                    "selector": { "type": "string" },
+                    "text": { "type": "string" },
+                    "role": { "type": "string" }
+                    }), &["tabId"]),
+                }),
+                json!({
                     "name": "browser_type",
                     "description": "Type text into one field. Target it like browser_click; set clear to replace the current value.",
                     "annotations": tool_annotations(false, true),
@@ -368,6 +380,16 @@ fn tool_definitions(role: &str, mode: &str, harness_instructions: Option<&str>) 
                     "deltaY": { "type": "number" },
                     "selector": { "type": "string" }
                     }), &["tabId"]),
+                }),
+                json!({
+                    "name": "browser_drag",
+                    "description": "Press at one element or point, move, and release at another: reordering a list, moving a slider, drawing on a canvas. Targets take the same ref/selector/text as browser_click, or explicit x and y.",
+                    "annotations": tool_annotations(false, false),
+                    "inputSchema": text_schema(json!({
+                    "tabId": { "type": "string" },
+                    "from": { "type": "object", "description": "Start: { ref } | { selector } | { text, role } | { x, y }" },
+                    "to": { "type": "object", "description": "End: { ref } | { selector } | { text, role } | { x, y }" }
+                    }), &["tabId", "from", "to"]),
                 }),
                 json!({
                     "name": "browser_wait_for",
@@ -627,9 +649,11 @@ mod tests {
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",
+                "browser_hover",
                 "browser_type",
                 "browser_press",
                 "browser_scroll",
+                "browser_drag",
                 "browser_wait_for",
                 "browser_evaluate",
             ]
@@ -653,9 +677,11 @@ mod tests {
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",
+                "browser_hover",
                 "browser_type",
                 "browser_press",
                 "browser_scroll",
+                "browser_drag",
                 "browser_wait_for",
                 "browser_evaluate",
             ]
@@ -679,9 +705,11 @@ mod tests {
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",
+                "browser_hover",
                 "browser_type",
                 "browser_press",
                 "browser_scroll",
+                "browser_drag",
                 "browser_wait_for",
                 "browser_evaluate",
             ]

@@ -496,6 +496,8 @@ const INTEGRATOR_TOOL_COPY: Readonly<Record<string, readonly [string, string]>> 
   browser_open: ["Opening a browser tab", "Opened a browser tab"],
   browser_list: ["Checking open browser tabs", "Checked open browser tabs"],
   browser_close: ["Closing a browser tab", "Closed a browser tab"],
+  browser_hover: ["Hovering an element", "Hovered an element"],
+  browser_drag: ["Dragging on the page", "Dragged on the page"],
   browser_navigate: ["Opening a page", "Opened a page"],
   browser_snapshot: ["Reading the page", "Read the page"],
   browser_click: ["Clicking on the page", "Clicked on the page"],

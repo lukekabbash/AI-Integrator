@@ -631,9 +631,11 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_navigate",
             "browser_snapshot",
             "browser_click",
+            "browser_hover",
             "browser_type",
             "browser_press",
             "browser_scroll",
+            "browser_drag",
             "browser_wait_for",
             "browser_evaluate",
         ]),
@@ -649,9 +651,11 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_navigate",
             "browser_snapshot",
             "browser_click",
+            "browser_hover",
             "browser_type",
             "browser_press",
             "browser_scroll",
+            "browser_drag",
             "browser_wait_for",
             "browser_evaluate",
         ]),
@@ -674,9 +678,11 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_navigate",
             "browser_snapshot",
             "browser_click",
+            "browser_hover",
             "browser_type",
             "browser_press",
             "browser_scroll",
+            "browser_drag",
             "browser_wait_for",
             "browser_evaluate",
         ]),
@@ -700,9 +706,11 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_navigate",
             "browser_snapshot",
             "browser_click",
+            "browser_hover",
             "browser_type",
             "browser_press",
             "browser_scroll",
+            "browser_drag",
             "browser_wait_for",
             "browser_evaluate",
         ]),
@@ -1474,6 +1482,7 @@ async fn browser_tool(
             call("snapshot", vec![json!({ "limit": limit })]).await
         }
         "browser_click" => call("click", vec![target(), json!({})]).await,
+        "browser_hover" => call("hover", vec![target()]).await,
         "browser_type" => {
             let value = text("text")
                 .ok_or_else(|| IntegratorError::InvalidInput("text is required".into()))?;
@@ -1495,6 +1504,10 @@ async fn browser_tool(
                 .cloned()
                 .unwrap_or_else(|| json!([]));
             call("press", vec![Value::String(key), modifiers]).await
+        }
+        "browser_drag" => {
+            let point = |key: &str| params.get(key).cloned().unwrap_or(Value::Null);
+            call("drag", vec![point("from"), point("to"), json!({})]).await
         }
         "browser_scroll" => {
             let delta_x = params.get("deltaX").and_then(Value::as_f64).unwrap_or(0.0);
@@ -4070,9 +4083,11 @@ mod tests {
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",
+                "browser_hover",
                 "browser_type",
                 "browser_press",
                 "browser_scroll",
+                "browser_drag",
                 "browser_wait_for",
                 "browser_evaluate",
             ])
@@ -4131,9 +4146,11 @@ mod tests {
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",
+                "browser_hover",
                 "browser_type",
                 "browser_press",
                 "browser_scroll",
+                "browser_drag",
                 "browser_wait_for",
                 "browser_evaluate",
             ])
@@ -4158,9 +4175,11 @@ mod tests {
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",
+                "browser_hover",
                 "browser_type",
                 "browser_press",
                 "browser_scroll",
+                "browser_drag",
                 "browser_wait_for",
                 "browser_evaluate",
             ])
@@ -4183,9 +4202,11 @@ mod tests {
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",
+                "browser_hover",
                 "browser_type",
                 "browser_press",
                 "browser_scroll",
+                "browser_drag",
                 "browser_wait_for",
                 "browser_evaluate",
             ])

@@ -30,6 +30,7 @@ import {
   ExternalLink,
   GitBranch,
   KeyRound,
+  Keyboard,
   Lightbulb,
   LoaderCircle,
   Mic,
@@ -91,6 +92,7 @@ import { AppearanceSettings } from "./AppearanceSettings";
 import { ArchiveSettings } from "./ArchiveSettings";
 import { BrandMark } from "./BrandMark";
 import { ComposerSettings } from "./ComposerSettings";
+import { KeybindingsSettings } from "./KeybindingsSettings";
 import { Tooltip } from "./Tooltip";
 import { Dropdown, ProviderIcon, type DropdownOption } from "./Dropdown";
 import { Slider } from "./Slider";
@@ -157,6 +159,7 @@ export type SettingsSection =
   | "memory"
   | "appearance"
   | "composer"
+  | "keybindings"
   | "explain"
   | "git"
   | "browser"
@@ -190,6 +193,8 @@ interface SettingsViewProps {
   onResetPreferences: () => void;
   runtimeActionRequest?: RuntimeActionRequest | null;
   initialSection?: SettingsSection;
+  /** Bumped every time the workspace asks for a section; see the sync below. */
+  sectionRequest?: number;
   onRefreshRuntimes?: () => Promise<RuntimeConnection[]>;
   /** Mirrors each persisted change into the workspace immediately. */
   onSettingChanged?: (key: string, value: unknown) => void;
@@ -212,6 +217,12 @@ const settingsNav: Array<{ id: SettingsSection; label: string; hint: string; ico
   },
   { id: "appearance", label: "Appearance", hint: "Themes, type, motion", icon: Palette },
   { id: "composer", label: "Composer", hint: "Send behavior", icon: Braces },
+  {
+    id: "keybindings",
+    label: "Keyboard",
+    hint: "Shortcuts for every global command",
+    icon: Keyboard,
+  },
   {
     id: "models-runtimes",
     label: "Runtimes and Models",
@@ -262,6 +273,8 @@ const DEFAULT_SETTINGS: SettingsMap = {
   "personalization.about": "",
   "memory.enabled": false,
   "composer.enterToSend": true,
+  "keyboard.arrowNavigation": true,
+  "keyboard.wrapNavigation": true,
   "transcript.showModel": true,
   "transcript.showTimestamps": true,
   "transcript.activityDensity": "normal",
@@ -5129,6 +5142,16 @@ export function SettingsView(props: SettingsViewProps) {
   const [section, setSection] = useState<SettingsSection>(
     props.runtimeActionRequest ? "models-runtimes" : (props.initialSection ?? "general"),
   );
+  // This view stays mounted behind the workspace, so a later "open Settings at
+  // X" cannot arrive as a fresh mount. Adjusting during render (rather than in
+  // an effect) lands the right section in the same commit as the screen change.
+  const [appliedSectionRequest, setAppliedSectionRequest] = useState(props.sectionRequest ?? 0);
+  if ((props.sectionRequest ?? 0) !== appliedSectionRequest) {
+    setAppliedSectionRequest(props.sectionRequest ?? 0);
+    setSection(
+      props.runtimeActionRequest ? "models-runtimes" : (props.initialSection ?? "general"),
+    );
+  }
   const [query, setQuery] = useState("");
   const [settings, setSettings] = useState<SettingsMap>(DEFAULT_SETTINGS);
   const [appInfo, setAppInfo] = useState<LocalAppInfo>({
@@ -5326,6 +5349,9 @@ export function SettingsView(props: SettingsViewProps) {
               runtimes={props.runtimes}
               projectName={props.projects?.find((project) => !project.archived)?.name}
             />
+          ) : null}
+          {section === "keybindings" ? (
+            <KeybindingsSettings settings={settings} setSetting={setSetting} />
           ) : null}
           {section === "browser" ? (
             <BrowserSettings settings={settings} setSetting={setSetting} />

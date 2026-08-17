@@ -3117,6 +3117,7 @@ export function RightRailShell({
         className="rail-tabs"
         role="tablist"
         aria-label={label}
+        data-nav-region="rightRail"
         style={{ "--rail-tab-count": tabs.length } as CSSProperties}
       >
         {tabs.map((item, index) => (
@@ -3129,6 +3130,9 @@ export function RightRailShell({
             aria-controls={`task-tools-panel-${item.id}`}
             tabIndex={activeTab === item.id ? 0 : -1}
             data-active={activeTab === item.id}
+            data-nav-item
+            data-nav-label={item.label}
+            data-nav-active={activeTab === item.id ? "true" : undefined}
             onClick={() => selectTab(item.id)}
             onKeyDown={(event) => moveTabFocus(event, index)}
           >

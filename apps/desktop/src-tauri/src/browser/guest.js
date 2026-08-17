@@ -17,15 +17,25 @@
   let generation = 0;
 
   const ok = (value) => ({ ok: true, value: value ?? null });
+  /** Returned by `resolve` for a ref issued by a document that has since gone. */
+  const STALE = Symbol("stale-ref");
+  const STALE_MESSAGE =
+    "That ref came from a page this tab has since left. Take a fresh snapshot.";
   const err = (code, message) => ({ ok: false, error: { code, message: String(message) } });
 
   function refFor(element) {
     let ref = BY_ELEMENT.get(element);
     if (ref && REFS.get(ref)?.deref() === element) return ref;
-    ref = `e${++refSeq}`;
+    ref = `e${++refSeq}@${generation}`;
     BY_ELEMENT.set(element, ref);
     REFS.set(ref, new WeakRef(element));
     return ref;
+  }
+
+  /** Refs are tagged with the generation that issued them; see `setGeneration`. */
+  function generationOf(ref) {
+    const at = String(ref).lastIndexOf("@");
+    return at === -1 ? null : Number(String(ref).slice(at + 1));
   }
 
   function elementForRef(ref) {
@@ -176,7 +186,11 @@
 
   function resolve(target) {
     if (!target) return null;
-    if (target.ref) return elementForRef(target.ref);
+    if (target.ref) {
+      const issued = generationOf(target.ref);
+      if (issued !== null && issued !== generation) return STALE;
+      return elementForRef(target.ref);
+    }
     if (target.selector) {
       try {
         return document.querySelector(target.selector);
@@ -201,6 +215,55 @@
   function centreOf(element) {
     const rect = element.getBoundingClientRect();
     return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  }
+
+  /**
+   * What the page looks like now that the action has landed. Every mutating
+   * entry point returns this, so a caller does not have to follow one tool call
+   * with a snapshot just to learn whether anything moved.
+   */
+  function pageState() {
+    const focused = document.activeElement;
+    return {
+      url: location.href,
+      title: document.title,
+      scrollY: Math.round(scrollY),
+      generation,
+      viewport: { width: innerWidth, height: innerHeight },
+      // A viewport this small means the tab is parked offscreen, not that the
+      // page is tiny. Saying so keeps the caller from trusting the geometry.
+      offscreen: innerWidth <= 16 || innerHeight <= 16,
+      focusedRef: focused && focused !== document.body ? refFor(focused) : null,
+    };
+  }
+
+  /** A field's own value, so `type` can report what actually stuck. */
+  function readValue(element) {
+    if (!element) return null;
+    if (element.contentEditable === "true") return element.textContent ?? "";
+    const value = "value" in element ? element.value : null;
+    if (typeof value !== "string") return null;
+    // Never echo a secret back through a tool reply.
+    return element.type === "password" ? null : value;
+  }
+
+  /**
+   * Submits the form a field belongs to. Synthesized keys do not trigger the
+   * browser's own default action, so Enter has to do this itself: ask the form
+   * first, then fall back to the control a person pressing Enter would hit.
+   */
+  function submitFrom(element) {
+    const form = element?.form ?? element?.closest?.("form");
+    if (!form) return false;
+    if (typeof form.requestSubmit === "function") {
+      const submitter = form.querySelector(
+        "button[type='submit'],input[type='submit'],button:not([type])",
+      );
+      form.requestSubmit(submitter ?? undefined);
+      return true;
+    }
+    form.submit();
+    return true;
   }
 
   function pointerSequence(element, point, options = {}) {
@@ -289,28 +352,50 @@
          the way a person's pointer would. It never takes pointer events and it
          is not part of #marks, so clearing annotations leaves it alone. */
       #agent{position:fixed;left:0;top:0;pointer-events:none;opacity:0;
-             transition:opacity .18s ease}
+             transition:opacity .5s cubic-bezier(.4,0,.2,1)}
       #agent[data-live="true"]{opacity:1}
-      #agent .point{position:absolute;left:0;top:0;width:22px;height:22px;
-                    transform:translate(-2px,-2px);
-                    transition:translate .26s cubic-bezier(.22,1,.28,1)}
-      #agent .point svg{display:block;width:22px;height:22px;
-                        filter:drop-shadow(0 2px 5px rgba(0,0,0,.35))}
-      #agent .ring{position:absolute;left:0;top:0;width:16px;height:16px;margin:-8px 0 0 -8px;
+      /* Travel uses a long ease-out so the pointer arrives the way a hand does:
+         quickly at first, settling at the end. The glow trails a beat behind it,
+         which is what reads as weight rather than teleporting. */
+      #agent .point{position:absolute;left:0;top:0;width:26px;height:26px;
+                    transition:translate .42s cubic-bezier(.16,1,.3,1)}
+      #agent .point .glyph{display:block;width:26px;height:26px;transform-origin:4px 3px;
+                           transition:transform .16s cubic-bezier(.34,1.56,.64,1);
+                           filter:drop-shadow(0 3px 8px rgba(0,0,0,.30))
+                                  drop-shadow(0 1px 2px rgba(0,0,0,.22))}
+      #agent[data-press="true"] .point .glyph{transform:scale(.82)}
+      #agent .halo{position:absolute;left:0;top:0;width:34px;height:34px;margin:-6px 0 0 -6px;
+                   border-radius:99px;opacity:.16;
+                   background:radial-gradient(circle,var(--accent,#4c8dff) 0%,transparent 68%);
+                   transition:translate .52s cubic-bezier(.16,1,.3,1),opacity .3s ease}
+      #agent .ring{position:absolute;left:0;top:0;width:18px;height:18px;margin:-9px 0 0 -9px;
                    border:2px solid var(--accent,#4c8dff);border-radius:99px;opacity:0;
-                   animation:integrator-tap .5s cubic-bezier(.22,1,.28,1) forwards}
-      #agent .label{position:absolute;left:18px;top:16px;padding:2px 7px;border-radius:99px;
+                   animation:integrator-tap .62s cubic-bezier(.16,1,.3,1) forwards}
+      #agent .trail{position:absolute;left:0;top:0;height:2px;border-radius:99px;
+                    transform-origin:0 50%;opacity:0;
+                    background:linear-gradient(90deg,transparent,var(--accent,#4c8dff));
+                    animation:integrator-trail .5s cubic-bezier(.16,1,.3,1) forwards}
+      #agent .label{position:absolute;left:20px;top:19px;padding:3px 8px;
+                    border-radius:calc(var(--radius,12px) - 5px);
                     background:var(--accent,#4c8dff);color:var(--accent-ink,#fff);
-                    font:10px/1.5 var(--font,ui-sans-serif,system-ui,sans-serif);
-                    font-weight:650;white-space:nowrap;
-                    box-shadow:0 2px 8px rgba(0,0,0,.28)}
+                    font:10px/1.45 var(--font,ui-sans-serif,system-ui,sans-serif);
+                    font-weight:640;letter-spacing:.01em;white-space:nowrap;
+                    opacity:0;transform:translateY(-2px);
+                    transition:opacity .22s ease,transform .22s cubic-bezier(.16,1,.3,1);
+                    box-shadow:0 4px 14px rgba(0,0,0,.26)}
+      #agent[data-acting="true"] .label{opacity:1;transform:translateY(0)}
       @keyframes integrator-tap{
-        0%{opacity:.9;transform:scale(.4)}
-        100%{opacity:0;transform:scale(2.6)}
+        0%{opacity:.85;transform:scale(.35)}
+        70%{opacity:.35}
+        100%{opacity:0;transform:scale(2.4)}
+      }
+      @keyframes integrator-trail{
+        0%{opacity:.5}
+        100%{opacity:0}
       }
       @media (prefers-reduced-motion: reduce){
-        #agent .point{transition:none}
-        #agent .ring{animation-duration:.01s}
+        #agent .point,#agent .halo,#agent .label{transition:none}
+        #agent .ring,#agent .trail{animation-duration:.01s}
       }
     </style><svg><g id="strokes"></g></svg><div id="marks"></div><div id="agent"></div>`;
     document.documentElement.appendChild(overlayHost);
@@ -325,53 +410,135 @@
 
   /* ------------------------------------------------------------- cursor */
 
+  // A pointer with a little weight to it: a filled arrow with a soft rim so it
+  // reads on any page, a highlight down one edge, and a shadow that lifts it
+  // off the content.
   const CURSOR_GLYPH =
-    '<svg viewBox="0 0 24 24" fill="none"><path d="M5 3l13 8.2-5.7 1.1L9.9 18 5 3z" ' +
-    'fill="var(--accent,#4c8dff)" stroke="var(--accent-ink,#fff)" stroke-width="1.4" ' +
-    'stroke-linejoin="round"/></svg>';
+    '<svg class="glyph" viewBox="0 0 26 26" fill="none">' +
+    '<path d="M5.2 3.1 19.6 12.2a.7.7 0 0 1-.24 1.28l-5.03.95a.7.7 0 0 0-.47.34l-2.6 4.6a.7.7 0 0 1-1.3-.2L5.2 3.1Z" ' +
+    'fill="var(--accent,#4c8dff)" stroke="var(--accent-ink,#fff)" stroke-width="1.5" ' +
+    'stroke-linejoin="round"/>' +
+    '<path d="M6.9 6.2 9.4 15l1.5-2.7 2.9-.55Z" fill="var(--accent-ink,#fff)" opacity=".22"/>' +
+    "</svg>";
+  /** How long the pointer travels before an action lands on the page. */
+  const CURSOR_TRAVEL_MS = 420;
+  /** The pointer stays put this long after the last action, then fades. */
+  const CURSOR_IDLE_MS = 120_000;
   let cursorIdle = 0;
+  let cursorActing = 0;
   let cursorAt = { x: 0, y: 0 };
 
+  const reducedMotion = () =>
+    typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+
   /**
-   * Shows the agent's pointer at a point and, for anything that lands, a tap
-   * ring. `label` names the action so a person watching can follow along.
-   * Sync on purpose: the host's entry points return a value, so the animation
-   * plays alongside the real event rather than delaying it.
+   * Moves the agent's pointer to a point and names what it is about to do.
+   * Returns how long the caller should wait before the real event lands, so
+   * the page reacts as the pointer arrives rather than before it sets off.
    */
   function agentCursor(point, label) {
     const root = ensureOverlay();
     const layer = root.getElementById("agent");
-    if (!layer) return;
+    if (!layer) return 0;
     const x = Math.round(point?.x ?? cursorAt.x);
     const y = Math.round(point?.y ?? cursorAt.y);
+    const from = cursorAt;
+    const distance = Math.hypot(x - from.x, y - from.y);
     cursorAt = { x, y };
+
     let pointer = layer.querySelector(".point");
+    let halo = layer.querySelector(".halo");
     if (!pointer) {
+      halo = document.createElement("div");
+      halo.className = "halo";
+      layer.appendChild(halo);
       pointer = document.createElement("div");
       pointer.className = "point";
       pointer.innerHTML = `${CURSOR_GLYPH}<span class="label"></span>`;
       layer.appendChild(pointer);
+      // First appearance starts where it is going, so it fades in rather than
+      // flying in from the top-left corner of the page.
+      pointer.style.translate = `${x}px ${y}px`;
+      halo.style.translate = `${x}px ${y}px`;
     }
     pointer.style.translate = `${x}px ${y}px`;
+    if (halo) halo.style.translate = `${x}px ${y}px`;
+
+    // A faint streak along the path, drawn once and left to fade. Short hops
+    // do not get one; they read as jitter rather than movement.
+    if (distance > 48 && !reducedMotion()) {
+      const trail = document.createElement("div");
+      trail.className = "trail";
+      trail.style.width = `${Math.round(distance)}px`;
+      trail.style.translate = `${from.x}px ${from.y}px`;
+      trail.style.rotate = `${Math.atan2(y - from.y, x - from.x)}rad`;
+      layer.appendChild(trail);
+      trail.addEventListener("animationend", () => trail.remove());
+    }
+
     const caption = pointer.querySelector(".label");
-    if (caption) {
-      caption.textContent = label ?? "";
-      caption.style.display = label ? "" : "none";
-    }
-    if (label) {
-      const ring = document.createElement("div");
-      ring.className = "ring";
-      ring.style.translate = `${x}px ${y}px`;
-      layer.appendChild(ring);
-      ring.addEventListener("animationend", () => ring.remove());
-    }
+    if (caption && label) caption.textContent = label;
     layer.dataset.live = "true";
+    layer.dataset.acting = label ? "true" : "false";
+    clearTimeout(cursorActing);
+    cursorActing = setTimeout(() => {
+      if (layer.isConnected) layer.dataset.acting = "false";
+    }, 1400);
+
     clearTimeout(cursorIdle);
-    // Fades on its own so a finished run does not leave a pointer parked on
-    // the page for the user to wonder about.
+    // It stays where it finished for a good while: a pointer that vanishes the
+    // moment a run pauses makes the next action look like it came from nowhere.
     cursorIdle = setTimeout(() => {
       if (layer.isConnected) layer.dataset.live = "false";
-    }, 2600);
+    }, CURSOR_IDLE_MS);
+
+    if (reducedMotion()) return 0;
+    // Nearby targets do not need the full travel time.
+    return distance < 8 ? 60 : Math.min(CURSOR_TRAVEL_MS, 140 + distance * 0.5);
+  }
+
+  /** The press itself: the arrow dips, a ring spreads from the point. */
+  function agentTap() {
+    const root = ensureOverlay();
+    const layer = root.getElementById("agent");
+    if (!layer) return;
+    layer.dataset.press = "true";
+    setTimeout(() => {
+      if (layer.isConnected) layer.dataset.press = "false";
+    }, 150);
+    const ring = document.createElement("div");
+    ring.className = "ring";
+    ring.style.translate = `${cursorAt.x}px ${cursorAt.y}px`;
+    layer.appendChild(ring);
+    ring.addEventListener("animationend", () => ring.remove());
+  }
+
+  /**
+   * Runs an action now and lets its cursor animation catch up afterwards.
+   *
+   * This used to defer the action behind the cursor's travel, which read well
+   * on screen and lied to the caller: `scroll` answered with the scroll
+   * position it had *before* scrolling, and a keypress could be flushed after
+   * the agent had already navigated away. The animation is decoration; the
+   * gesture is the answer, so the gesture goes first and the reply describes
+   * the page as it is once the action has landed.
+   *
+   * `flushPending` stays for the one case that still defers — a drag's
+   * intermediate hops — so a caller never observes a half-finished path.
+   */
+  let pending = null;
+
+  function schedule(_delay, run) {
+    flushPending();
+    run();
+  }
+
+  function flushPending() {
+    if (!pending) return;
+    const { timer, run } = pending;
+    pending = null;
+    clearTimeout(timer);
+    run();
   }
 
   function outline(element, label) {
@@ -509,7 +676,43 @@
       return ok({ themed: true });
     },
 
+    /**
+     * The host's document counter for this tab. A fresh document gets a fresh
+     * guest, so the guest cannot know how many pages came before it — only the
+     * host can, and it pushes the number in on every load. Refs are tagged with
+     * it, which is what lets a ref from an earlier page report itself as stale
+     * instead of merely missing.
+     */
+    setGeneration(value) {
+      const next = Number(value);
+      if (!Number.isFinite(next)) return err("invalid-input", "generation must be a number");
+      generation = next;
+      return ok({ generation });
+    },
+
+    /**
+     * Moves the pointer over an element without pressing. Menus that open on
+     * hover need this, and there was no way to ask for it.
+     */
+    hover(target) {
+      const element = resolve(target);
+      if (element === STALE) return err("stale-ref", STALE_MESSAGE);
+      if (!element) return err("not-found", "No element matched that target.");
+      element.scrollIntoView({ block: "center", inline: "center" });
+      const point = centreOf(element);
+      agentCursor(point, "hover");
+      const base = { bubbles: true, cancelable: true, composed: true, clientX: point.x, clientY: point.y };
+      element.dispatchEvent(new PointerEvent("pointerover", { ...base, pointerId: 1, isPrimary: true }));
+      element.dispatchEvent(new MouseEvent("mouseover", base));
+      element.dispatchEvent(new PointerEvent("pointermove", { ...base, pointerId: 1, isPrimary: true }));
+      element.dispatchEvent(new MouseEvent("mousemove", base));
+      return ok({ hovered: describe(element), ...pageState() });
+    },
+
     snapshot(options = {}) {
+      // Anything the host asks for settles the action still in flight, so a
+      // caller never reads the page mid-gesture.
+      flushPending();
       const limit = Math.min(options.limit ?? 200, 500);
       const elements = [];
       for (const element of document.querySelectorAll(INTERACTIVE)) {
@@ -531,37 +734,47 @@
 
     click(target, options = {}) {
       const element = resolve(target);
+      if (element === STALE) return err("stale-ref", STALE_MESSAGE);
       if (!element) return err("not-found", "No element matched that target.");
       element.scrollIntoView({ block: "center", inline: "center" });
       const point = target.x != null && target.y != null ? { x: target.x, y: target.y } : centreOf(element);
-      agentCursor(point, "click");
-      pointerSequence(element, point, options);
-      return ok({ clicked: describe(element) });
+      // The press lands as the pointer arrives, not before it sets off.
+      schedule(agentCursor(point, "click"), () => {
+        agentTap();
+        pointerSequence(element, point, options);
+      });
+      return ok({ clicked: describe(element), ...pageState() });
     },
 
     type(target, text, options = {}) {
       const element = target ? resolve(target) : document.activeElement;
+      if (element === STALE) return err("stale-ref", STALE_MESSAGE);
       if (!element) return err("not-found", "No element matched that target.");
       if (!("value" in element) && element.contentEditable !== "true") {
         return err("not-editable", "That element does not accept text.");
       }
       element.scrollIntoView({ block: "center" });
-      agentCursor(centreOf(element), text.length > 12 ? "typing" : `typing “${text}”`);
-      element.focus({ preventScroll: true });
-      if (element.contentEditable === "true") {
-        if (options.clear) element.textContent = "";
-        element.textContent += text;
-      } else {
-        setValue(element, options.clear ? text : `${element.value ?? ""}${text}`);
-      }
-      element.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }));
-      element.dispatchEvent(new Event("change", { bubbles: true }));
-      return ok({ typed: text.length });
+      const label = text.length > 12 ? "typing" : `typing “${text}”`;
+      schedule(agentCursor(centreOf(element), label), () => {
+        agentTap();
+        element.focus({ preventScroll: true });
+        if (element.contentEditable === "true") {
+          if (options.clear) element.textContent = "";
+          element.textContent += text;
+        } else {
+          setValue(element, options.clear ? text : `${element.value ?? ""}${text}`);
+        }
+        element.dispatchEvent(
+          new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }),
+        );
+        element.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      return ok({ typed: text.length, value: readValue(element), ...pageState() });
     },
 
     press(key, modifiers = []) {
       const element = document.activeElement ?? document.body;
-      agentCursor(centreOf(element), [...modifiers, key].join("+"));
+      const delay = agentCursor(centreOf(element), [...modifiers, key].join("+"));
       const init = {
         key,
         code: key.length === 1 ? `Key${key.toUpperCase()}` : key,
@@ -572,20 +785,94 @@
         altKey: modifiers.includes("Alt"),
         metaKey: modifiers.includes("Meta"),
       };
-      element.dispatchEvent(new KeyboardEvent("keydown", init));
-      if (key === "Enter" && element instanceof HTMLFormElement) element.requestSubmit?.();
-      element.dispatchEvent(new KeyboardEvent("keyup", init));
-      return ok({ key });
+      schedule(delay, () => {
+        agentTap();
+        const keydown = new KeyboardEvent("keydown", init);
+        const delivered = element.dispatchEvent(keydown);
+        // Synthesized keys do not run default actions, so Enter in a field has
+        // to submit for itself. The form is the element's owner, never the
+        // element — checking `instanceof HTMLFormElement` meant this never
+        // fired for the input a person would actually be typing in.
+        if (key === "Enter" && delivered && !modifiers.length) submitFrom(element);
+        element.dispatchEvent(new KeyboardEvent("keyup", init));
+      });
+      return ok({ key, ...pageState() });
+    },
+
+    /**
+     * Press at one point, travel, release at another — a sort, a slider, a
+     * canvas stroke. The pointer is moved in steps because most drag
+     * implementations listen for movement rather than a single jump, and the
+     * agent's cursor follows the same path so the gesture is watchable.
+     */
+    drag(from, to, options = {}) {
+      const source = resolve(from);
+      if (source === STALE) return err("stale-ref", STALE_MESSAGE);
+      if (!source) return err("not-found", "No element matched the start of the drag.");
+      source.scrollIntoView({ block: "center", inline: "center" });
+      const start =
+        from?.x != null && from?.y != null ? { x: from.x, y: from.y } : centreOf(source);
+      const target = to && (to.ref || to.selector || to.text) ? resolve(to) : null;
+      const end =
+        to?.x != null && to?.y != null ? { x: to.x, y: to.y } : target ? centreOf(target) : null;
+      if (!end) return err("not-found", "No element or point matched the end of the drag.");
+
+      const steps = Math.max(6, Math.min(24, Math.round(Math.hypot(end.x - start.x, end.y - start.y) / 24)));
+      const base = (point, buttons) => ({
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        clientX: Math.round(point.x),
+        clientY: Math.round(point.y),
+        button: 0,
+        buttons,
+        pointerId: 1,
+        isPrimary: true,
+      });
+
+      schedule(agentCursor(start, "drag"), () => {
+        agentTap();
+        source.dispatchEvent(new PointerEvent("pointerdown", base(start, 1)));
+        source.dispatchEvent(new MouseEvent("mousedown", base(start, 1)));
+        const hop = (index) => {
+          const ratio = index / steps;
+          const at = {
+            x: start.x + (end.x - start.x) * ratio,
+            y: start.y + (end.y - start.y) * ratio,
+          };
+          const over = document.elementFromPoint(at.x, at.y) ?? source;
+          over.dispatchEvent(new PointerEvent("pointermove", base(at, 1)));
+          over.dispatchEvent(new MouseEvent("mousemove", base(at, 1)));
+          if (index === steps) {
+            agentCursor(end, "drop");
+            const dropped = document.elementFromPoint(end.x, end.y) ?? target ?? source;
+            dropped.dispatchEvent(new PointerEvent("pointerup", base(end, 0)));
+            dropped.dispatchEvent(new MouseEvent("mouseup", base(end, 0)));
+            agentTap();
+            return;
+          }
+          // Moving over several frames rather than in one jump: a slider that
+          // reads only the final position still works, and one that tracks
+          // movement gets something to track.
+          setTimeout(() => hop(index + 1), reducedMotion() ? 0 : 16);
+        };
+        hop(1);
+      });
+      return ok({ from: describe(source), to: target ? describe(target) : end });
     },
 
     scroll(target, deltaX = 0, deltaY = 0) {
-      const element = target ? resolve(target) : null;
-      agentCursor(element ? centreOf(element) : { x: innerWidth / 2, y: innerHeight / 2 }, "scroll");
-      (element ?? window).scrollBy({ left: deltaX, top: deltaY, behavior: "instant" });
-      return ok({ scrollY: Math.round(scrollY) });
+      const target_ = target ? resolve(target) : null;
+      const element = target_ === STALE ? null : target_;
+      const at = element ? centreOf(element) : { x: innerWidth / 2, y: innerHeight / 2 };
+      schedule(agentCursor(at, "scroll"), () => {
+        (element ?? window).scrollBy({ left: deltaX, top: deltaY, behavior: "instant" });
+      });
+      return ok({ ...pageState() });
     },
 
     waitFor(condition = {}) {
+      flushPending();
       if (condition.urlIncludes && !location.href.includes(condition.urlIncludes)) {
         return ok({ matched: false });
       }
@@ -594,13 +881,15 @@
         if (!body.includes(condition.text)) return ok({ matched: false });
       }
       if (condition.selector || condition.ref || condition.role) {
-        const element = resolve(condition);
+        const resolved = resolve(condition);
+        const element = resolved === STALE ? null : resolved;
         if (!element || !visible(element)) return ok({ matched: false });
       }
       return ok({ matched: true });
     },
 
     evaluate(expression) {
+      flushPending();
       try {
         // Deliberate: `browser_evaluate` exists to run caller-supplied page
         // expressions, and the guest is already inside the page's own origin.
@@ -616,6 +905,7 @@
     /** Highlights an element without acting on it, for the agent cursor. */
     highlight(target) {
       const element = resolve(target);
+      if (element === STALE) return err("stale-ref", STALE_MESSAGE);
       if (!element) return err("not-found", "No element matched that target.");
       ensureOverlay().getElementById("marks").replaceChildren();
       outline(element, accessibleName(element).slice(0, 40) || element.tagName.toLowerCase());

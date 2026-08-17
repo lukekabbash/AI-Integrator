@@ -19,12 +19,23 @@ function renderIcon(open: boolean) {
 
 describe("AnimatedFolderIcon", () => {
   it("paints real geometry on the first frame", () => {
-    // Motion owns `d`; with nothing to paint it wrote the string "undefined"
-    // and the icon rendered nothing while the console filled with SVG errors.
+    // Motion used to own `d` and had nothing to paint on mount, so it wrote the
+    // string "undefined": a blank icon for a frame and an SVG parse error per
+    // folder. React owns the attribute now, so the first paint is the drawing.
     const { container } = renderIcon(false);
     const drawn = paths(container);
     expect(drawn).toHaveLength(2);
     for (const d of drawn) expect(d).toMatch(/^M[\d\s.]/);
+  });
+
+  it("never hands the DOM a path it cannot parse", () => {
+    for (const open of [false, true]) {
+      for (const d of paths(renderIcon(open).container)) {
+        expect(d).not.toMatch(/undefined|NaN/);
+        // Every command is a letter followed by numbers; nothing else is legal.
+        expect(d.replace(/[\d\s.-]/g, "")).toMatch(/^[MLA]+$/);
+      }
+    }
   });
 
   it("shows a different flap open than closed", () => {
@@ -35,8 +46,8 @@ describe("AnimatedFolderIcon", () => {
   });
 
   it("follows the open state when it changes", () => {
-    // Motion drops `animate` updates for `d`, so the icon must not depend on
-    // them to tell the truth about the folder underneath it.
+    // The icon has to tell the truth about the folder underneath it on every
+    // flip, not just the state it was born in.
     const { container, rerender } = renderIcon(false);
     const closed = paths(container);
     rerender(

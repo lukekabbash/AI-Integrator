@@ -41,6 +41,7 @@ import { ResizeHandle } from "./ResizeHandle";
 import { ProjectChatListClip, SidebarCollectionClip } from "./SidebarCollectionClips";
 import { Tooltip } from "./Tooltip";
 import { TravelingSelection } from "./TravelingSelection";
+import { useRailCursor } from "../useRailCursor";
 import {
   CHAT_DOT_LABEL as chatDotLabel,
   chatDotKind,
@@ -110,6 +111,16 @@ interface TaskSidebarProps {
   onResize?: (delta: number) => void;
   /** Chat/project `…` menus open left into the rail or right over the canvas. */
   sidebarMenuDirection?: SidebarMenuDirection;
+  /**
+   * Keycaps for the two shortcuts this rail advertises, resolved from the
+   * user's bindings so a rebind is reflected here instead of the hint lying.
+   * An empty array means the command is unbound and no hint is shown.
+   */
+  shortcutHints?: { newChat: string[]; searchChats: string[] };
+  /** Arrow-key cursor over the rail; see `spatialNavigation.ts`. */
+  arrowNavigation?: boolean;
+  /** Whether that cursor wraps past the first and last row. */
+  wrapNavigation?: boolean;
 }
 
 const menuSpring = {
@@ -226,6 +237,9 @@ export const TaskSidebar = memo(function TaskSidebar({
   activeDestination = "chats",
   onResize,
   sidebarMenuDirection = "right",
+  shortcutHints,
+  arrowNavigation = true,
+  wrapNavigation = true,
 }: TaskSidebarProps) {
   const reduceMotion =
     Boolean(useReducedMotion()) ||
@@ -275,6 +289,8 @@ export const TaskSidebar = memo(function TaskSidebar({
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const searchGenerationRef = useRef(0);
   const mod = modKeyLabel();
+  const newChatHint = shortcutHints ? shortcutHints.newChat.join(" ") : `${mod} N`;
+  const searchHint = shortcutHints ? shortcutHints.searchChats.join(" ") : `${mod} K`;
 
   // Adjust-during-render (not an effect): the active project's group opens
   // the moment it changes, without an extra committed render in between.
@@ -534,6 +550,19 @@ export const TaskSidebar = memo(function TaskSidebar({
     setExpandedProjects((current) => ({ ...current, [projectId]: !expanded }));
   };
 
+  // The rail cursor. Expand and collapse route back through the same toggle a
+  // click uses, so the keyboard and the pointer cannot drift out of step.
+  const toggleProjectCell = (cell: HTMLElement, expanded: boolean) => {
+    const projectId = cell.dataset.navId;
+    if (projectId) toggleProjectExpanded(projectId, expanded);
+  };
+  const onRailKeyDown = useRailCursor(chatListRef, {
+    enabled: arrowNavigation,
+    wrap: wrapNavigation,
+    onExpand: (cell) => toggleProjectCell(cell, false),
+    onCollapse: (cell) => toggleProjectCell(cell, true),
+  });
+
   const renderChat = (
     task: TaskSummary,
     options?: {
@@ -592,6 +621,10 @@ export const TaskSidebar = memo(function TaskSidebar({
           <button
             className="chat-row"
             data-chat-select
+            data-nav-item
+            data-nav-label={task.title}
+            data-nav-active={task.id === activeTaskId ? "true" : undefined}
+            data-nav-parent={options?.searchResult ? undefined : task.projectId}
             type="button"
             onClick={() => {
               onSelectTask(task.id);
@@ -921,7 +954,7 @@ export const TaskSidebar = memo(function TaskSidebar({
         >
           <Plus aria-hidden="true" />
           <span>New chat</span>
-          <kbd>{mod} N</kbd>
+          {newChatHint ? <kbd>{newChatHint}</kbd> : null}
         </motion.button>
 
         <nav className="sidebar-primary-nav" aria-label="AI Integrator">
@@ -946,12 +979,8 @@ export const TaskSidebar = memo(function TaskSidebar({
         <div
           className="sidebar-scroll"
           ref={chatListRef}
-          onKeyDown={(event) => {
-            if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-              event.preventDefault();
-              focusRelativeChat(event.key === "ArrowDown" ? 1 : -1);
-            }
-          }}
+          data-nav-region="sidebar"
+          onKeyDown={onRailKeyDown}
         >
           <section className="sidebar-collection" aria-label="Project collection">
             <div className="rail-section-heading">
@@ -1052,6 +1081,12 @@ export const TaskSidebar = memo(function TaskSidebar({
                         </button>
                         <button
                           className="project-select-button"
+                          data-nav-item
+                          data-nav-id={project.id}
+                          data-nav-label={project.name}
+                          data-nav-active={
+                            project.id === activeProjectId && !activeTaskId ? "true" : undefined
+                          }
                           type="button"
                           onClick={() => {
                             // Inactive → select (auto-expands). Active → toggle
@@ -1614,7 +1649,7 @@ export const TaskSidebar = memo(function TaskSidebar({
                         }}
                         placeholder="Search chats, projects, and messages"
                       />
-                      <kbd>{mod} K</kbd>
+                      {searchHint ? <kbd>{searchHint}</kbd> : null}
                     </label>
                     <div
                       className="search-modal-results"

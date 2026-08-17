@@ -15,6 +15,7 @@ import {
   parseWorkPane,
   pruneSurfaces,
   reorderSurfaces,
+  NEW_SURFACE,
   REVIEW_SURFACE,
   serializeWorkPane,
   setPaneWidth,
@@ -31,6 +32,8 @@ export interface WorkPaneController {
   active: WorkSurface | null;
   openFile: (path: string, revealLine?: number | null, options?: { activate?: boolean }) => void;
   openReview: () => void;
+  /** Opens (or brings forward) the one blank tab, which shows the launcher. */
+  openNew: () => void;
   openSubagent: (delegationId: string, options?: { activate?: boolean; show?: boolean }) => void;
   openBrowser: (tabId: string, options?: { activate?: boolean; show?: boolean }) => void;
   activate: (id: string) => void;
@@ -95,6 +98,7 @@ export function useWorkPane(ownerKey: string): WorkPaneController {
       openFile: (path, revealLine = null, options) =>
         update((current) => openSurface(current, fileSurface(path, revealLine), options)),
       openReview: () => update((current) => openSurface(current, REVIEW_SURFACE)),
+      openNew: () => update((current) => openSurface(current, NEW_SURFACE)),
       openSubagent: (delegationId, options) =>
         update((current) => openSurface(current, subagentSurface(delegationId), options)),
       openBrowser: (tabId, options) =>
@@ -132,6 +136,11 @@ export function useWorkPaneHeaderAlignment(
     const root = rootRef.current;
     const pane = paneRef.current;
     if (!root || !pane || !open) return;
+    // The header keeps the view tabs, the usage pill and the window controls at
+    // its right end whether or not the pane is open. The strip shares that row,
+    // so it has to know how much of the right side is already taken rather than
+    // guessing at a constant that goes stale the moment the cluster changes.
+    const headerEnd = root.querySelector<HTMLElement>(".titlebar-end");
     const align = () => {
       const rootRect = root.getBoundingClientRect();
       const paneRect = pane.getBoundingClientRect();
@@ -139,18 +148,22 @@ export function useWorkPaneHeaderAlignment(
         "--subagent-pane-left",
         `${Math.max(0, paneRect.left - rootRect.left)}px`,
       );
+      const endWidth = headerEnd?.getBoundingClientRect().width ?? 0;
+      root.style.setProperty("--titlebar-end-width", `${Math.round(endWidth)}px`);
       root.dataset.subagentLayoutReady = "true";
     };
     align();
     const observer = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(align);
     observer?.observe(root);
     observer?.observe(pane);
+    if (headerEnd) observer?.observe(headerEnd);
     window.addEventListener("resize", align);
     return () => {
       observer?.disconnect();
       window.removeEventListener("resize", align);
       delete root.dataset.subagentLayoutReady;
       root.style.removeProperty("--subagent-pane-left");
+      root.style.removeProperty("--titlebar-end-width");
     };
   }, [rootRef, paneRef, open, width]);
 }

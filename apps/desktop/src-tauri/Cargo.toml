@@ -20,6 +20,12 @@ chrono.workspace = true
 directories.workspace = true
 dunce.workspace = true
 futures-util.workspace = true
+# ripgrep's own walker and searcher, used in-process by `workspace_search`:
+# real .gitignore semantics and no `rg` binary to locate or parse.
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
 integrator-core = { path = "../../../crates/integrator-core" }
 integrator-runtime = { path = "../../../crates/integrator-runtime" }
 keyring = "4.1.4"
@@ -42,6 +48,16 @@ which.workspace = true
 xcap = "0.9"
 image = { version = "0.25", default-features = false, features = ["png"] }
 zeroize.workspace = true
+
+# A dev server the app started must die with the app even when the app is
+# killed, so `dev_server::guard` puts every child in a job object that the OS
+# reaps when our handle closes. `Drop` alone never runs on a force-kill.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+] }
 
 [lints]
 workspace = true

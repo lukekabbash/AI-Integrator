@@ -17,7 +17,11 @@ export type WorkSurface =
     }
   | { id: "review"; kind: "review" }
   | { id: `subagent:${string}`; kind: "subagent"; delegationId: string }
-  | { id: `browser:${string}`; kind: "browser"; tabId: string };
+  | { id: `browser:${string}`; kind: "browser"; tabId: string }
+  // An empty tab showing the launcher, opened by the strip's + button. There is
+  // only ever one: pressing + again brings it forward rather than stacking blank
+  // tabs, and choosing something from it replaces it.
+  | { id: "new"; kind: "new" };
 
 export type WorkSurfaceKind = WorkSurface["kind"];
 
@@ -58,6 +62,7 @@ export function fileSurface(path: string, revealLine: number | null = null): Wor
   return { id: fileSurfaceId(path), kind: "file", path, revealLine, revealRequestId: 0 };
 }
 export const REVIEW_SURFACE: WorkSurface = { id: "review", kind: "review" };
+export const NEW_SURFACE: WorkSurface = { id: "new", kind: "new" };
 export function subagentSurface(delegationId: string): WorkSurface {
   return { id: subagentSurfaceId(delegationId), kind: "subagent", delegationId };
 }
@@ -210,7 +215,9 @@ interface StoredWorkPane {
 export function serializeWorkPane(byTask: WorkPaneByTask): string {
   const stored: StoredWorkPane = { version: 1, byTask: {} };
   for (const [taskId, state] of Object.entries(byTask)) {
-    const surfaces = state.surfaces.filter((surface) => surface.kind !== "browser");
+    const surfaces = state.surfaces.filter(
+      (surface) => surface.kind !== "browser" && surface.kind !== "new",
+    );
     if (surfaces.length === 0 && !state.open && state.width === WORK_PANE_DEFAULT_WIDTH) continue;
     stored.byTask[taskId] = {
       open: state.open,

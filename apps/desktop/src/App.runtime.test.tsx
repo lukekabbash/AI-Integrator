@@ -2204,25 +2204,24 @@ describe("native runtime recovery UI", () => {
     expect(appRoot).toHaveAttribute("data-subagent-visible", "true");
     expect(appRoot).toHaveAttribute("data-subagent-layout-ready", "true");
     expect(document.querySelector(".conversation-header")).not.toBeInTheDocument();
-    // The titlebar slice over the pane carries the tab strip; the subagent's
-    // own header sits in the pane's subheader row beneath it.
+    // The titlebar slice over the pane carries the tab strip. The subagent's
+    // detail is on its tab, not in a row of its own inside the pane.
     expect(titlebar!.querySelector(".titlebar-subagent-slot")).toContainElement(
       titlebar!.querySelector(".work-pane-strip"),
     );
-    const subheader = document.querySelector<HTMLElement>(".work-pane-subheader");
-    expect(subheader).toHaveAttribute("data-visible", "true");
-    expect(
-      within(subheader!).getByRole("heading", { name: "Polish the interaction" }),
-    ).toBeInTheDocument();
+    expect(document.querySelector(".work-pane-subheader")).not.toBeInTheDocument();
+    const strip = titlebar!.querySelector<HTMLElement>(".work-pane-strip");
+    const subagentTab = within(strip!).getByRole("tab", { name: /Polish the interaction/ });
+    expect(subagentTab.getAttribute("title")).toContain("Polish the interaction");
 
     // The shared controls live once, in the work pane's strip.
     expect(screen.getAllByRole("button", { name: /chat navigation/i })).toHaveLength(1);
     expect(within(titlebar!).getByRole("button", { name: /chat navigation/i })).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: "Toggle terminal" })).toHaveLength(1);
     expect(screen.getAllByRole("button", { name: "Close task tools" })).toHaveLength(1);
-    const strip = titlebar!.querySelector<HTMLElement>(".work-pane-strip-trailing");
-    expect(within(strip!).getByRole("button", { name: "Toggle terminal" })).toBeInTheDocument();
-    expect(within(strip!).getByRole("button", { name: "Close task tools" })).toBeInTheDocument();
+    const trailing = titlebar!.querySelector<HTMLElement>(".work-pane-strip-trailing");
+    expect(within(trailing!).getByRole("button", { name: "Toggle terminal" })).toBeInTheDocument();
+    expect(within(trailing!).getByRole("button", { name: "Close task tools" })).toBeInTheDocument();
 
     // A second subagent is a peer tab in the same pane, never a second pane.
     const stablePane = document.querySelector(".work-pane");

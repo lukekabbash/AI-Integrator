@@ -136,6 +136,7 @@ impl BrowserTabs {
                 },
                 label,
                 held: None,
+                generation: 0,
             },
         );
         true

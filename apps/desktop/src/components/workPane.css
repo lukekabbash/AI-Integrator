@@ -124,7 +124,11 @@
   width: 100%;
   min-width: 0;
   height: 100%;
-  padding: 0 112px 0 8px;
+  /* The header's right cluster — view tabs, usage, window controls — sits above
+     this row and stays put whether the pane is open or not, so the strip ends
+     where that cluster begins. The width is measured, not assumed; the fallback
+     covers the window controls alone. */
+  padding: 0 calc(var(--titlebar-end-width, 112px) + 10px) 0 8px;
   display: flex;
   align-items: flex-end;
   gap: 6px;
@@ -157,6 +161,49 @@
 .work-pane-tab[data-active="true"] > button[role="tab"] svg {
   color: var(--color-text-secondary);
 }
+/* The rail's sigil with a bot face in its corner, inside the footprint of an
+   ordinary tab glyph so the strip keeps its rhythm. The sigil scales itself
+   down rather than the box growing around it. */
+.work-pane-agent-glyph {
+  position: relative;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  display: grid;
+  place-items: center;
+}
+.work-pane-agent-glyph > .agent-glyph,
+.work-pane-agent-glyph > span:first-child {
+  width: 14px;
+  height: 14px;
+}
+.work-pane-agent-glyph svg {
+  width: 14px;
+  height: 14px;
+}
+.work-pane-agent-face {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 8px !important;
+  height: 8px !important;
+  padding: 0.5px;
+  border-radius: 99px;
+  background: var(--color-canvas);
+  color: var(--color-text-secondary);
+  stroke-width: 2.4;
+}
+
+.work-pane-strip-new {
+  flex: none;
+  margin-bottom: 4px;
+  color: var(--color-text-tertiary);
+}
+.work-pane-strip-new svg {
+  width: 13px;
+  height: 13px;
+}
+
 .work-pane-strip-close-all {
   flex: none;
   margin-bottom: 4px;

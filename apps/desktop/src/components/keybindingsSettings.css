@@ -1,0 +1,187 @@
+/*
+ * Keyboard shortcuts. Rows are quiet by default — the keycaps are the only
+ * thing that should read at a glance, and they only lift when the row is
+ * hovered or actively recording. Nothing here carries the gel stack.
+ */
+
+.settings-section.keybinding-summary {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 18px;
+  flex-wrap: wrap;
+}
+.settings-section.keybinding-summary > header {
+  margin-bottom: 0;
+}
+
+.keybinding-group > header {
+  margin-bottom: 4px;
+}
+
+.keybinding-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.keybinding-row {
+  min-height: 56px;
+  padding: 9px 8px 9px 3px;
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(160px, auto);
+  align-items: center;
+  gap: 18px;
+  border-top: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-row);
+  transition:
+    background var(--duration-fast) var(--ease-standard),
+    box-shadow var(--duration-fast) var(--ease-standard);
+}
+.keybinding-row:hover {
+  background: color-mix(in srgb, var(--color-layer-2) 60%, transparent);
+}
+.keybinding-row[data-recording] {
+  background: color-mix(in srgb, var(--color-accent) 8%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 34%, transparent);
+}
+
+.keybinding-label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.keybinding-label strong {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.keybinding-label small {
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--color-text-tertiary);
+}
+.keybinding-conflict {
+  margin-top: 2px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  color: var(--color-status-warning);
+}
+.keybinding-conflict svg {
+  width: 12px;
+  height: 12px;
+  flex: none;
+}
+
+.keybinding-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.keybinding-record {
+  min-width: 118px;
+  min-height: 30px;
+  padding: 4px 9px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font: inherit;
+  cursor: pointer;
+  transition:
+    border-color var(--duration-fast) var(--ease-standard),
+    background var(--duration-fast) var(--ease-standard);
+}
+.keybinding-record:hover {
+  border-color: var(--color-border-base);
+  background: color-mix(in srgb, var(--color-layer-2) 78%, transparent);
+}
+.keybinding-record:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+.keybinding-row[data-recording] .keybinding-record {
+  border-color: color-mix(in srgb, var(--color-accent) 46%, transparent);
+  background: var(--color-layer-1);
+}
+
+.keybinding-keys {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+/* The base `kbd` rule pushes itself right with `margin-left: auto`; inside a
+   keycap run each cap has to stay put so the run reads as one shortcut. */
+.keybinding-keys kbd {
+  margin-left: 0;
+  min-width: 22px;
+  padding: 2px 6px;
+  font-size: 10.5px;
+  line-height: 15px;
+  color: var(--color-text-secondary);
+}
+
+.keybinding-unbound,
+.keybinding-listening {
+  font-size: 10.5px;
+  color: var(--color-text-tertiary);
+}
+.keybinding-listening {
+  color: color-mix(in srgb, var(--color-accent) 82%, var(--color-text-primary));
+}
+
+.keybinding-reset {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  flex: none;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--color-text-tertiary);
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity var(--duration-fast) var(--ease-standard),
+    color var(--duration-fast) var(--ease-standard),
+    background var(--duration-fast) var(--ease-standard);
+}
+.keybinding-reset svg {
+  width: 13px;
+  height: 13px;
+}
+.keybinding-reset:hover:not(:disabled) {
+  color: var(--color-text-primary);
+  background: color-mix(in srgb, var(--color-layer-2) 84%, transparent);
+}
+.keybinding-reset:focus-visible {
+  opacity: 1;
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+.keybinding-reset:disabled {
+  cursor: default;
+}
+/* The reset affordance stays out of the way until the row is in play, and
+   never appears on a row that is already at its default. */
+.keybinding-row:hover .keybinding-reset:not(:disabled),
+.keybinding-row[data-recording] .keybinding-reset:not(:disabled) {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .keybinding-row,
+  .keybinding-record,
+  .keybinding-reset {
+    transition: none;
+  }
+}
