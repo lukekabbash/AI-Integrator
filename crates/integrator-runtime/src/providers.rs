@@ -362,6 +362,8 @@ pub fn runtime_search_path() -> Option<OsString> {
     let login_path: Option<OsString> = None;
     let inherited = std::env::var_os("PATH");
     let home = home_dir();
+    // Only Windows adds to this list below; elsewhere it is read as it comes.
+    #[allow(unused_mut)]
     let mut paths = runtime_search_paths(
         login_path.as_deref(),
         inherited.as_deref(),
@@ -537,6 +539,8 @@ fn find_known_install(provider: &ProviderKind) -> Option<PathBuf> {
 }
 
 fn known_install_candidates(provider: &ProviderKind) -> Vec<PathBuf> {
+    // The Windows-only blocks below are the only ones that add to this.
+    #[allow(unused_mut)]
     let mut candidates = match provider {
         ProviderKind::Codex => home_dir()
             .map(|home| {

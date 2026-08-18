@@ -796,7 +796,7 @@ pub(super) async fn fill_login(
         &label,
         format!(
             "window.__integrator.fillLogin({key:?},{origin:?},{username:?},{:?},true)",
-            &*password
+            *password
         ),
     )
     .await
