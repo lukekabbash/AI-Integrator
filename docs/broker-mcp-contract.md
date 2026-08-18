@@ -65,7 +65,9 @@ Inside a task, reach has three layers:
 
 `browser_grant(tabId, delegationId, mode)` hands one of the orchestrator's tabs
 to a child: `read` allows snapshot and wait, `drive` adds the verbs
-that change the page.
+that change the page. The reply names the share as `grantedTo` and `mode`.
+`heldBy` still reads as the orchestrator, because sharing a tab is not handing
+it over — both can address it.
 
 Saved logins are a capability, never a secret. `browser_fill_login` causes the
 app to type a password the user saved for that exact browser identity and
@@ -94,7 +96,24 @@ tools say so rather than reporting success over a page that did not move:
 `browser_focus` asks the app to show a tab and reports whether it landed:
 `focused: false` means the pane is closed or the user is in another chat. The
 tab is still yours to drive either way — a tab nothing is showing keeps a full
-1280×800 viewport, so its geometry is as true off screen as on.
+1280×800 viewport, so its geometry is true at that width.
+
+It is not the width a gesture will use, though, and that is worth knowing. A
+gesture brings its tab on screen first, into a pane that is nearer 460 wide, and
+a responsive site lays out differently there — or serves different controls
+altogether. So:
+
+- A reply carries `layoutShift` when the viewport has changed size since the
+  page was last read. Take a fresh snapshot before trusting earlier geometry.
+- A ref taken at one width is refused with `stale-ref` once the page has
+  re-laid out at another, the same way a ref from a page the tab has left is.
+  Snapshot again rather than pressing a control that has moved.
+- A gesture that navigates answers `navigated: true` with the new address. The
+  action landed; its reply belonged to the document the tab has left, so there
+  is nothing to repeat.
+- A page between documents has no runtime to ask yet and answers
+  `guest-not-ready`. `browser_wait_for` keeps waiting through it; anything else
+  is worth one retry.
 
 Two things a caller sees in `browser_list` and should act on:
 

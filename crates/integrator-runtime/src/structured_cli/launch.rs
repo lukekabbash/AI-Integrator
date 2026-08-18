@@ -8,6 +8,23 @@ use super::{StructuredCliLaunchOptions, StructuredCliProvider, StructuredPermiss
 /// than forwarded so a stale UI value cannot fail the whole turn.
 const CLAUDE_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
+/// Session settings that `--setting-sources` cannot turn off. Official Agent
+/// SDK docs list auto memory and claude.ai MCP connectors as still loading
+/// after an empty setting-sources list. Servers passed via `--mcp-config` are
+/// unaffected by `disableClaudeAiConnectors`.
+pub(super) const CLAUDE_CHAT_SESSION_SETTINGS: &str =
+    r#"{"disableClaudeAiConnectors":true,"autoMemoryEnabled":false}"#;
+
+/// Process env that backs the Chat `--settings` keys. `ENABLE_CLAUDEAI_MCP_SERVERS`
+/// is the documented env form of `disableClaudeAiConnectors`;
+/// `CLAUDE_CODE_DISABLE_AUTO_MEMORY` is the documented env form of
+/// `autoMemoryEnabled: false`. Both are set so a CLI that honors only one
+/// surface still isolates Chat.
+pub(super) const CLAUDE_CHAT_ISOLATION_ENV: &[(&str, &str)] = &[
+    ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1"),
+    ("ENABLE_CLAUDEAI_MCP_SERVERS", "false"),
+];
+
 /// Maps a UI effort id to the capitalized suffix agy's display-style model
 /// names use ("Gemini 3.1 Pro (High)"). Unknown values are dropped so a stale
 /// UI value cannot fail the whole turn (agy validates `--model` and rejects
@@ -95,12 +112,33 @@ pub(super) fn provider_args(options: &StructuredCliLaunchOptions) -> Vec<String>
                 args.extend(["--append-system-prompt".into(), instructions.into()]);
             }
             if options.permission_mode == StructuredPermissionMode::Chat {
+                // Chat isolation has to keep two things that the obvious
+                // "lock it down" flags each drop:
+                //
+                // * `--safe-mode` / CLAUDE_CODE_SAFE_MODE disables MCP
+                //   servers, including `--mcp-config`. The Chat prompt then
+                //   advertises Integrator browser/scheduling tools that never
+                //   appear in the model's tool list.
+                // * `--bare` / CLAUDE_CODE_SIMPLE keeps `--mcp-config` but
+                //   refuses OAuth and the keychain, so Chat cannot use the
+                //   user's Claude login.
+                //
+                // The documented replacement is `settingSources: []` on the
+                // CLI (`--setting-sources` with an empty list): no
+                // user/project/local settings, CLAUDE.md, skills, hooks, or
+                // commands. Subscription auth and `--mcp-config` still work.
+                // `--tools ""` strips built-ins only; MCP is unaffected.
+                // `--settings` covers auto memory and claude.ai connectors,
+                // which an empty setting-sources list does not control.
                 args.extend([
                     "--tools".into(),
                     String::new(),
                     "--disable-slash-commands".into(),
-                    "--safe-mode".into(),
                     "--no-chrome".into(),
+                    "--setting-sources".into(),
+                    String::new(),
+                    "--settings".into(),
+                    CLAUDE_CHAT_SESSION_SETTINGS.into(),
                 ]);
             }
             args

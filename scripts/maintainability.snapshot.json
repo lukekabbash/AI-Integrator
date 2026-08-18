@@ -27,7 +27,7 @@
     },
     {
       "path": "apps/desktop/src-tauri/src/delegation.rs",
-      "maxLines": 4919
+      "maxLines": 4972
     },
     {
       "path": "apps/desktop/src/bridge.test.ts",
@@ -123,7 +123,7 @@
     },
     {
       "path": "apps/desktop/src-tauri/src/browser/mod.rs",
-      "maxLines": 1148
+      "maxLines": 1257
     },
     {
       "path": "apps/desktop/src-tauri/src/browser/vault.rs",

@@ -45,6 +45,7 @@ tokio.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 url.workspace = true
 uuid.workspace = true
+webview-capture = { path = "../../../crates/webview-capture" }
 which.workspace = true
 xcap = "0.9"
 image = { version = "0.25", default-features = false, features = ["png"] }

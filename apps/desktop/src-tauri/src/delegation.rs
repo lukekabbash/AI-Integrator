@@ -1567,6 +1567,18 @@ async fn browser_tool(
             "role": params.get("role"),
         })
     };
+    // What `browser_type` aims at. `text` is the characters to insert there, so
+    // it must never travel into the locator: copied in, it made every type a
+    // hunt for a control *named* whatever was being typed, and — since the
+    // object was then never empty — took away the "type into whatever has
+    // focus" fallback as well.
+    let typing_target = || {
+        json!({
+            "ref": params.get("ref"),
+            "selector": params.get("selector"),
+            "role": params.get("role"),
+        })
+    };
     let call = async |method: &str, args: Vec<Value>| -> Result<Value> {
         let id = tab_id()?;
         agent_invoke(app, &tabs, &caller, &id, method, args)
@@ -1618,7 +1630,18 @@ async fn browser_tool(
                 ));
             }
             let tab = crate::browser::grant_for_agent(app, &tabs, &caller, &id, &delegation, mode)?;
-            Ok(json!({ "tab": tab }))
+            // Naming the share explicitly. `heldBy` still reads as the
+            // orchestrator, because it is: whoever last drove the tab holds it,
+            // and handing a child a key does not take yours away. Without these
+            // two fields the reply was the tab exactly as it looked before, and
+            // a grant that had worked read as a call that did nothing.
+            Ok(json!({
+                "tab": tab,
+                "grantedTo": delegation,
+                "mode": mode,
+                "note": "that subagent can now address this tab by id. You keep it too — \
+                         sharing is not handing over.",
+            }))
         }
         "browser_focus" => {
             let id = tab_id()?;
@@ -1672,13 +1695,29 @@ async fn browser_tool(
                 .unwrap_or(false);
             call(
                 "type",
-                vec![target(), Value::String(value), json!({ "clear": clear })],
+                vec![
+                    typing_target(),
+                    Value::String(value),
+                    json!({ "clear": clear }),
+                ],
             )
             .await
         }
         "browser_press" => {
-            let key = text("key")
-                .ok_or_else(|| IntegratorError::InvalidInput("key is required".into()))?;
+            // A literal space trims away to nothing, and "key is required" then
+            // reads as though the argument had been left out altogether. Say
+            // what to write instead of what is missing.
+            let given = params
+                .get("key")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let key = text("key").ok_or_else(|| {
+                IntegratorError::InvalidInput(if given.is_empty() {
+                    "key is required".into()
+                } else {
+                    "write Space for the space bar — a bare space is not a key name".to_string()
+                })
+            })?;
             let modifiers = params
                 .get("modifiers")
                 .cloned()
@@ -1707,10 +1746,24 @@ async fn browser_tool(
                 .unwrap_or(WAIT_FOR_DEFAULT_MS)
                 .min(WAIT_FOR_MAX_MS);
             let deadline = std::time::Instant::now() + Duration::from_millis(budget);
+            let id = tab_id()?;
             loop {
-                let seen = call("waitFor", vec![params.clone()]).await?;
-                if seen.get("matched").and_then(Value::as_bool) == Some(true) {
-                    return Ok(seen);
+                match agent_invoke(app, &tabs, &caller, &id, "waitFor", vec![params.clone()]).await
+                {
+                    Ok(seen) => {
+                        if seen.get("matched").and_then(Value::as_bool) == Some(true) {
+                            return Ok(seen);
+                        }
+                    }
+                    // A page between documents has no runtime to ask yet, and
+                    // one that navigates mid-poll answers for a document that is
+                    // gone. Both are exactly what waiting is for: a load in
+                    // progress used to end the wait on its first poll with
+                    // "Cannot read properties of undefined".
+                    Err(error)
+                        if matches!(error.code, "guest-not-ready" | "page-navigated")
+                            && std::time::Instant::now() < deadline => {}
+                    Err(error) => return Err(IntegratorError::Unavailable(error.message)),
                 }
                 if std::time::Instant::now() >= deadline {
                     return Ok(json!({

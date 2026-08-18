@@ -427,7 +427,7 @@ fn open_profile_probe(
     let target = Url::parse("about:blank").expect("about:blank parses");
     let webview = window
         .add_child(
-            WebviewBuilder::new(&label, WebviewUrl::External(target))
+            super::surface::apply(WebviewBuilder::new(&label, WebviewUrl::External(target)))
                 .general_autofill_enabled(false)
                 .data_directory(profile),
             super::parked().0,

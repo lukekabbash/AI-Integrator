@@ -12,8 +12,11 @@ use crate::redact_and_bound;
 
 use super::{
     DIAGNOSTIC_LIMIT, StructuredCliEvent, StructuredCliEventKind, StructuredCliLaunchOptions,
-    StructuredCliProvider,
-    launch::{antigravity_prompt_with_images, claude_user_content, provider_args},
+    StructuredCliProvider, StructuredPermissionMode,
+    launch::{
+        CLAUDE_CHAT_ISOLATION_ENV, antigravity_prompt_with_images, claude_user_content,
+        provider_args,
+    },
     parse::parse_provider_line,
 };
 
@@ -63,6 +66,11 @@ pub(super) fn spawn_structured_child(options: &StructuredCliLaunchOptions) -> Re
         // A user-set value always wins.
         if std::env::var_os("ENABLE_TOOL_SEARCH").is_none() {
             command.env("ENABLE_TOOL_SEARCH", "auto");
+        }
+        if options.permission_mode == StructuredPermissionMode::Chat {
+            for (name, value) in CLAUDE_CHAT_ISOLATION_ENV {
+                command.env(*name, *value);
+            }
         }
     }
     #[cfg(unix)]

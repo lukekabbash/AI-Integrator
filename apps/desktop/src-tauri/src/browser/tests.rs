@@ -66,6 +66,119 @@ fn every_parked_webview_is_hidden_from_the_host_chat() {
 }
 
 #[test]
+fn the_blank_page_is_a_url_a_tab_may_be_pointed_at() {
+    // Every tab opened without an address starts here, so refusing to navigate
+    // back to it was refusing the one page the browser itself hands out. Read as
+    // a bare host it became "https://about:blank", whose port is "blank".
+    assert_eq!(
+        normalize_url("about:blank").unwrap().as_str(),
+        "about:blank"
+    );
+    assert_eq!(
+        normalize_url("  about:blank  ").unwrap().as_str(),
+        "about:blank"
+    );
+    // Only that one. `about:` is not a general escape from the scheme rules.
+    assert!(normalize_url("about:srcdoc").is_err());
+    assert!(normalize_url("about:config").is_err());
+}
+
+#[test]
+fn a_guest_call_answers_for_a_runtime_that_is_not_there_yet() {
+    // A document part-way through a navigation has no `window.__integrator`, and
+    // reading a method off it threw: `browser_wait_for` polling a loading page
+    // ended on its first poll with "Cannot read properties of undefined". The
+    // guard names the state in a code a caller can wait out.
+    let script = guest_call("window.__integrator.snapshot()".into());
+    assert!(script.starts_with("(window.__integrator ? ("));
+    assert!(script.contains("guest-not-ready"));
+
+    // Both the action and the wait loop go through it.
+    assert!(
+        source_between(
+            include_str!("agent.rs"),
+            "pub async fn agent_invoke",
+            "/// Waits for the page to stop changing size",
+        )
+        .contains("guest_call(format!(")
+    );
+    let waiting = source_between(
+        include_str!("../delegation.rs"),
+        "\"browser_wait_for\" =>",
+        "other => Err(IntegratorError::InvalidInput",
+    );
+    assert!(waiting.contains("\"guest-not-ready\" | \"page-navigated\""));
+}
+
+#[test]
+fn a_deferred_reply_belongs_to_the_document_that_parked_it() {
+    // A new page gets a new guest with its ticket counter back at zero, so a
+    // bare number let the host poll for one action's reply and be handed the
+    // next page's. Tickets carry the document; a mismatch is reported as the
+    // navigation it was, not as "that reply is gone".
+    assert!(GUEST_RUNTIME.contains("const DOC = "));
+    assert!(GUEST_RUNTIME.contains("`${DOC}:${++ticketSeq}`"));
+    assert!(GUEST_RUNTIME.contains("if (!key.startsWith(`${DOC}:`))"));
+    assert!(GUEST_RUNTIME.contains("\"page-navigated\""));
+
+    // And the host turns that into where the tab now is, because the gesture
+    // did land — answering with a failure invites the same click twice.
+    let invoke = source_between(
+        include_str!("agent.rs"),
+        "pub async fn agent_invoke",
+        "/// Waits for the page to stop changing size",
+    );
+    assert!(invoke.contains("super::NAVIGATED && writing"));
+    assert!(invoke.contains("\"navigated\": true"));
+}
+
+#[test]
+fn one_guest_call_at_a_time_per_tab() {
+    // Parking a ticket and polling `settle` is two round trips, and the guest
+    // runs a pending gesture early the moment a second action arrives, so two
+    // calls in flight on one tab interleave and one reply is lost.
+    let module = include_str!("mod.rs");
+    assert!(module.contains("fn eval_lock_for(label: &str)"));
+    let eval = source_between(
+        module,
+        "pub(super) async fn eval_json",
+        "if value.get(\"ok\")",
+    );
+    assert!(eval.contains("let lock = eval_lock_for(label);"));
+    assert!(eval.contains("lock.lock().await"));
+}
+
+#[test]
+fn a_ticket_is_only_ever_the_shape_the_guest_issues() {
+    // It is put back into a script, so nothing else may travel there.
+    assert!(ticket_is_well_formed("1755478900123-42:7"));
+    assert!(!ticket_is_well_formed(""));
+    assert!(!ticket_is_well_formed("1:2\"); alert(1); ("));
+    assert!(!ticket_is_well_formed("a".repeat(65).as_str()));
+}
+
+#[test]
+fn agent_tab_replies_carry_no_icon_bytes() {
+    // `favicon` is a data: URL of up to 96 KiB. It is a picture for the tab
+    // strip; in a tool reply it is thousands of base64 characters a model reads
+    // and can do nothing with.
+    let agent = include_str!("agent.rs");
+    assert!(agent.contains("fn without_icon(mut tab: BrowserTab)"));
+    for site in [
+        "open_for_agent",
+        "navigate_for_agent",
+        "grant_for_agent",
+        "tabs_for_caller",
+    ] {
+        let body = source_between(agent, &format!("fn {site}"), "\n}\n");
+        assert!(
+            body.contains("without_icon"),
+            "{site} still hands back icon bytes"
+        );
+    }
+}
+
+#[test]
 fn rejects_non_web_schemes_and_junk() {
     assert!(normalize_url("file:///etc/passwd").is_err());
     assert!(normalize_url("javascript:alert(1)").is_err());
@@ -643,6 +756,132 @@ fn every_verb_answers_for_the_mechanism_the_page_actually_uses() {
 }
 
 #[test]
+fn a_verb_describes_its_target_before_the_gesture_lands() {
+    // A click that navigates or re-renders leaves the node detached, and a
+    // detached node measures 0×0 — which is how a click that worked came back
+    // reporting an empty rectangle over the thing it had just pressed.
+    assert!(GUEST_RUNTIME.contains("const clicked = describe(element);"));
+    assert!(GUEST_RUNTIME.contains("ok({ clicked, ...pageState() })"));
+    assert!(GUEST_RUNTIME.contains("const hovered = describe(element);"));
+    assert!(GUEST_RUNTIME.contains("const described = { from: describe(source)"));
+}
+
+#[test]
+fn a_gesture_can_be_aimed_at_a_plain_coordinate() {
+    // A canvas stroke and a slider have no element to name. Only the end of a
+    // drag understood a point, so every coordinate drag was refused for a start
+    // it never looked for — and asking the document what is at a point had to
+    // stop answering "the agent cursor you are drawing".
+    assert!(GUEST_RUNTIME.contains("function elementAtPoint(x, y)"));
+    assert!(GUEST_RUNTIME.contains("host.style.pointerEvents = \"none\""));
+    assert!(GUEST_RUNTIME.contains("function resolveAt(target)"));
+    assert!(GUEST_RUNTIME.contains("const source = resolveAt(from);"));
+    // One precedence rule, in one place: a named locator wins, a bare point
+    // asks the page what is there, and both together mean that element at that
+    // point.
+    assert!(GUEST_RUNTIME.contains("function named(target)"));
+    assert!(GUEST_RUNTIME.contains("function pointOf(target)"));
+    // Scrolling the page would move the coordinate out from under the gesture.
+    assert!(GUEST_RUNTIME.contains("if (!fromPoint) source.scrollIntoView"));
+    assert!(GUEST_RUNTIME.contains("if (!at) element.scrollIntoView"));
+}
+
+#[test]
+fn scrolling_something_that_does_not_scroll_scrolls_the_page() {
+    // `scrollBy` on a box with no overflow does nothing and says nothing, so
+    // naming a wrapper — `#content` on a page whose scroller is the document —
+    // swallowed the gesture and reported success.
+    assert!(GUEST_RUNTIME.contains("function scrollableFrom(element)"));
+    assert!(GUEST_RUNTIME.contains("(scroller ?? window).scrollBy("));
+    assert!(GUEST_RUNTIME.contains("that element does not scroll, so the page was scrolled"));
+}
+
+#[test]
+fn a_ref_taken_at_another_width_is_spent_like_one_from_another_page() {
+    // A parked tab is 1280 wide and one in the pane about 460, and a gesture
+    // brings the tab forward before it lands: the snapshot describes a desktop
+    // layout the click never sees. Refs still resolved, because generation only
+    // counts documents, so a click reported success against geometry that had
+    // moved — or a control the narrow layout does not have at all.
+    assert!(GUEST_RUNTIME.contains("function layoutClass()"));
+    assert!(
+        GUEST_RUNTIME.contains("if (record && record.layout !== layoutClass()) return RESIZED;")
+    );
+    assert!(GUEST_RUNTIME.contains("RESIZED_MESSAGE"));
+    // Every verb answers for both kinds of spent ref, through one helper.
+    assert!(GUEST_RUNTIME.contains("function gone(resolved)"));
+    assert!(!GUEST_RUNTIME.contains("=== STALE ?"));
+    assert_eq!(
+        GUEST_RUNTIME
+            .matches("err(\"stale-ref\", STALE_MESSAGE)")
+            .count(),
+        1
+    );
+    // And a reply says the page has re-laid out since it was last read.
+    assert!(GUEST_RUNTIME.contains("function layoutShift()"));
+    assert!(GUEST_RUNTIME.contains("describedAt = { width: innerWidth, height: innerHeight };"));
+    // The host waits for the resize to finish before the gesture resolves.
+    let invoke = source_between(
+        include_str!("agent.rs"),
+        "pub async fn agent_invoke",
+        "/// Waits for the page to stop changing size",
+    );
+    assert!(invoke.contains("settle_layout(app, &label).await"));
+}
+
+#[test]
+fn typing_never_hunts_for_a_field_named_after_what_is_typed() {
+    // One locator was built for every verb, so `text` — the characters to
+    // insert — was also the accessible name to find. Worse, the object was then
+    // never empty, which took away the "type into whatever has focus" path too.
+    let browser = source_between(
+        include_str!("../delegation.rs"),
+        "async fn browser_tool",
+        "fn peers_list",
+    );
+    let typing = source_between(browser, "let typing_target = ||", "let call =");
+    assert!(!typing.contains("\"text\""));
+    assert!(typing.contains("\"role\""));
+    assert!(browser.contains("vec![\n                    typing_target(),"));
+    // Role on its own is a target, so `{ role: "searchbox" }` finds the field.
+    assert!(GUEST_RUNTIME.contains("if (target.text || target.role)"));
+    assert!(GUEST_RUNTIME.contains("if (!wanted) return element;"));
+    // And the words a person reads count, not only the accessible name, which a
+    // long `title` tooltip otherwise owns outright.
+    assert!(
+        GUEST_RUNTIME.contains("const label = shown.length <= 200 ? shown.toLowerCase() : \"\";")
+    );
+}
+
+#[test]
+fn a_bare_space_is_answered_with_what_to_write_instead() {
+    let press = source_between(
+        include_str!("../delegation.rs"),
+        "\"browser_press\" =>",
+        "\"browser_drag\" =>",
+    );
+    assert!(press.contains("write Space for the space bar"));
+    assert!(press.contains("if given.is_empty()"));
+}
+
+#[test]
+fn a_grant_reply_names_the_share_it_made() {
+    // The reply was the tab exactly as it looked before, so a grant that had
+    // worked read as a call that did nothing. `heldBy` stays the orchestrator:
+    // handing a child a key does not take yours away.
+    let grant = source_between(
+        include_str!("../delegation.rs"),
+        "\"browser_grant\" =>",
+        "\"browser_focus\" =>",
+    );
+    assert!(grant.contains("\"grantedTo\": delegation"));
+    assert!(grant.contains("\"mode\": mode"));
+    // Never by moving the hold: that would lock the orchestrator out of its own
+    // tab, and it is the one that has to keep driving.
+    assert!(!grant.contains("mark_held"));
+}
+
+#[test]
 fn guest_runtime_exposes_every_method_the_host_may_call() {
     // The dispatcher allowlist and the runtime must not drift apart.
     for method in [
@@ -711,12 +950,22 @@ fn every_agent_action_shows_the_cursor_that_performed_it() {
 
 #[test]
 fn eval_waits_for_the_cursor_to_arrive_before_reading_the_page() {
+    // WebView2's ExecuteScript serialises a Promise as `{}`, so the wrapper
+    // must stay synchronous and hand a pending reply to the guest as a ticket
+    // the host polls; an `async` wrapper made every reply read as null.
     let eval = source_between(
         include_str!("mod.rs"),
         "pub(super) async fn eval_json",
-        "let raw = Zeroizing::new(",
+        "if value.get(\"ok\")",
     );
-    assert!(eval.contains("await value"));
+    assert!(!eval.contains("(async () =>"));
+    assert!(eval.contains("typeof value.then === 'function'"));
+    assert!(eval.contains("guest.defer(value)"));
+    assert!(eval.contains("guest.settle("));
+
+    let guest = include_str!("guest.js");
+    assert!(guest.contains("defer(value) {"));
+    assert!(guest.contains("settle(ticket) {"));
 }
 
 #[test]
@@ -762,4 +1011,67 @@ fn tabs_are_labelled_out_of_the_capability_scope() {
     let label = "browser-tab-1";
     assert!(!label.starts_with("main"));
     assert!(!label.starts_with("task-"));
+}
+
+#[test]
+fn windows_ua_uses_the_engine_major_and_never_says_webview() {
+    let ua = surface::user_agent(surface::SurfaceOs::Windows, Some("151.0.3351.95"));
+    assert!(ua.contains("Chrome/151.0.0.0"));
+    assert!(ua.contains("Windows NT 10.0"));
+    assert!(!ua.contains("WebView"));
+    assert!(!ua.contains("Edg/"));
+    assert!(!ua.contains("Chrome/134"));
+}
+
+#[test]
+fn unknown_or_unreadable_engine_falls_back_to_current_chrome() {
+    let missing = surface::user_agent(surface::SurfaceOs::Windows, None);
+    let webkit = surface::user_agent(surface::SurfaceOs::Windows, Some("21619.1.26.11.3"));
+    let expected = format!("Chrome/{}.0.0.0", surface::FALLBACK_CHROME_MAJOR);
+    assert!(missing.contains(&expected));
+    assert!(webkit.contains(&expected));
+    assert!(!missing.contains("WebView"));
+}
+
+#[test]
+fn macos_ua_looks_like_safari_not_windows_chrome() {
+    let ua = surface::user_agent(surface::SurfaceOs::Mac, Some("21619.1.26.11.3"));
+    assert!(ua.contains("Macintosh"));
+    assert!(ua.contains("Version/19.0"));
+    assert!(ua.contains("Safari/605.1.15"));
+    assert!(!ua.contains("Windows NT"));
+    assert!(!ua.contains("WebView"));
+}
+
+#[test]
+fn windows_args_keep_wry_defaults_and_drop_client_hints() {
+    assert!(surface::WINDOWS_BROWSER_ARGS.contains("msWebOOUI"));
+    assert!(surface::WINDOWS_BROWSER_ARGS.contains("msPdfOOUI"));
+    assert!(surface::WINDOWS_BROWSER_ARGS.contains("msSmartScreenProtection"));
+    assert!(surface::WINDOWS_BROWSER_ARGS.contains("UserAgentClientHint"));
+}
+
+#[test]
+fn identity_surface_strips_its_prelude_and_never_names_webview() {
+    let script = include_str!("identity_surface.js");
+    assert!(script.contains("delete window.__integratorSurface;"));
+    assert!(script.contains("userAgentData"));
+    assert!(script.contains("webdriver"));
+    assert!(!script.contains("WebView"));
+}
+
+#[test]
+fn every_profile_webview_takes_the_desktop_browser_surface() {
+    let tabs = include_str!("mod.rs");
+    let create = source_between(
+        tabs,
+        "pub(super) fn tab_webview_builder",
+        "pub(super) async fn create_tab",
+    );
+    assert!(create.contains("surface::apply"));
+    assert!(!create.contains("Chrome/134"));
+
+    let sites = include_str!("sites.rs");
+    let probe = source_between(sites, "fn open_profile_probe", "fn profile_webview_known");
+    assert!(probe.contains("surface::apply"));
 }

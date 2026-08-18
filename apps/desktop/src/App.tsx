@@ -1706,6 +1706,9 @@ export default function App() {
       if (!active) return;
       const { tabs, taskId } = focusable.current;
       if (!browserRequestBelongsToTask(taskId, tabs, request)) return;
+      // A popped-out tab is the browser window's to raise; opening a pane
+      // surface for it here would place nothing and fight that window.
+      if (tabs.some((tab) => tab.id === request.tabId && tab.poppedOut)) return;
       workPane.openBrowser(request.tabId, { activate: true, show: true });
     });
     return () => {

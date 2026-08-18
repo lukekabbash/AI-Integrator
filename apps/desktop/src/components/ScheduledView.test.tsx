@@ -69,7 +69,7 @@ const runtimes = [
 function renderScheduled(
   createRequest = 0,
   onTaskCreated?: (task: TaskSummary) => void,
-  options: { motionScale?: number; railToggle?: boolean } = {},
+  options: { motionScale?: number; railToggle?: boolean; tasks?: typeof tasks } = {},
 ) {
   function Harness() {
     const [railOpen, setRailOpen] = useState(false);
@@ -94,7 +94,7 @@ function renderScheduled(
           onResizeRail={() => undefined}
           motionScale={options.motionScale ?? 0}
           projects={projects}
-          tasks={tasks}
+          tasks={options.tasks ?? tasks}
           runtimes={runtimes}
           activeTaskId="task-1"
           defaultRoute={{ runtime: "codex", model: "gpt-5.6-sol", effort: "medium" }}
@@ -328,6 +328,34 @@ describe("ScheduledView", () => {
         route: expect.objectContaining({ runtime: "codex", model: "gpt-5.6-sol" }),
       }),
     );
+  });
+
+  it("moves an existing schedule to another chat", async () => {
+    const update = vi.spyOn(bridge, "updateAutomation").mockResolvedValue(automation);
+    renderScheduled(0, undefined, {
+      tasks: [...tasks, { ...tasks[0], id: "task-2", title: "Second session" }],
+    });
+    fireEvent.click(await screen.findByRole("button", { name: /Dependency audit/ }));
+
+    const target = screen.getByRole("button", { name: "Continues in" });
+    expect(target).toHaveTextContent("Coding session");
+    fireEvent.click(target);
+    fireEvent.click(screen.getByRole("option", { name: /Second session/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(update).toHaveBeenCalledWith(
+        "automation-1",
+        expect.objectContaining({ taskId: "task-2" }),
+      ),
+    );
+  });
+
+  it("offers the auto-review profile for unattended runs", async () => {
+    renderScheduled();
+    fireEvent.click(await screen.findByRole("button", { name: /Dependency audit/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Permission ceiling" }));
+    expect(screen.getByRole("option", { name: "Auto" })).toBeInTheDocument();
   });
 
   it("narrows a schedule to named MCP servers and skills, and persists the scope", async () => {

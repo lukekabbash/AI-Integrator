@@ -111,7 +111,19 @@ fn chat_mode_removes_claude_coding_tools_and_keeps_antigravity_in_plan() {
             .iter()
             .any(|argument| argument == "--disable-slash-commands")
     );
-    assert!(claude.iter().any(|argument| argument == "--safe-mode"));
+    assert!(claude.iter().any(|argument| argument == "--no-chrome"));
+    assert!(
+        claude
+            .windows(2)
+            .any(|pair| pair[0] == "--setting-sources" && pair[1].is_empty())
+    );
+    assert!(
+        claude
+            .windows(2)
+            .any(|pair| { pair[0] == "--settings" && pair[1] == CLAUDE_CHAT_SESSION_SETTINGS })
+    );
+    assert!(!claude.iter().any(|argument| argument == "--safe-mode"));
+    assert!(!claude.iter().any(|argument| argument == "--bare"));
     assert!(
         claude
             .iter()
@@ -133,6 +145,67 @@ fn chat_mode_removes_claude_coding_tools_and_keeps_antigravity_in_plan() {
         !antigravity
             .iter()
             .any(|argument| argument == "--dangerously-skip-permissions")
+    );
+}
+
+#[test]
+fn claude_chat_isolation_keeps_mcp_config_and_drops_safe_mode() {
+    let chat = provider_args(&StructuredCliLaunchOptions {
+        provider: StructuredCliProvider::Claude,
+        executable: "claude".into(),
+        working_directory: ".".into(),
+        model: None,
+        effort: None,
+        system_instructions: Some("Chat policy".into()),
+        resume_session_id: None,
+        permission_mode: StructuredPermissionMode::Chat,
+        mcp_config_path: Some("/app/chat-mcp.json".into()),
+        control_overlay: None,
+        plugin_dirs: Vec::new(),
+    });
+    assert!(
+        chat.windows(2)
+            .any(|pair| { pair[0] == "--mcp-config" && pair[1] == "/app/chat-mcp.json" })
+    );
+    assert!(
+        chat.windows(2)
+            .any(|pair| pair[0] == "--allowed-tools" && pair[1] == "mcp__integrator")
+    );
+    assert!(chat.contains(&"--append-system-prompt".to_owned()));
+    // Empty setting-sources is the documented `settingSources: []` form.
+    // `--safe-mode` would drop this MCP file; `--bare` would drop login.
+    assert!(!chat.iter().any(|argument| argument == "--safe-mode"));
+    assert!(!chat.iter().any(|argument| argument == "--bare"));
+    assert!(CLAUDE_CHAT_SESSION_SETTINGS.contains("disableClaudeAiConnectors"));
+    assert!(CLAUDE_CHAT_SESSION_SETTINGS.contains("autoMemoryEnabled"));
+    assert_eq!(
+        CLAUDE_CHAT_ISOLATION_ENV,
+        [
+            ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1"),
+            ("ENABLE_CLAUDEAI_MCP_SERVERS", "false"),
+        ]
+        .as_slice()
+    );
+
+    let task = provider_args(&StructuredCliLaunchOptions {
+        provider: StructuredCliProvider::Claude,
+        executable: "claude".into(),
+        working_directory: ".".into(),
+        model: None,
+        effort: None,
+        system_instructions: Some("durable harness policy".into()),
+        resume_session_id: None,
+        permission_mode: StructuredPermissionMode::AcceptEdits,
+        mcp_config_path: Some("/app/task-mcp.json".into()),
+        control_overlay: None,
+        plugin_dirs: Vec::new(),
+    });
+    assert!(!task.iter().any(|argument| argument == "--setting-sources"));
+    assert!(!task.iter().any(|argument| argument == "--settings"));
+    assert!(!task.iter().any(|argument| argument == "--tools"));
+    assert!(
+        task.windows(2)
+            .any(|pair| { pair[0] == "--mcp-config" && pair[1] == "/app/task-mcp.json" })
     );
 }
 

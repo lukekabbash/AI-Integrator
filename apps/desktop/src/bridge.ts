@@ -1088,6 +1088,8 @@ export interface AutomationWriteInput {
   route: AutomationRoute;
   recurrenceUserRequest?: string;
   iterationNotes: boolean;
+  /** Moves the automation to another chat. Omitted, it keeps the current one. */
+  taskId?: string;
 }
 
 export interface AutomationCreateInput extends AutomationWriteInput {
@@ -7252,7 +7254,11 @@ export const bridge: AppBridge = {
 
   updateAutomation: async (automationId, input) => {
     if (!isTauri()) return updateDemoAutomation(automationId, input);
-    return nativeInvoke<Automation>("automation_update", { automationId, ...input });
+    return nativeInvoke<Automation>("automation_update", {
+      automationId,
+      ...input,
+      ...(input.taskId ? { taskId: nativeTaskIds.get(input.taskId) ?? input.taskId } : {}),
+    });
   },
 
   listAutomationRuns: async (automationId) => {

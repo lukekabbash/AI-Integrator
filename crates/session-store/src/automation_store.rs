@@ -31,6 +31,8 @@ pub struct NewAutomation {
 }
 
 pub struct UpdateAutomation {
+    /// Which chat the automation continues in. `None` keeps the current one.
+    pub task_id: Option<TaskId>,
     pub title: String,
     pub prompt: String,
     pub trigger: AutomationTrigger,
@@ -150,30 +152,49 @@ impl LocalStore {
         validate_iteration_notes(&input.trigger, input.iteration_notes)?;
         validate_route(&input.route)?;
         let current = self.get_automation(id)?;
+        let task_id = input.task_id.unwrap_or(current.task_id);
+        if task_id != current.task_id {
+            // Delegation targets are scoped to the chat that owns the subagent,
+            // so they cannot follow the automation to another chat.
+            if matches!(current.target, AutomationTarget::Delegation { .. }) {
+                return Err(IntegratorError::InvalidInput(
+                    "a subagent wakeup stays in the chat that owns the subagent".into(),
+                ));
+            }
+            self.get_task(task_id)?;
+        }
         if let AutomationTrigger::DelegationsSettled {
             ref delegation_ids, ..
         } = input.trigger
         {
             for delegation_id in delegation_ids {
                 let delegation = self.get_delegation(*delegation_id)?;
-                if delegation.parent_task_id != current.task_id {
+                if delegation.parent_task_id != task_id {
                     return Err(IntegratorError::Unauthorized(
                         "automation trigger includes another task's subagent".into(),
                     ));
                 }
             }
         }
-        if !matches!(
-            current.status,
-            AutomationStatus::Active | AutomationStatus::Paused | AutomationStatus::NeedsAttention
-        ) {
+        if current.status == AutomationStatus::Running {
             return Err(IntegratorError::InvalidInput(
-                "only active, paused, or attention-needed automations can be edited".into(),
+                "this scheduled task is mid-run and cannot be edited yet".into(),
             ));
         }
-        let next_run_at = initial_next_run(&input.trigger);
-        let status = if current.status == AutomationStatus::Paused {
-            AutomationStatus::Paused
+        // A cancelled or completed automation stays where it is. Editing it is
+        // how the user prepares a re-run ("run now" is what revives it), so the
+        // edit must not resurrect the schedule behind their back.
+        let terminal = matches!(
+            current.status,
+            AutomationStatus::Cancelled | AutomationStatus::Completed
+        );
+        let next_run_at = if terminal {
+            None
+        } else {
+            initial_next_run(&input.trigger)
+        };
+        let status = if terminal || current.status == AutomationStatus::Paused {
+            current.status
         } else {
             AutomationStatus::Active
         };
@@ -184,7 +205,7 @@ impl LocalStore {
         self.connection
             .lock()
             .execute(
-                "UPDATE automations SET title = ?1, prompt = ?2, trigger_json = ?3, route_json = ?4, recurrence_user_request = ?5, status = ?6, next_run_at = ?7, last_error = NULL, updated_at = ?8, iteration_notes = ?9, next_run_note = ?10 WHERE id = ?11",
+                "UPDATE automations SET title = ?1, prompt = ?2, trigger_json = ?3, route_json = ?4, recurrence_user_request = ?5, status = ?6, next_run_at = ?7, last_error = NULL, updated_at = ?8, iteration_notes = ?9, next_run_note = ?10, task_id = ?11 WHERE id = ?12",
                 params![
                     title,
                     prompt,
@@ -198,6 +219,7 @@ impl LocalStore {
                     Utc::now().to_rfc3339(),
                     input.iteration_notes,
                     next_run_note,
+                    task_id.to_string(),
                     id.to_string(),
                 ],
             )
@@ -359,13 +381,18 @@ impl LocalStore {
             .connection
             .lock()
             .execute(
-                "UPDATE automations SET status = 'active', next_run_at = ?1, updated_at = ?1 WHERE id = ?2 AND status IN ('active', 'paused', 'needs-attention')",
+                // Cancelled and completed are revivable: "run now" is an explicit
+                // request, and a schedule the user cancelled mid-run is exactly
+                // the one they come back to. Only a claimed run is off limits,
+                // because reviving it would dispatch the same occurrence twice.
+                "UPDATE automations SET status = 'active', next_run_at = ?1, last_error = NULL, updated_at = ?1 WHERE id = ?2 AND status != 'running'",
                 params![Utc::now().to_rfc3339(), id.to_string()],
             )
             .map_err(storage_error)?;
         if changed == 0 {
+            self.get_automation(id)?;
             return Err(IntegratorError::InvalidInput(
-                "this automation cannot run again".into(),
+                "this scheduled task is already running".into(),
             ));
         }
         self.get_automation(id)
@@ -886,6 +913,7 @@ mod tests {
             .update_automation(
                 automation.id,
                 UpdateAutomation {
+                    task_id: None,
                     title: "Check once more".into(),
                     prompt: automation.prompt,
                     trigger: AutomationTrigger::At { run_at },
@@ -899,5 +927,118 @@ mod tests {
         assert_eq!(updated.title, "Check once more");
         assert_eq!(updated.route.fallbacks[0].runtime, "claude");
         assert_eq!(updated.route.fallbacks[0].effort.as_deref(), Some("high"));
+    }
+
+    fn edit(task_id: Option<TaskId>, trigger: AutomationTrigger) -> UpdateAutomation {
+        UpdateAutomation {
+            task_id,
+            title: "Check once more".into(),
+            prompt: "Inspect the current result.".into(),
+            trigger,
+            route: route(),
+            recurrence_user_request: None,
+            iteration_notes: false,
+        }
+    }
+
+    fn scheduled(store: &LocalStore, task_id: TaskId, run_at: DateTime<Utc>) -> Automation {
+        store
+            .create_automation(NewAutomation {
+                task_id,
+                title: "Check again".into(),
+                prompt: "Inspect the current result.".into(),
+                target: AutomationTarget::Task,
+                trigger: AutomationTrigger::At { run_at },
+                route: route(),
+                source: AutomationSource::User,
+                recurrence_user_request: None,
+                iteration_notes: false,
+            })
+            .expect("automation")
+    }
+
+    #[test]
+    fn an_edit_can_move_the_automation_to_another_chat() {
+        let store = LocalStore::open_in_memory().expect("store");
+        let origin = task(&store);
+        let destination = task(&store);
+        let run_at = Utc::now() + Duration::minutes(5);
+        let automation = scheduled(&store, origin, run_at);
+
+        let moved = store
+            .update_automation(
+                automation.id,
+                edit(Some(destination), AutomationTrigger::At { run_at }),
+            )
+            .expect("retarget automation");
+        assert_eq!(moved.task_id, destination);
+        assert!(
+            store
+                .list_automations(Some(origin))
+                .expect("origin list")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .list_automations(Some(destination))
+                .expect("destination list")
+                .len(),
+            1
+        );
+
+        // Omitting the task id keeps the chat it was just moved to.
+        let stayed = store
+            .update_automation(moved.id, edit(None, AutomationTrigger::At { run_at }))
+            .expect("edit without retarget");
+        assert_eq!(stayed.task_id, destination);
+    }
+
+    #[test]
+    fn a_cancelled_automation_can_be_edited_and_run_again() {
+        let store = LocalStore::open_in_memory().expect("store");
+        let origin = task(&store);
+        let destination = task(&store);
+        let run_at = Utc::now() + Duration::minutes(5);
+        let automation = scheduled(&store, origin, run_at);
+        store
+            .cancel_automation(automation.id)
+            .expect("cancel automation");
+
+        // Editing a cancelled task prepares a re-run without resurrecting the
+        // schedule on its own.
+        let edited = store
+            .update_automation(
+                automation.id,
+                edit(Some(destination), AutomationTrigger::At { run_at }),
+            )
+            .expect("edit cancelled automation");
+        assert_eq!(edited.status, AutomationStatus::Cancelled);
+        assert_eq!(edited.task_id, destination);
+        assert!(edited.next_run_at.is_none());
+
+        let revived = store
+            .run_automation_now(automation.id)
+            .expect("run cancelled automation now");
+        assert_eq!(revived.status, AutomationStatus::Active);
+        assert!(revived.next_run_at.is_some_and(|next| next <= Utc::now()));
+    }
+
+    #[test]
+    fn a_claimed_run_blocks_both_edits_and_run_now() {
+        let store = LocalStore::open_in_memory().expect("store");
+        let task_id = task(&store);
+        let run_at = Utc::now() - Duration::minutes(1);
+        let automation = scheduled(&store, task_id, run_at);
+        store
+            .claim_automation(automation.id, run_at)
+            .expect("claim")
+            .expect("claimed run");
+
+        assert!(store.run_automation_now(automation.id).is_err());
+        assert!(
+            store
+                .update_automation(automation.id, edit(None, AutomationTrigger::At { run_at }))
+                .is_err()
+        );
     }
 }

@@ -12,7 +12,10 @@ mod launch;
 mod parse;
 mod process;
 #[cfg(test)]
-use launch::{antigravity_prompt_with_images, provider_args};
+use launch::{
+    CLAUDE_CHAT_ISOLATION_ENV, CLAUDE_CHAT_SESSION_SETTINGS, antigravity_prompt_with_images,
+    provider_args,
+};
 #[cfg(test)]
 use parse::{ParsedEvent, parse_provider_line};
 use process::{ChildTurnContext, run_child, spawn_structured_child};
@@ -36,6 +39,8 @@ pub enum StructuredPermissionMode {
     ReadOnly,
     /// General Chat: no coding tools or provider customizations. Provider
     /// adapters may still project the one explicitly configured Chat MCP.
+    /// Claude Chat must not use `--safe-mode` (it drops that MCP) or `--bare`
+    /// (it drops subscription auth).
     Chat,
     AcceptEdits,
     /// Skip provider approval prompts entirely. Only reachable from the

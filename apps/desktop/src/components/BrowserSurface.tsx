@@ -21,6 +21,7 @@ import {
 } from "react";
 
 import { bridge, type BrowserTab, type LocalServer } from "../bridge";
+import { watchLayoutShift } from "../layoutShift";
 import { useNativePageParked } from "../useModalOpen";
 import { resolveOmniboxInput, readSearchEngine } from "../browserOmnibox";
 import { toggleBrowserBookmark } from "./browserBookmarks";
@@ -406,14 +407,15 @@ export function BrowserSurface({
       frame = requestAnimationFrame(place);
     };
     report();
-    const observer = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(report);
-    observer?.observe(node);
-    window.addEventListener("resize", report);
+    // Size *and* position: the pane is a fixed-width column, so opening or
+    // closing a sidebar slides this slot sideways without resizing it, and a
+    // ResizeObserver on the slot alone would leave the page where the slot
+    // used to be. See watchLayoutShift.
+    const stopWatching = watchLayoutShift(node, report);
     window.addEventListener("scroll", report, true);
     return () => {
       cancelAnimationFrame(frame);
-      observer?.disconnect();
-      window.removeEventListener("resize", report);
+      stopWatching();
       window.removeEventListener("scroll", report, true);
       onBounds(null);
     };
