@@ -1,14 +1,30 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Maximize2, Minus, Plus, X } from "lucide-react";
 import { AnimatePresence, m as motion, useReducedMotion } from "motion/react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactElement,
+  type ReactNode,
+} from "react";
 
 import { bridge, type BrowserTab } from "../bridge";
+import { browserTabNeedsAgentProtection } from "../browserClosePolicy";
 import { poppedOutComposerHost } from "../composerCapture";
 import { initializeTheme, normalizeThemePreferences, setThemePreferences } from "../theme";
 import { type BrowserHost, useBrowserTabs } from "../useBrowserTabs";
 import { BROWSER_SETTINGS } from "./BrowserSettings";
 import { BrowserSurface } from "./BrowserSurface";
+import {
+  groupTabs,
+  nextActiveAfterCollapse,
+  truncateGroupName,
+  visibleTabs,
+  type StripGroup,
+} from "./browserWindowGroups";
 import {
   cycledTabId,
   jumpedTabId,
@@ -17,10 +33,13 @@ import {
   taskIdForNewTab,
 } from "./browserWindowTabs";
 import { TabFavicon } from "./TabFavicon";
+import { Tooltip } from "./Tooltip";
 import { TravelingSelection } from "./TravelingSelection";
 import "./browserWindow.css";
 
 const NO_TABS: BrowserTab[] = [];
+/** How many closed tabs Ctrl+Shift+T can bring back this session. */
+const CLOSED_RING = 10;
 
 /** The strip's enter/exit motion: a tab grows in from its leading edge. */
 const tabSpring = { type: "spring" as const, stiffness: 540, damping: 38, mass: 0.7 };
@@ -32,6 +51,84 @@ function isTypingTarget(target: EventTarget | null): boolean {
   return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
 }
 
+function collapsedStorageKey(scope: string): string {
+  return `integrator.popout.collapsed.${scope}`;
+}
+
+function readCollapsed(scope: string): Set<string> {
+  if (typeof window === "undefined") return new Set();
+  try {
+    const raw = window.sessionStorage.getItem(collapsedStorageKey(scope));
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    return new Set(Array.isArray(parsed) ? parsed.filter((id) => typeof id === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function writeCollapsed(scope: string, collapsed: ReadonlySet<string>): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(collapsedStorageKey(scope), JSON.stringify([...collapsed]));
+  } catch {
+    // Session storage is a convenience; the strip works without it.
+  }
+}
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host || url;
+  } catch {
+    return url;
+  }
+}
+
+/** Where a strip tooltip is drawn. The strip sits above a native page that
+ *  covers any HTML bubble under it, so while a live tab is in front the guest
+ *  draws the bubble in its own layer (`hostTooltip`); with nothing live to
+ *  cover it, the ordinary bubble does. */
+interface TooltipHost {
+  taskId: string;
+  tabId: string;
+}
+
+interface StripTooltipProps {
+  label: string;
+  hint?: string;
+  host: TooltipHost | null;
+  children: ReactElement;
+}
+
+function StripTooltip({ label, hint, host, children }: StripTooltipProps) {
+  const onOpenChange = useCallback(
+    (open: boolean, anchor?: DOMRect, shown?: ReactNode) => {
+      const api = bridge.browser;
+      if (!host || !api) return;
+      if (!open || !anchor || typeof shown !== "string") {
+        void api.invoke(host.taskId, host.tabId, "hostTooltip", [null]).catch(() => undefined);
+        return;
+      }
+      void api
+        .invoke(host.taskId, host.tabId, "hostTooltip", [
+          { label: shown, hint, x: anchor.left + anchor.width / 2 },
+        ])
+        .catch(() => undefined);
+    },
+    [hint, host],
+  );
+  return (
+    <Tooltip
+      label={label}
+      hint={hint}
+      placement="bottom"
+      renderBubble={host === null}
+      onOpenChange={host ? onOpenChange : undefined}
+    >
+      {children}
+    </Tooltip>
+  );
+}
+
 /**
  * The pop-out browser window.
  *
@@ -40,16 +137,19 @@ function isTypingTarget(target: EventTarget | null): boolean {
  * nothing else. Several tabs share the window with a strip across the top,
  * which is what makes it a browser window rather than a detached page.
  *
- * Two kinds of window run this shell. A task's window (`?taskId=`) shows that
- * task's popped-out tabs. The chat window (`?scope=chat`) is shared by every
- * chat, so its strip mixes tabs from several tasks; the native side decides
- * which tabs belong to the calling window and this shell just lists them.
- * Closing the window docks them all back; that lives in the native side, so it
- * holds even if this renderer never gets the chance.
+ * The strip is grouped: every tab sits under a coloured pill named for its
+ * group — the task's project, or the one Chat group — and a pill collapses its
+ * tabs away. Two kinds of window run this shell. A task's window (`?taskId=`)
+ * shows that task's popped-out tabs. The chat window (`?scope=chat`) is shared
+ * by every chat, so its strip mixes tabs from several tasks; the native side
+ * decides which tabs belong to the calling window and this shell just lists
+ * them. Closing the window docks them all back; that lives in the native side,
+ * so it holds even if this renderer never gets the chance.
  */
 export function BrowserWindowShell() {
   const [allowExternalOpen, setAllowExternalOpen] = useState(false);
   const [taskTitle, setTaskTitle] = useState("Browser");
+  const [taskTitles, setTaskTitles] = useState<ReadonlyMap<string, string>>(() => new Map());
   const query = useMemo(
     () =>
       typeof window === "undefined"
@@ -59,6 +159,7 @@ export function BrowserWindowShell() {
   );
   const urlTaskId = query.get("taskId");
   const chatScope = query.get("scope") === "chat";
+  const storageScope = chatScope ? "chat" : (urlTaskId ?? "task");
   const host = useMemo<BrowserHost>(
     () =>
       poppedOutComposerHost(async (file, name, chatTaskId) =>
@@ -69,8 +170,10 @@ export function BrowserWindowShell() {
 
   const [tabs, setTabs] = useState<BrowserTab[]>(NO_TABS);
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => readCollapsed(storageScope));
   const previousTabIds = useRef<Set<string>>(new Set());
   const lastTaskId = useRef<string | null>(urlTaskId);
+  const closedRing = useRef<{ taskId: string; url: string }[]>([]);
   const reduceMotion =
     Boolean(useReducedMotion()) ||
     (typeof document !== "undefined" && document.documentElement.dataset.motion === "none");
@@ -149,15 +252,19 @@ export function BrowserWindowShell() {
     };
   }, []);
 
+  // Task titles name the window and say whose agent is in a tab. Both kinds of
+  // window need them: the chat window's strip mixes chats.
   useEffect(() => {
-    if (chatScope || !urlTaskId) return;
     let active = true;
     const refresh = () => {
       void bridge
         .loadWorkspace()
         .then((workspace) => {
           if (!active) return;
-          setTaskTitle(workspace.tasks.find((task) => task.id === urlTaskId)?.title || "Browser");
+          const titles = new Map<string, string>();
+          for (const task of workspace.tasks) titles.set(task.id, task.title);
+          setTaskTitles(titles);
+          if (urlTaskId) setTaskTitle(titles.get(urlTaskId) || "Browser");
         })
         .catch(() => undefined);
     };
@@ -167,7 +274,7 @@ export function BrowserWindowShell() {
       active = false;
       window.removeEventListener("focus", refresh);
     };
-  }, [chatScope, urlTaskId]);
+  }, [urlTaskId]);
 
   useEffect(() => {
     const previous = previousTabIds.current;
@@ -175,10 +282,44 @@ export function BrowserWindowShell() {
     setActiveId((current) => nextPoppedTabId(current, previous, tabs));
   }, [tabs]);
 
+  const groups = useMemo(() => groupTabs(tabs, collapsed, activeId), [tabs, collapsed, activeId]);
+  const visible = useMemo(() => visibleTabs(groups), [groups]);
+  // Read once per tab change, as the pane does; the native close is the
+  // source of truth and answers `false` if the deadline has not passed.
+  const protectedIds = useMemo(
+    () => new Set(tabs.filter((tab) => browserTabNeedsAgentProtection(tab)).map((tab) => tab.id)),
+    [tabs],
+  );
+
+  const toggleGroup = useCallback(
+    (groupId: string) => {
+      setCollapsed((current) => {
+        const next = new Set(current);
+        if (next.has(groupId)) next.delete(groupId);
+        else next.add(groupId);
+        writeCollapsed(storageScope, next);
+        // Collapsing the group in front moves the selection to a neighbour;
+        // the tab keeps running, parked, like every other tab not in front.
+        if (!current.has(groupId)) {
+          const after = groupTabs(tabs, next, activeId);
+          const owner = after.find((group) => group.id === groupId);
+          if (owner?.activeHidden) {
+            const target = nextActiveAfterCollapse(activeId, after);
+            if (target) setActiveId(target);
+          }
+        }
+        return next;
+      });
+    },
+    [activeId, storageScope, tabs],
+  );
+
   // An agent asking to be watched. A popped tab is not the work pane's to
   // show, so this window answers for its own strip — without it, an agent
   // could never bring a popped page forward, and a screenshot of one came back
-  // as a picture of whatever was covering this window.
+  // as a picture of whatever was covering this window. A collapsed group stays
+  // collapsed: the tab comes to the front, the pill lights up, and the person
+  // decides whether to expand.
   const tabsRef = useRef(tabs);
   useEffect(() => {
     tabsRef.current = tabs;
@@ -213,6 +354,12 @@ export function BrowserWindowShell() {
   useEffect(() => {
     if (activeTaskId) lastTaskId.current = activeTaskId;
   }, [activeTaskId]);
+  const activeGroup = groups.find((group) => group.tabs.some((tab) => tab.id === activeId));
+  // The guest can only draw a tooltip while it is awake and in front.
+  const tooltipHost: TooltipHost | null =
+    active && !active.sleeping && !activeGroup?.collapsed
+      ? { taskId: active.taskId, tabId: active.id }
+      : null;
 
   // A task window is named for its task; the chat window, holding several
   // chats' pages, is named for whichever page is in front.
@@ -232,10 +379,18 @@ export function BrowserWindowShell() {
     (tab: BrowserTab) => void bridge.browser?.setPoppedOut(tab.taskId, tab.id, false),
     [],
   );
-  const closeTab = useCallback(
-    (tab: BrowserTab) => void bridge.browser?.close(tab.taskId, tab.id),
-    [],
-  );
+  const closeTab = useCallback(async (tab: BrowserTab) => {
+    const api = bridge.browser;
+    if (!api) return;
+    // `false` means the native side kept the tab for recent agent work; the
+    // tooltip already said so, and there is nothing to reopen.
+    const closed = await api.close(tab.taskId, tab.id).catch(() => false);
+    if (closed && tab.url && !/^about:/.test(tab.url)) {
+      closedRing.current = [...closedRing.current, { taskId: tab.taskId, url: tab.url }].slice(
+        -CLOSED_RING,
+      );
+    }
+  }, []);
   const addTab = useCallback(async () => {
     const api = bridge.browser;
     const taskId = taskIdForNewTab(activeTaskId, lastTaskId.current, urlTaskId);
@@ -243,9 +398,25 @@ export function BrowserWindowShell() {
     const tab = await api.open(taskId);
     await api.setPoppedOut(taskId, tab.id, true);
   }, [activeTaskId, urlTaskId]);
+  const reopenClosed = useCallback(async () => {
+    const api = bridge.browser;
+    if (!api) return;
+    while (closedRing.current.length > 0) {
+      const last = closedRing.current[closedRing.current.length - 1];
+      closedRing.current = closedRing.current.slice(0, -1);
+      try {
+        const tab = await api.open(last.taskId, last.url);
+        await api.setPoppedOut(last.taskId, tab.id, true);
+        return;
+      } catch {
+        // The task may be gone; try the one before it.
+      }
+    }
+  }, []);
 
   // Browser shortcuts: the strip is keyboard-driven the way any browser's is,
-  // as long as the keys are not on their way into a text field.
+  // as long as the keys are not on their way into a text field. Cycling and
+  // digits walk the visible tabs — a collapsed group is skipped, as in Chrome.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (!event.ctrlKey || event.altKey || event.metaKey) return;
@@ -253,22 +424,23 @@ export function BrowserWindowShell() {
       const key = event.key;
       if (key === "t" || key === "T") {
         event.preventDefault();
-        void addTab();
+        if (event.shiftKey) void reopenClosed();
+        else void addTab();
         return;
       }
       if (key === "w" || key === "W") {
         event.preventDefault();
-        if (active) dock(active);
+        if (active) void closeTab(active);
         return;
       }
       if (key === "Tab") {
         event.preventDefault();
-        const next = cycledTabId(activeId, tabs, event.shiftKey ? -1 : 1);
+        const next = cycledTabId(activeId, visible, event.shiftKey ? -1 : 1);
         if (next) setActiveId(next);
         return;
       }
       if (/^[1-9]$/.test(key)) {
-        const target = jumpedTabId(Number(key), tabs);
+        const target = jumpedTabId(Number(key), visible);
         if (target) {
           event.preventDefault();
           setActiveId(target);
@@ -277,94 +449,74 @@ export function BrowserWindowShell() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [tabs, activeId, active, addTab, dock]);
+  }, [visible, activeId, active, addTab, closeTab, reopenClosed]);
 
   const windowHandle = getCurrentWindow();
-  const stripLabel = chatScope ? "Chat" : taskTitle;
+  const layoutKey = groups
+    .map(
+      (group) => `${group.id}:${group.collapsed ? "" : group.tabs.map((tab) => tab.id).join(",")}`,
+    )
+    .join("|");
 
   return (
     <div className="browser-window" data-tauri-drag-region>
       <header className="browser-window-strip" data-tauri-drag-region>
-        <span
-          className="browser-window-title"
-          data-scope={chatScope ? "chat" : "task"}
-          title={stripLabel}
-          data-tauri-drag-region
-        >
-          {stripLabel}
-        </span>
-        <div
-          className="browser-window-tabs"
-          role="tablist"
-          aria-label="Popped out browser tabs"
-          data-tauri-drag-region
-        >
+        <div className="browser-window-tabs" role="tablist" aria-label="Popped out browser tabs">
           {/* The work pane's strip and this one are the same object in two
               frames, so the selection reads the same way here: outlines on
               every tab, one travelling fill in the sidebar's colour. */}
           <TravelingSelection
-            activeKey={activeId ?? ""}
+            activeKey={activeGroup?.activeHidden ? "" : (activeId ?? "")}
             className="tab-strip-selection"
             clampWidth={false}
             pace="quick"
-            layoutKey={tabs.map((tab) => tab.id).join("|")}
+            layoutKey={layoutKey}
           />
           <AnimatePresence initial={false}>
-            {tabs.map((tab) => (
-              <motion.div
-                key={tab.id}
-                layout={!reduceMotion}
-                className="file-reader-tab browser-window-tab"
-                data-active={tab.id === activeId ? "true" : undefined}
-                data-traveling-selection={tab.id}
-                data-task-id={tab.taskId}
-                initial={reduceMotion ? false : { opacity: 0, scaleX: 0.6, flexGrow: 0, minWidth: 0 }}
-                animate={{ opacity: 1, scaleX: 1, flexGrow: 1, minWidth: 64 }}
-                exit={
-                  reduceMotion
-                    ? { opacity: 0 }
-                    : { opacity: 0, scaleX: 0.6, flexGrow: 0, minWidth: 0 }
-                }
-                transition={reduceMotion ? { duration: 0 } : tabSpring}
-                style={{ originX: 0 }}
-                onAuxClick={(event) => {
-                  if (event.button === 1) {
-                    event.preventDefault();
-                    closeTab(tab);
-                  }
-                }}
-              >
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={tab.id === activeId}
-                  onClick={() => setActiveId(tab.id)}
-                >
-                  <TabFavicon src={tab.favicon} />
-                  <span>{tabLabel(tab)}</span>
-                </button>
-                <button
-                  type="button"
-                  className="file-reader-tab-close"
-                  aria-label={`Return ${tab.title || tab.url} to the app`}
-                  title="Return to the app"
-                  onClick={() => dock(tab)}
-                >
-                  <X aria-hidden="true" />
-                </button>
-              </motion.div>
-            ))}
+            {groups.flatMap((group) => [
+              <GroupPill
+                key={`pill:${group.id}`}
+                group={group}
+                tooltipHost={tooltipHost}
+                reduceMotion={reduceMotion}
+                onToggle={toggleGroup}
+              />,
+              ...(group.collapsed
+                ? []
+                : group.tabs.map((tab) => (
+                    <StripTab
+                      key={tab.id}
+                      tab={tab}
+                      group={group}
+                      active={tab.id === activeId}
+                      preservesAgentWork={protectedIds.has(tab.id)}
+                      driver={
+                        tab.heldBy && tab.heldBy !== "you"
+                          ? `${tab.heldBy} is working here — ${
+                              taskTitles.get(tab.taskId) ?? "another chat"
+                            }`
+                          : null
+                      }
+                      tooltipHost={tooltipHost}
+                      reduceMotion={reduceMotion}
+                      onSelect={() => setActiveId(tab.id)}
+                      onDock={() => dock(tab)}
+                      onClose={() => void closeTab(tab)}
+                    />
+                  ))),
+            ])}
           </AnimatePresence>
         </div>
-        <button
-          type="button"
-          className="browser-window-new-tab"
-          aria-label="New browser tab"
-          title="New tab (Ctrl+T)"
-          onClick={() => void addTab()}
-        >
-          <Plus aria-hidden="true" />
-        </button>
+        <StripTooltip label="New tab" hint="Ctrl+T" host={tooltipHost}>
+          <button
+            type="button"
+            className="browser-window-new-tab"
+            aria-label="New browser tab"
+            onClick={() => void addTab()}
+          >
+            <Plus aria-hidden="true" />
+          </button>
+        </StripTooltip>
         <div className="browser-window-strip-spacer" data-tauri-drag-region />
         <div className="browser-window-controls">
           <button
@@ -412,6 +564,144 @@ export function BrowserWindowShell() {
         )}
       </div>
     </div>
+  );
+}
+
+interface GroupPillProps {
+  group: StripGroup<BrowserTab>;
+  tooltipHost: TooltipHost | null;
+  reduceMotion: boolean;
+  onToggle: (groupId: string) => void;
+}
+
+/** One group's name, in its colour. Click folds the group's tabs away and
+ *  back; a dot says an agent is working in one of them. */
+function GroupPill({ group, tooltipHost, reduceMotion, onToggle }: GroupPillProps) {
+  const count = group.tabs.length;
+  const tabsWord = count === 1 ? "tab" : "tabs";
+  return (
+    <StripTooltip
+      label={group.name}
+      hint={`${count} ${tabsWord} · click to ${group.collapsed ? "expand" : "collapse"}`}
+      host={tooltipHost}
+    >
+      <motion.button
+        type="button"
+        layout={!reduceMotion}
+        className="browser-group-pill"
+        data-group-id={group.id}
+        data-group-kind={group.kind}
+        data-color={group.colorIndex}
+        data-collapsed={group.collapsed ? "true" : undefined}
+        data-live={group.live ? "true" : undefined}
+        data-active-hidden={group.activeHidden ? "true" : undefined}
+        aria-pressed={!group.collapsed}
+        aria-label={`${group.name}, ${count} ${tabsWord}, ${
+          group.collapsed ? "collapsed" : "expanded"
+        }`}
+        transition={reduceMotion ? { duration: 0 } : tabSpring}
+        onClick={() => onToggle(group.id)}
+      >
+        <span className="browser-group-pill-name">{truncateGroupName(group.name)}</span>
+        {group.live ? <span className="browser-group-pill-dot" aria-hidden="true" /> : null}
+      </motion.button>
+    </StripTooltip>
+  );
+}
+
+interface StripTabProps {
+  tab: BrowserTab;
+  group: StripGroup<BrowserTab>;
+  active: boolean;
+  /** The native side would keep this tab on close for recent agent work. */
+  preservesAgentWork: boolean;
+  /** "<agent> is working here — <task>" while an agent holds the tab. */
+  driver: string | null;
+  tooltipHost: TooltipHost | null;
+  reduceMotion: boolean;
+  onSelect: () => void;
+  onDock: () => void;
+  onClose: () => void;
+}
+
+function StripTab({
+  tab,
+  group,
+  active,
+  preservesAgentWork,
+  driver,
+  tooltipHost,
+  reduceMotion,
+  onSelect,
+  onDock,
+  onClose,
+}: StripTabProps) {
+  const label = tabLabel(tab);
+  return (
+    <motion.div
+      layout={!reduceMotion}
+      className="file-reader-tab browser-window-tab"
+      data-active={active ? "true" : undefined}
+      data-traveling-selection={tab.id}
+      data-task-id={tab.taskId}
+      data-group-id={group.id}
+      data-color={group.colorIndex}
+      data-busy={driver ? "true" : undefined}
+      initial={reduceMotion ? false : { opacity: 0, scaleX: 0.6, flexGrow: 0, minWidth: 0 }}
+      animate={{ opacity: 1, scaleX: 1, flexGrow: 1, minWidth: 96 }}
+      exit={reduceMotion ? { opacity: 0 } : { opacity: 0, scaleX: 0.6, flexGrow: 0, minWidth: 0 }}
+      transition={reduceMotion ? { duration: 0 } : tabSpring}
+      style={{ originX: 0 }}
+      onAuxClick={(event) => {
+        if (event.button === 1) {
+          event.preventDefault();
+          onClose();
+        }
+      }}
+    >
+      <StripTooltip
+        label={`${group.name} · ${label}`}
+        hint={driver ?? hostOf(tab.url)}
+        host={tooltipHost}
+      >
+        <button type="button" role="tab" aria-selected={active} onClick={onSelect}>
+          <TabFavicon src={tab.favicon} />
+          <span>{label}</span>
+        </button>
+      </StripTooltip>
+      {/* Two verbs, as in the pane: Minus sends the page back to the pane with
+          everything still running; X ends it. */}
+      <StripTooltip label="Send to the pane" hint="Keeps the page running" host={tooltipHost}>
+        <button
+          type="button"
+          className="file-reader-tab-close browser-window-tab-minimize"
+          aria-label={`Send ${label} to the app`}
+          onClick={(event) => {
+            event.stopPropagation();
+            onDock();
+          }}
+        >
+          <Minus aria-hidden="true" />
+        </button>
+      </StripTooltip>
+      <StripTooltip
+        label={preservesAgentWork ? "Minimize" : "Close"}
+        hint={preservesAgentWork ? "Recent agent work is kept in the compact browser" : "Ctrl+W"}
+        host={tooltipHost}
+      >
+        <button
+          type="button"
+          className="file-reader-tab-close"
+          aria-label={preservesAgentWork ? `Minimize ${label}` : `Close ${label}`}
+          onClick={(event) => {
+            event.stopPropagation();
+            onClose();
+          }}
+        >
+          <X aria-hidden="true" />
+        </button>
+      </StripTooltip>
+    </motion.div>
   );
 }
 

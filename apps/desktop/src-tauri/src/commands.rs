@@ -1049,13 +1049,14 @@ pub async fn voice_typing_transcribe(
 
 #[tauri::command]
 pub async fn project_register(
+    app: AppHandle,
     state: State<'_, AppState>,
     path: PathBuf,
 ) -> CommandResult<TrustedProject> {
     let git = state.git.clone();
     let store = Arc::clone(&state.store);
     let authorizations = Arc::clone(&state.git_authorizations);
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let mut authorizations = authorizations.lock().expect("git authorization cache lock");
         let project_root = canonical_project_directory(&path)?;
         let identity = git
@@ -1082,7 +1083,11 @@ pub async fn project_register(
     })
     .await
     .map_err(|_| worker_error())?
-    .map_err(Into::into)
+    .map_err(Into::into);
+    // Browser tabs name their group after the project; a change here must
+    // reach the next tab list.
+    crate::browser::groups::invalidate_groups_in(&app);
+    result
 }
 
 /// Windows forbids `<>:"/\|?*` in file names and trailing dots/spaces; the
@@ -1128,7 +1133,7 @@ pub async fn project_create(
             "could not locate the Documents folder".into(),
         ))
     })?;
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let mut authorizations = authorizations.lock().expect("git authorization cache lock");
         let name = name.trim().to_string();
         validate_project_name(&name)?;
@@ -1159,7 +1164,11 @@ pub async fn project_create(
     })
     .await
     .map_err(|_| worker_error())?
-    .map_err(Into::into)
+    .map_err(Into::into);
+    // Browser tabs name their group after the project; a change here must
+    // reach the next tab list.
+    crate::browser::groups::invalidate_groups_in(&app);
+    result
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1187,13 +1196,14 @@ pub fn project_default_parent(app: AppHandle) -> CommandResult<PathBuf> {
 /// while a repository chosen from the authenticated GitHub catalog uses `gh`.
 #[tauri::command]
 pub async fn project_clone(
+    app: AppHandle,
     state: State<'_, AppState>,
     input: ProjectCloneInput,
 ) -> CommandResult<TrustedProject> {
     let git = state.git.clone().ok_or_else(git_unavailable)?;
     let store = Arc::clone(&state.store);
     let authorizations = Arc::clone(&state.git_authorizations);
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         validate_project_name(&input.folder_name)?;
         let parent = canonical_project_directory(&input.parent)?;
         let destination = parent.join(input.folder_name.trim());
@@ -1219,7 +1229,11 @@ pub async fn project_clone(
     })
     .await
     .map_err(|_| worker_error())?
-    .map_err(Into::into)
+    .map_err(Into::into);
+    // Browser tabs name their group after the project; a change here must
+    // reach the next tab list.
+    crate::browser::groups::invalidate_groups_in(&app);
+    result
 }
 
 #[tauri::command]
@@ -1291,6 +1305,7 @@ pub async fn project_list(state: State<'_, AppState>) -> CommandResult<Vec<Trust
 
 #[tauri::command]
 pub async fn project_remove(
+    app: AppHandle,
     state: State<'_, AppState>,
     project_id: Option<ProjectId>,
     repository_path: Option<PathBuf>,
@@ -1299,7 +1314,7 @@ pub async fn project_remove(
     let store = Arc::clone(&state.store);
     let authorizations = Arc::clone(&state.git_authorizations);
     let delete_files = delete_files.unwrap_or(false);
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let Some(project_id) = project_id else {
             if delete_files {
                 return Err(IntegratorError::InvalidInput(
@@ -1341,7 +1356,11 @@ pub async fn project_remove(
     })
     .await
     .map_err(|_| worker_error())?
-    .map_err(Into::into)
+    .map_err(Into::into);
+    // Browser tabs name their group after the project; a change here must
+    // reach the next tab list.
+    crate::browser::groups::invalidate_groups_in(&app);
+    result
 }
 
 #[tauri::command]

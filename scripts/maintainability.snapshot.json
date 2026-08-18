@@ -11,7 +11,7 @@
     },
     {
       "path": "apps/desktop/src-tauri/src/commands.rs",
-      "maxLines": 9828
+      "maxLines": 9847
     },
     {
       "path": "apps/desktop/src/App.tsx",
@@ -19,7 +19,7 @@
     },
     {
       "path": "apps/desktop/src/bridge.ts",
-      "maxLines": 7674
+      "maxLines": 7682
     },
     {
       "path": "apps/desktop/src/components/SettingsView.tsx",
@@ -47,7 +47,7 @@
     },
     {
       "path": "crates/session-store/src/tests.rs",
-      "maxLines": 2548
+      "maxLines": 2590
     },
     {
       "path": "apps/desktop/src/runtimeProjection.test.ts",
@@ -123,7 +123,7 @@
     },
     {
       "path": "apps/desktop/src-tauri/src/browser/mod.rs",
-      "maxLines": 1148
+      "maxLines": 1154
     },
     {
       "path": "apps/desktop/src-tauri/src/browser/vault.rs",

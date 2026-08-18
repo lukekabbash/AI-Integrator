@@ -143,6 +143,21 @@
   --color-warning: var(--color-status-warning);
   --color-danger: var(--color-status-danger);
   --color-info: var(--color-status-info);
+  /* Tab-group hues. Derived from tokens every preset already sets, so a group
+     pill stays in the family of whatever theme is on without 27 presets each
+     having to name eight more colours. A preset that wants its own can
+     override these directly. */
+  --color-group-1: var(--color-accent);
+  --color-group-2: var(--color-status-success);
+  --color-group-3: var(--color-status-warning);
+  --color-group-4: var(--color-status-info);
+  --color-group-5: var(--color-status-danger);
+  --color-group-6: var(
+    --color-accent-secondary,
+    color-mix(in srgb, var(--color-accent) 50%, var(--color-status-info))
+  );
+  --color-group-7: color-mix(in srgb, var(--color-status-success) 55%, var(--color-status-info));
+  --color-group-8: color-mix(in srgb, var(--color-status-warning) 55%, var(--color-status-danger));
   --color-diff-add-bg: var(--color-diff-added);
   --color-diff-add-text: var(--color-diff-addedText);
   --color-diff-add-gutter: var(--color-diff-addedStrong);
@@ -348,6 +363,18 @@ samp,
     --color-accent-pressed: VisitedText;
     --color-accent-subtle: Canvas;
     --color-accent-text: Canvas;
+    /* Forced colours have no palette to spend on eight hues, and a mix of two
+       system colours is not one the user chose. The group pills give up their
+       distinctions here and read as ordinary text, with the first — the window's
+       own group — kept on Highlight. */
+    --color-group-1: Highlight;
+    --color-group-2: CanvasText;
+    --color-group-3: CanvasText;
+    --color-group-4: CanvasText;
+    --color-group-5: CanvasText;
+    --color-group-6: CanvasText;
+    --color-group-7: CanvasText;
+    --color-group-8: CanvasText;
     --shadow-elevated: none;
     --shadow-composer: none;
   }

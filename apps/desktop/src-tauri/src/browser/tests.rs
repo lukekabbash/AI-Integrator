@@ -136,6 +136,21 @@ fn context_actions_are_authenticated_task_scoped_and_web_only() {
     );
 }
 
+/// The group a test task belongs to, without a store: task ids starting with
+/// `chat` are chats (mirroring `popout::task_is_chat` for the fixtures here),
+/// everything else is a path group over the task string.
+fn test_group(task: &str) -> Group {
+    if task.starts_with("chat") {
+        Group::chat()
+    } else {
+        Group {
+            id: groups::path_group_id(std::path::Path::new(task)),
+            name: task.to_string(),
+            kind: groups::GroupKind::Path,
+        }
+    }
+}
+
 /// A registry holding one tab per `(id, task, owner)`, where `owner` is the
 /// delegated child that opened it, or `None` for the orchestrator's own.
 fn registry(rows: &[(&str, &str, Option<&str>)]) -> BrowserTabs {
@@ -143,12 +158,16 @@ fn registry(rows: &[(&str, &str, Option<&str>)]) -> BrowserTabs {
     {
         let mut guard = tabs.tabs.lock().unwrap();
         for (id, task, owner) in rows {
+            let group = test_group(task);
             guard.insert(
                 (*id).to_string(),
                 Tab {
                     state: BrowserTab {
                         id: (*id).to_string(),
                         task_id: (*task).to_string(),
+                        group_id: group.id,
+                        group_name: group.name,
+                        group_kind: group.kind,
                         url: "about:blank".into(),
                         title: String::new(),
                         favicon: None,
@@ -174,6 +193,96 @@ fn registry(rows: &[(&str, &str, Option<&str>)]) -> BrowserTabs {
         }
     }
     tabs
+}
+
+#[test]
+fn registry_fixture_groups_match_the_chat_rule() {
+    // The fixture's Chat kind is decided by the task string the way
+    // `popout::task_is_chat` decides it from the store: chats and only chats
+    // land in the Chat group. Everything else keeps a group of its own.
+    let tabs = registry(&[
+        ("tab-1", "chat-a", None),
+        ("tab-2", "chat-b", None),
+        ("tab-3", "task-a", None),
+        ("tab-4", "task-b", Some("child")),
+    ]);
+    for tab in tabs.snapshot(None) {
+        let chat = tab.task_id.starts_with("chat");
+        assert_eq!(
+            tab.group_kind == groups::GroupKind::Chat,
+            chat,
+            "{}",
+            tab.id
+        );
+        assert_eq!(tab.group_id == groups::CHAT_GROUP_ID, chat, "{}", tab.id);
+        if !chat {
+            assert_eq!(
+                tab.group_id,
+                groups::path_group_id(std::path::Path::new(&tab.task_id))
+            );
+        }
+    }
+    let ids: std::collections::HashSet<_> = tabs
+        .snapshot(None)
+        .into_iter()
+        .map(|tab| tab.group_id)
+        .collect();
+    assert_eq!(
+        ids.len(),
+        3,
+        "two chats share one group; each task has its own"
+    );
+}
+
+#[test]
+fn snapshots_take_the_cached_group_name() {
+    // A re-registered project renames its pill through the cache; a tab
+    // recorded under the old name reads the new one on the way out.
+    let tabs = registry(&[("tab-1", "task-a", None)]);
+    assert_eq!(tabs.snapshot(None)[0].group_name, "task-a");
+    tabs.groups.lock().unwrap().insert(
+        "task-a".into(),
+        Group {
+            id: groups::path_group_id(std::path::Path::new("task-a")),
+            name: "Renamed".into(),
+            kind: groups::GroupKind::Path,
+        },
+    );
+    assert_eq!(tabs.snapshot(None)[0].group_name, "Renamed");
+    groups::invalidate_groups(&tabs);
+    assert_eq!(tabs.snapshot(None)[0].group_name, "task-a");
+}
+
+#[test]
+fn store_backed_groups_agree_with_task_kind() {
+    // Same rule `popout::task_is_chat` applies from the store: a task is in
+    // the Chat group exactly when its kind is Chat.
+    let store = session_store::LocalStore::open_in_memory().expect("open store");
+    let make = |kind, path: Option<std::path::PathBuf>| {
+        store
+            .create_task(integrator_core::NewTask {
+                kind,
+                title: "t".into(),
+                repository_path: path,
+                worktree_path: None,
+                runtime: None,
+                model: None,
+                effort: None,
+                parent_task_id: None,
+            })
+            .expect("create task")
+    };
+    let chat = make(integrator_core::TaskKind::Chat, None);
+    let code = make(
+        integrator_core::TaskKind::Code,
+        Some(std::path::PathBuf::from("/tmp/somewhere")),
+    );
+    for task in [chat, code] {
+        let group = groups::resolve_group(&store, &task.id.to_string());
+        let is_chat = task.kind == integrator_core::TaskKind::Chat;
+        assert_eq!(group.kind == groups::GroupKind::Chat, is_chat);
+        assert_eq!(group.id == groups::CHAT_GROUP_ID, is_chat);
+    }
 }
 
 fn caller(task: &str, delegation: Option<&str>) -> Caller {

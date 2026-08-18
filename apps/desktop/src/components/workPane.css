@@ -276,7 +276,7 @@
 
 .work-pane-strip-new {
   flex: none;
-  margin-bottom: 4px;
+  margin-bottom: 3px;
   color: var(--color-text-tertiary);
 }
 .work-pane-strip-new svg {

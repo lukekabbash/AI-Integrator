@@ -1989,6 +1989,48 @@ fn queued_message_dispatch_recovery_and_adversarial_boundaries_fail_closed() {
 }
 
 #[test]
+fn project_for_repository_path_matches_the_exact_root_only() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    let repository = directory.path().join("repository");
+    let common = repository.join(".git");
+    std::fs::create_dir_all(&common).expect("fixture directories");
+    let store = LocalStore::open_in_memory().expect("open store");
+    let registered = store
+        .upsert_trusted_project("Repository", &repository, Some((&repository, &common)))
+        .expect("register project");
+
+    let found = store
+        .project_for_repository_path(&repository)
+        .expect("look up project")
+        .expect("project registered under this root");
+    assert_eq!(found.id, registered.id);
+    assert_eq!(found.display_name, "Repository");
+    assert_eq!(found.repository_root, repository);
+    assert_eq!(
+        found.git_repository_root.as_deref(),
+        Some(repository.as_path())
+    );
+    assert_eq!(
+        found.git_common_directory.as_deref(),
+        Some(common.as_path())
+    );
+
+    assert!(
+        store
+            .project_for_repository_path(&directory.path().join("elsewhere"))
+            .expect("look up other path")
+            .is_none()
+    );
+    // A child of the root is a different path; the match is exact, not a prefix.
+    assert!(
+        store
+            .project_for_repository_path(&common)
+            .expect("look up nested path")
+            .is_none()
+    );
+}
+
+#[test]
 fn trusted_projects_persist_across_reopen_and_export() {
     let directory = tempfile::tempdir().expect("temp directory");
     let database = directory.path().join("integrator.sqlite3");

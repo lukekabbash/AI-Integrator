@@ -18,6 +18,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::groups::{GroupCache, GroupKind};
+
 /// One tab's user-visible state. The renderer renders from this; the agent
 /// reads the same fields through the broker.
 #[derive(Clone, Debug, Serialize)]
@@ -26,6 +28,11 @@ pub struct BrowserTab {
     pub id: String,
     /// Task that owns the tab, so agent tools cannot address another task's tabs.
     pub task_id: String,
+    /// The group this tab is drawn and (from stage B) cookie-scoped under: the
+    /// task's project, or the one Chat group. Derived from the task; never edited.
+    pub group_id: String,
+    pub group_name: String,
+    pub group_kind: GroupKind,
     pub url: String,
     pub title: String,
     /// The site's own icon as a `data:` URL, once the page has been asked for
@@ -206,6 +213,9 @@ pub struct BrowserTabs {
     /// Serializes profile merges and scope-setting writes. A second confirm
     /// cannot race the rollback snapshot from the first.
     pub(crate) identity_change: Mutex<()>,
+    /// Each task's group, resolved once from the store. Cleared by
+    /// `groups::invalidate_groups` when a project changes.
+    pub(crate) groups: GroupCache,
 }
 
 impl Default for BrowserTabs {
@@ -218,6 +228,7 @@ impl Default for BrowserTabs {
             placement_orders: Mutex::default(),
             identity_scope: super::BrowserIdentityScope::Task,
             identity_change: Mutex::default(),
+            groups: Mutex::default(),
         }
     }
 }
@@ -254,6 +265,11 @@ impl BrowserTabs {
                 let mut state = tab.state.clone();
                 state.held_by = holder_of(tab, user_hold);
                 state.agent_protected_until = agent_protected_until(tab);
+                // A re-registered project renames its pill without touching
+                // each tab: the cached name wins over the one recorded at open.
+                if let Some(name) = self.cached_group_name(&state.task_id) {
+                    state.group_name = name;
+                }
                 state
             })
             .collect();

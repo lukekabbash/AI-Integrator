@@ -32,6 +32,7 @@ use crate::command_api::{CommandError, CommandResult};
 mod agent;
 mod capture;
 mod favicon;
+pub mod groups;
 mod identity;
 mod menu;
 mod popout;
@@ -41,6 +42,7 @@ mod servers;
 pub(crate) mod sites;
 mod vault;
 
+pub use groups::Group;
 pub use identity::BrowserIdentityScope;
 pub(crate) use identity::{configured_scope, prepare_profile_layout, prune_ephemeral_profiles};
 pub use menu::browser_tab_menu;
@@ -537,9 +539,13 @@ pub(super) async fn create_tab(
         )));
     }
 
+    let group = groups::group_for_task(app, state, &task_id);
     let tab = BrowserTab {
         id: id.clone(),
         task_id,
+        group_id: group.id,
+        group_name: group.name,
+        group_kind: group.kind,
         url: target.to_string(),
         title: String::new(),
         favicon: favicon::cached_for_url(target.as_str()),

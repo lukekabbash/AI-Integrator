@@ -10,6 +10,9 @@ import { BrowserChromeBar, BrowserSurface, type BrowserSurfaceProps } from "./Br
 const POPPED_TAB: BrowserTab = {
   id: "tab-a",
   taskId: "task-a",
+  groupId: "project:test",
+  groupName: "Test project",
+  groupKind: "project",
   url: "https://example.com",
   title: "Example",
   loading: false,

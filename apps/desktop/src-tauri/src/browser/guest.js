@@ -861,6 +861,8 @@
                     box-shadow:0 8px 24px rgba(0,0,0,.24);
                     font:11px/1.35 var(--font,ui-sans-serif,system-ui,sans-serif);
                     white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      .host-tooltip small{display:block;margin-top:2px;font-size:10px;line-height:1.3;
+                    color:var(--muted,#96a0ab);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
       /* The agent's own cursor. A page driven from the outside otherwise moves
          by itself with nothing to watch; this shows where the work is landing,
          the way a person's pointer would. It never takes pointer events and it
@@ -1166,6 +1168,13 @@
       root.appendChild(bubble);
     }
     bubble.textContent = value.label.slice(0, 120);
+    // The pop-out strip's tooltips carry a second line — the group, or who is
+    // driving the tab. Same bubble, dimmer text under the label.
+    if (typeof value.hint === "string" && value.hint.trim()) {
+      const hint = document.createElement("small");
+      hint.textContent = value.hint.slice(0, 120);
+      bubble.appendChild(hint);
+    }
     bubble.style.left = "8px";
     const width = bubble.getBoundingClientRect().width;
     const wanted = Number.isFinite(Number(value.x)) ? Number(value.x) - width / 2 : 8;

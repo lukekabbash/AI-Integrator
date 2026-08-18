@@ -1402,6 +1402,14 @@ export interface BrowserMenuPick {
 export interface BrowserTab {
   id: string;
   taskId: string;
+  /**
+   * The group this tab is drawn under: the task's project, or the one Chat
+   * group. Native derives it from the task; the renderer must not re-derive
+   * it from `TaskSummary.projectId`, whose ids differ.
+   */
+  groupId: string;
+  groupName: string;
+  groupKind: "chat" | "project" | "path";
   url: string;
   title: string;
   /** The site's own icon as a `data:` URL, once the page has reported one. */

@@ -34,36 +34,10 @@
   background: color-mix(in srgb, var(--color-text-primary) 7%, transparent);
 }
 
-.browser-window-title {
-  height: 30px;
-  max-width: 190px;
-  flex: none;
-  display: block;
-  margin-right: 4px;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  color: var(--color-text-secondary);
-  font-size: 10.5px;
-  font-weight: 620;
-  line-height: 30px;
-}
-.browser-window-title[data-scope="chat"] {
-  padding: 0 7px;
-  height: 18px;
-  align-self: center;
-  margin-bottom: 6px;
-  border-radius: var(--radius-control);
-  background: var(--color-layer-1);
-  color: var(--color-text-tertiary);
-  font-size: 10px;
-  letter-spacing: 0.02em;
-  line-height: 18px;
-  text-transform: uppercase;
-}
-
-/* Tabs shrink to share the strip rather than scrolling off it, the way a
-   browser's do; the title fades out on the right as a tab tightens. */
+/* Tabs keep a readable width and the row scrolls once they no longer fit —
+   squashing them to a favicon buys nothing when a group pill already says
+   where a tab belongs. No scrollbar; the edges fade instead, so a run of tabs
+   reads as continuing past the strip rather than being cut off. */
 .browser-window-tabs {
   position: relative;
   flex: 0 1 auto;
@@ -72,7 +46,13 @@
   display: flex;
   align-items: flex-end;
   gap: 4px;
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  mask-image: linear-gradient(90deg, transparent, #000 10px, #000 calc(100% - 10px), transparent);
+}
+.browser-window-tabs::-webkit-scrollbar {
+  display: none;
 }
 
 /* Same strip as the work pane: every tab outlined, the selected one filled by
@@ -80,10 +60,10 @@
 .browser-window-tab {
   position: relative;
   z-index: 1;
-  /* Each tab asks for a comfortable width and gives it up evenly as the strip
-     fills, the way a browser's do; nothing scrolls off the end. */
-  flex: 1 1 176px;
-  min-width: 64px;
+  /* Each tab asks for a comfortable width and gives up only what it can spare;
+     past that the row scrolls rather than shrinking titles into nothing. */
+  flex: 0 1 176px;
+  min-width: 96px;
   max-width: 220px;
   height: 30px;
   border-radius: 8px 8px 0 0;
@@ -95,13 +75,12 @@
   border-bottom: 0;
   background: transparent;
 }
-.browser-window-tabs .browser-window-tab:not([data-active="true"]):hover {
-  background: var(--color-layer-1);
-}
+/* Type and spacing come from the pane's strip verbatim: the two rows sit one
+   above the other on screen often enough that any drift reads as a bug. */
 .browser-window-tabs .browser-window-tab > button[role="tab"] {
-  padding: 0 8px;
-  gap: 6px;
-  font-size: 11px;
+  padding: 0 6px;
+  gap: 5px;
+  font-size: 10.5px;
   font-weight: 500;
   transition: padding-right var(--motion-fast) var(--ease-standard);
 }
@@ -113,8 +92,8 @@
 }
 .browser-window-tab .tab-favicon,
 .browser-window-tab > button[role="tab"] > svg {
-  width: 14px;
-  height: 14px;
+  width: 12px;
+  height: 12px;
   border-radius: 2px;
 }
 .browser-window-tabs .browser-window-tab[data-active="true"] > button[role="tab"] {
@@ -133,10 +112,9 @@
    selected, so a resting strip shows titles — the work pane behaves the same. */
 .browser-window-tabs .browser-window-tab > .file-reader-tab-close {
   position: absolute;
-  top: 4px;
-  right: 3px;
-  bottom: 4px;
-  width: 20px;
+  top: 0;
+  bottom: 0;
+  width: 22px;
   opacity: 0;
   transform: translateY(-1px) scale(0.88);
   pointer-events: none;
@@ -147,10 +125,17 @@
     color var(--motion-fast) var(--ease-standard),
     background-color var(--motion-fast) var(--ease-standard);
 }
+/* Close sits at the end; minimize tucks in beside it — the pane's order. */
+.browser-window-tabs .browser-window-tab > .file-reader-tab-close:last-of-type {
+  right: 0;
+}
+.browser-window-tabs .browser-window-tab > .browser-window-tab-minimize {
+  right: 20px;
+}
 .browser-window-tab:hover > button[role="tab"],
 .browser-window-tab:focus-within > button[role="tab"],
 .browser-window-tab[data-active="true"] > button[role="tab"] {
-  padding-right: 26px;
+  padding-right: 42px;
 }
 .browser-window-tab:hover > .file-reader-tab-close,
 .browser-window-tab:focus-within > .file-reader-tab-close,
@@ -159,14 +144,17 @@
   transform: scale(1);
   pointer-events: auto;
 }
-.browser-window-tab > .file-reader-tab-close:hover {
-  background: color-mix(in srgb, var(--color-text-primary) 10%, transparent);
-}
+/* No square behind either control on hover: the pane's tabs answer a hover with
+   colour alone, and a filled box here made the popout the odd one out. */
 .browser-window-tab[data-active="true"] > .file-reader-tab-close {
   color: var(--color-selection-text);
 }
-.browser-window-tab[data-active="true"] > .file-reader-tab-close:hover {
-  background: color-mix(in srgb, var(--color-selection-text) 14%, transparent);
+/* Minus is the quieter of the two: the page carries on either way. */
+.browser-window-tab-minimize {
+  color: var(--color-text-tertiary);
+}
+.browser-window-tab-minimize:hover {
+  color: var(--color-text-secondary);
 }
 @media (prefers-reduced-motion: reduce) {
   .browser-window-tab,
@@ -182,12 +170,176 @@
   transition: none;
 }
 
-.browser-window-new-tab {
-  width: 28px;
-  height: 28px;
+/* A tab an agent is driving. Same dot, same breath as the pane's strip — the
+   window it happens to be drawn in should not change what it looks like. The
+   keyframes are restated here because the pop-out loads its own stylesheet. */
+.browser-window-tab[data-busy="true"] > button:first-child::after {
+  content: "";
+  width: 6px;
+  height: 6px;
+  margin-left: 1px;
+  border-radius: 99px;
+  background: var(--color-accent);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-accent) 60%, transparent);
+  animation: browser-window-agent-breath 1.9s var(--ease-emphasized) infinite;
+}
+@keyframes browser-window-agent-breath {
+  0%,
+  100% {
+    opacity: 0.55;
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-accent) 55%, transparent);
+  }
+  50% {
+    opacity: 1;
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-accent) 0%, transparent);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .browser-window-tab[data-busy="true"] > button:first-child::after {
+    animation: none;
+    opacity: 1;
+  }
+}
+[data-motion="none"] .browser-window-tab[data-busy="true"] > button:first-child::after {
+  animation: none;
+  opacity: 1;
+}
+
+/* The group's hue on the selected tab's top edge — Chrome's coloured underline,
+   read from the other end. Only the active tab carries it; a whole strip of
+   coloured edges would be a bar chart, not a tab row. */
+.browser-window-tab[data-active="true"][data-color="1"] {
+  box-shadow: inset 0 2px 0 var(--color-group-1);
+}
+.browser-window-tab[data-active="true"][data-color="2"] {
+  box-shadow: inset 0 2px 0 var(--color-group-2);
+}
+.browser-window-tab[data-active="true"][data-color="3"] {
+  box-shadow: inset 0 2px 0 var(--color-group-3);
+}
+.browser-window-tab[data-active="true"][data-color="4"] {
+  box-shadow: inset 0 2px 0 var(--color-group-4);
+}
+.browser-window-tab[data-active="true"][data-color="5"] {
+  box-shadow: inset 0 2px 0 var(--color-group-5);
+}
+.browser-window-tab[data-active="true"][data-color="6"] {
+  box-shadow: inset 0 2px 0 var(--color-group-6);
+}
+.browser-window-tab[data-active="true"][data-color="7"] {
+  box-shadow: inset 0 2px 0 var(--color-group-7);
+}
+.browser-window-tab[data-active="true"][data-color="8"] {
+  box-shadow: inset 0 2px 0 var(--color-group-8);
+}
+
+/* The pill that opens each group in the strip. It is the label the window used
+   to carry in its corner, moved inline where the tabs it names begin, and it is
+   also the control that folds them away. Collapsed, it fills with its hue so a
+   folded group is as loud as the tabs it is standing in for. */
+.browser-group-pill {
+  --group: var(--color-group-1);
   flex: none;
   align-self: center;
-  margin-top: 4px;
+  margin-bottom: 6px;
+  height: 18px;
+  max-width: 120px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 999px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  font-weight: 620;
+  letter-spacing: 0.01em;
+  line-height: 18px;
+  cursor: pointer;
+  background: color-mix(in srgb, var(--group) 18%, var(--color-layer-1));
+  color: var(--group);
+  transition:
+    background-color var(--motion-fast) var(--ease-standard),
+    filter var(--motion-fast) var(--ease-standard);
+}
+.browser-group-pill[data-color="2"] {
+  --group: var(--color-group-2);
+}
+.browser-group-pill[data-color="3"] {
+  --group: var(--color-group-3);
+}
+.browser-group-pill[data-color="4"] {
+  --group: var(--color-group-4);
+}
+.browser-group-pill[data-color="5"] {
+  --group: var(--color-group-5);
+}
+.browser-group-pill[data-color="6"] {
+  --group: var(--color-group-6);
+}
+.browser-group-pill[data-color="7"] {
+  --group: var(--color-group-7);
+}
+.browser-group-pill[data-color="8"] {
+  --group: var(--color-group-8);
+}
+.browser-group-pill[data-collapsed="true"] {
+  background: var(--group);
+  color: var(--color-accent-contrast);
+}
+.browser-group-pill:hover {
+  background: color-mix(in srgb, var(--group) 28%, var(--color-layer-1));
+}
+.browser-group-pill[data-collapsed="true"]:hover {
+  filter: brightness(1.08);
+}
+/* The active tab is inside a folded group: a ring says where it went. */
+.browser-group-pill[data-active-hidden="true"] {
+  box-shadow: 0 0 0 1.5px color-mix(in srgb, var(--group) 60%, transparent);
+}
+/* Someone else is driving a page in here. It breathes rather than blinks, the
+   same as the busy dot on a tab. */
+.browser-group-pill-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: browser-group-live 1.6s var(--ease-standard) infinite;
+}
+.browser-group-pill[data-collapsed="true"] .browser-group-pill-dot {
+  background: var(--color-accent-contrast);
+}
+@keyframes browser-group-live {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .browser-group-pill,
+  .browser-group-pill-dot {
+    animation: none;
+    transition: none;
+  }
+}
+[data-motion="none"] .browser-group-pill,
+[data-motion="none"] .browser-group-pill-dot {
+  animation: none;
+  transition: none;
+}
+
+/* Sits on the tabs' baseline, not the strip's middle, so its glyph lines up
+   with the pane's + when both strips are on screen. */
+.browser-window-new-tab {
+  width: 26px;
+  height: 26px;
+  flex: none;
+  align-self: flex-end;
+  margin: 0 0 5px 2px;
   display: grid;
   place-items: center;
   border: 0;
@@ -200,15 +352,15 @@
     color var(--motion-fast) var(--ease-standard);
 }
 .browser-window-new-tab:hover {
-  background: var(--color-layer-1);
+  background: var(--color-layer-2);
   color: var(--color-text-primary);
 }
 .browser-window-new-tab:active {
-  background: var(--color-layer-2);
+  background: color-mix(in srgb, var(--color-text-primary) 8%, var(--color-layer-2));
 }
 .browser-window-new-tab svg {
-  width: 14px;
-  height: 14px;
+  width: 13px;
+  height: 13px;
 }
 
 .browser-window-strip-spacer {

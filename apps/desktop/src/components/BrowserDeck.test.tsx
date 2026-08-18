@@ -12,6 +12,9 @@ function tab(id: string, title: string, heldBy?: string): BrowserTab {
   return {
     id,
     taskId: "task-1",
+    groupId: "project:test",
+    groupName: "Test project",
+    groupKind: "project",
     url: `https://example.com/${id}`,
     title,
     loading: false,

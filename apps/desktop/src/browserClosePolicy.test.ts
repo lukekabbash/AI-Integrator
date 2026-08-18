@@ -6,6 +6,9 @@ import { browserTabNeedsAgentProtection } from "./browserClosePolicy";
 const TAB: BrowserTab = {
   id: "tab-1",
   taskId: "task-1",
+  groupId: "project:test",
+  groupName: "Test project",
+  groupKind: "project",
   url: "https://example.com",
   title: "Example",
   loading: false,

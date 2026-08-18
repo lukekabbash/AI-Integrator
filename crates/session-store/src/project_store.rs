@@ -94,32 +94,27 @@ impl LocalStore {
             )
             .map_err(storage_error)?;
         let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                ))
-            })
+            .query_map([], project_row)
             .map_err(storage_error)?;
-        rows.map(|row| {
-            let (id, display_name, root, git_root, common, created, opened) =
-                row.map_err(storage_error)?;
-            Ok(TrustedProject {
-                id: ProjectId::from_str(&id).map_err(invalid_stored)?,
-                display_name,
-                repository_root: PathBuf::from(root),
-                git_repository_root: git_root.map(PathBuf::from),
-                git_common_directory: common.map(PathBuf::from),
-                created_at: parse_time(&created)?,
-                last_opened_at: parse_time(&opened)?,
-            })
-        })
-        .collect()
+        rows.map(|row| project_from_row(row.map_err(storage_error)?))
+            .collect()
+    }
+
+    /// The trusted project whose root is exactly this path, if any. Tasks link to
+    /// projects by path (see `remove_trusted_project`), so this is the one lookup
+    /// the browser needs to name a task's group.
+    pub fn project_for_repository_path(&self, path: &Path) -> Result<Option<TrustedProject>> {
+        let root = path.to_string_lossy();
+        let connection = self.connection.lock();
+        let row = connection
+            .query_row(
+                "SELECT p.id, p.display_name, p.repository_root, g.repository_root, g.git_common_directory, p.created_at, p.last_opened_at FROM trusted_projects p LEFT JOIN project_git_repositories g ON g.project_id = p.id WHERE p.repository_root = ?1",
+                [root.as_ref()],
+                project_row,
+            )
+            .optional()
+            .map_err(storage_error)?;
+        row.map(project_from_row).transpose()
     }
 
     /// Detaches a trusted project and deletes Integrator-owned history for it
@@ -135,33 +130,11 @@ impl LocalStore {
                 )
                 .map_err(storage_error)?;
             statement
-                .query_row([project_id.to_string()], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                    ))
-                })
+                .query_row([project_id.to_string()], project_row)
                 .optional()
                 .map_err(storage_error)?
                 .ok_or_else(|| IntegratorError::NotFound(format!("project {project_id}")))
-                .and_then(
-                    |(id, display_name, root, git_root, common, created, opened)| {
-                        Ok(TrustedProject {
-                            id: ProjectId::from_str(&id).map_err(invalid_stored)?,
-                            display_name,
-                            repository_root: PathBuf::from(root),
-                            git_repository_root: git_root.map(PathBuf::from),
-                            git_common_directory: common.map(PathBuf::from),
-                            created_at: parse_time(&created)?,
-                            last_opened_at: parse_time(&opened)?,
-                        })
-                    },
-                )?
+                .and_then(project_from_row)?
         };
         let project_root = project.repository_root.to_string_lossy().into_owned();
         // Tasks are path-linked rather than FK-linked; wipe them explicitly so
@@ -206,4 +179,42 @@ impl LocalStore {
             )
             .map_err(storage_error)
     }
+}
+
+/// One `trusted_projects` row joined to its optional Git identity, in column
+/// order: id, display name, root, git root, git common dir, created, opened.
+type ProjectRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+);
+
+fn project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    ))
+}
+
+fn project_from_row(
+    (id, display_name, root, git_root, common, created, opened): ProjectRow,
+) -> Result<TrustedProject> {
+    Ok(TrustedProject {
+        id: ProjectId::from_str(&id).map_err(invalid_stored)?,
+        display_name,
+        repository_root: PathBuf::from(root),
+        git_repository_root: git_root.map(PathBuf::from),
+        git_common_directory: common.map(PathBuf::from),
+        created_at: parse_time(&created)?,
+        last_opened_at: parse_time(&opened)?,
+    })
 }

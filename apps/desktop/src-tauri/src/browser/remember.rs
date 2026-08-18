@@ -25,7 +25,7 @@ use crate::command_api::CommandError;
 use std::collections::HashMap;
 
 use super::{
-    BrowserTab, BrowserTabs, Tab, emit_changed, is_blank, tab_webview_builder, unavailable,
+    BrowserTab, BrowserTabs, Group, Tab, emit_changed, is_blank, tab_webview_builder, unavailable,
 };
 
 /// Writes this task's current tabs over whatever was remembered before.
@@ -70,6 +70,7 @@ pub fn restore(app: &AppHandle, tabs: &Arc<BrowserTabs>, task_id: &str) -> usize
     let Ok(remembered) = state.store.browser_tabs(task) else {
         return 0;
     };
+    let group = super::groups::group_for_task(app, tabs, task_id);
     let mut added = 0;
     for stored in remembered {
         if Url::parse(&stored.url).is_err() {
@@ -79,7 +80,7 @@ pub fn restore(app: &AppHandle, tabs: &Arc<BrowserTabs>, task_id: &str) -> usize
             .favicon
             .clone()
             .or_else(|| super::favicon::cached_for_url(&stored.url));
-        if tabs.insert_sleeping(task_id, &stored.url, &stored.title, favicon) {
+        if tabs.insert_sleeping(task_id, &group, &stored.url, &stored.title, favicon) {
             added += 1;
         }
     }
@@ -172,6 +173,7 @@ impl BrowserTabs {
     pub(super) fn insert_sleeping(
         &self,
         task_id: &str,
+        group: &Group,
         url: &str,
         title: &str,
         favicon: Option<String>,
@@ -191,6 +193,9 @@ impl BrowserTabs {
                 state: BrowserTab {
                     id,
                     task_id: task_id.to_string(),
+                    group_id: group.id.clone(),
+                    group_name: group.name.clone(),
+                    group_kind: group.kind,
                     url: url.to_string(),
                     title: title.to_string(),
                     favicon,
