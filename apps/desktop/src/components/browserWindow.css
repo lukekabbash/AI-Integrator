@@ -237,14 +237,16 @@
    to carry in its corner, moved inline where the tabs it names begin, and it is
    also the control that folds them away. Collapsed, it fills with its hue so a
    folded group is as loud as the tabs it is standing in for. */
+/* The pill sits on the tab row, centred on the tabs' own height — Chrome's
+   group chip does the same — rather than floating mid-strip. */
 .browser-group-pill {
   --group: var(--color-group-1);
   flex: none;
-  align-self: center;
-  margin-bottom: 6px;
-  height: 18px;
+  align-self: flex-end;
+  margin: 0 6px 5px 4px;
+  height: 20px;
   max-width: 120px;
-  padding: 0 8px;
+  padding: 0 9px;
   border: 0;
   border-radius: 999px;
   overflow: hidden;
@@ -253,7 +255,7 @@
   font-size: 10px;
   font-weight: 620;
   letter-spacing: 0.01em;
-  line-height: 18px;
+  line-height: 20px;
   cursor: pointer;
   background: color-mix(in srgb, var(--group) 18%, var(--color-layer-1));
   color: var(--group);
@@ -440,12 +442,7 @@
   border: 1px solid var(--color-border-strong);
   border-radius: 6px;
   background:
-    linear-gradient(
-        to bottom,
-        var(--color-layer-1) 0,
-        var(--color-layer-1) 7px,
-        transparent 7px
-      )
+    linear-gradient(to bottom, var(--color-layer-1) 0, var(--color-layer-1) 7px, transparent 7px)
       no-repeat,
     var(--color-layer-2);
   box-shadow: inset 0 7px 0 -6px var(--color-border-subtle);

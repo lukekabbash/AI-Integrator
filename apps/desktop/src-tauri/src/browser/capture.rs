@@ -68,6 +68,15 @@ async fn capture<R: Runtime>(
     webview: &tauri::Webview<R>,
     max_edge: Option<u32>,
 ) -> Result<Capture, CommandError> {
+    // The tab's own camera first. It answers with the page and nothing else —
+    // no window behind it, no pointer, no need for the tab to be on screen or
+    // its window in front — so everything below is the fallback for the
+    // platforms and failures that path does not cover.
+    if let Some(png) = super::direct_capture::capture_png(webview).await
+        && let Some(shot) = encode_direct(png, max_edge)
+    {
+        return Ok(shot);
+    }
     let window = webview.window();
     if window.is_minimized().unwrap_or(false) {
         return Err(unavailable(
@@ -131,6 +140,56 @@ fn to_monitor_units(
         PhysicalPosition::new(down(position.x), down(position.y)),
         PhysicalSize::new(down_u(size.width), down_u(size.height)),
     )
+}
+
+/// Wraps PNG bytes the webview produced itself.
+///
+/// Nothing is re-encoded at full size — the bytes are already the picture the
+/// caller wants, and a decode/encode round trip would only lose time. A poster
+/// is the exception: it is capped, and a cap means a resize.
+///
+/// `None` when the bytes are not a PNG this can read, which sends the caller
+/// to the screen crop rather than handing back a picture nothing can open.
+fn encode_direct(png: Vec<u8>, max_edge: Option<u32>) -> Option<Capture> {
+    let (width, height) =
+        image::ImageReader::with_format(std::io::Cursor::new(&png), image::ImageFormat::Png)
+            .into_dimensions()
+            .ok()?;
+    let Some(edge) = max_edge.filter(|edge| width.max(height) > *edge) else {
+        return Some(Capture {
+            png_base64: STANDARD.encode(&png),
+            width,
+            height,
+        });
+    };
+    let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+        .ok()?
+        .to_rgba8();
+    let scale = f64::from(edge) / f64::from(width.max(height));
+    let resized = image::imageops::resize(
+        &decoded,
+        scaled(width, scale),
+        scaled(height, scale),
+        image::imageops::FilterType::Triangle,
+    );
+    let mut small = Vec::new();
+    image::codecs::png::PngEncoder::new_with_quality(
+        &mut small,
+        image::codecs::png::CompressionType::Fast,
+        image::codecs::png::FilterType::NoFilter,
+    )
+    .write_image(
+        resized.as_raw(),
+        resized.width(),
+        resized.height(),
+        image::ExtendedColorType::Rgba8,
+    )
+    .ok()?;
+    Some(Capture {
+        png_base64: STANDARD.encode(&small),
+        width: resized.width(),
+        height: resized.height(),
+    })
 }
 
 struct Encoded {
@@ -275,6 +334,48 @@ fn scaled(edge: u32, scale: f64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A PNG of a given size, standing in for what a webview hands back.
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(width, height, image::Rgba([1, 2, 3, 255]));
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut bytes)
+            .write_image(
+                image.as_raw(),
+                width,
+                height,
+                image::ExtendedColorType::Rgba8,
+            )
+            .expect("test png should encode");
+        bytes
+    }
+
+    #[test]
+    fn a_self_capture_is_passed_through_at_full_size() {
+        // Not re-encoded: the bytes the webview produced are already the
+        // picture, and a decode/encode round trip would only cost time.
+        let bytes = png(300, 200);
+        let shot = encode_direct(bytes.clone(), None).expect("a PNG should be readable");
+        assert_eq!((shot.width, shot.height), (300, 200));
+        assert_eq!(STANDARD.decode(&shot.png_base64).expect("base64"), bytes);
+    }
+
+    #[test]
+    fn a_capped_self_capture_is_scaled_to_the_longest_edge() {
+        let shot = encode_direct(png(1280, 800), Some(640)).expect("a PNG should be readable");
+        assert_eq!((shot.width, shot.height), (640, 400));
+    }
+
+    #[test]
+    fn a_self_capture_under_the_cap_is_left_alone() {
+        let shot = encode_direct(png(320, 200), Some(640)).expect("a PNG should be readable");
+        assert_eq!((shot.width, shot.height), (320, 200));
+    }
+
+    #[test]
+    fn bytes_that_are_not_a_png_fall_back_rather_than_being_handed_on() {
+        assert!(encode_direct(b"not a png".to_vec(), None).is_none());
+    }
 
     #[test]
     fn tab_rect_adds_client_origin_to_webview_placement() {

@@ -136,7 +136,7 @@ describe("useBrowserTabs task isolation", () => {
     await controller?.close("tab-a");
     await controller?.openExternally("tab-a");
 
-    expect(mocks.browser.close).toHaveBeenCalledWith("task-a", "tab-a");
+    expect(mocks.browser.close).toHaveBeenCalledWith("task-a", "tab-a", undefined);
     expect(mocks.openExternalLink).not.toHaveBeenCalled();
   });
 

@@ -191,7 +191,9 @@ export function useTabDrag(options: UseTabDragOptions): TabDrag {
         if (isNoDrag(event.target)) return;
         const tab = optionsRef.current.tabs.find((candidate) => candidate.id === tabId);
         if (!tab) return;
-        capturePointer(event.currentTarget, event.pointerId, true);
+        // No capture yet: capturing on the press retargets the release to this
+        // element, and the tab button under it never gets its click. Capture
+        // starts with the drag, once the pointer has actually moved.
         pointerIdRef.current = event.pointerId;
         screenRef.current = { x: event.screenX, y: event.screenY };
         apply(
@@ -215,6 +217,9 @@ export function useTabDrag(options: UseTabDragOptions): TabDrag {
           groupSpan: optionsRef.current.groupSpanFor(live.start.tabId),
           originClient: { width: window.innerWidth, height: window.innerHeight },
         });
+        if (live.phase === "armed" && next.phase !== "armed") {
+          capturePointer(event.currentTarget, event.pointerId, true);
+        }
         apply(next);
         if (next.phase === "torn") scheduleHitTest();
       },

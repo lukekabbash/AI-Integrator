@@ -249,7 +249,7 @@ describe("BrowserWindowShell chrome", () => {
 
     // X closes for real; Minus is the way back to the pane.
     fireEvent.click(screen.getByRole("button", { name: "Close Beta" }));
-    await waitFor(() => expect(mocks.close).toHaveBeenCalledWith("task-a", "tab-b"));
+    await waitFor(() => expect(mocks.close).toHaveBeenCalledWith("task-a", "tab-b", true));
 
     fireEvent.click(screen.getByRole("button", { name: "Minimize browser window" }));
     fireEvent.click(screen.getByRole("button", { name: "Maximize or restore browser window" }));
@@ -277,7 +277,7 @@ describe("BrowserWindowShell chrome", () => {
       screen.getByRole("tab", { name: "Alpha" }).parentElement!,
       new MouseEvent("auxclick", { bubbles: true, button: 1 }),
     );
-    expect(mocks.close).toHaveBeenCalledWith("task-a", "tab-a");
+    expect(mocks.close).toHaveBeenCalledWith("task-a", "tab-a", true);
   });
 
   it("drives the strip from the keyboard unless a text field has focus", async () => {
@@ -293,7 +293,7 @@ describe("BrowserWindowShell chrome", () => {
     expect(screen.getByRole("tab", { name: "Beta" })).toHaveAttribute("aria-selected", "true");
 
     fireEvent.keyDown(window, { key: "w", ctrlKey: true });
-    await waitFor(() => expect(mocks.close).toHaveBeenCalledWith("task-a", "tab-b"));
+    await waitFor(() => expect(mocks.close).toHaveBeenCalledWith("task-a", "tab-b", true));
 
     fireEvent.keyDown(window, { key: "t", ctrlKey: true });
     await waitFor(() => expect(mocks.open).toHaveBeenCalledWith("task-a"));

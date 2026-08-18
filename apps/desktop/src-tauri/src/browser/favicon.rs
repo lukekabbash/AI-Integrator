@@ -212,7 +212,7 @@ fn fetch(source: &str) -> Option<String> {
     }
     let client = reqwest::blocking::Client::builder()
         .timeout(FETCH_TIMEOUT)
-        .user_agent(super::BROWSER_USER_AGENT)
+        .user_agent(super::surface::browser_user_agent())
         .build()
         .ok()?;
     let response = client.get(source).send().ok()?;

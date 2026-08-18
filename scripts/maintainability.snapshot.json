@@ -7,7 +7,7 @@
   "exceptions": [
     {
       "path": "apps/desktop/src/styles.css",
-      "maxLines": 17221
+      "maxLines": 17224
     },
     {
       "path": "apps/desktop/src-tauri/src/commands.rs",
@@ -15,11 +15,11 @@
     },
     {
       "path": "apps/desktop/src/App.tsx",
-      "maxLines": 7797
+      "maxLines": 7791
     },
     {
       "path": "apps/desktop/src/bridge.ts",
-      "maxLines": 7760
+      "maxLines": 7768
     },
     {
       "path": "apps/desktop/src/components/SettingsView.tsx",
@@ -27,7 +27,7 @@
     },
     {
       "path": "apps/desktop/src-tauri/src/delegation.rs",
-      "maxLines": 4970
+      "maxLines": 5023
     },
     {
       "path": "apps/desktop/src/bridge.test.ts",
@@ -44,6 +44,10 @@
     {
       "path": "apps/desktop/src/components/Transcript.tsx",
       "maxLines": 2632
+    },
+    {
+      "path": "crates/session-store/src/automation_store.rs",
+      "maxLines": 1044
     },
     {
       "path": "crates/session-store/src/tests.rs",
@@ -83,7 +87,7 @@
     },
     {
       "path": "apps/desktop/src/components/ScheduledView.tsx",
-      "maxLines": 1582
+      "maxLines": 1629
     },
     {
       "path": "crates/adapter-acp/src/lib.rs",
@@ -123,7 +127,7 @@
     },
     {
       "path": "apps/desktop/src-tauri/src/browser/mod.rs",
-      "maxLines": 1206
+      "maxLines": 1320
     },
     {
       "path": "apps/desktop/src-tauri/src/browser/vault.rs",

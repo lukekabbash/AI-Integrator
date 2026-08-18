@@ -85,6 +85,7 @@ pub fn automation_update(
     app: AppHandle<tauri::Wry>,
     state: State<'_, AppState>,
     automation_id: AutomationId,
+    task_id: Option<TaskId>,
     title: String,
     prompt: String,
     trigger: AutomationTrigger,
@@ -92,9 +93,11 @@ pub fn automation_update(
     recurrence_user_request: Option<String>,
     iteration_notes: bool,
 ) -> CommandResult<Automation> {
+    let previous_task_id = state.store.get_automation(automation_id)?.task_id;
     let automation = state.store.update_automation(
         automation_id,
         UpdateAutomation {
+            task_id,
             title,
             prompt,
             trigger,
@@ -104,6 +107,16 @@ pub fn automation_update(
         },
     )?;
     state.automation_notify.notify_one();
+    // The chat it left has to refresh its timeline too, or the automation
+    // lingers there until something else forces a reload.
+    if previous_task_id != automation.task_id {
+        let _ = app.emit(
+            CHANGED_EVENT,
+            AutomationChanged {
+                task_id: previous_task_id,
+            },
+        );
+    }
     emit_changed(&app, &automation);
     Ok(automation)
 }
@@ -234,9 +247,34 @@ pub fn start(app: AppHandle<tauri::Wry>) {
     });
 }
 
+/// Any window can run a due automation: the dispatch carries its own task id
+/// and the turn is sent by task, not by whatever chat that window shows. The
+/// main window is only preferred so the choice is stable; a popped-out task
+/// window keeps the process alive after the main window is closed, and back
+/// when this looked up `"main"` alone that left every run failing.
+///
+/// Emission still targets exactly one window because the listener is global —
+/// broadcasting would start the same turn once per open window.
+fn dispatch_window(app: &AppHandle<tauri::Wry>) -> Option<tauri::WebviewWindow> {
+    if let Some(main) = app.get_webview_window("main") {
+        return Some(main);
+    }
+    let mut labels: Vec<String> = app.webview_windows().into_keys().collect();
+    labels.sort();
+    labels
+        .into_iter()
+        .find_map(|label| app.get_webview_window(&label))
+}
+
 fn dispatch_due(app: &AppHandle<tauri::Wry>) -> integrator_core::Result<()> {
     let state = app.state::<AppState>();
     let now = Utc::now();
+    // Claiming a run with no window to receive it would burn it, so leave the
+    // automation due instead. The loop retries within five seconds, and the
+    // frontend drains anything already claimed when it mounts.
+    let Some(window) = dispatch_window(app) else {
+        return Ok(());
+    };
     for automation in state.store.active_automations()? {
         let Some(scheduled_for) = due_at(&state, &automation, now)? else {
             continue;
@@ -246,14 +284,9 @@ fn dispatch_due(app: &AppHandle<tauri::Wry>) -> integrator_core::Result<()> {
         };
         emit_changed(app, &automation);
         let dispatch = AutomationDispatch { automation, run };
-        let emitted = app
-            .get_webview_window("main")
-            .ok_or_else(|| "main window unavailable".to_owned())
-            .and_then(|window| {
-                window
-                    .emit(DUE_EVENT, &dispatch)
-                    .map_err(|error| error.to_string())
-            });
+        let emitted = window
+            .emit(DUE_EVENT, &dispatch)
+            .map_err(|error| error.to_string());
         if let Err(error) = emitted {
             let automation =
                 state

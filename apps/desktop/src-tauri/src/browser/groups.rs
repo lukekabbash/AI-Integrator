@@ -205,6 +205,8 @@ mod tests {
     #[test]
     fn path_names_are_the_last_component() {
         assert_eq!(path_group_name(Path::new("/home/luke/repo")), "repo");
+        // Backslashes only separate on Windows; elsewhere this is one component.
+        #[cfg(windows)]
         assert_eq!(
             path_group_name(Path::new("H:\\Code\\integrator-3")),
             "integrator-3"

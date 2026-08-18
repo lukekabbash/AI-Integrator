@@ -6621,18 +6621,21 @@ kbd {
 }
 
 /* Squeeze the right cluster by the space it actually has, not the whole
-   composer. Runtime drops to its provider icon before model/effort labels
+   composer. Runtime drops to icon + caret before model/effort labels
    are ellipsized — never "Cur…" next to a still-full model name. */
 @container composer-route (max-width: 420px) {
-  .route-select .dropdown-label,
-  .route-select .dropdown-chevron {
+  .route-select .dropdown-label {
     display: none;
   }
   .route-select .dropdown-trigger {
-    width: 29px;
-    padding: 0;
+    width: auto;
+    padding: 0 3px 0 5px;
     justify-content: center;
-    gap: 0;
+    gap: 1px;
+  }
+  .route-select .dropdown-chevron {
+    width: 11px;
+    height: 11px;
   }
 }
 

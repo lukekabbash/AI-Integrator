@@ -1088,6 +1088,8 @@ export interface AutomationWriteInput {
   route: AutomationRoute;
   recurrenceUserRequest?: string;
   iterationNotes: boolean;
+  /** Moves the automation to another chat. Omitted, it keeps the current one. */
+  taskId?: string;
 }
 
 export interface AutomationCreateInput extends AutomationWriteInput {
@@ -1540,7 +1542,8 @@ export interface BrowserBridge {
   /** The tabs that live in the calling browser window, in strip order. */
   poppedOutTabs(): Promise<BrowserTab[]>;
   /** True when closed; false when recent agent work kept it alive. */
-  close(taskId: string, tabId: string): Promise<boolean>;
+  /** `force` closes through the recent-agent-work guard: the person meant it. */
+  close(taskId: string, tabId: string, force?: boolean): Promise<boolean>;
   /** Physical-pixel rectangle for the tab, or null to hide it. */
   setBounds(
     taskId: string,
@@ -4852,7 +4855,8 @@ function nativeBrowserBridge(): BrowserBridge | undefined {
     list: (taskId) => nativeInvoke<BrowserTab[]>("browser_tab_list", { taskId }),
     restore: (taskId) => nativeInvoke<BrowserTab[]>("browser_tabs_restore", { taskId }),
     poppedOutTabs: () => nativeInvoke<BrowserTab[]>("browser_popout_tabs"),
-    close: (taskId, tabId) => nativeInvoke<boolean>("browser_tab_close", { taskId, tabId }),
+    close: (taskId, tabId, force) =>
+      nativeInvoke<boolean>("browser_tab_close", { taskId, tabId, force }),
     setBounds: (
       taskId,
       tabId,
@@ -7338,7 +7342,11 @@ export const bridge: AppBridge = {
 
   updateAutomation: async (automationId, input) => {
     if (!isTauri()) return updateDemoAutomation(automationId, input);
-    return nativeInvoke<Automation>("automation_update", { automationId, ...input });
+    return nativeInvoke<Automation>("automation_update", {
+      automationId,
+      ...input,
+      ...(input.taskId ? { taskId: nativeTaskIds.get(input.taskId) ?? input.taskId } : {}),
+    });
   },
 
   listAutomationRuns: async (automationId) => {

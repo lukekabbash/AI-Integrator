@@ -55,7 +55,7 @@ The remaining certified runtimes apply the strongest native boundary they expose
 
 - Cursor is pinned to its advertised `ask` mode with its sandbox enabled. Session creation fails closed if Ask or Plan is not advertised.
 - Kimi is pinned to Plan, replaces skill discovery with the app-owned empty Chat directory, and likewise fails closed when the session does not advertise Ask or Plan.
-- Claude runs in `dontAsk` with an empty built-in tool list, slash commands and Chrome disabled, safe mode enabled, and only the explicit Integrator Chat MCP configuration.
+- Claude runs in `dontAsk` with an empty built-in tool list, slash commands and Chrome disabled, empty `--setting-sources` (not `--safe-mode`, which drops MCP, and not `--bare`, which drops subscription auth), and only the explicit Integrator Chat MCP configuration. Auto memory and claude.ai connectors are disabled so they cannot leak past that empty source list.
 - Grok runs with an empty built-in tool list, read-only sandbox, `dontAsk`, web search, subagents, and memory disabled, and its Claude/Cursor compatibility scanners disabled for the Chat process.
 - Antigravity runs in Plan with its sandbox enabled. An app-owned hook denies every tool call except the exact Integrator scheduling controls and, when memory is opted in, `memory_save`.
 

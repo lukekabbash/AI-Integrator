@@ -338,13 +338,14 @@ fn browser_tools(role: &str) -> Vec<Value> {
         }),
         json!({
             "name": "browser_type",
-            "description": "Type text into one field. Target it like browser_click; set clear to replace the current value. Aimed at a <select>, this chooses the option whose label, value or index matches the text instead — native dropdowns are drawn by the operating system and have nothing to click open.",
+            "description": "Type text into one field. Aim it with ref, selector, or role; with none of those it types into whatever has focus. Set clear to replace the current value. Aimed at a <select>, this chooses the option whose label, value or index matches the text instead — native dropdowns are drawn by the operating system and have nothing to click open.",
             "annotations": tool_annotations(false, true),
             "inputSchema": text_schema(json!({
                 "tabId": { "type": "string" },
-                "text": { "type": "string" },
+                "text": { "type": "string", "description": "The characters to type. This is never used to find the field." },
                 "ref": { "type": "string" },
                 "selector": { "type": "string" },
+                "role": { "type": "string", "description": "Aim by role alone, such as searchbox or textbox, when you have no ref." },
                 "clear": { "type": "boolean" }
             }), &["tabId", "text"]),
         }),
@@ -360,7 +361,7 @@ fn browser_tools(role: &str) -> Vec<Value> {
         }),
         json!({
             "name": "browser_scroll",
-            "description": "Scroll a browser tab, or a container inside it. Positive deltaY scrolls down.",
+            "description": "Scroll a browser tab, or a container inside it. Positive deltaY scrolls down. A selector that names something which does not itself scroll scrolls the page instead, and the reply says so.",
             "annotations": tool_annotations(false, false),
             "inputSchema": text_schema(json!({
                 "tabId": { "type": "string" },

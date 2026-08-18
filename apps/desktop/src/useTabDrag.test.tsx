@@ -125,6 +125,18 @@ describe("useTabDrag", () => {
     expect(callbacks.onReorder).not.toHaveBeenCalled();
   });
 
+  it("does not capture the pointer on a plain press, so the tab's own click still lands", () => {
+    setUp();
+    const tab = pressBravo();
+    const capture = vi.fn();
+    tab.setPointerCapture = capture;
+    movePointer(tab, 151, 15);
+    expect(capture).not.toHaveBeenCalled();
+    // Past the threshold the drag owns the pointer.
+    movePointer(tab, 190, 15);
+    expect(capture).toHaveBeenCalled();
+  });
+
   it("drags and shows a ghost once past the threshold", () => {
     setUp();
     const tab = pressBravo();

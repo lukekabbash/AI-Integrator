@@ -1,0 +1,46 @@
+[package]
+name = "webview-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38"
+# Pinned to the major `webview2-com` itself links: `CapturePreview` takes that
+# version's `IStream`, and two `windows` crates in the graph are two unrelated
+# types with the same name.
+windows = { version = "0.61", features = [
+  "Win32_System_Com",
+  "Win32_UI_Shell",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+  "NSBitmapImageRep",
+  "NSGraphics",
+  "NSImageRep",
+] }
+objc2-foundation = { version = "0.3", features = ["NSDictionary", "NSValue"] }
+objc2-web-kit = { version = "0.3", features = [
+  "WKSnapshotConfiguration",
+  "WKWebView",
+] }
+
+# This crate exists to own the `unsafe` the rest of the workspace forbids, so
+# it cannot inherit the workspace lints wholesale. Every other lint the
+# workspace sets is repeated here on purpose: the exception is `unsafe_code`
+# and nothing else.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
+too_many_arguments = "allow"
+type_complexity = "allow"

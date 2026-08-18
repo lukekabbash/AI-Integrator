@@ -4,7 +4,7 @@
 
 use super::*;
 
-fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+pub(super) fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     source
         .split_once(start)
         .and_then(|(_, rest)| rest.split_once(end).map(|(section, _)| section))
@@ -63,6 +63,119 @@ fn every_parked_webview_is_hidden_from_the_host_chat() {
         "/// Moves a tab without losing history",
     );
     assert!(moved.contains("webview.hide()"));
+}
+
+#[test]
+fn the_blank_page_is_a_url_a_tab_may_be_pointed_at() {
+    // Every tab opened without an address starts here, so refusing to navigate
+    // back to it was refusing the one page the browser itself hands out. Read as
+    // a bare host it became "https://about:blank", whose port is "blank".
+    assert_eq!(
+        normalize_url("about:blank").unwrap().as_str(),
+        "about:blank"
+    );
+    assert_eq!(
+        normalize_url("  about:blank  ").unwrap().as_str(),
+        "about:blank"
+    );
+    // Only that one. `about:` is not a general escape from the scheme rules.
+    assert!(normalize_url("about:srcdoc").is_err());
+    assert!(normalize_url("about:config").is_err());
+}
+
+#[test]
+fn a_guest_call_answers_for_a_runtime_that_is_not_there_yet() {
+    // A document part-way through a navigation has no `window.__integrator`, and
+    // reading a method off it threw: `browser_wait_for` polling a loading page
+    // ended on its first poll with "Cannot read properties of undefined". The
+    // guard names the state in a code a caller can wait out.
+    let script = guest_call("window.__integrator.snapshot()".into());
+    assert!(script.starts_with("(window.__integrator ? ("));
+    assert!(script.contains("guest-not-ready"));
+
+    // Both the action and the wait loop go through it.
+    assert!(
+        source_between(
+            include_str!("agent.rs"),
+            "pub async fn agent_invoke",
+            "/// Waits for the page to stop changing size",
+        )
+        .contains("guest_call(format!(")
+    );
+    let waiting = source_between(
+        include_str!("../delegation.rs"),
+        "\"browser_wait_for\" =>",
+        "other => Err(IntegratorError::InvalidInput",
+    );
+    assert!(waiting.contains("\"guest-not-ready\" | \"page-navigated\""));
+}
+
+#[test]
+fn a_deferred_reply_belongs_to_the_document_that_parked_it() {
+    // A new page gets a new guest with its ticket counter back at zero, so a
+    // bare number let the host poll for one action's reply and be handed the
+    // next page's. Tickets carry the document; a mismatch is reported as the
+    // navigation it was, not as "that reply is gone".
+    assert!(GUEST_RUNTIME.contains("const DOC = "));
+    assert!(GUEST_RUNTIME.contains("`${DOC}:${++ticketSeq}`"));
+    assert!(GUEST_RUNTIME.contains("if (!key.startsWith(`${DOC}:`))"));
+    assert!(GUEST_RUNTIME.contains("\"page-navigated\""));
+
+    // And the host turns that into where the tab now is, because the gesture
+    // did land — answering with a failure invites the same click twice.
+    let invoke = source_between(
+        include_str!("agent.rs"),
+        "pub async fn agent_invoke",
+        "/// Waits for the page to stop changing size",
+    );
+    assert!(invoke.contains("super::NAVIGATED && writing"));
+    assert!(invoke.contains("\"navigated\": true"));
+}
+
+#[test]
+fn one_guest_call_at_a_time_per_tab() {
+    // Parking a ticket and polling `settle` is two round trips, and the guest
+    // runs a pending gesture early the moment a second action arrives, so two
+    // calls in flight on one tab interleave and one reply is lost.
+    let module = include_str!("mod.rs");
+    assert!(module.contains("fn eval_lock_for(label: &str)"));
+    let eval = source_between(
+        module,
+        "pub(super) async fn eval_json",
+        "if value.get(\"ok\")",
+    );
+    assert!(eval.contains("let lock = eval_lock_for(label);"));
+    assert!(eval.contains("lock.lock().await"));
+}
+
+#[test]
+fn a_ticket_is_only_ever_the_shape_the_guest_issues() {
+    // It is put back into a script, so nothing else may travel there.
+    assert!(ticket_is_well_formed("1755478900123-42:7"));
+    assert!(!ticket_is_well_formed(""));
+    assert!(!ticket_is_well_formed("1:2\"); alert(1); ("));
+    assert!(!ticket_is_well_formed("a".repeat(65).as_str()));
+}
+
+#[test]
+fn agent_tab_replies_carry_no_icon_bytes() {
+    // `favicon` is a data: URL of up to 96 KiB. It is a picture for the tab
+    // strip; in a tool reply it is thousands of base64 characters a model reads
+    // and can do nothing with.
+    let agent = include_str!("agent.rs");
+    assert!(agent.contains("fn without_icon(mut tab: BrowserTab)"));
+    for site in [
+        "open_for_agent",
+        "navigate_for_agent",
+        "grant_for_agent",
+        "tabs_for_caller",
+    ] {
+        let body = source_between(agent, &format!("fn {site}"), "\n}\n");
+        assert!(
+            body.contains("without_icon"),
+            "{site} still hands back icon bytes"
+        );
+    }
 }
 
 #[test]
@@ -139,7 +252,7 @@ fn context_actions_are_authenticated_task_scoped_and_web_only() {
 /// The group a test task belongs to, without a store: task ids starting with
 /// `chat` are chats (mirroring `groups::resolve_group` for the fixtures here),
 /// everything else is a path group over the task string.
-fn test_group(task: &str) -> Group {
+pub(super) fn test_group(task: &str) -> Group {
     if task.starts_with("chat") {
         Group::chat()
     } else {
@@ -190,7 +303,7 @@ pub(super) fn fixture_tab(id: &str, task: &str, owner: Option<&str>) -> Tab {
 
 /// A registry holding one tab per `(id, task, owner)`, where `owner` is the
 /// delegated child that opened it, or `None` for the orchestrator's own.
-fn registry(rows: &[(&str, &str, Option<&str>)]) -> BrowserTabs {
+pub(super) fn registry(rows: &[(&str, &str, Option<&str>)]) -> BrowserTabs {
     let tabs = BrowserTabs::new();
     {
         let mut guard = tabs.tabs.lock().unwrap();
@@ -291,7 +404,7 @@ fn store_backed_groups_agree_with_task_kind() {
     }
 }
 
-fn caller(task: &str, delegation: Option<&str>) -> Caller {
+pub(super) fn caller(task: &str, delegation: Option<&str>) -> Caller {
     Caller {
         task_id: task.to_string(),
         delegation_id: delegation.map(str::to_owned),
@@ -983,6 +1096,132 @@ fn every_verb_answers_for_the_mechanism_the_page_actually_uses() {
 }
 
 #[test]
+fn a_verb_describes_its_target_before_the_gesture_lands() {
+    // A click that navigates or re-renders leaves the node detached, and a
+    // detached node measures 0×0 — which is how a click that worked came back
+    // reporting an empty rectangle over the thing it had just pressed.
+    assert!(GUEST_RUNTIME.contains("const clicked = describe(element);"));
+    assert!(GUEST_RUNTIME.contains("ok({ clicked, ...pageState() })"));
+    assert!(GUEST_RUNTIME.contains("const hovered = describe(element);"));
+    assert!(GUEST_RUNTIME.contains("const described = { from: describe(source)"));
+}
+
+#[test]
+fn a_gesture_can_be_aimed_at_a_plain_coordinate() {
+    // A canvas stroke and a slider have no element to name. Only the end of a
+    // drag understood a point, so every coordinate drag was refused for a start
+    // it never looked for — and asking the document what is at a point had to
+    // stop answering "the agent cursor you are drawing".
+    assert!(GUEST_RUNTIME.contains("function elementAtPoint(x, y)"));
+    assert!(GUEST_RUNTIME.contains("host.style.pointerEvents = \"none\""));
+    assert!(GUEST_RUNTIME.contains("function resolveAt(target)"));
+    assert!(GUEST_RUNTIME.contains("const source = resolveAt(from);"));
+    // One precedence rule, in one place: a named locator wins, a bare point
+    // asks the page what is there, and both together mean that element at that
+    // point.
+    assert!(GUEST_RUNTIME.contains("function named(target)"));
+    assert!(GUEST_RUNTIME.contains("function pointOf(target)"));
+    // Scrolling the page would move the coordinate out from under the gesture.
+    assert!(GUEST_RUNTIME.contains("if (!fromPoint) source.scrollIntoView"));
+    assert!(GUEST_RUNTIME.contains("if (!at) element.scrollIntoView"));
+}
+
+#[test]
+fn scrolling_something_that_does_not_scroll_scrolls_the_page() {
+    // `scrollBy` on a box with no overflow does nothing and says nothing, so
+    // naming a wrapper — `#content` on a page whose scroller is the document —
+    // swallowed the gesture and reported success.
+    assert!(GUEST_RUNTIME.contains("function scrollableFrom(element)"));
+    assert!(GUEST_RUNTIME.contains("(scroller ?? window).scrollBy("));
+    assert!(GUEST_RUNTIME.contains("that element does not scroll, so the page was scrolled"));
+}
+
+#[test]
+fn a_ref_taken_at_another_width_is_spent_like_one_from_another_page() {
+    // A parked tab is 1280 wide and one in the pane about 460, and a gesture
+    // brings the tab forward before it lands: the snapshot describes a desktop
+    // layout the click never sees. Refs still resolved, because generation only
+    // counts documents, so a click reported success against geometry that had
+    // moved — or a control the narrow layout does not have at all.
+    assert!(GUEST_RUNTIME.contains("function layoutClass()"));
+    assert!(
+        GUEST_RUNTIME.contains("if (record && record.layout !== layoutClass()) return RESIZED;")
+    );
+    assert!(GUEST_RUNTIME.contains("RESIZED_MESSAGE"));
+    // Every verb answers for both kinds of spent ref, through one helper.
+    assert!(GUEST_RUNTIME.contains("function gone(resolved)"));
+    assert!(!GUEST_RUNTIME.contains("=== STALE ?"));
+    assert_eq!(
+        GUEST_RUNTIME
+            .matches("err(\"stale-ref\", STALE_MESSAGE)")
+            .count(),
+        1
+    );
+    // And a reply says the page has re-laid out since it was last read.
+    assert!(GUEST_RUNTIME.contains("function layoutShift()"));
+    assert!(GUEST_RUNTIME.contains("describedAt = { width: innerWidth, height: innerHeight };"));
+    // The host waits for the resize to finish before the gesture resolves.
+    let invoke = source_between(
+        include_str!("agent.rs"),
+        "pub async fn agent_invoke",
+        "/// Waits for the page to stop changing size",
+    );
+    assert!(invoke.contains("settle_layout(app, &label).await"));
+}
+
+#[test]
+fn typing_never_hunts_for_a_field_named_after_what_is_typed() {
+    // One locator was built for every verb, so `text` — the characters to
+    // insert — was also the accessible name to find. Worse, the object was then
+    // never empty, which took away the "type into whatever has focus" path too.
+    let browser = source_between(
+        include_str!("../delegation.rs"),
+        "async fn browser_tool",
+        "fn peers_list",
+    );
+    let typing = source_between(browser, "let typing_target = ||", "let call =");
+    assert!(!typing.contains("\"text\""));
+    assert!(typing.contains("\"role\""));
+    assert!(browser.contains("vec![\n                    typing_target(),"));
+    // Role on its own is a target, so `{ role: "searchbox" }` finds the field.
+    assert!(GUEST_RUNTIME.contains("if (target.text || target.role)"));
+    assert!(GUEST_RUNTIME.contains("if (!wanted) return element;"));
+    // And the words a person reads count, not only the accessible name, which a
+    // long `title` tooltip otherwise owns outright.
+    assert!(
+        GUEST_RUNTIME.contains("const label = shown.length <= 200 ? shown.toLowerCase() : \"\";")
+    );
+}
+
+#[test]
+fn a_bare_space_is_answered_with_what_to_write_instead() {
+    let press = source_between(
+        include_str!("../delegation.rs"),
+        "\"browser_press\" =>",
+        "\"browser_drag\" =>",
+    );
+    assert!(press.contains("write Space for the space bar"));
+    assert!(press.contains("if given.is_empty()"));
+}
+
+#[test]
+fn a_grant_reply_names_the_share_it_made() {
+    // The reply was the tab exactly as it looked before, so a grant that had
+    // worked read as a call that did nothing. `heldBy` stays the orchestrator:
+    // handing a child a key does not take yours away.
+    let grant = source_between(
+        include_str!("../delegation.rs"),
+        "\"browser_grant\" =>",
+        "\"browser_focus\" =>",
+    );
+    assert!(grant.contains("\"grantedTo\": delegation"));
+    assert!(grant.contains("\"mode\": mode"));
+    // Never by moving the hold: that would lock the orchestrator out of its own
+    // tab, and it is the one that has to keep driving.
+    assert!(!grant.contains("mark_held"));
+}
+
+#[test]
 fn guest_runtime_exposes_every_method_the_host_may_call() {
     // The dispatcher allowlist and the runtime must not drift apart.
     for method in [
@@ -1051,12 +1290,22 @@ fn every_agent_action_shows_the_cursor_that_performed_it() {
 
 #[test]
 fn eval_waits_for_the_cursor_to_arrive_before_reading_the_page() {
+    // WebView2's ExecuteScript serialises a Promise as `{}`, so the wrapper
+    // must stay synchronous and hand a pending reply to the guest as a ticket
+    // the host polls; an `async` wrapper made every reply read as null.
     let eval = source_between(
         include_str!("mod.rs"),
         "pub(super) async fn eval_json",
-        "let raw = Zeroizing::new(",
+        "if value.get(\"ok\")",
     );
-    assert!(eval.contains("await value"));
+    assert!(!eval.contains("(async () =>"));
+    assert!(eval.contains("typeof value.then === 'function'"));
+    assert!(eval.contains("guest.defer(value)"));
+    assert!(eval.contains("guest.settle("));
+
+    let guest = include_str!("guest.js");
+    assert!(guest.contains("defer(value) {"));
+    assert!(guest.contains("settle(ticket) {"));
 }
 
 #[test]
@@ -1104,395 +1353,65 @@ fn tabs_are_labelled_out_of_the_capability_scope() {
     assert!(!label.starts_with("task-"));
 }
 
-// ---- stage B: group-shared reach
-
-/// The fixture's chat tasks all share the one Chat group; path tasks are each
-/// their own group. Popping a tab out is what shares it.
-fn shared_registry() -> BrowserTabs {
-    let tabs = registry(&[
-        ("tab-mine", "chat-1", None),
-        ("tab-mine-popped", "chat-1", None),
-        ("tab-sibling-pane", "chat-2", None),
-        ("tab-sibling-popped", "chat-2", None),
-        ("tab-elsewhere-popped", "task-a", None),
-    ]);
-    for id in [
-        "tab-mine-popped",
-        "tab-sibling-popped",
-        "tab-elsewhere-popped",
-    ] {
-        tabs.update(id, |tab| tab.popped_out = true);
-    }
-    tabs
+#[test]
+fn windows_ua_uses_the_engine_major_and_never_says_webview() {
+    let ua = surface::user_agent(surface::SurfaceOs::Windows, Some("151.0.3351.95"));
+    assert!(ua.contains("Chrome/151.0.0.0"));
+    assert!(ua.contains("Windows NT 10.0"));
+    assert!(!ua.contains("WebView"));
+    assert!(!ua.contains("Edg/"));
+    assert!(!ua.contains("Chrome/134"));
 }
 
 #[test]
-fn the_access_matrix_holds_for_every_row() {
-    // 01-vocabulary-and-model.md: (group, task, popped_out) → reach.
-    let tabs = shared_registry();
-    let me = caller("chat-1", None);
-    let rows: [(&str, Option<GrantMode>); 5] = [
-        // ≠ G, any, any → invisible.
-        ("tab-elsewhere-popped", None),
-        // = G, = T, any → yes.
-        ("tab-mine", Some(GrantMode::Drive)),
-        ("tab-mine-popped", Some(GrantMode::Drive)),
-        // = G, ≠ T, pane → invisible.
-        ("tab-sibling-pane", None),
-        // = G, ≠ T, popped out → Drive.
-        ("tab-sibling-popped", Some(GrantMode::Drive)),
-    ];
-    for (id, expected) in rows {
-        assert_eq!(tabs.reach(id, &me), expected, "{id}");
-    }
-    let seen: Vec<String> = tabs
-        .visible_to(&me, false)
-        .into_iter()
-        .map(|tab| tab.id)
-        .collect();
-    assert_eq!(seen, ["tab-mine", "tab-mine-popped", "tab-sibling-popped"]);
+fn unknown_or_unreadable_engine_falls_back_to_current_chrome() {
+    let missing = surface::user_agent(surface::SurfaceOs::Windows, None);
+    let webkit = surface::user_agent(surface::SurfaceOs::Windows, Some("21619.1.26.11.3"));
+    let expected = format!("Chrome/{}.0.0.0", surface::FALLBACK_CHROME_MAJOR);
+    assert!(missing.contains(&expected));
+    assert!(webkit.contains(&expected));
+    assert!(!missing.contains("WebView"));
 }
 
 #[test]
-fn a_shared_tab_is_driven_but_never_owned() {
-    // Close, grant and dock go through `owns`, which still wants the task.
-    let tabs = shared_registry();
-    let me = caller("chat-1", None);
-    assert_eq!(
-        tabs.reach("tab-sibling-popped", &me),
-        Some(GrantMode::Drive)
-    );
-    assert!(!tabs.owns("tab-sibling-popped", &me));
-    assert!(tabs.owns("tab-mine-popped", &me));
-    // Docking the sibling's tab would make it invisible again: sharing is the
-    // owner's choice both ways.
-    tabs.update("tab-sibling-popped", |tab| tab.popped_out = false);
-    assert_eq!(tabs.reach("tab-sibling-popped", &me), None);
+fn macos_ua_looks_like_safari_not_windows_chrome() {
+    let ua = surface::user_agent(surface::SurfaceOs::Mac, Some("21619.1.26.11.3"));
+    assert!(ua.contains("Macintosh"));
+    assert!(ua.contains("Version/19.0"));
+    assert!(ua.contains("Safari/605.1.15"));
+    assert!(!ua.contains("Windows NT"));
+    assert!(!ua.contains("WebView"));
 }
 
 #[test]
-fn a_child_inherits_its_parents_group_and_reaches_a_popped_out_sibling_task_tab() {
-    let tabs = shared_registry();
-    let child = caller("chat-1", Some("child-1"));
-    assert_eq!(
-        tabs.reach("tab-sibling-popped", &child),
-        Some(GrantMode::Drive)
-    );
-    assert_eq!(tabs.reach("tab-sibling-pane", &child), None);
-    assert!(!tabs.owns("tab-sibling-popped", &child));
-    let seen: Vec<String> = tabs
-        .visible_to(&child, false)
-        .into_iter()
-        .map(|tab| tab.id)
-        .collect();
-    assert_eq!(seen, ["tab-sibling-popped"]);
+fn windows_args_keep_wry_defaults_and_drop_client_hints() {
+    assert!(surface::WINDOWS_BROWSER_ARGS.contains("msWebOOUI"));
+    assert!(surface::WINDOWS_BROWSER_ARGS.contains("msPdfOOUI"));
+    assert!(surface::WINDOWS_BROWSER_ARGS.contains("msSmartScreenProtection"));
+    assert!(surface::WINDOWS_BROWSER_ARGS.contains("UserAgentClientHint"));
 }
 
 #[test]
-fn the_cap_is_shared_by_every_task_in_a_group() {
-    let tabs = registry(&[
-        ("tab-1", "chat-1", None),
-        ("tab-2", "chat-2", None),
-        ("tab-3", "chat-2", None),
-        ("tab-4", "task-a", None),
-    ]);
-    for id in ["tab-1", "tab-2", "tab-3", "tab-4"] {
-        tabs.update(id, |tab| tab.hidden = true);
-    }
-    tabs.touch("tab-2");
-    tabs.touch("tab-1");
-    // Two chats, one group, one cap: candidates come from both tasks.
-    assert_eq!(
-        tabs.sleepable(Some(groups::CHAT_GROUP_ID), "tab-1"),
-        ["tab-3", "tab-2"]
-    );
-    assert_eq!(tabs.live_count(Some(groups::CHAT_GROUP_ID)), 3);
-    // A parked popped-out tab is a candidate like any other.
-    tabs.update("tab-3", |tab| tab.popped_out = true);
-    assert_eq!(
-        tabs.sleepable(Some(groups::CHAT_GROUP_ID), "tab-1"),
-        ["tab-3", "tab-2"]
-    );
-    // The total cap looks across groups, oldest first.
-    tabs.touch("tab-4");
-    assert_eq!(
-        tabs.sleepable(None, "none"),
-        ["tab-3", "tab-2", "tab-1", "tab-4"]
-    );
-    assert_eq!(remember::LIVE_TAB_CAP_PER_GROUP, 8);
-    assert_eq!(remember::LIVE_TAB_CAP_TOTAL, 24);
+fn identity_surface_strips_its_prelude_and_never_names_webview() {
+    let script = include_str!("identity_surface.js");
+    assert!(script.contains("delete window.__integratorSurface;"));
+    assert!(script.contains("userAgentData"));
+    assert!(script.contains("webdriver"));
+    assert!(!script.contains("WebView"));
 }
 
 #[test]
-fn waking_and_opening_both_enforce_the_group_cap() {
-    // Both entry points hand the woken/new tab's group to the cap.
-    let remember = include_str!("remember.rs");
-    let wake = source_between(remember, "pub async fn wake(", "impl BrowserTabs {");
-    assert!(wake.contains("enforce_cap(app, tabs, &tab.group_id, tab_id)"));
-    let module = include_str!("mod.rs");
-    assert!(module.contains("remember::enforce_cap(app, state, &tab.group_id, &tab.id)"));
-    // The cap is per group and then total, in that order.
-    let cap = source_between(remember, "pub(super) fn enforce_cap(", "/// Loads a tab");
-    assert!(cap.contains("(Some(group_id), LIVE_TAB_CAP_PER_GROUP)"));
-    assert!(cap.contains("(None, LIVE_TAB_CAP_TOTAL)"));
-}
-
-#[test]
-fn a_hold_names_the_holder_and_its_task() {
-    let tabs = shared_registry();
-    let sibling = caller("chat-2", None);
-    tabs.mark_held_by("tab-sibling-popped", &sibling);
-    assert_eq!(
-        tabs.holder("tab-sibling-popped", false),
-        Some(("the main agent".to_string(), Some("chat-2".to_string())))
+fn every_profile_webview_takes_the_desktop_browser_surface() {
+    let tabs = include_str!("mod.rs");
+    let create = source_between(
+        tabs,
+        "pub(super) fn tab_webview_builder",
+        "pub(super) async fn create_tab",
     );
-    // A person's hold has no task.
-    tabs.mark_user_active("tab-mine", 0);
-    assert_eq!(
-        tabs.holder("tab-mine", true),
-        Some((USER_HOLDER.to_string(), None))
-    );
-    // Standing off names the task when it is known, and how long to wait.
-    let text = agent::stood_off("the main agent", Some("Fix login"));
-    assert!(
-        text.starts_with("the main agent of task \"Fix login\" is working in that tab right now")
-    );
-    assert!(text.contains(
-        "open your own with browser_open, or wait; holds expire 45 s after the last action"
-    ));
-    let untitled = agent::stood_off("subagent child-1", None);
-    assert!(untitled.starts_with("subagent child-1 is working in that tab right now"));
-    let person = agent::stood_off(USER_HOLDER, Some("Fix login"));
-    assert!(person.starts_with("the person is working in that tab right now"));
-    assert!(!person.contains("Fix login"));
-}
+    assert!(create.contains("surface::apply"));
+    assert!(!create.contains("Chrome/134"));
 
-#[test]
-fn agent_tools_open_popped_out_and_move_tabs_only_for_the_owner() {
-    let agent = include_str!("agent.rs");
-    let open = source_between(
-        agent,
-        "pub async fn open_for_agent(",
-        "pub async fn set_popped_out_for_agent(",
-    );
-    assert!(open.contains("popped_out: bool"));
-    assert!(open.contains("super::popout::preferred_target(tabs, &tab.id)"));
-    assert!(open.contains("super::popout::move_tab(app, tabs, &tab.id, target, false)"));
-    let moved = source_between(
-        agent,
-        "pub async fn set_popped_out_for_agent(",
-        "/// Points one reachable tab",
-    );
-    assert!(moved.contains("if !tabs.owns(tab_id, caller)"));
-    assert!(moved.contains("super::popout::preferred_target(tabs, tab_id)"));
-    assert!(moved.contains("super::popout::MoveTarget::Main"));
-    assert!(moved.contains("super::popout::move_tab(app, tabs, tab_id, target, false)"));
-    let focus = source_between(
-        agent,
-        "pub async fn focus_for_agent(",
-        "async fn bring_on_screen(",
-    );
-    assert!(focus.contains("tab.popped_out"));
-    assert!(focus.contains("raise_host_window(app, &label).await"));
-    let close = source_between(
-        agent,
-        "pub async fn close_for_agent(",
-        "pub fn grant_for_agent(",
-    );
-    assert!(close.contains("dock or close it from there"));
-}
-
-#[test]
-fn a_browser_list_row_names_its_group_holder_and_sharer() {
-    let tabs = shared_registry();
-    let sibling = caller("chat-2", None);
-    tabs.mark_held_by("tab-sibling-popped", &sibling);
-    let me = caller("chat-1", None);
-    let title_of = |task: &str| (task == "chat-2").then(|| "Book flights".to_string());
-
-    let held = tabs
-        .snapshot_held(None, false)
-        .into_iter()
-        .find(|tab| tab.id == "tab-sibling-popped")
-        .unwrap();
-    let row = agent::decorate_row(&held, &me, Some("chat-2"), title_of);
-    assert_eq!(row["id"], "tab-sibling-popped");
-    assert_eq!(row["taskId"], "chat-2");
-    assert_eq!(
-        row["group"],
-        serde_json::json!({ "id": groups::CHAT_GROUP_ID, "name": groups::CHAT_GROUP_NAME, "kind": "chat" })
-    );
-    assert!(row.get("groupId").is_none() && row.get("groupName").is_none());
-    assert_eq!(row["poppedOut"], true);
-    assert_eq!(row["sleeping"], false);
-    assert_eq!(
-        row["heldBy"],
-        serde_json::json!({ "label": "the main agent", "taskId": "chat-2", "taskTitle": "Book flights" })
-    );
-    assert_eq!(row["heldByLabel"], "the main agent");
-    assert_eq!(
-        row["sharedFrom"],
-        serde_json::json!({ "taskId": "chat-2", "taskTitle": "Book flights" })
-    );
-
-    // One of my own, idle: no holder, no sharer, and the title lookup is
-    // never asked about a task the row does not name.
-    let mine = tabs.tab("tab-mine").unwrap();
-    let row = agent::decorate_row(&mine, &me, None, |_| panic!("no task to name"));
-    assert!(row.get("heldBy").is_none() && row.get("heldByLabel").is_none());
-    assert!(row.get("sharedFrom").is_none());
-    assert_eq!(row["group"]["kind"], "chat");
-}
-
-// ---- stage D: persistence and cleanup
-
-fn recent(task: &str, url: &str) -> session_store::StoredRecentTab {
-    session_store::StoredRecentTab {
-        task_id: task.parse().unwrap(),
-        group_id: groups::CHAT_GROUP_ID.into(),
-        url: url.into(),
-        title: url.into(),
-        favicon: None,
-        closed_at: chrono::Utc::now(),
-        reason: "stale".into(),
-    }
-}
-
-#[test]
-fn cleanup_never_closes_a_tab_on_screen_or_held() {
-    let task_a = integrator_core::TaskId::new().to_string();
-    let task_b = integrator_core::TaskId::new().to_string();
-    let tabs = registry(&[
-        ("tab-1", &task_a, None),
-        ("tab-2", &task_a, None),
-        ("tab-3", &task_a, None),
-        ("tab-4", &task_b, None),
-    ]);
-    for (id, url) in [
-        ("tab-1", "one"),
-        ("tab-2", "two"),
-        ("tab-3", "three"),
-        ("tab-4", "four"),
-    ] {
-        tabs.update(id, |tab| tab.url = format!("https://{url}.example/"));
-    }
-    // tab-1 on screen; tab-2 parked and idle; tab-3 asleep; tab-4 parked but
-    // driven by an agent inside the hold window.
-    tabs.update("tab-2", |tab| tab.hidden = true);
-    tabs.update("tab-3", |tab| {
-        tab.hidden = true;
-        tab.sleeping = true;
-    });
-    tabs.update("tab-4", |tab| tab.hidden = true);
-    tabs.mark_held("tab-4", "the main agent");
-    assert!(!tabs.retirable("tab-1"));
-    assert!(tabs.retirable("tab-2"));
-    assert!(tabs.retirable("tab-3"));
-    assert!(!tabs.retirable("tab-4"));
-    assert!(!tabs.retirable("tab-none"));
-
-    let retired = [
-        recent(&task_a, "https://one.example/"),
-        recent(&task_a, "https://two.example/"),
-        recent(&task_a, "https://three.example/"),
-        recent(&task_b, "https://four.example/"),
-        recent(&task_b, "https://gone.example/"),
-    ];
-    let plan = cleanup::plan(&tabs, &retired);
-    assert_eq!(plan.close, vec!["tab-2".to_string(), "tab-3".to_string()]);
-    // The on-screen and held tabs stay, and their rows are written back.
-    assert_eq!(plan.rewrite, vec![task_a.clone(), task_b.clone()]);
-}
-
-#[test]
-fn stored_rows_carry_window_order_and_touch() {
-    let tabs = registry(&[("tab-1", "task-a", None), ("tab-2", "task-a", None)]);
-    tabs.set_window("tab-2", Some("browser-window-x"), Some(3));
-    let (rows, touched) = tabs.stored_rows("task-a");
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].window_id, None);
-    assert_eq!(rows[0].window_order, None);
-    assert!(rows[0].last_touched_at.is_some());
-    assert_eq!(rows[1].window_id.as_deref(), Some("browser-window-x"));
-    assert_eq!(rows[1].window_order, Some(3));
-    assert_eq!(touched.len(), 2);
-    assert_eq!(touched[1].0, "tab-2");
-    // A touch moves the wall-clock time and queues the task for the flush.
-    let before = touched[1].1;
-    std::thread::sleep(Duration::from_millis(5));
-    tabs.touch("tab-2");
-    let (rows, _) = tabs.stored_rows("task-a");
-    assert!(rows[1].last_touched_at.unwrap() > before);
-    assert_eq!(tabs.take_dirty_touch(), vec!["task-a".to_string()]);
-    assert!(tabs.take_dirty_touch().is_empty());
-}
-
-#[test]
-fn every_change_to_a_strip_is_written() {
-    // Moves, reorders and title changes each write the affected tasks; the
-    // touch flush writes only what drifted; a closed popped-out tab is
-    // recorded for "Recently closed".
-    let popout = include_str!("popout.rs");
-    let moved = source_between(popout, "pub(super) fn move_tab(", "fn place_at(");
-    assert!(moved.contains("super::remember::remember(app, state, &tab.task_id)"));
-    assert!(moved.contains("super::remember::remember_window(app, state, label)"));
-    let reorder = source_between(
-        popout,
-        "pub fn browser_window_reorder(",
-        "pub fn browser_popout_tabs(",
-    );
-    assert!(reorder.contains("remember_window(webview.app_handle(), &state, label)"));
-    let events = source_between(popout, "window.on_window_event(move |event|", "Ok(window)");
-    assert!(events.contains("note_window_geometry(&event_app, &event_label, true)"));
-    assert!(events.contains("tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)"));
-    assert!(events.contains("persist::forget_window(&event_app, &event_label)"));
-
-    let module = include_str!("mod.rs");
-    let title = source_between(module, ".on_document_title_changed(", ".on_new_window(");
-    assert!(title.contains("remember::remember(&title_app, &title_tabs, &task)"));
-    let close = source_between(module, "pub(super) fn close_tab_with(", "/// Keeps a still");
-    assert!(close.contains("remember::note_closed(app, &closing)"));
-
-    let remember = include_str!("remember.rs");
-    let pane = source_between(
-        remember,
-        "pub fn restore(",
-        "pub(crate) const LIVE_TAB_CAP_PER_GROUP",
-    );
-    assert!(pane.contains("stored.window_id.is_some()"));
-    let noted = source_between(remember, "pub(super) fn note_closed(", "pub fn restore(");
-    assert!(noted.contains("!closing.popped_out || closing.url.starts_with(\"about:\")"));
-    assert!(noted.contains("reason: \"closed\""));
-
-    // Restore is armed on the main window's first focus, never at boot.
-    let persist = include_str!("persist.rs");
-    let armed = source_between(persist, "pub fn start_background_tasks(", "#[cfg(test)]");
-    assert!(armed.contains("tauri::WindowEvent::Focused(true)) && once.claim()"));
-    assert!(armed.contains("restore::restore_windows(&app)"));
-}
-
-#[test]
-fn recent_rows_take_the_agent_shape() {
-    let task = integrator_core::TaskId::new();
-    let mut row = recent(&task.to_string(), "https://docs.example/page");
-    row.title = "Docs".into();
-    row.reason = "over-cap".into();
-    let rows = agent::recent_rows(&[row.clone()], &Group::chat());
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["url"], "https://docs.example/page");
-    assert_eq!(rows[0]["title"], "Docs");
-    assert_eq!(rows[0]["reason"], "over-cap");
-    assert_eq!(rows[0]["closedAt"], row.closed_at.to_rfc3339());
-    assert_eq!(
-        rows[0]["group"],
-        serde_json::json!({ "id": groups::CHAT_GROUP_ID, "name": groups::CHAT_GROUP_NAME, "kind": "chat" })
-    );
-    assert!(rows[0].get("taskId").is_none() && rows[0].get("favicon").is_none());
-    // The tool declaration and dispatch both know the flag.
-    let broker = include_str!("../broker_mcp.rs");
-    assert!(broker.contains("\"includeRecent\": { \"type\": \"boolean\""));
-    let delegation = include_str!("../delegation.rs");
-    assert!(
-        delegation.contains("params.get(\"includeRecent\").and_then(Value::as_bool) == Some(true)")
-    );
+    let sites = include_str!("sites.rs");
+    let probe = source_between(sites, "fn open_profile_probe", "fn profile_webview_known");
+    assert!(probe.contains("surface::apply"));
 }

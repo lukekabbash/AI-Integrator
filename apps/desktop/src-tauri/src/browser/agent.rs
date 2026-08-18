@@ -39,8 +39,8 @@ use crate::command_api::CommandError;
 
 use super::{
     AGENT_ACCESS_SETTING, BrowserTab, BrowserTabs, Caller, GrantMode, close_tab, create_tab,
-    emit_changed, eval_json, invalid, is_blank, lock_active_tab, normalize_url, registry::HOLD_TTL,
-    setting_enabled, unavailable, webview_of,
+    emit_changed, eval_json, guest_call, invalid, is_blank, lock_active_tab, normalize_url,
+    registry::HOLD_TTL, setting_enabled, unavailable, webview_of,
 };
 
 /// Guest actions that change the page rather than read it. `guest.js` keeps
@@ -136,12 +136,17 @@ pub async fn agent_invoke(
         )));
     }
     super::remember::ensure_awake(app, tabs, tab_id).await;
-    if CURSOR_METHODS.contains(&method) {
-        let _ = bring_on_screen(app, tabs, caller, tab_id).await;
-    }
     let label = tabs
         .label_for(tab_id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
+    if CURSOR_METHODS.contains(&method) && bring_on_screen(app, tabs, caller, tab_id).await {
+        // Showing a parked tab resizes it from 1280 wide to whatever the pane
+        // is, and the page needs a beat to re-lay out at the new size. Waiting
+        // for it here is what keeps the gesture from resolving its target
+        // against a layout the page is halfway out of — the rectangle it
+        // measures and the element it presses are both read after this.
+        settle_layout(app, &label).await;
+    }
     tabs.mark_held_by(tab_id, caller);
     let args = serde_json::to_string(&args).map_err(|error| invalid(error.to_string()))?;
     // The guest gets the last word on whether this lands. Only the page can see
@@ -152,13 +157,64 @@ pub async fn agent_invoke(
     let reply = eval_json(
         app,
         &label,
-        format!(
+        guest_call(format!(
             "window.__integrator.blocked?.({method:?}, {user_hold}) || window.__integrator.{method}(...{args})"
-        ),
+        )),
     )
-    .await?;
+    .await;
+    let reply = match reply {
+        Ok(reply) => reply,
+        // A gesture that navigates takes its own reply with it: the guest that
+        // parked it went with the document. The action did land — the guest
+        // flushes a pending pointer on `pagehide` — so the honest answer is
+        // where the tab is now, not a failure the caller would answer by
+        // clicking the same thing again.
+        Err(error) if error.code == super::NAVIGATED && writing => {
+            let url = tabs
+                .snapshot(None)
+                .into_iter()
+                .find(|tab| tab.id == tab_id)
+                .map(|tab| tab.url);
+            return Ok(json!({
+                "navigated": true,
+                "url": url,
+                "note": error.message,
+            }));
+        }
+        Err(error) => return Err(error),
+    };
     super::note_user_activity(tabs, tab_id, &reply);
     Ok(reply)
+}
+
+/// Waits for the page to stop changing size after the tab was shown.
+///
+/// Two readings that agree, rather than a fixed sleep: the pane may animate
+/// open, and a page that re-lays out reports a new viewport as it goes.
+async fn settle_layout<R: Runtime>(app: &AppHandle<R>, label: &str) {
+    let mut previous = None;
+    for _ in 0..LAYOUT_SETTLE_TRIES {
+        let current = eval_json(app, label, VIEWPORT.into()).await.ok();
+        if current.is_some() && current == previous {
+            return;
+        }
+        previous = current;
+        tokio::time::sleep(LAYOUT_SETTLE_POLL).await;
+    }
+}
+
+const LAYOUT_SETTLE_TRIES: u8 = 6;
+const LAYOUT_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// The same tab, without the site's icon.
+///
+/// `favicon` is a `data:` URL of up to 96 KiB — a picture for the tab strip,
+/// and in a tool reply nothing but weight: a model reads it as tens of
+/// thousands of characters of base64 it can do nothing with, once per tab in
+/// every list. The renderer still gets it; only agent replies drop it.
+fn without_icon(mut tab: BrowserTab) -> BrowserTab {
+    tab.favicon = None;
+    tab
 }
 
 /// How a refusal reads depends on who is holding the tab: another agent can be
@@ -228,6 +284,7 @@ pub async fn open_for_agent(
     }
     emit_changed(app, tabs);
     tabs.tab(&tab.id)
+        .map(without_icon)
         .ok_or_else(|| IntegratorError::NotFound("that browser tab is no longer open".into()))
 }
 
@@ -297,7 +354,7 @@ pub async fn navigate_for_agent(
         })
         .ok_or_else(|| IntegratorError::NotFound("that browser tab is no longer open".into()))?;
     emit_changed(app, tabs);
-    Ok(tab)
+    Ok(without_icon(tab))
 }
 
 /// Closes a tab this caller owns. A granted tab is someone else's to close.
@@ -356,6 +413,7 @@ pub fn grant_for_agent(
     tabs.snapshot(Some(&caller.task_id))
         .into_iter()
         .find(|candidate| candidate.id == tab_id)
+        .map(without_icon)
         .ok_or_else(|| IntegratorError::NotFound("that browser tab is no longer open".into()))
 }
 
@@ -475,17 +533,23 @@ pub async fn screenshot_for_agent(
     let label = tabs
         .label_for(tab_id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
-    if !tabs.on_screen(tab_id) && !bring_on_screen(app, tabs, caller, tab_id).await {
-        return Err(unavailable(
-            "that tab is not on screen, so there is nothing to photograph — the browser pane \
-             may be closed or the user may be looking at another chat. browser_snapshot reads \
-             the page without needing it on screen.",
-        ));
+    // Where the tab can photograph itself, none of this applies: the webview
+    // renders its own content, so a parked tab in a window behind the app
+    // yields the same picture as one in front, and nothing has to be moved or
+    // raised to get it. The screen-crop fallback still needs both.
+    if !webview_capture::supported() {
+        if !tabs.on_screen(tab_id) && !bring_on_screen(app, tabs, caller, tab_id).await {
+            return Err(unavailable(
+                "that tab is not on screen, so there is nothing to photograph — the browser pane \
+                 may be closed or the user may be looking at another chat. browser_snapshot reads \
+                 the page without needing it on screen.",
+            ));
+        }
+        // The picture is whatever the screen holds over the tab's rectangle,
+        // so the window it lives in — the app, or its own pop-out — has to be
+        // the window in front before the shutter.
+        raise_host_window(app, &label).await;
     }
-    // The picture is whatever the screen holds over the tab's rectangle, so
-    // the window it lives in — the app, or its own pop-out — has to be the
-    // window in front before the shutter.
-    raise_host_window(app, &label).await;
     let webview = webview_of(app, &label)?;
     let shot = super::capture::capture_full(&webview).await?;
     let viewport = eval_json(app, &label, VIEWPORT.into()).await.ok();
@@ -493,9 +557,10 @@ pub async fn screenshot_for_agent(
         "width": shot.width,
         "height": shot.height,
         "viewport": viewport,
-        "note": "a picture of the tab as it is on the user's screen. Anything covering the \
-                 browser pane appears in it too. Coordinates in the image are device pixels; \
-                 divide by width/viewport.width to get CSS pixels for browser_drag.",
+        "note": "a picture of the page this tab is showing, rendered by the tab itself: no \
+                 window covering it appears in it, and it does not need to be on screen. \
+                 Coordinates in the image are device pixels; divide by width/viewport.width \
+                 to get CSS pixels for browser_drag.",
     });
     // Persist a copy the transcript can show later. Codex stores only a
     // short slice of the tool result, so the base64 image block itself
@@ -661,6 +726,7 @@ pub fn tabs_for_caller<R: Runtime>(
     tabs.visible_to(caller, lock_active_tab(app))
         .into_iter()
         .map(|tab| {
+            let tab = without_icon(tab);
             let mut row = agent_row(app, tabs, caller, &tab);
             // Which browser window a popped-out tab is in, so an agent can
             // say "the tab in the second window" if asked.

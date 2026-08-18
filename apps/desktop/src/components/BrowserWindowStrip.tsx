@@ -195,14 +195,14 @@ export function StripTab({
         </button>
       </StripTooltip>
       <StripTooltip
-        label={preservesAgentWork ? "Minimize" : "Close"}
-        hint={preservesAgentWork ? "Recent agent work is kept in the compact browser" : "Ctrl+W"}
+        label="Close"
+        hint={preservesAgentWork ? "An agent used this tab recently" : "Ctrl+W"}
         host={tooltipHost}
       >
         <button
           type="button"
           className="file-reader-tab-close"
-          aria-label={preservesAgentWork ? `Minimize ${label}` : `Close ${label}`}
+          aria-label={`Close ${label}`}
           onClick={(event) => {
             event.stopPropagation();
             onClose();

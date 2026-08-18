@@ -32,6 +32,7 @@ use crate::command_api::{CommandError, CommandResult};
 mod agent;
 mod capture;
 mod cleanup;
+mod direct_capture;
 mod favicon;
 pub mod groups;
 mod identity;
@@ -44,6 +45,7 @@ mod remember;
 mod restore;
 mod servers;
 pub(crate) mod sites;
+mod surface;
 mod vault;
 mod windows;
 
@@ -103,17 +105,15 @@ pub const EXTERNAL_OPEN_SETTING: &str = "settings.browser.externalOpen";
 /// unless asked for: it is a preference, and both answers are legitimate.
 pub const DISMISS_CONSENT_SETTING: &str = "settings.browser.dismissConsent";
 const GUEST_RUNTIME: &str = include_str!("guest.js");
-/// WebView2 reports itself as Edge with a `WebView2` product token, and several
-/// large identity providers — Google's among them — refuse to accept a sign-in
-/// from a string they read as an embedded control. This is the same engine and
-/// the same recent Chromium, described the way the desktop browser describes
-/// itself, so those flows work in a tab the user opened deliberately.
-const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
 /// What a tab measures while it is parked off screen. Wide enough that sites
 /// serve their desktop layout, so a background tab and a visible one agree.
 const OFFSCREEN_SIZE: (f64, f64) = (1280.0, 800.0);
 const EVAL_TIMEOUT: Duration = Duration::from_secs(15);
+/// How often the host asks the guest whether a deferred reply has settled.
+const EVAL_SETTLE_POLL: Duration = Duration::from_millis(30);
+/// The key a wrapper reply carries when the guest parked a Promise. Distinct
+/// enough that no guest method's own reply can be mistaken for it.
+const EVAL_TICKET_KEY: &str = "__integratorTicket";
 const MAX_EVAL_BYTES: usize = 96 * 1024;
 const MAX_CONTEXT_TEXT_CHARS: usize = 4_000;
 const MAX_NAVIGATION_URL_BYTES: usize = 16 * 1024;
@@ -211,6 +211,14 @@ pub(super) fn normalize_url(input: &str) -> Result<Url, CommandError> {
     if trimmed.len() > 2048 {
         return Err(invalid("that URL is too long"));
     }
+    // The blank page has no host to prefix. Read as a bare host, "about:blank"
+    // became "https://about:blank" — a port of "blank" — so pointing a tab back
+    // at the very page `browser_open` starts it on was refused as junk.
+    if let Ok(url) = Url::parse(trimmed)
+        && url.as_str() == "about:blank"
+    {
+        return Ok(url);
+    }
     let candidate = if trimmed.contains("://") {
         trimmed.to_string()
     } else {
@@ -286,34 +294,24 @@ pub(super) fn webview_of<R: Runtime>(
 }
 
 /// Runs an expression in the guest and returns its JSON result.
-pub(super) async fn eval_json<R: Runtime>(
-    app: &AppHandle<R>,
-    label: &str,
-    script: String,
+/// One round trip: run a script that returns a JSON string, and parse it. The
+/// deadline is shared across the polls of one `eval_json` call.
+async fn eval_once<R: Runtime>(
+    webview: &tauri::Webview<R>,
+    script: &str,
+    deadline: tokio::time::Instant,
 ) -> Result<Value, CommandError> {
-    let script = Zeroizing::new(script);
-    let webview = webview_of(app, label)?;
     let (tx, rx) = oneshot::channel();
     let sender = Mutex::new(Some(tx));
-    // The guest runtime never throws; the wrapper still catches so a hostile
-    // page cannot break the channel by redefining globals. Awaiting lets a
-    // click wait for the pointer to arrive so the reply is the page after
-    // the gesture, not before it.
-    let wrapped = Zeroizing::new(format!(
-        "(async () => {{ try {{ const value = ({script}); \
-         return JSON.stringify(await value); }} \
-         catch (error) {{ return JSON.stringify({{ ok: false, error: {{ code: 'guest-failed', message: String(error) }} }}); }} }})()",
-        script = script.as_str(),
-    ));
     webview
-        .eval_with_callback(wrapped.as_str(), move |payload| {
+        .eval_with_callback(script, move |payload| {
             if let Some(tx) = sender.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 let _ = tx.send(payload);
             }
         })
         .map_err(|error| unavailable(error.to_string()))?;
     let raw = Zeroizing::new(
-        tokio::time::timeout(EVAL_TIMEOUT, rx)
+        tokio::time::timeout_at(deadline, rx)
             .await
             .map_err(|_| CommandError {
                 code: "provider-timeout",
@@ -332,8 +330,114 @@ pub(super) async fn eval_json<R: Runtime>(
         .as_ref()
         .map(|value| value.as_str())
         .unwrap_or_else(|| raw.as_str());
-    let value: Value = serde_json::from_str(encoded)
-        .map_err(|_| unavailable("the page returned a malformed reply"))?;
+    serde_json::from_str(encoded).map_err(|_| unavailable("the page returned a malformed reply"))
+}
+
+/// Wraps an expression that reaches into the guest runtime.
+///
+/// A document part-way through a navigation has no `window.__integrator` yet:
+/// reading a method off it threw, the wrapper reported that as `guest-failed`,
+/// and a `browser_wait_for` polling a loading page gave up on its first poll
+/// with "Cannot read properties of undefined". A missing runtime is a *not
+/// yet*, so it answers in a code a caller can wait out rather than an error
+/// that reads like a broken page.
+pub(super) fn guest_call(expression: String) -> String {
+    format!(
+        "(window.__integrator ? ({expression}) : {{ ok: false, error: {{ code: {NOT_READY:?}, \
+         message: 'this tab is between pages, so its runtime is not injected yet — try again' }} }})"
+    )
+}
+
+const NOT_READY: &str = "guest-not-ready";
+/// The guest answered for a document this tab has since left. See `settle`.
+const NAVIGATED: &str = "page-navigated";
+
+/// One guest call at a time per webview.
+///
+/// A deferred reply is two round trips — park a ticket, then poll `settle` —
+/// and the guest runs a still-pending gesture early the moment a second action
+/// arrives (see `schedule` in guest.js), so two calls in flight on one tab
+/// interleave. Worse, a navigation between the pair rebuilds the guest with its
+/// ticket counter back at zero, which is how one action came to read another's
+/// reply. Held across the pair, this keeps every reply with the call that asked
+/// for it.
+fn eval_lock_for(label: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    // Tabs come and go; drop the locks nothing is waiting on rather than
+    // keeping an entry per label this app has ever opened.
+    if locks.len() > 64 {
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
+    Arc::clone(locks.entry(label.to_string()).or_default())
+}
+
+/// A ticket is the guest's own text; it is put back into a script, so nothing
+/// but the shape the guest issues may travel there.
+fn ticket_is_well_formed(ticket: &str) -> bool {
+    !ticket.is_empty()
+        && ticket.len() <= 64
+        && ticket
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | ':'))
+}
+
+pub(super) async fn eval_json<R: Runtime>(
+    app: &AppHandle<R>,
+    label: &str,
+    script: String,
+) -> Result<Value, CommandError> {
+    let script = Zeroizing::new(script);
+    let webview = webview_of(app, label)?;
+    let lock = eval_lock_for(label);
+    let _turn = lock.lock().await;
+    // The guest runtime never throws; the wrapper still catches so a hostile
+    // page cannot break the channel by redefining globals.
+    //
+    // The wrapper is synchronous on purpose. WebView2's ExecuteScript reports
+    // the value of the expression as it stands and serialises a Promise as
+    // `{}` — an `async` wrapper here made every reply read as null. An action
+    // that finishes later (a click waits for the pointer to arrive, so the
+    // reply is the page after the gesture) is parked in the guest under a
+    // ticket, and the host polls `settle` until it has resolved.
+    let wrapped = Zeroizing::new(format!(
+        "(() => {{ try {{ const value = ({script}); \
+         if (value && typeof value.then === 'function') {{ \
+         const guest = window.__integrator; \
+         if (!guest) return JSON.stringify({{ ok: false, error: {{ code: {NOT_READY:?}, message: 'this tab is between pages, so its runtime is not injected yet — try again' }} }}); \
+         return JSON.stringify({{ {ticket}: guest.defer(value) }}); }} \
+         return JSON.stringify(value); }} \
+         catch (error) {{ return JSON.stringify({{ ok: false, error: {{ code: 'guest-failed', message: String(error) }} }}); }} }})()",
+        script = script.as_str(),
+        ticket = EVAL_TICKET_KEY,
+    ));
+    let deadline = tokio::time::Instant::now() + EVAL_TIMEOUT;
+    let mut value = eval_once(&webview, wrapped.as_str(), deadline).await?;
+    if let Some(ticket) = value.get(EVAL_TICKET_KEY).and_then(Value::as_str) {
+        if !ticket_is_well_formed(ticket) {
+            return Err(unavailable("the page returned a malformed reply"));
+        }
+        // A guest that is not there yet answers `done: false`, so a navigation
+        // in the middle of a gesture keeps polling until the new document can
+        // say what became of it rather than failing on the gap between the two.
+        let settle = format!(
+            "(() => {{ try {{ const guest = window.__integrator; \
+             if (!guest) return JSON.stringify({{ done: false }}); \
+             return JSON.stringify(guest.settle({ticket:?})); }} \
+             catch (error) {{ return JSON.stringify({{ done: true, value: {{ ok: false, error: {{ code: 'guest-failed', message: String(error) }} }} }}); }} }})()"
+        );
+        loop {
+            tokio::time::sleep(EVAL_SETTLE_POLL).await;
+            let entry = eval_once(&webview, &settle, deadline).await?;
+            if entry.get("done").and_then(Value::as_bool) == Some(true) {
+                value = entry.get("value").cloned().unwrap_or(Value::Null);
+                break;
+            }
+        }
+    }
     if value.get("ok").and_then(Value::as_bool) == Some(false) {
         let error = value.get("error").cloned().unwrap_or_default();
         return Err(CommandError {
@@ -342,6 +446,11 @@ pub(super) async fn eval_json<R: Runtime>(
             // and deserves the same code, so a caller can treat it as one case.
             code: match error.get("code").and_then(Value::as_str) {
                 Some("user-holding") => "unavailable",
+                // Both of these are momentary rather than wrong, and a caller
+                // that can wait — `browser_wait_for` — needs to tell them from
+                // a page that genuinely refused the action.
+                Some(NOT_READY) => NOT_READY,
+                Some(NAVIGATED) => NAVIGATED,
                 _ => "provider-protocol",
             },
             message: bounded_guest_message(
@@ -460,7 +569,7 @@ pub(super) fn tab_webview_builder(
     let context_id = id.to_string();
     let context_task_id = task_id.to_string();
 
-    let mut builder = WebviewBuilder::new(label, WebviewUrl::External(target.clone()))
+    let builder = WebviewBuilder::new(label, WebviewUrl::External(target.clone()))
         // Keep addresses and other ambient WebView profile data out of task
         // identities. Password autofill is separate and remains vendor-owned.
         .general_autofill_enabled(false)
@@ -532,8 +641,8 @@ pub(super) fn tab_webview_builder(
             // This is a signal, never a browser window.
             NewWindowResponse::Deny
         })
-        .on_navigation(browser_navigation_allowed)
-        .user_agent(BROWSER_USER_AGENT);
+        .on_navigation(browser_navigation_allowed);
+    let mut builder = surface::apply(builder);
     if let Some(profile) = profile_directory(app, state, task_id) {
         builder = builder.data_directory(profile);
     }
@@ -725,9 +834,12 @@ pub async fn browser_tab_close(
     state: tauri::State<'_, Arc<BrowserTabs>>,
     task_id: String,
     tab_id: String,
+    force: Option<bool>,
 ) -> CommandResult<bool> {
     require_task(&state, &task_id, &tab_id)?;
-    if state.agent_recently_used(&tab_id) {
+    // The recent-agent-work guard turns an X into a minimize; `force` is the
+    // person saying they meant close. The strips always mean close.
+    if !force.unwrap_or(false) && state.agent_recently_used(&tab_id) {
         return Ok(false);
     }
     close_tab(&app, &state, &tab_id)?;
@@ -1136,7 +1248,7 @@ pub async fn browser_tab_invoke(
     let reply = eval_json(
         &app,
         &label,
-        format!("window.__integrator.{method}(...{args})"),
+        guest_call(format!("window.__integrator.{method}(...{args})")),
     )
     .await?;
     // The renderer's replies carry the same `userIdleMs` an agent's do, so the
@@ -1204,3 +1316,5 @@ pub use vault::{
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_windows;

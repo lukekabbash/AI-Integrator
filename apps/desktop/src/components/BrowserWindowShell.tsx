@@ -365,7 +365,8 @@ export function BrowserWindowShell() {
     if (!api) return;
     // `false` means the native side kept the tab for recent agent work; the
     // tooltip already said so, and there is nothing to reopen.
-    const closed = await api.close(tab.taskId, tab.id).catch(() => false);
+    // The X means close, agent or not: the person can see the strip.
+    const closed = await api.close(tab.taskId, tab.id, true).catch(() => false);
     if (closed && tab.url && !/^about:/.test(tab.url)) {
       closedRing.current = [...closedRing.current, { taskId: tab.taskId, url: tab.url }].slice(
         -CLOSED_RING,

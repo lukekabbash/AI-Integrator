@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useState, type RefObject } from "react";
 
+import { watchLayoutShift } from "./layoutShift";
+
 import {
   activateSurface,
   activeSurface,
@@ -186,11 +188,16 @@ export function useWorkPaneHeaderAlignment(
     let observer: ResizeObserver | undefined;
     let raf = 0;
     let openingFrames = 0;
+    // The pane is a fixed-width column: a sidebar sliding open moves it
+    // without resizing it, and its own ResizeObserver stays silent. Follow the
+    // neighbours that push it around as well, once the pane exists.
+    let stopShift: (() => void) | undefined;
 
     const watch = (node: Element | null | undefined) => {
       if (!node || watched.has(node) || !observer) return;
       watched.add(node);
       observer.observe(node);
+      if (node === paneRef.current && !stopShift) stopShift = watchLayoutShift(node, align);
     };
 
     const schedule = () => {
@@ -237,6 +244,7 @@ export function useWorkPaneHeaderAlignment(
     return () => {
       window.cancelAnimationFrame(raf);
       observer?.disconnect();
+      stopShift?.();
       window.removeEventListener("resize", align);
       delete root.dataset.subagentLayoutReady;
       root.style.removeProperty("--subagent-pane-left");

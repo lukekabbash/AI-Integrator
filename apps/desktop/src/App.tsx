@@ -1619,15 +1619,12 @@ export default function App() {
   const requestBrowserTabClose = useCallback(
     (tabId: string) => {
       const surfaceId = `browser:${tabId}`;
-      const expectedToPreserve = browserProtectedTabIds.has(tabId);
-      if (expectedToPreserve) workPane.close(surfaceId);
-      void browser.close(tabId).then((closed) => {
-        // If native state became protected after this render, false is the
-        // correction: move it to the deck instead of destroying it.
-        if (!closed || !expectedToPreserve) workPane.close(surfaceId);
-      });
+      // X means close, agent work or not: the person is looking at the strip
+      // and can see what is there. Minus is the way to keep a page running.
+      workPane.close(surfaceId);
+      void browser.close(tabId, true);
     },
-    [browser, browserProtectedTabIds, workPane],
+    [browser, workPane],
   );
   // A tab an agent opened gets a pane tab of its own, so its browsing is
   // something the user watches rather than something happening off screen.
@@ -1706,6 +1703,9 @@ export default function App() {
       if (!active) return;
       const { tabs, taskId } = focusable.current;
       if (!browserRequestBelongsToTask(taskId, tabs, request)) return;
+      // A popped-out tab is the browser window's to raise; opening a pane
+      // surface for it here would place nothing and fight that window.
+      if (tabs.some((tab) => tab.id === request.tabId && tab.poppedOut)) return;
       workPane.openBrowser(request.tabId, { activate: true, show: true });
     });
     return () => {
@@ -7548,12 +7548,6 @@ export default function App() {
                               browser.tabs
                                 .filter((tab) => tab.heldBy)
                                 .map((tab) => [tab.id, tab.heldBy as string]),
-                            )}
-                            browserProtected={Object.fromEntries(
-                              browser.tabs.map((tab) => [
-                                tab.id,
-                                browserProtectedTabIds.has(tab.id),
-                              ]),
                             )}
                             onBrowserClose={requestBrowserTabClose}
                             browserTaskId={browser.taskId}

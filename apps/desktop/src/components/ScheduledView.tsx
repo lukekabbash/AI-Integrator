@@ -45,6 +45,7 @@ import {
   type TranscriptEvent,
 } from "../bridge";
 import { eventsForRun } from "../automationTranscript";
+import { AUTO_REVIEW_PROFILE } from "../autoReviewSettings";
 import {
   applyRuntimeProjectionBatch,
   createRuntimeProjectionState,
@@ -180,7 +181,7 @@ type RouteCandidate = Pick<AutomationRoute, "runtime" | "model" | "effort">;
 type IntervalUnit = "minutes" | "hours" | "days";
 type ScheduleDraft = Pick<
   Automation,
-  "title" | "prompt" | "trigger" | "route" | "recurrenceUserRequest"
+  "taskId" | "title" | "prompt" | "trigger" | "route" | "recurrenceUserRequest"
 > & { iterationNotes: boolean };
 
 const FILTERS: ScheduleFilter[] = ["all", "active", "paused", "needs-attention"];
@@ -323,6 +324,9 @@ const PERMISSIONS: DropdownOption[] = [
   { value: "read-only", label: "Read only" },
   { value: "project-write", label: "Project write" },
   { value: "ask", label: "Ask as needed" },
+  // Nobody is at the keyboard for a scheduled run, which is the case the
+  // auto-review profile exists for. The composer offers it; so does this.
+  { value: AUTO_REVIEW_PROFILE, label: "Auto" },
   { value: "full-access", label: "Full access" },
 ];
 
@@ -395,6 +399,7 @@ function intervalSeconds(amount: number, unit: IntervalUnit): number {
 
 function draftFor(automation: Automation): ScheduleDraft {
   return {
+    taskId: automation.taskId,
     title: automation.title,
     prompt: automation.prompt,
     trigger: automation.trigger,
@@ -805,6 +810,28 @@ export function ScheduledView({
     [projects, tasks],
   );
 
+  /* Chats an existing schedule can be moved to. Unlike the create sheet this
+     offers no "new chat" entry: the schedule already has somewhere to live, and
+     an edit that silently spawned a chat would be hard to undo. The chat it
+     currently points at is kept even when archived, so editing a schedule never
+     silently relocates it. */
+  const chatOptions: DropdownOption[] = useMemo(() => {
+    const current = draft?.taskId;
+    const options = availableTasks.map((task) => ({
+      value: task.id,
+      label: taskLabel(task.id),
+      icon: <ProviderIcon provider={task.runtime} label={task.runtime} />,
+    }));
+    if (current && !options.some((option) => option.value === current)) {
+      options.unshift({
+        value: current,
+        label: taskLabel(current),
+        icon: <ProviderIcon provider="" label="chat" />,
+      });
+    }
+    return options;
+  }, [availableTasks, draft?.taskId, taskLabel]);
+
   const filtered = useMemo(() => {
     const needle = query.trim().toLowerCase();
     return automations.filter(
@@ -912,9 +939,29 @@ export function ScheduledView({
         </div>
         <div className="scheduled-target-row">
           <span>Continues in</span>
-          <button type="button" onClick={() => onOpenTask(selected.taskId)}>
-            {taskLabel(selected.taskId)} <ExternalLink />
-          </button>
+          {selected.target.kind === "delegation" ? (
+            // A subagent wakeup belongs to the chat that owns the subagent, so
+            // it is the one schedule that cannot be moved.
+            <button type="button" onClick={() => onOpenTask(selected.taskId)}>
+              {taskLabel(selected.taskId)} <ExternalLink />
+            </button>
+          ) : (
+            <>
+              <Dropdown
+                aria-label="Continues in"
+                value={draft.taskId}
+                options={chatOptions}
+                onChange={(taskId) => setDraft({ ...draft, taskId })}
+              />
+              <button
+                type="button"
+                aria-label={`Open ${taskLabel(draft.taskId)}`}
+                onClick={() => onOpenTask(draft.taskId)}
+              >
+                <ExternalLink />
+              </button>
+            </>
+          )}
         </div>
         {draft.trigger.kind === "at" ? (
           <label className="scheduled-field">

@@ -804,10 +804,10 @@ pub(super) async fn fill_login(
     let reply = match super::eval_json(
         app,
         &label,
-        format!(
+        super::guest_call(format!(
             "window.__integrator.fillLogin({key:?},{origin:?},{username:?},{:?},true)",
             *password
-        ),
+        )),
     )
     .await
     {
@@ -858,7 +858,7 @@ pub(super) async fn save_from_page(
     let mut captured = super::eval_json(
         app,
         &label,
-        format!("window.__integrator.captureLogin({key:?})"),
+        super::guest_call(format!("window.__integrator.captureLogin({key:?})")),
     )
     .await?;
     let captured = captured

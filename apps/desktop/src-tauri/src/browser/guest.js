@@ -25,19 +25,57 @@
   const BY_ELEMENT = new WeakMap(); // Element -> ref
   let refSeq = 0;
   let generation = 0;
+  // Replies the host is still waiting on; see `defer`/`settle` on the api.
+  const TICKETS = new Map(); // ticket -> { done, value }
+  let ticketSeq = 0;
+  // Which document these tickets belong to. A new page gets a new guest with
+  // its counter back at zero, so a bare number let the host poll for one
+  // action's reply and be handed the next page's instead. Tickets carry this,
+  // and `settle` refuses one that was issued by a document now gone.
+  const DOC = `${Math.trunc(performance.timeOrigin)}-${Math.trunc(Math.random() * 1e9)}`;
 
   const ok = (value) => ({ ok: true, value: value ?? null });
   /** Returned by `resolve` for a ref issued by a document that has since gone. */
   const STALE = Symbol("stale-ref");
+  /** Returned for a ref taken at a width this page no longer has. */
+  const RESIZED = Symbol("resized-ref");
   const STALE_MESSAGE = "That ref came from a page this tab has since left. Take a fresh snapshot.";
+  const RESIZED_MESSAGE =
+    "That ref was taken while this tab was a different width, and the page has re-laid out " +
+    "since — its controls may have moved, changed, or gone. Take a fresh snapshot.";
   const err = (code, message) => ({ ok: false, error: { code, message: String(message) } });
+
+  /** The refusal a spent ref earns, or null when the target is usable. */
+  function gone(resolved) {
+    if (resolved === STALE) return err("stale-ref", STALE_MESSAGE);
+    if (resolved === RESIZED) return err("stale-ref", RESIZED_MESSAGE);
+    return null;
+  }
+
+  /**
+   * Which layout this page is showing.
+   *
+   * A parked tab measures 1280 wide and one in the pane about 460, and sites
+   * serve different markup at each — a search box that is an input at desktop
+   * width is a link at phone width. So a ref handed out at one width cannot be
+   * trusted at the other. Classed rather than measured exactly: dragging the
+   * pane a few pixels re-lays nothing out and must not spend every ref.
+   */
+  function layoutClass() {
+    const width = innerWidth;
+    if (width < 480) return "xs";
+    if (width < 768) return "sm";
+    if (width < 1024) return "md";
+    if (width < 1280) return "lg";
+    return "xl";
+  }
 
   function refFor(element) {
     let ref = BY_ELEMENT.get(element);
-    if (ref && REFS.get(ref)?.deref() === element) return ref;
+    if (ref && REFS.get(ref)?.node.deref() === element) return ref;
     ref = `e${++refSeq}@${generation}`;
     BY_ELEMENT.set(element, ref);
-    REFS.set(ref, new WeakRef(element));
+    REFS.set(ref, { node: new WeakRef(element), layout: layoutClass() });
     return ref;
   }
 
@@ -48,7 +86,7 @@
   }
 
   function elementForRef(ref) {
-    const element = REFS.get(ref)?.deref();
+    const element = REFS.get(ref)?.node.deref();
     if (!element || !element.isConnected) return null;
     return element;
   }
@@ -201,6 +239,10 @@
     if (target.ref) {
       const issued = generationOf(target.ref);
       if (issued !== null && issued !== generation) return STALE;
+      // A ref this document never issued is simply unknown; only one it did
+      // issue, at a width it no longer has, has been spent by the resize.
+      const record = REFS.get(target.ref);
+      if (record && record.layout !== layoutClass()) return RESIZED;
       return elementForRef(target.ref);
     }
     if (target.selector) {
@@ -210,8 +252,11 @@
         return null;
       }
     }
-    if (target.text) {
-      const wanted = String(target.text).toLowerCase();
+    // Role on its own is a target: "the searchbox" is how a caller that has not
+    // taken a snapshot describes the one field on the page, and requiring text
+    // beside it meant `{ role: "searchbox" }` matched nothing at all.
+    if (target.text || target.role) {
+      const wanted = target.text ? String(target.text).toLowerCase() : null;
       const role = target.role ? String(target.role).toLowerCase() : null;
       const candidates = [
         ...document.querySelectorAll(INTERACTIVE),
@@ -220,9 +265,83 @@
       for (const element of candidates) {
         if (!visible(element)) continue;
         if (role && roleOf(element).toLowerCase() !== role) continue;
+        if (!wanted) return element;
         const name = accessibleName(element).toLowerCase();
-        if (target.exact ? name === wanted : name.includes(wanted)) return element;
+        // The words on the page count too, not only the accessible name: a
+        // control whose `title` is a paragraph of guidance takes its name from
+        // that paragraph, so "Log in" — the label a person reads — matched
+        // nothing. Bounded, because the whole document is the text content of
+        // <body> and matching that would target the page itself.
+        const shown = (element.textContent ?? "").replace(/\s+/g, " ").trim();
+        const label = shown.length <= 200 ? shown.toLowerCase() : "";
+        const hit = target.exact
+          ? name === wanted || label === wanted
+          : name.includes(wanted) || label.includes(wanted);
+        if (hit) return element;
       }
+    }
+    return null;
+  }
+
+  /**
+   * What the page has at a point, with the agent's own overlay out of the way.
+   *
+   * The cursor and its marks sit in a layer above the document, so asking the
+   * document what is at a coordinate could otherwise answer "the pointer you
+   * are drawing" — which is why a drag given plain coordinates found nothing.
+   */
+  function elementAtPoint(x, y) {
+    const host = overlayHost;
+    const previous = host?.style.pointerEvents;
+    if (host) host.style.pointerEvents = "none";
+    const element = document.elementFromPoint(x, y);
+    if (host) host.style.pointerEvents = previous ?? "none";
+    return element ?? document.body;
+  }
+
+  /**
+   * A target that may be a plain coordinate rather than an element.
+   *
+   * A locator that names something wins; a bare point asks the page what is
+   * there. Both together — a ref and a point inside it — mean that element at
+   * that point, which is how a canvas or a slider is addressed.
+   */
+  function resolveAt(target) {
+    if (!named(target) && target?.x != null && target?.y != null) {
+      return elementAtPoint(target.x, target.y);
+    }
+    return resolve(target);
+  }
+
+  /** Whether a locator names an element at all, rather than a point or nothing. */
+  function named(target) {
+    return Boolean(target && (target.ref || target.selector || target.text || target.role));
+  }
+
+  /** Whether a locator carries an explicit coordinate to act at. */
+  function pointOf(target) {
+    return target?.x != null && target?.y != null ? { x: target.x, y: target.y } : null;
+  }
+
+  /**
+   * The nearest box that can actually scroll, starting at this element.
+   *
+   * `scrollBy` on something that does not scroll does nothing and reports
+   * nothing, so naming a wrapper — `#content` on a page whose scroller is the
+   * document — swallowed the gesture and answered success.
+   */
+  function scrollableFrom(element) {
+    let node = element;
+    while (node && node !== document.body && node !== document.documentElement) {
+      const style = getComputedStyle(node);
+      const scrolls = /auto|scroll|overlay/.test(`${style.overflowY} ${style.overflowX}`);
+      if (
+        scrolls &&
+        (node.scrollHeight > node.clientHeight + 1 || node.scrollWidth > node.clientWidth + 1)
+      ) {
+        return node;
+      }
+      node = node.parentElement;
     }
     return null;
   }
@@ -385,9 +504,29 @@
    * entry point returns this, so a caller does not have to follow one tool call
    * with a snapshot just to learn whether anything moved.
    */
+  /**
+   * The viewport the last snapshot described, so a reply can say the page has
+   * been re-laid out since. A tab is parked at a desktop width while nothing is
+   * showing it and resized to the pane the moment a gesture brings it forward,
+   * which is enough to move — or replace — every control the snapshot listed.
+   */
+  let describedAt = null;
+
+  function layoutShift() {
+    if (!describedAt) return null;
+    if (describedAt.width === innerWidth && describedAt.height === innerHeight) return null;
+    return (
+      `the viewport was ${describedAt.width}×${describedAt.height} when this page was last ` +
+      `read and is ${innerWidth}×${innerHeight} now, so the page has re-laid out. Take a fresh ` +
+      "snapshot before trusting earlier refs or rectangles."
+    );
+  }
+
   function pageState() {
     const focused = document.activeElement;
+    const shifted = layoutShift();
     return {
+      ...(shifted ? { layoutShift: shifted } : {}),
       url: location.href,
       title: document.title,
       scrollY: Math.round(scrollY),
@@ -1453,6 +1592,50 @@
     },
 
     /**
+     * Host-only. WebView2's ExecuteScript hands the host the value of an
+     * expression as it stands and serialises a Promise as `{}`, so an action
+     * that finishes later — a click that waits for the pointer to arrive —
+     * cannot be awaited from outside. The host's wrapper parks such a value
+     * here under a ticket and polls `settle` until it has resolved. The map
+     * lives in this closure, out of the page's reach.
+     */
+    defer(value) {
+      const ticket = `${DOC}:${++ticketSeq}`;
+      TICKETS.set(ticket, { done: false });
+      Promise.resolve(value).then(
+        (settled) => TICKETS.set(ticket, { done: true, value: settled }),
+        (error) =>
+          TICKETS.set(ticket, {
+            done: true,
+            value: err("guest-failed", String(error)),
+          }),
+      );
+      return ticket;
+    },
+
+    settle(ticket) {
+      const key = String(ticket);
+      // A ticket from another document means the page moved on while the
+      // gesture was landing. It did land — `pagehide` flushes the pointer
+      // before the document goes — so this is news about where the tab is now,
+      // not a failure to repeat.
+      if (!key.startsWith(`${DOC}:`)) {
+        return {
+          done: true,
+          value: err(
+            "page-navigated",
+            "the page navigated while that action was landing. The action was delivered; " +
+              "its reply belonged to the document this tab has left.",
+          ),
+        };
+      }
+      const entry = TICKETS.get(key);
+      if (!entry) return { done: true, value: err("guest-failed", "that reply is gone") };
+      if (entry.done) TICKETS.delete(key);
+      return entry;
+    },
+
+    /**
      * Moves the pointer over an element without pressing.
      *
      * This reaches a menu that listens for `mouseenter` and cannot reach one
@@ -1463,9 +1646,14 @@
      */
     hover(target) {
       const element = resolve(target);
-      if (element === STALE) return err("stale-ref", STALE_MESSAGE);
+      const refused = gone(element);
+      if (refused) return refused;
       if (!element) return err("not-found", "No element matched that target.");
       element.scrollIntoView({ block: "center", inline: "center" });
+      // Measured before the pointer moves: an element that the hover itself
+      // detaches or re-renders measures 0×0 afterwards, which is how a hover
+      // that worked came to report an empty rectangle.
+      const hovered = describe(element);
       const point = centreOf(element);
       const base = {
         bubbles: true,
@@ -1491,7 +1679,7 @@
         }
       }).then(() =>
         ok({
-          hovered: describe(element),
+          hovered,
           ...(cssHoverOnly(element)
             ? {
                 cssHoverOnly: true,
@@ -1510,6 +1698,7 @@
       // Anything the host asks for settles the action still in flight, so a
       // caller never reads the page mid-gesture.
       flushPending();
+      describedAt = { width: innerWidth, height: innerHeight };
       const limit = Math.min(options.limit ?? 200, 500);
       // A consent dialog owns the page while it is up, so it is what a snapshot
       // describes. Reporting the page behind it hands back geometry for
@@ -1573,22 +1762,32 @@
     },
 
     click(target, options = {}) {
-      const element = resolve(target);
-      if (element === STALE) return err("stale-ref", STALE_MESSAGE);
+      const element = resolveAt(target);
+      const refused = gone(element);
+      if (refused) return refused;
       if (!element) return err("not-found", "No element matched that target.");
-      element.scrollIntoView({ block: "center", inline: "center" });
-      const point =
-        target.x != null && target.y != null ? { x: target.x, y: target.y } : centreOf(element);
+      const at = pointOf(target);
+      // Never scroll for a press aimed at a coordinate: moving the page is what
+      // would make that coordinate point somewhere else.
+      if (!at) element.scrollIntoView({ block: "center", inline: "center" });
+      const point = at ?? centreOf(element);
+      // Described before the press, not after. A click that navigates or
+      // re-renders leaves the node detached, and a detached node measures
+      // 0×0 — which is how a successful click came to report an empty rect.
+      const clicked = describe(element);
       // The press lands as the pointer arrives, not before it sets off.
       return schedule(agentCursor(point, "click"), () => {
         agentTap();
         pointerSequence(element, point, options);
-      }).then(() => ok({ clicked: describe(element), ...pageState() }));
+      }).then(() => ok({ clicked, ...pageState() }));
     },
 
     type(target, text, options = {}) {
-      const element = target ? resolve(target) : document.activeElement;
-      if (element === STALE) return err("stale-ref", STALE_MESSAGE);
+      // An empty locator means "whatever has focus". The object the host builds
+      // always has the keys, so this asks whether any of them names anything.
+      const element = named(target) ? resolve(target) : document.activeElement;
+      const refused = gone(element);
+      if (refused) return refused;
       if (!element) return err("not-found", "No element matched that target.");
       // A <select> has a value but no text to type into it, and setting that
       // value through the input setter threw "Illegal invocation". Typing at a
@@ -1659,16 +1858,25 @@
      * agent's cursor follows the same path so the gesture is watchable.
      */
     drag(from, to, options = {}) {
-      const source = resolve(from);
-      if (source === STALE) return err("stale-ref", STALE_MESSAGE);
+      // A start given as plain coordinates is a real target — a canvas stroke
+      // or a slider has no element to name — and only `to` understood one, so
+      // every coordinate drag was refused for a start it never looked for.
+      const source = resolveAt(from);
+      const refused = gone(source);
+      if (refused) return refused;
       if (!source) return err("not-found", "No element matched the start of the drag.");
-      source.scrollIntoView({ block: "center", inline: "center" });
-      const start =
-        from?.x != null && from?.y != null ? { x: from.x, y: from.y } : centreOf(source);
-      const target = to && (to.ref || to.selector || to.text) ? resolve(to) : null;
+      const fromPoint = pointOf(from);
+      if (!fromPoint) source.scrollIntoView({ block: "center", inline: "center" });
+      const start = fromPoint ?? centreOf(source);
+      const target = named(to) ? resolve(to) : null;
+      const endRefused = gone(target);
+      if (endRefused) return endRefused;
       const end =
-        to?.x != null && to?.y != null ? { x: to.x, y: to.y } : target ? centreOf(target) : null;
+        pointOf(to) ?? (target ? centreOf(target) : null);
       if (!end) return err("not-found", "No element or point matched the end of the drag.");
+      // Both ends are described before the gesture: a reorder detaches the row
+      // it moved, and a detached row measures 0×0.
+      const described = { from: describe(source), to: target ? describe(target) : end };
 
       const steps = Math.max(
         6,
@@ -1729,8 +1937,7 @@
         });
       }).then(() =>
         ok({
-          from: describe(source),
-          to: target ? describe(target) : end,
+          ...described,
           // Which mechanism was used, so a caller reading "moved nothing" knows
           // whether to look at the page or at the gesture.
           kind: html5 ? "html5-drag" : "pointer-drag",
@@ -1739,12 +1946,29 @@
     },
 
     scroll(target, deltaX = 0, deltaY = 0) {
-      const target_ = target ? resolve(target) : null;
-      const element = target_ === STALE ? null : target_;
+      const resolved = named(target) ? resolve(target) : null;
+      const element = gone(resolved) ? null : resolved;
+      // A named element that does not itself scroll is not the scroller: the
+      // page is. Nothing said so before, so scrolling "inside #content" on a
+      // page whose scroller is the document reported success over a page that
+      // had not moved.
+      const scroller = element ? scrollableFrom(element) : null;
       const at = element ? centreOf(element) : { x: innerWidth / 2, y: innerHeight / 2 };
       return schedule(agentCursor(at, "scroll"), () => {
-        (element ?? window).scrollBy({ left: deltaX, top: deltaY, behavior: "instant" });
-      }).then(() => ok({ ...pageState() }));
+        (scroller ?? window).scrollBy({ left: deltaX, top: deltaY, behavior: "instant" });
+      }).then(() =>
+        ok({
+          scrolled: scroller ? describe(scroller) : "page",
+          ...(element && !scroller
+            ? {
+                note:
+                  "that element does not scroll, so the page was scrolled instead. Name the " +
+                  "container that has the scrollbar if you meant something else.",
+              }
+            : {}),
+          ...pageState(),
+        }),
+      );
     },
 
     waitFor(condition = {}) {
@@ -1758,7 +1982,7 @@
       }
       if (condition.selector || condition.ref || condition.role) {
         const resolved = resolve(condition);
-        const element = resolved === STALE ? null : resolved;
+        const element = gone(resolved) ? null : resolved;
         if (!element || !visible(element)) return ok({ matched: false });
       }
       return ok({ matched: true });
@@ -1767,7 +1991,8 @@
     /** Highlights an element without acting on it, for the agent cursor. */
     highlight(target) {
       const element = resolve(target);
-      if (element === STALE) return err("stale-ref", STALE_MESSAGE);
+      const refused = gone(element);
+      if (refused) return refused;
       if (!element) return err("not-found", "No element matched that target.");
       ensureOverlay().getElementById("marks").replaceChildren();
       outline(element, accessibleName(element).slice(0, 40) || element.tagName.toLowerCase());

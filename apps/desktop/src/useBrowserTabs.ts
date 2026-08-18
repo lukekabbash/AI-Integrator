@@ -35,8 +35,9 @@ export interface BrowserController {
   recordingTabId: string | null;
   annotatingTabId: string | null;
   open: (url?: string) => Promise<BrowserTab | null>;
-  /** Closes an idle/user tab; false means recent agent work was preserved. */
-  close: (tabId: string) => Promise<boolean>;
+  /** Closes a tab; false means recent agent work was preserved. `force`
+   *  closes regardless — the person clicked X and meant it. */
+  close: (tabId: string, force?: boolean) => Promise<boolean>;
   navigate: (tabId: string, url: string) => Promise<void>;
   history: (tabId: string, action: "back" | "forward" | "reload" | "stop") => Promise<void>;
   setBounds: (tabId: string, rect: DOMRect | null, placementSlot: BrowserPlacementSlot) => void;
@@ -511,10 +512,10 @@ export function useBrowserTabs(
           return null;
         }
       },
-      close: async (tabId) => {
+      close: async (tabId, force) => {
         if (!api || !taskId || !byId[tabId]) return false;
         try {
-          return await api.close(taskId, tabId);
+          return await api.close(taskId, tabId, force);
         } catch (error) {
           report(taskId, error, "Could not close that tab.");
           return false;
