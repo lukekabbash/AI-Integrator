@@ -345,7 +345,9 @@ fn validate(mut spec: ServerSpec) -> CommandResult<ServerSpec> {
         return Err(invalid("that command line has too many arguments"));
     }
     if spec.env.len() > MAX_ENV {
-        return Err(invalid("that command line has too many environment entries"));
+        return Err(invalid(
+            "that command line has too many environment entries",
+        ));
     }
     if !spec.cwd.is_dir() {
         return Err(invalid(&format!(
@@ -400,7 +402,10 @@ fn spawn_into(
             let _ = child.wait();
             return Err(CommandError {
                 code: "unavailable",
-                message: format!("{} was stopped again because it could not be held to the app's lifetime: {reason}", managed.spec.label),
+                message: format!(
+                    "{} was stopped again because it could not be held to the app's lifetime: {reason}",
+                    managed.spec.label
+                ),
             });
         }
     };
@@ -669,10 +674,16 @@ mod tests {
     }
 
     fn test_child_args(name: &str) -> Vec<String> {
-        ["--exact", name, "--ignored", "--nocapture", "--test-threads=1"]
-            .iter()
-            .map(|argument| (*argument).to_string())
-            .collect()
+        [
+            "--exact",
+            name,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ]
+        .iter()
+        .map(|argument| (*argument).to_string())
+        .collect()
     }
 
     fn pid_of(servers: &DevServers, id: &ServerId) -> u32 {
@@ -762,7 +773,11 @@ mod tests {
         // `--nocapture`, so the marker lands part way along a line rather than
         // at the start of one. Bounded, because a reader waiting on a line
         // that never comes is a hung test suite, not a failing one.
-        for line in BufReader::new(stdout).lines().map_while(Result::ok).take(64) {
+        for line in BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+            .take(64)
+        {
             if let Some((_, value)) = line.split_once("child-pid=") {
                 pid = value.trim().parse::<u32>().ok();
             }
@@ -830,7 +845,8 @@ mod tests {
         );
         let log = servers.log(&id, 0);
         assert!(
-            log.first().is_some_and(|line| line.stream == Stream::System),
+            log.first()
+                .is_some_and(|line| line.stream == Stream::System),
             "the log opens with the command line we ran"
         );
         assert!(
@@ -884,7 +900,10 @@ mod tests {
             None,
             "a tab the user closed does not get reopened behind them"
         );
-        assert_eq!(state_of(&servers, &id), ServerState::Listening { port: 4180 });
+        assert_eq!(
+            state_of(&servers, &id),
+            ServerState::Listening { port: 4180 }
+        );
 
         servers.restart(&id).expect("restarting");
         assert_eq!(
@@ -967,7 +986,11 @@ mod tests {
             );
         }
         prune(&mut servers);
-        assert_eq!(servers.len(), MAX_RETAINED - 1, "room is left for the new row");
+        assert_eq!(
+            servers.len(),
+            MAX_RETAINED - 1,
+            "room is left for the new row"
+        );
         assert!(
             servers.contains_key(&ServerId::new(format!("srv-{}", MAX_RETAINED + 5))),
             "the newest rows are the ones kept"

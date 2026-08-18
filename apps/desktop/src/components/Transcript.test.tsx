@@ -2,7 +2,7 @@
 import "@testing-library/jest-dom/vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { TranscriptEvent } from "../bridge";
+import { bridge, type TranscriptEvent } from "../bridge";
 import { Transcript } from "./Transcript";
 import {
   readTranscriptViewportState,
@@ -1443,5 +1443,155 @@ describe("Transcript", () => {
     const cue = screen.getByLabelText("Resumed after interruption");
     expect(cue.tagName).toBe("EM");
     expect(cue).toHaveTextContent("resumed");
+  });
+
+  it("renders a sent annotation as an attachment chip in the bubble, not the markup", async () => {
+    vi.spyOn(bridge, "readAttachmentPreview").mockResolvedValue(
+      "data:image/png;base64,cHJldmlldw==",
+    );
+    const annotation = [
+      "<browser_annotation>",
+      "Page: Checkout",
+      "URL: http://localhost:3773/checkout",
+      'Element: <button> role=button name="Sign in"',
+      "Selector: #signin",
+      "Note:",
+      "make this a button",
+      "</browser_annotation>",
+    ].join("\n");
+    render(
+      <Transcript
+        events={[
+          event(
+            "user-1",
+            "user",
+            `fix the button\n\nAttached files:\n- /tmp/Annotation · Sign in.png\n\n${annotation}`,
+          ),
+        ]}
+      />,
+    );
+
+    expect(screen.queryByText(/<browser_annotation>/)).toBeNull();
+    expect(screen.queryByText("Attached files:")).toBeNull();
+    expect(screen.getByLabelText("Page annotations")).toBeInTheDocument();
+    expect(screen.getByText("Sign in")).toBeInTheDocument();
+    expect(screen.getByText("make this a button")).toBeInTheDocument();
+    expect(screen.getByText("fix the button", { selector: ".turn--user p" })).toBeInTheDocument();
+    expect(screen.queryByText("Annotation · Sign in.png")).toBeNull();
+    expect(await screen.findByAltText("Sign in")).toHaveAttribute(
+      "src",
+      "data:image/png;base64,cHJldmlldw==",
+    );
+    const chip = document.querySelector(".turn--user .user-attachments .user-annotation");
+    expect(chip).toHaveClass("user-attachment", "user-attachment--annotation");
+    expect(document.querySelectorAll(".turn--user .user-attachment")).toHaveLength(1);
+  });
+
+  it("keeps an annotation-only send as a chip in its own bubble", () => {
+    const annotation = [
+      "<browser_annotation>",
+      "Page: Checkout",
+      "URL: http://localhost:3773/checkout",
+      'Element: <button> role=button name="Pay"',
+      "Selector: #pay",
+      "</browser_annotation>",
+    ].join("\n");
+    render(<Transcript events={[event("user-1", "user", annotation)]} />);
+
+    expect(screen.getByLabelText("Your message")).toHaveClass("turn", "turn--user");
+    expect(screen.getByText("Pay")).toBeInTheDocument();
+    expect(document.querySelector(".turn--user .user-annotation")).not.toBeNull();
+    expect(document.querySelector(".turn--user p")).toBeNull();
+    expect(screen.queryByText(/<browser_annotation>/)).toBeNull();
+  });
+
+  it("shows a screenshot in an expanded runtime event instead of the base64", async () => {
+    const png =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const output = JSON.stringify(
+      {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ width: 1280, height: 800, note: "a picture of the tab" }),
+          },
+          { type: "image", data: png, mimeType: "image/png" },
+        ],
+        isError: false,
+      },
+      null,
+      2,
+    );
+    render(
+      <Transcript
+        events={[
+          {
+            ...event("shot-1", "tool", ""),
+            title: "Viewed image",
+            status: "success",
+            details: [{ label: "Output", body: output }],
+          },
+        ]}
+      />,
+    );
+
+    expect(document.querySelector(".activity-shot--inline")).not.toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /Viewed image/ }));
+    const image = await screen.findByRole("img", { name: "Viewed image" });
+    expect(image).toHaveAttribute("src", `data:image/png;base64,${png}`);
+    expect(screen.getByText(/1280/)).toBeInTheDocument();
+    expect(document.querySelector(".activity-body")?.textContent).not.toContain("iVBORw0KGgo");
+  });
+
+  it("loads a persisted screenshot path when the tool output kept the file", async () => {
+    vi.spyOn(bridge, "readAttachmentPreview").mockResolvedValue(
+      "data:image/png;base64,cHJldmlldw==",
+    );
+    render(
+      <Transcript
+        events={[
+          {
+            ...event("shot-2", "tool", ""),
+            title: "Viewed image",
+            status: "success",
+            details: [
+              {
+                label: "Output",
+                body: JSON.stringify({
+                  width: 800,
+                  imagePath: "H:/app/browser-captures/task-1/screenshot.png",
+                  note: "on screen",
+                }),
+              },
+            ],
+          },
+        ]}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Viewed image/ }));
+    expect(await screen.findByRole("img", { name: "Viewed image" })).toHaveAttribute(
+      "src",
+      "data:image/png;base64,cHJldmlldw==",
+    );
+  });
+
+  it("narrates a live screenshot as Viewing image", () => {
+    render(
+      <Transcript
+        events={[
+          event("user-1", "user", "look at the page"),
+          {
+            ...event("shot-1", "tool", '{"tabId":"tab-1"}'),
+            title: "Viewing image",
+            status: "running",
+          },
+        ]}
+        running
+      />,
+    );
+
+    expect(screen.getByText("Viewing image")).toBeInTheDocument();
+    expect(screen.queryByText(/tabId/)).not.toBeInTheDocument();
   });
 });

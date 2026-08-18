@@ -78,6 +78,9 @@ pub fn storage_totals(state: State<'_, AppState>) -> CommandResult<StorageTotals
     let attachment_bytes = directory_size(&state.data_directory.join("chat-attachments"))
         .saturating_add(directory_size(
             &state.data_directory.join("pasted-attachments"),
+        ))
+        .saturating_add(directory_size(
+            &state.data_directory.join("browser-captures"),
         ));
     Ok(StorageTotals {
         total_bytes: database_bytes

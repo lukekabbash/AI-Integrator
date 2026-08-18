@@ -357,7 +357,7 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
         "Claude Fable 5",
         "Claude Opus 5",
         "GPT-5.6 Sol",
-        "Cursor Grok 4.5",
+        "Cursor Grok 4.6",
       ],
       detail: "Desktop detected; agent CLI setup is required for structured runs.",
     },
@@ -369,7 +369,7 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
       account: "Claude Max",
       status: "connected",
       fidelity: "structured",
-      models: ["Claude Fable 5", "Claude Sonnet 5", "Claude Opus 4.8", "Claude Haiku 4.5"],
+      models: ["Claude Fable 5", "Claude Opus 5", "Claude Sonnet 5", "Claude Haiku 4.5"],
       detail: "Existing vendor login reused. Subscription quota percentage is not exposed.",
     },
     {
@@ -387,7 +387,7 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
       command: "kimi acp",
       status: "not_installed",
       fidelity: "acp",
-      models: ["Kimi K3", "Kimi K2.7 Code", "Kimi K2.7 Code Highspeed"],
+      models: ["Kimi K3", "Kimi K3 256k", "Kimi K2.7 Code", "Kimi K2.7 Code Highspeed"],
       detail: "Install Kimi Code, then sign in with its vendor-owned device flow.",
     },
     {
@@ -398,8 +398,10 @@ export function createDemoSnapshot(): WorkspaceSnapshot {
       status: "login_required",
       fidelity: "structured",
       models: [
-        "Gemini 3.1 Pro",
+        "Gemini 3.7 Flash",
+        "Gemini 3.6 Flash",
         "Gemini 3.5 Flash",
+        "Gemini 3.1 Pro",
         "Claude Sonnet 4.6 (Thinking)",
         "Claude Opus 4.6 (Thinking)",
         "GPT-OSS 120B",

@@ -41,6 +41,10 @@ fn stale_structured_resume_is_cleared_only_for_provider_rejection() {
 
 #[test]
 fn stale_structured_resume_rejection_clears_the_durable_reference() {
+    // A resume reference is stored against an absolute repository path, and
+    // what counts as absolute is platform-specific: `/fixture/repository` is a
+    // relative path on Windows, which used to fail this test there only.
+    let repository = std::env::temp_dir().join("integrator-fixture-repository");
     let store = LocalStore::open_in_memory().expect("open store");
     let task = store
         .create_task(NewTask {
@@ -59,7 +63,7 @@ fn stale_structured_resume_rejection_clears_the_durable_reference() {
         task.id,
         ProviderKind::Claude,
         "stale-session",
-        Path::new("/fixture/repository"),
+        &repository,
         "project-write",
         "off",
     )
@@ -153,6 +157,7 @@ fn chat_wire_text_never_starts_as_a_provider_command() {
     assert!(wire.starts_with("<integrator-chat-policy>"));
     assert!(wire.contains("Never call provider-native shell"));
     assert!(wire.contains("no user message"));
+    assert!(wire.contains("External-browser handoff is off"));
 }
 
 #[test]
@@ -588,12 +593,14 @@ fn acp_launch_is_provider_aware_and_rejects_non_acp_routes() {
     );
     let project = AcpLaunchProfile::Project {
         tools: crate::harness_prompt::LocalToolsProjection::Unavailable,
+        browser: crate::harness_prompt::ExternalBrowserHandoff::IntegratorOnly,
     };
     let grok = acp_launch_arguments(&ProviderKind::Grok, &project).expect("Grok ACP route");
     assert_eq!(grok[0], "--no-auto-update");
     assert_eq!(grok[1], "--rules");
     assert!(grok[2].contains("durable harness policy"));
     assert!(grok[2].contains("delegation are unavailable"));
+    assert!(grok[2].contains("External-browser handoff is off"));
     assert_eq!(
         &grok[3..],
         ["agent", "--no-leader", "--always-approve", "stdio"]
@@ -747,6 +754,47 @@ fn antigravity_model_output_parser_accepts_machine_readable_inventory() {
             "flash"
         ]
     );
+}
+
+#[test]
+fn antigravity_model_output_parser_reads_agy_command_envelope() {
+    let output = serde_json::json!({
+        "status": "SUCCESS",
+        "response": "gemini-3.7-flash-high\tGemini 3.7 Flash (High)\n../not-a-model\tIgnored",
+        "command": {
+            "name": "models",
+            "data": {
+                "models": [
+                    { "id": "gemini-3.7-flash-high", "label": "Gemini 3.7 Flash (High)" },
+                    { "id": "gemini-3.6-flash-medium", "label": "Gemini 3.6 Flash (Medium)" },
+                    { "id": "gemini-3.1-pro-high", "label": "Gemini 3.1 Pro (High)" },
+                    { "id": "claude-opus-4-6-thinking", "label": "Claude Opus 4.6 (Thinking)" },
+                    { "id": "../evil", "label": "Update available" }
+                ]
+            }
+        }
+    })
+    .to_string();
+    assert_eq!(
+        parse_antigravity_models(&output),
+        [
+            "Gemini 3.7 Flash (High)",
+            "Gemini 3.6 Flash (Medium)",
+            "Gemini 3.1 Pro (High)",
+            "Claude Opus 4.6 (Thinking)"
+        ]
+    );
+}
+
+#[test]
+fn antigravity_model_output_parser_rejects_empty_or_adversarial_envelopes() {
+    for output in [
+        r#"{"status":"SUCCESS","command":{"name":"models","data":{"models":[]}}}"#,
+        r#"{"status":"ERROR","command":{"name":"models","data":{"models":[{"id":"../evil","label":"not a model"}]}}}"#,
+        r#"{"conversation_id":"","status":"SUCCESS","response":"Update available"}"#,
+    ] {
+        assert_eq!(parse_antigravity_models(output), [] as [&str; 0]);
+    }
 }
 
 #[test]
@@ -1644,6 +1692,28 @@ fn acp_permission_params(kinds: &[&str]) -> Value {
 }
 
 #[test]
+fn antigravity_auto_turns_ask_me_into_a_deny() {
+    let asked = close_antigravity_auto_outcome(Outcome::AskTheUser {
+        reason: "the reviewer wrote prose".into(),
+    });
+    assert_eq!(
+        asked,
+        Outcome::Reject {
+            reason: "the reviewer wrote prose (Antigravity cannot prompt; denied)".into(),
+        }
+    );
+    let allowed = close_antigravity_auto_outcome(Outcome::Approve {
+        reason: "safe".into(),
+    });
+    assert_eq!(
+        allowed,
+        Outcome::Approve {
+            reason: "safe".into(),
+        }
+    );
+}
+
+#[test]
 fn an_acp_permission_request_reads_as_the_boundary_it_is() {
     let request = acp_boundary_request(
         &acp_permission_params(&["allow_once", "reject_once"]),
@@ -1891,4 +1961,23 @@ fn a_stored_route_reviews_on_its_own_runtime_never_the_tasks() {
     // and it has no native reviewer to degrade into.
     let custom = auto_review_plan(&store, ProviderKind::CustomAcp).expect("custom route");
     assert_eq!(custom.config.route.runtime, ProviderKind::CustomAcp);
+}
+
+#[test]
+fn saved_resume_matches_canonical_and_raw_workspace_paths() {
+    let temp = tempfile::tempdir().expect("temp workspace");
+    let raw = temp.path().to_path_buf();
+    let canonical = dunce::canonicalize(&raw).expect("canonicalize workspace");
+    assert!(saved_resume_matches_workspace(&canonical, &canonical));
+    assert!(saved_resume_matches_workspace(&raw, &canonical));
+    let trailing = PathBuf::from(format!(
+        "{}{}",
+        canonical.display(),
+        std::path::MAIN_SEPARATOR
+    ));
+    assert!(saved_resume_matches_workspace(&trailing, &canonical));
+    assert!(!saved_resume_matches_workspace(
+        Path::new("/missing/workspace"),
+        &canonical
+    ));
 }

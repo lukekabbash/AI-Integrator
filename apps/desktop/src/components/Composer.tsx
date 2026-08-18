@@ -16,9 +16,12 @@ import {
   MousePointerClick,
 } from "lucide-react";
 import {
+  annotationAttachmentLabel,
   isAnnotationAttachment,
   isAnnotationBlock,
+  pairAnnotationAttachments,
   parseAnnotationBlock,
+  splitAnnotationBlocks,
   type PendingAnnotation,
 } from "../browserAnnotation";
 import { FileIcon } from "./FileIcon";
@@ -26,7 +29,9 @@ import {
   bridge,
   persistableComposerAttachment,
   PROVIDER_DEFAULT_MODEL,
+  formatEffortRouteLabel,
   resolveModelEffort,
+  resolveModelFast,
   type ComposerDraftAttachment,
   type TaskPermission,
   type ComposerDraftValue,
@@ -43,6 +48,7 @@ import type { ComposerNotice } from "../composerNotices";
 import { prettyModelLabel, resolveModelLabel } from "../modelLabel";
 import type { RuntimeRouteDefaults } from "../routingDefaults";
 import { Dropdown, ProviderIcon } from "./Dropdown";
+import { Switch } from "./SettingControls";
 import { Tooltip } from "./Tooltip";
 import {
   activeAutocompleteToken,
@@ -82,6 +88,8 @@ interface ComposerProps {
   defaultModel: string;
   /** Settings-provided reasoning effort, applied when the model supports it. */
   defaultEffort?: string;
+  /** Last Fast selection for this chat when the model advertises a Fast tier. */
+  defaultFast?: boolean;
   /** Preferred model and effort recalled when the user switches runtimes. */
   runtimeDefaults?: RuntimeRouteDefaults;
   /** Settings-provided permission profile preselected for new chats. */
@@ -104,6 +112,7 @@ interface ComposerProps {
     runtime: RuntimeId;
     model: string;
     effort?: string;
+    fast?: boolean;
     permission: TaskPermission;
     delegation: "off" | "manual" | "balanced" | "budget-first";
     nativeActionId?: string;
@@ -113,7 +122,13 @@ interface ComposerProps {
   /** Canonical trusted repository/worktree used for provider-native discovery. */
   workingDirectory?: string;
   /** Persist provider/model/effort for an existing chat as soon as the user changes them. */
-  onRoutingChange?: (value: { runtime: RuntimeId; model: string; effort?: string }) => void;
+  onRoutingChange?: (value: {
+    runtime: RuntimeId;
+    model: string;
+    effort?: string;
+    /** Present when the picked route also carries a fast-output choice. */
+    fast?: boolean;
+  }) => void;
   /** Fires immediately when the user switches the permission profile, even mid-run. */
   onPermissionChange?: (permission: TaskPermission) => void;
   /** Live session mode state for providers that advertise modes (e.g. Cursor
@@ -190,6 +205,7 @@ export function Composer({
   defaultRuntime,
   defaultModel,
   defaultEffort,
+  defaultFast,
   runtimeDefaults,
   defaultPermission,
   defaultDelegation,
@@ -238,9 +254,10 @@ export function Composer({
   );
   const [model, setModel] = useState(initialDraft?.model ?? defaultModel);
   const [effort, setEffort] = useState<string | undefined>(initialDraft?.effort ?? defaultEffort);
-  const [permission, setPermission] = useState<
-    TaskPermission
-  >(initialDraft?.permission ?? defaultPermission ?? "project-write");
+  const [fast, setFast] = useState<boolean | undefined>(initialDraft?.fast ?? defaultFast);
+  const [permission, setPermission] = useState<TaskPermission>(
+    initialDraft?.permission ?? defaultPermission ?? "project-write",
+  );
   // Agent-driven permission changes (e.g. an approved plan exit) override
   // the picker even after the user touched it — the session already moved.
   // Applied once per request id with the adjust-state-during-render pattern.
@@ -349,6 +366,8 @@ export function Composer({
         ];
   const effortOptions = activeEntry?.efforts ?? [];
   const activeEffort = resolveModelEffort(activeEntry, effort);
+  const supportsFast = activeEntry?.supportsFast === true;
+  const activeFast = resolveModelFast(activeEntry, fast);
   const preferredRuntimeEffort = runtimeDefaults?.[runtime]?.effort ?? defaultEffort;
   const delegationAvailable = runtime !== "antigravity" && runtime !== "custom";
   const delegationControlDisabled = delegationDisabled || !delegationAvailable;
@@ -361,6 +380,7 @@ export function Composer({
       runtime,
       model: activeModel,
       effort,
+      ...(supportsFast && activeFast !== undefined ? { fast: activeFast } : {}),
       permission: effectivePermission,
       delegation: effectiveDelegation,
       selectionStart: caret,
@@ -372,9 +392,11 @@ export function Composer({
       caret,
       contextReferences,
       effectiveDelegation,
+      activeFast,
       effectivePermission,
       effort,
       prompt,
+      supportsFast,
       runtime,
     ],
   );
@@ -395,6 +417,14 @@ export function Composer({
     attachments.length > 0 ||
     contextReferences.length > 0 ||
     annotations.length > 0;
+  const annotationPreviews = useMemo(
+    () => pairAnnotationAttachments(annotations, attachments),
+    [annotations, attachments],
+  );
+  const foldedAnnotationAttachments = useMemo(
+    () => new Set([...annotationPreviews.values()].map(attachmentIdentity)),
+    [annotationPreviews],
+  );
 
   useEffect(() => {
     onDraftChangeRef.current = onDraftChange;
@@ -690,13 +720,13 @@ export function Composer({
     const textarea = textareaRef.current;
     const start = textarea?.selectionStart ?? prompt.length;
     const end = textarea?.selectionEnd ?? start;
-    // A browser annotation is context, not prose: it becomes a chip like an
-    // attachment and rejoins the message on send, instead of dropping a block
-    // of markup into the middle of whatever the user was typing.
+    // A browser annotation is context, not prose: it becomes a screenshot-style
+    // attachment chip and rejoins the message on send, instead of dropping a
+    // block of markup into the middle of whatever the user was typing.
     if (isAnnotationBlock(insertRequest.text)) {
       annotationSequence.current += 1;
       const annotation = parseAnnotationBlock(insertRequest.text, annotationSequence.current);
-      queueMicrotask(() => setAnnotations((current) => [...current, annotation]));
+      setAnnotations((current) => [...current, annotation]);
       onInsertHandled?.(insertRequest.id);
       textarea?.focus();
       return;
@@ -744,16 +774,28 @@ export function Composer({
     if (!restoreRequest || restoreRequest.id === lastRestoreIdRef.current) return;
     lastRestoreIdRef.current = restoreRequest.id;
     const value = restoreRequest.value;
-    const position = value.selectionEnd;
     draftTouchedRef.current = true;
     suppressDraftEmissionRef.current = true;
-    setPrompt(value.prompt);
+    // A queued message carries its annotation blocks in the prompt; they come
+    // back as chips, not markup in the textarea.
+    const { text: restoredPrompt, annotations: restoredAnnotations } = splitAnnotationBlocks(
+      value.prompt,
+    );
+    const position = Math.min(value.selectionEnd, restoredPrompt.length);
+    setPrompt(restoredPrompt);
+    setAnnotations(
+      restoredAnnotations.map((annotation) => {
+        annotationSequence.current += 1;
+        return { ...annotation, id: annotationSequence.current };
+      }),
+    );
     setAttachments(value.attachments);
     setContextReferences(value.contextReferences ?? []);
     const restoredRuntime = normalizeRuntime(runtimes, value.runtime);
     setRuntime(restoredRuntime);
     setModel(value.model);
     setEffort(value.effort);
+    setFast(value.fast);
     setPermission(value.permission);
     setDelegation(
       restoredRuntime === "antigravity" || restoredRuntime === "custom" ? "off" : value.delegation,
@@ -765,7 +807,10 @@ export function Composer({
     onRestoreHandled?.(restoreRequest.id);
     requestAnimationFrame(() => {
       textareaRef.current?.focus();
-      textareaRef.current?.setSelectionRange(value.selectionStart, value.selectionEnd);
+      textareaRef.current?.setSelectionRange(
+        Math.min(value.selectionStart, restoredPrompt.length),
+        position,
+      );
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps -- consumes the request exactly once per id
   }, [restoreRequest]);
@@ -795,11 +840,13 @@ export function Composer({
     nextRuntime: RuntimeId,
     nextModel: string,
     nextEffort: string | undefined,
+    nextFast?: boolean,
   ) => {
     onRoutingChange?.({
       runtime: nextRuntime,
       model: nextModel,
       effort: nextEffort,
+      ...(nextFast !== undefined ? { fast: nextFast } : {}),
     });
   };
 
@@ -817,7 +864,16 @@ export function Composer({
     );
     setDelegation(defaultDelegation ?? "off");
     setEffort(defaultEffort);
-  }, [defaultRuntime, defaultModel, defaultPermission, defaultDelegation, defaultEffort, runtimes]);
+    setFast(defaultFast);
+  }, [
+    defaultRuntime,
+    defaultModel,
+    defaultPermission,
+    defaultDelegation,
+    defaultEffort,
+    defaultFast,
+    runtimes,
+  ]);
 
   useEffect(() => {
     let active = true;
@@ -1152,21 +1208,24 @@ export function Composer({
     const nextEntry = resolvedCatalog[0];
     if (!nextEntry) return;
     const nextEffort = resolveModelEffort(nextEntry, preferredRuntimeEffort);
+    const nextFast = resolveModelFast(nextEntry, nextEntry.supportsFast ? fast : undefined);
     let cancelled = false;
     void Promise.resolve().then(() => {
       if (cancelled) return;
       setModel(nextEntry.id);
       setEffort(nextEffort);
+      setFast(nextFast);
       onRoutingChange?.({
         runtime,
         model: nextEntry.id,
         effort: nextEntry.efforts?.length ? nextEffort : undefined,
+        ...(nextFast !== undefined ? { fast: nextFast } : {}),
       });
     });
     return () => {
       cancelled = true;
     };
-  }, [cachedCatalog, model, onRoutingChange, preferredRuntimeEffort, runtime]);
+  }, [cachedCatalog, fast, model, onRoutingChange, preferredRuntimeEffort, runtime]);
 
   const submit = async () => {
     const trimmed = prompt.trim();
@@ -1272,7 +1331,9 @@ export function Composer({
       draftCleared = true;
       const accepted = await onSend({
         prompt: outgoing,
-        draftPrompt: submittedDraft,
+        // Annotations ride with the draft so a queued send keeps them: the
+        // queue rebuilds only the attachment and reference tails itself.
+        draftPrompt: [submittedDraft, annotationBlock].filter(Boolean).join("\n\n"),
         attachments: submittedAttachments.map(persistableComposerAttachment),
         ...(submittedContextReferences.length > 0
           ? { contextReferences: submittedContextReferences }
@@ -1280,6 +1341,7 @@ export function Composer({
         runtime,
         model: activeModel,
         effort: effortOptions.length > 0 ? activeEffort : undefined,
+        ...(supportsFast && activeFast !== undefined ? { fast: activeFast } : {}),
         permission: effectivePermission,
         delegation: effectiveDelegation,
         ...(nativeActionId ? { nativeActionId } : {}),
@@ -1322,7 +1384,14 @@ export function Composer({
     draftTouchedRef.current = true;
     routingTouched.current = true;
     setEffort(next);
-    emitRoutingChange(runtime, activeModel, next);
+    emitRoutingChange(runtime, activeModel, next, activeFast);
+  };
+
+  const changeFast = (next: boolean) => {
+    draftTouchedRef.current = true;
+    routingTouched.current = true;
+    setFast(next);
+    emitRoutingChange(runtime, activeModel, activeEffort, next);
   };
 
   const permissionOptions = [
@@ -1618,7 +1687,10 @@ export function Composer({
             autoFocus
           />
         </div>
-        {attachments.length > 0 || contextReferences.length > 0 || attachmentError ? (
+        {attachments.length > 0 ||
+        contextReferences.length > 0 ||
+        annotations.length > 0 ||
+        attachmentError ? (
           <div className="composer-attachments" aria-label="Attached context">
             {contextReferences.map((reference) => (
               <div className="composer-attachment composer-chat-reference" key={reference.id}>
@@ -1641,73 +1713,106 @@ export function Composer({
                 </Tooltip>
               </div>
             ))}
-            {annotations.map((annotation) => (
-              <div
-                className="composer-attachment composer-annotation"
-                key={`annotation-${annotation.id}`}
-                title={annotation.note || annotation.origin}
-              >
-                <MousePointerClick className="file-type-icon" aria-hidden="true" />
-                <span className="composer-annotation-copy">
-                  <strong>{annotation.label}</strong>
-                  <small>{annotation.note || annotation.origin || "Marked on the page"}</small>
-                </span>
-                <Tooltip label="Remove annotation" placement="top">
-                  <button
-                    className="composer-attachment-remove"
-                    type="button"
-                    aria-label={`Remove annotation ${annotation.label}`}
-                    onClick={() => {
-                      draftTouchedRef.current = true;
-                      setAnnotations((current) =>
-                        current.filter((item) => item.id !== annotation.id),
-                      );
-                    }}
-                  >
-                    <X aria-hidden="true" />
-                  </button>
-                </Tooltip>
-              </div>
-            ))}
-            {attachments.map((attachment) => (
-              <div
-                className={`composer-attachment${
-                  attachment.dataUrl ? " composer-attachment--image" : ""
-                }${isAnnotationAttachment(attachment.name) ? " composer-attachment--annotation" : ""}`}
-                key={attachmentIdentity(attachment)}
-              >
-                {isAnnotationAttachment(attachment.name) ? (
-                  <MousePointerClick className="file-type-icon" aria-hidden="true" />
-                ) : null}
-                {attachment.dataUrl ? (
-                  <img src={attachment.dataUrl} alt={attachment.name} />
-                ) : attachment.entry === "folder" ? (
-                  <Folder className="file-type-icon" aria-hidden="true" />
-                ) : (
-                  <FileIcon fileName={attachment.name} />
-                )}
-                <Tooltip label={attachment.path} placement="top">
-                  <span>{attachment.name}</span>
-                </Tooltip>
-                <Tooltip label="Remove attachment" placement="top">
-                  <button
-                    className="composer-attachment-remove"
-                    type="button"
-                    aria-label={`Remove ${attachment.name}`}
-                    onClick={() => {
-                      draftTouchedRef.current = true;
-                      setAttachments((current) =>
-                        current.filter(
-                          (item) => attachmentIdentity(item) !== attachmentIdentity(attachment),
-                        ),
-                      );
-                    }}
-                  >
-                    <X aria-hidden="true" />
-                  </button>
-                </Tooltip>
-              </div>
-            ))}
+            {annotations.map((annotation) => {
+              const preview = annotationPreviews.get(annotation.id);
+              return (
+                <div
+                  className="composer-attachment composer-attachment--image composer-attachment--annotation composer-annotation"
+                  key={`annotation-${annotation.id}`}
+                  title={annotation.note || annotation.origin}
+                >
+                  {preview?.dataUrl ? (
+                    <img src={preview.dataUrl} alt={annotation.label} />
+                  ) : (
+                    <span className="composer-annotation-thumb" aria-hidden="true">
+                      <MousePointerClick />
+                    </span>
+                  )}
+                  <span className="composer-annotation-copy">
+                    <strong>{annotation.label}</strong>
+                    <small>{annotation.note || annotation.origin || "Marked on the page"}</small>
+                  </span>
+                  <Tooltip label="Remove annotation" placement="top">
+                    <button
+                      className="composer-attachment-remove"
+                      type="button"
+                      aria-label={`Remove annotation ${annotation.label}`}
+                      onClick={() => {
+                        draftTouchedRef.current = true;
+                        const paired = annotationPreviews.get(annotation.id);
+                        setAnnotations((current) =>
+                          current.filter((item) => item.id !== annotation.id),
+                        );
+                        if (paired) {
+                          setAttachments((current) =>
+                            current.filter(
+                              (item) => attachmentIdentity(item) !== attachmentIdentity(paired),
+                            ),
+                          );
+                        }
+                      }}
+                    >
+                      <X aria-hidden="true" />
+                    </button>
+                  </Tooltip>
+                </div>
+              );
+            })}
+            {attachments
+              .filter(
+                (attachment) => !foldedAnnotationAttachments.has(attachmentIdentity(attachment)),
+              )
+              .map((attachment) => (
+                <div
+                  className={`composer-attachment${
+                    attachment.dataUrl ? " composer-attachment--image" : ""
+                  }${isAnnotationAttachment(attachment.name) ? " composer-attachment--annotation" : ""}`}
+                  key={attachmentIdentity(attachment)}
+                >
+                  {attachment.dataUrl ? (
+                    <img
+                      src={attachment.dataUrl}
+                      alt={
+                        isAnnotationAttachment(attachment.name)
+                          ? annotationAttachmentLabel(attachment.name)
+                          : attachment.name
+                      }
+                    />
+                  ) : attachment.entry === "folder" ? (
+                    <Folder className="file-type-icon" aria-hidden="true" />
+                  ) : (
+                    <FileIcon fileName={attachment.name} />
+                  )}
+                  <Tooltip label={attachment.path} placement="top">
+                    <span>
+                      {isAnnotationAttachment(attachment.name)
+                        ? annotationAttachmentLabel(attachment.name)
+                        : attachment.name}
+                    </span>
+                  </Tooltip>
+                  <Tooltip label="Remove attachment" placement="top">
+                    <button
+                      className="composer-attachment-remove"
+                      type="button"
+                      aria-label={`Remove ${
+                        isAnnotationAttachment(attachment.name)
+                          ? annotationAttachmentLabel(attachment.name)
+                          : attachment.name
+                      }`}
+                      onClick={() => {
+                        draftTouchedRef.current = true;
+                        setAttachments((current) =>
+                          current.filter(
+                            (item) => attachmentIdentity(item) !== attachmentIdentity(attachment),
+                          ),
+                        );
+                      }}
+                    >
+                      <X aria-hidden="true" />
+                    </button>
+                  </Tooltip>
+                </div>
+              ))}
             {attachmentError ? (
               <p className="composer-attachment-error" role="alert">
                 {attachmentError}
@@ -1902,11 +2007,28 @@ export function Composer({
                 disabled={routingDisabled}
                 leading={<Gauge />}
                 value={activeEffort}
+                triggerLabel={formatEffortRouteLabel(
+                  effortOptions.find((option) => option.id === activeEffort)?.label ?? activeEffort,
+                  supportsFast && activeFast === true,
+                )}
                 onChange={changeEffort}
                 options={effortOptions.map((option) => ({
                   value: option.id,
                   label: option.label,
                 }))}
+                footer={
+                  supportsFast ? (
+                    <div className="dropdown-fast">
+                      <span>Fast</span>
+                      <Switch
+                        checked={activeFast === true}
+                        onChange={changeFast}
+                        label="Fast"
+                        disabled={routingDisabled}
+                      />
+                    </div>
+                  ) : null
+                }
                 compact
               />
             ) : null}
@@ -1928,8 +2050,15 @@ export function Composer({
                   nextEfforts.length > 0
                     ? resolveModelEffort(nextEntry, preferredRuntimeEffort)
                     : preferredRuntimeEffort;
+                const nextFast = resolveModelFast(nextEntry, nextEntry?.supportsFast ? fast : undefined);
                 setEffort(nextEffort);
-                emitRoutingChange(runtime, next, nextEfforts.length > 0 ? nextEffort : undefined);
+                setFast(nextFast);
+                emitRoutingChange(
+                  runtime,
+                  next,
+                  nextEfforts.length > 0 ? nextEffort : undefined,
+                  nextFast,
+                );
               }}
               options={modelOptions}
               compact
@@ -1961,15 +2090,18 @@ export function Composer({
                   nextEfforts.length > 0
                     ? resolveModelEffort(nextEntry, preferredRoute?.effort)
                     : preferredRoute?.effort;
+                const nextFast = resolveModelFast(nextEntry);
                 setRuntime(nextRuntime);
                 setModel(nextModel);
                 setEffort(nextEffort);
+                setFast(nextFast);
                 loadProviderCatalog(nextRuntime);
                 if (nextModel) {
                   emitRoutingChange(
                     nextRuntime,
                     nextModel,
                     nextEfforts.length > 0 ? nextEffort : undefined,
+                    nextFast,
                   );
                 }
               }}
@@ -2092,7 +2224,8 @@ export function Composer({
                   disabled={
                     (!prompt.trim() &&
                       attachments.length === 0 &&
-                      contextReferences.length === 0) ||
+                      contextReferences.length === 0 &&
+                      annotations.length === 0) ||
                     !activeModel ||
                     sendDisabled ||
                     sending

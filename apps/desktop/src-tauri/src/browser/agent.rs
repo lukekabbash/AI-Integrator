@@ -13,15 +13,22 @@
 //!   that child. Siblings cannot see it; the orchestrator can. The
 //!   orchestrator may hand a tab to a child, read-only or to drive.
 //! - **Hold** — whoever last drove a tab holds it briefly, so two agents do
-//!   not undo each other mid-flow. Advisory, expires on its own.
+//!   not undo each other mid-flow. Advisory, expires on its own. A recent
+//!   keystroke from the person using the app is only an exclusive hold when
+//!   Settings → Browser “Lock agents out of the tab you are using” is on.
 //!
 //! Tabs are shared with the *user* by design — that is the point of the
 //! surface — so none of this hides a page from the person watching it.
 
-use std::sync::Arc;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
-use tauri::{AppHandle, Emitter, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use url::Url;
 
 use integrator_core::IntegratorError;
@@ -30,13 +37,21 @@ use crate::command_api::CommandError;
 
 use super::{
     AGENT_ACCESS_SETTING, BrowserTab, BrowserTabs, Caller, GrantMode, close_tab, create_tab,
-    emit_changed, eval_json, invalid, is_blank, normalize_url, setting_enabled, unavailable,
-    webview_of,
+    emit_changed, eval_json, invalid, is_blank, lock_active_tab, normalize_url, setting_enabled,
+    unavailable, webview_of,
 };
 
 /// Guest actions that change the page rather than read it. `guest.js` keeps
 /// the same list for its own half of the hold; the drift test holds them level.
-pub(super) const WRITES: &[&str] = &["click", "type", "press", "scroll", "drag", "evaluate"];
+pub(super) const WRITES: &[&str] = &["click", "type", "press", "scroll", "drag"];
+
+/// Gestures that draw the agent pointer. These are brought on screen so the
+/// person can watch the glide, even when the tab was parked or in the deck.
+const CURSOR_METHODS: &[&str] = &["click", "type", "press", "scroll", "drag", "hover"];
+
+/// Guest replies that can expose page text. This native guard mirrors the
+/// guest's refusal so an untrusted page cannot bypass it by replacing JS.
+const CREDENTIAL_READS: &[&str] = &["snapshot"];
 
 pub fn ensure_agent_access<R: Runtime>(app: &AppHandle<R>) -> Result<(), CommandError> {
     if setting_enabled(app, AGENT_ACCESS_SETTING) {
@@ -58,7 +73,7 @@ fn reach_for(
 ) -> Result<(), CommandError> {
     match tabs.reach(tab_id, caller) {
         Some(GrantMode::Read) if writing => Err(unavailable(
-            "that tab was shared with you read-only — snapshot and evaluate are fine, changing the page is not",
+            "that tab was shared with you read-only — snapshots are fine, changing the page is not",
         )),
         Some(_) => Ok(()),
         // Distinguishing these two is worth the branch: one means "ask whoever
@@ -80,6 +95,19 @@ pub(super) fn ensure_reach(
     reach_for(tabs, caller, tab_id, true)
 }
 
+pub(super) fn ensure_credential_read_safe(
+    tabs: &BrowserTabs,
+    tab_id: &str,
+    method: &str,
+) -> Result<(), CommandError> {
+    if CREDENTIAL_READS.contains(&method) && tabs.credential_in_flight(tab_id) {
+        return Err(unavailable(
+            "a saved password is filled in on this page, so reading it is refused until the tab navigates",
+        ));
+    }
+    Ok(())
+}
+
 /// Runs a guest action for an agent.
 pub async fn agent_invoke(
     app: &AppHandle,
@@ -92,14 +120,20 @@ pub async fn agent_invoke(
     ensure_agent_access(app)?;
     let writing = WRITES.contains(&method);
     reach_for(tabs, caller, tab_id, writing)?;
+    ensure_credential_read_safe(tabs, tab_id, method)?;
     let who = caller.label();
     // Reading a page is harmless when someone else is mid-flow; changing it is
-    // not. A tab someone else is working in refuses writes rather than letting
-    // two runs undo each other, and says who has it.
-    if writing && let Some(holder) = tabs.held_by_other(tab_id, &who) {
+    // not. A tab another agent is working in refuses writes rather than letting
+    // two runs undo each other, and says who has it. The person using the app
+    // is only an exclusive holder when they asked for that lock.
+    let user_hold = lock_active_tab(app);
+    if writing && let Some(holder) = tabs.held_by_other(tab_id, &who, user_hold) {
         return Err(unavailable(stood_off(&holder)));
     }
     super::remember::ensure_awake(app, tabs, tab_id).await;
+    if CURSOR_METHODS.contains(&method) {
+        let _ = bring_on_screen(app, tabs, caller, tab_id).await;
+    }
     let label = tabs
         .label_for(tab_id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
@@ -108,11 +142,13 @@ pub async fn agent_invoke(
     // The guest gets the last word on whether this lands. Only the page can see
     // the person's own clicks and keys, so the veto has to be asked there —
     // `blocked` answers null when the way is clear, which lets the call through.
+    // The lock flag is passed live so toggling the setting applies to the open
+    // document, not only the next navigation.
     let reply = eval_json(
         app,
         &label,
         format!(
-            "window.__integrator.blocked?.({method:?}) || window.__integrator.{method}(...{args})"
+            "window.__integrator.blocked?.({method:?}, {user_hold}) || window.__integrator.{method}(...{args})"
         ),
     )
     .await?;
@@ -174,7 +210,7 @@ pub async fn navigate_for_agent(
         _ => IntegratorError::Unavailable(error.message),
     })?;
     let who = caller.label();
-    if let Some(holder) = tabs.held_by_other(tab_id, &who) {
+    if let Some(holder) = tabs.held_by_other(tab_id, &who, lock_active_tab(app)) {
         return Err(IntegratorError::Unavailable(stood_off(&holder)));
     }
     tabs.mark_held(tab_id, &who);
@@ -287,6 +323,10 @@ async fn bring_on_screen(
     caller: &Caller,
     tab_id: &str,
 ) -> bool {
+    // Both renderers listen: the work pane opens the tab in its strip, and the
+    // pop-out window selects it in its own. A popped tab is not the main
+    // window's to show, so without that second listener an agent could never
+    // photograph one.
     let _ = app.emit(
         super::BROWSER_FOCUS_EVENT,
         json!({ "taskId": caller.task_id.as_str(), "tabId": tab_id }),
@@ -300,6 +340,32 @@ async fn bring_on_screen(
         }
     }
     false
+}
+
+/// Brings the window a tab lives in to the front and waits for the compositor.
+///
+/// A capture is a crop of the screen, so a window sitting behind another one
+/// yields the other one's pixels — which is exactly what a pop-out browser
+/// behind the app produced: a picture of the app with the page as a sliver
+/// down the side. Raising the host first is the difference between a
+/// photograph of the tab and a photograph of whatever covers it.
+async fn raise_host_window(app: &AppHandle, label: &str) {
+    let Ok(webview) = webview_of(app, label) else {
+        return;
+    };
+    let window = webview.window();
+    if window.is_minimized().unwrap_or(false) {
+        let _ = window.unminimize();
+    }
+    if !window.is_visible().unwrap_or(true) {
+        let _ = window.show();
+    }
+    if !window.is_focused().unwrap_or(false) {
+        let _ = window.set_focus();
+    }
+    // One frame is not enough on Windows: the raise is asynchronous and the
+    // screen still holds the old stacking order for a beat.
+    tokio::time::sleep(RAISE_SETTLE).await;
 }
 
 /// Takes a picture of the tab's viewport for an agent.
@@ -336,6 +402,10 @@ pub async fn screenshot_for_agent(
              the page without needing it on screen.",
         ));
     }
+    // The picture is whatever the screen holds over the tab's rectangle, so
+    // the window it lives in — the app, or its own pop-out — has to be the
+    // window in front before the shutter.
+    raise_host_window(app, &label).await;
     let webview = webview_of(app, &label)?;
     let shot = super::capture::capture_full(&webview).await?;
     let viewport = eval_json(app, &label, VIEWPORT.into()).await.ok();
@@ -347,6 +417,22 @@ pub async fn screenshot_for_agent(
                  browser pane appears in it too. Coordinates in the image are device pixels; \
                  divide by width/viewport.width to get CSS pixels for browser_drag.",
     });
+    // Persist a copy the transcript can show later. Codex stores only a
+    // short slice of the tool result, so the base64 image block itself
+    // never survives as a picture in the chat.
+    if let Some(path) = persist_agent_screenshot(app, &caller.task_id, &shot.png_base64) {
+        // Saying how to show it is the difference between an agent that can
+        // hand the user the picture and one that can only describe it: the
+        // transcript draws an app-owned capture inline from this markdown.
+        reply["imagePath"] = json!(path);
+        reply["showInReply"] = json!(format!("![screenshot]({path})"));
+        if let Some(note) = reply["note"].as_str() {
+            reply["note"] = json!(format!(
+                "{note} To show this picture to the user, put this line in your reply: \
+                 ![screenshot]({path})"
+            ));
+        }
+    }
     // The broker turns this into an MCP image block alongside the text.
     reply[super::MCP_CONTENT_KEY] = json!([{
         "type": "image",
@@ -356,6 +442,113 @@ pub async fn screenshot_for_agent(
     Ok(reply)
 }
 
+/// Reads back a capture this app wrote, as a `data:` URL the transcript can
+/// draw. Only files under `browser-captures` are readable, so an agent naming
+/// some other path in its reply gets nothing rather than a file read.
+///
+/// A `data:` URL rather than a file URL because the renderer's content policy
+/// allows `data:` images and no remote or file ones, and because the picture
+/// is app-owned bytes either way.
+#[tauri::command]
+pub async fn browser_capture_image(
+    state: tauri::State<'_, crate::state::AppState>,
+    path: String,
+) -> Result<String, CommandError> {
+    let (file, mime) = inline_capture_source(&state.data_directory, &path)?;
+    let bytes = tauri::async_runtime::spawn_blocking(move || fs::read(&file))
+        .await
+        .map_err(|_| unavailable("the capture reader stopped"))?
+        .map_err(|_| unavailable("that capture is not there any more"))?;
+    if bytes.is_empty() || bytes.len() > MAX_INLINE_CAPTURE_BYTES {
+        return Err(unavailable("that capture is too large to show inline"));
+    }
+    Ok(format!("data:{mime};base64,{}", STANDARD.encode(&bytes)))
+}
+
+/// Resolves a requested path to a capture this app owns, or refuses it.
+///
+/// Both sides are canonicalised before they are compared, so neither `..` nor
+/// a symlink planted inside the capture folder can point the read somewhere
+/// else. An agent is the one naming this path, and a page is what talks to the
+/// agent, so the answer to "read this file" has to be no by default.
+fn inline_capture_source(
+    data_directory: &Path,
+    path: &str,
+) -> Result<(PathBuf, &'static str), CommandError> {
+    let root = data_directory.join("browser-captures");
+    let root = root.canonicalize().unwrap_or(root);
+    let requested = PathBuf::from(path)
+        .canonicalize()
+        .map_err(|_| unavailable("that capture is not there any more"))?;
+    if !requested.starts_with(&root) {
+        return Err(unavailable("that file is not one of this app's captures"));
+    }
+    let mime = match requested
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        _ => return Err(unavailable("that capture is not an image")),
+    };
+    Ok((requested, mime))
+}
+
+/// The most a single inline picture may carry into the transcript.
+const MAX_INLINE_CAPTURE_BYTES: usize = 12 * 1024 * 1024;
+
+/// Writes an agent screenshot under app-owned data. Fail-soft: a missed
+/// file still leaves the MCP image for the model.
+fn persist_agent_screenshot(app: &AppHandle, task_id: &str, png_base64: &str) -> Option<String> {
+    let state = app.try_state::<crate::state::AppState>()?;
+    let png = STANDARD.decode(png_base64).ok()?;
+    persist_screenshot_png(&state.data_directory, task_id, &png)
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+pub(super) fn persist_screenshot_png(
+    data_directory: &Path,
+    task_id: &str,
+    png: &[u8],
+) -> Option<PathBuf> {
+    let task = capture_task_dir(task_id)?;
+    if png.is_empty() {
+        return None;
+    }
+    let directory = data_directory.join("browser-captures").join(task);
+    fs::create_dir_all(&directory).ok()?;
+    let path = directory.join(format!("screenshot-{}.png", uuid::Uuid::new_v4()));
+    if !path.starts_with(&directory) {
+        return None;
+    }
+    fs::write(&path, png).ok()?;
+    Some(path)
+}
+
+fn capture_task_dir(task_id: &str) -> Option<&str> {
+    if task_id.is_empty() || task_id.len() > 80 {
+        return None;
+    }
+    if task_id.contains("..") {
+        return None;
+    }
+    if !task_id
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+    {
+        return None;
+    }
+    Some(task_id)
+}
+
+/// How long a raised window is given to actually be on top before the screen
+/// is read. Long enough for the compositor, short enough not to read as a
+/// pause in a tool call.
+const RAISE_SETTLE: std::time::Duration = std::time::Duration::from_millis(220);
 /// How long `browser_focus` gives the renderer to actually show the tab.
 const FOCUS_TRIES: u8 = 10;
 const FOCUS_POLL: std::time::Duration = std::time::Duration::from_millis(120);
@@ -380,6 +573,65 @@ pub async fn cookies_for_agent(
 }
 
 /// Every tab this caller may address.
-pub fn tabs_for_caller(tabs: &BrowserTabs, caller: &Caller) -> Vec<BrowserTab> {
-    tabs.visible_to(caller)
+pub fn tabs_for_caller<R: Runtime>(
+    app: &AppHandle<R>,
+    tabs: &BrowserTabs,
+    caller: &Caller,
+) -> Vec<BrowserTab> {
+    tabs.visible_to(caller, lock_active_tab(app))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_this_apps_own_captures_may_be_drawn_inline() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let png = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        let capture = persist_screenshot_png(root.path(), "task-1", &png).expect("wrote capture");
+        let (file, mime) =
+            inline_capture_source(root.path(), &capture.to_string_lossy()).expect("ours");
+        assert_eq!(mime, "image/png");
+        assert!(file.ends_with(capture.file_name().expect("named")));
+
+        // A file outside the capture folder is refused, by name or by way of a
+        // path that walks out of it.
+        let outsider = root.path().join("secret.png");
+        fs::write(&outsider, png).expect("wrote outsider");
+        assert!(inline_capture_source(root.path(), &outsider.to_string_lossy()).is_err());
+        let escape = root
+            .path()
+            .join("browser-captures")
+            .join("task-1")
+            .join("..")
+            .join("..")
+            .join("secret.png");
+        assert!(inline_capture_source(root.path(), &escape.to_string_lossy()).is_err());
+
+        // Something that is not an image, inside the folder, is still refused.
+        let notes = root
+            .path()
+            .join("browser-captures")
+            .join("task-1")
+            .join("notes.txt");
+        fs::write(&notes, b"hello").expect("wrote notes");
+        assert!(inline_capture_source(root.path(), &notes.to_string_lossy()).is_err());
+    }
+
+    #[test]
+    fn persists_a_png_under_the_task_capture_folder() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let png = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        let path = persist_screenshot_png(root.path(), "task-1", &png).expect("wrote capture");
+        assert!(path.starts_with(root.path().join("browser-captures").join("task-1")));
+        assert_eq!(fs::read(&path).expect("read capture"), png);
+    }
+
+    #[test]
+    fn refuses_a_task_id_that_would_leave_the_capture_root() {
+        let root = tempfile::tempdir().expect("temp dir");
+        assert!(persist_screenshot_png(root.path(), "../escape", &[1, 2, 3]).is_none());
+        assert!(persist_screenshot_png(root.path(), "task/evil", &[1, 2, 3]).is_none());
+    }
 }

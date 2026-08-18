@@ -205,6 +205,12 @@ function queuedMessage(prompt = "Follow up") {
   };
 }
 
+/** Review has no header tab; the View menu is its front door in these tests. */
+function openReviewFromMenu() {
+  fireEvent.click(screen.getByRole("button", { name: "View" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "Review changes" }));
+}
+
 describe("native runtime recovery UI", () => {
   beforeEach(() => {
     const localValues = new Map<string, string>();
@@ -436,7 +442,9 @@ describe("native runtime recovery UI", () => {
     fireEvent.click(within(titlebar!).getByRole("button", { name: "Open work pane" }));
     const workPane = document.querySelector<HTMLElement>(".work-pane");
     expect(workPane).not.toBeNull();
-    expect(await within(workPane!).findByRole("button", { name: /^Browser/ })).toBeDisabled();
+    expect(await within(workPane!).findByRole("status")).toHaveTextContent(
+      "Browser tabs need the desktop app",
+    );
     expect(within(workPane!).queryByRole("button", { name: /^Review changes/ })).toBeNull();
     expect(within(workPane!).queryByRole("button", { name: /^Files/ })).toBeNull();
     expect(within(workPane!).queryByRole("button", { name: /^Subagents/ })).toBeNull();
@@ -2095,7 +2103,7 @@ describe("native runtime recovery UI", () => {
 
     render(<App />);
     await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
-    fireEvent.click(await screen.findByRole("tab", { name: "Review" }));
+    openReviewFromMenu();
 
     expect(
       await screen.findByText(
@@ -2140,7 +2148,7 @@ describe("native runtime recovery UI", () => {
 
     render(<App />);
     await screen.findByText("Recovered from the persisted projection.", {}, { timeout: 5000 });
-    fireEvent.click(await screen.findByRole("tab", { name: "Review" }));
+    openReviewFromMenu();
 
     expect(await screen.findByRole("alert")).toHaveTextContent("Git diff timed out");
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
@@ -2153,7 +2161,7 @@ describe("native runtime recovery UI", () => {
     expect(bridgeMock.loadTaskGitFile).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps Task and Review left of the shared controls while the work pane is open", async () => {
+  it("keeps the shared controls in the titlebar end while the work pane is open", async () => {
     rightRailProbe.enabled = true;
     bridgeMock.listDelegations.mockImplementation(async (taskId: string) =>
       taskId === "task-1"
@@ -2215,7 +2223,13 @@ describe("native runtime recovery UI", () => {
     const appRoot = document.querySelector<HTMLElement>(".app-root");
     expect(titlebar).not.toBeNull();
     expect(appRoot).toHaveAttribute("data-subagent-visible", "true");
-    expect(appRoot).toHaveAttribute("data-subagent-layout-ready", "true");
+    // jsdom has no layout, so a real pane offset is never measured here. A
+    // 0px value is the bug that covers File / Edit / View when switching tabs
+    // or popping out; refusing that reading is the contract.
+    expect(appRoot!.style.getPropertyValue("--subagent-pane-left")).not.toBe("0px");
+    expect(within(titlebar!).getByRole("button", { name: "File" })).toBeInTheDocument();
+    expect(within(titlebar!).getByRole("button", { name: "Edit" })).toBeInTheDocument();
+    expect(within(titlebar!).getByRole("button", { name: "View" })).toBeInTheDocument();
     expect(document.querySelector(".conversation-header")).not.toBeInTheDocument();
     // The titlebar slice over the pane carries the tab strip. The subagent's
     // detail is on its tab, not in a row of its own inside the pane.
@@ -2227,18 +2241,16 @@ describe("native runtime recovery UI", () => {
     const subagentTab = within(strip!).getByRole("tab", { name: /Polish the interaction/ });
     expect(subagentTab.getAttribute("title")).toContain("Polish the interaction");
 
-    // The shared controls stay in the titlebar end. Opening the pane must not
-    // move Task and Review to the far side of them.
+    // The shared controls stay in the titlebar end, once each. There are no
+    // Task/Review view tabs in the header any more: Review lives in the pane
+    // and behind the git files in the rail.
     expect(screen.getAllByRole("button", { name: /chat navigation/i })).toHaveLength(1);
     expect(within(titlebar!).getByRole("button", { name: /chat navigation/i })).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: "Toggle terminal" })).toHaveLength(1);
     expect(screen.getAllByRole("button", { name: "Close task tools" })).toHaveLength(1);
     expect(titlebar!.querySelector(".work-pane-strip-trailing")).not.toBeInTheDocument();
-    const taskTab = within(titlebar!).getByRole("tab", { name: "Task" });
-    const terminalToggle = within(titlebar!).getByRole("button", { name: "Toggle terminal" });
-    expect(
-      taskTab.compareDocumentPosition(terminalToggle) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
+    expect(within(titlebar!).queryByRole("tablist", { name: "Task view" })).toBeNull();
+    expect(within(titlebar!).queryByRole("tab", { name: "Task" })).toBeNull();
 
     // A second subagent is a peer tab in the same pane, never a second pane.
     const stablePane = document.querySelector(".work-pane");
@@ -3038,7 +3050,7 @@ describe("native runtime recovery UI", () => {
     });
     await waitFor(() => expect(bridgeMock.loadTaskGit).toHaveBeenCalledTimes(2));
 
-    fireEvent.click(screen.getByRole("tab", { name: "Review" }));
+    openReviewFromMenu();
     await waitFor(() =>
       expect(bridgeMock.loadTaskGitFile).toHaveBeenCalledWith(
         "task-1",

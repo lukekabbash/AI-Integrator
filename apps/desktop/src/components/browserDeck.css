@@ -1,126 +1,175 @@
-/* The card deck: browser tabs the work pane is not showing, as a column of
-   live cards in the bottom-right corner of the main window — or wherever the
-   grip was last dragged to.
+/* Compact browser deck: one live face, the rest peeking down and left like a
+   pile of cards. Native webviews cannot overlap, so only the front page is
+   placed; cards behind are stills. The face's title strip is the grip and
+   carries the cycle arrows and the "n / N" count; wheeling over the strip and
+   the arrow keys turn the pile too.
 
-   One rule shapes all of this — a native webview always paints above HTML —
-   so every card's page rectangle is left completely clear and every control
-   lives outside it: the title strip above each page, the grip and the named
-   strips above the column. Cards never overlap: two native pages cannot
-   stack, so they sit one above another and every one of them shows. */
+   In the air (dragging, or gliding to a clear spot after a drop) the whole
+   pile is HTML: the face shows its still under a soft veil, lifts a little and
+   throws a deeper shadow. It lands with the same easing everything else in the
+   app settles with, and only then does the live page return to the face. */
 
 .browser-deck {
-  /* One height for every card; the column shortens each page as it grows so
-     four live pages still fit under the title bar. */
-  --deck-page-height: clamp(
-    88px,
-    calc((100vh - 140px) / var(--deck-live, 1) - 40px),
-    200px
-  );
+  --deck-card-width: 336px;
+  --deck-bar-height: 34px;
+  --deck-page-height: 184px;
+  --deck-peek-x: 12px;
+  --deck-peek-y: 10px;
+  --deck-depth: 0;
+  --deck-radius: calc(var(--radius-row, 10px) + 2px);
+  --deck-shadow-rest:
+    0 0 0 1px rgb(0 0 0 / 4%),
+    0 1px 2px rgb(0 0 0 / 22%),
+    0 14px 36px -10px rgb(0 0 0 / 45%);
+  --deck-shadow-lift:
+    0 0 0 1px rgb(0 0 0 / 5%),
+    0 2px 4px rgb(0 0 0 / 22%),
+    0 28px 56px -12px rgb(0 0 0 / 55%);
   position: fixed;
-  /* right/bottom come from the element style: the remembered drag offset. */
   right: 18px;
   bottom: 18px;
   z-index: 40;
-  display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  gap: 6px;
-  width: 320px;
   pointer-events: none;
 }
 .browser-deck > * {
   pointer-events: auto;
 }
-.browser-deck[data-live="1"] { --deck-live: 1; }
-.browser-deck[data-live="2"] { --deck-live: 2; }
-.browser-deck[data-live="3"] { --deck-live: 3; }
-.browser-deck[data-live="4"] { --deck-live: 4; }
-
-/* The handle. Dragging anywhere else would fight the page underneath. */
-.browser-deck-grip {
-  align-self: flex-end;
-  display: grid;
-  place-items: center;
-  width: 44px;
-  height: 18px;
-  border: 1px solid var(--color-border-subtle);
-  border-radius: 99px;
-  background: var(--color-elevated, var(--color-layer-1));
-  color: var(--color-text-muted);
-  cursor: grab;
-  touch-action: none;
-  user-select: none;
-  transition: color var(--duration-fast, 120ms) var(--ease-emphasized);
-}
-.browser-deck-grip:hover,
-.browser-deck-grip:focus-visible {
-  color: var(--color-text-primary);
-}
-.browser-deck-grip:active {
-  cursor: grabbing;
-}
-.browser-deck-grip svg {
-  width: 14px;
-  height: 14px;
+:root[data-appearance="light"] .browser-deck {
+  --deck-shadow-rest:
+    0 0 0 1px rgb(37 42 45 / 6%),
+    0 1px 2px rgb(37 42 45 / 10%),
+    0 14px 36px -10px rgb(37 42 45 / 22%);
+  --deck-shadow-lift:
+    0 0 0 1px rgb(37 42 45 / 7%),
+    0 2px 4px rgb(37 42 45 / 10%),
+    0 28px 56px -12px rgb(37 42 45 / 30%);
 }
 
-/* Tabs past the column's limit: named strips, oldest at the top. A click
-   makes one a live card again and retires the oldest live card to a strip. */
-.browser-deck-strips {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.browser-deck-strip {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  height: 28px;
-  padding: 0 10px;
-  border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-row, 10px);
-  background: var(--color-elevated, var(--color-layer-1));
-  color: var(--color-text-muted);
-  font-size: 12px;
-  text-align: left;
-  cursor: pointer;
+/* The glide after a drop, and the automatic slide clear of a page that opened
+   underneath: position eases; the drag itself sets position per frame. */
+.browser-deck[data-phase="settling"] {
   transition:
-    translate var(--duration-fast, 120ms) var(--ease-emphasized),
-    color var(--duration-fast, 120ms) var(--ease-emphasized);
-}
-.browser-deck-strip:hover {
-  color: var(--color-text-primary);
-  translate: 0 -1px;
-}
-.browser-deck-strip-label {
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
+    right 400ms var(--ease-emphasized),
+    bottom 400ms var(--ease-emphasized);
 }
 
-.browser-deck-column {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+/* Motion owns the pile's rise and sink; the stack's own transform is the lift. */
+.browser-deck-pile {
+  transform-origin: 100% 100%;
+  will-change: transform, opacity;
+}
+
+.browser-deck-stack {
+  position: relative;
+  width: var(--deck-card-width);
+  height: calc(var(--deck-bar-height) + var(--deck-page-height));
+  padding-left: calc(var(--deck-peek-x) * var(--deck-depth));
+  padding-bottom: calc(var(--deck-peek-y) * var(--deck-depth));
+  box-sizing: content-box;
+  overflow: visible;
+  outline: none;
+  transform-origin: 50% 100%;
+  transition: transform 220ms var(--ease-emphasized);
+}
+/* The lift: the pile leaves the surface while it is carried. */
+.browser-deck[data-dragging="true"] .browser-deck-stack {
+  transform: translateY(-3px) scale(1.015);
 }
 
 .browser-deck-card {
+  --depth: 0;
+  position: absolute;
+  top: 0;
+  left: calc(var(--deck-peek-x) * var(--deck-depth));
+  width: var(--deck-card-width);
   display: flex;
   flex-direction: column;
   border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-row, 10px);
+  border-radius: var(--deck-radius);
   background: var(--color-elevated, var(--color-layer-1));
-  box-shadow: var(--shadow-elevated, 0 10px 30px rgb(0 0 0 / 0.28));
+  box-shadow: var(--deck-shadow-rest);
   overflow: hidden;
+  /* Peek travel is motion-owned so cycling and promoting can be followed. */
+  z-index: calc(8 - var(--depth));
+  transition: box-shadow 220ms var(--ease-emphasized), filter 220ms var(--ease-standard);
+}
+.browser-deck[data-dragging="true"] .browser-deck-card {
+  box-shadow: var(--deck-shadow-lift);
+}
+.browser-deck-card[data-depth="1"] {
+  --depth: 1;
+  filter: brightness(0.94) saturate(0.96);
+}
+.browser-deck-card[data-depth="2"] {
+  --depth: 2;
+  filter: brightness(0.88) saturate(0.92);
+}
+.browser-deck-card[data-peek="true"] {
+  cursor: pointer;
+}
+.browser-deck-card[data-peek="true"]:hover {
+  filter: brightness(1) saturate(1);
+}
+.browser-deck-card[data-peek="true"] .browser-deck-bar {
+  pointer-events: none;
+  /* Only the first peek column of a card behind shows past the face; the
+     favicon sits centred in it so every card in the pile names its site. */
+  padding-left: calc((var(--deck-peek-x) - 14px) / 2);
+}
+.browser-deck-mark {
+  display: inline-grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  color: var(--color-text-muted);
+}
+.browser-deck-mark > svg,
+.browser-deck-mark > .tab-favicon {
+  width: 14px;
+  height: 14px;
+}
+.browser-deck-card[data-peek="true"] .browser-deck-mark {
+  transition: transform 180ms var(--ease-emphasized);
+}
+.browser-deck-card[data-peek="true"]:hover .browser-deck-mark {
+  transform: scale(1.12);
+}
+.browser-deck-card[data-peek="true"]:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
 }
 
 .browser-deck-bar {
+  position: relative;
+  height: var(--deck-bar-height);
+  padding: 0 4px 0 10px;
   display: flex;
   align-items: center;
   gap: 6px;
-  height: 32px;
-  padding: 0 4px 0 10px;
   border-bottom: 1px solid var(--color-border-subtle);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--color-text-primary) 4%, transparent),
+    transparent
+  );
+  user-select: none;
+}
+/* The hairline highlight along the top edge, the way a real card catches light. */
+.browser-deck-bar::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: color-mix(in srgb, var(--color-text-primary) 8%, transparent);
+  pointer-events: none;
+}
+.browser-deck-card[data-depth="0"] .browser-deck-bar {
+  cursor: grab;
+}
+.browser-deck-card[data-depth="0"] .browser-deck-bar:active,
+.browser-deck[data-dragging="true"] .browser-deck-card[data-depth="0"] .browser-deck-bar {
+  cursor: grabbing;
 }
 .browser-deck-title {
   flex: 1;
@@ -129,15 +178,15 @@
   white-space: nowrap;
   text-overflow: ellipsis;
   font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
   color: var(--color-text-primary);
 }
-/* Which tab the agent is in, named rather than merely marked: with the pane
-   closed this corner is the only place the user can see it. */
 .browser-deck-who {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  max-width: 42%;
+  max-width: 34%;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -165,10 +214,88 @@
   display: flex;
   align-items: center;
   gap: 2px;
+  flex: none;
 }
 
-/* The page's rectangle. Nothing is drawn *over* it: the webview is placed on
-   top, and the still below is only what shows until it arrives. */
+/* Cycle controls, docked over the face's strip left of its actions: ‹ 2 / 5 ›.
+   They belong to the stack, not the card, so swapping the face out from under
+   them keeps their focus. The strip leaves them room. */
+.browser-deck-nav {
+  --deck-nav-height: 22px;
+  position: absolute;
+  top: calc((var(--deck-bar-height) - var(--deck-nav-height)) / 2);
+  right: 60px;
+  z-index: 9;
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  height: var(--deck-nav-height);
+  padding: 0 2px;
+  border-radius: 99px;
+  background: color-mix(in srgb, var(--color-text-primary) 5%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-border-subtle) 80%, transparent);
+  transition: opacity 160ms var(--ease-standard);
+}
+.browser-deck[data-dragging="true"] .browser-deck-nav {
+  opacity: 0;
+  pointer-events: none;
+}
+.browser-deck:not([data-count="1"]) .browser-deck-card[data-depth="0"] .browser-deck-actions {
+  margin-left: 78px;
+}
+.browser-deck-count {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+  min-width: 26px;
+  justify-content: center;
+  padding: 0 2px;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
+.browser-deck-count > b {
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.browser-deck-count > i {
+  font-style: normal;
+  opacity: 0.6;
+}
+.browser-deck-cycle {
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 99px;
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  padding: 0;
+  transition:
+    color var(--duration-fast) var(--ease-standard),
+    background var(--duration-fast) var(--ease-standard),
+    transform var(--duration-fast) var(--ease-emphasized);
+}
+.browser-deck-cycle:hover,
+.browser-deck-cycle:focus-visible {
+  color: var(--color-text-primary);
+  background: color-mix(in srgb, var(--color-accent) 14%, transparent);
+}
+.browser-deck-cycle:active {
+  transform: scale(0.9);
+}
+.browser-deck-cycle:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 1px;
+}
+.browser-deck-cycle svg {
+  width: 13px;
+  height: 13px;
+}
+
 .browser-deck-page {
   position: relative;
   height: var(--deck-page-height);
@@ -183,6 +310,26 @@
   object-fit: cover;
   object-position: top center;
 }
+/* Over the face's still while it is in the air, so it reads as a card being
+   carried rather than a page that has frozen. */
+.browser-deck-veil {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--color-elevated, var(--color-layer-1)) 18%, transparent),
+    color-mix(in srgb, var(--color-elevated, var(--color-layer-1)) 42%, transparent)
+  );
+  animation: browser-deck-veil-in 160ms var(--ease-standard) both;
+}
+@keyframes browser-deck-veil-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
 .browser-deck-empty {
   position: absolute;
   inset: 0;
@@ -193,10 +340,16 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .browser-deck-strip,
-  .browser-deck-grip,
-  .browser-deck-who > i {
+  .browser-deck,
+  .browser-deck-stack,
+  .browser-deck-card,
+  .browser-deck-who > i,
+  .browser-deck-cycle,
+  .browser-deck-veil {
     transition: none;
     animation: none;
+  }
+  .browser-deck[data-dragging="true"] .browser-deck-stack {
+    transform: none;
   }
 }

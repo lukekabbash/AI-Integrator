@@ -70,6 +70,28 @@ describe("Dropdown", () => {
     );
   });
 
+  it("can show a footer and a custom closed label", async () => {
+    render(
+      <Dropdown
+        aria-label="Reasoning effort"
+        defaultValue="high"
+        triggerLabel="High Fast"
+        footer={<div>Fast</div>}
+        options={[
+          { value: "low", label: "Low" },
+          { value: "high", label: "High" },
+        ]}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Reasoning effort" })).toHaveTextContent("High Fast");
+    fireEvent.click(screen.getByRole("button", { name: "Reasoning effort" }));
+    expect(await screen.findByRole("listbox", { name: "Reasoning effort" })).toBeInTheDocument();
+    expect(screen.getByText("Fast")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: "Low" }));
+    expect(screen.getByRole("button", { name: "Reasoning effort" })).toHaveTextContent("High Fast");
+  });
+
   it("can be directed to open upward", async () => {
     render(
       <Dropdown
@@ -81,8 +103,8 @@ describe("Dropdown", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: "Upward runtime" }));
-    expect(await screen.findByRole("listbox", { name: "Upward runtime" })).toHaveClass(
-      "dropdown-menu--up",
-    );
+    expect(
+      (await screen.findByRole("listbox", { name: "Upward runtime" })).closest(".dropdown-menu"),
+    ).toHaveClass("dropdown-menu--up");
   });
 });

@@ -8,16 +8,35 @@
 //! bridge reports tool errors rather than crashing the host CLI session.
 
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::TcpStream,
     time::Duration,
 };
 
 use serde_json::{Value, json};
+use zeroize::Zeroizing;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_STDIO_LINE_BYTES: usize = 1024 * 1024;
+const MAX_BROKER_REPLY_BYTES: usize = 16 * 1024 * 1024;
+
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    line: &mut String,
+    max_bytes: usize,
+) -> Result<usize, String> {
+    line.clear();
+    let read = reader
+        .take((max_bytes + 1) as u64)
+        .read_line(line)
+        .map_err(|error| error.to_string())?;
+    if read > max_bytes {
+        return Err("broker message exceeded the local size limit".into());
+    }
+    Ok(read)
+}
 
 struct BrokerLink {
     reader: BufReader<TcpStream>,
@@ -29,14 +48,19 @@ impl BrokerLink {
     fn connect() -> Result<Self, String> {
         let addr = std::env::var("INTEGRATOR_BROKER_ADDR")
             .map_err(|_| "INTEGRATOR_BROKER_ADDR is not set".to_owned())?;
-        let token = std::env::var("INTEGRATOR_BROKER_TOKEN")
-            .map_err(|_| "INTEGRATOR_BROKER_TOKEN is not set".to_owned())?;
+        let token = Zeroizing::new(
+            std::env::var("INTEGRATOR_BROKER_TOKEN")
+                .map_err(|_| "INTEGRATOR_BROKER_TOKEN is not set".to_owned())?,
+        );
         let role = broker_role();
         let scope = std::env::var("INTEGRATOR_BROKER_SCOPE").unwrap_or_default();
         let mode = std::env::var("INTEGRATOR_BROKER_MODE").unwrap_or_else(|_| "balanced".into());
         let addr = addr
             .parse::<std::net::SocketAddr>()
             .map_err(|_| "invalid broker address".to_owned())?;
+        if !addr.ip().is_loopback() {
+            return Err("broker address must be loopback".into());
+        }
         let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
             .map_err(|error| format!("broker unreachable: {error}"))?;
         stream.set_read_timeout(Some(CALL_TIMEOUT)).ok();
@@ -53,7 +77,7 @@ impl BrokerLink {
         };
         let hello = link.request(
             "hello",
-            json!({ "token": token, "role": role, "scope": scope, "mode": mode }),
+            json!({ "token": token.as_str(), "role": role, "scope": scope, "mode": mode }),
         )?;
         if hello.get("ok").and_then(Value::as_bool) != Some(true) {
             return Err("broker rejected the session".into());
@@ -64,17 +88,15 @@ impl BrokerLink {
     fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id;
         self.next_id += 1;
-        let mut payload = json!({ "id": id, "method": method, "params": params }).to_string();
+        let mut payload =
+            Zeroizing::new(json!({ "id": id, "method": method, "params": params }).to_string());
         payload.push('\n');
         self.writer
             .write_all(payload.as_bytes())
             .map_err(|error| format!("broker write failed: {error}"))?;
         let mut line = String::new();
         loop {
-            line.clear();
-            let read = self
-                .reader
-                .read_line(&mut line)
+            let read = read_bounded_line(&mut self.reader, &mut line, MAX_BROKER_REPLY_BYTES)
                 .map_err(|error| format!("broker read failed: {error}"))?;
             if read == 0 {
                 return Err("broker connection closed".into());
@@ -109,7 +131,7 @@ fn broker_instructions() -> Option<String> {
     std::env::var("INTEGRATOR_BROKER_INSTRUCTIONS")
         .ok()
         .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty() && value.len() <= 2_048)
+        .filter(|value| !value.is_empty() && value.len() <= 8_192)
 }
 
 fn initialize_result(protocol_version: &str) -> Value {
@@ -210,7 +232,7 @@ fn browser_tools(role: &str) -> Vec<Value> {
     if role != "child" {
         tools.push(json!({
             "name": "browser_grant",
-            "description": "Hand one of your browser tabs to a subagent you started, so it can work the page you already opened. mode 'read' allows snapshot and evaluate; 'drive' allows clicking and typing too. A subagent cannot pass a tab on to anyone else.",
+            "description": "Hand one of your browser tabs to a subagent you started, so it can work the page you already opened. mode 'read' allows snapshots; 'drive' allows clicking and typing too. A subagent cannot pass a tab on to anyone else.",
             "annotations": tool_annotations(false, false),
             "inputSchema": text_schema(json!({
                 "tabId": { "type": "string" },
@@ -230,7 +252,7 @@ fn browser_tools(role: &str) -> Vec<Value> {
         }),
         json!({
             "name": "browser_fill_login",
-            "description": "Sign in to the page in a tab using a login the user has saved for that exact site. You never see the password: the app types it and the reply names only the username. Reading the page — snapshot and evaluate — is refused from the fill until the form is submitted or the tab navigates. If the user has not allowed sign-ins on that site, this returns needs-user-approval, asks them, and you try again later.",
+            "description": "Sign in to the page in a tab using a login the user has saved for that exact site and browser identity. You never see the password: the app types it and the reply names only the username. Reading the page is refused from the fill until the form is submitted or the tab navigates. If the user has not allowed sign-ins for that identity and site, this returns needs-user-approval, asks them, and you try again later.",
             "annotations": tool_annotations(false, true),
             "inputSchema": text_schema(json!({
                 "tabId": { "type": "string" },
@@ -349,15 +371,6 @@ fn browser_tools(role: &str) -> Vec<Value> {
                 "urlIncludes": { "type": "string" },
                 "timeoutMs": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 5000 }
             }), &["tabId"]),
-        }),
-        json!({
-            "name": "browser_evaluate",
-            "description": "Evaluate one JavaScript expression in a browser tab and return its JSON result, up to 64 KB. The expression may change page state.",
-            "annotations": tool_annotations(false, true),
-            "inputSchema": text_schema(json!({
-                "tabId": { "type": "string" },
-                "expression": { "type": "string" }
-            }), &["tabId", "expression"]),
         }),
     ]);
     tools
@@ -573,12 +586,20 @@ fn respond_error(stdout: &mut impl Write, id: Value, code: i64, message: &str) {
 /// Entry point for `--broker-mcp` mode. Returns the process exit code.
 pub fn run() -> i32 {
     let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
     let mut stdout = std::io::stdout().lock();
     let role = broker_role();
     let mode = broker_mode();
     let mut link: Option<BrokerLink> = None;
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
+    let mut line = Zeroizing::new(String::new());
+    loop {
+        let read = match read_bounded_line(&mut stdin, &mut line, MAX_STDIO_LINE_BYTES) {
+            Ok(read) => read,
+            Err(_) => return 1,
+        };
+        if read == 0 {
+            break;
+        }
         // Some shells prepend a BOM to the first piped line; strip it so the
         // initialize request is never silently dropped.
         let line = line.trim_start_matches('\u{feff}').trim();
@@ -604,6 +625,7 @@ pub fn run() -> i32 {
                 let requested = params
                     .get("protocolVersion")
                     .and_then(Value::as_str)
+                    .filter(|value| value.len() <= 64 && !value.chars().any(char::is_control))
                     .unwrap_or(PROTOCOL_VERSION);
                 respond(&mut stdout, id, initialize_result(requested));
             }
@@ -689,6 +711,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn broker_lines_are_bounded_before_json_parsing() {
+        let mut valid = std::io::Cursor::new(b"{\"id\":1}\n".to_vec());
+        let mut line = String::new();
+        assert_eq!(
+            read_bounded_line(&mut valid, &mut line, 32).expect("bounded line"),
+            9
+        );
+        assert_eq!(line, "{\"id\":1}\n");
+
+        let mut oversized = std::io::Cursor::new(vec![b'x'; 33]);
+        assert!(read_bounded_line(&mut oversized, &mut line, 32).is_err());
+    }
+
+    #[test]
     fn tool_lists_are_role_scoped() {
         let orchestrator: Vec<String> = tool_definitions("orchestrator", "balanced", None)
             .iter()
@@ -750,7 +786,6 @@ mod tests {
                 "browser_scroll",
                 "browser_drag",
                 "browser_wait_for",
-                "browser_evaluate",
             ]
         );
 
@@ -782,7 +817,6 @@ mod tests {
                 "browser_scroll",
                 "browser_drag",
                 "browser_wait_for",
-                "browser_evaluate",
             ]
         );
         let chat_enabled: Vec<String> = tool_definitions("chat", "memory-on", None)
@@ -814,7 +848,6 @@ mod tests {
                 "browser_scroll",
                 "browser_drag",
                 "browser_wait_for",
-                "browser_evaluate",
             ]
         );
     }

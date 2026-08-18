@@ -1667,7 +1667,7 @@ The shell is §6.3. The guts have their own rules.
 
 ### 34.1 Control row
 
-Context / permission / attach on the left. Runtime / model / effort / mic / send on the right. At `container composer (max-width: 620px)` the optional cluster hides, overflow collapses into a menu, effort loses its leading icon and locks to 68px, model/route use `cqw`, mic collapses to a 19px caret.
+Context / permission / attach on the left. Runtime / model / effort / mic / send on the right. At `container composer (max-width: 620px)` the optional cluster hides, overflow collapses into a menu, and mic collapses to a 19px caret. The right cluster is its own container (`composer-route`): runtime drops to the provider icon first, and only then may model/effort labels ellipsis.
 
 The composer is a container. Density changes with its own width, not only with the window.
 

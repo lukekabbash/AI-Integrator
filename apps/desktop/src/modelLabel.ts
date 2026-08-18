@@ -75,6 +75,7 @@ export function prettyModelLabel(modelId?: string | null): string {
 
   const kimiLabels: Record<string, string> = {
     k3: "Kimi K3",
+    "k3-256k": "Kimi K3 256k",
     "kimi-for-coding": "Kimi K2.7 Code",
     "kimi-for-coding-highspeed": "Kimi K2.7 Code Highspeed",
   };

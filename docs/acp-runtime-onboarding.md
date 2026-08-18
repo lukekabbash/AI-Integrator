@@ -36,7 +36,7 @@ Implemented against the current Moonshot `kimi-code` TypeScript runtime and its 
 - Update: `kimi upgrade`.
 - Login: `kimi login`; ACP advertises auth method `login`. Integrator does not inspect Kimi credential files.
 - Launch: `kimi acp` over local stdio.
-- Models: negotiated from the ACP `model` config option. Setup fallback ids are `kimi-code/k3`, `kimi-code/kimi-for-coding`, and `kimi-code/kimi-for-coding-highspeed`.
+- Models: negotiated from the ACP `model` config option. Setup fallback ids are `kimi-code/k3`, `kimi-code/k3-256k`, `kimi-code/kimi-for-coding`, and `kimi-code/kimi-for-coding-highspeed`.
 - Modes: `default`, `plan`, `auto`, and `yolo`, negotiated from the ACP `mode` config option.
 - Thinking: negotiated from the `thought_level` config option. Current ACP exposes `off`/`on`, or a locked `on` for always-thinking models.
 - Outside ACP, K3 documents low, high, and max reasoning: `minimum`/`light` map to low, `medium` maps to high, `xhigh`/`ultra` map to max, and `none` disables thinking. Those values are intentionally not sent through ACP today. The adapter currently hides that granularity and selects the model default internally; presenting them in Integrator would create controls with no protocol effect. If Kimi advertises multiple thought values later, the generic parser will surface them without a Kimi-specific UI list.

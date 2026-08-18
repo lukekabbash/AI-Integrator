@@ -10,7 +10,7 @@ export interface SignInRequest {
 
 export interface BrowserSignInPromptProps {
   request: SignInRequest;
-  /** Fills this once. `remember` also allows this origin from now on. */
+  /** Fills this once. `remember` also allows this origin in this identity. */
   onAllow: (remember: boolean) => void;
   onDismiss: () => void;
 }
@@ -18,10 +18,9 @@ export interface BrowserSignInPromptProps {
 /**
  * An agent asking to sign in somewhere the user has not allowed it to yet.
  *
- * The decision is per site, not per agent: "may anything sign in to this site
- * for me" is a question about the account, and the answer holds for every run
- * afterwards. Saying yes here fills the login now; the agent is meanwhile told
- * to try again, so nothing is left waiting on a person who may be away.
+ * The decision is per site and browser identity, not per agent. Saying yes
+ * fills the login now; the agent is meanwhile told to try again, so nothing is
+ * left waiting on a person who may be away.
  */
 export function BrowserSignInPrompt({ request, onAllow, onDismiss }: BrowserSignInPromptProps) {
   return (
@@ -44,7 +43,7 @@ export function BrowserSignInPrompt({ request, onAllow, onDismiss }: BrowserSign
           Just this once
         </button>
         <button type="button" className="primary-button small" onClick={() => onAllow(true)}>
-          Always on this site
+          Always here
         </button>
       </div>
     </div>

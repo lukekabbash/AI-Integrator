@@ -15,6 +15,7 @@ describe("prettyModelLabel", () => {
     expect(prettyModelLabel("grok-4.6")).toBe("Grok 4.6");
     expect(prettyModelLabel("grok-build")).toBe("Grok Build");
     expect(prettyModelLabel("kimi-code/k3")).toBe("Kimi K3");
+    expect(prettyModelLabel("kimi-code/k3-256k")).toBe("Kimi K3 256k");
     expect(prettyModelLabel("kimi-code/kimi-for-coding")).toBe("Kimi K2.7 Code");
     expect(prettyModelLabel("kimi-code/kimi-for-coding-highspeed")).toBe(
       "Kimi K2.7 Code Highspeed",
@@ -29,6 +30,9 @@ describe("prettyModelLabel", () => {
     expect(prettyModelLabel("claude-haiku-4-5-20251001")).toBe("Claude Haiku 4.5");
 
     expect(prettyModelLabel("composer-2.5")).toBe("Composer 2.5");
+    expect(prettyModelLabel("cursor-grok-4.6")).toBe("Cursor Grok 4.6");
+    expect(prettyModelLabel("gemini-3.7-flash")).toBe("Gemini 3.7 Flash");
+    expect(prettyModelLabel("gpt-5.3-codex")).toBe("GPT-5.3 Codex");
     expect(prettyModelLabel("cursor-small")).toBe("Cursor Small");
     expect(prettyModelLabel("deepseek-r1")).toBe("DeepSeek R1");
     expect(prettyModelLabel("deepseek-v3.1")).toBe("DeepSeek V3.1");

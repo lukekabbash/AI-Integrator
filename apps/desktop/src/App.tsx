@@ -95,7 +95,9 @@ import {
   isRuntimeUpdateRequired,
   type ComposerNotice,
 } from "./composerNotices";
+import { splitAnnotationBlocks } from "./browserAnnotation";
 import { prettyModelLabel } from "./modelLabel";
+import { listenComposerOffers } from "./composerCapture";
 import { ComposerDraftStore } from "./composerDraftStore";
 import { nextForkTitle } from "./forkTitle";
 import type { RuntimeActionRequest, SettingsSection } from "./components/SettingsView";
@@ -147,7 +149,6 @@ import { TaskStatusPill } from "./components/TaskStatusPill";
 import { SubagentProjectionCache } from "./components/subagentProjectionCache";
 import { QueuedMessages } from "./components/QueuedMessages";
 import { formatCompactTokenCount } from "./components/conversationFormatting";
-import { SlidingTabIndicator } from "./components/SlidingTabIndicator";
 import { TaskSidebar } from "./components/TaskSidebar";
 import {
   applyRuntimeProjection,
@@ -218,6 +219,7 @@ type ComposerTurnInput = {
   runtime: RuntimeId;
   model: string;
   effort?: string;
+  fast?: boolean;
   permission: TaskPermission;
   delegation: "off" | "manual" | "balanced" | "budget-first";
   nativeActionId?: string;
@@ -1638,9 +1640,28 @@ export default function App() {
       workPane.openBrowser(tab.id, { activate: false, show: true });
     }
   }, [browser.tabs, snapshot.activeTaskId, workPane]);
+  // A tab this window just asked for exists natively before it exists in the
+  // list this window reads, and the sweep below runs in between. Without a
+  // grace period it threw away the surface the person had just opened — type
+  // an address into a blank tab and the pane went back to the blank tab.
+  const openingBrowserTabs = useRef<Map<string, number>>(new Map());
+  const holdBrowserSurface = useCallback((tabId: string) => {
+    openingBrowserTabs.current.set(tabId, Date.now());
+  }, []);
   useEffect(() => {
     if (!browser.ready) return;
-    workPane.prune((surface) => surface.kind !== "browser" || Boolean(browser.byId[surface.tabId]));
+    const pending = openingBrowserTabs.current;
+    for (const [tabId, at] of pending) {
+      // Confirmed, or waited long enough that a failed open should not pin a
+      // surface to a tab that is never coming.
+      if (browser.byId[tabId] || Date.now() - at > 10_000) pending.delete(tabId);
+    }
+    workPane.prune(
+      (surface) =>
+        surface.kind !== "browser" ||
+        Boolean(browser.byId[surface.tabId]) ||
+        pending.has(surface.tabId),
+    );
   }, [browser.byId, browser.ready, workPane]);
   // An agent asking to be watched — before a step the user should see, or when
   // it needs them to sign in. Unlike a tab merely opening, this one does take
@@ -1822,6 +1843,28 @@ export default function App() {
     value: ComposerDraftValue;
   } | null>(null);
   const composerRestoreSequence = useRef(0);
+  useEffect(() => {
+    let active = true;
+    const stop = listenComposerOffers({
+      onAttach: (offer) => {
+        if (!active || browserTaskIdRef.current !== offer.taskId) return;
+        composerAttachmentSequence.current += 1;
+        setComposerAttachment({
+          id: composerAttachmentSequence.current,
+          attachment: offer.attachment,
+        });
+      },
+      onInsert: (offer) => {
+        if (!active || browserTaskIdRef.current !== offer.taskId) return;
+        composerInsertSequence.current += 1;
+        setComposerInsert({ id: composerInsertSequence.current, text: offer.text });
+      },
+    });
+    return () => {
+      active = false;
+      void stop.then((unlisten) => unlisten()).catch(() => undefined);
+    };
+  }, []);
   const projectionBuffer = useRef<RuntimeProjectionEvent[]>([]);
   const projectionReady = useRef(false);
   const projectionTaskId = useRef("");
@@ -3496,6 +3539,7 @@ export default function App() {
         runtime,
         model: options?.model ?? runtimeDetails?.models[0] ?? "Provider default",
         effort: options?.effort,
+        fast: options?.fast,
         permission: options?.permission ?? "project-write",
         delegation: options?.delegation ?? "balanced",
         draft: options?.draft,
@@ -3629,6 +3673,7 @@ export default function App() {
           runtime: routedInput.runtime,
           model: routedInput.model,
           effort: routedInput.effort,
+          fast: routedInput.fast,
           permission: routedInput.permission,
           delegation: routedInput.delegation,
           draft: submittedDraft?.revision === input.draftRevision ? submittedDraft : undefined,
@@ -3724,6 +3769,7 @@ export default function App() {
         runtime: routedInput.runtime,
         model: routedInput.model,
         effort: routedInput.effort,
+        fast: routedInput.fast,
         permission: routedInput.permission,
         delegation: routedInput.delegation,
         nativeActionId: routedInput.nativeActionId,
@@ -3739,7 +3785,9 @@ export default function App() {
         targetTask.title === CHAT_TITLE_PLACEHOLDER ||
         targetTask.title === GENERAL_CHAT_TITLE_PLACEHOLDER
       ) {
-        const titlePrompt = routedInput.draftPrompt?.trim() || routedInput.prompt;
+        // Title from the words, not the annotation markup riding with them.
+        const titlePrompt =
+          splitAnnotationBlocks(routedInput.draftPrompt ?? "").text || routedInput.prompt;
         // Staggered: the title helper boots its own cold provider process,
         // and starting it in the same instant as the real turn's spawn makes
         // the two cold starts contend for CPU/network right when
@@ -3984,6 +4032,7 @@ export default function App() {
         runtime: input.runtime,
         model: input.model,
         effort: input.effort,
+        fast: input.fast,
         permission: task.kind === "chat" ? "read-only" : input.permission,
         delegation: task.kind === "chat" ? "off" : input.delegation,
         nativeActionId: task.kind === "chat" ? undefined : input.nativeActionId,
@@ -6056,9 +6105,7 @@ export default function App() {
       runtime: activeTask.runtime,
       model: activeTask.model ?? "Provider default",
       effort: activeTask.effort,
-      permission:
-        (taskPermissions[activeTask.id] as
-          TaskPermission | undefined) ?? "project-write",
+      permission: (taskPermissions[activeTask.id] as TaskPermission | undefined) ?? "project-write",
       delegation: "off" as const,
     };
     const timer = window.setTimeout(() => void sendTurn(build), 0);
@@ -6445,7 +6492,7 @@ export default function App() {
     tab: "git" | "agents" | "files" | "usage";
     id: number;
   }>();
-  const openWorkPaneLaunch = (kind: WorkPaneLaunchKind) => {
+  const openWorkPaneLaunch = (kind: WorkPaneLaunchKind, url?: string) => {
     // Accountless chats have no repository surfaces. They still own an
     // isolated browser session, but files, review and subagents belong to a
     // project task and must not be conjured through a shortcut.
@@ -6458,8 +6505,11 @@ export default function App() {
       return replaceBlank();
     }
     if (kind === "browser") {
-      void browser.open().then((tab) => {
-        if (tab) workPane.openBrowser(tab.id);
+      void browser.open(url).then((tab) => {
+        if (tab) {
+          holdBrowserSurface(tab.id);
+          workPane.openBrowser(tab.id);
+        }
         replaceBlank();
       });
       return;
@@ -6861,37 +6911,6 @@ export default function App() {
               >
                 {sidebarCollapsed ? <PanelLeftOpen /> : <PanelLeftClose />}
               </button>
-            ) : undefined
-          }
-          tabs={
-            screen === "workspace" && activeTask?.kind !== "chat" ? (
-              <div className="titlebar-view-tabs" role="tablist" aria-label="Task view">
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={centerView === "task"}
-                  data-active={centerView === "task"}
-                  onClick={() => changeCenterView("task")}
-                >
-                  {centerView === "task" ? (
-                    <SlidingTabIndicator layoutId="workspace-view-tab-indicator" />
-                  ) : null}
-                  Task
-                </button>
-                <button
-                  type="button"
-                  role="tab"
-                  aria-label="Review"
-                  aria-selected={centerView === "review"}
-                  data-active={centerView === "review"}
-                  onClick={reviewChanges}
-                >
-                  {centerView === "review" ? (
-                    <SlidingTabIndicator layoutId="workspace-view-tab-indicator" />
-                  ) : null}
-                  Review{snapshot.git.files.length ? ` ${snapshot.git.files.length}` : ""}
-                </button>
-              </div>
             ) : undefined
           }
           trailing={
@@ -7365,6 +7384,7 @@ export default function App() {
                                 defaultRuntime={activeTask?.runtime ?? settingsDefaultRuntime}
                                 defaultModel={activeTask?.model ?? settingsDefaultModel}
                                 defaultEffort={activeTask?.effort ?? settingsDefaultRoute.effort}
+                                defaultFast={activeTask?.fast}
                                 runtimeDefaults={composerRuntimeDefaults}
                                 defaultPermission={activeTaskPermission}
                                 defaultDelegation={
@@ -7480,6 +7500,7 @@ export default function App() {
                                                   runtime: routing.runtime,
                                                   model: routing.model,
                                                   effort: routing.effort,
+                                                  fast: routing.fast,
                                                 }
                                               : task,
                                           ),
@@ -7561,7 +7582,12 @@ export default function App() {
                             void (async () => {
                               if (remember) {
                                 await bridge.browser
-                                  ?.allowAgentSignIn(request.origin, true)
+                                  ?.allowAgentSignIn(
+                                    tab.taskId,
+                                    request.tabId,
+                                    request.origin,
+                                    true,
+                                  )
                                   .catch(() => undefined);
                               }
                               await browser.fillLogin(request.tabId, tab.taskId);

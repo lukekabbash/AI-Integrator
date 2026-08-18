@@ -359,6 +359,7 @@ async fn generate_codex_title(
                 CodexThreadOverrides {
                     config: Some(config),
                     developer_instructions: Some(ISOLATED_NAMING_INSTRUCTIONS.into()),
+                    service_tier: None,
                 },
             )
             .await
@@ -578,6 +579,8 @@ async fn generate_structured_title(
                 crate::antigravity_hooks::AntigravityOverlayPolicy::Chat {
                     memory_enabled: false,
                 },
+                crate::harness_prompt::ExternalBrowserHandoff::Allowed,
+                None,
             )
             .map_err(CommandError::from)?,
         )
@@ -612,6 +615,7 @@ async fn generate_structured_title(
         Ok(turn_id) => turn_id,
         Err(error) => {
             if let Some(overlay) = overlay {
+                let _ = fs::remove_dir_all(&overlay.reviews);
                 let _ = fs::remove_dir_all(overlay.root);
             }
             return Err(error);
@@ -682,6 +686,7 @@ async fn generate_structured_title(
         }
     };
     if let Some(overlay) = overlay {
+        let _ = fs::remove_dir_all(&overlay.reviews);
         let _ = fs::remove_dir_all(overlay.root);
     }
     result

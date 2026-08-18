@@ -21,6 +21,10 @@ interface DropdownProps {
   compact?: boolean;
   disabled?: boolean;
   placement?: "auto" | "down" | "up";
+  /** Overrides the closed trigger copy without changing the selected option. */
+  triggerLabel?: string;
+  /** Extra chrome below the options; clicks here do not commit a value. */
+  footer?: ReactNode;
 }
 
 export function Dropdown({
@@ -35,6 +39,8 @@ export function Dropdown({
   compact = false,
   disabled = false,
   placement: preferredPlacement = "auto",
+  triggerLabel,
+  footer,
 }: DropdownProps) {
   const [internalValue, setInternalValue] = useState(defaultValue ?? options[0]?.value ?? "");
   const [open, setOpen] = useState(false);
@@ -92,7 +98,7 @@ export function Dropdown({
     }
     const triggerRect = buttonRef.current?.getBoundingClientRect();
     if (preferredPlacement === "auto" && triggerRect && typeof window !== "undefined") {
-      const estimatedMenuHeight = Math.min(options.length * 30 + 12, 320);
+      const estimatedMenuHeight = Math.min(options.length * 30 + 12 + (footer ? 44 : 0), 320);
       const roomBelow = window.innerHeight - triggerRect.bottom - 12;
       const roomAbove = triggerRect.top - 12;
       setPlacement(roomBelow < estimatedMenuHeight && roomAbove > roomBelow ? "up" : "down");
@@ -146,16 +152,13 @@ export function Dropdown({
         {!leading && selected?.icon ? (
           <span className="dropdown-selected-icon">{selected.icon}</span>
         ) : null}
-        <span className="dropdown-label">{selected?.label ?? "Select"}</span>
+        <span className="dropdown-label">{triggerLabel ?? selected?.label ?? "Select"}</span>
         <ChevronDown className="dropdown-chevron" aria-hidden="true" />
       </button>
       <AnimatePresence>
         {open ? (
           <motion.div
             className={`dropdown-menu dropdown-menu--${placement}`}
-            id={listId}
-            role="listbox"
-            aria-label={ariaLabel}
             initial={{ opacity: 0, y: placement === "up" ? 6 : -6, scale: 0.96 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{
@@ -170,6 +173,7 @@ export function Dropdown({
                 : { type: "spring", stiffness: 540, damping: 33, mass: 0.7 }
             }
           >
+            <div id={listId} role="listbox" aria-label={ariaLabel}>
             {options.map((option, index) => (
               <button
                 className="dropdown-option"
@@ -212,6 +216,8 @@ export function Dropdown({
                 {option.value === selected?.value ? <Check aria-hidden="true" /> : null}
               </button>
             ))}
+            </div>
+            {footer}
           </motion.div>
         ) : null}
       </AnimatePresence>

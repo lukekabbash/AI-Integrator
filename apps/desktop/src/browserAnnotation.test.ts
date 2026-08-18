@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  annotationAttachmentLabel,
   annotationAttachmentName,
+  annotationImageNames,
   isAnnotationAttachment,
   isAnnotationBlock,
+  pairAnnotationAttachments,
   parseAnnotationBlock,
+  splitAnnotationBlocks,
   ANNOTATION_ATTACHMENT_PREFIX,
 } from "./browserAnnotation";
 
@@ -67,5 +71,47 @@ describe("browser annotation attachments", () => {
     expect(isAnnotationAttachment("screenshot.png")).toBe(false);
     expect(isAnnotationAttachment("annotation · header.png")).toBe(false);
     expect(ANNOTATION_ATTACHMENT_PREFIX.endsWith(" ")).toBe(true);
+  });
+
+  it("reads the element back out of an annotation file name", () => {
+    expect(annotationAttachmentLabel("Annotation · Sign in.png")).toBe("Sign in");
+    expect(annotationAttachmentLabel("screenshot.png")).toBe("screenshot.png");
+  });
+
+  it("pairs an annotation with the screenshot named after it", () => {
+    const named = parseAnnotationBlock(BLOCK, 1);
+    const unnamed = parseAnnotationBlock(
+      BLOCK.replace(' name="Pair with this environment"', ""),
+      2,
+    );
+    expect(annotationImageNames(named)).toEqual(["Annotation · Pair with this environment.png"]);
+    expect(annotationImageNames(unnamed)).toEqual(["Annotation · p.png"]);
+
+    const crop = { name: "Annotation · Pair with this environment.png" };
+    const other = { name: "browser-1.png" };
+    const pairs = pairAnnotationAttachments([named], [other, crop]);
+    expect(pairs.get(1)).toBe(crop);
+    expect(pairs.size).toBe(1);
+  });
+
+  it("pairs a lone annotation image when the names only agree on the tag", () => {
+    const unnamed = parseAnnotationBlock(
+      BLOCK.replace(' name="Pair with this environment"', ""),
+      4,
+    );
+    const crop = { name: "Annotation · p.png" };
+    expect(pairAnnotationAttachments([unnamed], [crop]).get(4)).toBe(crop);
+  });
+
+  it("lifts annotation blocks out of a sent prompt", () => {
+    const sent = `please restyle this\n\n${BLOCK}`;
+    const { text, annotations } = splitAnnotationBlocks(sent);
+    expect(text).toBe("please restyle this");
+    expect(annotations).toHaveLength(1);
+    expect(annotations[0]).toMatchObject({
+      label: "Pair with this environment",
+      origin: "localhost:3773",
+    });
+    expect(splitAnnotationBlocks("just text")).toEqual({ text: "just text", annotations: [] });
   });
 });

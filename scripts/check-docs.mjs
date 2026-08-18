@@ -19,9 +19,14 @@ const failures = [];
 const linkPattern = /\[[^\]]+\]\(([^)]+)\)/g;
 
 for (const file of markdown) {
-  const source = readFileSync(file, "utf8");
-  const fenceCount = source.match(/^```/gm)?.length ?? 0;
+  const raw = readFileSync(file, "utf8");
+  const fenceCount = raw.match(/^```/gm)?.length ?? 0;
   if (fenceCount % 2 !== 0) failures.push(`${file}: unbalanced code fences`);
+
+  // A link inside a code span is an example of the form, not a link to
+  // follow: a doc that shows `[path:line](./path#Lline)` is not claiming
+  // there is a file called `path`.
+  const source = raw.replace(/`[^`\n]*`/g, (span) => " ".repeat(span.length));
 
   for (const match of source.matchAll(linkPattern)) {
     const target = match[1].split("#")[0];

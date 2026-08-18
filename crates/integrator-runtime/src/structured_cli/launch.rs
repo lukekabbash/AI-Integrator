@@ -132,6 +132,7 @@ pub(super) fn provider_args(options: &StructuredCliLaunchOptions) -> Vec<String>
             match options.permission_mode {
                 // agy print mode has no control channel to answer its default
                 // request-review prompts; callers must not route "ask" here.
+                // Auto is AcceptEdits plus the PreToolUse mailbox, not Prompt.
                 StructuredPermissionMode::Prompt => {}
                 StructuredPermissionMode::ReadOnly => {
                     args.extend(["--mode".into(), "plan".into()]);

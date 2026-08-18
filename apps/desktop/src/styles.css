@@ -171,7 +171,7 @@ select:focus-visible,
   min-width: 0;
   overflow: hidden;
   border-bottom: 1px solid var(--color-border-subtle);
-  border-left: 1px solid var(--color-border-subtle);
+  border-left: 1px solid transparent;
   background: var(--color-canvas);
   opacity: 0;
   pointer-events: none;
@@ -272,7 +272,9 @@ select:focus-visible,
   display: flex;
   align-items: center;
   overflow: hidden;
-  z-index: 1;
+  /* Above the work-pane slot so a bad --subagent-pane-left cannot bury
+     File / Edit / View, the chat-nav button, or the task title. */
+  z-index: 4;
 }
 /* overflow:hidden clips title/tabs, but also the absolute File/Edit/View menus.
    Open the clip only while a menu is mounted so the panel can paint below. */
@@ -5954,6 +5956,12 @@ kbd {
   gap: 3px;
   min-width: 0;
 }
+.composer-controls-right {
+  flex: 1 1 auto;
+  justify-content: flex-end;
+  container-type: inline-size;
+  container-name: composer-route;
+}
 .composer-controls-optional {
   display: flex;
   align-items: center;
@@ -6080,6 +6088,11 @@ kbd {
 .route-select:hover,
 .model-select:hover {
   color: var(--color-text-primary);
+}
+.route-select,
+.model-select,
+.effort-select {
+  flex: none;
 }
 .route-select {
   min-width: 0;
@@ -6233,6 +6246,29 @@ kbd {
   margin-left: auto;
   color: var(--color-accent);
 }
+.dropdown-fast {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 4px;
+  padding: 7px 8px 3px;
+  border-top: 1px solid var(--color-border-subtle);
+  color: var(--color-text-primary);
+  font-size: 11px;
+  font-weight: 600;
+}
+.dropdown-fast .switch {
+  width: 32px;
+  height: 18px;
+}
+.dropdown-fast .switch span {
+  width: 12px;
+  height: 12px;
+}
+.dropdown-fast .switch[data-checked="true"] span {
+  transform: translateX(14px);
+}
 .dropdown-selected-icon,
 .dropdown-option-icon {
   width: 16px;
@@ -6362,7 +6398,7 @@ kbd {
   padding-left: 6px;
 }
 .route-select .dropdown-label {
-  max-width: 94px;
+  max-width: 120px;
 }
 .model-select .dropdown-trigger {
   max-width: 142px;
@@ -6563,31 +6599,8 @@ kbd {
   .composer-controls-left {
     flex: none;
   }
-  .composer-controls-right {
-    flex: 1;
-    justify-content: flex-end;
-  }
   .composer-overflow-controls {
     display: block;
-  }
-  .effort-select {
-    flex: 0 0 68px;
-    width: 68px;
-    max-width: 68px;
-  }
-  .effort-select .dropdown-trigger > svg:first-child {
-    display: none;
-  }
-  .model-select {
-    width: min(116px, 21cqw);
-  }
-  .route-select {
-    width: min(104px, 22cqw);
-  }
-  .effort-select .dropdown-trigger,
-  .model-select .dropdown-trigger,
-  .route-select .dropdown-trigger {
-    width: 100%;
   }
   .mic-select {
     width: 19px;
@@ -6604,6 +6617,43 @@ kbd {
   }
   .mic-select .dropdown-chevron {
     width: 11px;
+  }
+}
+
+/* Squeeze the right cluster by the space it actually has, not the whole
+   composer. Runtime drops to its provider icon before model/effort labels
+   are ellipsized — never "Cur…" next to a still-full model name. */
+@container composer-route (max-width: 420px) {
+  .route-select .dropdown-label,
+  .route-select .dropdown-chevron {
+    display: none;
+  }
+  .route-select .dropdown-trigger {
+    width: 29px;
+    padding: 0;
+    justify-content: center;
+    gap: 0;
+  }
+}
+
+@container composer-route (max-width: 300px) {
+  .effort-select,
+  .model-select {
+    flex: 0 1 auto;
+    min-width: 0;
+  }
+  .effort-select {
+    max-width: min(118px, 36cqw);
+  }
+  .effort-select .dropdown-trigger > svg:first-child {
+    display: none;
+  }
+  .model-select {
+    max-width: min(142px, 44cqw);
+  }
+  .effort-select .dropdown-trigger,
+  .model-select .dropdown-trigger {
+    width: 100%;
   }
 }
 
@@ -6900,7 +6950,7 @@ kbd {
 }
 .resize-handle:hover::after,
 .resize-handle:focus-visible::after,
-body[data-resizing="true"] .resize-handle::after {
+.resize-handle[data-resizing="true"]::after {
   transform: scale(1);
 }
 /* Hover previews a soft, muted grip -- the same tint the sidebar's own
@@ -6909,10 +6959,14 @@ body[data-resizing="true"] .resize-handle::after {
 .resize-handle:focus-visible::after {
   background-color: color-mix(in srgb, var(--color-text-muted) 45%, transparent);
 }
-/* An active drag warms the grip toward the accent, but still translucent
-   rather than the old hard-edged, fully opaque line. */
-body[data-resizing="true"] .resize-handle::after {
+/* An active drag warms only that grip toward the accent. Other handles stay
+   hidden — body[data-resizing] is for layout, not a global marker reveal. */
+.resize-handle[data-resizing="true"]::after {
   background-color: color-mix(in srgb, var(--color-accent) 55%, transparent);
+}
+body[data-resizing="true"] .resize-handle:not([data-resizing="true"])::after {
+  transform: scale(0.55);
+  background-color: transparent;
 }
 .resize-handle--horizontal {
   top: 0;
@@ -7642,7 +7696,7 @@ body[data-resizing="true"] .resize-handle::after {
 }
 .git-workspace > .resize-handle--vertical:hover,
 .git-workspace > .resize-handle--vertical:focus-visible,
-body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
+.git-workspace > .resize-handle--vertical[data-resizing="true"] {
   background: color-mix(in srgb, var(--color-accent) 12%, transparent);
 }
 .git-section {
@@ -8715,6 +8769,63 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
 .user-attachment .file-type-icon {
   width: 13px;
   flex: none;
+}
+
+/* A sent annotation is the same chip the composer showed before send: the
+   crop, the element, the note — sitting with the other attachments in the
+   bubble, never the markup the agent received. */
+.user-attachment--annotation {
+  border-color: color-mix(in srgb, var(--color-accent) 55%, transparent);
+  background: color-mix(in srgb, var(--color-accent) 8%, transparent);
+}
+.user-annotation {
+  max-width: 260px;
+  padding: 3px;
+}
+.user-annotation img {
+  width: 34px;
+  height: 34px;
+  max-width: none;
+  max-height: none;
+  border-radius: 6px;
+  object-fit: cover;
+  object-position: top;
+}
+.user-annotation-thumb {
+  width: 34px;
+  height: 34px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--color-accent) 14%, var(--color-layer-1));
+  color: var(--color-accent);
+}
+.user-annotation-thumb svg {
+  width: 15px;
+  height: 15px;
+}
+.user-annotation-copy {
+  min-width: 0;
+  padding-right: 5px;
+  display: grid;
+  gap: 1px;
+}
+.user-annotation strong {
+  overflow: hidden;
+  color: var(--color-text-primary);
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.user-annotation small {
+  overflow: hidden;
+  color: var(--color-text-muted);
+  font-size: 10.5px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .project-file-preview {
@@ -14353,6 +14464,34 @@ button.explain-fallback-step:hover .explain-fallback-role {
   max-height: 320px;
   overflow-y: auto;
 }
+.activity-shot-wrap {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-self: center;
+}
+.activity-shot--inline {
+  display: block;
+  width: 22px;
+  height: 16px;
+  border-radius: 3px;
+  object-fit: cover;
+  object-position: top;
+  border: 1px solid var(--color-border-subtle);
+  background: var(--color-layer-1);
+}
+.activity-shot--detail {
+  display: block;
+  max-width: calc(100% - 20px);
+  max-height: 220px;
+  width: auto;
+  height: auto;
+  margin: 6px 10px;
+  border-radius: var(--radius-control);
+  object-fit: contain;
+  object-position: top;
+  border: 1px solid var(--color-border-subtle);
+  background: var(--color-layer-1);
+}
 .activity-diff-review {
   width: calc(100% - 25px);
   max-width: calc(100% - 25px);
@@ -16745,28 +16884,28 @@ button.explain-fallback-step:hover .explain-fallback-role {
   height: 13px;
 }
 
-/* A browser annotation reads as evidence, not as a plain image attachment:
-   the accent hairline ties it back to the pick overlay it came from. */
+/* A browser annotation uses the same thumbnail chip as a screenshot; the
+   accent hairline is the only cue that it came from the pick overlay. */
 .composer-attachment--annotation {
   border-color: color-mix(in srgb, var(--color-accent) 55%, transparent);
   background: color-mix(in srgb, var(--color-accent) 8%, transparent);
 }
-.composer-attachment--annotation .file-type-icon {
-  color: var(--color-accent);
-}
-/* A marked element waiting to be sent: the element on top, where it came from
-   or what was said about it underneath. Wider than a file chip because the
-   second line is the whole point. */
 .composer-annotation {
-  align-items: flex-start;
-  max-width: 320px;
-  padding-block: 6px;
-  border-color: color-mix(in srgb, var(--color-accent) 55%, transparent);
-  background: color-mix(in srgb, var(--color-accent) 8%, transparent);
+  max-width: 280px;
 }
-.composer-annotation .file-type-icon {
-  margin-top: 1px;
+.composer-annotation-thumb {
+  width: 34px;
+  height: 34px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--color-accent) 14%, var(--color-layer-1));
   color: var(--color-accent);
+}
+.composer-annotation-thumb svg {
+  width: 15px;
+  height: 15px;
 }
 .composer-annotation-copy {
   min-width: 0;
@@ -16789,12 +16928,178 @@ button.explain-fallback-step:hover .explain-fallback-role {
 }
 
 /* Browser settings: sites holding sign-in state. Quiet rows, no card. */
+.browser-scope-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.browser-scope-options button {
+  min-height: 66px;
+  padding: 10px 12px;
+  display: grid;
+  align-content: center;
+  gap: 4px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-control);
+  color: var(--color-text-primary);
+  background: color-mix(in srgb, var(--color-surface-layer1) 45%, transparent);
+  text-align: left;
+  cursor: pointer;
+}
+.browser-scope-options button:hover:not(:disabled) {
+  border-color: var(--color-border-base);
+  background: var(--color-surface-layer1);
+}
+.browser-scope-options button[data-selected="true"] {
+  border-color: var(--color-focus);
+  background: color-mix(in srgb, var(--color-selection-active) 66%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-focus) 24%, transparent);
+}
+.browser-scope-options button:focus-visible {
+  outline: 1px solid var(--color-focus);
+  outline-offset: 2px;
+}
+.browser-scope-options button:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+.browser-scope-options strong {
+  font-size: 12px;
+  font-weight: 630;
+}
+.browser-scope-options small {
+  color: var(--color-text-tertiary);
+  font-size: 10px;
+  line-height: 1.4;
+}
+.browser-restart-note {
+  margin: 9px 0 0;
+  padding: 7px 9px;
+  border-radius: var(--radius-control);
+  color: var(--color-text-secondary);
+  background: color-mix(in srgb, var(--color-status-warning) 10%, transparent);
+  font-size: 10.5px;
+  line-height: 1.4;
+}
 .browser-sites-header {
   margin-top: 14px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+}
+.browser-buckets {
+  margin-top: 4px;
+  border-block: 1px solid var(--color-border-subtle);
+}
+.browser-bucket {
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+.browser-bucket:last-child {
+  border-bottom: 0;
+}
+.browser-bucket-toggle {
+  width: 100%;
+  min-height: 50px;
+  padding: 8px 2px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 0;
+  color: var(--color-text-primary);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.browser-bucket-toggle:hover {
+  background: color-mix(in srgb, var(--color-surface-layer1) 54%, transparent);
+}
+.browser-bucket-toggle:focus-visible {
+  outline: 1px solid var(--color-focus);
+  outline-offset: -1px;
+}
+.browser-bucket-toggle > span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+.browser-bucket-toggle strong {
+  overflow: hidden;
+  font-size: 11.5px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.browser-bucket-toggle small {
+  overflow: hidden;
+  color: var(--color-text-tertiary);
+  font-size: 9.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.browser-bucket-toggle > svg {
+  width: 14px;
+  flex: none;
+  color: var(--color-text-tertiary);
+  transition: transform var(--duration-fast) var(--ease-standard);
+}
+.browser-bucket-toggle[aria-expanded="true"] > svg {
+  transform: rotate(180deg);
+}
+.browser-bucket-body {
+  padding: 0 10px 12px;
+  background: color-mix(in srgb, var(--color-surface-layer1) 34%, transparent);
+}
+.browser-bucket-body .settings-empty {
+  padding-inline: 0;
+}
+.browser-bucket-body .browser-sites-list {
+  margin-top: 0;
+}
+.browser-login-list strong {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.browser-login-list strong svg {
+  width: 12px;
+}
+.browser-login-list li > button {
+  margin-left: auto;
+}
+.browser-bucket-actions {
+  flex-wrap: wrap;
+}
+.browser-scope-modal {
+  width: min(500px, calc(100vw - 32px));
+}
+.browser-scope-warning {
+  margin: 0 10px 12px;
+  padding: 11px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 9px;
+  border: 1px solid color-mix(in srgb, var(--color-status-warning) 30%, var(--color-border-base));
+  border-radius: var(--radius-control);
+  background: color-mix(in srgb, var(--color-status-warning) 8%, var(--color-canvas));
+}
+.browser-scope-warning > svg {
+  width: 16px;
+  color: var(--color-status-warning);
+}
+.browser-scope-warning p {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.browser-scope-warning ul {
+  margin: 7px 0 0;
+  padding-left: 16px;
+  color: var(--color-text-tertiary);
+  font-size: 10.5px;
+  line-height: 1.5;
 }
 .browser-sites-list {
   margin: 4px 0 0;
@@ -16832,4 +17137,65 @@ button.explain-fallback-step:hover .explain-fallback-role {
   margin-top: 12px;
   display: flex;
   gap: 8px;
+}
+
+/* A picture inside an agent's reply. An agent that photographed a page hands
+   over the photograph; it sits in the prose at a readable size, and clicking
+   it is not a navigation — there is nowhere else to take it. */
+.markdown-image {
+  display: block;
+  max-width: min(100%, 720px);
+  max-height: 520px;
+  margin: 8px 0;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-panel);
+  background: var(--color-layer-1);
+  object-fit: contain;
+  object-position: top left;
+}
+.markdown-image-pending {
+  display: block;
+  width: min(100%, 360px);
+  height: 120px;
+  margin: 8px 0;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-panel);
+  background: linear-gradient(
+    100deg,
+    var(--color-layer-1) 30%,
+    color-mix(in srgb, var(--color-layer-2) 70%, var(--color-layer-1)) 50%,
+    var(--color-layer-1) 70%
+  );
+  background-size: 300% 100%;
+  animation: markdown-image-wait 1.4s var(--ease-standard) infinite;
+}
+@keyframes markdown-image-wait {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: 0 0;
+  }
+}
+.markdown-image-missing {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 1px dashed var(--color-border-subtle);
+  border-radius: var(--radius-control);
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+}
+.markdown-image-missing svg {
+  width: 12px;
+  height: 12px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .markdown-image-pending {
+    animation: none;
+  }
+}
+[data-motion="none"] .markdown-image-pending {
+  animation: none;
 }

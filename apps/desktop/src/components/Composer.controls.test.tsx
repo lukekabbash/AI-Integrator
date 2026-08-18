@@ -229,6 +229,61 @@ describe("Composer compact controls", () => {
     );
   });
 
+  it("shows a Fast toggle under reasoning effort and labels the pill High Fast", async () => {
+    mockModelCatalog(() => [
+      {
+        id: "gpt-5.6-sol",
+        label: "GPT-5.6 Sol",
+        efforts: [
+          { id: "low", label: "Low" },
+          { id: "high", label: "High" },
+        ],
+        defaultEffort: "high",
+        supportsFast: true,
+      },
+    ]);
+    const onSend = vi.fn().mockResolvedValue(true);
+    const onRoutingChange = vi.fn();
+
+    render(
+      <Composer
+        runtimes={runtimes}
+        defaultRuntime="codex"
+        defaultModel="gpt-5.6-sol"
+        defaultEffort="high"
+        onSend={onSend}
+        onRoutingChange={onRoutingChange}
+      />,
+    );
+
+    await waitFor(() => expect(bridge.listModelCatalog).toHaveBeenCalledWith("codex"));
+    const effort = await screen.findByRole("button", { name: "Reasoning effort" });
+    expect(effort).toHaveTextContent("High");
+    expect(effort).not.toHaveTextContent("Fast");
+
+    fireEvent.click(effort);
+    const fast = await screen.findByRole("switch", { name: "Fast" });
+    expect(fast).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(fast);
+    expect(onRoutingChange).toHaveBeenCalledWith(
+      expect.objectContaining({ runtime: "codex", model: "gpt-5.6-sol", effort: "high", fast: true }),
+    );
+    expect(screen.getByRole("button", { name: "Reasoning effort" })).toHaveTextContent("High Fast");
+
+    fireEvent.click(screen.getByRole("option", { name: "Low" }));
+    expect(screen.getByRole("button", { name: "Reasoning effort" })).toHaveTextContent("Low Fast");
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Task message" }), {
+      target: { value: "Use Fast." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(onSend).toHaveBeenCalledWith(
+        expect.objectContaining({ effort: "low", fast: true }),
+      ),
+    );
+  });
+
   it("applies a late-loaded delegation default until the user chooses a mode", async () => {
     mockModelCatalog(() => [{ id: "gpt-5.6-luna", label: "GPT-5.6 Luna" }]);
     const props = {
@@ -474,6 +529,7 @@ describe("Composer compact controls", () => {
     expect(screen.getByRole("button", { name: "Permission" })).toHaveTextContent("Project write");
     fireEvent.click(screen.getByRole("button", { name: "Permission" }));
     expect(screen.getByRole("option", { name: "Ask as needed" })).toBeDisabled();
+    expect(screen.getByRole("option", { name: "Auto" })).toBeEnabled();
 
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 

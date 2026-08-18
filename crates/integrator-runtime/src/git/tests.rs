@@ -248,11 +248,13 @@ fn stage_reaches_tracked_files_under_a_later_ignored_directory_without_force() {
         .expect("stage tracked file under ignored directory");
     let notes = files
         .iter()
-        .find(|file| file.path == PathBuf::from("temp/docs/notes.md"))
+        .find(|file| file.path == Path::new("temp/docs/notes.md"))
         .expect("notes row");
     assert_eq!(notes.index_status, 'M');
     assert!(
-        files.iter().all(|file| file.path != PathBuf::from("temp/scratch.md")),
+        files
+            .iter()
+            .all(|file| file.path != Path::new("temp/scratch.md")),
         "ignored untracked file must never be staged: {files:?}"
     );
 
@@ -261,8 +263,14 @@ fn stage_reaches_tracked_files_under_a_later_ignored_directory_without_force() {
     let files = git
         .stage(root, &[PathBuf::from("temp")])
         .expect("stage ignored directory containing tracked files");
-    assert!(files.iter().all(|file| file.path != PathBuf::from("temp/scratch.md")));
-    let staged = git.diff(root, DiffScope::Staged, None).expect("staged diff");
+    assert!(
+        files
+            .iter()
+            .all(|file| file.path != Path::new("temp/scratch.md"))
+    );
+    let staged = git
+        .diff(root, DiffScope::Staged, None)
+        .expect("staged diff");
     assert!(staged.patch.contains("+v3"));
 }
 

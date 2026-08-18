@@ -25,7 +25,8 @@ export function isStaleProviderResumeError(error: unknown): boolean {
   return (
     message.includes("no saved provider session") ||
     message.includes("predates the current mcp configuration") ||
-    message.includes("no longer the active resumable session")
+    message.includes("no longer the active resumable session") ||
+    message.includes("does not match this task and workspace")
   );
 }
 

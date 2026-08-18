@@ -1,3 +1,5 @@
+import { splitAnnotationBlocks, type PendingAnnotation } from "../browserAnnotation";
+
 export function formatCompactTokenCount(tokens: number): string {
   if (tokens < 1_000) return String(tokens);
   if (tokens < 1_000_000) return `${Math.round(tokens / 1_000)}k`;
@@ -15,6 +17,18 @@ export function splitAttachmentBlock(body: string): { text: string; attachments:
     .map((line) => line.replace(/^- /, "").trim())
     .filter(Boolean);
   return { text: body.slice(0, match.index).trimEnd(), attachments };
+}
+
+/** Strips the composer-authored attachment and annotation tails so the
+ * transcript can render chips instead of the raw prompt the agent saw. */
+export function splitSentUserMessage(body: string): {
+  text: string;
+  attachments: string[];
+  annotations: PendingAnnotation[];
+} {
+  const { text: withoutAnnotations, annotations } = splitAnnotationBlocks(body);
+  const { text, attachments } = splitAttachmentBlock(withoutAnnotations);
+  return { text, attachments, annotations };
 }
 
 /** Finds the nearest ancestor (or self) of a selection endpoint matching

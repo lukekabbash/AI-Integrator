@@ -43,7 +43,10 @@ The local desktop/broker remains authoritative for task identity, policy interse
 | `browser_snapshot` | No | Read a page: url, title, viewport, text, and interactive elements with stable refs |
 | `browser_click` / `browser_type` / `browser_press` / `browser_scroll` | Yes | Synthesise one interaction in a tab |
 | `browser_wait_for` | No | Test one page condition without blocking |
-| `browser_evaluate` | Yes | Evaluate one expression in a tab, bounded to 64 KB of result |
+
+Arbitrary page JavaScript is intentionally not a broker capability. It would
+bypass the metadata-only cookie boundary and expose script-readable session
+tokens. Snapshots and typed actions cover the supported automation surface.
 
 Browser tools are scoped to the calling task: a tab records the task that
 opened it, and a call naming another task's tab is refused. That boundary has
@@ -56,20 +59,22 @@ Inside a task, reach has three layers:
   cannot see it in `browser_list` and cannot address it; the orchestrator can.
   A child closes only its own tabs and never grants a tab onward.
 - **Hold** — whoever last drove the tab keeps it for 45 seconds, so two runs do
-  not undo each other mid-flow. Advisory, and it expires on its own.
+  not undo each other mid-flow. Advisory, and it expires on its own. A person
+  using the tab is not an exclusive holder unless Settings → Browser “Lock
+  agents out of the tab you are using” is on.
 
 `browser_grant(tabId, delegationId, mode)` hands one of the orchestrator's tabs
-to a child: `read` allows snapshot, wait and evaluate, `drive` adds the verbs
+to a child: `read` allows snapshot and wait, `drive` adds the verbs
 that change the page.
 
 Saved logins are a capability, never a secret. `browser_fill_login` causes the
-app to type a password the user saved for that exact origin — scheme, host and
-port, with no subdomain widening and no following a redirect. The reply names
+app to type a password the user saved for that exact browser identity and
+origin — scheme, host and port, with no subdomain widening and no following a redirect. The reply names
 the username and nothing else, and from the fill until the form is submitted or
-the tab navigates, `browser_snapshot`, `browser_evaluate` and any capture of
+the tab navigates, `browser_snapshot` and any capture of
 that tab are refused with `credential-in-flight`. An agent can cause a login to
 happen; it can never learn a credential. If the user has not allowed sign-ins on
-that origin the call returns `needs-user-approval`, they are asked, and the
+that origin in that browser identity the call returns `needs-user-approval`, they are asked, and the
 right move is to carry on with something else and try again later.
 
 Some things a page does cannot be reached by a synthesised event, and the
@@ -93,13 +98,13 @@ tab is still yours to drive either way — a tab nothing is showing keeps a full
 
 Two things a caller sees in `browser_list` and should act on:
 
-- `heldBy` names whoever drove the tab in the last 45 seconds — an agent, or
-  `you` when the person using the app is working in it. Reads are always
-  allowed, but a write to a tab someone else has is refused with that name in
-  the message. Open your own tab rather than taking the page out from under a
-  run in flight, and never try to work around the person: their hold is
-  enforced by the page itself, which is the only place a real keystroke is
-  distinguishable from a synthesised one.
+- `heldBy` names whoever drove the tab in the last 45 seconds. That is another
+  agent, or `you` when the person using the app is working in it *and* they
+  turned on Settings → Browser “Lock agents out of the tab you are using”.
+  Reads are always allowed. A write to a tab another agent has is refused with
+  that name in the message — open your own tab rather than taking the page out
+  from under a run in flight. When the lock is off (the default), the person
+  being in the tab does not stand you off: you work the page alongside them.
 - `sleeping` marks a tab remembered from an earlier session: it has an address
   and a title but no page loaded yet. Addressing it loads it first, so nothing
   special is required — it costs one page load the first time.

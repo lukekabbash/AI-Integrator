@@ -9,20 +9,21 @@
 
 use std::{
     collections::BTreeMap,
-    fs::{self, OpenOptions},
+    fs,
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 
 use adapter_acp::AcpSessionCapabilities;
 use serde::Serialize;
 use serde_json::Value;
 use session_store::LocalStore;
-use zeroize::Zeroizing;
+use url::{Host, Url};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::command_api::{CommandError, CommandResult};
 use crate::credential_store::{self, CredentialStorage};
@@ -42,6 +43,122 @@ const MAX_SERVERS: usize = 128;
 const MAX_ARGS: usize = 32;
 const MAX_ENV: usize = 32;
 const MAX_TEXT: usize = 2_048;
+const MAX_MCP_SECRET_BYTES: usize = 16 * 1024;
+const MAX_PRIVATE_JSON_BYTES: u64 = 1024 * 1024;
+
+fn is_sensitive_env_key(key: &str) -> bool {
+    let key = key.replace('-', "_").to_ascii_uppercase();
+    matches!(
+        key.as_str(),
+        "TOKEN"
+            | "AUTH_TOKEN"
+            | "ACCESS_TOKEN"
+            | "REFRESH_TOKEN"
+            | "ID_TOKEN"
+            | "API_KEY"
+            | "APIKEY"
+            | "SECRET"
+            | "CLIENT_SECRET"
+            | "PASSWORD"
+            | "PASSWD"
+            | "PRIVATE_KEY"
+            | "GITHUB_PAT"
+            | "AWS_SECRET_ACCESS_KEY"
+            | "AWS_SESSION_TOKEN"
+    ) || key.ends_with("_TOKEN")
+        || key.ends_with("_SECRET")
+        || key.ends_with("_PASSWORD")
+        || key.ends_with("_PASSWD")
+        || key.ends_with("_API_KEY")
+        || key.ends_with("_PRIVATE_KEY")
+        || key.ends_with("_PAT")
+}
+
+fn looks_like_secret_value(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    (value.len() >= 16
+        && (lower.starts_with("sk-")
+            || lower.starts_with("ghp_")
+            || lower.starts_with("github_pat_")
+            || lower.starts_with("xoxb-")
+            || lower.starts_with("xoxp-")))
+        || (value.len() >= 30 && value.starts_with("AIza"))
+        || (value.matches('.').count() == 2
+            && value.split('.').all(|part| {
+                part.len() >= 8
+                    && part
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            }))
+}
+
+fn is_sensitive_url_query_key(key: &str) -> bool {
+    let normalized = key.replace('-', "_").to_ascii_uppercase();
+    is_sensitive_env_key(&normalized)
+        || matches!(
+            normalized.as_str(),
+            "KEY"
+                | "AUTH"
+                | "AUTHORIZATION"
+                | "CREDENTIAL"
+                | "CREDENTIALS"
+                | "SIGNATURE"
+                | "SIG"
+                | "ACCESS_KEY"
+                | "SECRET_KEY"
+        )
+}
+
+fn sensitive_argument_flag(value: &str) -> bool {
+    let normalized = value.trim_start_matches(['-', '/']);
+    let key = normalized
+        .split_once('=')
+        .map(|(key, _)| key)
+        .unwrap_or(normalized)
+        .replace('-', "_");
+    is_sensitive_env_key(&key)
+}
+
+fn has_sensitive_arguments(transport: &McpTransport) -> bool {
+    let McpTransport::Stdio { args, .. } = transport else {
+        return false;
+    };
+    args.iter().enumerate().any(|(index, argument)| {
+        let lower = argument.to_ascii_lowercase();
+        let prior_is_secret_flag = index > 0 && sensitive_argument_flag(&args[index - 1]);
+        let explicit_assignment = argument.split_ascii_whitespace().any(|token| {
+            token
+                .split_once('=')
+                .is_some_and(|(key, value)| !value.is_empty() && sensitive_argument_flag(key))
+        });
+        prior_is_secret_flag
+            || explicit_assignment
+            || looks_like_secret_value(argument)
+            || lower.contains("authorization:")
+            || lower.contains("cookie:")
+            || (lower.contains("bearer ") && lower.split_whitespace().count() > 1)
+    })
+}
+
+fn zeroize_json_strings(value: &mut Value) {
+    match value {
+        Value::String(value) => value.zeroize(),
+        Value::Array(values) => values.iter_mut().for_each(zeroize_json_strings),
+        Value::Object(values) => values.values_mut().for_each(zeroize_json_strings),
+        _ => {}
+    }
+}
+
+fn zeroize_transport_strings(transport: &mut McpTransport) {
+    match transport {
+        McpTransport::Stdio { command, args, env } => {
+            command.zeroize();
+            args.iter_mut().for_each(Zeroize::zeroize);
+            env.values_mut().for_each(Zeroize::zeroize);
+        }
+        McpTransport::Remote { url, .. } => url.zeroize(),
+    }
+}
 
 fn is_false(value: &bool) -> bool {
     !*value
@@ -67,6 +184,10 @@ pub fn mcps_root(documents: &Path) -> PathBuf {
     documents.join("AI Integrator").join("MCPs")
 }
 
+fn checked_mcps_root(documents: &Path, create: bool) -> io::Result<Option<PathBuf>> {
+    private_descendant(documents, &Path::new("AI Integrator").join("MCPs"), create)
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", tag = "transport")]
 pub enum McpTransport {
@@ -74,6 +195,9 @@ pub enum McpTransport {
     Stdio {
         command: String,
         args: Vec<String>,
+        /// Environment values stay native-only. The renderer receives the
+        /// separately computed credential-slot metadata, never this map.
+        #[serde(skip_serializing)]
         env: BTreeMap<String, String>,
     },
     #[serde(rename_all = "camelCase")]
@@ -183,8 +307,29 @@ fn parse_transport(spec: &Value) -> Result<McpTransport, String> {
     let object = spec.as_object().ok_or("server spec must be an object")?;
     if let Some(url) = object.get("url") {
         let url = url.as_str().ok_or("url must be a string")?.trim();
-        if !(url.starts_with("https://") || url.starts_with("http://")) || url.len() > MAX_TEXT {
-            return Err("url must be an http(s) URL".into());
+        if url.len() > MAX_TEXT {
+            return Err("url must be a bounded http(s) URL".into());
+        }
+        let parsed = Url::parse(url).map_err(|_| "url must be an http(s) URL")?;
+        let loopback = matches!(parsed.host(), Some(Host::Ipv4(address)) if address.is_loopback())
+            || matches!(parsed.host(), Some(Host::Ipv6(address)) if address.is_loopback())
+            || matches!(parsed.host(), Some(Host::Domain(domain)) if domain.eq_ignore_ascii_case("localhost") || domain.to_ascii_lowercase().ends_with(".localhost"));
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host().is_none()
+            || (parsed.scheme() == "http" && !loopback)
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+            || parsed.query_pairs().any(|(key, value)| {
+                is_sensitive_url_query_key(&key)
+                    || looks_like_secret_value(&value)
+                    || value.to_ascii_lowercase().contains("bearer ")
+            })
+        {
+            return Err(
+                "remote MCP URLs require HTTPS (except loopback) and cannot contain credentials"
+                    .into(),
+            );
         }
         let oauth = object.get("auth").and_then(Value::as_str) == Some("oauth")
             || object
@@ -192,7 +337,7 @@ fn parse_transport(spec: &Value) -> Result<McpTransport, String> {
                 .is_some_and(|value| value.as_bool() == Some(true) || value.is_object())
             || known_oauth_server(url);
         return Ok(McpTransport::Remote {
-            url: url.into(),
+            url: parsed.to_string(),
             oauth,
         });
     }
@@ -233,27 +378,154 @@ fn parse_transport(spec: &Value) -> Result<McpTransport, String> {
     })
 }
 
+fn inline_sensitive_env(transport: &McpTransport) -> bool {
+    let McpTransport::Stdio { env, .. } = transport else {
+        return false;
+    };
+    env.iter().any(|(key, value)| {
+        value != KEYCHAIN_PLACEHOLDER
+            && !value.is_empty()
+            && (is_sensitive_env_key(key) || looks_like_secret_value(value))
+    })
+}
+
+#[derive(Default)]
+struct CredentialMigration {
+    snapshots: Vec<(String, Option<Zeroizing<String>>)>,
+}
+
+impl CredentialMigration {
+    fn append(&mut self, mut other: Self) {
+        self.snapshots.append(&mut other.snapshots);
+    }
+
+    fn rollback(self) -> bool {
+        let mut failed = false;
+        for (account, previous) in self.snapshots.into_iter().rev() {
+            let result = match previous {
+                Some(previous) => {
+                    credential_store::write(MCP_CREDENTIAL_SERVICE, &account, &previous)
+                }
+                None => credential_store::delete(MCP_CREDENTIAL_SERVICE, &account),
+            };
+            failed |= result.is_err();
+        }
+        !failed
+    }
+}
+
+fn migrate_inline_credentials(
+    server: &str,
+    transport: &mut McpTransport,
+) -> CommandResult<CredentialMigration> {
+    let McpTransport::Stdio { env, .. } = transport else {
+        return Ok(CredentialMigration::default());
+    };
+    let mut migration = CredentialMigration::default();
+    for (key, value) in env {
+        if value == KEYCHAIN_PLACEHOLDER
+            || value.is_empty()
+            || (!is_sensitive_env_key(key) && !looks_like_secret_value(value))
+        {
+            continue;
+        }
+        if value.len() > MAX_MCP_SECRET_BYTES {
+            let _ = migration.rollback();
+            return Err(invalid("an inline MCP credential is too large to migrate"));
+        }
+        let secret = Zeroizing::new(std::mem::take(value));
+        *value = KEYCHAIN_PLACEHOLDER.to_string();
+        let account = format!("{server}/{key}");
+        let previous = match credential_store::read(MCP_CREDENTIAL_SERVICE, &account) {
+            Ok(previous) => previous,
+            Err(_) => {
+                let _ = migration.rollback();
+                return Err(CommandError {
+                code: "credential-store-unavailable",
+                message: "Native credential storage could not be read while securing an MCP configuration."
+                    .into(),
+                });
+            }
+        };
+        migration.snapshots.push((account.clone(), previous));
+        if credential_store::write(MCP_CREDENTIAL_SERVICE, &account, &secret).is_err() {
+            let _ = migration.rollback();
+            return Err(CommandError {
+                code: "credential-store-unavailable",
+                message: "Native credential storage could not secure an inline MCP credential."
+                    .into(),
+            });
+        }
+    }
+    Ok(migration)
+}
+
+fn transport_body(transport: &McpTransport) -> Value {
+    match transport {
+        McpTransport::Stdio { command, args, env } => serde_json::json!({
+            "command": command,
+            "args": args,
+            "env": env,
+        }),
+        McpTransport::Remote { url, oauth } => {
+            let mut body = serde_json::json!({ "url": url });
+            if *oauth {
+                body["auth"] = Value::String("oauth".into());
+            }
+            body
+        }
+    }
+}
+
+fn write_json_atomic(path: &Path, value: &Value) -> io::Result<()> {
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MCP configuration path is not a regular file",
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("MCP configuration has no parent directory"))?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".integrator-mcp-")
+        .tempfile_in(parent)?;
+    let bytes = Zeroizing::new(serde_json::to_vec_pretty(value).expect("MCP config serializes"));
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
+}
+
 /// Read one user server file: a bare spec (file stem = name) or a standard
 /// `{"mcpServers": {name: spec}}` block pasted from another tool.
-fn read_server_file(path: &Path, output: &mut Vec<(String, McpTransport)>) {
+fn read_server_file(path: &Path, output: &mut Vec<(String, McpTransport)>, bundled: &mut bool) {
+    *bundled = false;
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return;
     };
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > MAX_FILE_BYTES {
         return;
     }
-    let Ok(parsed) = fs::read_to_string(path)
-        .map_err(|_| ())
-        .and_then(|content| serde_json::from_str::<Value>(&content).map_err(|_| ()))
-    else {
+    let Ok(content) = fs::read_to_string(path) else {
+        return;
+    };
+    let content = Zeroizing::new(content);
+    let Ok(mut parsed) = serde_json::from_str::<Value>(&content) else {
         return;
     };
     if let Some(servers) = parsed.get("mcpServers").and_then(Value::as_object) {
+        *bundled = true;
         for (key, spec) in servers.iter().take(16) {
             if let (Some(name), Ok(transport)) = (bounded_name(key), parse_transport(spec)) {
                 output.push((name, transport));
             }
         }
+        zeroize_json_strings(&mut parsed);
         return;
     }
     let stem = path
@@ -264,6 +536,7 @@ fn read_server_file(path: &Path, output: &mut Vec<(String, McpTransport)>) {
     if let (Some(name), Ok(transport)) = (bounded_name(&stem), parse_transport(&parsed)) {
         output.push((name, transport));
     }
+    zeroize_json_strings(&mut parsed);
 }
 
 fn scan_user_root(root: &Path, output: &mut Vec<IntegratorMcpServer>) {
@@ -276,7 +549,52 @@ fn scan_user_root(root: &Path, output: &mut Vec<IntegratorMcpServer>) {
             continue;
         }
         let mut found = Vec::new();
-        read_server_file(&path, &mut found);
+        let mut bundled = false;
+        read_server_file(&path, &mut found, &mut bundled);
+        let mut migration = CredentialMigration::default();
+        let mut migration_failed = false;
+        for (name, transport) in &mut found {
+            if has_sensitive_arguments(transport) {
+                migration_failed = true;
+                break;
+            }
+            match migrate_inline_credentials(name, transport) {
+                Ok(next) => migration.append(next),
+                Err(_) => {
+                    migration_failed = true;
+                    break;
+                }
+            }
+        }
+        if migration_failed {
+            let _ = migration.rollback();
+            for (_, transport) in &mut found {
+                zeroize_transport_strings(transport);
+            }
+            continue;
+        }
+        if !migration.snapshots.is_empty() {
+            let body = if bundled {
+                Value::Object(serde_json::Map::from_iter([(
+                    "mcpServers".into(),
+                    Value::Object(
+                        found
+                            .iter()
+                            .map(|(name, transport)| (name.clone(), transport_body(transport)))
+                            .collect(),
+                    ),
+                )]))
+            } else if let Some((_, transport)) = found.first() {
+                transport_body(transport)
+            } else {
+                let _ = migration.rollback();
+                continue;
+            };
+            if write_json_atomic(&path, &body).is_err() {
+                let _ = migration.rollback();
+                continue;
+            }
+        }
         for (name, transport) in found {
             output.push(IntegratorMcpServer {
                 name,
@@ -309,8 +627,16 @@ fn scan_plugin_root(root: &Path, source: &str, output: &mut Vec<IntegratorMcpSer
         };
         for manifest in ["mcp.json", ".mcp.json"] {
             let mut found = Vec::new();
-            read_server_file(&plugin.path().join(manifest), &mut found);
-            for (name, transport) in found {
+            let mut bundled = false;
+            read_server_file(&plugin.path().join(manifest), &mut found, &mut bundled);
+            for (name, mut transport) in found {
+                // Installed manifests are not a credential store. A plugin
+                // must declare a keychain placeholder instead of bundling a
+                // raw token into renderer-visible configuration.
+                if inline_sensitive_env(&transport) || has_sensitive_arguments(&transport) {
+                    zeroize_transport_strings(&mut transport);
+                    continue;
+                }
                 output.push(IntegratorMcpServer {
                     name: format!("{plugin_name}:{name}"),
                     source: source.into(),
@@ -342,7 +668,9 @@ fn discover_all(app: &tauri::AppHandle, store: &LocalStore) -> Vec<IntegratorMcp
         return Vec::new();
     };
     let mut servers = Vec::new();
-    scan_user_root(&mcps_root(&documents), &mut servers);
+    if let Ok(Some(root)) = checked_mcps_root(&documents, false) {
+        scan_user_root(&root, &mut servers);
+    }
     scan_plugin_root(&plugins_root(&documents), "plugin", &mut servers);
     if let Some(bundled) = bundled_root(app) {
         scan_plugin_root(&bundled, "first-party", &mut servers);
@@ -358,10 +686,40 @@ fn discover_all(app: &tauri::AppHandle, store: &LocalStore) -> Vec<IntegratorMcp
             .and_then(Value::as_bool)
             .unwrap_or(false);
         server.credentials = credential_slots(&server.name, &server.transport);
-        server.authorization = matches!(server.transport, McpTransport::Remote { oauth: true, .. })
-            .then(|| crate::mcp_oauth::authorization_status(&server.name));
+        server.authorization = match &server.transport {
+            McpTransport::Remote { url, oauth: true } => {
+                Some(crate::mcp_oauth::authorization_status(&server.name, url))
+            }
+            _ => None,
+        };
     }
     servers
+}
+
+fn credential_slot_declared(server: &IntegratorMcpServer, key: &str) -> bool {
+    matches!(
+        &server.transport,
+        McpTransport::Stdio { env, .. }
+            if env.get(key).is_some_and(|value| value == KEYCHAIN_PLACEHOLDER)
+    )
+}
+
+fn ensure_credential_slot(
+    app: &tauri::AppHandle,
+    store: &LocalStore,
+    server_name: &str,
+    key: &str,
+) -> CommandResult<()> {
+    let declared = discover_all(app, store)
+        .iter()
+        .any(|server| server.name == server_name && credential_slot_declared(server, key));
+    if declared {
+        Ok(())
+    } else {
+        Err(invalid(
+            "that MCP server does not declare this credential slot",
+        ))
+    }
 }
 
 pub fn enabled_servers(app: &tauri::AppHandle, store: &LocalStore) -> Vec<IntegratorMcpServer> {
@@ -483,42 +841,34 @@ pub async fn integrator_mcp_save(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     name: String,
-    config: Value,
+    mut config: Value,
 ) -> CommandResult<IntegratorMcpOverview> {
     let store = Arc::clone(&state.store);
     tauri::async_runtime::spawn_blocking(move || {
         let name = bounded_name(&name).ok_or_else(|| {
             invalid("server names use letters, numbers, hyphens, underscores, and dots")
         })?;
-        let transport = parse_transport(&config).map_err(invalid)?;
+        let transport_result = parse_transport(&config);
+        zeroize_json_strings(&mut config);
+        let mut transport = transport_result.map_err(invalid)?;
+        if inline_sensitive_env(&transport) || has_sensitive_arguments(&transport) {
+            zeroize_transport_strings(&mut transport);
+            return Err(invalid(
+                "store MCP credentials as keychain-backed environment values; inline secret arguments are refused",
+            ));
+        }
         let documents = documents_dir(&app).ok_or(CommandError {
             code: "unavailable",
             message: "could not locate the Documents folder".into(),
         })?;
-        let root = mcps_root(&documents);
-        fs::create_dir_all(&root).map_err(|error| CommandError {
+        let root = checked_mcps_root(&documents, true)
+            .and_then(|root| root.ok_or_else(|| io::Error::other("MCPs folder was not created")))
+            .map_err(|error| CommandError {
             code: "unavailable",
             message: format!("could not prepare the MCPs folder: {error}"),
         })?;
-        let body = match &transport {
-            McpTransport::Stdio { command, args, env } => serde_json::json!({
-                "command": command,
-                "args": args,
-                "env": env,
-            }),
-            McpTransport::Remote { url, oauth } => {
-                let mut body = serde_json::json!({ "url": url });
-                if *oauth {
-                    body["auth"] = Value::String("oauth".into());
-                }
-                body
-            }
-        };
-        fs::write(
-            root.join(format!("{name}.json")),
-            serde_json::to_vec_pretty(&body).expect("static config"),
-        )
-        .map_err(|error| CommandError {
+        let body = transport_body(&transport);
+        write_json_atomic(&root.join(format!("{name}.json")), &body).map_err(|error| CommandError {
             code: "unavailable",
             message: format!("could not write the server file: {error}"),
         })?;
@@ -545,8 +895,16 @@ pub async fn integrator_mcp_remove(
             code: "unavailable",
             message: "could not locate the Documents folder".into(),
         })?;
-        let path = mcps_root(&documents).join(format!("{name}.json"));
-        if !path.is_file() {
+        let root = checked_mcps_root(&documents, false)
+            .map_err(|error| CommandError {
+                code: "unavailable",
+                message: format!("could not inspect the MCPs folder: {error}"),
+        })?
+            .ok_or_else(|| invalid("the MCPs folder does not exist"))?;
+        let path = root.join(format!("{name}.json"));
+        let removable = fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink());
+        if !removable {
             return Err(invalid(
                 "only servers in your MCPs folder can be removed here; plugin servers go away with their plugin",
             ));
@@ -579,43 +937,45 @@ pub async fn integrator_mcp_import(
             code: "unavailable",
             message: "could not locate the Documents folder".into(),
         })?;
-        let root = mcps_root(&documents);
-        fs::create_dir_all(&root).map_err(|error| CommandError {
-            code: "unavailable",
-            message: format!("could not prepare the MCPs folder: {error}"),
-        })?;
+        let root = checked_mcps_root(&documents, true)
+            .and_then(|root| root.ok_or_else(|| io::Error::other("MCPs folder was not created")))
+            .map_err(|error| CommandError {
+                code: "unavailable",
+                message: format!("could not prepare the MCPs folder: {error}"),
+            })?;
         let mut imported = Vec::new();
         let mut skipped = Vec::new();
         for source in import_sources(&app) {
             let mut found = Vec::new();
-            read_server_file(&source, &mut found);
-            for (name, transport) in found {
+            let mut bundled = false;
+            read_server_file(&source, &mut found, &mut bundled);
+            for (name, mut transport) in found {
                 let target = root.join(format!("{name}.json"));
                 if target.exists() {
+                    zeroize_transport_strings(&mut transport);
                     skipped.push(name);
                     continue;
                 }
-                let body = match &transport {
-                    McpTransport::Stdio { command, args, env } => serde_json::json!({
-                        "command": command,
-                        "args": args,
-                        "env": env,
-                    }),
-                    McpTransport::Remote { url, oauth } => {
-                        let mut body = serde_json::json!({ "url": url });
-                        if *oauth {
-                            body["auth"] = Value::String("oauth".into());
-                        }
-                        body
+                if has_sensitive_arguments(&transport) {
+                    zeroize_transport_strings(&mut transport);
+                    skipped.push(name);
+                    continue;
+                }
+                let migration = match migrate_inline_credentials(&name, &mut transport) {
+                    Ok(migration) => migration,
+                    Err(_) => {
+                        zeroize_transport_strings(&mut transport);
+                        skipped.push(name);
+                        continue;
                     }
                 };
-                if fs::write(
-                    &target,
-                    serde_json::to_vec_pretty(&body).expect("static config"),
-                )
-                .is_ok()
-                {
+                let body = transport_body(&transport);
+                if write_json_atomic(&target, &body).is_ok() {
                     imported.push(name);
+                } else {
+                    let _ = migration.rollback();
+                    zeroize_transport_strings(&mut transport);
+                    skipped.push(name);
                 }
             }
         }
@@ -653,6 +1013,7 @@ fn import_sources(app: &tauri::AppHandle) -> Vec<PathBuf> {
 /// the `{{keychain}}` placeholder; the raw value never enters server config.
 #[tauri::command]
 pub fn integrator_mcp_credential_set(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     server: String,
     key: String,
@@ -662,14 +1023,17 @@ pub fn integrator_mcp_credential_set(
     if !valid_server_identity(&server) {
         return Err(invalid("unknown server name"));
     }
-    if key.len() > 64 || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if key.is_empty()
+        || key.len() > 64
+        || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
         return Err(invalid("unknown credential key"));
     }
-    let value = secret.trim();
-    if value.is_empty() || value.chars().count() > 4_096 {
+    ensure_credential_slot(&app, &state.store, &server, &key)?;
+    if secret.is_empty() || secret.len() > MAX_MCP_SECRET_BYTES {
         return Err(invalid("paste a valid secret before saving"));
     }
-    credential_store::write(MCP_CREDENTIAL_SERVICE, &format!("{server}/{key}"), value).map_err(
+    credential_store::write(MCP_CREDENTIAL_SERVICE, &format!("{server}/{key}"), &secret).map_err(
         |_| CommandError {
             code: "credential-store-unavailable",
             message: "Native credential storage could not be written.".into(),
@@ -680,6 +1044,7 @@ pub fn integrator_mcp_credential_set(
 
 #[tauri::command]
 pub fn integrator_mcp_credential_clear(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     server: String,
     key: String,
@@ -687,9 +1052,13 @@ pub fn integrator_mcp_credential_clear(
     if !valid_server_identity(&server) {
         return Err(invalid("unknown server name"));
     }
-    if key.len() > 64 || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if key.is_empty()
+        || key.len() > 64
+        || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
         return Err(invalid("unknown credential key"));
     }
+    ensure_credential_slot(&app, &state.store, &server, &key)?;
     credential_store::delete(MCP_CREDENTIAL_SERVICE, &format!("{server}/{key}")).map_err(|_| {
         CommandError {
             code: "credential-store-unavailable",
@@ -771,8 +1140,7 @@ pub async fn integrator_mcp_oauth_disconnect(
 
 /// Remove stale per-turn MCP config overlays. Called once at startup.
 pub fn prune_projections(data_directory: &Path) {
-    let root = data_directory.join(PROJECTION_DIR);
-    if root.exists() {
+    if let Ok(Some(root)) = private_descendant(data_directory, Path::new(PROJECTION_DIR), false) {
         let _ = fs::remove_dir_all(root);
     }
 }
@@ -804,34 +1172,88 @@ fn resolved_env(server: &str, env: &BTreeMap<String, String>) -> BTreeMap<String
         .collect()
 }
 
-fn ensure_private_directory(path: &Path) -> io::Result<()> {
-    fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-fn write_private_json(path: &Path, value: &Value) -> io::Result<()> {
-    if let Ok(metadata) = fs::symlink_metadata(path) {
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+pub(crate) fn private_descendant(
+    root: &Path,
+    relative: &Path,
+    create: bool,
+) -> io::Result<Option<PathBuf>> {
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private path is not a relative descendant",
+        ));
+    }
+    let canonical_root = fs::canonicalize(root)?;
+    if !canonical_root.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private path root is not a directory",
+        ));
+    }
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            unreachable!("private path components were validated")
+        };
+        let candidate = current.join(component);
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "private path contains a link or non-directory",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
+                fs::create_dir(&candidate)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        let canonical = fs::canonicalize(&candidate)?;
+        if !canonical.starts_with(&canonical_root) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "MCP projection path is not a regular file",
+                "private path escaped its trusted root",
             ));
         }
-        fs::remove_file(path)?;
+        current = candidate;
     }
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
     #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(path)?;
-    file.write_all(&serde_json::to_vec_pretty(value).expect("MCP projection serializes"))?;
-    file.sync_all()
+    fs::set_permissions(&current, fs::Permissions::from_mode(0o700))?;
+    Ok(Some(current))
 }
 
-fn remote_headers(server: &str) -> serde_json::Map<String, Value> {
-    crate::mcp_oauth::authorization_header(server)
+fn read_private_json(path: &Path) -> io::Result<Value> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_PRIVATE_JSON_BYTES
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private JSON input is not a bounded regular file",
+        ));
+    }
+    let bytes = Zeroizing::new(fs::read(path)?);
+    serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+pub(crate) fn write_private_json(path: &Path, value: &mut Value) -> io::Result<()> {
+    let result = write_json_atomic(path, value);
+    zeroize_json_strings(value);
+    result
+}
+
+fn remote_headers(server: &IntegratorMcpServer) -> serde_json::Map<String, Value> {
+    let McpTransport::Remote { url, .. } = &server.transport else {
+        return serde_json::Map::new();
+    };
+    crate::mcp_oauth::authorization_header(&server.name, url)
         .map(|authorization| {
             serde_json::Map::from_iter([("Authorization".into(), Value::String(authorization))])
         })
@@ -862,7 +1284,7 @@ fn claude_server_config_with_headers(
 }
 
 fn claude_server_config(server: &IntegratorMcpServer) -> Value {
-    claude_server_config_with_headers(server, remote_headers(&server.name))
+    claude_server_config_with_headers(server, remote_headers(server))
 }
 
 fn codex_server_config_with_headers(
@@ -886,7 +1308,7 @@ fn codex_server_config_with_headers(
 }
 
 fn codex_server_config(server: &IntegratorMcpServer) -> Value {
-    codex_server_config_with_headers(server, remote_headers(&server.name))
+    codex_server_config_with_headers(server, remote_headers(server))
 }
 
 pub fn merge_codex_mcp_config(mut base: Value, servers: &[IntegratorMcpServer]) -> Value {
@@ -941,7 +1363,7 @@ pub fn acp_mcp_server_entries(
                     }))
                 }
                 McpTransport::Remote { url, .. } if capabilities.mcp_http => {
-                    let headers = remote_headers(&server.name)
+                    let headers = remote_headers(server)
                         .into_iter()
                         .map(|(name, value)| {
                             serde_json::json!({
@@ -981,8 +1403,7 @@ pub fn write_claude_mcp_config(
         return Ok(base_config.map(Path::to_path_buf));
     }
     let mut merged = match base_config {
-        Some(path) => serde_json::from_str::<Value>(&fs::read_to_string(path)?)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        Some(path) => read_private_json(path)?,
         None => serde_json::json!({}),
     };
     if !merged.is_object() {
@@ -1000,10 +1421,10 @@ pub fn write_claude_mcp_config(
     for server in servers {
         map.insert(projection_name(&server.name), claude_server_config(server));
     }
-    let dir = data_directory.join(PROJECTION_DIR);
-    ensure_private_directory(&dir)?;
+    let dir = private_descendant(data_directory, Path::new(PROJECTION_DIR), true)?
+        .ok_or_else(|| io::Error::other("MCP projection directory was not created"))?;
     let path = dir.join(format!("{}.json", uuid::Uuid::new_v4()));
-    write_private_json(&path, &merged)?;
+    write_private_json(&path, &mut merged)?;
     Ok(Some(path))
 }
 
@@ -1025,8 +1446,8 @@ pub fn write_antigravity_mcp_config_with_base(
     servers: &[IntegratorMcpServer],
     base_config: Option<&Path>,
 ) -> io::Result<Option<PathBuf>> {
-    let agents = overlay_root.join(".agents");
-    ensure_private_directory(&agents)?;
+    let agents = private_descendant(overlay_root, Path::new(".agents"), true)?
+        .ok_or_else(|| io::Error::other("Antigravity agents directory was not created"))?;
     let path = agents.join("mcp_config.json");
     if servers.is_empty() && base_config.is_none() {
         if let Err(error) = fs::remove_file(&path)
@@ -1037,8 +1458,7 @@ pub fn write_antigravity_mcp_config_with_base(
         return Ok(None);
     }
     let mut document = match base_config {
-        Some(path) => serde_json::from_str::<Value>(&fs::read_to_string(path)?)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        Some(path) => read_private_json(path)?,
         None => serde_json::json!({}),
     };
     if !document.is_object() {
@@ -1056,7 +1476,7 @@ pub fn write_antigravity_mcp_config_with_base(
                 McpTransport::Remote { url, .. } => serde_json::json!({
                     "serverUrl": url,
                     "transport": "http",
-                    "headers": remote_headers(&server.name),
+                    "headers": remote_headers(server),
                 }),
             };
             (projection_name(&server.name), config)
@@ -1074,7 +1494,7 @@ pub fn write_antigravity_mcp_config_with_base(
         .as_object_mut()
         .expect("mcpServers is an object")
         .extend(selected);
-    write_private_json(&path, &document)?;
+    write_private_json(&path, &mut document)?;
     Ok(Some(path))
 }
 
@@ -1109,6 +1529,24 @@ mod tests {
             Ok(McpTransport::Remote { oauth: false, .. })
         ));
         assert!(parse_transport(&serde_json::json!({ "url": "ftp://example.com" })).is_err());
+        assert!(parse_transport(&serde_json::json!({ "url": "http://example.com/mcp" })).is_err());
+        assert!(
+            parse_transport(&serde_json::json!({ "url": "http://127.0.0.1:7777/mcp" })).is_ok()
+        );
+        assert!(
+            parse_transport(&serde_json::json!({ "url": "https://user:secret@example.com/mcp" }))
+                .is_err()
+        );
+        assert!(
+            parse_transport(
+                &serde_json::json!({ "url": "https://example.com/mcp?api_key=secret" })
+            )
+            .is_err()
+        );
+        assert!(
+            parse_transport(&serde_json::json!({ "url": "https://example.com/mcp?key=secret" }))
+                .is_err()
+        );
         assert!(parse_transport(&serde_json::json!({ "command": "" })).is_err());
         assert!(
             parse_transport(&serde_json::json!({ "command": "x", "args": "not-array" })).is_err()
@@ -1122,6 +1560,84 @@ mod tests {
             parse_transport(&serde_json::json!({ "command": "x", "args": oversized_args }))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn inline_mcp_secrets_are_detected_before_renderer_or_file_projection() {
+        let secret_key = parse_transport(&serde_json::json!({
+            "command": "server",
+            "env": { "SERVICE_API_KEY": "not-plain-text" }
+        }))
+        .unwrap();
+        let secret_shape = parse_transport(&serde_json::json!({
+            "command": "server",
+            "env": { "CONFIG": "ghp_abcdefghijklmnopqrstuvwxyz" }
+        }))
+        .unwrap();
+        let ordinary = parse_transport(&serde_json::json!({
+            "command": "server",
+            "env": { "LOG_LEVEL": "debug" }
+        }))
+        .unwrap();
+        let secret_argument = parse_transport(&serde_json::json!({
+            "command": "server",
+            "args": ["--token", "opaque-value"]
+        }))
+        .unwrap();
+
+        assert!(inline_sensitive_env(&secret_key));
+        assert!(inline_sensitive_env(&secret_shape));
+        assert!(!inline_sensitive_env(&ordinary));
+        assert!(has_sensitive_arguments(&secret_argument));
+        assert!(!has_sensitive_arguments(&ordinary));
+    }
+
+    #[test]
+    fn renderer_serialization_omits_native_env_and_exposes_only_slot_metadata() {
+        let transport = McpTransport::Stdio {
+            command: "server".into(),
+            args: vec!["--stdio".into()],
+            env: BTreeMap::from([
+                ("API_KEY".into(), KEYCHAIN_PLACEHOLDER.into()),
+                ("LOG_LEVEL".into(), "debug".into()),
+            ]),
+        };
+        let server = IntegratorMcpServer {
+            name: "local".into(),
+            source: "user".into(),
+            origin: "MCPs folder".into(),
+            enabled: false,
+            credentials: vec![McpCredentialSlot {
+                key: "API_KEY".into(),
+                configured: true,
+                available: true,
+                storage: CredentialStorage::OsCredentialStore,
+            }],
+            authorization: None,
+            transport,
+        };
+
+        assert!(credential_slot_declared(&server, "API_KEY"));
+        assert!(!credential_slot_declared(&server, "LOG_LEVEL"));
+        let value = serde_json::to_value(server).expect("serialize renderer overview");
+        assert!(value.get("env").is_none());
+        assert_eq!(
+            value.pointer("/credentials/0/key").and_then(Value::as_str),
+            Some("API_KEY")
+        );
+        assert!(!value.to_string().contains("debug"));
+    }
+
+    #[test]
+    fn atomic_mcp_json_write_replaces_without_leaving_partial_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.json");
+        fs::write(&path, b"old").unwrap();
+
+        write_json_atomic(&path, &serde_json::json!({ "command": "server" })).unwrap();
+
+        let value: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(value["command"], "server");
     }
 
     #[test]
@@ -1394,6 +1910,7 @@ mod tests {
     #[test]
     fn antigravity_projection_lives_in_the_private_control_overlay() {
         let root = std::env::temp_dir().join(format!("agy-mcp-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("control overlay fixture");
         let path = write_antigravity_mcp_config(
             &root,
             &[IntegratorMcpServer {

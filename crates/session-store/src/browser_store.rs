@@ -5,6 +5,9 @@ use super::*;
 pub struct StoredBrowserTab {
     pub url: String,
     pub title: String,
+    /// The site's icon as a `data:` URL, when one was resolved. Kept so a
+    /// restored strip shows icons before any page has loaded.
+    pub favicon: Option<String>,
 }
 
 impl LocalStore {
@@ -29,14 +32,15 @@ impl LocalStore {
             }
             transaction
                 .execute(
-                    "INSERT INTO browser_tabs(task_id, ordinal, url, title, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO browser_tabs(task_id, ordinal, url, title, updated_at, favicon) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         task_id.to_string(),
                         ordinal as i64,
                         tab.url,
                         tab.title,
-                        now
+                        now,
+                        tab.favicon
                     ],
                 )
                 .map_err(storage_error)?;
@@ -50,7 +54,8 @@ impl LocalStore {
         let connection = self.connection.lock();
         let mut statement = connection
             .prepare(
-                "SELECT url, title FROM browser_tabs WHERE task_id = ?1 ORDER BY ordinal ASC",
+                "SELECT url, title, favicon FROM browser_tabs WHERE task_id = ?1 \
+                 ORDER BY ordinal ASC",
             )
             .map_err(storage_error)?;
         let rows = statement
@@ -58,6 +63,7 @@ impl LocalStore {
                 Ok(StoredBrowserTab {
                     url: row.get(0)?,
                     title: row.get(1)?,
+                    favicon: row.get(2)?,
                 })
             })
             .map_err(storage_error)?;

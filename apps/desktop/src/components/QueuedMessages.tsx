@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 import { AnimatePresence, m as motion } from "motion/react";
 import { ArrowUp, CornerDownLeft, GripVertical, Loader2, X } from "lucide-react";
 import { Tooltip } from "./Tooltip";
+import { splitAnnotationBlocks } from "../browserAnnotation";
 
 export interface QueuedMessage {
   id: string;
@@ -23,10 +24,16 @@ interface QueuedMessagesProps {
   disabled?: boolean;
 }
 
-/** One line of preview text; the full prompt stays in the title and labels. */
+/** One line of preview text; the full prompt stays in the title and labels.
+ * Annotation markup reads as the element it marked, not as a tag. */
 function summarize(prompt: string): string {
-  const line = prompt.trim().split("\n", 1)[0];
-  return line || prompt.trim();
+  const { text, annotations } = splitAnnotationBlocks(prompt);
+  const line = text.split("\n", 1)[0];
+  if (line) return line;
+  if (annotations.length > 0) {
+    return `Annotation · ${annotations.map((annotation) => annotation.label).join(", ")}`;
+  }
+  return prompt.trim();
 }
 
 function movedOrder(messages: QueuedMessage[], from: number, to: number): string[] {

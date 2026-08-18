@@ -42,6 +42,7 @@ export function ResizeHandle({
     window.removeEventListener("blur", stop);
     const captured = capturedPointer.current;
     capturedPointer.current = null;
+    captured?.element.removeAttribute("data-resizing");
     if (captured?.element.hasPointerCapture?.(captured.id)) {
       captured.element.releasePointerCapture?.(captured.id);
     }
@@ -86,6 +87,7 @@ export function ResizeHandle({
     activelyResizing.current = true;
     event.currentTarget.setPointerCapture?.(event.pointerId);
     capturedPointer.current = { element: event.currentTarget, id: event.pointerId };
+    event.currentTarget.dataset.resizing = "true";
     document.body.dataset.resizing = "true";
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", stop);

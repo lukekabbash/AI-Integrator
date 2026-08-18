@@ -75,7 +75,9 @@ async fn capture<R: Runtime>(
         ));
     }
     if !window.is_visible().unwrap_or(true) {
-        return Err(unavailable("the app window is hidden, so the tab cannot be captured"));
+        return Err(unavailable(
+            "the app window is hidden, so the tab cannot be captured",
+        ));
     }
     // The webview's position is relative to the window's client area, and
     // `inner_position` is where that client area sits on the screen. Adding
@@ -114,7 +116,11 @@ fn to_monitor_units(
     position: PhysicalPosition<i32>,
     size: PhysicalSize<u32>,
     scale: f64,
-) -> (PhysicalPosition<i32>, PhysicalPosition<i32>, PhysicalSize<u32>) {
+) -> (
+    PhysicalPosition<i32>,
+    PhysicalPosition<i32>,
+    PhysicalSize<u32>,
+) {
     if !cfg!(target_os = "macos") || scale <= 0.0 || (scale - 1.0).abs() < f64::EPSILON {
         return (client_origin, position, size);
     }
@@ -170,8 +176,8 @@ fn monitor_region(
 ) -> Option<(u32, u32, u32, u32)> {
     let left = i64::from(tab.x).max(i64::from(monitor_x));
     let top = i64::from(tab.y).max(i64::from(monitor_y));
-    let right =
-        (i64::from(tab.x) + i64::from(tab.width)).min(i64::from(monitor_x) + i64::from(monitor_width));
+    let right = (i64::from(tab.x) + i64::from(tab.width))
+        .min(i64::from(monitor_x) + i64::from(monitor_width));
     let bottom = (i64::from(tab.y) + i64::from(tab.height))
         .min(i64::from(monitor_y) + i64::from(monitor_height));
     if right <= left || bottom <= top {
@@ -311,7 +317,10 @@ mod tests {
             width: 800,
             height: 600,
         };
-        assert_eq!(monitor_region(tab, 0, 0, 1920, 1080), Some((0, 0, 600, 550)));
+        assert_eq!(
+            monitor_region(tab, 0, 0, 1920, 1080),
+            Some((0, 0, 600, 550))
+        );
         let far_right = ScreenRect {
             x: 1800,
             y: 900,

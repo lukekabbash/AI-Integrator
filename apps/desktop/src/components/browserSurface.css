@@ -31,6 +31,13 @@
 .browser-chrome .icon-button:not(:disabled):hover {
   background: color-mix(in srgb, var(--color-selection-text) 14%, transparent);
 }
+/* A control with nothing to act on yet — a new tab's history and actions —
+   keeps its place at a third of the strip's ink, so the strip is the same
+   shape before and after the first page. */
+.browser-chrome .icon-button:disabled {
+  color: color-mix(in srgb, var(--color-selection-text) 34%, transparent);
+  cursor: default;
+}
 .browser-chrome-history,
 .browser-chrome-actions {
   flex: none;
@@ -51,38 +58,205 @@
   display: flex;
   align-items: center;
 }
-.browser-address input {
-  width: 100%;
-  min-width: 0;
-  height: 26px;
-  padding: 0 26px 0 10px;
-  border: 1px solid color-mix(in srgb, var(--color-border-base) 70%, transparent);
-  border-radius: var(--radius-control);
-  background: var(--color-layer-1);
-  color: var(--color-text-primary);
-  font-size: 11px;
-  font-family: inherit;
-}
-.browser-address input:hover {
-  border-color: var(--color-border-strong);
-}
-.browser-address input:focus {
-  outline: none;
-  border-color: var(--color-border-strong);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-accent) 14%, transparent);
-}
-.browser-address input::placeholder {
-  color: var(--color-text-tertiary);
-}
 .browser-address-external {
-  position: absolute;
-  right: 3px;
   opacity: 0;
   transition: opacity var(--duration-fast) var(--ease-standard);
 }
 .browser-address:hover .browser-address-external,
 .browser-address:focus-within .browser-address-external {
   opacity: 1;
+}
+
+.browser-omnibox {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.browser-omnibox-field {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  height: 28px;
+  padding: 0 6px 0 8px;
+  border: 1px solid color-mix(in srgb, var(--color-border-base) 70%, transparent);
+  border-radius: var(--radius-control);
+  background: var(--color-layer-1);
+  transition:
+    border-color var(--duration-fast) var(--ease-standard),
+    box-shadow var(--duration-fast) var(--ease-standard);
+}
+.browser-omnibox[data-size="hero"] .browser-omnibox-field {
+  height: 48px;
+  padding: 0 14px 0 18px;
+  border-radius: var(--radius-lg);
+}
+.browser-omnibox-field:hover {
+  border-color: var(--color-border-strong);
+}
+.browser-omnibox[data-open="true"] .browser-omnibox-field,
+.browser-omnibox-field:focus-within {
+  border-color: var(--color-border-strong);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-accent) 14%, transparent);
+}
+.browser-omnibox-leading {
+  flex: none;
+  display: grid;
+  place-items: center;
+  color: var(--color-text-tertiary);
+}
+.browser-omnibox-leading svg {
+  width: 13px;
+  height: 13px;
+  stroke-width: 1.8;
+}
+.browser-omnibox[data-size="hero"] .browser-omnibox-leading svg {
+  width: 16px;
+  height: 16px;
+}
+.browser-omnibox-field input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-text-primary);
+  font: inherit;
+  font-size: 11.5px;
+}
+.browser-omnibox[data-size="hero"] .browser-omnibox-field input {
+  font-size: 14px;
+  letter-spacing: -0.015em;
+}
+.browser-omnibox-field input:focus {
+  outline: none;
+}
+.browser-omnibox-field input::placeholder {
+  color: var(--color-text-tertiary);
+}
+.browser-omnibox-engine {
+  flex: none;
+  max-width: 7.5em;
+  overflow: hidden;
+  color: var(--color-text-tertiary);
+  font-size: 10px;
+  font-weight: 620;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.browser-omnibox-engine[data-quiet="true"] {
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+}
+.browser-omnibox[data-size="hero"] .browser-omnibox-engine {
+  padding: 3px 7px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--color-layer-2) 80%, transparent);
+  color: var(--color-text-secondary);
+}
+.browser-omnibox-clear svg {
+  width: 12px;
+  height: 12px;
+}
+.browser-omnibox-star[data-on="true"] {
+  color: var(--color-accent);
+}
+.browser-omnibox-star[data-on="true"] svg {
+  fill: currentColor;
+}
+.browser-omnibox-list {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  left: 0;
+  z-index: 40;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-panel);
+  background: var(--color-surface-elevated, var(--color-layer-2));
+  box-shadow: var(--shadow-elevated);
+}
+.browser-omnibox-list button {
+  width: 100%;
+  min-height: 34px;
+  padding: 5px 8px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 0;
+  border-radius: var(--radius-row);
+  background: transparent;
+  color: var(--color-text-secondary);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+.browser-omnibox-list button[data-active="true"],
+.browser-omnibox-list button:hover {
+  color: var(--color-text-primary);
+  background: color-mix(in srgb, var(--color-layer-2) 72%, transparent);
+}
+.browser-omnibox-list button > span:nth-child(2) {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.browser-omnibox-list strong {
+  overflow: hidden;
+  color: var(--color-text-primary);
+  font-size: 12px;
+  font-weight: 560;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.browser-omnibox-list mark {
+  background: color-mix(in srgb, var(--color-accent) 22%, transparent);
+  color: inherit;
+  border-radius: 2px;
+}
+.browser-omnibox-list small {
+  overflow: hidden;
+  color: var(--color-text-tertiary);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.browser-omnibox-list em {
+  flex: none;
+  color: var(--color-text-tertiary);
+  font-size: 9.5px;
+  font-style: normal;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.browser-omnibox-mark {
+  width: 22px;
+  height: 22px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius-control);
+  color: var(--color-text-tertiary);
+  background: color-mix(in srgb, var(--color-layer-2) 70%, transparent);
+}
+.browser-omnibox-mark[data-kind="search"] {
+  color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+}
+.browser-omnibox-mark[data-kind="server"] {
+  color: var(--color-accent);
+}
+.browser-omnibox-mark svg,
+.browser-omnibox-mark .tab-favicon {
+  width: 14px;
+  height: 14px;
 }
 
 .browser-record[data-recording="true"] {
@@ -109,7 +283,7 @@
   position: absolute;
   top: calc(100% + 6px);
   right: 0;
-  z-index: 30;
+  z-index: 40;
   min-width: 210px;
   padding: 4px;
   display: flex;
@@ -139,12 +313,18 @@
 }
 
 .browser-message {
+  position: relative;
+  z-index: 0;
   flex: none;
+  min-width: 0;
   margin: 0;
   padding: 6px 10px;
+  overflow: hidden;
   border-bottom: 1px solid var(--color-border-subtle);
   color: var(--color-text-secondary);
   font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* The native tab is painted over this rectangle. */
@@ -154,20 +334,6 @@
   min-height: 0;
   overflow: hidden;
   background: color-mix(in srgb, var(--color-layer-1) 60%, var(--color-canvas));
-}
-/* The native page starts a few pixels in, to clear the seam. Those pixels are
-   part of the browser, so they carry the chrome's fill straight down the edge
-   instead of showing the recess through as a line beside the page. */
-.browser-viewport::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 0;
-  z-index: 2;
-  width: var(--browser-seam, 0px);
-  background: var(--color-selection-active);
-  pointer-events: none;
 }
 /* The still under the native page. Anchored top-left because that is the
    corner a page and its picture agree on whatever the slot has been resized
@@ -231,28 +397,339 @@
   }
 }
 
-/* Start page — what a blank tab offers. Quiet rows in the launcher's idiom,
-   not cards: the port badge carries the identity, the row carries the hit. */
+
+/* Start page — the new tab. One column, centred, on a soft accent glow that
+   fades into the canvas. `home` is the full page inside a browser surface;
+   `compact` is the same page scaled to the narrow launcher. Rows keep the
+   launcher's idiom: a mark carries the identity, the row carries the hit. */
 .browser-start {
   position: absolute;
   inset: 0;
-  padding: 18px 16px 22px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
   overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--color-canvas);
+}
+.browser-start-glow {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: min(52vh, 420px);
+  pointer-events: none;
+  background: radial-gradient(
+    ellipse 70% 100% at 50% -10%,
+    color-mix(in srgb, var(--color-accent) 8%, transparent),
+    color-mix(in srgb, var(--color-accent) 2%, transparent) 55%,
+    transparent 100%
+  );
+}
+.browser-start[data-layout="compact"] .browser-start-glow {
+  height: 220px;
+  background: radial-gradient(
+    ellipse 90% 100% at 50% -20%,
+    color-mix(in srgb, var(--color-accent) 6%, transparent),
+    transparent 100%
+  );
+}
+.browser-start-body {
+  position: relative;
+  width: 100%;
+  min-height: 0;
+  /* Sits a little below the strip rather than against it: the pane is a
+     browser's new tab, and a new tab breathes before it offers anything. */
+  padding: clamp(28px, 9vh, 72px) 18px 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+.browser-start[data-layout="home"] .browser-start-body {
+  width: min(760px, 100%);
+  margin: 0 auto;
+  padding: max(48px, 12vh) 28px 48px;
+  gap: 32px;
+}
+
+/* Quiet controls that belong to the page — the launcher's Review. */
+.browser-start-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 4px;
+  margin-bottom: -6px;
+}
+
+/* Hero: the mark, the wordmark, the search. */
+.browser-start-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
+.browser-start[data-layout="home"] .browser-start-hero {
+  gap: 26px;
+}
+.browser-start[data-layout="compact"] .browser-start-hero {
+  gap: 18px;
+}
+.browser-start[data-layout="home"] .browser-start-hero .browser-omnibox {
+  width: min(640px, 100%);
+  flex: none;
+}
+.browser-start[data-layout="compact"] .browser-start-hero .browser-omnibox {
+  width: 100%;
+  flex: none;
+}
+.browser-start-brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+}
+.browser-start-brand-glyph {
+  width: 26px;
+  height: 21px;
+}
+.browser-start[data-layout="home"] .browser-start-brand-glyph {
+  width: 40px;
+  height: 32px;
+  opacity: 1;
+}
+.browser-start-wordmark {
+  margin: 0;
+  color: var(--color-text-primary);
+  font-size: 18px;
+  font-weight: 560;
+  letter-spacing: -0.03em;
+  line-height: 1;
+}
+.browser-start[data-layout="home"] .browser-start-wordmark {
+  font-size: 26px;
+}
+
+/* Hero omnibox: taller, pill-shaped, lifted off the glow. */
+.browser-omnibox[data-size="hero"] .browser-omnibox-field {
+  height: 52px;
+  padding: 0 10px 0 20px;
+  gap: 8px;
+  border-color: var(--color-border-subtle);
+  border-radius: var(--radius-full);
+  box-shadow: var(--shadow-elevated, 0 8px 28px color-mix(in srgb, black 18%, transparent));
+}
+.browser-omnibox[data-size="hero"] .browser-omnibox-field:hover {
+  border-color: var(--color-border-base);
+}
+.browser-omnibox[data-size="hero"][data-open="true"] .browser-omnibox-field,
+.browser-omnibox[data-size="hero"] .browser-omnibox-field:focus-within {
+  border-color: color-mix(in srgb, var(--color-accent) 40%, var(--color-border-subtle));
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--color-accent) 18%, transparent),
+    var(--shadow-elevated, 0 8px 28px color-mix(in srgb, black 18%, transparent));
+}
+.browser-omnibox[data-size="hero"] .browser-omnibox-list {
+  top: calc(100% + 8px);
+  padding: 6px;
+}
+/* The launcher's chrome-sized field, one step calmer than the toolbar's. */
+.browser-start[data-layout="compact"] .browser-omnibox-field {
+  height: 42px;
+  padding: 0 8px 0 16px;
+  gap: 8px;
+  border-color: var(--color-border-subtle);
+  border-radius: var(--radius-full);
+  box-shadow: 0 6px 20px color-mix(in srgb, black 14%, transparent);
+}
+.browser-start[data-layout="compact"] .browser-omnibox-field input {
+  font-size: 12.5px;
+}
+.browser-start[data-layout="compact"] .browser-omnibox-leading svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* Bookmarks: shortcut tiles. */
+.browser-start[data-layout="home"] .browser-start-bookmarks,
+.browser-start[data-layout="home"] .browser-start-columns {
+  width: 100%;
+}
+.browser-start-tiles {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(76px, 1fr));
+  justify-content: center;
+  gap: 8px 4px;
+}
+.browser-start[data-layout="home"] .browser-start-tiles {
+  grid-template-columns: repeat(auto-fit, minmax(96px, 96px));
+  gap: 12px 8px;
+}
+.browser-start-tiles li {
+  position: relative;
+  display: flex;
+  justify-content: center;
+}
+.browser-start-tiles li > button:first-child,
+.browser-start-tile-ghost {
+  width: 100%;
+  min-width: 0;
+  padding: 8px 4px 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-panel);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font: inherit;
+  text-align: center;
+  cursor: pointer;
+  transition:
+    background var(--duration-fast) var(--ease-standard),
+    color var(--duration-fast) var(--ease-standard);
+}
+.browser-start-tile-ghost {
+  cursor: default;
+  color: var(--color-text-tertiary);
+}
+.browser-start-tile-mark {
+  width: 56px;
+  height: 56px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-full);
+  background: var(--color-layer-1);
+  color: var(--color-text-tertiary);
+  transition:
+    background var(--duration-fast) var(--ease-standard),
+    border-color var(--duration-fast) var(--ease-standard),
+    transform var(--duration-moderate) var(--ease-emphasized),
+    box-shadow var(--duration-fast) var(--ease-standard);
+}
+.browser-start[data-layout="home"] .browser-start-tile-mark {
+  width: 64px;
+  height: 64px;
+}
+.browser-start-tile-mark svg,
+.browser-start-tile-mark .tab-favicon {
+  width: 18px;
+  height: 18px;
+  stroke-width: 1.7;
+}
+.browser-start-tile-ghost .browser-start-tile-mark {
+  border-style: dashed;
+  background: transparent;
+}
+.browser-start-tile-label {
+  max-width: 100%;
+  overflow: hidden;
+  font-size: 11px;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.browser-start-tiles li > button:first-child:hover {
+  color: var(--color-text-primary);
+}
+.browser-start-tiles li > button:first-child:hover .browser-start-tile-mark,
+.browser-start-tiles li > button:first-child:focus-visible .browser-start-tile-mark {
+  background: var(--color-layer-2);
+  border-color: var(--color-border-strong);
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px color-mix(in srgb, black 14%, transparent);
+}
+.browser-start-tiles li > button:first-child:active .browser-start-tile-mark {
+  transform: translateY(0) scale(0.97);
+}
+.browser-start-tiles li > button:first-child:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+.browser-start-unpin,
+.browser-start-pin {
+  width: 22px;
+  height: 22px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--color-text-tertiary);
+  cursor: pointer;
+}
+.browser-start-tiles .browser-start-unpin {
+  position: absolute;
+  top: 0;
+  right: 6px;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-full);
+  background: var(--color-layer-2);
+  border: 1px solid var(--color-border-subtle);
+  opacity: 0;
+  transform: scale(0.8);
+  transition:
+    opacity var(--duration-fast) var(--ease-standard),
+    transform var(--duration-fast) var(--ease-emphasized);
+}
+.browser-start[data-layout="home"] .browser-start-tiles .browser-start-unpin {
+  right: 10px;
+}
+.browser-start-tiles li:hover .browser-start-unpin,
+.browser-start-tiles li:focus-within .browser-start-unpin {
+  opacity: 1;
+  transform: scale(1);
+}
+.browser-start-unpin:hover,
+.browser-start-pin:hover {
+  color: var(--color-text-primary);
+}
+.browser-start-pin svg,
+.browser-start-unpin svg {
+  width: 12px;
+  height: 12px;
+  stroke-width: 1.8;
+}
+.browser-start-tiles .browser-start-unpin svg {
+  width: 10px;
+  height: 10px;
+  stroke-width: 2;
+}
+
+/* Sections: recently opened, local servers. */
+.browser-start-columns {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.browser-start[data-layout="home"] .browser-start-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 24px 32px;
+}
+.browser-start[data-layout="home"] .browser-start-columns > section:only-child {
+  grid-column: 1 / -1;
+  width: min(480px, 100%);
+  margin: 0 auto;
 }
 .browser-start section {
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 4px;
 }
 .browser-start-eyebrow {
   height: 26px;
+  padding: 0 2px;
   display: flex;
   align-items: center;
   gap: 7px;
-  color: color-mix(in srgb, var(--color-text-tertiary) 88%, transparent);
+  color: var(--color-text-tertiary);
   font-size: 10px;
   font-weight: 650;
   letter-spacing: 0.07em;
@@ -278,9 +755,14 @@
   flex-direction: column;
   gap: 2px;
 }
-.browser-start-list button {
+.browser-start-list li {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.browser-start-list li > button:first-child {
   width: 100%;
-  min-height: 44px;
+  min-height: 42px;
   padding: 6px 10px;
   display: flex;
   align-items: center;
@@ -296,19 +778,19 @@
     background var(--duration-fast) var(--ease-standard),
     border-color var(--duration-fast) var(--ease-standard);
 }
-.browser-start-list button:hover {
+.browser-start-list li > button:first-child:hover {
   color: var(--color-text-primary);
   background: color-mix(in srgb, var(--color-accent) 8%, transparent);
   border-color: color-mix(in srgb, var(--color-accent) 55%, transparent);
 }
-.browser-start-list button:focus-visible {
+.browser-start-list li > button:first-child:focus-visible {
   outline: 2px solid var(--color-focus-ring);
   outline-offset: 2px;
 }
-.browser-start-list button[data-quiet="true"] {
+.browser-start-list li > button:first-child[data-quiet="true"] {
   opacity: 0.72;
 }
-.browser-start-list button > span:last-child {
+.browser-start-list li > button:first-child > span:last-child {
   min-width: 0;
   display: flex;
   flex-direction: column;
@@ -326,14 +808,14 @@
 .browser-start-list small {
   overflow: hidden;
   color: var(--color-text-tertiary);
-  font-size: 9.5px;
+  font-size: 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
 }
 .browser-start-mark {
-  width: 32px;
-  height: 26px;
+  width: 28px;
+  height: 24px;
   flex: none;
   display: grid;
   place-items: center;
@@ -347,7 +829,8 @@
   background: color-mix(in srgb, var(--color-accent) 12%, var(--color-layer-1));
   color: var(--color-accent);
 }
-.browser-start-mark svg {
+.browser-start-mark svg,
+.browser-start-mark .tab-favicon {
   width: 14px;
   height: 14px;
   stroke-width: 1.7;
@@ -378,4 +861,17 @@
 }
 .browser-start-more:hover {
   color: var(--color-text-secondary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .browser-start-tile-mark,
+  .browser-start-tiles .browser-start-unpin,
+  .browser-start-tiles li > button:first-child,
+  .browser-start-list li > button:first-child {
+    transition: none;
+  }
+  .browser-start-tiles li > button:first-child:hover .browser-start-tile-mark,
+  .browser-start-tiles li > button:first-child:active .browser-start-tile-mark {
+    transform: none;
+  }
 }

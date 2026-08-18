@@ -813,12 +813,18 @@ fn antigravity_inventory_has_models(stdout: &str) -> bool {
     fn inventory_entry_is_model(value: &serde_json::Value) -> bool {
         match value {
             serde_json::Value::String(model) => model_shape(model),
-            serde_json::Value::Object(object) => {
-                ["id", "slug", "model", "name", "displayName", "display_name"]
-                    .iter()
-                    .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
-                    .is_some_and(model_shape)
-            }
+            serde_json::Value::Object(object) => [
+                "label",
+                "displayName",
+                "display_name",
+                "name",
+                "id",
+                "slug",
+                "model",
+            ]
+            .iter()
+            .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
+            .is_some_and(model_shape),
             _ => false,
         }
     }
@@ -827,7 +833,7 @@ fn antigravity_inventory_has_models(stdout: &str) -> bool {
         match value {
             serde_json::Value::String(model) => model_shape(model),
             serde_json::Value::Array(models) => models.iter().any(inventory_entry_is_model),
-            serde_json::Value::Object(object) => ["models", "data", "items"]
+            serde_json::Value::Object(object) => ["models", "data", "items", "command"]
                 .iter()
                 .filter_map(|key| object.get(*key))
                 .any(inventory_value_has_models),
@@ -1435,6 +1441,7 @@ esac
         for inventory in [
             r#"{"models":[{"name":"Gemini 3.5 Flash (Medium)"},{"name":"Claude Sonnet 4.6 (Thinking)"}]}"#,
             r#"{"models":"Gemini 3.5 Flash"}"#,
+            r#"{"status":"SUCCESS","command":{"name":"models","data":{"models":[{"id":"gemini-3.7-flash-high","label":"Gemini 3.7 Flash (High)"}]}}}"#,
         ] {
             let (state, code) = parse_antigravity_model_auth(true, inventory, "");
             assert_eq!(state, AuthenticationState::Authenticated);
@@ -1467,7 +1474,12 @@ esac
             (true, r#"{"models":["Gemini 3:"]}"#, ""),
             (
                 true,
-                r#"{"models":[{"id":"error","name":"Gemini 3.5 Flash"}]}"#,
+                r#"{"models":[{"id":"error","label":"not a model"}]}"#,
+                "",
+            ),
+            (
+                true,
+                r#"{"status":"SUCCESS","command":{"name":"models","data":{"models":[]}}}"#,
                 "",
             ),
             (true, "Update available", ""),

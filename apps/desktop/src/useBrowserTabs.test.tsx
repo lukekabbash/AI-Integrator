@@ -197,6 +197,75 @@ describe("useBrowserTabs task isolation", () => {
     }
   });
 
+  it("turns a picked element into an annotation crop and block for the composer", async () => {
+    const taskTabs = [tab("task-a", "tab-a")];
+    mocks.browser.restore.mockResolvedValue(taskTabs);
+    mocks.browser.list.mockResolvedValue(taskTabs);
+    mocks.browser.subscribe.mockResolvedValue(() => undefined);
+    mocks.browser.screenshot.mockResolvedValue("iVBORw0KGgo=");
+    let attached = false;
+    mocks.browser.invoke.mockClear();
+    mocks.browser.invoke.mockImplementation(async (_task: string, _tab: string, method: string) => {
+      if (method !== "pickResult") return null;
+      if (!attached) return { picking: true, picked: null, comment: "", cancelled: false };
+      attached = false;
+      return {
+        picking: false,
+        picked: { ref: "e1", tag: "button", role: "button", name: "Sign in", selector: "#signin" },
+        comment: "",
+        cancelled: false,
+      };
+    });
+    const images: string[] = [];
+    const inserted: string[] = [];
+    const host: BrowserHost = {
+      attachImage: async (_file, name) => {
+        images.push(name);
+      },
+      insertText: (text) => {
+        inserted.push(text);
+      },
+    };
+    let controller: BrowserController | undefined;
+    render(
+      <Probe
+        taskId="task-a"
+        host={host}
+        onController={(next) => {
+          controller = next;
+        }}
+      />,
+    );
+    await screen.findByText("tab-a");
+    await act(async () => {
+      await controller?.toggleAnnotate("tab-a");
+    });
+    await waitFor(() => expect(controller?.annotatingTabId).toBe("tab-a"));
+    attached = true;
+    await waitFor(() => expect(inserted).toHaveLength(1), { timeout: 3000 });
+    await waitFor(() => expect(images).toEqual(["Annotation · Sign in.png"]));
+    expect(inserted[0]).toContain("<browser_annotation>");
+    expect(inserted[0]).toContain('name="Sign in"');
+    // The picker re-arms for the next element instead of dropping the mode.
+    await waitFor(() =>
+      expect(
+        mocks.browser.invoke.mock.calls
+          .map((call) => call[2])
+          .filter((method) => method !== "pickResult" && method !== "setTheme"),
+      ).toEqual(["startPick", "annotate", "clearAnnotations", "startPick"]),
+    );
+    await waitFor(() => expect(controller?.annotatingTabId).toBe("tab-a"));
+    // A second pick lands as a second chip.
+    attached = true;
+    await waitFor(() => expect(inserted).toHaveLength(2), { timeout: 3000 });
+    // Toggling the toolbar button ends the session.
+    await act(async () => {
+      await controller?.toggleAnnotate("tab-a");
+    });
+    expect(controller?.annotatingTabId).toBeNull();
+    expect(mocks.browser.invoke).toHaveBeenCalledWith("task-a", "tab-a", "cancelPick");
+  });
+
   it("labels a delayed capture with the task that requested it", async () => {
     const taskA = [tab("task-a", "tab-a")];
     const taskB = [tab("task-b", "tab-b")];

@@ -182,9 +182,11 @@ impl GitService {
                 let path = path.replace('\\', "/");
                 let path = path.trim_end_matches('/');
                 tracked.contains(path)
-                    || tracked
-                        .iter()
-                        .any(|entry| entry.strip_prefix(path).is_some_and(|rest| rest.starts_with('/')))
+                    || tracked.iter().any(|entry| {
+                        entry
+                            .strip_prefix(path)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                    })
             });
         if !tracked_paths.is_empty() {
             let mut args = vec!["add", "--update", "--"];

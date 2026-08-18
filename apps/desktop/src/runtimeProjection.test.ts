@@ -721,6 +721,83 @@ describe("runtime projection reducer", () => {
     expect(runtimeTranscript(scheduled)[0].title).toBe("Wake-up scheduled");
   });
 
+  it("labels a browser screenshot as viewing an image", () => {
+    const png =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const running = applyRuntimeProjection(
+      createRuntimeProjectionState("task-1"),
+      event(55, {
+        kind: "itemChanged",
+        item: {
+          id: "codex:thread-1:turn-1:shot",
+          providerItemId: "shot",
+          kind: "mcpTool",
+          status: "inProgress",
+          mcpServer: "integrator",
+          mcpTool: "browser_screenshot",
+          toolInput: '{"tabId":"tab-1"}',
+          truncated: false,
+          updatedAt: "2026-07-10T16:00:00Z",
+        },
+      }),
+    );
+    expect(runtimeTranscript(running)[0]).toMatchObject({
+      title: "Viewing image",
+      body: "",
+    });
+
+    const completed = applyRuntimeProjection(
+      running,
+      event(56, {
+        kind: "itemChanged",
+        item: {
+          id: "codex:thread-1:turn-1:shot",
+          providerItemId: "shot",
+          kind: "mcpTool",
+          status: "completed",
+          mcpServer: "integrator",
+          mcpTool: "browser_screenshot",
+          toolInput: '{"tabId":"tab-1"}',
+          output: JSON.stringify({
+            content: [
+              { type: "text", text: '{"width":1280}' },
+              { type: "image", data: png, mimeType: "image/png" },
+            ],
+          }),
+          truncated: false,
+          updatedAt: "2026-07-10T16:00:01Z",
+        },
+      }),
+    );
+    expect(runtimeTranscript(completed)[0]).toMatchObject({
+      title: "Viewed image",
+      body: "",
+    });
+  });
+
+  it("labels reading a picture file as viewing an image", () => {
+    const state = applyRuntimeProjection(
+      createRuntimeProjectionState("task-1"),
+      event(57, {
+        kind: "itemChanged",
+        item: {
+          id: "codex:thread-1:turn-1:photo",
+          providerItemId: "photo",
+          kind: "mcpTool",
+          status: "completed",
+          mcpTool: "read",
+          toolInput: '{"path":"docs/checkout.png"}',
+          truncated: false,
+          updatedAt: "2026-07-10T16:00:00Z",
+        },
+      }),
+    );
+    expect(runtimeTranscript(state)[0]).toMatchObject({
+      title: "Viewed image",
+      body: "docs/checkout.png",
+    });
+  });
+
   it("turns file tools into readable paths with diff-style line counts", () => {
     const state = applyRuntimeProjection(
       createRuntimeProjectionState("task-1"),

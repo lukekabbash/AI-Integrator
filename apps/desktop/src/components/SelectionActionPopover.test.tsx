@@ -4,7 +4,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DiffFile } from "../bridge";
 import { DiffView } from "./DiffView";
-import { splitAttachmentBlock } from "./conversationFormatting";
+import { splitAttachmentBlock, splitSentUserMessage } from "./conversationFormatting";
 
 const file: DiffFile = {
   path: "src/lib.rs",
@@ -100,5 +100,24 @@ describe("sent-message attachment parsing", () => {
       attachments: ["/tmp/a.txt"],
     });
     expect(splitAttachmentBlock("just text")).toEqual({ text: "just text", attachments: [] });
+  });
+
+  it("splits annotation markup after the attachment block", () => {
+    const annotation = [
+      "<browser_annotation>",
+      "Page: Checkout",
+      "URL: http://localhost:3773/checkout",
+      'Element: <button> role=button name="Sign in"',
+      "Selector: #signin",
+      "Note:",
+      "make this a button",
+      "</browser_annotation>",
+    ].join("\n");
+    const body = `fix the button\n\nAttached files:\n- /tmp/Annotation · Sign in.png\n\n${annotation}`;
+    expect(splitSentUserMessage(body)).toMatchObject({
+      text: "fix the button",
+      attachments: ["/tmp/Annotation · Sign in.png"],
+      annotations: [expect.objectContaining({ label: "Sign in", note: "make this a button" })],
+    });
   });
 });

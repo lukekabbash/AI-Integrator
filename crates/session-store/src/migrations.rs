@@ -939,4 +939,13 @@ pub(super) const MIGRATIONS: &[(i64, &str)] = &[
         );
         "#,
     ),
+    (
+        26,
+        r#"
+        -- A remembered tab keeps its site icon (a small data: URL) so the
+        -- strip shows icons before any page has loaded. Nullable: older rows
+        -- and sites without an icon have none.
+        ALTER TABLE browser_tabs ADD COLUMN favicon TEXT;
+        "#,
+    ),
 ];

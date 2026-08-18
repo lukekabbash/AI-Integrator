@@ -21,10 +21,12 @@ describe("ResizeHandle", () => {
 
     fireEvent.pointerDown(separator, { clientX: 100 });
     expect(document.body).toHaveAttribute("data-resizing", "true");
+    expect(separator).toHaveAttribute("data-resizing", "true");
     fireEvent.pointerMove(window, { clientX: 124 });
     expect(onResize).toHaveBeenCalledWith(24);
     fireEvent.pointerUp(window);
     expect(document.body).not.toHaveAttribute("data-resizing");
+    expect(separator).not.toHaveAttribute("data-resizing");
 
     fireEvent.keyDown(separator, { key: "ArrowLeft" });
     fireEvent.keyDown(separator, { key: "ArrowRight" });
@@ -104,6 +106,7 @@ describe("ResizeHandle", () => {
 
     fireEvent.lostPointerCapture(separator, { pointerId: 7 });
     expect(document.body).not.toHaveAttribute("data-resizing");
+    expect(separator).not.toHaveAttribute("data-resizing");
     expect(releasePointerCapture).not.toHaveBeenCalled();
   });
 
@@ -126,5 +129,25 @@ describe("ResizeHandle", () => {
     expect(setPointerCapture).toHaveBeenCalledWith(11);
     expect(releasePointerCapture).toHaveBeenCalledWith(11);
     expect(document.body).not.toHaveAttribute("data-resizing");
+  });
+
+  it("marks only the handle being dragged", () => {
+    render(
+      <>
+        <ResizeHandle axis="horizontal" label="Resize tools" onResize={vi.fn()} />
+        <ResizeHandle axis="horizontal" label="Resize work pane" onResize={vi.fn()} />
+      </>,
+    );
+    const tools = screen.getByRole("separator", { name: "Resize tools" });
+    const pane = screen.getByRole("separator", { name: "Resize work pane" });
+
+    fireEvent.pointerDown(tools, { clientX: 100 });
+    expect(tools).toHaveAttribute("data-resizing", "true");
+    expect(pane).not.toHaveAttribute("data-resizing");
+    expect(document.body).toHaveAttribute("data-resizing", "true");
+
+    fireEvent.pointerUp(window);
+    expect(tools).not.toHaveAttribute("data-resizing");
+    expect(pane).not.toHaveAttribute("data-resizing");
   });
 });

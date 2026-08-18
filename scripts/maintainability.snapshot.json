@@ -7,119 +7,135 @@
   "exceptions": [
     {
       "path": "apps/desktop/src/styles.css",
-      "maxLines": 16814
+      "maxLines": 17201
     },
     {
       "path": "apps/desktop/src-tauri/src/commands.rs",
-      "maxLines": 9577
+      "maxLines": 9828
     },
     {
       "path": "apps/desktop/src/App.tsx",
-      "maxLines": 7708
-    },
-    {
-      "path": "apps/desktop/src/components/SettingsView.tsx",
-      "maxLines": 5431
+      "maxLines": 7796
     },
     {
       "path": "apps/desktop/src/bridge.ts",
-      "maxLines": 7285
+      "maxLines": 7674
+    },
+    {
+      "path": "apps/desktop/src/components/SettingsView.tsx",
+      "maxLines": 5463
     },
     {
       "path": "apps/desktop/src-tauri/src/delegation.rs",
-      "maxLines": 4820
+      "maxLines": 4919
+    },
+    {
+      "path": "apps/desktop/src/bridge.test.ts",
+      "maxLines": 3444
+    },
+    {
+      "path": "apps/desktop/src/App.runtime.test.tsx",
+      "maxLines": 3307
     },
     {
       "path": "apps/desktop/src/components/RightRail.tsx",
       "maxLines": 3249
     },
     {
-      "path": "apps/desktop/src/App.runtime.test.tsx",
-      "maxLines": 3295
-    },
-    {
-      "path": "apps/desktop/src/bridge.test.ts",
-      "maxLines": 2768
+      "path": "apps/desktop/src/components/Transcript.tsx",
+      "maxLines": 2632
     },
     {
       "path": "crates/session-store/src/tests.rs",
-      "maxLines": 2541
-    },
-    {
-      "path": "apps/desktop/src/components/Transcript.tsx",
-      "maxLines": 2435
+      "maxLines": 2548
     },
     {
       "path": "apps/desktop/src/runtimeProjection.test.ts",
-      "maxLines": 2227
+      "maxLines": 2304
     },
     {
       "path": "apps/desktop/src/components/Composer.tsx",
-      "maxLines": 2135
+      "maxLines": 2270
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/commands_tests.rs",
+      "maxLines": 1983
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/integrator_mcp.rs",
+      "maxLines": 1950
     },
     {
       "path": "apps/desktop/src/theme.ts",
       "maxLines": 1918
     },
     {
-      "path": "crates/session-store/src/projection_store/tests.rs",
-      "maxLines": 1803
-    },
-    {
       "path": "apps/desktop/src/components/TaskSidebar.tsx",
       "maxLines": 1879
     },
     {
-      "path": "crates/adapter-acp/src/lib.rs",
-      "maxLines": 1535
+      "path": "crates/session-store/src/projection_store/tests.rs",
+      "maxLines": 1803
     },
     {
       "path": "apps/desktop/src/components/Transcript.test.tsx",
-      "maxLines": 1447
+      "maxLines": 1597
     },
     {
-      "path": "apps/desktop/src-tauri/src/integrator_mcp.rs",
-      "maxLines": 1433
+      "path": "apps/desktop/src/components/ScheduledView.tsx",
+      "maxLines": 1582
+    },
+    {
+      "path": "crates/adapter-acp/src/lib.rs",
+      "maxLines": 1536
+    },
+    {
+      "path": "crates/integrator-runtime/src/providers.rs",
+      "maxLines": 1493
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/mcp_oauth.rs",
+      "maxLines": 1442
     },
     {
       "path": "apps/desktop/src/runtimeProjection.ts",
-      "maxLines": 1409
+      "maxLines": 1429
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/integrator_skills.rs",
+      "maxLines": 1395
     },
     {
       "path": "crates/adapter-codex/src/lib.rs",
-      "maxLines": 1336
-    },
-    {
-      "path": "apps/desktop/src-tauri/src/commands_tests.rs",
-      "maxLines": 1791
+      "maxLines": 1353
     },
     {
       "path": "apps/desktop/src/components/SubagentsSettings.tsx",
       "maxLines": 1292
     },
     {
-      "path": "crates/integrator-runtime/src/providers.rs",
-      "maxLines": 1107
+      "path": "apps/desktop/src-tauri/src/chat_title.rs",
+      "maxLines": 1224
     },
     {
       "path": "crates/integrator-core/src/domain.rs",
       "maxLines": 1195
     },
     {
-      "path": "apps/desktop/src-tauri/src/integrator_skills.rs",
-      "maxLines": 1375
+      "path": "apps/desktop/src-tauri/src/browser/mod.rs",
+      "maxLines": 1148
     },
     {
-      "path": "apps/desktop/src-tauri/src/chat_title.rs",
-      "maxLines": 1219
+      "path": "apps/desktop/src-tauri/src/browser/vault.rs",
+      "maxLines": 1148
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/antigravity_hooks.rs",
+      "maxLines": 1103
     },
     {
       "path": "apps/desktop/src/components/FileView.tsx",
       "maxLines": 1089
-    },
-    {
-      "path": "apps/desktop/src-tauri/src/mcp_oauth.rs",
-      "maxLines": 1077
     },
     {
       "path": "crates/session-store/src/delegation_store.rs",
@@ -130,8 +146,12 @@
       "maxLines": 1045
     },
     {
-      "path": "apps/desktop/src/components/ScheduledView.tsx",
-      "maxLines": 1582
+      "path": "apps/desktop/src-tauri/src/browser/sites.rs",
+      "maxLines": 1042
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/dev_server/mod.rs",
+      "maxLines": 1003
     }
   ],
   "allowedBridgeImports": [
@@ -140,6 +160,7 @@
     "apps/desktop/src/autoReviewSettings.ts",
     "apps/desktop/src/automationTranscript.ts",
     "apps/desktop/src/automationTurnPrompt.ts",
+    "apps/desktop/src/browserClosePolicy.ts",
     "apps/desktop/src/commitMessageSettings.ts",
     "apps/desktop/src/components/AgentGlyph.tsx",
     "apps/desktop/src/components/BrowserDeck.tsx",
@@ -154,6 +175,7 @@
     "apps/desktop/src/components/DiffView.tsx",
     "apps/desktop/src/components/FileView.tsx",
     "apps/desktop/src/components/GitRemoteDialog.tsx",
+    "apps/desktop/src/components/MarkdownImage.tsx",
     "apps/desktop/src/components/McpActivationDialog.tsx",
     "apps/desktop/src/components/PermissionsSettings.tsx",
     "apps/desktop/src/components/ReviewSurface.tsx",
@@ -170,15 +192,15 @@
     "apps/desktop/src/components/Transcript.tsx",
     "apps/desktop/src/components/UsageSettings.tsx",
     "apps/desktop/src/components/WorkPane.tsx",
-    "apps/desktop/src/components/commitGraphModel.ts",
-    "apps/desktop/src/browserClosePolicy.ts",
     "apps/desktop/src/components/browserDeckModel.ts",
     "apps/desktop/src/components/browserWindowTabs.ts",
+    "apps/desktop/src/components/commitGraphModel.ts",
     "apps/desktop/src/components/composerModel.ts",
     "apps/desktop/src/components/fileViewSupport.ts",
     "apps/desktop/src/components/nativeActionCache.ts",
     "apps/desktop/src/components/taskSidebarModel.ts",
     "apps/desktop/src/components/transcriptEventIndex.ts",
+    "apps/desktop/src/composerCapture.ts",
     "apps/desktop/src/composerDraftStore.ts",
     "apps/desktop/src/demoData.ts",
     "apps/desktop/src/explainSettings.ts",
@@ -187,6 +209,7 @@
     "apps/desktop/src/mcpSettings.ts",
     "apps/desktop/src/routingDefaults.ts",
     "apps/desktop/src/runtimeProjection.ts",
+    "apps/desktop/src/runtimeTurnControls.ts",
     "apps/desktop/src/skillsSettings.ts",
     "apps/desktop/src/useBrowserTabs.ts"
   ]

@@ -28,6 +28,7 @@ import {
   Layers,
   LoaderCircle,
   MessageCircleQuestion,
+  MousePointerClick,
   Pencil,
   RefreshCw,
   Search,
@@ -45,8 +46,11 @@ import {
 import { DiffView, type DiffCommitState, type DiffSelectionPayload } from "./DiffView";
 import { FileIcon } from "./FileIcon";
 import { parseProjectFileHref, type ProjectFileLocation } from "./fileViewSupport";
+import { MarkdownImage } from "./MarkdownImage";
 import { Tooltip } from "./Tooltip";
-import { splitAttachmentBlock } from "./conversationFormatting";
+import { extractActivityImages, isImageFileName } from "../activityMedia";
+import { pairAnnotationAttachments, type PendingAnnotation } from "../browserAnnotation";
+import { splitSentUserMessage } from "./conversationFormatting";
 import {
   normalizeStreamedMarkdown,
   repairStreamedTables,
@@ -233,6 +237,11 @@ const MarkdownBody = memo(function MarkdownBody({
       a: (props: React.AnchorHTMLAttributes<HTMLAnchorElement> & { node?: unknown }) => (
         <MarkdownLink {...props} onOpenFile={onOpenFile} />
       ),
+      // An agent that has photographed a page hands over the picture itself,
+      // not a path for the person to go and open.
+      img: (props: React.ImgHTMLAttributes<HTMLImageElement> & { node?: unknown }) => (
+        <MarkdownImage src={props.src} alt={props.alt} title={props.title} />
+      ),
     }),
     [onOpenFile],
   );
@@ -260,20 +269,19 @@ function mentionSegments(text: string): Array<string | { mention: string }> {
   return segments;
 }
 
-function AttachmentThumb({
-  path,
-  previewCache,
-}: {
-  path: string;
-  previewCache: AttachmentPreviewCache;
-}) {
-  const name = path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
-  const isImage = attachmentKind(name) === "image";
-  const [preview, setPreview] = useState<string | null>(
-    () => previewCache.values.get(path) ?? null,
+function attachmentFileName(path: string): string {
+  return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
+}
+
+function useAttachmentPreview(path: string | undefined, previewCache: AttachmentPreviewCache) {
+  const [preview, setPreview] = useState<string | null>(() =>
+    path ? (previewCache.values.get(path) ?? null) : null,
   );
   useEffect(() => {
-    if (!isImage) return;
+    if (!path || attachmentKind(attachmentFileName(path)) !== "image") {
+      setPreview(null);
+      return;
+    }
     let active = true;
     void loadAttachmentPreview(previewCache, path).then((dataUrl) => {
       if (active) setPreview(dataUrl);
@@ -281,7 +289,20 @@ function AttachmentThumb({
     return () => {
       active = false;
     };
-  }, [isImage, path, previewCache]);
+  }, [path, previewCache]);
+  return preview;
+}
+
+function AttachmentThumb({
+  path,
+  previewCache,
+}: {
+  path: string;
+  previewCache: AttachmentPreviewCache;
+}) {
+  const name = attachmentFileName(path);
+  const isImage = attachmentKind(name) === "image";
+  const preview = useAttachmentPreview(path, previewCache);
   return (
     <Tooltip label={path} placement="top">
       <span
@@ -292,6 +313,112 @@ function AttachmentThumb({
         <span>{name}</span>
       </span>
     </Tooltip>
+  );
+}
+
+function ActivityShot({
+  src,
+  path,
+  previewCache,
+  variant,
+}: {
+  src?: string;
+  path?: string;
+  previewCache: AttachmentPreviewCache;
+  variant: "inline" | "detail";
+}) {
+  const preview = useAttachmentPreview(path, previewCache);
+  const url = src ?? preview;
+  if (!url) return null;
+  return (
+    <img
+      className={`activity-shot activity-shot--${variant}`}
+      src={url}
+      alt={variant === "inline" ? "" : "Viewed image"}
+    />
+  );
+}
+
+function ActivityDetailMedia({
+  body,
+  previewCache,
+}: {
+  body: string;
+  previewCache: AttachmentPreviewCache;
+}) {
+  const media = extractActivityImages(body);
+  if (!media.images.length && !media.imagePaths.length && !media.text) return null;
+  return (
+    <>
+      {media.images.map((src) => (
+        <ActivityShot key={src} src={src} previewCache={previewCache} variant="detail" />
+      ))}
+      {media.imagePaths.map((path) => (
+        <ActivityShot key={path} path={path} previewCache={previewCache} variant="detail" />
+      ))}
+      {media.text ? <pre>{media.text}</pre> : null}
+    </>
+  );
+}
+
+function ActivityDetail({
+  label,
+  body,
+  previewCache,
+}: {
+  label: string;
+  body: string;
+  previewCache: AttachmentPreviewCache;
+}) {
+  const media = extractActivityImages(body);
+  if (!media.images.length && !media.imagePaths.length && !media.text) return null;
+  return (
+    <div className="activity-detail">
+      <span className="activity-detail-label">{label}</span>
+      <ActivityDetailMedia body={body} previewCache={previewCache} />
+    </div>
+  );
+}
+
+function firstActivityShot(event: TranscriptEvent): { src?: string; path?: string } | undefined {
+  const bodies = [...(event.details ?? []).map((detail) => detail.body), event.body ?? ""];
+  for (const body of bodies) {
+    const media = extractActivityImages(body);
+    if (media.images[0]) return { src: media.images[0] };
+    if (media.imagePaths[0]) return { path: media.imagePaths[0] };
+  }
+  return undefined;
+}
+
+function UserAnnotationCard({
+  annotation,
+  previewPath,
+  previewCache,
+}: {
+  annotation: PendingAnnotation;
+  previewPath?: string;
+  previewCache: AttachmentPreviewCache;
+}) {
+  const preview = useAttachmentPreview(previewPath, previewCache);
+  const caption = annotation.note || annotation.origin || "Marked on the page";
+  // Same chip as the composer showed before send: thumb, element, note.
+  return (
+    <span
+      className="user-attachment user-attachment--image user-attachment--annotation user-annotation"
+      title={annotation.note || annotation.origin}
+    >
+      {preview ? (
+        <img src={preview} alt={annotation.label} />
+      ) : (
+        <span className="user-annotation-thumb" aria-hidden="true">
+          <MousePointerClick />
+        </span>
+      )}
+      <span className="user-annotation-copy">
+        <strong>{annotation.label}</strong>
+        <small>{caption}</small>
+      </span>
+    </span>
   );
 }
 
@@ -323,44 +450,79 @@ const UserMessage = memo(function UserMessage({
   const skillPrefix = nativeSkill ? `/${nativeSkill}` : "";
   const hasVerifiedSkill =
     Boolean(skillPrefix) && (body === skillPrefix || body.startsWith(`${skillPrefix} `));
-  const { text, attachments } = splitAttachmentBlock(body);
+  const { text, attachments, annotations } = splitSentUserMessage(body);
+  const attachmentEntries = attachments.map((path) => ({
+    path,
+    name: attachmentFileName(path),
+  }));
+  const annotationPreviews = pairAnnotationAttachments(annotations, attachmentEntries);
+  const foldedAttachmentPaths = new Set(
+    [...annotationPreviews.values()].map((entry) => entry.path),
+  );
+  const visibleAttachments = attachments.filter((path) => !foldedAttachmentPaths.has(path));
   const tail = hasVerifiedSkill ? text.slice(skillPrefix.length) : text;
+  const hasText = Boolean(tail) || hasVerifiedSkill;
+  const showBubble =
+    hasText || visibleAttachments.length > 0 || annotations.length > 0 || Boolean(nativeSkill);
   const clock = showTimestamp ? formatClock(timestamp) : "";
   return (
-    <div className="turn-user-wrap">
-      <section className="turn turn--user" data-event-id={id} aria-label="Your message">
-        {nativeSkill ? (
-          <span className="skill-invocation-marker" aria-label={`Skill invoked: ${nativeSkill}`}>
-            <Wrench aria-hidden />
-            Skill invoked <strong>{nativeSkill}</strong>
-          </span>
-        ) : null}
-        <p>
-          {hasVerifiedSkill ? (
-            <Tooltip label="Provider-native skill" placement="top">
-              <strong className="native-skill-token" aria-label={`Native skill ${skillPrefix}`}>
-                {skillPrefix}
-              </strong>
-            </Tooltip>
+    <div
+      className="turn-user-wrap"
+      data-event-id={id}
+      aria-label={showBubble ? undefined : "Your message"}
+    >
+      {showBubble ? (
+        <section className="turn turn--user" aria-label="Your message">
+          {nativeSkill ? (
+            <span className="skill-invocation-marker" aria-label={`Skill invoked: ${nativeSkill}`}>
+              <Wrench aria-hidden />
+              Skill invoked <strong>{nativeSkill}</strong>
+            </span>
           ) : null}
-          {mentionSegments(tail).map((segment, index) =>
-            typeof segment === "string" ? (
-              segment
-            ) : (
-              <Tooltip key={`${segment.mention}-${index}`} label="Context mention" placement="top">
-                <strong className="context-mention-token">{segment.mention}</strong>
-              </Tooltip>
-            ),
-          )}
-        </p>
-        {attachments.length > 0 ? (
-          <span className="user-attachments" aria-label="Attached files">
-            {attachments.map((path) => (
-              <AttachmentThumb key={path} path={path} previewCache={previewCache} />
-            ))}
-          </span>
-        ) : null}
-      </section>
+          {hasText ? (
+            <p>
+              {hasVerifiedSkill ? (
+                <Tooltip label="Provider-native skill" placement="top">
+                  <strong className="native-skill-token" aria-label={`Native skill ${skillPrefix}`}>
+                    {skillPrefix}
+                  </strong>
+                </Tooltip>
+              ) : null}
+              {mentionSegments(tail).map((segment, index) =>
+                typeof segment === "string" ? (
+                  segment
+                ) : (
+                  <Tooltip
+                    key={`${segment.mention}-${index}`}
+                    label="Context mention"
+                    placement="top"
+                  >
+                    <strong className="context-mention-token">{segment.mention}</strong>
+                  </Tooltip>
+                ),
+              )}
+            </p>
+          ) : null}
+          {visibleAttachments.length > 0 || annotations.length > 0 ? (
+            <span
+              className="user-attachments"
+              aria-label={annotations.length > 0 ? "Page annotations" : "Attached files"}
+            >
+              {annotations.map((annotation) => (
+                <UserAnnotationCard
+                  key={`annotation-${annotation.id}`}
+                  annotation={annotation}
+                  previewPath={annotationPreviews.get(annotation.id)?.path}
+                  previewCache={previewCache}
+                />
+              ))}
+              {visibleAttachments.map((path) => (
+                <AttachmentThumb key={path} path={path} previewCache={previewCache} />
+              ))}
+            </span>
+          ) : null}
+        </section>
+      ) : null}
       <div className="message-footer message-footer--user">
         {clock ? (
           <time className="message-time" dateTime={timestamp}>
@@ -756,6 +918,7 @@ interface ActivityEventProps {
   isDiffApproved?: (file: DiffFile) => boolean;
   onRevertDiff?: (file: DiffFile) => void;
   diffCommitState?: (file: DiffFile) => DiffCommitState | undefined;
+  previewCache: AttachmentPreviewCache;
 }
 
 const ActivityEvent = memo(function ActivityEventRow({
@@ -769,6 +932,7 @@ const ActivityEvent = memo(function ActivityEventRow({
   isDiffApproved,
   onRevertDiff,
   diffCommitState,
+  previewCache,
 }: ActivityEventProps): React.ReactElement {
   const expanded = isExpanded(event);
   const hasChildren = Boolean(event.children?.length);
@@ -786,6 +950,7 @@ const ActivityEvent = memo(function ActivityEventRow({
   const expandable = hasChildren || hasDetails || hasLongBody || hasDiff;
   const canOpenFile = Boolean(filePath && onOpenFile && event.title);
   const isWorkedFor = event.title === "Worked for";
+  const inlineShot = firstActivityShot(event);
   const toggleExpanded = () => {
     if (expandable) onExpandedChange(event.id, !expanded);
   };
@@ -815,6 +980,21 @@ const ActivityEvent = memo(function ActivityEventRow({
           </span>
           <span className="activity-copy">
             <strong>{event.title ?? event.body}</strong>
+            {inlineShot ? (
+              <Tooltip
+                label={event.status === "running" ? "Viewing image" : "Viewed image"}
+                placement="top"
+              >
+                <span className="activity-shot-wrap">
+                  <ActivityShot
+                    src={inlineShot.src}
+                    path={inlineShot.path}
+                    previewCache={previewCache}
+                    variant="inline"
+                  />
+                </span>
+              </Tooltip>
+            ) : null}
             {canOpenFile && filePath && onOpenFile ? (
               <Tooltip label={filePath} placement="top">
                 <button
@@ -879,10 +1059,12 @@ const ActivityEvent = memo(function ActivityEventRow({
             transition={{ duration: 0.18 }}
           >
             {event.details?.map((detail) => (
-              <div className="activity-detail" key={detail.label}>
-                <span className="activity-detail-label">{detail.label}</span>
-                <pre>{detail.body}</pre>
-              </div>
+              <ActivityDetail
+                key={detail.label}
+                label={detail.label}
+                body={detail.body}
+                previewCache={previewCache}
+              />
             ))}
           </motion.div>
         ) : null}
@@ -894,7 +1076,7 @@ const ActivityEvent = memo(function ActivityEventRow({
             exit={{ height: 0, opacity: 0 }}
             transition={{ duration: 0.18 }}
           >
-            <pre>{event.body}</pre>
+            <ActivityDetailMedia body={event.body} previewCache={previewCache} />
           </motion.div>
         ) : null}
         {expanded && event.children ? (
@@ -928,6 +1110,7 @@ const ActivityEvent = memo(function ActivityEventRow({
                   isDiffApproved={isDiffApproved}
                   onRevertDiff={onRevertDiff}
                   diffCommitState={diffCommitState}
+                  previewCache={previewCache}
                 />
               ),
             )}
@@ -1890,6 +2073,7 @@ export function Transcript({
         isDiffApproved={isDiffApproved}
         onRevertDiff={onRevertDiff ? revertDiff : undefined}
         diffCommitState={diffCommitState}
+        previewCache={previewCacheRef.current}
       />
     );
   };
@@ -2125,6 +2309,7 @@ export function Transcript({
                           isDiffApproved={isDiffApproved}
                           onRevertDiff={onRevertDiff ? revertDiff : undefined}
                           diffCommitState={diffCommitState}
+                          previewCache={previewCacheRef.current}
                         />
                       </motion.div>
                     ),
@@ -2357,6 +2542,8 @@ function isDisplayableActivityDetail(detail: string): boolean {
   if (trimmed === "{}" || trimmed === "[]" || trimmed === "{" || trimmed === "[") return false;
   if (/^\{\s*\}$/.test(trimmed) || /^\[\s*\]$/.test(trimmed)) return false;
   if (ACTIVITY_PLACEHOLDER_DETAILS.has(trimmed.toLowerCase())) return false;
+  if (trimmed.startsWith("data:image") || trimmed.includes("iVBORw0KGgo")) return false;
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) return false;
   return true;
 }
 
@@ -2392,6 +2579,9 @@ function progressiveActivityVerb(event: TranscriptEvent): string {
     "tool call": "Using a tool",
   };
   if (fromTitle[lower]) return fromTitle[lower];
+  if (/view(?:ing|ed)(?: an)? image/i.test(title) || /photograph/i.test(title)) {
+    return "Viewing image";
+  }
   if (/^(Checking|Starting|Sending|Collecting|Stopping|Using)\b/i.test(title)) return title;
   if (/ing\b/i.test(title) && title.length < 48) return title;
 
@@ -2417,6 +2607,13 @@ function describeCurrentActivity(event: TranscriptEvent): string {
   const detail = activityDisplayBody(event);
   const usableDetail = isDisplayableActivityDetail(detail) ? detail : undefined;
   const verb = progressiveActivityVerb(event);
+
+  if (verb === "Viewing image") {
+    if (usableDetail && isImageFileName(usableDetail)) {
+      return `Viewing image ${fileName(usableDetail)}`;
+    }
+    return "Viewing image";
+  }
 
   if (usableDetail) {
     if (usableDetail.toLowerCase() === verb.toLowerCase()) return verb;

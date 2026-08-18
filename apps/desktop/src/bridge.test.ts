@@ -18,9 +18,11 @@ import {
   extractCodexCatalog,
   extractCursorModelParams,
   formatBridgeError,
+  formatEffortRouteLabel,
   mergeCursorModelParams,
   parseDiffLines,
   resolveModelEffort,
+  resolveModelFast,
   runtimeAuthWarning,
 } from "./bridge";
 import { createDemoSnapshot } from "./demoData";
@@ -97,6 +99,47 @@ describe("provider model catalogs", () => {
         defaultEffort: "medium",
       },
     ]);
+  });
+
+  it("reads Codex Fast from advertised service tiers", () => {
+    expect(
+      extractCodexCatalog({
+        data: [
+          {
+            id: "gpt-5.6-sol",
+            displayName: "GPT-5.6 Sol",
+            defaultReasoningEffort: "medium",
+            supportedReasoningEfforts: [{ reasoningEffort: "medium" }, { reasoningEffort: "high" }],
+            serviceTiers: [
+              { id: "standard", name: "Standard" },
+              { id: "fast", name: "Fast" },
+            ],
+            defaultServiceTier: "standard",
+          },
+        ],
+      }),
+    ).toEqual([
+      {
+        id: "gpt-5.6-sol",
+        label: "GPT-5.6 Sol",
+        efforts: [
+          { id: "medium", label: "Medium" },
+          { id: "high", label: "High" },
+        ],
+        defaultEffort: "medium",
+        supportsFast: true,
+      },
+    ]);
+  });
+
+  it("labels the effort pill with Fast only when that tier is on", () => {
+    expect(formatEffortRouteLabel("High", true)).toBe("High Fast");
+    expect(formatEffortRouteLabel("Low", false)).toBe("Low");
+    expect(resolveModelFast({ id: "m", label: "M" })).toBeUndefined();
+    expect(resolveModelFast({ id: "m", label: "M", supportsFast: true }, true)).toBe(true);
+    expect(resolveModelFast({ id: "m", label: "M", supportsFast: true, defaultFast: true })).toBe(
+      true,
+    );
   });
 
   it("preserves every provider-advertised Codex effort, including newer levels", () => {
@@ -341,6 +384,9 @@ describe("provider model catalogs", () => {
         { id: "xhigh", label: "Extra High" },
         { id: "max", label: "Max" },
       ],
+      supportsFast: true,
+      fastConfigId: "fast",
+      defaultFast: false,
     });
     expect(params.get("gpt-5.5")?.configId).toBe("reasoning");
     expect(params.has("default")).toBe(false);
@@ -897,7 +943,12 @@ describe("native trusted-project bridge", () => {
     });
 
     const catalog = await bridge.listModelCatalog("claude");
-    expect(catalog.map((entry) => entry.id)).toContain("claude-fable-5");
+    expect(catalog.map((entry) => entry.id)).toEqual([
+      "claude-fable-5",
+      "claude-opus-5",
+      "claude-sonnet-5",
+      "claude-haiku-4-5",
+    ]);
     expect(catalog.every((entry) => entry.defaultEffort === "high")).toBe(true);
   });
 
@@ -1043,7 +1094,55 @@ describe("native trusted-project bridge", () => {
     });
 
     const catalog = await bridge.listModelCatalog("antigravity");
-    expect(catalog.map((entry) => entry.id)).toContain("Gemini 3.1 Pro");
+    expect(catalog.map((entry) => entry.id)).toEqual([
+      "Gemini 3.7 Flash",
+      "Gemini 3.6 Flash",
+      "Gemini 3.5 Flash",
+      "Gemini 3.1 Pro",
+      "Claude Sonnet 4.6 (Thinking)",
+      "Claude Opus 4.6 (Thinking)",
+      "GPT-OSS 120B",
+    ]);
+  });
+
+  it("falls back to the static Cursor catalog when the live probe fails", async () => {
+    invokeMock.mockImplementation(async () => {
+      throw new Error("provider-unavailable");
+    });
+
+    const catalog = await bridge.listModelCatalog("cursor");
+    expect(catalog.map((entry) => entry.id)).toEqual([
+      "auto",
+      "composer-2.5",
+      "claude-fable-5",
+      "claude-opus-5",
+      "claude-opus-4-8",
+      "claude-sonnet-5",
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
+      "gpt-5.5",
+      "gpt-5.3-codex",
+      "cursor-grok-4.6",
+      "cursor-grok-4.5",
+      "gemini-3.7-flash",
+      "gemini-3.6-flash",
+      "kimi-k3",
+    ]);
+  });
+
+  it("falls back to the documented Kimi catalog when the live probe fails", async () => {
+    invokeMock.mockImplementation(async () => {
+      throw new Error("provider-unavailable");
+    });
+
+    const catalog = await bridge.listModelCatalog("kimi");
+    expect(catalog.map((entry) => entry.id)).toEqual([
+      "kimi-code/k3",
+      "kimi-code/k3-256k",
+      "kimi-code/kimi-for-coding",
+      "kimi-code/kimi-for-coding-highspeed",
+    ]);
   });
 
   it("sends bounded model catalogs with specialist generation", async () => {
@@ -2341,6 +2440,253 @@ describe("native trusted-project bridge", () => {
     ).toHaveLength(1);
     expect(
       invokeMock.mock.calls.filter(([command]) => command === "acp_set_config_option"),
+    ).toHaveLength(0);
+  });
+
+  it("starts a fresh ACP session when the saved handle no longer matches", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "app_bootstrap") return { value: {} };
+      if (command === "local_export") {
+        return {
+          projects: [
+            {
+              id: "project-stale-resume",
+              displayName: "integrator-3",
+              repositoryRoot: "H:\\Code\\integrator-3",
+              gitCommonDirectory: "H:\\Code\\integrator-3\\.git",
+              createdAt: "2026-07-20T00:00:00Z",
+              lastOpenedAt: "2026-07-20T00:00:00Z",
+            },
+          ],
+          tasks: [
+            {
+              id: "task-stale-resume",
+              title: "Stale resume",
+              repositoryPath: "H:\\Code\\integrator-3",
+              state: "ready",
+              pinned: false,
+              archived: false,
+              runtime: "grok",
+              model: "Provider default",
+              createdAt: "2026-07-20T00:00:00Z",
+              updatedAt: "2026-07-20T00:00:00Z",
+            },
+          ],
+          settings: [],
+          providerSessions: [],
+          providerResumeStates: [
+            {
+              taskId: "task-stale-resume",
+              provider: "grok",
+              sessionRef: "grok-stale",
+              repositoryRoot: "H:\\Code\\integrator-3",
+              permission: "project-write",
+              delegation: "off",
+              updatedAt: "2026-07-20T00:00:00Z",
+            },
+          ],
+          runtimeSessions: [],
+        };
+      }
+      if (command === "acp_session_capabilities") {
+        return { load: true, resume: true, mcpHttp: true, mcpSse: true };
+      }
+      if (command === "acp_resume_session") {
+        throw {
+          code: "not-found",
+          message: "The saved provider session does not match this task and workspace",
+        };
+      }
+      if (command === "acp_start_session") return { sessionId: "grok-fresh" };
+      if (command === "acp_send_turn") return { turnId: "grok-fresh-turn" };
+      return undefined;
+    });
+
+    await bridge.loadWorkspace();
+    await expect(
+      bridge.sendTurn({
+        taskId: "task-stale-resume",
+        prompt: "Continue after a stale handle",
+        runtime: "grok",
+        model: "Provider default",
+        permission: "project-write",
+        delegation: "off",
+      }),
+    ).resolves.toMatchObject({ kind: "user" });
+
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "acp_resume_session"),
+    ).toHaveLength(1);
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "acp_start_session"),
+    ).toHaveLength(1);
+    expect(invokeMock).toHaveBeenCalledWith(
+      "acp_send_turn",
+      expect.objectContaining({ taskId: "task-stale-resume" }),
+    );
+  });
+
+  it("does not resume a cached Cursor session after Claude takes the task row", async () => {
+    let cursorAlive = true;
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "app_bootstrap") return { value: {} };
+      if (command === "local_export") {
+        return {
+          projects: [
+            {
+              id: "project-claude-overwrite",
+              displayName: "integrator-3",
+              repositoryRoot: "H:\\Code\\integrator-3",
+              gitCommonDirectory: "H:\\Code\\integrator-3\\.git",
+              createdAt: "2026-07-20T00:00:00Z",
+              lastOpenedAt: "2026-07-20T00:00:00Z",
+            },
+          ],
+          tasks: [
+            {
+              id: "task-claude-overwrite",
+              title: "Switch runtimes",
+              repositoryPath: "H:\\Code\\integrator-3",
+              state: "ready",
+              pinned: false,
+              archived: false,
+              runtime: "cursor",
+              model: "Provider default",
+              createdAt: "2026-07-20T00:00:00Z",
+              updatedAt: "2026-07-20T00:00:00Z",
+            },
+          ],
+          settings: [],
+          providerSessions: [],
+          providerResumeStates: [
+            {
+              taskId: "task-claude-overwrite",
+              provider: "cursor",
+              sessionRef: "cursor-before-claude",
+              repositoryRoot: "H:\\Code\\integrator-3",
+              permission: "project-write",
+              delegation: "off",
+              updatedAt: "2026-07-20T00:00:00Z",
+            },
+          ],
+          runtimeSessions: [],
+        };
+      }
+      if (command === "acp_session_capabilities") {
+        if (!cursorAlive) {
+          throw {
+            code: "provider-disconnected",
+            message: "ACP session is not connected for this task",
+          };
+        }
+        return { load: true, resume: true, mcpHttp: true, mcpSse: true };
+      }
+      if (command === "acp_resume_session") return { sessionId: "cursor-before-claude" };
+      if (command === "acp_start_session") return { sessionId: "cursor-after-claude" };
+      if (command === "acp_list_cursor_models") return { models: [] };
+      if (command === "acp_send_turn") return { turnId: "cursor-turn" };
+      if (command === "structured_cli_start_turn") return { turnId: "claude-turn" };
+      return undefined;
+    });
+
+    await bridge.loadWorkspace();
+    await bridge.sendTurn({
+      taskId: "task-claude-overwrite",
+      prompt: "First Cursor turn",
+      runtime: "cursor",
+      model: "Provider default",
+      permission: "project-write",
+      delegation: "off",
+    });
+    await bridge.sendTurn({
+      taskId: "task-claude-overwrite",
+      prompt: "Claude takes the row",
+      runtime: "claude",
+      model: "claude-sonnet-5",
+      permission: "project-write",
+      delegation: "off",
+    });
+    cursorAlive = false;
+    await bridge.sendTurn({
+      taskId: "task-claude-overwrite",
+      prompt: "Back to Cursor",
+      runtime: "cursor",
+      model: "Provider default",
+      permission: "project-write",
+      delegation: "off",
+    });
+
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "acp_resume_session"),
+    ).toHaveLength(1);
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "acp_start_session"),
+    ).toHaveLength(1);
+  });
+
+  it("resumes a Chat ACP session after restart even when the hydrated path is host-owned", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "app_bootstrap") return { value: {} };
+      if (command === "local_export") {
+        return {
+          projects: [],
+          tasks: [
+            {
+              id: "chat-grok-resume",
+              kind: "chat",
+              title: "Grok chat",
+              state: "ready",
+              pinned: false,
+              archived: false,
+              runtime: "grok",
+              model: "Provider default",
+              createdAt: "2026-07-20T00:00:00Z",
+              updatedAt: "2026-07-20T00:00:00Z",
+            },
+          ],
+          settings: [],
+          providerSessions: [],
+          providerResumeStates: [
+            {
+              taskId: "chat-grok-resume",
+              provider: "grok",
+              sessionRef: "grok-chat-session",
+              repositoryRoot:
+                "C:\\Users\\Blaze\\AppData\\Roaming\\AI Integrator\\chat-runtime\\chat-grok-resume",
+              permission: "read-only",
+              delegation: "off",
+              updatedAt: "2026-07-20T00:00:00Z",
+            },
+          ],
+          runtimeSessions: [],
+        };
+      }
+      if (command === "acp_session_capabilities") {
+        return { load: true, resume: true, mcpHttp: true, mcpSse: true };
+      }
+      if (command === "acp_resume_session") return { sessionId: "grok-chat-session" };
+      if (command === "acp_start_session") return { sessionId: "grok-chat-fresh" };
+      if (command === "acp_send_turn") return { turnId: "grok-chat-turn" };
+      return undefined;
+    });
+
+    await bridge.loadWorkspace();
+    await expect(
+      bridge.sendTurn({
+        taskId: "chat-grok-resume",
+        prompt: "Continue the chat",
+        runtime: "grok",
+        model: "Provider default",
+        permission: "read-only",
+        delegation: "off",
+      }),
+    ).resolves.toMatchObject({ kind: "user" });
+
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "acp_resume_session"),
+    ).toHaveLength(1);
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "acp_start_session"),
     ).toHaveLength(0);
   });
 

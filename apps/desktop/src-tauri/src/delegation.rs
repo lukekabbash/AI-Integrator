@@ -15,16 +15,11 @@
 
 use std::{
     collections::HashMap,
-    fs::OpenOptions,
-    io::Write,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
     time::Duration,
 };
-
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 
 use chrono::{DateTime, Utc};
 use integrator_core::{
@@ -46,7 +41,9 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
+    sync::Semaphore,
 };
+use zeroize::Zeroizing;
 
 use crate::{
     chat_title::{format_subagent_title, generate_subagent_title},
@@ -65,6 +62,8 @@ const CHILD_DIGEST_OPTIONS: session_store::HandoffDigestOptions =
         max_images: session_store::HANDOFF_DEFAULT_MAX_IMAGES,
     };
 const MAX_LINE_BYTES: usize = 256 * 1024;
+const BROKER_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_BROKER_CONNECTIONS: usize = 64;
 const MAX_SPECIALISTS: usize = 64;
 const MAX_SPECIALIST_CAPABILITIES: usize = 128;
 const MAX_SERVICE_FALLBACKS: usize = 4;
@@ -641,7 +640,6 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_scroll",
             "browser_drag",
             "browser_wait_for",
-            "browser_evaluate",
         ]),
         "chat" => json!([
             "schedule_wakeup",
@@ -665,7 +663,6 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_scroll",
             "browser_drag",
             "browser_wait_for",
-            "browser_evaluate",
         ]),
         // A child browses inside its parent's task, owning what it opens. It
         // never gets browser_grant: a tab it was handed is not its to pass on.
@@ -690,7 +687,6 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_scroll",
             "browser_drag",
             "browser_wait_for",
-            "browser_evaluate",
         ]),
         _ if mode == "off" => json!([
             "skill_data_request",
@@ -716,7 +712,6 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_scroll",
             "browser_drag",
             "browser_wait_for",
-            "browser_evaluate",
         ]),
         _ => json!([
             "skill_data_request",
@@ -749,7 +744,6 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_scroll",
             "browser_drag",
             "browser_wait_for",
-            "browser_evaluate",
         ]),
     };
     Ok(json!({
@@ -780,15 +774,32 @@ pub fn write_mcp_config(
     scope: &str,
     mode: &str,
 ) -> Result<PathBuf> {
+    let safe_segment = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    };
+    if !safe_segment(role) || !safe_segment(scope) {
+        return Err(IntegratorError::InvalidInput(
+            "broker MCP config identity is invalid".into(),
+        ));
+    }
     let executable = std::env::current_exe().map_err(IntegratorError::from)?;
     let state = app.state::<AppState>();
-    let directory = state.data_directory.join("broker-mcp");
-    std::fs::create_dir_all(&directory).map_err(IntegratorError::from)?;
+    let directory = crate::integrator_mcp::private_descendant(
+        &state.data_directory,
+        Path::new("broker-mcp"),
+        true,
+    )
+    .map_err(IntegratorError::from)?
+    .ok_or_else(|| IntegratorError::Unavailable("broker MCP directory was not created".into()))?;
     let env: serde_json::Map<String, Value> = broker_env(info, role, scope, mode)
         .into_iter()
         .map(|(key, value)| (key.to_owned(), Value::String(value)))
         .collect();
-    let config = json!({
+    let mut config = json!({
         "mcpServers": {
             "integrator": {
                 "command": executable.to_string_lossy(),
@@ -798,18 +809,16 @@ pub fn write_mcp_config(
         }
     });
     let path = directory.join(format!("{role}-{scope}.json"));
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(&path).map_err(IntegratorError::from)?;
-    file.write_all(&serde_json::to_vec_pretty(&config)?)
-        .map_err(IntegratorError::from)?;
+    crate::integrator_mcp::write_private_json(&path, &mut config).map_err(IntegratorError::from)?;
     Ok(path)
 }
 
 fn prune_stale_mcp_configs_in(data_directory: &Path) -> std::io::Result<usize> {
-    let directory = data_directory.join("broker-mcp");
+    let Some(directory) =
+        crate::integrator_mcp::private_descendant(data_directory, Path::new("broker-mcp"), false)?
+    else {
+        return Ok(0);
+    };
     let entries = match std::fs::read_dir(&directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -888,13 +897,18 @@ pub fn start_broker_host(app: AppHandle<tauri::Wry>) {
             let state = app.state::<AppState>();
             *state.broker.lock().expect("broker lock") = Some(broker.clone());
         }
+        let connection_slots = Arc::new(Semaphore::new(MAX_BROKER_CONNECTIONS));
         loop {
             let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let Ok(connection_slot) = Arc::clone(&connection_slots).try_acquire_owned() else {
                 continue;
             };
             let app = app.clone();
             let grants = Arc::clone(&broker.grants);
             tauri::async_runtime::spawn(async move {
+                let _connection_slot = connection_slot;
                 let _ = serve_connection(app, grants, stream).await;
             });
         }
@@ -915,38 +929,61 @@ async fn serve_connection(
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader).take(MAX_LINE_BYTES as u64);
     let mut session: Option<BrokerSession> = None;
-    let mut line = String::new();
+    let auth_deadline = tokio::time::Instant::now() + BROKER_AUTH_TIMEOUT;
+    let mut line = Zeroizing::new(String::new());
     loop {
         line.clear();
         reader.set_limit(MAX_LINE_BYTES as u64);
-        if reader.read_line(&mut line).await? == 0 {
+        let read = if session.is_none() {
+            match tokio::time::timeout_at(auth_deadline, reader.read_line(&mut line)).await {
+                Ok(read) => read?,
+                Err(_) => return Ok(()),
+            }
+        } else {
+            reader.read_line(&mut line).await?
+        };
+        if read == 0 {
             return Ok(());
         }
-        let Ok(request) = serde_json::from_str::<Value>(&line) else {
+        if read == MAX_LINE_BYTES && !line.ends_with('\n') {
+            return Ok(());
+        }
+        let Ok(mut request) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        let id = request
+            .get_mut("id")
+            .map(Value::take)
+            .unwrap_or(Value::Null);
         let method = request
-            .get("method")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let params = request.get("params").cloned().unwrap_or(Value::Null);
+            .get_mut("method")
+            .map(Value::take)
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let mut params = request
+            .get_mut("params")
+            .map(Value::take)
+            .unwrap_or(Value::Null);
+        let mut close_after_response = false;
 
-        let response = if method == "hello" {
-            let grant = params
-                .get("token")
-                .and_then(Value::as_str)
-                .and_then(|token| {
-                    grants
-                        .lock()
-                        .expect("broker grants lock")
-                        .get(token)
-                        .cloned()
+        let response = if method == "hello" && session.is_none() {
+            let token = params
+                .as_object_mut()
+                .and_then(|values| values.remove("token"))
+                .and_then(|value| match value {
+                    Value::String(value) => Some(Zeroizing::new(value)),
+                    _ => None,
                 });
-            let role = text_param(&params, "role").unwrap_or_default();
-            let scope = text_param(&params, "scope").unwrap_or_default();
-            let mode = text_param(&params, "mode").unwrap_or_else(|| "balanced".into());
+            let grant = token.as_deref().and_then(|token| {
+                grants
+                    .lock()
+                    .expect("broker grants lock")
+                    .get(token)
+                    .cloned()
+            });
+            let role = broker_claim_param(&params, "role", 32).unwrap_or_default();
+            let scope = broker_claim_param(&params, "scope", 128).unwrap_or_default();
+            let mode = broker_claim_param(&params, "mode", 64).unwrap_or_else(|| "balanced".into());
             if grant.as_ref().is_some_and(|grant| {
                 grant.role == role && grant.scope == scope && grant.mode == mode
             }) {
@@ -958,12 +995,18 @@ async fn serve_connection(
                 });
                 json!({ "id": id, "result": { "ok": true } })
             } else {
+                close_after_response = true;
                 json!({ "id": id, "error": { "message": "invalid broker token" } })
             }
+        } else if method == "hello" {
+            json!({ "id": id, "error": { "message": "broker session is already authenticated" } })
         } else if let Some(session) = session.as_ref() {
             match dispatch_tool(&app, session, &method, &params).await {
                 Ok(result) => json!({ "id": id, "result": result }),
-                Err(error) => json!({ "id": id, "error": { "message": error.to_string() } }),
+                Err(error) => {
+                    let message = redact_and_bound(&error.to_string(), 2_048).0;
+                    json!({ "id": id, "error": { "message": message } })
+                }
             }
         } else {
             json!({ "id": id, "error": { "message": "broker session is not authenticated" } })
@@ -971,7 +1014,20 @@ async fn serve_connection(
         let mut payload = response.to_string();
         payload.push('\n');
         writer.write_all(payload.as_bytes()).await?;
+        if close_after_response {
+            return Ok(());
+        }
     }
+}
+
+fn broker_claim_param(params: &Value, key: &str, max_bytes: usize) -> Option<String> {
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| {
+            !value.is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
+        })
+        .map(str::to_owned)
 }
 
 fn text_param(params: &Value, key: &str) -> Option<String> {
@@ -1524,11 +1580,11 @@ async fn browser_tool(
             let tab = crate::browser::open_for_agent(app, &tabs, &caller, url).await?;
             Ok(json!({ "tab": tab }))
         }
-        "browser_list" => Ok(json!({ "tabs": tabs_for_caller(&tabs, &caller) })),
+        "browser_list" => Ok(json!({ "tabs": tabs_for_caller(app, &tabs, &caller) })),
         "browser_close" => {
             let id = tab_id()?;
             crate::browser::close_for_agent(app, &tabs, &caller, &id).await?;
-            Ok(json!({ "closed": id, "tabs": tabs_for_caller(&tabs, &caller) }))
+            Ok(json!({ "closed": id, "tabs": tabs_for_caller(app, &tabs, &caller) }))
         }
         "browser_navigate" => {
             let id = tab_id()?;
@@ -1666,11 +1722,6 @@ async fn browser_tool(
                 }
                 tokio::time::sleep(WAIT_FOR_POLL).await;
             }
-        }
-        "browser_evaluate" => {
-            let expression = text("expression")
-                .ok_or_else(|| IntegratorError::InvalidInput("expression is required".into()))?;
-            call("evaluate", vec![Value::String(expression)]).await
         }
         other => Err(IntegratorError::InvalidInput(format!(
             "unknown browser tool '{other}'"
@@ -2418,7 +2469,8 @@ pub async fn spawn_child(app: AppHandle<tauri::Wry>, delegation_id: DelegationId
                     "off",
                     (provider == ProviderKind::Cursor)
                         .then(|| {
-                            crate::harness_prompt::instructions(
+                            crate::harness_prompt::instructions_for(
+                                &state.store,
                                 provider,
                                 crate::harness_prompt::LocalToolsProjection::Projected,
                             )
@@ -2603,7 +2655,8 @@ async fn respawn_existing_child(
                     "off",
                     (provider == ProviderKind::Cursor)
                         .then(|| {
-                            crate::harness_prompt::instructions(
+                            crate::harness_prompt::instructions_for(
+                                &state.store,
                                 provider,
                                 crate::harness_prompt::LocalToolsProjection::Projected,
                             )
@@ -2666,6 +2719,8 @@ async fn spawn_structured_child(
             } else {
                 crate::harness_prompt::LocalToolsProjection::Unavailable
             }),
+            crate::harness_prompt::ExternalBrowserHandoff::from_store(&state.store),
+            None,
         )?;
         crate::integrator_mcp::write_antigravity_mcp_config_with_base(
             &overlay.root,
@@ -2755,7 +2810,8 @@ async fn spawn_codex_child(
     };
     let has_tools = mcp_config.is_some();
     let effective_config = client.read_config(&cwd).await?;
-    let developer_instructions = crate::harness_prompt::codex_developer_instructions(
+    let developer_instructions = crate::harness_prompt::codex_developer_instructions_for(
+        &state.store,
         &effective_config,
         if has_tools {
             crate::harness_prompt::LocalToolsProjection::Projected
@@ -2782,6 +2838,7 @@ async fn spawn_codex_child(
                         adapter_codex::CodexThreadOverrides {
                             config: mcp_config.clone(),
                             developer_instructions: Some(developer_instructions.clone()),
+                            service_tier: None,
                         },
                     )
                     .await?
@@ -2798,6 +2855,7 @@ async fn spawn_codex_child(
                     adapter_codex::CodexThreadOverrides {
                         config: mcp_config,
                         developer_instructions: Some(developer_instructions),
+                        service_tier: None,
                     },
                 )
                 .await?
@@ -3040,7 +3098,10 @@ async fn spawn_acp_child(
     } else {
         crate::harness_prompt::LocalToolsProjection::Unavailable
     };
-    let profile = crate::commands::AcpLaunchProfile::Project { tools };
+    let profile = crate::commands::AcpLaunchProfile::Project {
+        tools,
+        browser: crate::harness_prompt::ExternalBrowserHandoff::from_store(&state.store),
+    };
     let arguments = crate::commands::acp_launch_arguments_with_route(
         &provider,
         &profile,
@@ -3250,7 +3311,8 @@ async fn start_child_turn(
                     model: model.clone(),
                     effort: effort.clone(),
                     system_instructions: matches!(provider, ProviderKind::Claude).then(|| {
-                        crate::harness_prompt::instructions(
+                        crate::harness_prompt::instructions_for(
+                            &app.state::<AppState>().store,
                             *provider,
                             if mcp_config.is_some() {
                                 crate::harness_prompt::LocalToolsProjection::Projected
@@ -4201,6 +4263,33 @@ mod tests {
     }
 
     #[test]
+    fn stale_mcp_config_cleanup_refuses_a_non_directory_control_path() {
+        let root = tempfile::tempdir().expect("temporary app data");
+        let sentinel = root.path().join("broker-mcp");
+        std::fs::write(&sentinel, b"do not replace").expect("control path sentinel");
+
+        assert!(prune_stale_mcp_configs_in(root.path()).is_err());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"do not replace");
+    }
+
+    #[test]
+    fn broker_claims_are_bounded_before_authentication() {
+        let params = json!({
+            "role": "orchestrator",
+            "scope": "task-1",
+            "mode": "balanced",
+            "bad": "x".repeat(129),
+        });
+
+        assert_eq!(
+            broker_claim_param(&params, "role", 32).as_deref(),
+            Some("orchestrator")
+        );
+        assert!(broker_claim_param(&params, "bad", 128).is_none());
+        assert!(broker_claim_param(&json!({ "role": "chat\nadmin" }), "role", 32).is_none());
+    }
+
+    #[test]
     fn codex_mcp_config_is_thread_scoped_and_required() {
         let config = codex_mcp_config(
             &BrokerInfo::new(43123),
@@ -4247,7 +4336,6 @@ mod tests {
                 "browser_scroll",
                 "browser_drag",
                 "browser_wait_for",
-                "browser_evaluate",
             ])
         );
         assert_eq!(
@@ -4315,7 +4403,6 @@ mod tests {
                 "browser_scroll",
                 "browser_drag",
                 "browser_wait_for",
-                "browser_evaluate",
             ])
         );
     }
@@ -4348,7 +4435,6 @@ mod tests {
                 "browser_scroll",
                 "browser_drag",
                 "browser_wait_for",
-                "browser_evaluate",
             ])
         );
 
@@ -4379,7 +4465,6 @@ mod tests {
                 "browser_scroll",
                 "browser_drag",
                 "browser_wait_for",
-                "browser_evaluate",
             ])
         );
     }

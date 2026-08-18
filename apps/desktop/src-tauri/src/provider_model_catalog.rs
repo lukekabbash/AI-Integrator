@@ -87,6 +87,21 @@ fn push_antigravity_model(models: &mut Vec<String>, value: &str) {
     }
 }
 
+/// agy 1.1.x wraps the inventory as `{ command: { data: { models: [...] } } }`
+/// with `{ id, label }` rows. Older builds used a flat `{ models: [...] }`
+/// list and `name` / `displayName` / slug fields. Prefer the display label so
+/// the composer can compose `--model "Gemini 3.7 Flash (High)"`.
+const ANTIGRAVITY_MODEL_FIELDS: [&str; 7] = [
+    "label",
+    "displayName",
+    "display_name",
+    "name",
+    "id",
+    "slug",
+    "model",
+];
+const ANTIGRAVITY_INVENTORY_KEYS: [&str; 4] = ["models", "data", "items", "command"];
+
 fn collect_antigravity_json_models(value: &Value, models: &mut Vec<String>) {
     match value {
         Value::String(model) => push_antigravity_model(models, model),
@@ -95,7 +110,7 @@ fn collect_antigravity_json_models(value: &Value, models: &mut Vec<String>) {
                 match entry {
                     Value::String(model) => push_antigravity_model(models, model),
                     Value::Object(object) => {
-                        for key in ["id", "slug", "model", "name", "displayName", "display_name"] {
+                        for key in ANTIGRAVITY_MODEL_FIELDS {
                             if let Some(Value::String(model)) = object.get(key) {
                                 push_antigravity_model(models, model);
                                 break;
@@ -107,7 +122,7 @@ fn collect_antigravity_json_models(value: &Value, models: &mut Vec<String>) {
             }
         }
         Value::Object(object) => {
-            for key in ["models", "data", "items"] {
+            for key in ANTIGRAVITY_INVENTORY_KEYS {
                 if let Some(nested) = object.get(key) {
                     collect_antigravity_json_models(nested, models);
                 }
@@ -117,8 +132,8 @@ fn collect_antigravity_json_models(value: &Value, models: &mut Vec<String>) {
     }
 }
 
-/// Current `agy --output-format json models` builds return a machine-readable
-/// inventory. The line parser remains as a bounded compatibility fallback for
+/// Current `agy --output-format json models` builds return a command-result
+/// envelope. The line parser remains as a bounded compatibility fallback for
 /// older builds, accepting only model-shaped slugs or branded display names.
 pub(crate) fn parse_antigravity_models(output: &str) -> Vec<String> {
     let mut models = Vec::new();

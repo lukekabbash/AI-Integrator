@@ -646,6 +646,11 @@ pub async fn task_remove(state: State<'_, AppState>, task_id: TaskId) -> Command
                 .join("chat-runtime")
                 .join(task_id.to_string()),
         )?;
+        remove_app_owned_directory(
+            &data_directory
+                .join("browser-captures")
+                .join(task_id.to_string()),
+        )?;
         Ok::<Task, IntegratorError>(removed)
     })
     .await
@@ -662,7 +667,12 @@ pub async fn local_clear(state: State<'_, AppState>) -> CommandResult<()> {
         let mut authorizations = authorizations.lock().expect("git authorization cache lock");
         store.clear_all_data()?;
         authorizations.clear();
-        for directory in ["chat-attachments", "pasted-attachments", "chat-runtime"] {
+        for directory in [
+            "chat-attachments",
+            "pasted-attachments",
+            "chat-runtime",
+            "browser-captures",
+        ] {
             remove_app_owned_directory(&data_directory.join(directory))?;
         }
         Ok::<(), IntegratorError>(())
@@ -1628,10 +1638,12 @@ pub async fn project_search_paths(
 ) -> CommandResult<SearchOutcome<PathHit>> {
     let root = authorized_project_directory(&state, repository).await?;
     let limits = search_limits(limit);
-    tauri::async_runtime::spawn_blocking(move || workspace_search::search_paths(&root, &query, &limits))
-        .await
-        .map_err(|_| worker_error())?
-        .map_err(Into::into)
+    tauri::async_runtime::spawn_blocking(move || {
+        workspace_search::search_paths(&root, &query, &limits)
+    })
+    .await
+    .map_err(|_| worker_error())?
+    .map_err(Into::into)
 }
 
 /// Finds text inside the repository's files. Same authorization story as
@@ -3746,6 +3758,7 @@ pub async fn codex_read_thread(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn codex_start_thread(
     app: AppHandle<tauri::Wry>,
     state: State<'_, AppState>,
@@ -3753,6 +3766,7 @@ pub async fn codex_start_thread(
     cwd: PathBuf,
     model: Option<String>,
     effort: Option<String>,
+    service_tier: Option<String>,
     permission: Option<String>,
     delegation: Option<String>,
     tool_scope: Option<AutomationToolScope>,
@@ -3829,7 +3843,7 @@ pub async fn codex_start_thread(
         apply_chat_codex_policy(&mut base_config, &effective_config, true)?;
         (
             Some(base_config),
-            crate::harness_prompt::chat_developer_instructions(memory_enabled),
+            crate::harness_prompt::chat_developer_instructions_for(&state.store, memory_enabled),
         )
     } else {
         let mcp_app = app.clone();
@@ -3854,7 +3868,8 @@ pub async fn codex_start_thread(
             .map_err(CommandError::from)?;
         (
             codex_config,
-            crate::harness_prompt::codex_developer_instructions(
+            crate::harness_prompt::codex_developer_instructions_for(
+                &state.store,
                 &effective_config,
                 crate::harness_prompt::LocalToolsProjection::Projected,
             ),
@@ -3884,6 +3899,7 @@ pub async fn codex_start_thread(
             CodexThreadOverrides {
                 config: codex_config,
                 developer_instructions: Some(developer_instructions),
+                service_tier,
             },
         )
         .await
@@ -4090,7 +4106,7 @@ fn inject_chat_context(
                 .mark_memories_used(&memories.iter().map(|memory| memory.id).collect::<Vec<_>>())?;
         }
     }
-    let policy = crate::harness_prompt::chat_developer_instructions(memory_enabled);
+    let policy = crate::harness_prompt::chat_developer_instructions_for(store, memory_enabled);
     Ok(format!(
         "<integrator-chat-policy>\n{policy}\n</integrator-chat-policy>\n\n{wire_prompt}"
     ))
@@ -4123,14 +4139,15 @@ pub async fn codex_resume_thread(
             .get_setting("settings.memory.enabled")
             .map_err(CommandError::from)?
             .is_some_and(|setting| setting.value.as_bool() == Some(true));
-        crate::harness_prompt::chat_developer_instructions(memory_enabled)
+        crate::harness_prompt::chat_developer_instructions_for(&state.store, memory_enabled)
     } else {
         let effective_config = runtime
             .client
             .read_config(&saved.repository_root)
             .await
             .map_err(CommandError::from)?;
-        crate::harness_prompt::codex_developer_instructions(
+        crate::harness_prompt::codex_developer_instructions_for(
+            &state.store,
             &effective_config,
             crate::harness_prompt::LocalToolsProjection::Projected,
         )
@@ -4930,11 +4947,15 @@ pub async fn acp_connect(
             .map_err(CommandError::from)?
             .is_some_and(|setting| setting.value.as_bool() == Some(true));
         AcpLaunchProfile::Chat {
-            instructions: crate::harness_prompt::chat_developer_instructions(memory_enabled),
+            instructions: crate::harness_prompt::chat_developer_instructions_for(
+                &state.store,
+                memory_enabled,
+            ),
         }
     } else {
         AcpLaunchProfile::Project {
             tools: crate::harness_prompt::LocalToolsProjection::Projected,
+            browser: crate::harness_prompt::ExternalBrowserHandoff::from_store(&state.store),
         }
     };
     let arguments = acp_launch_arguments_with_route(
@@ -5039,6 +5060,7 @@ pub(crate) enum AcpLaunchProfile {
     Default,
     Project {
         tools: crate::harness_prompt::LocalToolsProjection,
+        browser: crate::harness_prompt::ExternalBrowserHandoff,
     },
     Chat {
         instructions: String,
@@ -5138,9 +5160,9 @@ pub(crate) fn acp_launch_arguments_with_route(
         ProviderKind::Grok => {
             let mut arguments = vec!["--no-auto-update".into()];
             match profile {
-                AcpLaunchProfile::Project { tools } => arguments.extend([
+                AcpLaunchProfile::Project { tools, browser } => arguments.extend([
                     "--rules".into(),
-                    crate::harness_prompt::instructions(ProviderKind::Grok, *tools),
+                    crate::harness_prompt::instructions(ProviderKind::Grok, *tools, *browser),
                 ]),
                 AcpLaunchProfile::Chat { instructions } => arguments.extend([
                     "--permission-mode".into(),
@@ -5386,12 +5408,14 @@ async fn acp_session_mcp_servers(
         .map_err(CommandError::from)?
         .is_some_and(|setting| setting.value.as_bool() == Some(true));
     let harness_instructions = if is_chat {
-        Some(crate::harness_prompt::chat_developer_instructions(
+        Some(crate::harness_prompt::chat_developer_instructions_for(
+            &state.store,
             memory_enabled,
         ))
     } else {
         (runtime.provider == ProviderKind::Cursor).then(|| {
-            crate::harness_prompt::instructions(
+            crate::harness_prompt::instructions_for(
+                &state.store,
                 ProviderKind::Cursor,
                 crate::harness_prompt::LocalToolsProjection::Projected,
             )
@@ -5491,9 +5515,14 @@ pub async fn acp_resume_session(
         });
     }
     let runtime = acp_runtime(&state, Some(task_id), None).await?;
-    if saved.provider != runtime.provider || saved.repository_root != cwd {
+    if saved.provider != runtime.provider
+        || !saved_resume_matches_workspace(&saved.repository_root, &cwd)
+    {
+        // Workspace authorization already passed. A provider or path spelling
+        // mismatch means this handle is stale, not that the renderer escaped
+        // the task boundary.
         return Err(CommandError {
-            code: "unauthorized",
+            code: "not-found",
             message: "The saved provider session does not match this task and workspace".into(),
         });
     }
@@ -6198,21 +6227,12 @@ pub async fn structured_cli_start_turn(
                     });
                 }
             },
-            // Auto runs Claude in the same mode as project-write: routine edits
-            // proceed and everything else still arrives as a `can_use_tool`
-            // control request, which is exactly the set the reviewer answers in
-            // `spawn_structured_cli_pump`. agy reaches its decisions through the
-            // hook file instead and has no channel we can answer, so the profile
-            // is refused there rather than silently becoming project-write.
+            // Auto runs Claude and Antigravity in the same mode as project-write:
+            // routine edits proceed. Claude still raises `can_use_tool` for the
+            // rest; agy raises the same set through the PreToolUse hook mailbox.
             AUTO_PERMISSION_PROFILE => match structured_provider {
-                StructuredCliProvider::Claude => StructuredPermissionMode::AcceptEdits,
-                StructuredCliProvider::Antigravity => {
-                    return Err(CommandError {
-                        code: "invalid-input",
-                        message: "the Antigravity CLI has no approval channel for the Auto \
-                              reviewer; choose Read only, Project write, or Full access"
-                            .into(),
-                    });
+                StructuredCliProvider::Claude | StructuredCliProvider::Antigravity => {
+                    StructuredPermissionMode::AcceptEdits
                 }
             },
             // The user explicitly picked the "Full access" profile; map it onto
@@ -6244,7 +6264,7 @@ pub async fn structured_cli_start_turn(
         .map_err(CommandError::from)?
         .filter(|saved| {
             saved.provider == provider
-                && saved.repository_root == repository
+                && saved_resume_matches_workspace(&saved.repository_root, &repository)
                 && crate::integrator_mcp::resume_state_is_current(&state.store, saved)
         });
     let mut resume_session_id = None;
@@ -6481,12 +6501,15 @@ pub async fn structured_cli_start_turn(
     let client = integrator_runtime::StructuredCliClient::new();
     let process_id = uuid::Uuid::new_v4().to_string();
     let mut hook_event_log = None;
+    let mut hook_reviews = None;
     if matches!(structured_provider, StructuredCliProvider::Antigravity) {
         let scope = control_overlay
             .as_deref()
             .and_then(Path::file_name)
             .and_then(|name| name.to_str())
             .unwrap_or(&process_id);
+        let hook_profile =
+            (!is_chat && permission == AUTO_PERMISSION_PROFILE).then_some(AUTO_PERMISSION_PROFILE);
         let overlay = crate::antigravity_hooks::create_overlay(
             &state.data_directory,
             &repository,
@@ -6504,6 +6527,8 @@ pub async fn structured_cli_start_turn(
                     crate::harness_prompt::LocalToolsProjection::Projected,
                 )
             },
+            crate::harness_prompt::ExternalBrowserHandoff::from_store(&state.store),
+            hook_profile,
         )
         .map_err(CommandError::from)?;
         let overlay_root = overlay.root.clone();
@@ -6522,8 +6547,17 @@ pub async fn structured_cli_start_turn(
             code: "unavailable",
             message: format!("could not prepare Antigravity MCP configuration: {error}"),
         })?;
+        if hook_profile == Some(AUTO_PERMISSION_PROFILE) {
+            let wait_ms = auto_review_plan(&state.store, ProviderKind::Antigravity)
+                .as_ref()
+                .map(auto_review_hook_wait_ms)
+                .unwrap_or(12_000);
+            crate::antigravity_hooks::write_review_wait_ms(&overlay.reviews, wait_ms)
+                .map_err(CommandError::from)?;
+        }
         control_overlay = Some(overlay.root);
         hook_event_log = Some(overlay.event_log);
+        hook_reviews = Some(overlay.reviews);
     }
     let hook_offset = hook_event_log
         .as_deref()
@@ -6562,6 +6596,21 @@ pub async fn structured_cli_start_turn(
         sent_skill_index: Arc::new(std::sync::Mutex::new(sent_skill_index)),
     };
     spawn_structured_cli_pump(app.clone(), Arc::clone(&state.store), runtime.clone());
+    if permission == AUTO_PERMISSION_PROFILE
+        && let Some(reviews) = hook_reviews
+    {
+        spawn_antigravity_auto_reviews(
+            app.clone(),
+            Arc::clone(&state.store),
+            reviews,
+            binding.clone(),
+            thread_id.clone(),
+            Arc::clone(&runtime.current_turn),
+            Arc::clone(&runtime.alive),
+            repository.clone(),
+            state.data_directory.clone(),
+        );
+    }
     let turn_id = client
         .start_turn_with_images(
             StructuredCliLaunchOptions {
@@ -6579,9 +6628,13 @@ pub async fn structured_cli_start_turn(
                                 .ok()
                                 .flatten()
                                 .is_some_and(|setting| setting.value.as_bool() == Some(true));
-                            crate::harness_prompt::chat_developer_instructions(memory_enabled)
+                            crate::harness_prompt::chat_developer_instructions_for(
+                                &state.store,
+                                memory_enabled,
+                            )
                         } else {
-                            let mut instructions = crate::harness_prompt::instructions(
+                            let mut instructions = crate::harness_prompt::instructions_for(
+                                &state.store,
                                 provider,
                                 crate::harness_prompt::LocalToolsProjection::Projected,
                             );
@@ -7184,7 +7237,14 @@ pub(crate) fn structured_resume_rejected(
     let Some(message) = diagnostic.map(str::to_ascii_lowercase) else {
         return false;
     };
+    // Providers phrase this both ways round — Claude answers "No conversation
+    // found with session ID: …" as often as "… was not found", and only the
+    // second was recognised, so a stale reference survived the rejection it
+    // was supposed to clear.
     let missing = message.contains("not found")
+        || message.contains("no conversation found")
+        || message.contains("no session found")
+        || message.contains("no thread found")
         || message.contains("does not exist")
         || message.contains("unknown session");
     missing
@@ -7503,7 +7563,10 @@ pub(crate) fn spawn_acp_pump(
                     )
                     .await
                     {
-                        let _ = runtime.client.respond_to_server_request(&id, response).await;
+                        let _ = runtime
+                            .client
+                            .respond_to_server_request(&id, response)
+                            .await;
                         continue;
                     }
                     let options = params
@@ -8211,6 +8274,112 @@ fn push_auto_review_lines(lines: &mut Vec<TranscriptLine>, item: &ItemProjection
 /// trustworthy if the session reads back afterwards as one story, so this is
 /// emitted for every outcome, including the ones the user was asked about.
 #[allow(clippy::too_many_arguments)]
+fn auto_review_hook_wait_ms(plan: &AutoReviewPlan) -> u64 {
+    let reviewers = 1 + plan.fallback_configs.len();
+    let per = plan.config.timeout.as_millis() as u64;
+    per.saturating_mul(reviewers as u64)
+        .saturating_add(2_000)
+        .clamp(3_000, 245_000)
+}
+
+pub(crate) fn close_antigravity_auto_outcome(outcome: Outcome) -> Outcome {
+    match outcome {
+        Outcome::AskTheUser { reason } => Outcome::Reject {
+            reason: format!("{reason} (Antigravity cannot prompt; denied)"),
+        },
+        other => other,
+    }
+}
+
+fn spawn_antigravity_auto_reviews(
+    app: AppHandle<tauri::Wry>,
+    store: Arc<LocalStore>,
+    reviews: PathBuf,
+    binding: RuntimeBinding,
+    thread_id: String,
+    current_turn: Arc<std::sync::Mutex<Option<String>>>,
+    alive: Arc<AtomicBool>,
+    repository: PathBuf,
+    data_directory: PathBuf,
+) {
+    std::thread::spawn(move || {
+        while alive.load(Ordering::Acquire) {
+            for path in crate::antigravity_hooks::pending_review_request_paths(&reviews) {
+                let Ok(request) = crate::antigravity_hooks::read_review_request(&path) else {
+                    continue;
+                };
+                let turn_id = current_turn
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.clone())
+                    .unwrap_or_else(|| "agy-auto-review".into());
+                let outcome = tauri::async_runtime::block_on(review_antigravity_hook_request(
+                    &app,
+                    &store,
+                    &binding,
+                    &thread_id,
+                    &turn_id,
+                    &data_directory,
+                    &repository,
+                    &request,
+                ));
+                let _ = crate::antigravity_hooks::write_review_response(
+                    &reviews,
+                    &crate::antigravity_hooks::ReviewMailboxResponse {
+                        id: request.id,
+                        decision: outcome.0,
+                        reason: outcome.1,
+                    },
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn review_antigravity_hook_request(
+    app: &AppHandle<tauri::Wry>,
+    store: &LocalStore,
+    binding: &RuntimeBinding,
+    thread_id: &str,
+    turn_id: &str,
+    data_directory: &Path,
+    repository: &Path,
+    request: &crate::antigravity_hooks::ReviewMailboxRequest,
+) -> (String, Option<String>) {
+    let Some(plan) = auto_review_plan(store, ProviderKind::Antigravity) else {
+        return ("deny".into(), Some("no reviewer is configured".into()));
+    };
+    let mut boundary = crate::antigravity_hooks::mailbox_boundary_request(request);
+    if boundary.cwd.as_os_str().is_empty() {
+        boundary.cwd = repository.to_path_buf();
+    }
+    let transcript = auto_review_transcript(store, binding.task_id);
+    let reviewer = IsolatedReviewer {
+        data_directory: data_directory.to_path_buf(),
+    };
+    let outcome = close_antigravity_auto_outcome(
+        auto_review_outcome(&reviewer, &plan, &boundary, &transcript).await,
+    );
+    emit_auto_review_audit(
+        app,
+        store,
+        binding,
+        thread_id,
+        turn_id,
+        &request.id,
+        &boundary,
+        &outcome,
+    );
+    match outcome {
+        Outcome::Approve { .. } => ("allow".into(), None),
+        Outcome::Reject { reason } | Outcome::AskTheUser { reason } => {
+            ("deny".into(), Some(reason))
+        }
+    }
+}
+
 fn emit_auto_review_audit(
     app: &AppHandle<tauri::Wry>,
     store: &LocalStore,
@@ -8296,7 +8465,10 @@ async fn acp_auto_review_response(
     // The profile is read from the persisted resume record rather than from a
     // command argument, for the same reason the settings are: a permission
     // decision must not be steerable by whatever the renderer last sent.
-    let resume = store.provider_resume_state(binding.task_id).ok().flatten()?;
+    let resume = store
+        .provider_resume_state(binding.task_id)
+        .ok()
+        .flatten()?;
     if resume.permission != AUTO_PERMISSION_PROFILE {
         return None;
     }
@@ -8884,6 +9056,13 @@ fn canonical_project_directory(path: &Path) -> integrator_core::Result<PathBuf> 
         ));
     }
     Ok(canonical)
+}
+
+/// Authorized cwd is already canonical. Older or Windows-spelled resume rows
+/// can still name the same folder, so compare through canonicalize when the
+/// raw paths differ.
+pub(crate) fn saved_resume_matches_workspace(saved: &Path, cwd: &Path) -> bool {
+    saved == cwd || canonical_project_directory(saved).is_ok_and(|root| root == cwd)
 }
 
 fn list_project_files(root: &Path) -> integrator_core::Result<Vec<ProjectFileEntry>> {

@@ -12,40 +12,67 @@
 }
 
 .browser-window-strip {
+  position: relative;
   flex: none;
   height: 40px;
   padding: 0 0 0 10px;
   display: flex;
-  align-items: center;
-  gap: 6px;
+  align-items: flex-end;
+  gap: 4px;
   /* No line under the strip: the selected tab has to run into the chrome
      below it, the way it does in the pane. */
   background: var(--color-chrome-background, var(--color-canvas));
 }
+/* A hairline of light along the top edge in dark themes, where the strip and
+   the OS behind it would otherwise meet as one flat black. */
+:root:not([data-appearance="light"]) .browser-window-strip::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--color-text-primary) 7%, transparent);
+}
 
 .browser-window-title {
+  height: 30px;
   max-width: 190px;
+  flex: none;
+  display: block;
+  margin-right: 4px;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
   color: var(--color-text-secondary);
-  font-size: 11px;
+  font-size: 10.5px;
   font-weight: 620;
+  line-height: 30px;
+}
+.browser-window-title[data-scope="chat"] {
+  padding: 0 7px;
+  height: 18px;
+  align-self: center;
+  margin-bottom: 6px;
+  border-radius: var(--radius-control);
+  background: var(--color-layer-1);
+  color: var(--color-text-tertiary);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  line-height: 18px;
+  text-transform: uppercase;
 }
 
+/* Tabs shrink to share the strip rather than scrolling off it, the way a
+   browser's do; the title fades out on the right as a tab tightens. */
 .browser-window-tabs {
   position: relative;
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   min-width: 0;
   height: 100%;
   display: flex;
   align-items: flex-end;
   gap: 4px;
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-.browser-window-tabs::-webkit-scrollbar {
-  display: none;
+  overflow: hidden;
 }
 
 /* Same strip as the work pane: every tab outlined, the selected one filled by
@@ -53,7 +80,14 @@
 .browser-window-tab {
   position: relative;
   z-index: 1;
+  /* Each tab asks for a comfortable width and gives it up evenly as the strip
+     fills, the way a browser's do; nothing scrolls off the end. */
+  flex: 1 1 176px;
+  min-width: 64px;
   max-width: 220px;
+  height: 30px;
+  border-radius: 8px 8px 0 0;
+  transition: background-color var(--motion-fast) var(--ease-standard);
 }
 .browser-window-tabs .browser-window-tab,
 .browser-window-tabs .browser-window-tab[data-active="true"] {
@@ -61,12 +95,35 @@
   border-bottom: 0;
   background: transparent;
 }
+.browser-window-tabs .browser-window-tab:not([data-active="true"]):hover {
+  background: var(--color-layer-1);
+}
+.browser-window-tabs .browser-window-tab > button[role="tab"] {
+  padding: 0 8px;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 500;
+  transition: padding-right var(--motion-fast) var(--ease-standard);
+}
+.browser-window-tabs .browser-window-tab > button[role="tab"] > span {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-overflow: clip;
+  mask-image: linear-gradient(to right, black calc(100% - 14px), transparent);
+}
+.browser-window-tab .tab-favicon,
+.browser-window-tab > button[role="tab"] > svg {
+  width: 14px;
+  height: 14px;
+  border-radius: 2px;
+}
 .browser-window-tabs .browser-window-tab[data-active="true"] > button[role="tab"] {
   color: var(--color-selection-text);
 }
 .browser-window-tab .file-reader-tab-close {
   display: grid;
   place-items: center;
+  border-radius: var(--radius-control);
 }
 .browser-window-tab .file-reader-tab-close svg {
   width: 11px;
@@ -76,9 +133,10 @@
    selected, so a resting strip shows titles — the work pane behaves the same. */
 .browser-window-tabs .browser-window-tab > .file-reader-tab-close {
   position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
+  top: 4px;
+  right: 3px;
+  bottom: 4px;
+  width: 20px;
   opacity: 0;
   transform: translateY(-1px) scale(0.88);
   pointer-events: none;
@@ -86,15 +144,13 @@
   transition:
     opacity var(--motion-fast) var(--ease-standard),
     transform var(--motion-fast) var(--ease-emphasized),
-    color var(--motion-fast) var(--ease-standard);
-}
-.browser-window-tabs .browser-window-tab > button[role="tab"] {
-  transition: padding-right var(--motion-fast) var(--ease-standard);
+    color var(--motion-fast) var(--ease-standard),
+    background-color var(--motion-fast) var(--ease-standard);
 }
 .browser-window-tab:hover > button[role="tab"],
 .browser-window-tab:focus-within > button[role="tab"],
 .browser-window-tab[data-active="true"] > button[role="tab"] {
-  padding-right: 24px;
+  padding-right: 26px;
 }
 .browser-window-tab:hover > .file-reader-tab-close,
 .browser-window-tab:focus-within > .file-reader-tab-close,
@@ -103,20 +159,35 @@
   transform: scale(1);
   pointer-events: auto;
 }
+.browser-window-tab > .file-reader-tab-close:hover {
+  background: color-mix(in srgb, var(--color-text-primary) 10%, transparent);
+}
 .browser-window-tab[data-active="true"] > .file-reader-tab-close {
   color: var(--color-selection-text);
 }
+.browser-window-tab[data-active="true"] > .file-reader-tab-close:hover {
+  background: color-mix(in srgb, var(--color-selection-text) 14%, transparent);
+}
 @media (prefers-reduced-motion: reduce) {
-  .browser-window-tabs .browser-window-tab > .file-reader-tab-close {
+  .browser-window-tab,
+  .browser-window-tabs .browser-window-tab > .file-reader-tab-close,
+  .browser-window-tabs .browser-window-tab > button[role="tab"] {
     transition: none;
     transform: none;
   }
+}
+[data-motion="none"] .browser-window-tab,
+[data-motion="none"] .browser-window-tabs .browser-window-tab > .file-reader-tab-close,
+[data-motion="none"] .browser-window-tabs .browser-window-tab > button[role="tab"] {
+  transition: none;
 }
 
 .browser-window-new-tab {
   width: 28px;
   height: 28px;
   flex: none;
+  align-self: center;
+  margin-top: 4px;
   display: grid;
   place-items: center;
   border: 0;
@@ -124,39 +195,60 @@
   background: transparent;
   color: var(--color-text-secondary);
   cursor: pointer;
+  transition:
+    background-color var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard);
 }
 .browser-window-new-tab:hover {
   background: var(--color-layer-1);
   color: var(--color-text-primary);
+}
+.browser-window-new-tab:active {
+  background: var(--color-layer-2);
 }
 .browser-window-new-tab svg {
   width: 14px;
   height: 14px;
 }
 
+.browser-window-strip-spacer {
+  flex: 1 1 auto;
+  min-width: 8px;
+  align-self: stretch;
+}
+
 .browser-window-controls {
-  height: 100%;
+  align-self: stretch;
   flex: none;
   display: flex;
   margin-left: 4px;
 }
 .browser-window-controls button {
-  width: 44px;
-  height: 100%;
+  width: 46px;
+  height: 40px;
   display: grid;
   place-items: center;
   border: 0;
   background: transparent;
   color: var(--color-text-secondary);
   cursor: pointer;
+  transition:
+    background-color var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard);
 }
 .browser-window-controls button:hover {
   background: var(--color-layer-1);
   color: var(--color-text-primary);
 }
+.browser-window-controls button:active {
+  background: var(--color-layer-2);
+}
 .browser-window-controls .browser-window-close:hover {
   background: var(--color-status-danger);
   color: var(--color-accent-contrast);
+}
+.browser-window-controls .browser-window-close:active {
+  background: color-mix(in srgb, var(--color-status-danger) 85%, var(--color-canvas));
 }
 .browser-window-controls svg {
   width: 13px;
@@ -175,6 +267,9 @@
   min-height: 0;
 }
 
+/* Nothing out here: a quiet card in the middle of the canvas, not a bare
+   line of text. The native side hides the window once it empties, so this is
+   the frame or two before that. */
 .browser-window-empty {
   flex: 1 1 auto;
   display: flex;
@@ -182,13 +277,35 @@
   align-items: center;
   justify-content: center;
   gap: 6px;
+  padding: 24px;
   color: var(--color-text-secondary);
+  text-align: center;
+}
+.browser-window-empty-mark {
+  width: 36px;
+  height: 26px;
+  margin-bottom: 8px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 6px;
+  background:
+    linear-gradient(
+        to bottom,
+        var(--color-layer-1) 0,
+        var(--color-layer-1) 7px,
+        transparent 7px
+      )
+      no-repeat,
+    var(--color-layer-2);
+  box-shadow: inset 0 7px 0 -6px var(--color-border-subtle);
 }
 .browser-window-empty strong {
   color: var(--color-text-primary);
-  font-size: 12px;
+  font-size: 12.5px;
   font-weight: 650;
 }
 .browser-window-empty small {
+  max-width: 260px;
+  color: var(--color-text-tertiary);
   font-size: 11px;
+  line-height: 1.45;
 }

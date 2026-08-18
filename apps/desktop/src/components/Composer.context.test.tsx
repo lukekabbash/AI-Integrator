@@ -447,3 +447,91 @@ describe("selection context cards", () => {
     expect(screen.getByText("App.tsx")).toBeInTheDocument();
   });
 });
+
+describe("browser annotation attachments", () => {
+  const annotationBlock = [
+    "<browser_annotation>",
+    "Page: Checkout",
+    "URL: http://localhost:3773/checkout",
+    'Element: <button> role=button name="Sign in"',
+    "Selector: #signin",
+    "Note:",
+    "make this a button",
+    "</browser_annotation>",
+  ].join("\n");
+  const annotationImage = {
+    path: "/tmp/Annotation · Sign in.png",
+    name: "Annotation · Sign in.png",
+    kind: "image" as const,
+    dataUrl: "data:image/png;base64,aGk=",
+  };
+
+  it("shows a marked element as one screenshot-style chip", async () => {
+    const onSend = vi.fn().mockResolvedValue(true);
+    render(
+      <LazyMotion features={domAnimation} strict>
+        <Composer
+          runtimes={[codex]}
+          defaultRuntime="codex"
+          defaultModel="gpt-5.3-codex"
+          onSend={onSend}
+          insertRequest={{ id: 1, text: annotationBlock }}
+          attachmentRequest={{ id: 1, attachment: annotationImage }}
+        />
+      </LazyMotion>,
+    );
+
+    expect(await screen.findByText("make this a button")).toBeInTheDocument();
+    expect(screen.getByText("Sign in")).toBeInTheDocument();
+    expect(screen.getByAltText("Sign in")).toHaveAttribute("src", annotationImage.dataUrl);
+    expect(screen.getByRole("button", { name: "Remove annotation Sign in" })).toBeInTheDocument();
+    expect(screen.queryByText("Annotation · Sign in.png")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+    const outgoing = onSend.mock.calls[0][0];
+    expect(outgoing.prompt).toContain(annotationBlock);
+    expect(outgoing.prompt).toContain("/tmp/Annotation · Sign in.png");
+  });
+
+  it("still shows the chip when only the markup arrives", async () => {
+    render(
+      <LazyMotion features={domAnimation} strict>
+        <Composer
+          runtimes={[codex]}
+          defaultRuntime="codex"
+          defaultModel="gpt-5.3-codex"
+          onSend={vi.fn().mockResolvedValue(true)}
+          insertRequest={{ id: 1, text: annotationBlock }}
+        />
+      </LazyMotion>,
+    );
+
+    expect(await screen.findByText("Sign in")).toBeInTheDocument();
+    expect(screen.queryByRole("img")).toBeNull();
+    expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled();
+  });
+
+  it("removes the folded screenshot with the annotation chip", async () => {
+    render(
+      <LazyMotion features={domAnimation} strict>
+        <Composer
+          runtimes={[codex]}
+          defaultRuntime="codex"
+          defaultModel="gpt-5.3-codex"
+          onSend={vi.fn().mockResolvedValue(true)}
+          insertRequest={{ id: 1, text: annotationBlock }}
+          attachmentRequest={{ id: 1, attachment: annotationImage }}
+        />
+      </LazyMotion>,
+    );
+
+    expect(
+      await screen.findByRole("button", { name: "Remove annotation Sign in" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Remove annotation Sign in" }));
+    expect(screen.queryByText("Sign in")).toBeNull();
+    expect(screen.queryByAltText("Sign in")).toBeNull();
+    expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+  });
+});

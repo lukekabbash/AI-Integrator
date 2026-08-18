@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adapter-acp"
-version = "0.1.41"
+version = "0.1.5"
 dependencies = [
  "base64 0.22.1",
  "integrator-core",
@@ -16,7 +16,7 @@ dependencies = [
 
 [[package]]
 name = "adapter-codex"
-version = "0.1.41"
+version = "0.1.5"
 dependencies = [
  "integrator-core",
  "serde",
@@ -53,7 +53,7 @@ dependencies = [
 
 [[package]]
 name = "ai-integrator-desktop"
-version = "0.1.41"
+version = "0.1.5"
 dependencies = [
  "adapter-acp",
  "adapter-codex",
@@ -2310,7 +2310,7 @@ dependencies = [
 
 [[package]]
 name = "integrator-core"
-version = "0.1.41"
+version = "0.1.5"
 dependencies = [
  "chrono",
  "serde",
@@ -2321,7 +2321,7 @@ dependencies = [
 
 [[package]]
 name = "integrator-runtime"
-version = "0.1.41"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4406,7 +4406,7 @@ dependencies = [
 
 [[package]]
 name = "session-store"
-version = "0.1.41"
+version = "0.1.5"
 dependencies = [
  "chrono",
  "integrator-core",

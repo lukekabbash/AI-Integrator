@@ -14,26 +14,21 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
-  type CSSProperties,
   type ReactNode,
 } from "react";
 
-import type { BrowserTab } from "../bridge";
-import { useModalOpen } from "../useModalOpen";
+import { bridge, type BrowserTab, type LocalServer } from "../bridge";
+import { useNativePageParked } from "../useModalOpen";
+import { resolveOmniboxInput, readSearchEngine } from "../browserOmnibox";
+import { toggleBrowserBookmark } from "./browserBookmarks";
+import { BrowserOmnibox } from "./BrowserOmnibox";
 import { BrowserStart } from "./BrowserStart";
 import { rememberBrowserVisit } from "./browserRecents";
 import { Tooltip } from "./Tooltip";
 import "./browserSurface.css";
-
-/** Room the overflow menu needs below the toolbar, in CSS pixels. Grows with
- *  the menu: every item added has to be counted here, because the tab gives up
- *  exactly this much of its top and a native surface would paint over the rest. */
-const MENU_CLEARANCE = 250;
-/** The couple of pixels the pane's hairline and drag pill occupy at the seam.
- *  A native surface would paint over them, so the tab starts just inside. */
-const SEAM_CLEARANCE = 3;
 
 export interface BrowserSurfaceProps {
   tab: BrowserTab;
@@ -65,6 +60,130 @@ export interface BrowserSurfaceProps {
   message?: string | null;
 }
 
+export interface BrowserChromeBarProps {
+  /** Back / forward / reload. Omitted (or `disabled`) on a tab with no page. */
+  onHistory?: (action: "back" | "forward" | "reload" | "stop") => void;
+  disabled?: boolean;
+  loading?: boolean;
+  /** Tooltip bubbles draw in HTML unless a native page must draw them. */
+  renderBubble?: boolean;
+  onTooltipOpenChange?: (open: boolean, anchor?: DOMRect, label?: ReactNode) => void;
+  onSubmit?: (event: React.FormEvent) => void;
+  /** The address field and, after it, the action cluster. */
+  children: ReactNode;
+}
+
+/**
+ * The 38px strip every browser-shaped surface wears: history controls, then
+ * whatever the caller puts after them (address, actions). A new tab with no
+ * page uses the same strip with the history disabled, so the pane reads as
+ * a browser before it has anywhere to go.
+ */
+export function BrowserChromeBar({
+  onHistory,
+  disabled = false,
+  loading = false,
+  renderBubble = true,
+  onTooltipOpenChange,
+  onSubmit,
+  children,
+}: BrowserChromeBarProps) {
+  const inert = disabled || !onHistory;
+  return (
+    <form
+      className="browser-chrome"
+      onSubmit={
+        onSubmit ??
+        ((event) => {
+          event.preventDefault();
+        })
+      }
+    >
+      <div className="browser-chrome-history">
+        <Tooltip
+          label="Back"
+          placement="bottom"
+          renderBubble={renderBubble}
+          onOpenChange={onTooltipOpenChange}
+        >
+          <button
+            type="button"
+            className="icon-button subtle tiny"
+            aria-label="Back"
+            disabled={inert}
+            onClick={() => onHistory?.("back")}
+          >
+            <ArrowLeft aria-hidden="true" />
+          </button>
+        </Tooltip>
+        <Tooltip
+          label="Forward"
+          placement="bottom"
+          renderBubble={renderBubble}
+          onOpenChange={onTooltipOpenChange}
+        >
+          <button
+            type="button"
+            className="icon-button subtle tiny"
+            aria-label="Forward"
+            disabled={inert}
+            onClick={() => onHistory?.("forward")}
+          >
+            <ArrowRight aria-hidden="true" />
+          </button>
+        </Tooltip>
+        <Tooltip
+          label={loading ? "Stop loading" : "Reload"}
+          placement="bottom"
+          renderBubble={renderBubble}
+          onOpenChange={onTooltipOpenChange}
+        >
+          <button
+            type="button"
+            className="icon-button subtle tiny"
+            aria-label={loading ? "Stop loading" : "Reload"}
+            disabled={inert}
+            onClick={() => onHistory?.(loading ? "stop" : "reload")}
+          >
+            <RotateCw className={loading ? "spin" : undefined} aria-hidden="true" />
+          </button>
+        </Tooltip>
+      </div>
+      {children}
+    </form>
+  );
+}
+
+/**
+ * The action cluster with nothing to act on: a new tab wears the same five
+ * controls as a live page, disabled, so the strip is the same width and shape
+ * before and after the first address — nothing jumps when the page arrives.
+ */
+export function BrowserChromeActionsPlaceholder() {
+  const actions: [string, ReactNode][] = [
+    ["Annotate this page", <MousePointerClick aria-hidden="true" key="annotate" />],
+    ["Screenshot", <Camera aria-hidden="true" key="screenshot" />],
+    ["Record", <Circle aria-hidden="true" key="record" />],
+    ["Pop out into its own window", <PictureInPicture2 aria-hidden="true" key="popout" />],
+    ["More browser actions", <MoreVertical aria-hidden="true" key="more" />],
+  ];
+  return (
+    <div className="browser-chrome-actions" data-inert="true">
+      {actions.map(([label, icon]) => (
+        <button
+          key={label}
+          type="button"
+          className="icon-button subtle tiny"
+          aria-label={label}
+          disabled
+        >
+          {icon}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 /**
  * The chrome around a native browser tab. The page itself is a webview the
  * native side positions over `.browser-viewport`; everything here is the
@@ -93,18 +212,100 @@ export function BrowserSurface({
   message,
 }: BrowserSurfaceProps) {
   const viewportRef = useRef<HTMLDivElement>(null);
-  const [draft, setDraft] = useState(tab.url);
+  const [draft, setDraft] = useState(tab.url === "about:blank" ? "" : tab.url);
   const [focused, setFocused] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [suggestOpen, setSuggestOpen] = useState(false);
+  const [servers, setServers] = useState<LocalServer[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const modalOpen = useModalOpen();
+  const nativeParked = useNativePageParked();
   const popped = tab.poppedOut;
   const hostedHere = popped === poppedOutHost;
   const blank = !tab.url || tab.url === "about:blank";
-  // Only the in-app pane has a divider hanging over its left edge. Applying
-  // that inset in the independent window made its page look three pixels off.
-  const seamClearance = poppedOutHost ? 0 : SEAM_CLEARANCE;
+  const canUseNativeMenu =
+    !blank && hostedHere && typeof bridge.browser?.showMenu === "function";
+
+  // The overflow menu's entries, in one place, so the HTML menu and the OS
+  // menu offer the same things in the same order.
+  const menuEntries = useMemo(
+    () => [
+      { id: "reload", label: "Reload" },
+      ...(allowExternalOpen ? [{ id: "external", label: "Open in your system browser" }] : []),
+      ...(onPopOutAll ? [{ id: "popout-all", label: "Pop out every tab" }] : []),
+      { separator: true },
+      { id: "save-login", label: "Save this login", enabled: !blank },
+      { id: "fill-login", label: "Sign in with a saved login", enabled: !blank },
+      { separator: true },
+      { id: "copy", label: "Copy address" },
+      { id: "close", label: "Close tab" },
+    ],
+    [allowExternalOpen, blank, onPopOutAll],
+  );
+  const pickMenu = useCallback(
+    (itemId: string) => {
+      switch (itemId) {
+        case "reload":
+          void onHistory("reload");
+          break;
+        case "external":
+          void onOpenExternally();
+          break;
+        case "popout-all":
+          void onPopOutAll?.();
+          break;
+        case "save-login":
+          void onSaveLogin?.();
+          break;
+        case "fill-login":
+          void onFillLogin?.();
+          break;
+        case "copy":
+          void navigator.clipboard?.writeText(tab.url);
+          break;
+        case "close":
+          onClose();
+          break;
+      }
+    },
+    [onClose, onFillLogin, onHistory, onOpenExternally, onPopOutAll, onSaveLogin, tab.url],
+  );
+  const pickRef = useRef(pickMenu);
+  useEffect(() => {
+    pickRef.current = pickMenu;
+  }, [pickMenu]);
+  useEffect(() => {
+    const api = bridge.browser;
+    if (!api?.onMenuPick) return;
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    void api
+      .onMenuPick((pick) => {
+        if (pick.tabId === tab.id && pick.taskId === tab.taskId) pickRef.current(pick.itemId);
+      })
+      .then((stop) => {
+        if (active) unlisten = stop;
+        else stop();
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [tab.id, tab.taskId]);
+  const openNativeMenu = useCallback(
+    async (anchor: DOMRect) => {
+      const api = bridge.browser;
+      if (!api?.showMenu) return;
+      // Under the button, right-aligned to it, in the window's logical pixels
+      // (the renderer fills its window, so client coordinates are window
+      // coordinates).
+      await api
+        .showMenu(tab.taskId, tab.id, anchor.right, anchor.bottom + 4, menuEntries)
+        .catch(() => undefined);
+    },
+    [menuEntries, tab.id, tab.taskId],
+  );
   // The caller passes a fresh arrow every render. Reach it through a ref so
   // the placement effect below survives its parent re-rendering: keyed on the
   // callback it tore the tab off screen and put it back several times a
@@ -113,13 +314,6 @@ export function BrowserSurface({
   useEffect(() => {
     boundsRef.current = onBoundsChange;
   }, [onBoundsChange]);
-
-  // How much of the tab's top the open dropdown needs. A native surface paints
-  // above HTML, so a menu over the page would be invisible; while one is open
-  // the tab gives up this much of its top and the menu sits in real space. Held
-  // as a constant rather than measured, so opening the menu is one placement
-  // instead of a render, a measure and a second placement.
-  const overlayInset = menuOpen ? MENU_CLEARANCE : 0;
 
   const tooltipRef = useRef(onToolbarTooltip);
   useEffect(() => {
@@ -136,11 +330,25 @@ export function BrowserSurface({
       if (!viewport) return;
       void tooltipRef.current({
         label,
-        x: anchor.left + anchor.width / 2 - viewport.left - seamClearance,
+        x: anchor.left + anchor.width / 2 - viewport.left,
       });
     },
-    [blank, seamClearance],
+    [blank],
   );
+
+  useEffect(() => {
+    let active = true;
+    void (bridge.browser?.localServers?.(false) ?? Promise.resolve<LocalServer[]>([]))
+      .then((list) => {
+        if (active) setServers(list);
+      })
+      .catch(() => {
+        if (active) setServers([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, [tab.id]);
 
   // Keep the native tab glued to this slot: observe the box, the scroll
   // ancestors and the window, and report physical pixels.
@@ -153,10 +361,14 @@ export function BrowserSurface({
     // that must park the native page. Replacing it with `new blank -> null`
     // would park the blank tab instead and leave the old page over this slot.
     // Popped tabs are remote in the main window but local in the pop-out.
-    // A dialog is the other reason to stand down: the page would paint over it
+    // A dialog is one reason to stand down: the page would paint over it
     // and ignore its backdrop, so it parks until the dialog closes and the
-    // poster underneath takes the blur in its place.
-    if (!node || blank || !hostedHere || modalOpen) {
+    // poster underneath takes the blur in its place. Dragging the compact
+    // deck across this slot is the same problem — the cards are HTML and
+    // the webview would swallow them. The overflow menu must sit in HTML
+    // space too, but it must not shove the live page down to make room.
+    // Parking keeps the slot still.
+    if (!node || blank || !hostedHere || nativeParked || menuOpen || suggestOpen) {
       return;
     }
     let frame = 0;
@@ -176,10 +388,10 @@ export function BrowserSurface({
         return;
       }
       const placed = new DOMRect(
-        rect.x + seamClearance,
-        rect.y + overlayInset,
-        Math.max(1, rect.width - seamClearance),
-        Math.max(1, rect.height - overlayInset),
+        rect.x,
+        rect.y,
+        Math.max(1, rect.width),
+        Math.max(1, rect.height),
       );
       const ratio = window.devicePixelRatio || 1;
       const key = [placed.left, placed.top, placed.right, placed.bottom]
@@ -205,117 +417,90 @@ export function BrowserSurface({
       window.removeEventListener("scroll", report, true);
       onBounds(null);
     };
-  }, [blank, hostedHere, modalOpen, overlayInset, seamClearance]);
+  }, [blank, hostedHere, menuOpen, nativeParked, suggestOpen]);
+
+  const go = useCallback(
+    (input: string) => {
+      const resolved = resolveOmniboxInput(input, readSearchEngine());
+      if (resolved.kind === "empty") return;
+      inputRef.current?.blur();
+      void onNavigate(resolved.href);
+    },
+    [onNavigate],
+  );
 
   const submit = useCallback(
     (event: React.FormEvent) => {
       event.preventDefault();
-      inputRef.current?.blur();
-      void onNavigate(draft);
+      go(draft);
     },
-    [draft, onNavigate],
+    [draft, go],
   );
 
   useEffect(() => {
-    if (!blank && !tab.loading) rememberBrowserVisit(tab.url, tab.title);
-  }, [blank, tab.loading, tab.url, tab.title]);
+    if (!blank && !tab.loading) rememberBrowserVisit(tab.url, tab.title, tab.favicon);
+  }, [blank, tab.favicon, tab.loading, tab.url, tab.title]);
 
   return (
-    <div
-      className="browser-surface"
-      data-popped={popped ? "true" : undefined}
-      // The strip the native page leaves free at the seam. Painting it in the
-      // chrome's colour makes it the browser's own edge rather than a stray
-      // line between the transcript and the page.
-      style={{ "--browser-seam": `${seamClearance}px` } as CSSProperties}
-    >
-      <form className="browser-chrome" onSubmit={submit}>
-        <div className="browser-chrome-history">
-          <Tooltip
-            label="Back"
-            placement="bottom"
-            renderBubble={blank}
-            onOpenChange={reportToolbarTooltip}
-          >
-            <button
-              type="button"
-              className="icon-button subtle tiny"
-              aria-label="Back"
-              onClick={() => void onHistory("back")}
-            >
-              <ArrowLeft aria-hidden="true" />
-            </button>
-          </Tooltip>
-          <Tooltip
-            label="Forward"
-            placement="bottom"
-            renderBubble={blank}
-            onOpenChange={reportToolbarTooltip}
-          >
-            <button
-              type="button"
-              className="icon-button subtle tiny"
-              aria-label="Forward"
-              onClick={() => void onHistory("forward")}
-            >
-              <ArrowRight aria-hidden="true" />
-            </button>
-          </Tooltip>
-          <Tooltip
-            label={tab.loading ? "Stop loading" : "Reload"}
-            placement="bottom"
-            renderBubble={blank}
-            onOpenChange={reportToolbarTooltip}
-          >
-            <button
-              type="button"
-              className="icon-button subtle tiny"
-              aria-label={tab.loading ? "Stop loading" : "Reload"}
-              onClick={() => void onHistory(tab.loading ? "stop" : "reload")}
-            >
-              <RotateCw className={tab.loading ? "spin" : undefined} aria-hidden="true" />
-            </button>
-          </Tooltip>
-        </div>
+    <div className="browser-surface" data-popped={popped ? "true" : undefined}>
+      <BrowserChromeBar
+        onSubmit={submit}
+        loading={Boolean(tab.loading)}
+        renderBubble={blank}
+        onTooltipOpenChange={reportToolbarTooltip}
+        onHistory={(action) => void onHistory(action)}
+      >
         <div className="browser-address">
-          <input
-            ref={inputRef}
-            type="text"
-            value={focused ? draft : tab.url}
-            spellCheck={false}
-            aria-label="Address"
-            placeholder="Search or enter a URL"
+          <BrowserOmnibox
+            size="chrome"
+            value={focused ? draft : blank ? "" : tab.url}
+            inputRef={inputRef}
+            bookmark={blank ? undefined : { url: tab.url, title: tab.title, favicon: tab.favicon }}
+            onToggleBookmark={
+              blank
+                ? undefined
+                : () => {
+                    toggleBrowserBookmark(tab.url, tab.title, tab.favicon);
+                  }
+            }
+            onChange={setDraft}
+            onSubmit={go}
+            servers={servers.map((server) => ({
+              url: server.url,
+              title: server.title || server.process || `localhost:${server.port}`,
+              hint: `localhost:${server.port}`,
+            }))}
+            onSuggestOpenChange={setSuggestOpen}
             onFocus={() => {
               setFocused(true);
-              setDraft(tab.url);
+              setDraft(blank ? "" : tab.url);
               queueMicrotask(() => inputRef.current?.select());
             }}
             onBlur={() => setFocused(false)}
-            onChange={(event) => setDraft(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Escape") {
-                setDraft(tab.url);
-                inputRef.current?.blur();
-              }
+            onEscape={() => {
+              setDraft(blank ? "" : tab.url);
+              inputRef.current?.blur();
             }}
+            trailing={
+              allowExternalOpen ? (
+                <Tooltip
+                  label="Open in your system browser"
+                  placement="bottom"
+                  renderBubble={blank}
+                  onOpenChange={reportToolbarTooltip}
+                >
+                  <button
+                    type="button"
+                    className="icon-button subtle tiny browser-address-external"
+                    aria-label="Open in your system browser"
+                    onClick={() => void onOpenExternally()}
+                  >
+                    <ExternalLink aria-hidden="true" />
+                  </button>
+                </Tooltip>
+              ) : null
+            }
           />
-          {allowExternalOpen ? (
-            <Tooltip
-              label="Open in your system browser"
-              placement="bottom"
-              renderBubble={blank}
-              onOpenChange={reportToolbarTooltip}
-            >
-              <button
-                type="button"
-                className="icon-button subtle tiny browser-address-external"
-                aria-label="Open in your system browser"
-                onClick={() => void onOpenExternally()}
-              >
-                <ExternalLink aria-hidden="true" />
-              </button>
-            </Tooltip>
-          ) : null}
         </div>
         <div className="browser-chrome-actions">
           <Tooltip
@@ -397,7 +582,16 @@ export function BrowserSurface({
                 className="icon-button subtle tiny"
                 aria-label="More browser actions"
                 aria-expanded={menuOpen}
-                onClick={() => setMenuOpen((open) => !open)}
+                onClick={(event) => {
+                  // Over a live page the menu is the OS's, which draws above
+                  // the native page; the HTML menu is for a blank tab and for
+                  // hosts without a native side.
+                  if (canUseNativeMenu) {
+                    void openNativeMenu(event.currentTarget.getBoundingClientRect());
+                    return;
+                  }
+                  setMenuOpen((open) => !open);
+                }}
               >
                 <MoreVertical aria-hidden="true" />
               </button>
@@ -487,7 +681,7 @@ export function BrowserSurface({
             ) : null}
           </div>
         </div>
-      </form>
+      </BrowserChromeBar>
       {message ? (
         <p className="browser-message" role="status">
           {message}
@@ -506,7 +700,14 @@ export function BrowserSurface({
         {!blank && hostedHere && poster ? (
           <img className="browser-viewport-poster" src={poster} alt="" />
         ) : null}
-        {blank && hostedHere ? <BrowserStart onOpen={(url) => void onNavigate(url)} /> : null}
+        {blank && hostedHere ? (
+          <BrowserStart
+            layout="home"
+            autoFocus={poppedOutHost}
+            showSearch
+            onOpen={(url) => void onNavigate(url)}
+          />
+        ) : null}
         {!hostedHere ? (
           <div className="browser-viewport-note">
             <strong>{popped ? "This tab is in its own window" : "This tab is docked"}</strong>

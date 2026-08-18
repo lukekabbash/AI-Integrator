@@ -215,7 +215,10 @@ mod tests {
                 cursor += 1;
                 seen.push(line.text.clone());
             }
-            assert!(buffer.since(cursor).is_empty(), "a caught-up reader sees nothing");
+            assert!(
+                buffer.since(cursor).is_empty(),
+                "a caught-up reader sees nothing"
+            );
         }
         assert_eq!(seen.len(), 21);
         assert_eq!(seen.first().map(String::as_str), Some("r0-0"));
@@ -228,7 +231,11 @@ mod tests {
         let mut buffer = LogBuffer::new(8);
         buffer.push(Stream::Stderr, &"x".repeat(500_000));
         let stored = &buffer.since(0)[0].text;
-        assert_eq!(stored.chars().count(), MAX_LINE_CHARS + 1, "truncated, with a marker");
+        assert_eq!(
+            stored.chars().count(),
+            MAX_LINE_CHARS + 1,
+            "truncated, with a marker"
+        );
         assert!(stored.ends_with('…'));
     }
 

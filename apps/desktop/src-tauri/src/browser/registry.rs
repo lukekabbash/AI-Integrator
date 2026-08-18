@@ -38,6 +38,8 @@ pub struct BrowserTab {
     pub hidden: bool,
     /// Set while an agent is driving this tab, so a second one can see that
     /// someone is mid-flow here and open its own rather than take the wheel.
+    /// `you` appears only when the Settings lock is on and the person is in
+    /// the tab.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub held_by: Option<String>,
     /// Wall-clock deadline through which the UI must preserve this tab when
@@ -72,8 +74,7 @@ pub(crate) struct Tab {
     /// last answered — see `userIdleMs` in `guest.js`.
     pub(crate) user_at: Option<std::time::Instant>,
     /// Children the orchestrator has handed this tab to, and what they may do
-    /// with it. Read means snapshot and evaluate; drive adds the verbs that
-    /// change the page.
+    /// with it. Read means snapshot; drive adds the verbs that change the page.
     pub(crate) grants: HashMap<String, GrantMode>,
     /// How many documents this tab has loaded. The guest is rebuilt per
     /// document and cannot count them itself, so the host does and pushes the
@@ -155,9 +156,8 @@ impl Caller {
     }
 }
 
-/// How long after an agent's last action the tab still reads as theirs. The
-/// user's hold runs on the same clock, so "someone has this page" means one
-/// thing whoever the someone is.
+/// How long after an agent's last action the tab still reads as theirs. When
+/// the Settings lock is on, a recent real keystroke uses the same window.
 pub(crate) const HOLD_TTL: Duration = Duration::from_secs(45);
 
 /// A close click shortly after an agent action minimizes the tab instead of
@@ -200,6 +200,12 @@ pub struct BrowserTabs {
     /// chat being left may finish after the next chat has claimed that slot;
     /// the older request must then stay parked rather than leak across chats.
     placement_orders: Mutex<HashMap<PlacementLaneKey, PlacementOrder>>,
+    /// Fixed for this app process. A settings change is applied after restart,
+    /// so old and new tabs can never silently use different identity scopes.
+    identity_scope: super::BrowserIdentityScope,
+    /// Serializes profile merges and scope-setting writes. A second confirm
+    /// cannot race the rollback snapshot from the first.
+    pub(crate) identity_change: Mutex<()>,
 }
 
 impl Default for BrowserTabs {
@@ -210,23 +216,43 @@ impl Default for BrowserTabs {
             host_key: uuid::Uuid::new_v4().to_string(),
             poster_clock: AtomicU64::default(),
             placement_orders: Mutex::default(),
+            identity_scope: super::BrowserIdentityScope::Task,
+            identity_change: Mutex::default(),
         }
     }
 }
 
 impl BrowserTabs {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
 
+    pub fn with_identity_scope(identity_scope: super::BrowserIdentityScope) -> Self {
+        Self {
+            identity_scope,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) const fn identity_scope(&self) -> super::BrowserIdentityScope {
+        self.identity_scope
+    }
+
     pub(crate) fn snapshot(&self, task_id: Option<&str>) -> Vec<BrowserTab> {
+        self.snapshot_held(task_id, false)
+    }
+
+    /// Same as `snapshot`, and when `user_hold` is on a recent real keystroke
+    /// is reported as an exclusive hold — the Settings lock.
+    pub(crate) fn snapshot_held(&self, task_id: Option<&str>, user_hold: bool) -> Vec<BrowserTab> {
         let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
         let mut list: Vec<BrowserTab> = tabs
             .values()
             .filter(|tab| task_id.is_none_or(|task| tab.state.task_id == task))
             .map(|tab| {
                 let mut state = tab.state.clone();
-                state.held_by = holder_of(tab);
+                state.held_by = holder_of(tab, user_hold);
                 state.agent_protected_until = agent_protected_until(tab);
                 state
             })
@@ -237,8 +263,8 @@ impl BrowserTabs {
 
     /// Every tab this caller may address: the task's own, minus the ones a
     /// sibling child opened, plus anything granted to it.
-    pub(crate) fn visible_to(&self, caller: &Caller) -> Vec<BrowserTab> {
-        self.snapshot(Some(&caller.task_id))
+    pub(crate) fn visible_to(&self, caller: &Caller, user_hold: bool) -> Vec<BrowserTab> {
+        self.snapshot_held(Some(&caller.task_id), user_hold)
             .into_iter()
             .filter(|tab| self.reach(&tab.id, caller).is_some())
             .collect()
@@ -321,9 +347,11 @@ impl BrowserTabs {
     }
 
     /// Who is driving this tab right now, if anyone other than `asker`.
-    pub(crate) fn held_by_other(&self, id: &str, asker: &str) -> Option<String> {
+    /// `user_hold` is the Settings lock: off, a person in the tab is not an
+    /// exclusive holder.
+    pub(crate) fn held_by_other(&self, id: &str, asker: &str, user_hold: bool) -> Option<String> {
         let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
-        holder_of(tabs.get(id)?).filter(|who| who != asker)
+        holder_of(tabs.get(id)?, user_hold).filter(|who| who != asker)
     }
 
     /// Whether a renderer close request must preserve this tab in the compact
@@ -588,10 +616,11 @@ impl BrowserTabs {
 
 /// Who has this tab right now, if anyone. A hold is reported only while it is
 /// fresh, so nothing has to remember to release one when a run ends or an agent
-/// dies. The person outranks an agent: if they have touched the page inside the
-/// window, it is theirs even if an agent was mid-flow.
-pub(crate) fn holder_of(tab: &Tab) -> Option<String> {
-    if tab.user_at.is_some_and(|at| at.elapsed() < HOLD_TTL) {
+/// dies. When `user_hold` is on, the person outranks an agent: if they have
+/// touched the page inside the window, it is theirs even if an agent was
+/// mid-flow. Off (the default) they share the page.
+pub(crate) fn holder_of(tab: &Tab, user_hold: bool) -> Option<String> {
+    if user_hold && tab.user_at.is_some_and(|at| at.elapsed() < HOLD_TTL) {
         return Some(USER_HOLDER.to_string());
     }
     tab.held
@@ -607,8 +636,8 @@ fn agent_protected_until(tab: &Tab) -> Option<u64> {
     u64::try_from(deadline.duration_since(UNIX_EPOCH).ok()?.as_millis()).ok()
 }
 
-/// Notes the person's last touch from a guest reply, so a tab an agent is
-/// reading still reports who really has it.
+/// Notes the person's last touch from a guest reply, so a lock-on snapshot
+/// can report `heldBy: "you"` from the same clock the guest uses.
 pub(crate) fn note_user_activity(tabs: &BrowserTabs, tab_id: &str, reply: &Value) {
     if let Some(idle) = reply.get("userIdleMs").and_then(Value::as_u64) {
         tabs.mark_user_active(tab_id, idle);

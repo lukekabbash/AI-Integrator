@@ -23,6 +23,12 @@ export function isAnnotationAttachment(name: string): boolean {
   return name.startsWith(ANNOTATION_ATTACHMENT_PREFIX);
 }
 
+/** The element name encoded in `Annotation · Sign in.png`. */
+export function annotationAttachmentLabel(name: string): string {
+  if (!isAnnotationAttachment(name)) return name;
+  return name.slice(ANNOTATION_ATTACHMENT_PREFIX.length).replace(/\.png$/i, "");
+}
+
 export const ANNOTATION_BLOCK_OPEN = "<browser_annotation>";
 const ANNOTATION_BLOCK_CLOSE = "</browser_annotation>";
 
@@ -38,9 +44,68 @@ export interface PendingAnnotation {
   note: string;
 }
 
+/**
+ * File names the composer should treat as this annotation's screenshot. The
+ * crop is named from the page's accessible name, or the tag when that is
+ * empty; the chip label uses the same fallback, written as `<tag>`.
+ */
+export function annotationImageNames(annotation: PendingAnnotation): string[] {
+  const names = new Set([annotationAttachmentName(annotation.label)]);
+  const tag = /^<([a-zA-Z0-9-]+)>$/.exec(annotation.label)?.[1];
+  if (tag) names.add(annotationAttachmentName(tag));
+  return [...names];
+}
+
+/**
+ * Folds each annotation's screenshot into the annotation chip so the composer
+ * shows one attachment, not a text chip beside a second image chip.
+ */
+export function pairAnnotationAttachments<T extends { name: string }>(
+  annotations: PendingAnnotation[],
+  attachments: T[],
+): Map<number, T> {
+  const pairs = new Map<number, T>();
+  const used = new Set<T>();
+  for (const annotation of annotations) {
+    const names = new Set(annotationImageNames(annotation));
+    const match = attachments.find((item) => !used.has(item) && names.has(item.name));
+    if (!match) continue;
+    pairs.set(annotation.id, match);
+    used.add(match);
+  }
+  const leftoverAnnotations = annotations.filter((annotation) => !pairs.has(annotation.id));
+  const leftoverImages = attachments.filter(
+    (item) => isAnnotationAttachment(item.name) && !used.has(item),
+  );
+  if (leftoverAnnotations.length === 1 && leftoverImages.length === 1) {
+    pairs.set(leftoverAnnotations[0].id, leftoverImages[0]);
+  }
+  return pairs;
+}
+
 export function isAnnotationBlock(text: string): boolean {
   const trimmed = text.trim();
   return trimmed.startsWith(ANNOTATION_BLOCK_OPEN) && trimmed.endsWith(ANNOTATION_BLOCK_CLOSE);
+}
+
+/**
+ * Pulls every annotation block out of a sent prompt so the transcript can
+ * show a card instead of the markup the agent still receives.
+ */
+export function splitAnnotationBlocks(body: string): {
+  text: string;
+  annotations: PendingAnnotation[];
+} {
+  const annotations: PendingAnnotation[] = [];
+  const pattern = new RegExp(`${ANNOTATION_BLOCK_OPEN}[\\s\\S]*?${ANNOTATION_BLOCK_CLOSE}`, "g");
+  const text = body
+    .replace(pattern, (raw) => {
+      annotations.push(parseAnnotationBlock(raw, annotations.length + 1));
+      return "";
+    })
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return { text, annotations };
 }
 
 /**

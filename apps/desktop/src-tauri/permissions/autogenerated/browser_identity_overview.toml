@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-browser-identity-overview"
+description = "Enables the browser_identity_overview command without any pre-configured scope."
+commands.allow = ["browser_identity_overview"]
+
+[[permission]]
+identifier = "deny-browser-identity-overview"
+description = "Denies the browser_identity_overview command without any pre-configured scope."
+commands.deny = ["browser_identity_overview"]

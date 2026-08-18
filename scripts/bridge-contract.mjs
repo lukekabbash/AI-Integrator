@@ -219,7 +219,9 @@ function parseRustParameter(parameter, sourcePath, commandName) {
 
 function isInjectedTauriParameter(type) {
   const compact = type.replace(/\s+/g, "").replace(/^&(?:mut)?/, "");
-  return /(?:^|::)(?:State|AppHandle|Window|WebviewWindow)(?:<|$)/.test(
+  // `Webview` is injected the same way `Window` is — a command takes it to
+  // learn which renderer called it, and the renderer never sends it.
+  return /(?:^|::)(?:State|AppHandle|Window|WebviewWindow|Webview)(?:<|$)/.test(
     compact,
   );
 }

@@ -181,6 +181,8 @@ export interface TaskSummary {
   model: string;
   /** Last reasoning-effort selection for this chat when the model supports it. */
   effort?: string;
+  /** Last Fast / priority service-tier selection when the model advertises one. */
+  fast?: boolean;
   updatedAt: string;
   unread?: boolean;
   worktree?: string;
@@ -325,6 +327,8 @@ export interface DelegationRouting {
   runtime: RuntimeId;
   model: string;
   effort?: string;
+  /** Faster output at the same model, where the provider offers it. */
+  fast?: boolean;
 }
 
 export interface UsageMetric {
@@ -696,6 +700,8 @@ export interface ComposerDraftValue {
   runtime: RuntimeId;
   model: string;
   effort?: string;
+  /** Fast / priority service tier when the selected model advertises one. */
+  fast?: boolean;
   permission: TaskPermission;
   delegation: "off" | "manual" | "balanced" | "budget-first";
   selectionStart: number;
@@ -716,6 +722,7 @@ export interface QueueMessageInput {
   runtime: RuntimeId;
   model: string;
   effort?: string;
+  fast?: boolean;
   permission: ComposerDraftValue["permission"];
   delegation: ComposerDraftValue["delegation"];
   nativeActionId?: string;
@@ -896,6 +903,8 @@ export interface StartTaskInput {
   model: string;
   /** Reasoning-effort level id from the model's catalog entry; omitted for the provider default. */
   effort?: string;
+  /** Fast / priority service tier when the model's catalog advertises one. */
+  fast?: boolean;
   permission: TaskPermission;
   delegation: "off" | "manual" | "balanced" | "budget-first";
   /** Project-level new-chat draft promoted atomically with native task creation. */
@@ -940,6 +949,10 @@ export interface ModelCatalogEntry {
   /** Discrete reasoning-effort levels the model accepts; absent when the provider exposes none. */
   efforts?: ModelEffortOption[];
   defaultEffort?: string;
+  /** True when the live catalog advertises a Fast / priority service tier. */
+  supportsFast?: boolean;
+  /** Catalog default for Fast; used only when `supportsFast` is true. */
+  defaultFast?: boolean;
 }
 
 export interface SpecialistRuntimeCatalog {
@@ -962,6 +975,22 @@ export function resolveModelEffort(
     return entry.defaultEffort;
   }
   return efforts[0]?.id;
+}
+
+/** Fast is a catalog-advertised service tier, never a guessed sibling model. */
+export function resolveModelFast(
+  entry: ModelCatalogEntry | undefined,
+  preferred?: boolean,
+): boolean | undefined {
+  if (!entry?.supportsFast) return undefined;
+  if (preferred === true || preferred === false) return preferred;
+  return entry.defaultFast === true;
+}
+
+/** Closed effort-pill copy: `High` or `High Fast` when Fast is on. */
+export function formatEffortRouteLabel(effortLabel: string | undefined, fast?: boolean): string {
+  const label = effortLabel?.trim() || "Effort";
+  return fast ? `${label} Fast` : label;
 }
 
 export interface SendTurnInput extends Omit<StartTaskInput, "projectId"> {
@@ -1355,6 +1384,21 @@ export interface ExplainStreamEvent {
 }
 
 /** One native browser tab. Mirrors `BrowserTab` in the Rust browser module. */
+/** One entry of the tab's native overflow menu. */
+export interface BrowserMenuEntry {
+  id?: string;
+  label?: string;
+  enabled?: boolean;
+  separator?: boolean;
+}
+
+/** What the person chose from the tab's native overflow menu. */
+export interface BrowserMenuPick {
+  taskId: string;
+  tabId: string;
+  itemId: string;
+}
+
 export interface BrowserTab {
   id: string;
   taskId: string;
@@ -1393,6 +1437,39 @@ export interface BrowserSite {
   persistent: boolean;
 }
 
+export type BrowserIdentityScope = "task" | "shared";
+
+export interface BrowserIdentityBucket {
+  id: string;
+  label: string;
+  kind: "task" | "chat" | "shared" | "orphan";
+  taskId?: string;
+  archived: boolean;
+  updatedAt: string;
+  profilePresent: boolean;
+  savedLogins: number;
+  active: boolean;
+}
+
+export interface BrowserIdentityOverview {
+  activeScope: BrowserIdentityScope;
+  configuredScope: BrowserIdentityScope;
+  restartRequired: boolean;
+  buckets: BrowserIdentityBucket[];
+}
+
+export interface BrowserIdentitySwitchResult {
+  activeScope: BrowserIdentityScope;
+  configuredScope: BrowserIdentityScope;
+  restartRequired: boolean;
+  mergedCookies: number;
+  cookieConflicts: number;
+  skippedPartitionedCookies: number;
+  mergedLogins: number;
+  loginConflicts: number;
+  sourcesRetained: boolean;
+}
+
 /** A trusted page-menu action, already validated and bounded by the host. */
 export interface BrowserContextAction {
   taskId: string;
@@ -1406,12 +1483,19 @@ export interface BrowserContextAction {
 
 export interface BrowserBridge {
   localServers(refresh?: boolean): Promise<LocalServer[]>;
+  identityOverview(): Promise<BrowserIdentityOverview>;
+  bucketSites(bucketId: string): Promise<BrowserSite[]>;
+  clearBucket(bucketId: string): Promise<void>;
+  setIdentityScope(scope: BrowserIdentityScope): Promise<BrowserIdentitySwitchResult>;
   sites(): Promise<BrowserSite[]>;
   clearData(): Promise<void>;
   open(taskId: string, url?: string): Promise<BrowserTab>;
   list(taskId: string): Promise<BrowserTab[]>;
   /** Brings back the tabs this chat had open, asleep until one is shown. */
   restore(taskId: string): Promise<BrowserTab[]>;
+  /** The popped-out tabs that belong to the calling window: a task window's
+   *  own, or every chat's for the shared chat window. */
+  poppedOutTabs(): Promise<BrowserTab[]>;
   /** True when closed; false when recent agent work kept it alive. */
   close(taskId: string, tabId: string): Promise<boolean>;
   /** Physical-pixel rectangle for the tab, or null to hide it. */
@@ -1442,16 +1526,36 @@ export interface BrowserBridge {
     listener: (request: { taskId: string; tabId: string }) => void,
   ): Promise<() => void>;
   onContextAction(listener: (request: BrowserContextAction) => void): Promise<() => void>;
+  /**
+   * Opens the tab's overflow menu as an OS menu at a point in the window
+   * (logical px from its top-left), so it draws above the native page. Resolves
+   * when the menu closes; the pick arrives through `onMenuPick`.
+   */
+  showMenu?(
+    taskId: string,
+    tabId: string,
+    x: number,
+    y: number,
+    items: BrowserMenuEntry[],
+  ): Promise<void>;
+  onMenuPick?(listener: (pick: BrowserMenuPick) => void): Promise<() => void>;
+  /**
+   * A capture this app wrote, as a `data:` URL the transcript can draw. Only
+   * files under the app's own capture directory are readable, so an agent
+   * naming any other path gets an error rather than a file read.
+   */
+  captureImage?(path: string): Promise<string>;
   /** Saved logins, without passwords — there is no call that returns one. */
   savedLogins(): Promise<SavedLogin[]>;
   /** Saves the login typed into the page, from the page into the OS store. */
-  saveLogin(tabId: string, taskId: string, allProjects?: boolean): Promise<SavedLogin>;
+  saveLogin(tabId: string, taskId: string): Promise<SavedLogin>;
   /** Types a saved login into the tab. The value never comes back. */
   fillLogin(tabId: string, taskId: string, username?: string): Promise<unknown>;
-  forgetLogin(projectId: string, origin: string, username: string): Promise<SavedLogin[]>;
+  forgetLogin(bucketId: string, origin: string, username: string): Promise<SavedLogin[]>;
+  forgetBucketLogins(bucketId: string): Promise<SavedLogin[]>;
   forgetAllLogins(): Promise<SavedLogin[]>;
-  /** Remembers whether agents may sign in on one origin without asking. */
-  allowAgentSignIn(origin: string, allowed: boolean): Promise<void>;
+  /** Remembers whether agents may sign in on one origin in this identity. */
+  allowAgentSignIn(taskId: string, tabId: string, origin: string, allowed: boolean): Promise<void>;
   /** An agent asking to sign in somewhere it has not been allowed yet. */
   onFillRequest(
     listener: (request: {
@@ -1465,7 +1569,7 @@ export interface BrowserBridge {
 
 /** One saved login as Settings sees it: everything but the password. */
 export interface SavedLogin {
-  projectId: string;
+  bucketId: string;
   origin: string;
   username: string;
   savedAt: string;
@@ -1714,7 +1818,7 @@ export interface AppBridge {
   /** Persist provider/model/effort for a chat so reopen restores the same route. */
   updateTaskRouting(
     taskId: string,
-    input: { runtime: RuntimeId; model: string; effort?: string },
+    input: { runtime: RuntimeId; model: string; effort?: string; fast?: boolean },
   ): Promise<TaskSummary>;
   /** Persists a terminal task lifecycle state; live running/waiting remains projection-owned. */
   setTaskStatus?(taskId: string, status: TaskStatus): Promise<void>;
@@ -2067,6 +2171,7 @@ const codexThreadByTask = new Map<string, string>();
 const activeCodexThreads = new Set<string>();
 const codexConnectedTasks = new Set<string>();
 const codexDelegationByTask = new Map<string, StartTaskInput["delegation"]>();
+const codexFastByTask = new Map<string, boolean>();
 const codexMemoryEnabledByTask = new Map<string, boolean>();
 const providerResumeByTask = new Map<string, NativeProviderResumeState>();
 const providerRouteByTask = new Map<
@@ -2254,23 +2359,22 @@ function reconcileRuntimeFingerprints(statuses: NativeProviderStatus[]): void {
 
 /** Cursor only: thought-level session config option id per model id. */
 const cursorEffortConfigByModel = new Map<string, string>();
+/** Cursor only: Fast `model_config` option id per model id. */
+const cursorFastConfigByModel = new Map<string, string>();
 /** Cursor only: the ACP config option id used for model selection. */
 let cursorModelConfigId: string | undefined;
 const kimiEffortConfigByModel = new Map<string, string>();
 let kimiModelConfigId: string | undefined;
 const FALLBACK_MODELS: Partial<Record<RuntimeId, string[]>> = {
-  // No claude CLI surface lists models; keep this current with Anthropic's
-  // published wire ids until live discovery exists for this runtime.
-  claude: [
-    "claude-fable-5",
-    "claude-opus-5",
-    "claude-opus-4-8",
-    "claude-sonnet-5",
-    "claude-haiku-4-5",
-  ],
+  // Degraded fallback when `claude_list_models` is unavailable. Keep this
+  // aligned with the current Claude Code picker aliases (`resolvedModel`
+  // without context-window suffixes).
+  claude: ["claude-fable-5", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"],
   antigravity: [
-    "Gemini 3.1 Pro",
+    "Gemini 3.7 Flash",
+    "Gemini 3.6 Flash",
     "Gemini 3.5 Flash",
+    "Gemini 3.1 Pro",
     "Claude Sonnet 4.6 (Thinking)",
     "Claude Opus 4.6 (Thinking)",
     "GPT-OSS 120B",
@@ -2291,13 +2395,21 @@ const FALLBACK_MODELS: Partial<Record<RuntimeId, string[]>> = {
     "gpt-5.6-terra",
     "gpt-5.6-luna",
     "gpt-5.5",
+    "gpt-5.3-codex",
+    "cursor-grok-4.6",
     "cursor-grok-4.5",
+    "gemini-3.7-flash",
     "gemini-3.6-flash",
     "kimi-k3",
   ],
   grok: ["grok-4.6", "grok-4.5"],
   // Kimi replaces this with the account's negotiated ACP catalog on first use.
-  kimi: ["kimi-code/k3", "kimi-code/kimi-for-coding", "kimi-code/kimi-for-coding-highspeed"],
+  kimi: [
+    "kimi-code/k3",
+    "kimi-code/k3-256k",
+    "kimi-code/kimi-for-coding",
+    "kimi-code/kimi-for-coding-highspeed",
+  ],
   custom: [],
 };
 
@@ -2351,6 +2463,31 @@ function effortLabel(id: string): string {
   return labels[id] ?? (id.length > 0 ? id.charAt(0).toUpperCase() + id.slice(1) : id);
 }
 
+function extractAdvertisedFast(value: {
+  serviceTiers?: unknown;
+  additionalSpeedTiers?: unknown;
+  defaultServiceTier?: unknown;
+}): { supportsFast: boolean; defaultFast: boolean } {
+  const tiers = [
+    ...(Array.isArray(value.serviceTiers) ? value.serviceTiers : []),
+    ...(Array.isArray(value.additionalSpeedTiers) ? value.additionalSpeedTiers : []),
+  ];
+  const names = tiers.flatMap((tier) => {
+    if (typeof tier === "string") return [tier];
+    if (!tier || typeof tier !== "object") return [];
+    const entry = tier as { id?: unknown; name?: unknown };
+    return [entry.id, entry.name].filter(
+      (candidate): candidate is string => typeof candidate === "string" && candidate.length > 0,
+    );
+  });
+  const supportsFast = names.some((name) => name.toLowerCase() === "fast");
+  const defaultFast =
+    supportsFast &&
+    typeof value.defaultServiceTier === "string" &&
+    value.defaultServiceTier.toLowerCase() === "fast";
+  return { supportsFast, defaultFast };
+}
+
 /// Codex `model/list` entries carry `supportedReasoningEfforts` and
 /// `defaultReasoningEffort` alongside the model id.
 export function extractCodexCatalog(response: unknown): ModelCatalogEntry[] {
@@ -2378,6 +2515,9 @@ export function extractCodexCatalog(response: unknown): ModelCatalogEntry[] {
       displayName?: unknown;
       supportedReasoningEfforts?: unknown;
       defaultReasoningEffort?: unknown;
+      serviceTiers?: unknown;
+      additionalSpeedTiers?: unknown;
+      defaultServiceTier?: unknown;
       isDefault?: unknown;
     };
     const id = [value.id, value.model, value.slug, value.name].find(
@@ -2416,6 +2556,11 @@ export function extractCodexCatalog(response: unknown): ModelCatalogEntry[] {
           item.defaultEffort = value.defaultReasoningEffort;
         }
       }
+    }
+    const fast = extractAdvertisedFast(value);
+    if (fast.supportsFast) {
+      item.supportsFast = true;
+      if (fast.defaultFast) item.defaultFast = true;
     }
     if (value.isDefault === true) catalog.unshift(item);
     else catalog.push(item);
@@ -2487,6 +2632,7 @@ export function extractAcpCatalog(
   if (runtime === "cursor") {
     cursorModelConfigId = modelOption.id;
     cursorEffortConfigByModel.clear();
+    cursorFastConfigByModel.clear();
   } else {
     kimiModelConfigId = modelOption.id;
     kimiEffortConfigByModel.clear();
@@ -2536,9 +2682,13 @@ export function extractAcpCatalog(
 /** Per-model reasoning parameters from Cursor's model-list extension RPC. */
 export interface CursorModelParams {
   /** The `session/set_config_option` config id (e.g. "effort", "reasoning"). */
-  configId: string;
+  configId?: string;
   efforts: ModelEffortOption[];
   defaultEffort?: string;
+  supportsFast?: boolean;
+  defaultFast?: boolean;
+  /** The `session/set_config_option` id for Fast (`fast`). */
+  fastConfigId?: string;
 }
 
 /**
@@ -2566,17 +2716,42 @@ export function extractCursorModelParams(response: unknown): Map<string, CursorM
     const levelOption =
       thoughtOptions.find((option) => option.id === "effort" || option.id === "reasoning") ??
       thoughtOptions.find((option) => acpConfigValues(option.options).length > 2);
-    if (!levelOption || typeof levelOption.id !== "string") continue;
-    const efforts = acpConfigValues(levelOption.options).map((effort) => ({
-      id: effort.value,
-      label: effort.name ?? effortLabel(effort.value),
-    }));
-    if (efforts.length === 0) continue;
+    const fastOption = entry.configOptions.find(
+      (option): option is AcpConfigOption =>
+        Boolean(option && typeof option === "object") &&
+        (option as AcpConfigOption).id === "fast" &&
+        (option as AcpConfigOption).category === "model_config",
+    );
+    const efforts =
+      levelOption && typeof levelOption.id === "string"
+        ? acpConfigValues(levelOption.options).map((effort) => ({
+            id: effort.value,
+            label: effort.name ?? effortLabel(effort.value),
+          }))
+        : [];
+    const fastValues = fastOption
+      ? acpConfigValues(fastOption.options).map((option) => option.value)
+      : [];
+    const supportsFast =
+      typeof fastOption?.id === "string" &&
+      (fastValues.includes("true") || fastValues.includes("false"));
+    if (efforts.length === 0 && !supportsFast) continue;
     params.set(entry.value, {
-      configId: levelOption.id,
+      ...(levelOption && typeof levelOption.id === "string" && efforts.length > 0
+        ? {
+            configId: levelOption.id,
+            defaultEffort:
+              typeof levelOption.currentValue === "string" ? levelOption.currentValue : undefined,
+          }
+        : {}),
       efforts,
-      defaultEffort:
-        typeof levelOption.currentValue === "string" ? levelOption.currentValue : undefined,
+      ...(supportsFast && typeof fastOption?.id === "string"
+        ? {
+            supportsFast: true,
+            fastConfigId: fastOption.id,
+            defaultFast: fastOption.currentValue === "true",
+          }
+        : {}),
     });
   }
   return params;
@@ -2619,9 +2794,16 @@ export function mergeCursorModelParams(
     const plainId = entry.id.split("[")[0] ?? entry.id;
     const modelParams = params.get(entry.label) ?? params.get(plainId);
     if (!modelParams) continue;
-    entry.efforts = modelParams.efforts;
-    entry.defaultEffort = modelParams.defaultEffort;
-    cursorEffortConfigByModel.set(entry.id, modelParams.configId);
+    if (modelParams.efforts.length > 0 && modelParams.configId) {
+      entry.efforts = modelParams.efforts;
+      entry.defaultEffort = modelParams.defaultEffort;
+      cursorEffortConfigByModel.set(entry.id, modelParams.configId);
+    }
+    if (modelParams.supportsFast && modelParams.fastConfigId) {
+      entry.supportsFast = true;
+      if (modelParams.defaultFast) entry.defaultFast = true;
+      cursorFastConfigByModel.set(entry.id, modelParams.fastConfigId);
+    }
   }
 }
 
@@ -3242,6 +3424,35 @@ function repositoryForTask(taskId: string): string {
   return project.path;
 }
 
+function lastRouteMatchesRuntime(
+  taskId: string,
+  runtime: NativeProviderResumeState["provider"],
+): boolean {
+  const route = providerRouteByTask.get(taskId);
+  return !route || route.provider === runtime;
+}
+
+function canResumeAcpSession(
+  saved: NativeProviderResumeState | undefined,
+  runtime: NativeProviderResumeState["provider"],
+  cwd: string,
+  delegation: StartTaskInput["delegation"],
+  taskId: string,
+): boolean {
+  if (!saved || saved.provider !== runtime || saved.delegation !== delegation) {
+    return false;
+  }
+  if (!lastRouteMatchesRuntime(taskId, runtime)) {
+    return false;
+  }
+  // Chat cwd is host-owned (`chat-runtime/<task-id>`). The renderer sends ""
+  // and must not treat a hydrated absolute resume path as a mismatch.
+  if (nativeTaskKinds.get(taskId) === "chat") {
+    return true;
+  }
+  return saved.repositoryRoot === cwd;
+}
+
 function repositoryForProject(projectId: string): string {
   const knownRepository = repositoryByProjectId.get(projectId);
   if (knownRepository) return knownRepository;
@@ -3308,7 +3519,10 @@ function extractSessionId(response: unknown): string | undefined {
 const cursorSessionByTask = new Set<string>();
 const cursorDelegationByTask = new Map<string, StartTaskInput["delegation"]>();
 /** The model and effort last applied to each Cursor session, to skip redundant protocol calls. */
-const cursorAppliedSelection = new Map<string, { model?: string; effort?: string }>();
+const cursorAppliedSelection = new Map<
+  string,
+  { model?: string; effort?: string; fast?: boolean }
+>();
 const cursorConnectedTasks = new Set<string>();
 type AcpRuntimeId = "cursor" | "grok" | "kimi";
 type StandardAcpRuntimeId = Exclude<AcpRuntimeId, "cursor">;
@@ -3365,6 +3579,7 @@ function clearCursorSessionCaches(taskId?: string): void {
   invalidateModelCatalog("cursor");
   cursorModelConfigId = undefined;
   cursorEffortConfigByModel.clear();
+  cursorFastConfigByModel.clear();
   cursorModelParams = new Map();
 }
 
@@ -3524,10 +3739,7 @@ async function ensureCursorSessionForTaskUnlocked(
       cursorDelegationByTask.get(nativeTaskId) !== delegationMode
     ) {
       const saved = providerResumeByTask.get(nativeTaskId);
-      const resumable =
-        saved?.provider === "cursor" &&
-        saved.repositoryRoot === cwd &&
-        saved.delegation === delegationMode;
+      const resumable = canResumeAcpSession(saved, "cursor", cwd, delegationMode, nativeTaskId);
       const startSession = () =>
         nativeInvoke<unknown>("acp_start_session", {
           taskId: nativeTaskId,
@@ -3649,10 +3861,7 @@ async function ensureStandardAcpSessionUnlocked(
     state.delegations.get(nativeTaskId) !== input.delegation
   ) {
     const saved = providerResumeByTask.get(nativeTaskId);
-    const resumable =
-      saved?.provider === runtime &&
-      saved.repositoryRoot === cwd &&
-      saved.delegation === input.delegation;
+    const resumable = canResumeAcpSession(saved, runtime, cwd, input.delegation, nativeTaskId);
     const startSession = () =>
       nativeInvoke<unknown>("acp_start_session", {
         taskId: nativeTaskId,
@@ -3748,8 +3957,9 @@ async function applyCursorSelection(nativeTaskId: string, input: SendTurnInput):
       throw new Error(`Cursor could not switch to model "${model}": ${message}`);
     }
     applied.model = model;
-    // A model change resets Cursor's parameter state; re-apply effort below.
+    // A model change resets Cursor's parameter state; re-apply effort/Fast below.
     applied.effort = undefined;
+    applied.fast = undefined;
   }
   const configId = model ? cursorEffortConfigByModel.get(model) : undefined;
   if (input.effort && configId && applied.effort !== input.effort) {
@@ -3764,6 +3974,20 @@ async function applyCursorSelection(nativeTaskId: string, input: SendTurnInput):
       throw new Error(`Cursor could not set reasoning effort "${input.effort}": ${message}`);
     }
     applied.effort = input.effort;
+  }
+  const fastConfigId = model ? cursorFastConfigByModel.get(model) : undefined;
+  if (fastConfigId && input.fast !== undefined && applied.fast !== input.fast) {
+    try {
+      await nativeInvoke("acp_set_config_option", {
+        taskId: nativeTaskId,
+        configId: fastConfigId,
+        value: input.fast ? "true" : "false",
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Cursor could not set Fast mode: ${message}`);
+    }
+    applied.fast = input.fast;
   }
   cursorAppliedSelection.set(nativeTaskId, applied);
 }
@@ -3824,20 +4048,31 @@ const CLAUDE_DEFAULT_EFFORT = "high";
 
 /**
  * Degraded fallback only: a successfully probed `agy models` catalog replaces
- * this list with exact live display names (`Gemini 3.5 Flash (High)`) or
+ * this list with exact live display names (`Gemini 3.7 Flash (High)`) or
  * effort-suffixed slugs from older builds. antigravityCatalog() splits either
  * form into base model + effort, and the native adapter composes the selected
  * effort back into the exact `--model` shape.
  */
 const ANTIGRAVITY_CATALOG: ModelCatalogEntry[] = [
   {
-    id: "Gemini 3.1 Pro",
-    label: "Gemini 3.1 Pro",
+    id: "Gemini 3.7 Flash",
+    label: "Gemini 3.7 Flash",
     efforts: [
       { id: "low", label: "Low" },
+      { id: "medium", label: "Medium" },
       { id: "high", label: "High" },
     ],
-    defaultEffort: "high",
+    defaultEffort: "medium",
+  },
+  {
+    id: "Gemini 3.6 Flash",
+    label: "Gemini 3.6 Flash",
+    efforts: [
+      { id: "low", label: "Low" },
+      { id: "medium", label: "Medium" },
+      { id: "high", label: "High" },
+    ],
+    defaultEffort: "medium",
   },
   {
     id: "Gemini 3.5 Flash",
@@ -3848,6 +4083,15 @@ const ANTIGRAVITY_CATALOG: ModelCatalogEntry[] = [
       { id: "high", label: "High" },
     ],
     defaultEffort: "medium",
+  },
+  {
+    id: "Gemini 3.1 Pro",
+    label: "Gemini 3.1 Pro",
+    efforts: [
+      { id: "low", label: "Low" },
+      { id: "high", label: "High" },
+    ],
+    defaultEffort: "high",
   },
   // Third-party models agy proxies. "(Thinking)" is part of the literal model
   // name in agy's registry, not a reasoning level, so those ids carry the
@@ -4177,8 +4421,11 @@ async function ensureCodexThread(input: SendTurnInput): Promise<string> {
     // MCP configuration is fixed when a Codex thread starts. A fresh thread
     // keeps delegation changes truthful, and the task digest carries the
     // conversation across without mutating global Codex settings.
+    const configuredFast = codexFastByTask.get(nativeTaskId) ?? false;
+    const nextFast = input.fast === true;
     if (
       chatMemoryChanged ||
+      configuredFast !== nextFast ||
       (configuredDelegation !== input.delegation &&
         (configuredDelegation !== undefined || input.delegation !== "off"))
     ) {
@@ -4205,6 +4452,8 @@ function forgetCodexThread(taskId: string, nativeTaskId: string, threadId: strin
   if (codexThreadByTask.get(nativeTaskId) === threadId) codexThreadByTask.delete(nativeTaskId);
   codexDelegationByTask.delete(taskId);
   codexDelegationByTask.delete(nativeTaskId);
+  codexFastByTask.delete(taskId);
+  codexFastByTask.delete(nativeTaskId);
   codexMemoryEnabledByTask.delete(taskId);
   codexMemoryEnabledByTask.delete(nativeTaskId);
   activeCodexThreads.delete(threadId);
@@ -4224,6 +4473,7 @@ async function startNewCodexThread(
     cwd,
     model,
     effort: input.effort,
+    serviceTier: input.fast ? "fast" : undefined,
     permission: input.permission,
     delegation: input.delegation,
     toolScope: input.toolScope,
@@ -4234,6 +4484,8 @@ async function startNewCodexThread(
   codexThreadByTask.set(input.taskId, threadId);
   codexDelegationByTask.set(nativeTaskId, input.delegation);
   codexDelegationByTask.set(input.taskId, input.delegation);
+  codexFastByTask.set(nativeTaskId, input.fast === true);
+  codexFastByTask.set(input.taskId, input.fast === true);
   if (nativeTaskKinds.get(nativeTaskId) === "chat") {
     codexMemoryEnabledByTask.set(nativeTaskId, memoryEnabled);
     codexMemoryEnabledByTask.set(input.taskId, memoryEnabled);
@@ -4524,11 +4776,17 @@ function nativeBrowserBridge(): BrowserBridge | undefined {
   if (!isTauri()) return undefined;
   return {
     localServers: (refresh) => nativeInvoke<LocalServer[]>("browser_local_servers", { refresh }),
+    identityOverview: () => nativeInvoke<BrowserIdentityOverview>("browser_identity_overview"),
+    bucketSites: (bucketId) => nativeInvoke<BrowserSite[]>("browser_bucket_sites", { bucketId }),
+    clearBucket: (bucketId) => nativeInvoke<void>("browser_clear_bucket", { bucketId }),
+    setIdentityScope: (scope) =>
+      nativeInvoke<BrowserIdentitySwitchResult>("browser_set_identity_scope", { scope }),
     sites: () => nativeInvoke<BrowserSite[]>("browser_sites"),
     clearData: () => nativeInvoke<void>("browser_clear_data"),
     open: (taskId, url) => nativeInvoke<BrowserTab>("browser_tab_open", { taskId, url }),
     list: (taskId) => nativeInvoke<BrowserTab[]>("browser_tab_list", { taskId }),
     restore: (taskId) => nativeInvoke<BrowserTab[]>("browser_tabs_restore", { taskId }),
+    poppedOutTabs: () => nativeInvoke<BrowserTab[]>("browser_popout_tabs"),
     close: (taskId, tabId) => nativeInvoke<boolean>("browser_tab_close", { taskId, tabId }),
     setBounds: (
       taskId,
@@ -4575,16 +4833,24 @@ function nativeBrowserBridge(): BrowserBridge | undefined {
         listener(event.payload),
       );
     },
+    showMenu: (taskId, tabId, x, y, items) =>
+      nativeInvoke<void>("browser_tab_menu", { taskId, tabId, x, y, items }),
+    onMenuPick: async (listener) => {
+      const { listen } = await import("@tauri-apps/api/event");
+      return listen<BrowserMenuPick>("browser://menu-pick", (event) => listener(event.payload));
+    },
+    captureImage: (path) => nativeInvoke<string>("browser_capture_image", { path }),
     savedLogins: () => nativeInvoke<SavedLogin[]>("browser_saved_logins"),
-    saveLogin: (tabId, taskId, allProjects) =>
-      nativeInvoke<SavedLogin>("browser_save_login", { tabId, taskId, allProjects }),
+    saveLogin: (tabId, taskId) => nativeInvoke<SavedLogin>("browser_save_login", { tabId, taskId }),
     fillLogin: (tabId, taskId, username) =>
       nativeInvoke<unknown>("browser_fill_login", { tabId, taskId, username }),
-    forgetLogin: (projectId, origin, username) =>
-      nativeInvoke<SavedLogin[]>("browser_forget_login", { projectId, origin, username }),
+    forgetLogin: (bucketId, origin, username) =>
+      nativeInvoke<SavedLogin[]>("browser_forget_login", { bucketId, origin, username }),
+    forgetBucketLogins: (bucketId) =>
+      nativeInvoke<SavedLogin[]>("browser_forget_bucket_logins", { bucketId }),
     forgetAllLogins: () => nativeInvoke<SavedLogin[]>("browser_forget_all_logins"),
-    allowAgentSignIn: (origin, allowed) =>
-      nativeInvoke<void>("browser_allow_agent_sign_in", { origin, allowed }),
+    allowAgentSignIn: (taskId, tabId, origin, allowed) =>
+      nativeInvoke<void>("browser_allow_agent_sign_in", { taskId, tabId, origin, allowed }),
     onFillRequest: async (listener) => {
       const { listen } = await import("@tauri-apps/api/event");
       return listen<{ taskId: string; tabId: string; origin: string; username: string }>(
@@ -5560,6 +5826,7 @@ export const bridge: AppBridge = {
         runtime: mapStoredRuntime(task.runtime) ?? input.runtime,
         model: task.model?.trim() || input.model,
         effort: task.effort?.trim() || input.effort,
+        fast: input.fast,
         updatedAt: task.updatedAt,
       };
     }
@@ -5572,6 +5839,7 @@ export const bridge: AppBridge = {
       runtime: input.runtime,
       model: input.model,
       effort: input.effort,
+      fast: input.fast,
       updatedAt: new Date().toISOString(),
       unread: false,
       worktree: `ai/${new Date().toISOString().slice(0, 10)}`,
@@ -6687,6 +6955,7 @@ export const bridge: AppBridge = {
         runtime: mapStoredRuntime(task.runtime) ?? input.runtime,
         model: task.model?.trim() || input.model,
         effort: task.effort?.trim() || input.effort,
+        fast: input.fast,
         updatedAt: task.updatedAt,
         worktree: task.worktreePath ?? existing?.worktree,
         pinned: task.pinned,
@@ -6701,6 +6970,7 @@ export const bridge: AppBridge = {
       runtime: input.runtime,
       model: input.model,
       effort: input.effort,
+      fast: input.fast,
       updatedAt: new Date().toISOString(),
     };
     const next: WorkspaceSnapshot = {
@@ -6888,6 +7158,10 @@ export const bridge: AppBridge = {
           toolScope: routedInput.toolScope,
           ...attachmentArgs,
         });
+        // One resume row per task: Claude/agy overwrite SQLite. Drop the
+        // cached ACP handle so a later Cursor/Grok/Kimi reconnect starts
+        // fresh instead of resuming a session that no longer exists.
+        providerResumeByTask.delete(taskId);
       } else {
         throw new Error(
           `${routedInput.runtime} turn execution is not implemented by the native backend`,

@@ -13,6 +13,12 @@ function storeSnapshot(snapshot: ReturnType<typeof createDemoSnapshot>) {
   window.localStorage.setItem(DEMO_STORAGE_KEY, JSON.stringify(snapshot));
 }
 
+/** Review has no header tab; the View menu is its keyboard-free front door. */
+function openReviewFromMenu() {
+  fireEvent.click(screen.getByRole("button", { name: "View" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "Review changes" }));
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   bridge.invalidateModelCatalog("codex");
@@ -87,16 +93,15 @@ describe("AI Integrator desktop workspace", () => {
     expect(screen.getByRole("button", { name: "Model" })).not.toHaveTextContent("Checking model…");
   });
 
-  it("opens Review in the work pane from the view tabs", async () => {
+  it("opens Review in the work pane from the View menu, with no view tabs in the header", async () => {
     render(<App />);
-    const tabs = await screen.findByRole("tablist", { name: "Task view" });
-    const task = within(tabs).getByRole("tab", { name: "Task" });
-    const review = within(tabs).getByRole("tab", { name: "Review" });
-    expect(task.querySelector(".sliding-tab-indicator")).toBeInTheDocument();
-    expect(tabs.querySelectorAll(".sliding-tab-indicator")).toHaveLength(1);
+    await screen.findByRole("button", { name: "View" });
+    // Task/Review left the title bar: Review is reached from the View menu, the
+    // work pane's launcher, a git file in the rail, and its shortcut.
+    expect(screen.queryByRole("tablist", { name: "Task view" })).toBeNull();
 
     // Review is a work-pane tab now; the transcript keeps the canvas.
-    fireEvent.click(review);
+    openReviewFromMenu();
     const surfaces = await screen.findByRole("tablist", { name: "Open surfaces" });
     expect(within(surfaces).getByRole("tab", { name: "Review" })).toHaveAttribute(
       "aria-selected",
@@ -110,11 +115,15 @@ describe("AI Integrator desktop workspace", () => {
     // Regression: the pane used to animate out and then stay mounted, holding
     // its width while every control reported it closed.
     render(<App />);
-    const tabs = await screen.findByRole("tablist", { name: "Task view" });
-    fireEvent.click(within(tabs).getByRole("tab", { name: "Review" }));
+    await screen.findByRole("button", { name: "View" });
+    openReviewFromMenu();
     await screen.findByRole("tablist", { name: "Open surfaces" });
     const appRoot = document.querySelector<HTMLElement>(".app-root");
     expect(appRoot).toHaveAttribute("data-subagent-visible", "true");
+    expect(appRoot!.style.getPropertyValue("--subagent-pane-left")).not.toBe("0px");
+    expect(screen.getByRole("button", { name: "File" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "View" })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Close work pane" }));
     await waitFor(() => expect(document.querySelector(".work-pane")).toBeNull());
@@ -297,9 +306,9 @@ describe("AI Integrator desktop workspace", () => {
     });
   });
 
-  it("keeps Settings out of the workspace view tabs and reachable from the sidebar", async () => {
+  it("keeps Settings out of the title bar and reachable from the sidebar", async () => {
     render(<App />);
-    await screen.findByRole("tab", { name: "Task" });
+    await screen.findByRole("button", { name: "View" });
     expect(screen.queryByRole("tab", { name: "Settings" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Open Settings" }));
     expect(
@@ -939,7 +948,8 @@ describe("AI Integrator desktop workspace", () => {
     storeSnapshot(snapshot);
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("tab", { name: "Review" }));
+    await screen.findByRole("button", { name: "View" });
+    openReviewFromMenu();
     expect(
       await screen.findByRole("region", { name: /Diff for src\/runtime\/router\.ts/i }),
     ).toBeInTheDocument();

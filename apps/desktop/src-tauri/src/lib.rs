@@ -53,10 +53,12 @@ use automations::{
     automation_timeline, automation_update,
 };
 use browser::{
-    BrowserTabs, browser_allow_agent_sign_in, browser_clear_data, browser_fill_login,
-    browser_forget_all_logins, browser_forget_login, browser_local_servers, browser_save_login,
-    browser_saved_logins, browser_sites, browser_tab_close, browser_tab_history,
-    browser_tab_invoke, browser_tab_list, browser_tab_navigate, browser_tab_open,
+    BrowserTabs, browser_allow_agent_sign_in, browser_bucket_sites, browser_capture_image,
+    browser_clear_bucket, browser_clear_data, browser_fill_login, browser_forget_all_logins,
+    browser_forget_bucket_logins, browser_forget_login, browser_identity_overview,
+    browser_local_servers, browser_popout_tabs, browser_save_login, browser_saved_logins,
+    browser_set_identity_scope, browser_sites, browser_tab_close, browser_tab_history,
+    browser_tab_invoke, browser_tab_list, browser_tab_menu, browser_tab_navigate, browser_tab_open,
     browser_tab_poster, browser_tab_screenshot, browser_tab_set_bounds, browser_tab_set_popped_out,
     browser_tabs_restore,
 };
@@ -145,6 +147,18 @@ pub fn run() {
             })?;
             integrator_skills::prune_projections(&state.data_directory);
             integrator_mcp::prune_projections(&state.data_directory);
+            let browser_identity_scope = browser::configured_scope(&state.store);
+            if let Err(error) = browser::migrate_legacy_logins(&state.store) {
+                eprintln!("browser login migration deferred: {}", error.message);
+            }
+            if let Err(error) =
+                browser::prepare_profile_layout(&state.data_directory, browser_identity_scope)
+            {
+                eprintln!("browser profile migration deferred: {error}");
+            }
+            if let Err(error) = browser::prune_ephemeral_profiles(&state.data_directory) {
+                eprintln!("ephemeral browser profile cleanup deferred: {error}");
+            }
             if let Ok(documents) = app.path().document_dir() {
                 let retention = state
                     .store
@@ -161,7 +175,9 @@ pub fn run() {
                 }
             }
             app.manage(state);
-            app.manage(std::sync::Arc::new(BrowserTabs::new()));
+            app.manage(std::sync::Arc::new(BrowserTabs::with_identity_scope(
+                browser_identity_scope,
+            )));
             // Dev servers outlive any one window, so the registry is app-wide
             // like the browser tabs are, and its observer is installed once —
             // a server started from one window still reports to all of them.
@@ -235,6 +251,10 @@ pub fn run() {
             usage_history,
             browser_local_servers,
             browser_sites,
+            browser_identity_overview,
+            browser_bucket_sites,
+            browser_clear_bucket,
+            browser_set_identity_scope,
             browser_clear_data,
             browser_tab_open,
             browser_tab_list,
@@ -247,10 +267,14 @@ pub fn run() {
             browser_tab_screenshot,
             browser_tab_poster,
             browser_tab_set_popped_out,
+            browser_popout_tabs,
+            browser_tab_menu,
+            browser_capture_image,
             browser_saved_logins,
             browser_save_login,
             browser_fill_login,
             browser_forget_login,
+            browser_forget_bucket_logins,
             browser_forget_all_logins,
             browser_allow_agent_sign_in,
             voice_typing_credential_status,

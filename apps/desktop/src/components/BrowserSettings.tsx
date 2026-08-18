@@ -1,80 +1,335 @@
-import { Globe, KeyRound, RotateCw, Trash2 } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { AlertTriangle, ChevronDown, Globe, KeyRound, RotateCw, Trash2, X } from "lucide-react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
-import { bridge, type BrowserSite, type SavedLogin } from "../bridge";
+import {
+  bridge,
+  type BrowserIdentityOverview,
+  type BrowserIdentityScope,
+  type BrowserIdentitySwitchResult,
+  type BrowserSite,
+  type SavedLogin,
+} from "../bridge";
+import {
+  isSearchEngineId,
+  writeSearchEngine,
+  type SearchEngineId,
+} from "../browserOmnibox";
+import { Dropdown } from "./Dropdown";
 import { SettingRow, Switch } from "./SettingControls";
 import { readSetting, type SettingsMap } from "./settingsModel";
 
 export const BROWSER_SETTINGS = {
   agentAccess: "browser.agentAccess",
+  lockActiveTab: "browser.lockActiveTab",
   keepSignedIn: "browser.keepSignedIn",
   blockNewWindows: "browser.blockNewWindows",
   externalOpen: "browser.externalOpen",
   dismissConsent: "browser.dismissConsent",
+  identityScope: "browser.identityScope",
+  searchEngine: "browser.searchEngine",
 } as const;
 
-/**
- * Browser settings. Sign-in state is cookies in a profile directory on this
- * computer — the same thing your everyday browser keeps. Integrator never
- * reads, stores or shows a password, so this page lists the sites holding
- * state and offers to forget them, and nothing more.
- */
+function SharedScopeWarning({
+  open,
+  busy,
+  error,
+  onCancel,
+  onConfirm,
+}: {
+  open: boolean;
+  busy: boolean;
+  error: string;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const titleId = useId();
+  const descriptionId = useId();
+  const cancelRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    if (open) cancelRef.current?.focus();
+  }, [open]);
+
+  if (!open) return null;
+  const modal = (
+    <div
+      className="delete-project-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget && !busy) onCancel();
+      }}
+    >
+      <section
+        className="delete-project-modal browser-scope-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={descriptionId}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            if (!busy) onCancel();
+            return;
+          }
+          if (event.key !== "Tab") return;
+          const focusable = Array.from(
+            event.currentTarget.querySelectorAll<HTMLElement>("button:not(:disabled)"),
+          );
+          const first = focusable[0];
+          const last = focusable.at(-1);
+          if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last?.focus();
+          } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first?.focus();
+          }
+        }}
+      >
+        <header className="delete-project-header">
+          <h2 id={titleId}>Switch to one Shared browser identity?</h2>
+          <button
+            className="delete-project-close"
+            type="button"
+            aria-label="Close"
+            disabled={busy}
+            onClick={onCancel}
+          >
+            <X aria-hidden="true" />
+          </button>
+        </header>
+        <div className="browser-scope-warning" id={descriptionId}>
+          <AlertTriangle aria-hidden="true" />
+          <div>
+            <p>
+              Cookies and saved logins from every task will be merged into Shared. For conflicting
+              entries, the bucket from the most recently active task wins.
+            </p>
+            <ul>
+              <li>
+                This can combine parts of different account sessions and cause sign-in errors.
+              </li>
+              <li>If a site breaks, clear its Shared Browser data and sign in again.</li>
+              <li>Task and Chat/Main Browser source buckets stay intact.</li>
+              <li>The new scope applies after Integrator restarts.</li>
+            </ul>
+          </div>
+        </div>
+        {error ? (
+          <p className="delete-project-error" role="alert">
+            {error}
+          </p>
+        ) : null}
+        <footer className="delete-project-footer">
+          <button
+            ref={cancelRef}
+            className="delete-project-cancel"
+            type="button"
+            disabled={busy}
+            onClick={onCancel}
+          >
+            Cancel
+          </button>
+          <button
+            className="delete-project-confirm"
+            type="button"
+            disabled={busy}
+            onClick={onConfirm}
+          >
+            {busy ? "Merging…" : "Merge and use Shared"}
+          </button>
+        </footer>
+      </section>
+    </div>
+  );
+  return typeof document === "undefined" ? modal : createPortal(modal, document.body);
+}
+
+function switchSummary(result: BrowserIdentitySwitchResult): string {
+  if (result.configuredScope === "task") {
+    return result.restartRequired
+      ? "Task-scoped browser identity will apply after restart."
+      : "Browser identity is scoped by task.";
+  }
+  const conflicts = result.cookieConflicts + result.loginConflicts;
+  const merged = result.mergedCookies + result.mergedLogins;
+  const partitioned = result.skippedPartitionedCookies
+    ? `, ${result.skippedPartitionedCookies} partitioned ${
+        result.skippedPartitionedCookies === 1 ? "cookie" : "cookies"
+      } kept task-scoped`
+    : "";
+  return `Shared browser prepared: ${merged} ${merged === 1 ? "entry" : "entries"} merged${
+    conflicts ? `, ${conflicts} ${conflicts === 1 ? "conflict" : "conflicts"} resolved` : ""
+  }${partitioned}. Restart Integrator to apply it.`;
+}
+
+/** Browser policy plus bucketed, metadata-only management of local browser identity. */
 export function BrowserSettings({
   settings,
   setSetting,
+  onIdentityScopeChanged,
 }: {
   settings: SettingsMap;
   setSetting: (key: string, value: unknown) => void;
+  onIdentityScopeChanged?: (scope: BrowserIdentityScope) => void;
 }) {
-  const [sites, setSites] = useState<BrowserSite[]>([]);
+  const api = bridge.browser;
+  const available = Boolean(api);
+  const [overview, setOverview] = useState<BrowserIdentityOverview | null>(null);
   const [logins, setLogins] = useState<SavedLogin[]>([]);
+  const [sitesByBucket, setSitesByBucket] = useState<
+    Record<string, BrowserSite[] | null | undefined>
+  >({});
+  const [siteErrors, setSiteErrors] = useState<Record<string, string>>({});
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const [message, setMessage] = useState("");
   const [generation, setGeneration] = useState(0);
-  const [loaded, setLoaded] = useState<number | null>(null);
-  const available = Boolean(bridge.browser);
-  const loading = available && loaded !== generation;
+  const [loadedGeneration, setLoadedGeneration] = useState<number | null>(available ? null : 0);
+  const [busyBucket, setBusyBucket] = useState("");
+  const [warningOpen, setWarningOpen] = useState(false);
+  const [scopeBusy, setScopeBusy] = useState(false);
+  const [scopeError, setScopeError] = useState("");
 
-  useEffect(() => {
-    const api = bridge.browser;
-    let active = true;
-    (api?.sites() ?? Promise.resolve<BrowserSite[]>([]))
-      .then((next) => {
-        if (!active) return;
-        setSites(next);
-        setLoaded(generation);
-      })
-      .catch(() => {
-        if (!active) return;
-        setSites([]);
-        setLoaded(generation);
-      });
-    return () => {
-      active = false;
-    };
-  }, [generation]);
-
-  useEffect(() => {
-    let active = true;
-    (bridge.browser?.savedLogins() ?? Promise.resolve<SavedLogin[]>([]))
-      .then((next) => active && setLogins(next))
-      .catch(() => active && setLogins([]));
-    return () => {
-      active = false;
-    };
-  }, [generation]);
-
-  const clearAll = useCallback(async () => {
-    setMessage("");
-    try {
-      await bridge.browser?.clearData();
-      setGeneration((value) => value + 1);
-      setMessage("Signed out everywhere and cleared this browser's cache.");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Could not clear browsing data.");
-    }
+  const refresh = useCallback(() => {
+    setSitesByBucket({});
+    setSiteErrors({});
+    setExpanded(new Set());
+    setGeneration((value) => value + 1);
   }, []);
 
+  useEffect(() => {
+    const engine = readSetting(settings, BROWSER_SETTINGS.searchEngine, "google");
+    if (isSearchEngineId(engine)) writeSearchEngine(engine);
+  }, [settings]);
+
+  useEffect(() => {
+    if (!api) return;
+    let active = true;
+    void Promise.all([api.identityOverview(), api.savedLogins()])
+      .then(([nextOverview, nextLogins]) => {
+        if (!active) return;
+        setOverview(nextOverview);
+        setLogins(nextLogins);
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        setOverview(null);
+        setLogins([]);
+        setMessage(error instanceof Error ? error.message : "Could not read browser identities.");
+      })
+      .finally(() => active && setLoadedGeneration(generation));
+    return () => {
+      active = false;
+    };
+  }, [api, generation]);
+
+  const loadBucketSites = useCallback(
+    (bucketId: string) => {
+      if (!api) return;
+      setSitesByBucket((current) => ({ ...current, [bucketId]: null }));
+      setSiteErrors((current) => ({ ...current, [bucketId]: "" }));
+      void api
+        .bucketSites(bucketId)
+        .then((sites) => setSitesByBucket((current) => ({ ...current, [bucketId]: sites })))
+        .catch((error: unknown) => {
+          setSitesByBucket((current) => ({ ...current, [bucketId]: [] }));
+          setSiteErrors((current) => ({
+            ...current,
+            [bucketId]: error instanceof Error ? error.message : "Could not inspect this bucket.",
+          }));
+        });
+    },
+    [api],
+  );
+
+  const toggleBucket = (bucketId: string) => {
+    const opening = !expanded.has(bucketId);
+    setExpanded((current) => {
+      const next = new Set(current);
+      if (next.has(bucketId)) next.delete(bucketId);
+      else next.add(bucketId);
+      return next;
+    });
+    if (opening && !(bucketId in sitesByBucket)) loadBucketSites(bucketId);
+  };
+
+  const reloadOverview = useCallback(async () => {
+    if (!api) return;
+    const [nextOverview, nextLogins] = await Promise.all([
+      api.identityOverview(),
+      api.savedLogins(),
+    ]);
+    setOverview(nextOverview);
+    setLogins(nextLogins);
+  }, [api]);
+
+  const clearBucket = async (bucketId: string, label: string) => {
+    if (!api) return;
+    setBusyBucket(bucketId);
+    setMessage("");
+    try {
+      await api.clearBucket(bucketId);
+      setSitesByBucket((current) => ({ ...current, [bucketId]: [] }));
+      await reloadOverview();
+      setMessage(`${label} cookies, storage, and cache cleared. Saved logins were kept.`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : `Could not clear ${label}.`);
+    } finally {
+      setBusyBucket("");
+    }
+  };
+
+  const forgetBucket = async (bucketId: string, label: string) => {
+    if (!api) return;
+    setBusyBucket(bucketId);
+    setMessage("");
+    try {
+      setLogins(await api.forgetBucketLogins(bucketId));
+      await reloadOverview();
+      setMessage(`${label} saved logins removed from the OS credential store.`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : `Could not forget ${label} logins.`);
+    } finally {
+      setBusyBucket("");
+    }
+  };
+
+  const setIdentityScope = async (scope: BrowserIdentityScope) => {
+    if (!api) return;
+    setScopeBusy(true);
+    setScopeError("");
+    setMessage("");
+    try {
+      const result = await api.setIdentityScope(scope);
+      onIdentityScopeChanged?.(scope);
+      setOverview((current) =>
+        current
+          ? {
+              ...current,
+              activeScope: result.activeScope,
+              configuredScope: result.configuredScope,
+              restartRequired: result.restartRequired,
+            }
+          : current,
+      );
+      setWarningOpen(false);
+      setMessage(switchSummary(result));
+      await reloadOverview();
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Could not change browser scope.";
+      if (scope === "shared") setScopeError(detail);
+      else setMessage(detail);
+    } finally {
+      setScopeBusy(false);
+    }
+  };
+
   const flag = (key: string, fallback: boolean) => readSetting(settings, key, fallback) !== false;
+  const configuredScope =
+    overview?.configuredScope ??
+    readSetting<BrowserIdentityScope>(settings, BROWSER_SETTINGS.identityScope, "task");
+  const loading = available && loadedGeneration !== generation;
 
   return (
     <>
@@ -85,21 +340,93 @@ export function BrowserSettings({
         <div>
           <h1>Browser</h1>
           <p>
-            The browser tabs Integrator opens in the work pane, and what agents may do with them.
+            Browser tabs in the work pane, their local identity boundaries, and what agents may do.
           </p>
         </div>
       </div>
 
       <section className="settings-section">
         <header>
-          <h2>Agent access</h2>
-          <p>
-            Browser tabs belong to a task, and an agent can only reach its own task&apos;s tabs.
+          <h2>Browser identity</h2>
+          <p>Choose where cookies, site storage, cache, and saved logins are available.</p>
+        </header>
+        <div
+          className="browser-scope-options"
+          role="radiogroup"
+          aria-label="Browser identity scope"
+        >
+          <button
+            type="button"
+            role="radio"
+            aria-checked={configuredScope === "task"}
+            data-selected={configuredScope === "task"}
+            disabled={!available || scopeBusy}
+            onClick={() => void setIdentityScope("task")}
+          >
+            <strong>By task</strong>
+            <small>
+              Default. Each code task is isolated; standalone chats use Chat/Main Browser.
+            </small>
+          </button>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={configuredScope === "shared"}
+            data-selected={configuredScope === "shared"}
+            disabled={!available || scopeBusy}
+            onClick={() => {
+              if (configuredScope !== "shared") {
+                setScopeError("");
+                setWarningOpen(true);
+              }
+            }}
+          >
+            <strong>Shared</strong>
+            <small>Every task uses one browser identity after restart.</small>
+          </button>
+        </div>
+        {overview?.restartRequired ? (
+          <p className="browser-restart-note" role="status">
+            Restart Integrator to apply{" "}
+            {overview.configuredScope === "shared" ? "Shared" : "By task"}. Open tabs keep their
+            current identity until then.
           </p>
+        ) : null}
+      </section>
+
+      <section className="settings-section">
+        <header>
+          <h2>Search</h2>
+          <p>The address field searches here when the line is not a URL. Queries are not logged.</p>
+        </header>
+        <SettingRow
+          label="Search engine"
+          description="Used from a new tab and from the address field. Bookmarks stay independent of this."
+        >
+          <Dropdown
+            aria-label="Search engine"
+            value={readSetting<SearchEngineId>(settings, BROWSER_SETTINGS.searchEngine, "google")}
+            onChange={(value) => {
+              const engine = isSearchEngineId(value) ? value : "google";
+              setSetting(BROWSER_SETTINGS.searchEngine, engine);
+              writeSearchEngine(engine);
+            }}
+            options={[
+              { value: "google", label: "Google" },
+              { value: "ddg", label: "DuckDuckGo" },
+            ]}
+          />
+        </SettingRow>
+      </section>
+
+      <section className="settings-section">
+        <header>
+          <h2>Agent access</h2>
+          <p>Tabs stay task-owned even when their browser identity is Shared.</p>
         </header>
         <SettingRow
           label="Let agents open and drive browser tabs"
-          description="Turns on open, read a page, click, type and wait — and asks agents to check web work here instead of assuming it worked. Off refuses every browser tool with a reason."
+          description="Turns on open, read, click, type and wait. Off refuses every browser tool with a reason."
         >
           <Switch
             checked={flag(BROWSER_SETTINGS.agentAccess, true)}
@@ -108,8 +435,18 @@ export function BrowserSettings({
           />
         </SettingRow>
         <SettingRow
+          label="Lock agents out of the tab you are using"
+          description="When you click or type in a tab, agents wait until you stop. Off lets them keep working in that same tab alongside you."
+        >
+          <Switch
+            checked={readSetting<boolean>(settings, BROWSER_SETTINGS.lockActiveTab, false)}
+            onChange={(next) => setSetting(BROWSER_SETTINGS.lockActiveTab, next)}
+            label="Lock agents out of the tab you are using"
+          />
+        </SettingRow>
+        <SettingRow
           label="Decline cookie banners automatically"
-          description="Clicks the reject control on consent dialogs from vendors Integrator recognises — Cookiebot, OneTrust, Didomi and a few more. Never accepts, and never touches a login wall, an age gate or a terms dialog, which wear the same shape and mean something else."
+          description="Clicks reject on recognized consent dialogs. It never accepts or touches a login wall, age gate, or terms dialog."
         >
           <Switch
             checked={readSetting<boolean>(settings, BROWSER_SETTINGS.dismissConsent, false)}
@@ -119,7 +456,7 @@ export function BrowserSettings({
         </SettingRow>
         <SettingRow
           label="Keep pop-ups inside Integrator"
-          description="A page that opens a new window loads it in the same tab, so a sign-in hop stays somewhere you can watch."
+          description="Loads a new window in the same tab so sign-in hops remain visible."
         >
           <Switch
             checked={flag(BROWSER_SETTINGS.blockNewWindows, true)}
@@ -129,7 +466,7 @@ export function BrowserSettings({
         </SettingRow>
         <SettingRow
           label="Allow opening tabs in an external browser"
-          description="Shows the external-browser action in embedded tabs. Off keeps every browser handoff inside Integrator."
+          description="Shows the external-browser action in embedded tabs. Off keeps every browser handoff inside Integrator and tells agents to use only Integrator browser tools."
         >
           <Switch
             checked={flag(BROWSER_SETTINGS.externalOpen, false)}
@@ -141,16 +478,15 @@ export function BrowserSettings({
 
       <section className="settings-section">
         <header>
-          <h2>Signing in</h2>
+          <h2>Browser data by identity</h2>
           <p>
-            Sites you sign into stay signed in on this computer, so an automation does not have to
-            log in again. Integrator never sees or stores your passwords — sign-in stays between you
-            and the site.
+            Cookie values and passwords are never shown here. Saved passwords stay in the OS
+            credential store; this view receives metadata only.
           </p>
         </header>
         <SettingRow
           label="Stay signed in between sessions"
-          description="Keeps cookies and site data in a profile under Integrator's local data directory."
+          description="Keeps each identity's cookies and site data under Integrator's local data directory."
         >
           <Switch
             checked={flag(BROWSER_SETTINGS.keepSignedIn, true)}
@@ -159,132 +495,176 @@ export function BrowserSettings({
           />
         </SettingRow>
         <div className="browser-sites-header">
-          <span className="settings-eyebrow">Sites holding sign-in state</span>
+          <span className="settings-eyebrow">Tasks, then Chat/Main Browser</span>
           <button
             className="icon-button subtle tiny"
             type="button"
-            aria-label="Refresh site list"
+            aria-label="Refresh browser identities"
             disabled={loading}
-            onClick={() => setGeneration((value) => value + 1)}
+            onClick={refresh}
           >
             <RotateCw className={loading ? "spin" : undefined} aria-hidden="true" />
           </button>
         </div>
-        {sites.length === 0 ? (
-          <div className="settings-empty">
-            {!available
-              ? "Browser tabs need the desktop app."
-              : loading
-                ? "Reading this browser's cookies…"
-                : "No site has stored anything yet. Open a browser tab and sign in; it will appear here."}
-          </div>
+        {!available ? (
+          <div className="settings-empty">Browser identities need the desktop app.</div>
+        ) : loading && !overview ? (
+          <div className="settings-empty">Reading local browser identities…</div>
+        ) : !overview?.buckets.length ? (
+          <div className="settings-empty">No browser identities are available.</div>
         ) : (
-          <ul className="browser-sites-list">
-            {sites.map((site) => (
-              <li key={site.origin}>
-                <span>
-                  <strong>{site.origin}</strong>
-                  <small>
-                    {site.cookies} {site.cookies === 1 ? "cookie" : "cookies"} ·{" "}
-                    {site.persistent ? "kept between sessions" : "cleared when Integrator closes"}
-                  </small>
-                </span>
-              </li>
-            ))}
-          </ul>
+          <div className="browser-buckets">
+            {overview.buckets.map((bucket) => {
+              const isOpen = expanded.has(bucket.id);
+              const sites = sitesByBucket[bucket.id];
+              const bucketLogins = logins.filter((login) => login.bucketId === bucket.id);
+              const busy = busyBucket === bucket.id;
+              const storedSummary = [
+                bucket.profilePresent ? "browser data" : "no browser data",
+                `${bucketLogins.length} saved ${bucketLogins.length === 1 ? "login" : "logins"}`,
+              ].join(" · ");
+              return (
+                <article className="browser-bucket" key={bucket.id} data-kind={bucket.kind}>
+                  <button
+                    className="browser-bucket-toggle"
+                    type="button"
+                    aria-expanded={isOpen}
+                    onClick={() => toggleBucket(bucket.id)}
+                  >
+                    <span>
+                      <strong>{bucket.label}</strong>
+                      <small>
+                        {bucket.kind === "task"
+                          ? bucket.archived
+                            ? `Archived task · ${storedSummary}`
+                            : `Task · ${storedSummary}`
+                          : bucket.kind === "chat"
+                            ? `Standalone chats and main browser · ${storedSummary}`
+                            : bucket.kind === "shared"
+                              ? `Shared scope · ${storedSummary}`
+                              : `Deleted or legacy task · ${storedSummary}`}
+                      </small>
+                    </span>
+                    <ChevronDown aria-hidden="true" />
+                  </button>
+                  {isOpen ? (
+                    <div className="browser-bucket-body">
+                      {sites === null || sites === undefined ? (
+                        <div className="settings-empty">Reading cookie metadata…</div>
+                      ) : sites.length ? (
+                        <ul className="browser-sites-list">
+                          {sites.map((site) => (
+                            <li key={`${site.origin}:${site.persistent}`}>
+                              <span>
+                                <strong>{site.origin}</strong>
+                                <small>
+                                  {site.cookies} {site.cookies === 1 ? "cookie" : "cookies"} ·{" "}
+                                  {site.persistent
+                                    ? "kept between sessions"
+                                    : "cleared when Integrator closes"}
+                                </small>
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : null}
+                      {bucketLogins.length ? (
+                        <ul className="browser-sites-list browser-login-list">
+                          {bucketLogins.map((login) => (
+                            <li key={`${login.bucketId}:${login.origin}:${login.username}`}>
+                              <span>
+                                <strong>
+                                  <KeyRound aria-hidden="true" /> {login.origin}
+                                </strong>
+                                <small>
+                                  {login.username}
+                                  {login.lastUsedAt
+                                    ? ` · last used ${new Date(login.lastUsedAt).toLocaleDateString()}`
+                                    : " · never used"}
+                                </small>
+                              </span>
+                              <button
+                                className="icon-button subtle tiny"
+                                type="button"
+                                aria-label={`Forget the login for ${login.username} on ${login.origin}`}
+                                disabled={busy}
+                                onClick={() => {
+                                  setBusyBucket(bucket.id);
+                                  void api
+                                    ?.forgetLogin(login.bucketId, login.origin, login.username)
+                                    .then((next) => {
+                                      setLogins(next);
+                                      setMessage(`Forgot ${login.username} on ${login.origin}.`);
+                                    })
+                                    .catch(() => setMessage("Could not forget that login."))
+                                    .finally(() => setBusyBucket(""));
+                                }}
+                              >
+                                <Trash2 aria-hidden="true" />
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : null}
+                      {sites?.length === 0 &&
+                      bucketLogins.length === 0 &&
+                      !siteErrors[bucket.id] ? (
+                        <div className="settings-empty">
+                          No cookies or saved logins in this identity.
+                        </div>
+                      ) : null}
+                      {siteErrors[bucket.id] ? (
+                        <p className="settings-action-message" role="alert">
+                          {siteErrors[bucket.id]}
+                        </p>
+                      ) : null}
+                      <div className="settings-action-row browser-bucket-actions">
+                        <button
+                          className="secondary-button small"
+                          type="button"
+                          disabled={busy || !bucket.profilePresent}
+                          onClick={() => void clearBucket(bucket.id, bucket.label)}
+                        >
+                          <Trash2 aria-hidden="true" />
+                          Clear site data
+                        </button>
+                        <button
+                          className="secondary-button small"
+                          type="button"
+                          disabled={busy || bucketLogins.length === 0}
+                          onClick={() => void forgetBucket(bucket.id, bucket.label)}
+                        >
+                          <KeyRound aria-hidden="true" />
+                          Forget saved logins
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+                </article>
+              );
+            })}
+          </div>
         )}
-        <div className="settings-action-row">
-          <button
-            className="secondary-button small"
-            type="button"
-            disabled={!available}
-            onClick={() => void clearAll()}
-          >
-            <Trash2 aria-hidden="true" />
-            Sign out everywhere and clear data
-          </button>
-        </div>
         {message ? (
           <p className="settings-action-message" role="status">
             {message}
           </p>
         ) : null}
+        <p className="settings-hint">
+          A saved password cannot be shown back to you, and no agent can read one. Agents need your
+          per-site approval before Integrator types a saved login.
+        </p>
       </section>
 
-      <section className="settings-section">
-        <header>
-          <h2>Saved logins</h2>
-          <p>
-            Passwords you have asked Integrator to remember. Each one lives in this computer&apos;s
-            credential store and is only ever typed into the exact site it was saved for — never a
-            subdomain, never after a redirect. Save one from a browser tab: sign in, then choose
-            <strong> Save this login</strong> from the tab&apos;s menu.
-          </p>
-        </header>
-        {logins.length === 0 ? (
-          <div className="settings-empty">
-            {available
-              ? "Nothing saved yet."
-              : "Saved logins need the desktop app and its credential store."}
-          </div>
-        ) : (
-          <ul className="browser-sites-list">
-            {logins.map((login) => (
-              <li key={`${login.projectId}:${login.origin}:${login.username}`}>
-                <span>
-                  <strong>
-                    <KeyRound aria-hidden="true" /> {login.origin}
-                  </strong>
-                  <small>
-                    {login.username} ·{" "}
-                    {login.projectId === "*" ? "every project" : "this project only"}
-                    {login.lastUsedAt
-                      ? ` · last used ${new Date(login.lastUsedAt).toLocaleDateString()}`
-                      : " · never used"}
-                  </small>
-                </span>
-                <button
-                  className="icon-button subtle tiny"
-                  type="button"
-                  aria-label={`Forget the login for ${login.username} on ${login.origin}`}
-                  onClick={() => {
-                    void bridge.browser
-                      ?.forgetLogin(login.projectId, login.origin, login.username)
-                      .then(setLogins)
-                      .catch(() => setMessage("Could not forget that login."));
-                  }}
-                >
-                  <Trash2 aria-hidden="true" />
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-        {/* Said plainly rather than quietly omitted: a reveal is only worth
-            anything behind an OS re-authentication gate, and that is its own
-            piece of work. */}
-        <p className="settings-hint">
-          A saved password cannot be shown back to you, and no agent can read one. An agent may ask
-          to sign in; you decide per site, and it is told the username at most.
-        </p>
-        {logins.length > 0 ? (
-          <div className="settings-action-row">
-            <button
-              className="secondary-button small"
-              type="button"
-              onClick={() => {
-                void bridge.browser
-                  ?.forgetAllLogins()
-                  .then(setLogins)
-                  .catch(() => setMessage("Could not forget those logins."));
-              }}
-            >
-              <Trash2 aria-hidden="true" />
-              Forget every saved login
-            </button>
-          </div>
-        ) : null}
-      </section>
+      <SharedScopeWarning
+        open={warningOpen}
+        busy={scopeBusy}
+        error={scopeError}
+        onCancel={() => {
+          if (!scopeBusy) setWarningOpen(false);
+        }}
+        onConfirm={() => void setIdentityScope("shared")}
+      />
     </>
   );
 }

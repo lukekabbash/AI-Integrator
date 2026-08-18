@@ -39,6 +39,8 @@ describe("sidebar shell corners", () => {
     expect(rule(".native-titlebar:has(.titlebar-menu) .titlebar-left")).toContain(
       "overflow: visible",
     );
+    expect(rule(".titlebar-left")).toContain("z-index: 4");
+    expect(rule(".titlebar-subagent-slot")).toContain("z-index: 3");
   });
 
   it("keeps file context menus on an elevated surface with a defined entrance", () => {

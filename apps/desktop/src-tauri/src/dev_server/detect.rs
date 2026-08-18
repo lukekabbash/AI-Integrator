@@ -218,6 +218,9 @@ mod tests {
     fn the_working_directory_travels_with_the_spec() {
         let specs = candidates(r#"{"scripts":{"dev":"vite"}}"#, &PathBuf::from("H:/Code/x"));
         assert_eq!(specs[0].cwd, PathBuf::from("H:/Code/x"));
-        assert!(specs[0].env.is_empty(), "detection never invents environment");
+        assert!(
+            specs[0].env.is_empty(),
+            "detection never invents environment"
+        );
     }
 }

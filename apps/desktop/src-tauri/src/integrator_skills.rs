@@ -344,7 +344,18 @@ fn credential_presence_at(store: &LocalStore, setting_key: &str) -> serde_json::
 }
 
 fn credential_presence(store: &LocalStore) -> serde_json::Map<String, Value> {
-    credential_presence_at(store, skill_secret_presence_setting_key())
+    let mut current = credential_presence_at(store, skill_secret_presence_setting_key());
+    // Development builds now use the OS store too. Preserve the former local
+    // presence hints long enough for the first credential read to migrate the
+    // corresponding protected-file secret; an explicit new false still wins.
+    if credential_store::storage() == CredentialStorage::OsCredentialStore {
+        for (id, configured) in
+            credential_presence_at(store, DEVELOPMENT_SKILL_SECRET_PRESENCE_SETTING_KEY)
+        {
+            current.entry(id).or_insert(configured);
+        }
+    }
+    current
 }
 
 fn set_credential_presence_at(store: &LocalStore, setting_key: &str, id: &str, configured: bool) {
@@ -355,6 +366,16 @@ fn set_credential_presence_at(store: &LocalStore, setting_key: &str, id: &str, c
 
 fn set_credential_presence(store: &LocalStore, id: &str, configured: bool) {
     set_credential_presence_at(store, skill_secret_presence_setting_key(), id, configured);
+    if credential_store::storage() == CredentialStorage::OsCredentialStore {
+        // A current value shadows the legacy hint. Marking the old entry false
+        // also keeps older binaries from claiming a migrated secret exists.
+        set_credential_presence_at(
+            store,
+            DEVELOPMENT_SKILL_SECRET_PRESENCE_SETTING_KEY,
+            id,
+            false,
+        );
+    }
 }
 
 fn credential_is_configured(store: &LocalStore, id: &str) -> bool {
@@ -444,14 +465,13 @@ pub fn integrator_skill_credential_set(
             message: "Unknown skill credential.".into(),
         });
     };
-    let value = secret.trim();
-    if value.is_empty() || value.chars().count() > 4_096 {
+    if secret.is_empty() || secret.len() > 16 * 1024 {
         return Err(CommandError {
             code: "invalid-input",
             message: format!("Paste a valid {} before saving.", definition.label),
         });
     }
-    credential_store::write(PRODUCTION_SKILL_CREDENTIAL_SERVICE, definition.id, value).map_err(
+    credential_store::write(PRODUCTION_SKILL_CREDENTIAL_SERVICE, definition.id, &secret).map_err(
         |_| CommandError {
             code: "credential-store-unavailable",
             message: format!(
@@ -461,7 +481,7 @@ pub fn integrator_skill_credential_set(
         },
     )?;
     state
-        .cache_skill_credential(definition.id, Zeroizing::new(value.to_owned()))
+        .cache_skill_credential(definition.id, secret.clone())
         .map_err(CommandError::from)?;
     set_credential_presence(&state.store, definition.id, true);
     Ok(())

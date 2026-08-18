@@ -111,6 +111,8 @@ pub struct CodexLaunchOptions {
 pub struct CodexThreadOverrides {
     pub config: Option<Value>,
     pub developer_instructions: Option<String>,
+    /// Catalog-advertised Fast / priority tier (`serviceTier` on thread/start).
+    pub service_tier: Option<String>,
 }
 
 /// A skill already resolved by the trusted native host from `skills/list`.
@@ -377,6 +379,13 @@ impl CodexClient {
         if let Some(effort) = reasoning_effort {
             params["reasoningEffort"] = Value::String(effort.into());
         }
+        if let Some(tier) = overrides
+            .service_tier
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            params["serviceTier"] = Value::String(tier.into());
+        }
         if let Some(config) = overrides.config {
             if !config.is_object() {
                 return Err(IntegratorError::InvalidInput(
@@ -447,6 +456,13 @@ impl CodexClient {
         }
         if let Some(effort) = reasoning_effort {
             params["reasoningEffort"] = Value::String(effort.into());
+        }
+        if let Some(tier) = overrides
+            .service_tier
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            params["serviceTier"] = Value::String(tier.into());
         }
         if let Some(config) = overrides.config {
             if !config.is_object() {

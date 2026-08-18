@@ -1,3 +1,4 @@
+import { isImageFileName, outputLooksLikeImage } from "./activityMedia";
 import { parseDiffLines } from "./bridge";
 import type {
   ApprovalProjection,
@@ -504,13 +505,12 @@ const INTEGRATOR_TOOL_COPY: Readonly<Record<string, readonly [string, string]>> 
   browser_drag: ["Dragging on the page", "Dragged on the page"],
   browser_navigate: ["Opening a page", "Opened a page"],
   browser_snapshot: ["Reading the page", "Read the page"],
-  browser_screenshot: ["Photographing the page", "Photographed the page"],
+  browser_screenshot: ["Viewing image", "Viewed image"],
   browser_click: ["Clicking on the page", "Clicked on the page"],
   browser_type: ["Typing on the page", "Typed on the page"],
   browser_press: ["Pressing a key on the page", "Pressed a key on the page"],
   browser_scroll: ["Scrolling the page", "Scrolled the page"],
   browser_wait_for: ["Waiting on the page", "Checked the page"],
-  browser_evaluate: ["Running script on the page", "Ran script on the page"],
 };
 
 const PROVIDER_TOOL_COPY: Readonly<Record<string, readonly [string, string]>> = {
@@ -603,9 +603,23 @@ function toolSummary(
   const fallback = item.body || toolInputPreview(item.toolInput);
   const fromTitle = detailFromTitle(item.title, action);
   const semanticTitle = semanticToolTitle(item);
-  if (semanticTitle)
-    return { title: semanticTitle, body: path ?? fromTitle ?? fallback ?? "", changeStats };
   const running = item.status === "pending" || item.status === "inProgress";
+  const viewingImage =
+    (path ? isImageFileName(path) : false) ||
+    (fromTitle ? isImageFileName(fromTitle) : false) ||
+    (item.output ? outputLooksLikeImage(item.output) : false);
+  if (viewingImage) {
+    return {
+      title: running ? "Viewing image" : "Viewed image",
+      body: path && isImageFileName(path) ? path : "",
+      changeStats,
+    };
+  }
+  if (semanticTitle) {
+    const detail = path ?? fromTitle ?? fallback ?? "";
+    const hideStructured = /image/i.test(semanticTitle) && looksLikeStructuredToolText(detail);
+    return { title: semanticTitle, body: hideStructured ? "" : detail, changeStats };
+  }
   if (action === "read")
     return {
       title: running ? "Reading" : "Read",
@@ -641,6 +655,11 @@ function toolSummary(
 }
 
 /** First line of tool input when it is human-meaningful; skip empty JSON shells. */
+function looksLikeStructuredToolText(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.startsWith("{") || trimmed.startsWith("[") || outputLooksLikeImage(trimmed);
+}
+
 function toolInputPreview(toolInput?: string): string | undefined {
   if (!toolInput) return undefined;
   const first = toolInput.split("\n", 1)[0]?.trim();

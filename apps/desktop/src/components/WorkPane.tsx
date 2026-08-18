@@ -1,4 +1,4 @@
-import { Bot, FileDiff, Globe, Minus, Plus, X } from "lucide-react";
+import { Bot, FileDiff, Minus, Plus, X } from "lucide-react";
 import { m as motion, usePresence, useReducedMotion } from "motion/react";
 import {
   Suspense,
@@ -20,6 +20,9 @@ import { surfaceFileName, WORK_PANE_MIN_WIDTH, type WorkSurface } from "../workP
 import { AgentGlyph } from "./AgentGlyph";
 import { FileIcon } from "./FileIcon";
 import { ResizeHandle } from "./ResizeHandle";
+import { BrowserOmnibox } from "./BrowserOmnibox";
+import { BrowserStart } from "./BrowserStart";
+import { BrowserChromeActionsPlaceholder, BrowserChromeBar } from "./BrowserSurface";
 import { TabFavicon } from "./TabFavicon";
 import { Tooltip } from "./Tooltip";
 import { TravelingSelection } from "./TravelingSelection";
@@ -57,7 +60,7 @@ export interface WorkPaneProps {
   browserAvailable: boolean;
   /** Accountless chats expose only their task-scoped browser here. */
   browserOnly?: boolean;
-  onLaunch: (kind: WorkPaneLaunchKind) => void;
+  onLaunch: (kind: WorkPaneLaunchKind, url?: string) => void;
   /** Left/Right cursor across the tab strip; see `spatialNavigation.ts`. */
   arrowNavigation?: boolean;
   /** Whether that cursor wraps past the first and last tab. */
@@ -265,12 +268,16 @@ export function WorkPane({
             </motion.div>
           );
         })}
-        <Tooltip label="New tab" hint="Choose what opens here" placement="bottom">
+        <Tooltip
+          label="New tab"
+          hint={browserOnly ? "Open a blank page" : "Search, review, or open a page"}
+          placement="bottom"
+        >
           <button
             type="button"
             className="icon-button subtle tiny work-pane-strip-new"
             aria-label="New tab"
-            onClick={() => controller.openNew()}
+            onClick={() => (browserOnly ? onLaunch("browser") : controller.openNew())}
           >
             <Plus aria-hidden="true" />
           </button>
@@ -288,8 +295,6 @@ export function WorkPane({
         ref={paneRef}
         className="work-pane subagent-workspace-pane"
         data-empty={state.surfaces.length === 0 ? "true" : undefined}
-        // The seam takes its colour from whatever is open, so a browser tab
-        // carries its chrome fill all the way to the edge of the pane.
         data-kind={active?.kind ?? "launcher"}
         style={style}
         // The pane opens and closes by width, the way the rail beside it does,
@@ -309,9 +314,8 @@ export function WorkPane({
           if (open) setEntered(true);
         }}
       >
-        {/* The seam: one hairline with the drag pill centred on it. It hangs
-            past the pane's left edge into the row, because a native browser
-            surface paints above HTML and would bury anything drawn inside. */}
+        {/* Drag grip only — no drawn seam. It hangs into the transcript so a
+            native browser surface cannot bury the marker. */}
         <div className="work-pane-grip">
           <ResizeHandle
             axis="horizontal"
@@ -340,24 +344,18 @@ export function WorkPane({
                 renderBrowser={renderBrowser}
                 renderNew={() => (
                   <WorkPaneLauncher
-                    delegations={delegations}
                     browserAvailable={browserAvailable}
                     browserOnly={browserOnly}
                     onLaunch={onLaunch}
-                    onOpenSubagent={(id) => controller.openSubagent(id)}
-                    reduceMotion={reduceMotion}
                   />
                 )}
               />
             </Suspense>
           ) : (
             <WorkPaneLauncher
-              delegations={delegations}
               browserAvailable={browserAvailable}
               browserOnly={browserOnly}
               onLaunch={onLaunch}
-              onOpenSubagent={(id) => controller.openSubagent(id)}
-              reduceMotion={reduceMotion}
             />
           )}
         </div>
@@ -494,116 +492,56 @@ function SurfaceGlyph({
 /* -------------------------------------------------------------------------- */
 
 function WorkPaneLauncher({
-  delegations,
   browserAvailable,
   browserOnly,
   onLaunch,
-  onOpenSubagent,
-  reduceMotion,
 }: {
-  delegations: DelegationView[];
   browserAvailable: boolean;
   browserOnly: boolean;
-  onLaunch: (kind: WorkPaneLaunchKind) => void;
-  onOpenSubagent: (delegationId: string) => void;
-  reduceMotion: boolean;
+  onLaunch: (kind: WorkPaneLaunchKind, url?: string) => void;
 }) {
-  const live = browserOnly ? [] : delegations.filter((d) => d.childTaskId);
-  const options: Array<{
-    kind: WorkPaneLaunchKind;
-    icon: ReactNode;
-    title: string;
-    hint: string;
-    disabled?: boolean;
-  }> = [
-    {
-      kind: "browser",
-      icon: <Globe aria-hidden="true" />,
-      title: "Browser",
-      hint: browserAvailable
-        ? "Open a page or a local dev server the agent can drive too"
-        : "Available in the desktop app",
-      disabled: !browserAvailable,
-    },
-    ...(browserOnly
-      ? []
-      : ([
-          {
-            kind: "review",
-            icon: <FileDiff aria-hidden="true" />,
-            title: "Review changes",
-            hint: "The unified diff for this worktree",
-          },
-          {
-            kind: "files",
-            icon: <FileIcon fileName="index.ts" />,
-            title: "Files",
-            hint: "Browse the project tree in the rail and open files here",
-          },
-          {
-            kind: "subagents",
-            icon: <Bot aria-hidden="true" />,
-            title: "Subagents",
-            hint: live.length ? `${live.length} running` : "See the agents rail",
-          },
-        ] satisfies Array<{
-          kind: WorkPaneLaunchKind;
-          icon: ReactNode;
-          title: string;
-          hint: string;
-          disabled?: boolean;
-        }>)),
-  ];
+  const [draft, setDraft] = useState("");
+  const review = !browserOnly ? (
+    <button type="button" className="work-pane-review" onClick={() => onLaunch("review")}>
+      <FileDiff aria-hidden="true" />
+      Review changes
+    </button>
+  ) : null;
   return (
     <div className="work-pane-launcher">
-      <span className="work-pane-launcher-eyebrow">Open in this pane</span>
-      <ul className="work-pane-launcher-list">
-        {options.map((option, index) => (
-          <motion.li
-            key={option.kind}
-            initial={reduceMotion ? false : { opacity: 0, y: 4 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={reduceMotion ? { duration: 0 } : { ...railItemSpring, delay: index * 0.02 }}
-          >
-            <button
-              type="button"
-              className="work-pane-launcher-option"
-              disabled={option.disabled}
-              onClick={() => onLaunch(option.kind)}
-            >
-              <span className="work-pane-launcher-icon">{option.icon}</span>
-              <span>
-                <strong>{option.title}</strong>
-                <small>{option.hint}</small>
-              </span>
-            </button>
-          </motion.li>
-        ))}
-      </ul>
-      {live.length > 0 ? (
+      {browserAvailable ? (
         <>
-          <span className="work-pane-launcher-eyebrow">Running now</span>
-          <ul className="work-pane-launcher-list work-pane-launcher-list--compact">
-            {live.slice(0, 6).map((delegation) => (
-              <li key={delegation.id}>
-                <button
-                  type="button"
-                  className="work-pane-launcher-option"
-                  onClick={() => onOpenSubagent(delegation.id)}
-                >
-                  <span className="work-pane-launcher-icon">
-                    <Bot aria-hidden="true" />
-                  </span>
-                  <span>
-                    <strong>{delegation.title}</strong>
-                    <small>{delegation.status.replaceAll("_", " ")}</small>
-                  </span>
-                </button>
-              </li>
-            ))}
-          </ul>
+          {/* The same strip a live tab wears, with nowhere to go back to yet. */}
+          <BrowserChromeBar disabled>
+            <div className="browser-address">
+              <BrowserOmnibox
+                size="chrome"
+                value={draft}
+                onChange={setDraft}
+                onSubmit={(href) => {
+                  setDraft("");
+                  onLaunch("browser", href);
+                }}
+              />
+            </div>
+            <BrowserChromeActionsPlaceholder />
+          </BrowserChromeBar>
+          <BrowserStart
+            layout="compact"
+            autoFocus
+            actions={review}
+            onOpen={(url) => onLaunch("browser", url)}
+          />
         </>
-      ) : null}
+      ) : (
+        <>
+          {review ? <div className="work-pane-launcher-actions">{review}</div> : null}
+          <p className="work-pane-notice" role="status">
+            <strong>Browser tabs need the desktop app</strong>
+            <small>The web preview cannot host a native browser tab.</small>
+          </p>
+        </>
+      )}
     </div>
   );
 }

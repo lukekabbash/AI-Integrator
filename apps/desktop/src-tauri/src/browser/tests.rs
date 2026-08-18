@@ -69,8 +69,16 @@ fn every_parked_webview_is_hidden_from_the_host_chat() {
 fn rejects_non_web_schemes_and_junk() {
     assert!(normalize_url("file:///etc/passwd").is_err());
     assert!(normalize_url("javascript:alert(1)").is_err());
+    assert!(normalize_url("https://user:secret@example.com").is_err());
     assert!(normalize_url("   ").is_err());
     assert!(normalize_url(&"a".repeat(3000)).is_err());
+}
+
+#[test]
+fn page_titles_are_bounded_before_they_cross_native_boundaries() {
+    let title = bounded_page_title(&format!("hello\r\n{}", "x".repeat(800)));
+    assert!(!title.contains('\r') && !title.contains('\n'));
+    assert!(title.chars().count() <= 512);
 }
 
 fn context_action_url(key: &str, action: &str, target: &str, text: &str) -> Url {
@@ -330,6 +338,34 @@ fn renderer_tab_commands_refuse_another_task() {
 }
 
 #[test]
+fn secondary_renderers_are_bound_to_their_native_task_label() {
+    assert!(renderer_may_address_task("main", "task-a", false));
+    assert!(renderer_may_address_task("task-task-a", "task-a", false));
+    assert!(!renderer_may_address_task("task-task-b", "task-a", false));
+    assert!(renderer_may_address_task(
+        &popout::window_label("task-a"),
+        "task-a",
+        false
+    ));
+    assert!(!renderer_may_address_task(
+        &popout::window_label("task-b"),
+        "task-a",
+        false
+    ));
+    // The shared chat window reaches chats only.
+    assert!(renderer_may_address_task(
+        popout::CHAT_WINDOW_LABEL,
+        "task-a",
+        true
+    ));
+    assert!(!renderer_may_address_task(
+        popout::CHAT_WINDOW_LABEL,
+        "task-a",
+        false
+    ));
+}
+
+#[test]
 fn popout_window_identity_is_task_scoped_and_stable() {
     let first = popout::window_label("task-a");
     assert_eq!(first, popout::window_label("task-a"));
@@ -357,13 +393,13 @@ fn a_child_owns_what_it_opens_and_siblings_never_see_it() {
     assert_eq!(tabs.reach("tab-other", &child), None);
 
     let seen: Vec<String> = tabs
-        .visible_to(&child)
+        .visible_to(&child, false)
         .into_iter()
         .map(|tab| tab.id)
         .collect();
     assert_eq!(seen, ["tab-own"]);
-    assert!(tabs.visible_to(&sibling).is_empty());
-    assert_eq!(tabs.visible_to(&boss).len(), 2);
+    assert!(tabs.visible_to(&sibling, false).is_empty());
+    assert_eq!(tabs.visible_to(&boss, false).len(), 2);
 }
 
 #[test]
@@ -383,23 +419,36 @@ fn a_granted_tab_is_reachable_at_the_mode_it_was_granted() {
 }
 
 #[test]
-fn the_person_outranks_whatever_agent_was_mid_flow() {
-    // Both holds run on one clock, and the one at the keyboard wins: an agent
-    // that took the tab a moment ago is stood off the instant a hand moves.
+fn the_person_outranks_an_agent_only_when_the_tab_is_locked() {
+    // Agent-to-agent holds still stand the second caller off. A person in the
+    // tab does not, unless Settings → Browser lock is on.
     let tabs = registry(&[("tab-1", "task-a", None)]);
     tabs.mark_held("tab-1", "the main agent");
     assert_eq!(
-        tabs.held_by_other("tab-1", "subagent child-1").as_deref(),
+        tabs.held_by_other("tab-1", "subagent child-1", false)
+            .as_deref(),
         Some("the main agent")
     );
 
     tabs.mark_user_active("tab-1", 1_000);
     assert_eq!(
-        tabs.held_by_other("tab-1", "the main agent").as_deref(),
-        Some(USER_HOLDER)
+        tabs.held_by_other("tab-1", "the main agent", false)
+            .as_deref(),
+        None
     );
     assert_eq!(
         tabs.snapshot(Some("task-a"))[0].held_by.as_deref(),
+        Some("the main agent")
+    );
+    assert_eq!(
+        tabs.held_by_other("tab-1", "the main agent", true)
+            .as_deref(),
+        Some(USER_HOLDER)
+    );
+    assert_eq!(
+        tabs.snapshot_held(Some("task-a"), true)[0]
+            .held_by
+            .as_deref(),
         Some(USER_HOLDER)
     );
 
@@ -408,13 +457,14 @@ fn the_person_outranks_whatever_agent_was_mid_flow() {
     let stale = registry::HOLD_TTL.as_millis() as u64 + 1_000;
     tabs.mark_user_active("tab-1", stale);
     assert_eq!(
-        tabs.held_by_other("tab-1", "the main agent").as_deref(),
+        tabs.held_by_other("tab-1", "the main agent", true)
+            .as_deref(),
         Some(USER_HOLDER)
     );
 
     let fresh = registry(&[("tab-2", "task-a", None)]);
     fresh.mark_user_active("tab-2", stale);
-    assert_eq!(fresh.held_by_other("tab-2", "the main agent"), None);
+    assert_eq!(fresh.held_by_other("tab-2", "the main agent", true), None);
 }
 
 #[test]
@@ -455,11 +505,13 @@ fn recent_agent_work_outlives_the_live_hold_but_eventually_becomes_closable() {
 }
 
 #[test]
-fn the_guest_refuses_agent_writes_while_the_person_is_working() {
+fn the_guest_refuses_agent_writes_only_when_the_tab_is_locked() {
     // Only the page can tell a real keystroke from a synthesised one, so the
     // veto lives there — and it has to cover exactly the verbs the host calls
-    // writes, or one of them slips past the person's hold.
-    assert!(GUEST_RUNTIME.contains("function blocked(method)"));
+    // writes, or one of them slips past the person's hold. Off (the default)
+    // the second argument is false and the veto never fires.
+    assert!(GUEST_RUNTIME.contains("function blocked(method, lockActiveTab)"));
+    assert!(GUEST_RUNTIME.contains("if (!lockActiveTab || !AGENT_WRITES.has(method))"));
     assert!(GUEST_RUNTIME.contains("user-holding"));
     assert!(GUEST_RUNTIME.contains("event.isTrusted"));
     assert!(GUEST_RUNTIME.contains("userIdleMs: userIdle()"));
@@ -500,8 +552,11 @@ fn the_cap_sleeps_the_oldest_tab_nothing_is_looking_at() {
 fn a_filled_credential_closes_the_tab_to_reading() {
     let tabs = registry(&[("tab-1", "task-a", None)]);
     assert!(!tabs.credential_in_flight("tab-1"));
+    assert!(agent::ensure_credential_read_safe(&tabs, "tab-1", "snapshot").is_ok());
     tabs.mark_credential_filled("tab-1");
     assert!(tabs.credential_in_flight("tab-1"));
+    assert!(agent::ensure_credential_read_safe(&tabs, "tab-1", "snapshot").is_err());
+    assert!(agent::ensure_credential_read_safe(&tabs, "tab-1", "click").is_ok());
     // Navigating away is the end of it; the new document has nothing filled.
     tabs.clear_credential("tab-1");
     assert!(!tabs.credential_in_flight("tab-1"));
@@ -515,7 +570,7 @@ fn only_the_app_can_reach_the_login_entry_points() {
     assert!(GUEST_RUNTIME.contains("delete window.__integratorBrowser;"));
     assert!(GUEST_RUNTIME.contains("const HOST_KEY = String(CONFIG.hostKey ?? \"\");"));
     for method in [
-        "fillLogin(key, username, password, submit)",
+        "fillLogin(key, expectedOrigin, username, password, submit)",
         "captureLogin(key)",
     ] {
         assert!(
@@ -532,7 +587,9 @@ fn only_the_app_can_reach_the_login_entry_points() {
     );
     // And the lockout that makes the promise real.
     assert!(GUEST_RUNTIME.contains("credential-in-flight"));
-    assert!(GUEST_RUNTIME.contains("CREDENTIAL_READS = new Set([\"evaluate\", \"snapshot\"])"));
+    assert!(GUEST_RUNTIME.contains("CREDENTIAL_READS = new Set([\"snapshot\"])"));
+    assert!(GUEST_RUNTIME.contains("location.origin !== expectedOrigin"));
+    assert!(!GUEST_RUNTIME.contains("evaluate(expression)"));
 }
 
 #[test]
@@ -599,7 +656,6 @@ fn guest_runtime_exposes_every_method_the_host_may_call() {
         "scroll",
         "drag",
         "waitFor",
-        "evaluate",
         "highlight",
         "startPick",
         "pickResult",
@@ -612,8 +668,12 @@ fn guest_runtime_exposes_every_method_the_host_may_call() {
             "guest runtime is missing {method}"
         );
     }
-    // It must define exactly one global and never leak a second one.
-    assert!(GUEST_RUNTIME.contains("window.__integrator = api;"));
+    // It must define exactly one sealed global and never let a page replace
+    // the native call surface or its credential/user-hold vetoes.
+    assert!(GUEST_RUNTIME.contains("Object.freeze(api);"));
+    assert!(GUEST_RUNTIME.contains("Object.defineProperty(window, \"__integrator\""));
+    assert!(GUEST_RUNTIME.contains("writable: false"));
+    assert!(GUEST_RUNTIME.contains("configurable: false"));
 }
 
 #[test]
@@ -643,10 +703,33 @@ fn every_agent_action_shows_the_cursor_that_performed_it() {
     }
     // Typing labels itself with the text, so it is built rather than literal.
     assert!(GUEST_RUNTIME.contains("agentCursor(centreOf(element), label)"));
-    // The gesture lands before the reply; the animation catches up after.
-    // Deferring the action behind the cursor made `scroll` answer with the
-    // position it had before scrolling.
-    assert!(GUEST_RUNTIME.contains("function schedule(_delay, run)"));
+    // The pointer travels, then the gesture lands, then the reply is built —
+    // so the user sees the click and the agent reads the page after it.
+    assert!(GUEST_RUNTIME.contains("function schedule(delay, run)"));
+    assert!(GUEST_RUNTIME.contains("setTimeout(finish, delay)"));
+}
+
+#[test]
+fn eval_waits_for_the_cursor_to_arrive_before_reading_the_page() {
+    let eval = source_between(
+        include_str!("mod.rs"),
+        "pub(super) async fn eval_json",
+        "let raw = Zeroizing::new(",
+    );
+    assert!(eval.contains("await value"));
+}
+
+#[test]
+fn agent_clicks_bring_the_tab_on_screen() {
+    let invoke = source_between(
+        include_str!("agent.rs"),
+        "pub async fn agent_invoke",
+        "fn stood_off",
+    );
+    assert!(invoke.contains("bring_on_screen"));
+    assert!(invoke.contains("CURSOR_METHODS"));
+    assert!(invoke.contains("lock_active_tab"));
+    assert!(invoke.contains("blocked?.({method:?}, {user_hold})"));
 }
 
 #[test]

@@ -6,11 +6,9 @@
  * accessibility-shaped snapshot with stable refs, synthesized interaction,
  * an element picker and an annotation overlay. Everything is called through
  * `eval_with_callback`, so each entry point returns a JSON-serialisable value
- * and never throws across the boundary.
+ * (or a Promise of one) and never throws across the boundary.
  */
 (() => {
-  if (window.__integrator) return;
-
   // The prelude the host writes just above this script. It is read once and
   // removed before any page script runs, so a page can neither read the
   // host's key nor rewrite the settings the guest was launched with.
@@ -308,16 +306,17 @@
    * The hold, in the direction the host cannot see.
    *
    * An agent's gestures are synthesized, so they carry `isTrusted: false`; only
-   * a real hand moves this. While the person is working in a page, an agent
-   * writing to it would be taking the cursor out of their hands — so the guest
-   * refuses, the same way one agent stands off another's tab. Reads are always
-   * fine: watching over a shoulder costs the person nothing.
+   * a real hand moves this. When Settings → Browser “Lock agents out of the
+   * tab you are using” is on, writing while the person is mid-keystroke would
+   * take the cursor out of their hands — so the guest refuses. Off (the
+   * default) both work the same page. Reads are always fine.
    *
    * It has to live here rather than in the host, because a click inside a child
-   * webview never reaches the app.
+   * webview never reaches the app. The host passes the lock flag live on each
+   * call so toggling the setting applies to the open document.
    */
   const USER_HOLD_MS = 45000;
-  const AGENT_WRITES = new Set(["click", "type", "press", "scroll", "drag", "evaluate"]);
+  const AGENT_WRITES = new Set(["click", "type", "press", "scroll", "drag"]);
   let userAt = 0;
 
   for (const type of ["pointerdown", "keydown", "wheel", "touchstart"]) {
@@ -341,8 +340,8 @@
    * When the app last typed a saved password into this page.
    *
    * From that moment until the page navigates, reading it back is refused:
-   * `evaluate` could read the field's value, and a snapshot could pick up a
-   * page that has helpfully switched the field to `type="text"`. The lockout is
+   * a snapshot could pick up a page that has helpfully switched the field to
+   * `type="text"`. The lockout is
    * keyed on "a credential was filled here", never on what the field says it is
    * now, because the page controls that and the page is not trusted.
    *
@@ -351,7 +350,7 @@
    */
   let credentialAt = 0;
   const CREDENTIAL_TTL_MS = 300000;
-  const CREDENTIAL_READS = new Set(["evaluate", "snapshot"]);
+  const CREDENTIAL_READS = new Set(["snapshot"]);
 
   function credentialInFlight() {
     return credentialAt > 0 && Date.now() - credentialAt < CREDENTIAL_TTL_MS;
@@ -359,10 +358,11 @@
 
   /**
    * The veto the host consults before every agent action. It evaluates
-   * `blocked(method) || method(...)`, so an error envelope returned here
-   * refuses the action without dispatching it, and `null` lets it through.
+   * `blocked(method, lockActiveTab) || method(...)`, so an error envelope
+   * returned here refuses the action without dispatching it, and `null` lets
+   * it through. `lockActiveTab` is the Settings lock, passed live.
    */
-  function blocked(method) {
+  function blocked(method, lockActiveTab) {
     if (credentialInFlight() && CREDENTIAL_READS.has(method)) {
       return err(
         "credential-in-flight",
@@ -370,7 +370,7 @@
           "the form is submitted or the tab navigates. Clicking and typing still work.",
       );
     }
-    if (!AGENT_WRITES.has(method)) return null;
+    if (!lockActiveTab || !AGENT_WRITES.has(method)) return null;
     const idle = userIdle();
     if (idle === null || idle >= USER_HOLD_MS) return null;
     return err(
@@ -397,8 +397,8 @@
       // page is tiny. Saying so keeps the caller from trusting the geometry.
       offscreen: innerWidth <= 16 || innerHeight <= 16,
       focusedRef: focused && focused !== document.body ? refFor(focused) : null,
-      // How long ago a real hand touched this page. The host turns a fresh
-      // number into `heldBy: "you"` so the tab strip can show it.
+      // How long ago a real hand touched this page. When the Settings lock is
+      // on, the host turns a fresh number into `heldBy: "you"`.
       userIdleMs: userIdle(),
       // Anything the page tried to ask while that action was landing. Riding
       // along on the reply means a caller learns about a confirm it triggered
@@ -717,17 +717,19 @@
           .join(", ")}`,
       );
     }
-    agentCursor(centreOf(select), `choose “${match.text.trim()}”`);
-    agentTap();
-    select.value = match.value;
-    select.dispatchEvent(new Event("input", { bubbles: true }));
-    select.dispatchEvent(new Event("change", { bubbles: true }));
-    return ok({
-      chose: match.text.trim(),
-      value: match.value,
-      selectedIndex: select.selectedIndex,
-      ...pageState(),
-    });
+    return schedule(agentCursor(centreOf(select), `choose “${match.text.trim()}”`), () => {
+      agentTap();
+      select.value = match.value;
+      select.dispatchEvent(new Event("input", { bubbles: true }));
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    }).then(() =>
+      ok({
+        chose: match.text.trim(),
+        value: match.value,
+        selectedIndex: select.selectedIndex,
+        ...pageState(),
+      }),
+    );
   }
 
   /** The `code` for a key: the physical key, not the character it produces. */
@@ -863,8 +865,7 @@
          by itself with nothing to watch; this shows where the work is landing,
          the way a person's pointer would. It never takes pointer events and it
          is not part of #marks, so clearing annotations leaves it alone. */
-      #agent{position:fixed;left:0;top:0;pointer-events:none;opacity:0;
-             transition:opacity .5s cubic-bezier(.4,0,.2,1)}
+      #agent{position:fixed;left:0;top:0;pointer-events:none;opacity:0}
       #agent[data-live="true"]{opacity:1}
       /* Travel uses a long ease-out so the pointer arrives the way a hand does:
          quickly at first, settling at the end. The glow trails a beat behind it,
@@ -941,6 +942,7 @@
   let cursorIdle = 0;
   let cursorActing = 0;
   let cursorAt = { x: 0, y: 0 };
+  let cursorReady = false;
 
   const reducedMotion = () =>
     typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -956,9 +958,6 @@
     if (!layer) return 0;
     const x = Math.round(point?.x ?? cursorAt.x);
     const y = Math.round(point?.y ?? cursorAt.y);
-    const from = cursorAt;
-    const distance = Math.hypot(x - from.x, y - from.y);
-    cursorAt = { x, y };
 
     let pointer = layer.querySelector(".point");
     let halo = layer.querySelector(".halo");
@@ -970,11 +969,25 @@
       pointer.className = "point";
       pointer.innerHTML = `${CURSOR_GLYPH}<span class="label"></span>`;
       layer.appendChild(pointer);
-      // First appearance starts where it is going, so it fades in rather than
-      // flying in from the top-left corner of the page.
-      pointer.style.translate = `${x}px ${y}px`;
-      halo.style.translate = `${x}px ${y}px`;
     }
+    // First appearance on a document starts from the middle of the page so
+    // the pointer glides onto the target instead of popping in on top of it
+    // after the click has already happened.
+    if (!cursorReady) {
+      const origin = { x: Math.round(innerWidth / 2), y: Math.round(innerHeight / 2) };
+      pointer.style.transition = "none";
+      halo.style.transition = "none";
+      pointer.style.translate = `${origin.x}px ${origin.y}px`;
+      halo.style.translate = `${origin.x}px ${origin.y}px`;
+      pointer.getBoundingClientRect();
+      pointer.style.transition = "";
+      halo.style.transition = "";
+      cursorAt = origin;
+      cursorReady = true;
+    }
+    const from = cursorAt;
+    const distance = Math.hypot(x - from.x, y - from.y);
+    cursorAt = { x, y };
     pointer.style.translate = `${x}px ${y}px`;
     if (halo) halo.style.translate = `${x}px ${y}px`;
 
@@ -1028,32 +1041,37 @@
   }
 
   /**
-   * Runs an action now and lets its cursor animation catch up afterwards.
+   * Glides the pointer, then runs the gesture once it arrives.
    *
-   * This used to defer the action behind the cursor's travel, which read well
-   * on screen and lied to the caller: `scroll` answered with the scroll
-   * position it had *before* scrolling, and a keypress could be flushed after
-   * the agent had already navigated away. The animation is decoration; the
-   * gesture is the answer, so the gesture goes first and the reply describes
-   * the page as it is once the action has landed.
-   *
-   * `flushPending` stays for the one case that still defers — a drag's
-   * intermediate hops — so a caller never observes a half-finished path.
+   * The caller awaits this so the reply describes the page after the action,
+   * not before. Snapshot and wait still flush a leftover hop so they never
+   * read a half-finished drag. A navigation flushes too, so a click that
+   * leaves the page still lands and the host is not left waiting.
    */
   let pending = null;
 
-  function schedule(_delay, run) {
+  function schedule(delay, run) {
     flushPending();
-    run();
+    const start = () => Promise.resolve().then(run);
+    if (reducedMotion() || !(delay > 0)) return start();
+    return new Promise((resolve, reject) => {
+      const finish = () => {
+        pending = null;
+        start().then(resolve, reject);
+      };
+      pending = { timer: setTimeout(finish, delay), run: finish };
+    });
   }
 
   function flushPending() {
     if (!pending) return;
-    const { timer, run } = pending;
+    const job = pending;
     pending = null;
-    clearTimeout(timer);
-    run();
+    clearTimeout(job.timer);
+    job.run();
   }
+
+  addEventListener("pagehide", flushPending, { capture: true });
 
   function outline(element, label) {
     const root = ensureOverlay();
@@ -1357,9 +1375,12 @@
      * this — an agent asks the app to fill, and the app decides. The value
      * arrives, goes into the field, and is never returned.
      */
-    fillLogin(key, username, password, submit) {
+    fillLogin(key, expectedOrigin, username, password, submit) {
       if (!HOST_KEY || key !== HOST_KEY) {
         return err("unauthorized", "only the app can fill a saved login");
+      }
+      if (location.origin !== expectedOrigin) {
+        return err("origin-changed", "the page navigated before the saved login could be filled");
       }
       const secretField = passwordField();
       if (!secretField) return err("not-found", "this page has no password field");
@@ -1437,7 +1458,6 @@
       if (!element) return err("not-found", "No element matched that target.");
       element.scrollIntoView({ block: "center", inline: "center" });
       const point = centreOf(element);
-      agentCursor(point, "hover");
       const base = {
         bubbles: true,
         cancelable: true,
@@ -1446,32 +1466,35 @@
         clientY: point.y,
       };
       const chain = [element, ...ancestors(element, 4)];
-      // Menus usually open from a listener on the wrapper rather than on the
-      // link itself, and mouseenter does not bubble, so each is told directly.
-      for (const node of chain) {
-        node.dispatchEvent(
-          new PointerEvent("pointerover", { ...base, pointerId: 1, isPrimary: true }),
-        );
-        node.dispatchEvent(new MouseEvent("mouseover", base));
-        node.dispatchEvent(new MouseEvent("mouseenter", { ...base, bubbles: false }));
-        node.dispatchEvent(
-          new PointerEvent("pointermove", { ...base, pointerId: 1, isPrimary: true }),
-        );
-        node.dispatchEvent(new MouseEvent("mousemove", base));
-      }
-      return ok({
-        hovered: describe(element),
-        ...(cssHoverOnly(element)
-          ? {
-              cssHoverOnly: true,
-              note:
-                "this element's menu opens from a CSS :hover rule, which only a real pointer can set. " +
-                "Nothing here can open it — read the markup with browser_evaluate, or click the trigger " +
-                "if it has one.",
-            }
-          : {}),
-        ...pageState(),
-      });
+      return schedule(agentCursor(point, "hover"), () => {
+        // Menus usually open from a listener on the wrapper rather than on the
+        // link itself, and mouseenter does not bubble, so each is told directly.
+        for (const node of chain) {
+          node.dispatchEvent(
+            new PointerEvent("pointerover", { ...base, pointerId: 1, isPrimary: true }),
+          );
+          node.dispatchEvent(new MouseEvent("mouseover", base));
+          node.dispatchEvent(new MouseEvent("mouseenter", { ...base, bubbles: false }));
+          node.dispatchEvent(
+            new PointerEvent("pointermove", { ...base, pointerId: 1, isPrimary: true }),
+          );
+          node.dispatchEvent(new MouseEvent("mousemove", base));
+        }
+      }).then(() =>
+        ok({
+          hovered: describe(element),
+          ...(cssHoverOnly(element)
+            ? {
+                cssHoverOnly: true,
+                note:
+                  "this element's menu opens from a CSS :hover rule, which only a real pointer can set. " +
+                  "Nothing here can open it — inspect a snapshot, or click the trigger " +
+                  "if it has one.",
+              }
+            : {}),
+          ...pageState(),
+        }),
+      );
     },
 
     snapshot(options = {}) {
@@ -1535,9 +1558,9 @@
           reason: "that dialog has no reject control to click",
         });
       }
-      agentCursor(centreOf(button), "reject");
-      button.click();
-      return ok({ dismissed: true, vendor: consent.vendor.name });
+      return schedule(agentCursor(centreOf(button), "reject"), () => {
+        button.click();
+      }).then(() => ok({ dismissed: true, vendor: consent.vendor.name }));
     },
 
     click(target, options = {}) {
@@ -1548,11 +1571,10 @@
       const point =
         target.x != null && target.y != null ? { x: target.x, y: target.y } : centreOf(element);
       // The press lands as the pointer arrives, not before it sets off.
-      schedule(agentCursor(point, "click"), () => {
+      return schedule(agentCursor(point, "click"), () => {
         agentTap();
         pointerSequence(element, point, options);
-      });
-      return ok({ clicked: describe(element), ...pageState() });
+      }).then(() => ok({ clicked: describe(element), ...pageState() }));
     },
 
     type(target, text, options = {}) {
@@ -1569,7 +1591,7 @@
       }
       element.scrollIntoView({ block: "center" });
       const label = text.length > 12 ? "typing" : `typing “${text}”`;
-      schedule(agentCursor(centreOf(element), label), () => {
+      return schedule(agentCursor(centreOf(element), label), () => {
         agentTap();
         element.focus({ preventScroll: true });
         if (element.contentEditable === "true") {
@@ -1582,8 +1604,7 @@
           new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }),
         );
         element.dispatchEvent(new Event("change", { bubbles: true }));
-      });
-      return ok({ typed: text.length, value: readValue(element), ...pageState() });
+      }).then(() => ok({ typed: text.length, value: readValue(element), ...pageState() }));
     },
 
     press(key, modifiers = []) {
@@ -1603,7 +1624,7 @@
         altKey: modifiers.includes("Alt"),
         metaKey: modifiers.includes("Meta"),
       };
-      schedule(delay, () => {
+      return schedule(delay, () => {
         agentTap();
         const keydown = new KeyboardEvent("keydown", init);
         const delivered = element.dispatchEvent(keydown);
@@ -1619,8 +1640,7 @@
           insertText(element, typed);
         }
         element.dispatchEvent(new KeyboardEvent("keyup", init));
-      });
-      return ok({ key, value: readValue(element), ...pageState() });
+      }).then(() => ok({ key, value: readValue(element), ...pageState() }));
     },
 
     /**
@@ -1666,53 +1686,56 @@
       // the other, and each ignores the events meant for the other.
       const html5 = draggableFrom(source);
 
-      schedule(agentCursor(start, "drag"), () => {
+      return schedule(agentCursor(start, "drag"), () => {
         agentTap();
         source.dispatchEvent(new PointerEvent("pointerdown", base(start, 1)));
         source.dispatchEvent(new MouseEvent("mousedown", base(start, 1)));
         if (html5)
           dragSequence(html5, target ?? document.elementFromPoint(end.x, end.y), base, start, end);
-        const hop = (index) => {
-          const ratio = index / steps;
-          const at = {
-            x: start.x + (end.x - start.x) * ratio,
-            y: start.y + (end.y - start.y) * ratio,
+        return new Promise((resolve) => {
+          const hop = (index) => {
+            const ratio = index / steps;
+            const at = {
+              x: start.x + (end.x - start.x) * ratio,
+              y: start.y + (end.y - start.y) * ratio,
+            };
+            const over = document.elementFromPoint(at.x, at.y) ?? source;
+            over.dispatchEvent(new PointerEvent("pointermove", base(at, 1)));
+            over.dispatchEvent(new MouseEvent("mousemove", base(at, 1)));
+            if (index === steps) {
+              agentCursor(end, "drop");
+              const dropped = document.elementFromPoint(end.x, end.y) ?? target ?? source;
+              dropped.dispatchEvent(new PointerEvent("pointerup", base(end, 0)));
+              dropped.dispatchEvent(new MouseEvent("mouseup", base(end, 0)));
+              agentTap();
+              resolve();
+              return;
+            }
+            // Moving over several frames rather than in one jump: a slider that
+            // reads only the final position still works, and one that tracks
+            // movement gets something to track.
+            setTimeout(() => hop(index + 1), reducedMotion() ? 0 : 16);
           };
-          const over = document.elementFromPoint(at.x, at.y) ?? source;
-          over.dispatchEvent(new PointerEvent("pointermove", base(at, 1)));
-          over.dispatchEvent(new MouseEvent("mousemove", base(at, 1)));
-          if (index === steps) {
-            agentCursor(end, "drop");
-            const dropped = document.elementFromPoint(end.x, end.y) ?? target ?? source;
-            dropped.dispatchEvent(new PointerEvent("pointerup", base(end, 0)));
-            dropped.dispatchEvent(new MouseEvent("mouseup", base(end, 0)));
-            agentTap();
-            return;
-          }
-          // Moving over several frames rather than in one jump: a slider that
-          // reads only the final position still works, and one that tracks
-          // movement gets something to track.
-          setTimeout(() => hop(index + 1), reducedMotion() ? 0 : 16);
-        };
-        hop(1);
-      });
-      return ok({
-        from: describe(source),
-        to: target ? describe(target) : end,
-        // Which mechanism was used, so a caller reading "moved nothing" knows
-        // whether to look at the page or at the gesture.
-        kind: html5 ? "html5-drag" : "pointer-drag",
-      });
+          hop(1);
+        });
+      }).then(() =>
+        ok({
+          from: describe(source),
+          to: target ? describe(target) : end,
+          // Which mechanism was used, so a caller reading "moved nothing" knows
+          // whether to look at the page or at the gesture.
+          kind: html5 ? "html5-drag" : "pointer-drag",
+        }),
+      );
     },
 
     scroll(target, deltaX = 0, deltaY = 0) {
       const target_ = target ? resolve(target) : null;
       const element = target_ === STALE ? null : target_;
       const at = element ? centreOf(element) : { x: innerWidth / 2, y: innerHeight / 2 };
-      schedule(agentCursor(at, "scroll"), () => {
+      return schedule(agentCursor(at, "scroll"), () => {
         (element ?? window).scrollBy({ left: deltaX, top: deltaY, behavior: "instant" });
-      });
-      return ok({ ...pageState() });
+      }).then(() => ok({ ...pageState() }));
     },
 
     waitFor(condition = {}) {
@@ -1732,20 +1755,6 @@
       return ok({ matched: true });
     },
 
-    evaluate(expression) {
-      flushPending();
-      try {
-        // Deliberate: `browser_evaluate` exists to run caller-supplied page
-        // expressions, and the guest is already inside the page's own origin.
-        const value = Function(`"use strict";return (${expression})`)();
-        const json = JSON.stringify(value ?? null);
-        if (json && json.length > 64000) return err("too-large", "Result exceeds 64 KB.");
-        return ok(json === undefined ? null : JSON.parse(json));
-      } catch (error) {
-        return err("evaluate-failed", error?.message ?? error);
-      }
-    },
-
     /** Highlights an element without acting on it, for the agent cursor. */
     highlight(target) {
       const element = resolve(target);
@@ -1753,7 +1762,11 @@
       if (!element) return err("not-found", "No element matched that target.");
       ensureOverlay().getElementById("marks").replaceChildren();
       outline(element, accessibleName(element).slice(0, 40) || element.tagName.toLowerCase());
-      setTimeout(clearOverlay, 900);
+      // Only the highlight boxes go away. Clearing the whole overlay used to
+      // take the agent cursor with it.
+      setTimeout(() => {
+        overlayRoot?.getElementById("marks")?.replaceChildren();
+      }, 900);
       return ok({ highlighted: describe(element) });
     },
 
@@ -1952,5 +1965,13 @@
     );
   }
 
-  window.__integrator = api;
+  // Page code is untrusted. Keep it from replacing `blocked`, the host-only
+  // login methods, or any action before the native side invokes it.
+  Object.freeze(api);
+  Object.defineProperty(window, "__integrator", {
+    value: api,
+    writable: false,
+    configurable: false,
+    enumerable: false,
+  });
 })();

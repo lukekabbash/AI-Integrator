@@ -1,3 +1,4 @@
+import { LazyMotion, domMax } from "motion/react";
 import { StrictMode, lazy, Suspense } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
@@ -30,9 +31,13 @@ if (isBrowserWindow) initializeTheme();
 createRoot(root).render(
   <StrictMode>
     {isBrowserWindow ? (
-      <Suspense fallback={null}>
-        <BrowserWindowShell />
-      </Suspense>
+      // App provides LazyMotion for the workspace; the detached window mounts
+      // the shell directly, so its tab strip needs the same features here.
+      <LazyMotion features={domMax} strict>
+        <Suspense fallback={null}>
+          <BrowserWindowShell />
+        </Suspense>
+      </LazyMotion>
     ) : (
       <App />
     )}

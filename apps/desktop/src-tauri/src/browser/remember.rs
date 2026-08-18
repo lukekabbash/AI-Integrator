@@ -2,9 +2,9 @@
 //!
 //! Coming back to a chat should not mean looking every page up again, so the
 //! addresses a task had open are written to the store as they change and read
-//! back when the task is opened. Only the address and the title travel: page
-//! state belongs to the site and its cookies, which the browser profile already
-//! keeps.
+//! back when the task is opened. Only the address, the title and the site's
+//! small icon travel: page state belongs to the site and its cookies, which the
+//! browser profile already keeps.
 //!
 //! Restored tabs arrive asleep. Nothing is fetched and no webview exists until
 //! the tab is looked at or an agent addresses it, so opening a chat with a dozen
@@ -42,6 +42,11 @@ pub fn remember(app: &AppHandle, tabs: &BrowserTabs, task_id: &str) {
         .map(|tab| StoredBrowserTab {
             url: tab.url,
             title: tab.title,
+            // Icons are already bounded when resolved; the check is belt and
+            // braces against a row that would bloat the store.
+            favicon: tab
+                .favicon
+                .filter(|icon| icon.len() <= super::favicon::MAX_ICON_BYTES),
         })
         .collect();
     // Best effort: forgetting a tab list is a smaller problem than failing the
@@ -70,7 +75,11 @@ pub fn restore(app: &AppHandle, tabs: &Arc<BrowserTabs>, task_id: &str) -> usize
         if Url::parse(&stored.url).is_err() {
             continue;
         }
-        if tabs.insert_sleeping(task_id, &stored.url, &stored.title) {
+        let favicon = stored
+            .favicon
+            .clone()
+            .or_else(|| super::favicon::cached_for_url(&stored.url));
+        if tabs.insert_sleeping(task_id, &stored.url, &stored.title, favicon) {
             added += 1;
         }
     }
@@ -160,7 +169,13 @@ pub async fn wake(
 impl BrowserTabs {
     /// Registers a remembered tab with no webview behind it. Returns false when
     /// the same address is already present, so restoring twice is harmless.
-    pub(super) fn insert_sleeping(&self, task_id: &str, url: &str, title: &str) -> bool {
+    pub(super) fn insert_sleeping(
+        &self,
+        task_id: &str,
+        url: &str,
+        title: &str,
+        favicon: Option<String>,
+    ) -> bool {
         let mut tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
         if tabs
             .values()
@@ -178,7 +193,7 @@ impl BrowserTabs {
                     task_id: task_id.to_string(),
                     url: url.to_string(),
                     title: title.to_string(),
-                    favicon: None,
+                    favicon,
                     loading: false,
                     popped_out: false,
                     hidden: true,

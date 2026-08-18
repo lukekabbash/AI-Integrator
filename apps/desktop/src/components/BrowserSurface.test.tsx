@@ -4,7 +4,8 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { BrowserTab } from "../bridge";
-import { BrowserSurface, type BrowserSurfaceProps } from "./BrowserSurface";
+import { NATIVE_PAGE_DECK_OCCLUSION_ATTR } from "../useModalOpen";
+import { BrowserChromeBar, BrowserSurface, type BrowserSurfaceProps } from "./BrowserSurface";
 
 const POPPED_TAB: BrowserTab = {
   id: "tab-a",
@@ -56,6 +57,7 @@ describe("BrowserSurface native hosting", () => {
   });
 
   afterEach(() => {
+    document.documentElement.removeAttribute(NATIVE_PAGE_DECK_OCCLUSION_ATTR);
     cleanup();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
@@ -70,6 +72,45 @@ describe("BrowserSurface native hosting", () => {
       expect.objectContaining({ x: 100, y: 80, width: 640, height: 420 }),
     );
     expect(screen.queryByText("This tab is in its own window")).not.toBeInTheDocument();
+  });
+
+  it("parks the native page while a dialog is open and places it again after", async () => {
+    const onBoundsChange = vi.fn();
+    render(<BrowserSurface {...props({ onBoundsChange, poppedOutHost: true })} />);
+    expect(onBoundsChange).toHaveBeenCalledWith(expect.objectContaining({ width: 640 }));
+
+    // A webview paints above every dialog and ignores its backdrop, so the
+    // page has to leave rather than be covered.
+    const dialog = document.createElement("div");
+    dialog.setAttribute("aria-modal", "true");
+    document.body.appendChild(dialog);
+    await waitFor(() => expect(onBoundsChange).toHaveBeenLastCalledWith(null));
+
+    dialog.remove();
+    await waitFor(() =>
+      expect(onBoundsChange).toHaveBeenLastCalledWith(expect.objectContaining({ width: 640 })),
+    );
+  });
+
+  it("parks the in-pane page while the compact deck is dragged across it", async () => {
+    const onBoundsChange = vi.fn();
+    render(
+      <BrowserSurface
+        {...props({
+          tab: { ...POPPED_TAB, poppedOut: false },
+          onBoundsChange,
+        })}
+      />,
+    );
+    expect(onBoundsChange).toHaveBeenCalledWith(expect.objectContaining({ width: 640 }));
+
+    document.documentElement.setAttribute(NATIVE_PAGE_DECK_OCCLUSION_ATTR, "");
+    await waitFor(() => expect(onBoundsChange).toHaveBeenLastCalledWith(null));
+
+    document.documentElement.removeAttribute(NATIVE_PAGE_DECK_OCCLUSION_ATTR);
+    await waitFor(() =>
+      expect(onBoundsChange).toHaveBeenLastCalledWith(expect.objectContaining({ width: 640 })),
+    );
   });
 
   it("leaves a remotely hosted tab to its owning renderer and hides external actions by default", () => {
@@ -115,6 +156,47 @@ describe("BrowserSurface native hosting", () => {
     expect(screen.getByText("Local servers")).toBeInTheDocument();
   });
 
+  it("does not shove the native page down when more actions open", async () => {
+    const onBoundsChange = vi.fn();
+    render(<BrowserSurface {...props({ onBoundsChange, poppedOutHost: true })} />);
+    expect(onBoundsChange).toHaveBeenLastCalledWith(
+      expect.objectContaining({ x: 100, y: 80, width: 640, height: 420 }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "More browser actions" }));
+
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    await waitFor(() => expect(onBoundsChange).toHaveBeenLastCalledWith(null));
+    const shifted = onBoundsChange.mock.calls.some(
+      ([bounds]) => bounds && typeof bounds === "object" && "y" in bounds && bounds.y > 80,
+    );
+    expect(shifted).toBe(false);
+  });
+
+  it("does not shove the in-app page down when more actions open", async () => {
+    const onBoundsChange = vi.fn();
+    render(
+      <BrowserSurface
+        {...props({
+          tab: { ...POPPED_TAB, poppedOut: false },
+          onBoundsChange,
+        })}
+      />,
+    );
+    expect(onBoundsChange).toHaveBeenLastCalledWith(
+      expect.objectContaining({ x: 100, y: 80, width: 640, height: 420 }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "More browser actions" }));
+
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    await waitFor(() => expect(onBoundsChange).toHaveBeenLastCalledWith(null));
+    const shifted = onBoundsChange.mock.calls.some(
+      ([bounds]) => bounds && typeof bounds === "object" && "y" in bounds && bounds.y > 80,
+    );
+    expect(shifted).toBe(false);
+  });
+
   it("draws native-page tooltips without moving the browser bounds", async () => {
     const onBoundsChange = vi.fn();
     const onToolbarTooltip = vi.fn(async () => undefined);
@@ -130,11 +212,74 @@ describe("BrowserSurface native hosting", () => {
 
     fireEvent.mouseEnter(screen.getByRole("button", { name: "Back" }));
 
-    await waitFor(() => expect(onToolbarTooltip).toHaveBeenCalledWith({ label: "Back", x: 317 }), {
+    await waitFor(() => expect(onToolbarTooltip).toHaveBeenCalledWith({ label: "Back", x: 320 }), {
       timeout: 1_000,
     });
     expect(screen.queryByRole("tooltip")).toBeNull();
     expect(onBoundsChange).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a status notice in the chrome without insetting the native page", () => {
+    const onBoundsChange = vi.fn();
+    render(
+      <BrowserSurface
+        {...props({
+          tab: { ...POPPED_TAB, poppedOut: false },
+          onBoundsChange,
+          message: "Screenshot attached to the composer.",
+        })}
+      />,
+    );
+
+    const notice = screen.getByRole("status");
+    expect(notice).toHaveTextContent("Screenshot attached to the composer.");
+    expect(notice).toHaveClass("browser-message");
+    expect(onBoundsChange).toHaveBeenCalledWith(expect.objectContaining({ x: 100, width: 640 }));
+  });
+
+  it("searches from the address field when the draft is not a URL", () => {
+    const onNavigate = vi.fn(async () => undefined);
+    render(<BrowserSurface {...props({ onNavigate, poppedOutHost: true })} />);
+
+    const field = screen.getByRole("combobox");
+    fireEvent.focus(field);
+    fireEvent.change(field, { target: { value: "how to center a div" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+
+    expect(onNavigate).toHaveBeenCalledWith("https://www.google.com/search?q=how%20to%20center%20a%20div");
+  });
+
+  it("shows the hero search on a blank in-pane tab as well as the chrome address field", () => {
+    const onNavigate = vi.fn(async () => undefined);
+    render(
+      <BrowserSurface
+        {...props({
+          tab: { ...POPPED_TAB, url: "about:blank", title: "", poppedOut: false },
+          onNavigate,
+        })}
+      />,
+    );
+
+    expect(screen.getByRole("combobox", { name: /Search or enter a URL/ })).toBeInTheDocument();
+    const hero = screen.getByRole("combobox", { name: /Search Google or enter a URL/ });
+    fireEvent.focus(hero);
+    fireEvent.change(hero, { target: { value: "https://example.com/docs" } });
+    fireEvent.keyDown(hero, { key: "Enter" });
+    expect(onNavigate).toHaveBeenCalledWith("https://example.com/docs");
+    expect(screen.getByRole("button", { name: "Back" })).toBeEnabled();
+  });
+
+  it("renders a shared chrome bar with the history disabled when there is no page", () => {
+    render(
+      <BrowserChromeBar disabled>
+        <div className="browser-address" />
+      </BrowserChromeBar>,
+    );
+
+    expect(screen.getByRole("button", { name: "Back" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Forward" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reload" })).toBeDisabled();
+    expect(document.querySelector("form.browser-chrome")).not.toBeNull();
   });
 
   it("keeps the ordinary downward tooltip on a blank HTML start page", async () => {

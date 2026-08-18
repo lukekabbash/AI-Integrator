@@ -125,6 +125,48 @@ const EMPTY = createWorkPaneState();
 
 export { fileSurfaceId };
 
+/** A box this small is an opening slide, a pop-out reparent, or an unlaid-out
+ *  first frame — never a real place to hang the titlebar tab strip. */
+const HEADER_PANE_MIN_SIZE = 32;
+
+export interface HeaderRect {
+  left: number;
+  width: number;
+  height: number;
+}
+
+export interface WorkPaneHeaderAlignment {
+  paneLeft: number;
+  endWidth: number;
+}
+
+/**
+ * Maps the live pane box onto the titlebar slot. Returns null when the pane
+ * is not a usable measurement so the last good offset stays put — a 0×0 or
+ * left-edge reading would cover File / Edit / View and the chat title.
+ */
+export function measureWorkPaneHeaderAlignment(input: {
+  root: HeaderRect;
+  pane: HeaderRect;
+  headerEnd?: Pick<HeaderRect, "width"> | null;
+  reservedLeft?: number;
+}): WorkPaneHeaderAlignment | null {
+  if (input.pane.width < HEADER_PANE_MIN_SIZE || input.pane.height < 8) return null;
+  const reserved = Math.max(0, input.reservedLeft ?? 0);
+  const raw = input.pane.left - input.root.left;
+  if (!Number.isFinite(raw)) return null;
+  return {
+    paneLeft: Math.max(reserved, raw),
+    endWidth: Math.round(input.headerEnd?.width ?? 0),
+  };
+}
+
+function applyWorkPaneHeaderAlignment(root: HTMLElement, alignment: WorkPaneHeaderAlignment) {
+  root.style.setProperty("--subagent-pane-left", `${Math.round(alignment.paneLeft)}px`);
+  root.style.setProperty("--titlebar-end-width", `${alignment.endWidth}px`);
+  root.dataset.subagentLayoutReady = "true";
+}
+
 /** Keeps the titlebar tab-strip slice aligned over the pane. */
 export function useWorkPaneHeaderAlignment(
   rootRef: RefObject<HTMLElement | null>,
@@ -133,31 +175,67 @@ export function useWorkPaneHeaderAlignment(
 ) {
   useLayoutEffect(() => {
     const root = rootRef.current;
-    const pane = paneRef.current;
-    if (!root || !pane || !open) return;
+    if (!root || !open) return;
     // The header keeps the view tabs, the usage pill and the window controls at
     // its right end whether or not the pane is open. The strip shares that row,
     // so it has to know how much of the right side is already taken rather than
     // guessing at a constant that goes stale the moment the cluster changes.
     const headerEnd = root.querySelector<HTMLElement>(".titlebar-end");
-    const align = () => {
-      const rootRect = root.getBoundingClientRect();
-      const paneRect = pane.getBoundingClientRect();
-      root.style.setProperty(
-        "--subagent-pane-left",
-        `${Math.max(0, paneRect.left - rootRect.left)}px`,
-      );
-      const endWidth = headerEnd?.getBoundingClientRect().width ?? 0;
-      root.style.setProperty("--titlebar-end-width", `${Math.round(endWidth)}px`);
-      root.dataset.subagentLayoutReady = "true";
+    const titlebarLeft = root.querySelector<HTMLElement>(".titlebar-left");
+    const watched = new Set<Element>();
+    let observer: ResizeObserver | undefined;
+    let raf = 0;
+    let openingFrames = 0;
+
+    const watch = (node: Element | null | undefined) => {
+      if (!node || watched.has(node) || !observer) return;
+      watched.add(node);
+      observer.observe(node);
     };
+
+    const schedule = () => {
+      if (raf || openingFrames >= 12) return;
+      openingFrames += 1;
+      raf = window.requestAnimationFrame(() => {
+        raf = 0;
+        align();
+      });
+    };
+
+    const align = () => {
+      const pane = paneRef.current;
+      watch(pane);
+      if (!pane) {
+        schedule();
+        return;
+      }
+      const rootRect = root.getBoundingClientRect();
+      const next = measureWorkPaneHeaderAlignment({
+        root: rootRect,
+        pane: pane.getBoundingClientRect(),
+        headerEnd: headerEnd?.getBoundingClientRect() ?? null,
+        reservedLeft: titlebarLeft
+          ? titlebarLeft.getBoundingClientRect().right - rootRect.left
+          : 0,
+      });
+      // Tab switches and pop-outs remount the native page and can hand us a
+      // collapsed box for a frame. Keep the last good offset instead of
+      // sliding the strip over File / Edit / View.
+      if (next) {
+        applyWorkPaneHeaderAlignment(root, next);
+        return;
+      }
+      schedule();
+    };
+
+    observer = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(align);
+    watch(root);
+    watch(headerEnd);
+    watch(titlebarLeft);
     align();
-    const observer = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(align);
-    observer?.observe(root);
-    observer?.observe(pane);
-    if (headerEnd) observer?.observe(headerEnd);
     window.addEventListener("resize", align);
     return () => {
+      window.cancelAnimationFrame(raf);
       observer?.disconnect();
       window.removeEventListener("resize", align);
       delete root.dataset.subagentLayoutReady;

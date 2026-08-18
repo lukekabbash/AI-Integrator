@@ -40,6 +40,7 @@ sha2.workspace = true
 tauri = { version = "2", features = ["unstable"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
+tempfile = "3"
 tokio.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 url.workspace = true
@@ -61,6 +62,3 @@ win32job = "2"
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-tempfile = "3"

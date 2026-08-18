@@ -215,6 +215,9 @@ export function useBrowserTabs(
   );
   const recorder = useRef<ActiveRecording | null>(null);
   const picker = useRef<ActivePicker | null>(null);
+  // Bumped whenever the user or a task switch ends annotating, so a pick that
+  // finishes after that never re-arms the picker.
+  const pickerSession = useRef(0);
   const hostRef = useRef(host);
   useEffect(() => {
     hostRef.current = host;
@@ -266,6 +269,7 @@ export function useBrowserTabs(
       }
       if (picker.current?.taskId === taskId) {
         const activePicker = picker.current;
+        pickerSession.current += 1;
         window.clearInterval(activePicker.timer);
         picker.current = null;
         setAnnotatingState((current) => (current?.taskId === taskId ? null : current));
@@ -392,6 +396,7 @@ export function useBrowserTabs(
       if (!api || !taskId) return;
       if (picker.current) {
         const activePicker = picker.current;
+        pickerSession.current += 1;
         window.clearInterval(activePicker.timer);
         picker.current = null;
         setAnnotatingState((current) => (current?.taskId === activePicker.taskId ? null : current));
@@ -401,8 +406,12 @@ export function useBrowserTabs(
         return;
       }
       setTaskMessage(taskId, null);
-      try {
+      // The picker stays armed after each pick, so a dozen annotations is a
+      // dozen clicks. Esc on the page or the toolbar button ends it.
+      const session = pickerSession.current;
+      const arm = async () => {
         await api.invoke(taskId, tabId, "startPick", [pageTheme()]);
+        if (pickerSession.current !== session) return;
         setAnnotatingState({ taskId, tabId });
         const activePicker: ActivePicker = { timer: 0, taskId, tabId };
         activePicker.timer = window.setInterval(() => {
@@ -423,22 +432,8 @@ export function useBrowserTabs(
               if (!result.picked) return;
               const tab = tabs.find((candidate) => candidate.id === tabId);
               const picked = result.picked;
-              await api
-                .invoke(taskId, tabId, "annotate", [
-                  [{ kind: "element", ref: picked.ref, label: picked.name }],
-                ])
-                .catch(() => undefined);
-              try {
-                const base64 = await api.screenshot(taskId, tabId);
-                await hostRef.current.attachImage(
-                  pngBlob(base64),
-                  annotationAttachmentName(picked.name || picked.tag),
-                  taskId,
-                );
-              } catch {
-                // The context below still stands on its own without the image.
-              }
-              await api.invoke(taskId, tabId, "clearAnnotations").catch(() => undefined);
+              // The chip lands first: the annotation is the element and the
+              // note, and it must not wait on — or vanish with — the capture.
               hostRef.current.insertText(
                 [
                   "<browser_annotation>",
@@ -456,10 +451,35 @@ export function useBrowserTabs(
                 ].join("\n"),
                 taskId,
               );
+              await api
+                .invoke(taskId, tabId, "annotate", [
+                  [{ kind: "element", ref: picked.ref, label: picked.name }],
+                ])
+                .catch(() => undefined);
+              try {
+                const base64 = await api.screenshot(taskId, tabId);
+                await hostRef.current.attachImage(
+                  pngBlob(base64),
+                  annotationAttachmentName(picked.name || picked.tag),
+                  taskId,
+                );
+              } catch {
+                // The chip already stands on its own without the crop.
+              }
+              await api.invoke(taskId, tabId, "clearAnnotations").catch(() => undefined);
+              // Cancelled picks (Esc, Cancel) end the session; the guest
+              // reports those with `cancelled`, and the branch above already
+              // returned for them. Only a completed pick re-arms.
+              if (pickerSession.current === session && picker.current === null) {
+                await arm().catch(() => undefined);
+              }
             })
             .catch(() => undefined);
         }, 250);
         picker.current = activePicker;
+      };
+      try {
+        await arm();
       } catch (error) {
         report(taskId, error, "Could not start annotating that page.");
       }

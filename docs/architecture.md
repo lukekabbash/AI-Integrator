@@ -64,19 +64,22 @@ Rules:
 4. The broker is the sole writer for shared task state; agents own only their run scratch/results.
 5. Credentials remain in vendor/OS stores and never cross into the renderer or coordination ledger.
 6. Local IPC is process-bound or authenticated. v1 exposes no unauthenticated TCP/LAN listener.
+7. In-app browser profiles are native-owned and task-scoped by default. Standalone chat uses the
+   dedicated `Chat/Main Browser` identity; Shared identity is an explicit, restart-bound choice.
+   The renderer receives cookie and saved-login metadata, never cookie values or passwords.
 
 ## 4. Shared and platform-specific implementation
 
 The following interfaces have Windows/macOS implementations behind the same Rust contract:
 
-| Trait | Windows | macOS |
-|---|---|---|
-| `PtyHost` | ConPTY | POSIX PTY |
-| `ProcessTree` | Job Objects, process-tree accounting and kill-on-close | process groups/sessions and signal escalation |
-| `ShellEnvironment` | PowerShell/cmd/PATH/WSL discovery | login-shell PATH reconstruction |
-| `SecureStore` | Windows Credential Locker/DPAPI-backed storage | Keychain |
-| `PathIdentity` | drives, UNC, junctions, long paths, WSL mappings, case rules | volumes, symlinks/aliases, case rules |
-| `NativeIntegration` | notifications, attention, reveal/open, external terminal, sleep inhibition | equivalent AppKit/system integrations |
+| Trait               | Windows                                                                    | macOS                                         |
+| ------------------- | -------------------------------------------------------------------------- | --------------------------------------------- |
+| `PtyHost`           | ConPTY                                                                     | POSIX PTY                                     |
+| `ProcessTree`       | Job Objects, process-tree accounting and kill-on-close                     | process groups/sessions and signal escalation |
+| `ShellEnvironment`  | PowerShell/cmd/PATH/WSL discovery                                          | login-shell PATH reconstruction               |
+| `SecureStore`       | Windows Credential Locker/DPAPI-backed storage                             | Keychain                                      |
+| `PathIdentity`      | drives, UNC, junctions, long paths, WSL mappings, case rules               | volumes, symlinks/aliases, case rules         |
+| `NativeIntegration` | notifications, attention, reveal/open, external terminal, sleep inhibition | equivalent AppKit/system integrations         |
 
 Provider adapters, Broker MCP, Git policy, task ledger, delegation, redaction, usage, themes, and UI remain shared.
 
@@ -84,12 +87,12 @@ Provider adapters, Broker MCP, Git policy, task ledger, delegation, redaction, u
 
 One source commit and one version may produce multiple artifacts:
 
-| Target | v1 status | Installer | OS trust |
-|---|---|---|---|
-| Windows x64 | Required | per-user NSIS setup | Authenticode signed and timestamped |
-| macOS Apple Silicon | Required | notarized DMG containing `.app` | Developer ID, Hardened Runtime, notarized and stapled |
-| macOS Intel | Required unless audience data explicitly removes it | separate notarized DMG | same identity and notarization |
-| Windows ARM64 | Fast-follow unless demand justifies day-one certification | separate per-user NSIS setup | same Authenticode identity |
+| Target              | v1 status                                                 | Installer                       | OS trust                                              |
+| ------------------- | --------------------------------------------------------- | ------------------------------- | ----------------------------------------------------- |
+| Windows x64         | Required                                                  | per-user NSIS setup             | Authenticode signed and timestamped                   |
+| macOS Apple Silicon | Required                                                  | notarized DMG containing `.app` | Developer ID, Hardened Runtime, notarized and stapled |
+| macOS Intel         | Required unless audience data explicitly removes it       | separate notarized DMG          | same identity and notarization                        |
+| Windows ARM64       | Fast-follow unless demand justifies day-one certification | separate per-user NSIS setup    | same Authenticode identity                            |
 
 Different artifacts do not imply different products. They share version, release notes, capability matrix, migration level, and update channel.
 
@@ -141,4 +144,3 @@ Targets are measured on a representative midrange Windows machine and Apple Sili
 - [macOS application bundle](https://v2.tauri.app/distribute/macos-application-bundle/)
 - [Codex app-server](https://learn.chatgpt.com/docs/app-server)
 - [ACP transports](https://agentclientprotocol.com/protocol/v1/transports)
-

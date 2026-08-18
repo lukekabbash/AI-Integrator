@@ -1,7 +1,7 @@
 /* Work pane: the tabbed secondary surface between the transcript and the
-   right rail. It reuses the subagent pane's silhouette (hairline on the
-   left, canvas fill, resize grip inside) and the titlebar file-tab look for
-   its strip. Chrome has a body; the surfaces inside are flat. */
+   right rail. It reuses the subagent pane's silhouette (canvas fill, resize
+   grip inside) and the titlebar file-tab look for its strip. Chrome has a
+   body; the surfaces inside are flat. */
 
 /* Specificity beats `.subagent-workspace-pane > *` regardless of load order. */
 .work-pane.subagent-workspace-pane {
@@ -15,62 +15,38 @@
 .work-pane.subagent-workspace-pane > .resize-handle--horizontal {
   height: 100%;
 }
-/* The seam between the transcript and the pane: one hairline, with the drag
-   pill centred on it. Both live in the row rather than inside the pane, because
-   a native browser surface always paints above HTML and would bury anything
-   drawn at the pane's own edge. The strip straddles the line so the pill has
-   room on both sides; the tab gives up those couple of pixels (SEAM_CLEARANCE
-   in BrowserSurface) so nothing covers them. */
+/* The drag grip lives in the row rather than inside the pane: a native
+   browser surface paints above HTML and would bury anything drawn at the
+   pane's own edge. The strip hangs into the transcript so the pill never
+   needs a reserved gutter on the page. */
 .work-pane-grip {
   position: absolute;
   top: 0;
   bottom: 0;
-  /* Reaches out of the pane and over the transcript, so the strip straddles the
-     seam: eight pixels outside, two inside. */
+  /* Reaches out of the pane and over the transcript: eight pixels outside,
+     two inside. The pill sits in the outside half so a webview cannot cover
+     it. */
   left: -8px;
   width: 10px;
   z-index: 13;
-}
-/* No seam at rest — the pane meets the transcript with nothing drawn between
-   them. The hairline fades in under the pointer to say where the drag is, and
-   while a browser is open it comes up in the selection colour so the seam, the
-   selected tab and the browser's chrome are one piece. */
-.work-pane-grip::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  right: 2px;
-  bottom: 0;
-  width: 1px;
-  background: transparent;
-  transition: background-color var(--motion-fast) var(--ease-standard);
-}
-.work-pane-grip:hover::before,
-.work-pane-grip:focus-within::before,
-body[data-resizing="true"] .work-pane-grip::before {
-  background: var(--color-border-strong);
-}
-.work-pane[data-kind="browser"] .work-pane-grip:hover::before,
-.work-pane[data-kind="browser"] .work-pane-grip:focus-within::before,
-body[data-resizing="true"] .work-pane[data-kind="browser"] .work-pane-grip::before {
-  background: var(--color-selection-active);
 }
 .work-pane-grip > .resize-handle--horizontal {
   right: 0;
   left: 0;
   width: auto;
 }
-/* Centre the shared pill on the hairline instead of in the strip. */
+/* Sit the pill entirely on the transcript side of the seam. Nothing is drawn
+   between the panes at rest; hover and this handle's own drag reveal only
+   the marker. */
 .work-pane-grip > .resize-handle--horizontal::after {
   left: auto;
   right: 2px;
   margin-left: 0;
-  margin-right: -1px;
+  margin-right: 0;
 }
 
-/* The pane draws no border of its own; the hairline above is the whole seam.
-   It also stops clipping, so the grip can hang past its left edge — the
-   surfaces inside manage their own overflow. */
+/* The pane draws no border of its own. It also stops clipping, so the grip
+   can hang past its left edge — the surfaces inside manage their own overflow. */
 .work-pane.subagent-workspace-pane {
   border-left-color: transparent;
   overflow: visible;
@@ -315,103 +291,58 @@ body[data-resizing="true"] .work-pane[data-kind="browser"] .work-pane-grip::befo
   border-bottom: 1px solid var(--color-border-subtle);
 }
 
-/* Launcher — the empty pane offers what can open here (modal-option rows). */
+/* Launcher — the empty pane is the start page, plus Review on a task. */
 .work-pane-launcher {
-  padding: 18px 16px;
-  display: flex;
-  flex-direction: column;
-  /* The offer sits in the middle of the empty pane rather than hanging from
-     the top, so a tall pane does not strand it under the tab strip. `safe`
-     keeps a short pane scrollable from the top instead of clipping the first
-     row above the scroll origin. */
-  justify-content: safe center;
-  gap: 8px;
-  overflow-y: auto;
-}
-.work-pane-launcher-eyebrow {
-  height: 26px;
-  display: flex;
-  align-items: center;
-  color: color-mix(in srgb, var(--color-text-tertiary) 88%, transparent);
-  font-size: 10px;
-  font-weight: 650;
-  letter-spacing: 0.07em;
-  text-transform: uppercase;
-}
-.work-pane-launcher-list {
-  margin: 0 0 8px;
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
   padding: 0;
-  list-style: none;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  overflow: hidden;
 }
-.work-pane-launcher-option {
-  width: 100%;
-  padding: 11px 13px;
+.work-pane-launcher .browser-start {
+  position: relative;
+  inset: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.work-pane-launcher > .browser-chrome {
+  flex: none;
+}
+.work-pane-launcher-actions {
+  flex: none;
   display: flex;
+  justify-content: flex-end;
+  padding: 12px 16px 0;
+}
+.work-pane-review {
+  flex: none;
+  padding: 5px 10px;
+  display: inline-flex;
   align-items: center;
-  gap: 13px;
+  gap: 7px;
   border: 1px solid transparent;
-  border-radius: 11px;
+  border-radius: var(--radius-row);
   background: transparent;
   color: var(--color-text-secondary);
-  text-align: left;
   font: inherit;
+  font-size: 11.5px;
   cursor: pointer;
-  transition:
-    background var(--duration-fast) var(--ease-standard),
-    border-color var(--duration-fast) var(--ease-standard),
-    color var(--duration-fast) var(--ease-standard);
 }
-.work-pane-launcher-option:hover:not(:disabled) {
+.work-pane-review svg {
+  width: 14px;
+  height: 14px;
+  stroke-width: 1.7;
+}
+.work-pane-review:hover {
   color: var(--color-text-primary);
   background: color-mix(in srgb, var(--color-accent) 8%, transparent);
   border-color: color-mix(in srgb, var(--color-accent) 55%, transparent);
 }
-.work-pane-launcher-option:focus-visible {
+.work-pane-review:focus-visible {
   outline: 2px solid var(--color-focus-ring);
   outline-offset: 2px;
-}
-.work-pane-launcher-option:disabled {
-  cursor: default;
-  opacity: 0.55;
-}
-.work-pane-launcher-option > span:last-child {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.work-pane-launcher-option strong {
-  color: var(--color-text-primary);
-  font-size: 12.5px;
-  font-weight: 580;
-  letter-spacing: -0.01em;
-}
-.work-pane-launcher-option small {
-  color: var(--color-text-tertiary);
-  font-size: 10.5px;
-  line-height: 1.4;
-}
-.work-pane-launcher-icon {
-  width: 20px;
-  height: 20px;
-  flex: none;
-  display: grid;
-  place-items: center;
-  color: var(--color-text-secondary);
-}
-.work-pane-launcher-icon svg {
-  width: 17px;
-  height: 17px;
-  stroke-width: 1.7;
-}
-.work-pane-launcher-list--compact .work-pane-launcher-option {
-  padding: 8px 13px;
-}
-.work-pane-launcher-list--compact strong {
-  font-size: 12px;
 }
 .work-pane-notice {
   padding: 24px 18px;
@@ -427,6 +358,44 @@ body[data-resizing="true"] .work-pane[data-kind="browser"] .work-pane-grip::befo
 .work-pane-notice small {
   color: var(--color-text-tertiary);
   font-size: 10.5px;
+}
+
+/* Surface headers under a selected tab wear the tab's fill, the way the
+   browser chrome does, so tab and header read as one piece whatever kind of
+   surface is open. Scoped to the pane: diff headers elsewhere keep theirs. */
+.work-pane-content[data-kind="file"] .file-workspace-header,
+.work-pane-content[data-kind="review"] .diff-workspace:not(.diff-workspace--inline) > .diff-header {
+  min-height: 38px;
+  border-bottom: 1px solid var(--color-border-subtle);
+  background: var(--color-selection-active);
+  color: var(--color-selection-text);
+  transition: background-color var(--duration-fast) var(--ease-standard);
+}
+.work-pane-content[data-kind="file"] .file-workspace-header .diff-file-title strong,
+.work-pane-content[data-kind="file"] .file-workspace-header .diff-file-title > svg,
+.work-pane-content[data-kind="review"] .diff-workspace:not(.diff-workspace--inline) > .diff-header .diff-file-title strong,
+.work-pane-content[data-kind="review"] .diff-workspace:not(.diff-workspace--inline) > .diff-header .diff-file-title > svg,
+.work-pane-content[data-kind="review"] .diff-workspace:not(.diff-workspace--inline) > .diff-header .diff-comparison {
+  color: var(--color-selection-text);
+}
+.work-pane-content[data-kind="file"] .file-workspace-header .diff-file-title small,
+.work-pane-content[data-kind="review"] .diff-workspace:not(.diff-workspace--inline) > .diff-header .diff-file-title small,
+.work-pane-content[data-kind="review"] .diff-workspace:not(.diff-workspace--inline) > .diff-header .diff-file-meta-divider {
+  color: color-mix(in srgb, var(--color-selection-text) 62%, transparent);
+}
+.work-pane-content[data-kind="file"] .file-workspace-header .diff-header-icon-button,
+.work-pane-content[data-kind="review"] .diff-workspace:not(.diff-workspace--inline) > .diff-header .diff-header-icon-button,
+.work-pane-content[data-kind="review"] .diff-workspace:not(.diff-workspace--inline) > .diff-header .diff-review-button,
+.work-pane-content[data-kind="review"] .diff-workspace:not(.diff-workspace--inline) > .diff-header .diff-layout-toggle button {
+  color: color-mix(in srgb, var(--color-selection-text) 78%, transparent);
+}
+.work-pane-content[data-kind="file"] .file-workspace-header .diff-header-icon-button:hover,
+.work-pane-content[data-kind="review"] .diff-workspace:not(.diff-workspace--inline) > .diff-header .diff-header-icon-button:hover,
+.work-pane-content[data-kind="review"] .diff-workspace:not(.diff-workspace--inline) > .diff-header .diff-review-button:hover:not(:disabled),
+.work-pane-content[data-kind="review"] .diff-workspace:not(.diff-workspace--inline) > .diff-header .diff-layout-toggle button:hover,
+.work-pane-content[data-kind="review"] .diff-workspace:not(.diff-workspace--inline) > .diff-header .diff-layout-toggle button[aria-pressed="true"] {
+  color: var(--color-selection-text);
+  background: color-mix(in srgb, var(--color-selection-text) 14%, transparent);
 }
 
 /* Titlebar toggle: outline square + divider, right half fills when open. */
@@ -483,8 +452,7 @@ body[data-resizing="true"] .work-pane[data-kind="browser"] .work-pane-grip::befo
 
 @media (prefers-reduced-motion: reduce) {
   .work-pane-toggle-fill,
-  .work-pane-toggle-bead,
-  .work-pane-launcher-option {
+  .work-pane-toggle-bead {
     transition: none;
   }
   .work-pane-toggle[data-attention="true"] .work-pane-toggle-bead {

@@ -2488,20 +2488,24 @@ fn browser_tabs_are_remembered_per_task_and_die_with_it() {
                 StoredBrowserTab {
                     url: "https://example.com/docs".into(),
                     title: "Docs".into(),
+                    favicon: None,
                 },
                 // Nothing to reopen: a blank tab and an oversized address are
                 // dropped rather than stored.
                 StoredBrowserTab {
                     url: "about:blank".into(),
                     title: String::new(),
+                    favicon: None,
                 },
                 StoredBrowserTab {
                     url: format!("https://example.com/{}", "x".repeat(2100)),
                     title: "Too long".into(),
+                    favicon: None,
                 },
                 StoredBrowserTab {
                     url: "http://localhost:5173/".into(),
                     title: "Vite".into(),
+                    favicon: Some("data:image/png;base64,AAAA".into()),
                 },
             ],
         )
@@ -2514,10 +2518,12 @@ fn browser_tabs_are_remembered_per_task_and_die_with_it() {
             StoredBrowserTab {
                 url: "https://example.com/docs".into(),
                 title: "Docs".into(),
+                favicon: None,
             },
             StoredBrowserTab {
                 url: "http://localhost:5173/".into(),
                 title: "Vite".into(),
+                favicon: Some("data:image/png;base64,AAAA".into()),
             },
         ]
     );
@@ -2530,6 +2536,7 @@ fn browser_tabs_are_remembered_per_task_and_die_with_it() {
             &[StoredBrowserTab {
                 url: "https://example.com/other".into(),
                 title: "Other".into(),
+                favicon: None,
             }],
         )
         .expect("replace tabs");

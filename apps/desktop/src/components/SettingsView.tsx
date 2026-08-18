@@ -262,9 +262,12 @@ const settingsNav: Array<{ id: SettingsSection; label: string; hint: string; ico
  */
 const DEFAULT_SETTINGS: SettingsMap = {
   [BROWSER_SETTINGS.agentAccess]: true,
+  [BROWSER_SETTINGS.lockActiveTab]: false,
   [BROWSER_SETTINGS.keepSignedIn]: true,
   [BROWSER_SETTINGS.blockNewWindows]: true,
   [BROWSER_SETTINGS.externalOpen]: false,
+  [BROWSER_SETTINGS.identityScope]: "task",
+  [BROWSER_SETTINGS.searchEngine]: "google",
   "general.openLastWorkspace": true,
   "general.autoResumeInterruptedTurns": false,
   "general.confirmExternalActions": true,
@@ -322,6 +325,10 @@ const DEFAULT_SETTINGS: SettingsMap = {
   "delegation.instruction": "",
   "delegation.profiles": DEFAULT_SPECIALISTS,
 };
+
+function isInternalBrowserSetting(key: string): boolean {
+  return key === "browser.savedLogins" || key.startsWith("browser.agentSignIn.");
+}
 
 /**
  * Delegation policy for the native broker: which agents an orchestrator may
@@ -5182,7 +5189,9 @@ export function SettingsView(props: SettingsViewProps) {
           const key = setting.key.startsWith("settings.")
             ? setting.key.slice("settings.".length)
             : setting.key;
-          if (!key.startsWith("appearance.")) loaded[key] = setting.value;
+          if (!key.startsWith("appearance.") && !isInternalBrowserSetting(key)) {
+            loaded[key] = setting.value;
+          }
         }
         setSettings(loaded);
         setAppInfo(info);
@@ -5251,8 +5260,21 @@ export function SettingsView(props: SettingsViewProps) {
         typeof importedSettings === "object" &&
         !Array.isArray(importedSettings)
       ) {
+        let keptBrowserIdentityScope = false;
         for (const [key, value] of Object.entries(importedSettings as Record<string, unknown>)) {
-          setSetting(key.replace(/^settings\./, ""), value);
+          const normalized = key.replace(/^settings\./, "");
+          if (isInternalBrowserSetting(normalized)) continue;
+          if (normalized === BROWSER_SETTINGS.identityScope) {
+            keptBrowserIdentityScope = true;
+            continue;
+          }
+          setSetting(normalized, value);
+        }
+        if (keptBrowserIdentityScope) {
+          setActionMessage(
+            "Settings imported. Browser identity scope was kept so no cookie or login merge could be bypassed.",
+          );
+          return;
         }
       }
       if (!imported && !importedSettings)
@@ -5355,7 +5377,17 @@ export function SettingsView(props: SettingsViewProps) {
             <KeybindingsSettings settings={settings} setSetting={setSetting} />
           ) : null}
           {section === "browser" ? (
-            <BrowserSettings settings={settings} setSetting={setSetting} />
+            <BrowserSettings
+              settings={settings}
+              setSetting={setSetting}
+              onIdentityScopeChanged={(scope) => {
+                setSettings((current) => ({
+                  ...current,
+                  [BROWSER_SETTINGS.identityScope]: scope,
+                }));
+                props.onSettingChanged?.(BROWSER_SETTINGS.identityScope, scope);
+              }}
+            />
           ) : null}
           {section === "git" ? (
             <GitSettings settings={settings} setSetting={setSetting} runtimes={props.runtimes} />

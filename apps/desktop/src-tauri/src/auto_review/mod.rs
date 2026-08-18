@@ -53,7 +53,9 @@
 //! us through the `PreToolUse` hook we install ourselves — see
 //! `antigravity_hooks::write_hook_response`, which answers `{"decision",
 //! "reason"}` — so it, too, has somewhere for the verdict's sentence to land.
-//! Delegated is the only option on all of them.
+//! Print-mode agy still cannot raise an approval card, so `AskTheUser` becomes
+//! a deny on that runtime rather than a hang. Delegated is the only option on
+//! all of them.
 
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
 

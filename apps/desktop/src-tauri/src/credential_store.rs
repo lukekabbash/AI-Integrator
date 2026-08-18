@@ -1,11 +1,13 @@
 use std::{
-    fs::{self, OpenOptions},
+    collections::HashMap,
+    fs,
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 
 use directories::ProjectDirs;
 use serde::Serialize;
@@ -32,16 +34,26 @@ pub struct CredentialStoreError;
 
 pub type CredentialStoreResult<T> = std::result::Result<T, CredentialStoreError>;
 
-fn development_build() -> bool {
-    cfg!(debug_assertions) || matches!(option_env!("TAURI_ENV_DEBUG"), Some("true"))
-}
-
 pub fn storage() -> CredentialStorage {
-    if development_build() {
+    // Unit tests use a bounded local fixture. Every real app build, including
+    // `tauri dev`, uses the OS-owned credential store.
+    if cfg!(test) {
         CredentialStorage::ProtectedLocalFile
     } else {
         CredentialStorage::OsCredentialStore
     }
+}
+
+fn operation_lock(service: &str, account: &str) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let key = format!("{service}\0{account}");
+    LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 fn application_data_directory() -> CredentialStoreResult<PathBuf> {
@@ -118,8 +130,7 @@ fn read_development_at(
     #[cfg(unix)]
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     let content = Zeroizing::new(fs::read_to_string(path)?);
-    let value = content.trim();
-    Ok((!value.is_empty()).then(|| Zeroizing::new(value.to_owned())))
+    Ok((!content.is_empty()).then_some(content))
 }
 
 fn write_development_at(
@@ -131,25 +142,51 @@ fn write_development_at(
     let directory = development_directory_at(data_directory);
     ensure_private_directory(&directory)?;
     let path = development_path_at(data_directory, service, account);
-    let temporary = directory.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let result = (|| {
-        let mut file = options.open(&temporary)?;
-        file.write_all(value.as_bytes())?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temporary);
+    if let Ok(metadata) = fs::symlink_metadata(&path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "developer credential is not a regular file",
+        ));
     }
-    result
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".integrator-credential-")
+        .tempfile_in(&directory)?;
+    #[cfg(unix)]
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    temporary.write_all(value.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
 }
 
 fn delete_development_at(data_directory: &Path, service: &str, account: &str) -> io::Result<()> {
+    let directory = development_directory_at(data_directory);
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "developer credential path is not a directory",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
     let path = development_path_at(data_directory, service, account);
+    if let Ok(metadata) = fs::symlink_metadata(&path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "developer credential is not a regular file",
+        ));
+    }
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -270,7 +307,7 @@ fn read_os_credential(
             return match legacy.get_password() {
                 Ok(value) => {
                     let value = Zeroizing::new(value);
-                    Ok((!value.trim().is_empty()).then(|| Zeroizing::new(value.trim().to_owned())))
+                    Ok((!value.is_empty()).then_some(value))
                 }
                 Err(keyring::Error::NoEntry) => Ok(None),
                 Err(_) => Err(CredentialStoreError),
@@ -295,7 +332,7 @@ fn read_os_credential(
         return Err(CredentialStoreError);
     }
     let value = std::str::from_utf8(&bytes).map_err(|_| CredentialStoreError)?;
-    Ok((!value.trim().is_empty()).then(|| Zeroizing::new(value.trim().to_owned())))
+    Ok((!value.is_empty()).then(|| Zeroizing::new(value.to_owned())))
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -307,7 +344,7 @@ fn read_os_credential(
     match entry.get_password() {
         Ok(value) => {
             let value = Zeroizing::new(value);
-            Ok((!value.trim().is_empty()).then(|| Zeroizing::new(value.trim().to_owned())))
+            Ok((!value.is_empty()).then_some(value))
         }
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(_) => Err(CredentialStoreError),
@@ -375,17 +412,24 @@ fn delete_os_credential(service: &str, account: &str) -> CredentialStoreResult<(
         Err(keyring::Error::NoEntry) => None,
         Err(_) => return Err(CredentialStoreError),
     };
-    if let Some(manifest) = manifest {
-        delete_windows_generation(service, account, &manifest)?;
-    }
+    // Remove the manifest first. A partial chunk cleanup may leave an orphan,
+    // but never a live manifest that points at a half-deleted credential.
     match manifest_entry.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => {}
         Err(_) => return Err(CredentialStoreError),
     }
+    let mut cleanup_failed = manifest
+        .as_ref()
+        .is_some_and(|manifest| delete_windows_generation(service, account, manifest).is_err());
     let legacy = keyring::Entry::new(service, account).map_err(|_| CredentialStoreError)?;
     match legacy.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(_) => Err(CredentialStoreError),
+        Ok(()) | Err(keyring::Error::NoEntry) => {}
+        Err(_) => cleanup_failed = true,
+    }
+    if cleanup_failed {
+        Err(CredentialStoreError)
+    } else {
+        Ok(())
     }
 }
 
@@ -399,34 +443,81 @@ fn delete_os_credential(service: &str, account: &str) -> CredentialStoreResult<(
 }
 
 pub fn read(service: &str, account: &str) -> CredentialStoreResult<Option<Zeroizing<String>>> {
+    let lock = operation_lock(service, account);
+    let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
     match storage() {
         CredentialStorage::ProtectedLocalFile => {
             let data_directory = application_data_directory()?;
             read_development_at(&data_directory, service, account).map_err(|_| CredentialStoreError)
         }
-        CredentialStorage::OsCredentialStore => read_os_credential(service, account),
+        CredentialStorage::OsCredentialStore => {
+            if let Some(value) = read_os_credential(service, account)? {
+                return Ok(Some(value));
+            }
+            // Migrate the former debug-only file store lazily. The source is
+            // removed only after the OS store has accepted the exact value.
+            let data_directory = application_data_directory()?;
+            let Some(value) = read_development_at(&data_directory, service, account)
+                .map_err(|_| CredentialStoreError)?
+            else {
+                return Ok(None);
+            };
+            write_os_credential(service, account, &value)?;
+            if delete_development_at(&data_directory, service, account).is_err() {
+                let _ = delete_os_credential(service, account);
+                return Err(CredentialStoreError);
+            }
+            Ok(Some(value))
+        }
     }
 }
 
 pub fn write(service: &str, account: &str, value: &str) -> CredentialStoreResult<()> {
+    let lock = operation_lock(service, account);
+    let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
     match storage() {
         CredentialStorage::ProtectedLocalFile => {
             let data_directory = application_data_directory()?;
             write_development_at(&data_directory, service, account, value)
                 .map_err(|_| CredentialStoreError)
         }
-        CredentialStorage::OsCredentialStore => write_os_credential(service, account, value),
+        CredentialStorage::OsCredentialStore => {
+            let previous = read_os_credential(service, account)?;
+            write_os_credential(service, account, value)?;
+            let data_directory = application_data_directory()?;
+            if delete_development_at(&data_directory, service, account).is_err() {
+                let _ = match previous {
+                    Some(previous) => write_os_credential(service, account, &previous),
+                    None => delete_os_credential(service, account),
+                };
+                return Err(CredentialStoreError);
+            }
+            Ok(())
+        }
     }
 }
 
 pub fn delete(service: &str, account: &str) -> CredentialStoreResult<()> {
+    let lock = operation_lock(service, account);
+    let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
     match storage() {
         CredentialStorage::ProtectedLocalFile => {
             let data_directory = application_data_directory()?;
             delete_development_at(&data_directory, service, account)
                 .map_err(|_| CredentialStoreError)
         }
-        CredentialStorage::OsCredentialStore => delete_os_credential(service, account),
+        CredentialStorage::OsCredentialStore => {
+            let previous = read_os_credential(service, account)?;
+            delete_os_credential(service, account)?;
+            let data_directory = application_data_directory()?;
+            if delete_development_at(&data_directory, service, account).is_err() {
+                if let Some(previous) = previous {
+                    let _ = write_os_credential(service, account, &previous);
+                }
+                return Err(CredentialStoreError);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -448,15 +539,8 @@ mod tests {
     }
 
     #[test]
-    fn debug_builds_never_select_the_os_credential_store() {
-        assert_eq!(
-            storage(),
-            if development_build() {
-                CredentialStorage::ProtectedLocalFile
-            } else {
-                CredentialStorage::OsCredentialStore
-            }
-        );
+    fn tests_use_the_bounded_local_credential_fixture() {
+        assert_eq!(storage(), CredentialStorage::ProtectedLocalFile);
     }
 
     #[test]
@@ -509,6 +593,44 @@ mod tests {
                 .expect("read missing secret")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn development_credentials_preserve_surrounding_whitespace() {
+        let data_directory = tempfile::tempdir().expect("data directory");
+        write_development_at(data_directory.path(), "service", "account", "  secret\n")
+            .expect("write exact secret");
+
+        assert_eq!(
+            read_development_at(data_directory.path(), "service", "account")
+                .expect("read exact secret")
+                .as_deref()
+                .map(String::as_str),
+            Some("  secret\n")
+        );
+    }
+
+    #[test]
+    fn development_credential_replacement_is_atomic_and_refuses_non_files() {
+        let data_directory = tempfile::tempdir().expect("data directory");
+        write_development_at(data_directory.path(), "service", "account", "first")
+            .expect("write first secret");
+        write_development_at(data_directory.path(), "service", "account", "second")
+            .expect("replace secret");
+        assert_eq!(
+            read_development_at(data_directory.path(), "service", "account")
+                .expect("read replacement")
+                .as_deref()
+                .map(String::as_str),
+            Some("second")
+        );
+
+        let blocked = development_path_at(data_directory.path(), "service", "blocked");
+        fs::create_dir(&blocked).expect("non-file sentinel");
+        assert!(
+            write_development_at(data_directory.path(), "service", "blocked", "secret").is_err()
+        );
+        assert!(blocked.is_dir());
     }
 
     #[cfg(target_os = "windows")]
