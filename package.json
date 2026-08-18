@@ -1,6 +1,6 @@
 {
   "name": "ai-integrator",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "private": true,
   "description": "Local-first native control plane for coding agents",
   "packageManager": "npm@10.9.2",
