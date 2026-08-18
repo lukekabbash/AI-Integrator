@@ -184,7 +184,7 @@ pub(super) fn hide_window_if_empty(app: &AppHandle, tabs: &BrowserTabs, task_id:
 
 /// Moves one live child webview without navigating or rebuilding it. If
 /// parking fails after reparenting, it is returned to its original host.
-fn move_tab(
+pub(super) fn move_tab(
     app: &AppHandle,
     state: &Arc<BrowserTabs>,
     id: &str,

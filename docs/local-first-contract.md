@@ -131,7 +131,9 @@ v1 includes:
 - export a sanitized task package containing contract, messages/results, decisions, evidence references, patches/commits, usage provenance, and optional observable transcript ranges;
 - exclude secrets and secure terminal input from every export;
 - migration preview and rollback for storage-schema upgrades;
-- per-task, per-project, per-browser-identity, transcript, diagnostics, cache, and all-data deletion;
+- per-task, per-project, per-browser-identity (one identity per project group, plus Chat and
+  Shared; older per-task jars remain clearable), transcript, diagnostics, cache, and all-data
+  deletion;
 - uninstall choice: keep local data or delete it, with repository-associated files listed separately;
 - redacted diagnostics bundle the user explicitly creates and controls.
 

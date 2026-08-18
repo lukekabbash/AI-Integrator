@@ -182,6 +182,7 @@ fn registry(rows: &[(&str, &str, Option<&str>)]) -> BrowserTabs {
                     label: format!("browser-{id}"),
                     placement_slot: Some(PlacementSlot::Pane),
                     held: None,
+                    held_task: None,
                     user_at: None,
                     grants: HashMap::new(),
                     generation: 0,
@@ -289,6 +290,7 @@ fn caller(task: &str, delegation: Option<&str>) -> Caller {
     Caller {
         task_id: task.to_string(),
         delegation_id: delegation.map(str::to_owned),
+        group_id: test_group(task).id,
     }
 }
 
@@ -640,8 +642,10 @@ fn the_cap_sleeps_the_oldest_tab_nothing_is_looking_at() {
         ("tab-3", "task-a", None),
         ("tab-4", "task-b", None),
     ]);
+    let group_a = test_group("task-a").id;
+    let group_b = test_group("task-b").id;
     // Everything starts on screen, and what is on screen is never a candidate.
-    assert!(tabs.sleepable("task-a", "tab-1").is_empty());
+    assert!(tabs.sleepable(Some(&group_a), "tab-1").is_empty());
 
     for id in ["tab-1", "tab-2", "tab-3"] {
         tabs.update(id, |tab| tab.hidden = true);
@@ -649,12 +653,20 @@ fn the_cap_sleeps_the_oldest_tab_nothing_is_looking_at() {
     // Touch order decides, and the tab that just opened is spared.
     tabs.touch("tab-3");
     tabs.touch("tab-2");
-    assert_eq!(tabs.sleepable("task-a", "tab-2"), ["tab-1", "tab-3"]);
-    // Never another task's tabs, whatever their age.
-    assert_eq!(tabs.sleepable("task-b", "none"), Vec::<String>::new());
+    assert_eq!(tabs.sleepable(Some(&group_a), "tab-2"), ["tab-1", "tab-3"]);
+    // Never another group's tabs, whatever their age.
+    assert_eq!(tabs.sleepable(Some(&group_b), "none"), Vec::<String>::new());
 
+    // A parked popped-out tab is as invisible as a parked pane tab: still a
+    // candidate. A tab someone drove inside the hold window is not.
     tabs.update("tab-1", |tab| tab.popped_out = true);
-    assert_eq!(tabs.sleepable("task-a", "tab-2"), ["tab-3"]);
+    assert_eq!(tabs.sleepable(Some(&group_a), "tab-2"), ["tab-1", "tab-3"]);
+    tabs.mark_held("tab-1", "the main agent");
+    assert_eq!(tabs.sleepable(Some(&group_a), "tab-2"), ["tab-3"]);
+    // Across every group, for the total cap.
+    assert_eq!(tabs.sleepable(None, "tab-2"), ["tab-3"]);
+    assert_eq!(tabs.live_count(Some(&group_a)), 3);
+    assert_eq!(tabs.live_count(None), 4);
 }
 
 #[test]
@@ -871,4 +883,241 @@ fn tabs_are_labelled_out_of_the_capability_scope() {
     let label = "browser-tab-1";
     assert!(!label.starts_with("main"));
     assert!(!label.starts_with("task-"));
+}
+
+// ---- stage B: group-shared reach
+
+/// The fixture's chat tasks all share the one Chat group; path tasks are each
+/// their own group. Popping a tab out is what shares it.
+fn shared_registry() -> BrowserTabs {
+    let tabs = registry(&[
+        ("tab-mine", "chat-1", None),
+        ("tab-mine-popped", "chat-1", None),
+        ("tab-sibling-pane", "chat-2", None),
+        ("tab-sibling-popped", "chat-2", None),
+        ("tab-elsewhere-popped", "task-a", None),
+    ]);
+    for id in [
+        "tab-mine-popped",
+        "tab-sibling-popped",
+        "tab-elsewhere-popped",
+    ] {
+        tabs.update(id, |tab| tab.popped_out = true);
+    }
+    tabs
+}
+
+#[test]
+fn the_access_matrix_holds_for_every_row() {
+    // 01-vocabulary-and-model.md: (group, task, popped_out) → reach.
+    let tabs = shared_registry();
+    let me = caller("chat-1", None);
+    let rows: [(&str, Option<GrantMode>); 5] = [
+        // ≠ G, any, any → invisible.
+        ("tab-elsewhere-popped", None),
+        // = G, = T, any → yes.
+        ("tab-mine", Some(GrantMode::Drive)),
+        ("tab-mine-popped", Some(GrantMode::Drive)),
+        // = G, ≠ T, pane → invisible.
+        ("tab-sibling-pane", None),
+        // = G, ≠ T, popped out → Drive.
+        ("tab-sibling-popped", Some(GrantMode::Drive)),
+    ];
+    for (id, expected) in rows {
+        assert_eq!(tabs.reach(id, &me), expected, "{id}");
+    }
+    let seen: Vec<String> = tabs
+        .visible_to(&me, false)
+        .into_iter()
+        .map(|tab| tab.id)
+        .collect();
+    assert_eq!(seen, ["tab-mine", "tab-mine-popped", "tab-sibling-popped"]);
+}
+
+#[test]
+fn a_shared_tab_is_driven_but_never_owned() {
+    // Close, grant and dock go through `owns`, which still wants the task.
+    let tabs = shared_registry();
+    let me = caller("chat-1", None);
+    assert_eq!(
+        tabs.reach("tab-sibling-popped", &me),
+        Some(GrantMode::Drive)
+    );
+    assert!(!tabs.owns("tab-sibling-popped", &me));
+    assert!(tabs.owns("tab-mine-popped", &me));
+    // Docking the sibling's tab would make it invisible again: sharing is the
+    // owner's choice both ways.
+    tabs.update("tab-sibling-popped", |tab| tab.popped_out = false);
+    assert_eq!(tabs.reach("tab-sibling-popped", &me), None);
+}
+
+#[test]
+fn a_child_inherits_its_parents_group_and_reaches_a_popped_out_sibling_task_tab() {
+    let tabs = shared_registry();
+    let child = caller("chat-1", Some("child-1"));
+    assert_eq!(
+        tabs.reach("tab-sibling-popped", &child),
+        Some(GrantMode::Drive)
+    );
+    assert_eq!(tabs.reach("tab-sibling-pane", &child), None);
+    assert!(!tabs.owns("tab-sibling-popped", &child));
+    let seen: Vec<String> = tabs
+        .visible_to(&child, false)
+        .into_iter()
+        .map(|tab| tab.id)
+        .collect();
+    assert_eq!(seen, ["tab-sibling-popped"]);
+}
+
+#[test]
+fn the_cap_is_shared_by_every_task_in_a_group() {
+    let tabs = registry(&[
+        ("tab-1", "chat-1", None),
+        ("tab-2", "chat-2", None),
+        ("tab-3", "chat-2", None),
+        ("tab-4", "task-a", None),
+    ]);
+    for id in ["tab-1", "tab-2", "tab-3", "tab-4"] {
+        tabs.update(id, |tab| tab.hidden = true);
+    }
+    tabs.touch("tab-2");
+    tabs.touch("tab-1");
+    // Two chats, one group, one cap: candidates come from both tasks.
+    assert_eq!(
+        tabs.sleepable(Some(groups::CHAT_GROUP_ID), "tab-1"),
+        ["tab-3", "tab-2"]
+    );
+    assert_eq!(tabs.live_count(Some(groups::CHAT_GROUP_ID)), 3);
+    // A parked popped-out tab is a candidate like any other.
+    tabs.update("tab-3", |tab| tab.popped_out = true);
+    assert_eq!(
+        tabs.sleepable(Some(groups::CHAT_GROUP_ID), "tab-1"),
+        ["tab-3", "tab-2"]
+    );
+    // The total cap looks across groups, oldest first.
+    tabs.touch("tab-4");
+    assert_eq!(
+        tabs.sleepable(None, "none"),
+        ["tab-3", "tab-2", "tab-1", "tab-4"]
+    );
+    assert_eq!(remember::LIVE_TAB_CAP_PER_GROUP, 8);
+    assert_eq!(remember::LIVE_TAB_CAP_TOTAL, 24);
+}
+
+#[test]
+fn waking_and_opening_both_enforce_the_group_cap() {
+    // Both entry points hand the woken/new tab's group to the cap.
+    let remember = include_str!("remember.rs");
+    let wake = source_between(remember, "pub async fn wake(", "impl BrowserTabs {");
+    assert!(wake.contains("enforce_cap(app, tabs, &tab.group_id, tab_id)"));
+    let module = include_str!("mod.rs");
+    assert!(module.contains("remember::enforce_cap(app, state, &tab.group_id, &tab.id)"));
+    // The cap is per group and then total, in that order.
+    let cap = source_between(remember, "pub(super) fn enforce_cap(", "/// Loads a tab");
+    assert!(cap.contains("(Some(group_id), LIVE_TAB_CAP_PER_GROUP)"));
+    assert!(cap.contains("(None, LIVE_TAB_CAP_TOTAL)"));
+}
+
+#[test]
+fn a_hold_names_the_holder_and_its_task() {
+    let tabs = shared_registry();
+    let sibling = caller("chat-2", None);
+    tabs.mark_held_by("tab-sibling-popped", &sibling);
+    assert_eq!(
+        tabs.holder("tab-sibling-popped", false),
+        Some(("the main agent".to_string(), Some("chat-2".to_string())))
+    );
+    // A person's hold has no task.
+    tabs.mark_user_active("tab-mine", 0);
+    assert_eq!(
+        tabs.holder("tab-mine", true),
+        Some((USER_HOLDER.to_string(), None))
+    );
+    // Standing off names the task when it is known, and how long to wait.
+    let text = agent::stood_off("the main agent", Some("Fix login"));
+    assert!(
+        text.starts_with("the main agent of task \"Fix login\" is working in that tab right now")
+    );
+    assert!(text.contains(
+        "open your own with browser_open, or wait; holds expire 45 s after the last action"
+    ));
+    let untitled = agent::stood_off("subagent child-1", None);
+    assert!(untitled.starts_with("subagent child-1 is working in that tab right now"));
+    let person = agent::stood_off(USER_HOLDER, Some("Fix login"));
+    assert!(person.starts_with("the person is working in that tab right now"));
+    assert!(!person.contains("Fix login"));
+}
+
+#[test]
+fn agent_tools_open_popped_out_and_move_tabs_only_for_the_owner() {
+    let agent = include_str!("agent.rs");
+    let open = source_between(
+        agent,
+        "pub async fn open_for_agent(",
+        "pub async fn set_popped_out_for_agent(",
+    );
+    assert!(open.contains("popped_out: bool"));
+    assert!(open.contains("super::popout::move_tab(app, tabs, &tab.id, true, false)"));
+    let moved = source_between(
+        agent,
+        "pub async fn set_popped_out_for_agent(",
+        "/// Points one reachable tab",
+    );
+    assert!(moved.contains("if !tabs.owns(tab_id, caller)"));
+    assert!(moved.contains("super::popout::move_tab(app, tabs, tab_id, popped_out, false)"));
+    let focus = source_between(
+        agent,
+        "pub async fn focus_for_agent(",
+        "async fn bring_on_screen(",
+    );
+    assert!(focus.contains("tab.popped_out"));
+    assert!(focus.contains("raise_host_window(app, &label).await"));
+    let close = source_between(
+        agent,
+        "pub async fn close_for_agent(",
+        "pub fn grant_for_agent(",
+    );
+    assert!(close.contains("dock or close it from there"));
+}
+
+#[test]
+fn a_browser_list_row_names_its_group_holder_and_sharer() {
+    let tabs = shared_registry();
+    let sibling = caller("chat-2", None);
+    tabs.mark_held_by("tab-sibling-popped", &sibling);
+    let me = caller("chat-1", None);
+    let title_of = |task: &str| (task == "chat-2").then(|| "Book flights".to_string());
+
+    let held = tabs
+        .snapshot_held(None, false)
+        .into_iter()
+        .find(|tab| tab.id == "tab-sibling-popped")
+        .unwrap();
+    let row = agent::decorate_row(&held, &me, Some("chat-2"), title_of);
+    assert_eq!(row["id"], "tab-sibling-popped");
+    assert_eq!(row["taskId"], "chat-2");
+    assert_eq!(
+        row["group"],
+        serde_json::json!({ "id": groups::CHAT_GROUP_ID, "name": groups::CHAT_GROUP_NAME, "kind": "chat" })
+    );
+    assert!(row.get("groupId").is_none() && row.get("groupName").is_none());
+    assert_eq!(row["poppedOut"], true);
+    assert_eq!(row["sleeping"], false);
+    assert_eq!(
+        row["heldBy"],
+        serde_json::json!({ "label": "the main agent", "taskId": "chat-2", "taskTitle": "Book flights" })
+    );
+    assert_eq!(row["heldByLabel"], "the main agent");
+    assert_eq!(
+        row["sharedFrom"],
+        serde_json::json!({ "taskId": "chat-2", "taskTitle": "Book flights" })
+    );
+
+    // One of my own, idle: no holder, no sharer, and the title lookup is
+    // never asked about a task the row does not name.
+    let mine = tabs.tab("tab-mine").unwrap();
+    let row = agent::decorate_row(&mine, &me, None, |_| panic!("no task to name"));
+    assert!(row.get("heldBy").is_none() && row.get("heldByLabel").is_none());
+    assert!(row.get("sharedFrom").is_none());
+    assert_eq!(row["group"]["kind"], "chat");
 }

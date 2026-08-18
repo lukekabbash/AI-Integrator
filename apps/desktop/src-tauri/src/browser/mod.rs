@@ -34,6 +34,7 @@ mod capture;
 mod favicon;
 pub mod groups;
 mod identity;
+mod identity_migration;
 mod menu;
 mod popout;
 mod registry;
@@ -45,6 +46,7 @@ mod vault;
 pub use groups::Group;
 pub use identity::BrowserIdentityScope;
 pub(crate) use identity::{configured_scope, prepare_profile_layout, prune_ephemeral_profiles};
+pub(crate) use identity_migration::migrate_task_buckets_to_groups;
 pub use menu::browser_tab_menu;
 pub use popout::{browser_popout_tabs, browser_tab_set_popped_out};
 pub use registry::{BrowserTab, BrowserTabs, Caller, GrantMode};
@@ -399,7 +401,7 @@ fn profile_directory<R: Runtime>(
 ) -> Option<std::path::PathBuf> {
     let state = app.try_state::<crate::state::AppState>()?;
     let scope = tabs.identity_scope();
-    let bucket = identity::bucket_for_task(&state.store, scope, task_id);
+    let bucket = identity::bucket_for_task(app, tabs, scope, task_id);
     identity::profile_directory(
         &state.data_directory,
         scope,
@@ -569,6 +571,7 @@ pub(super) async fn create_tab(
                 label,
                 placement_slot: None,
                 held: None,
+                held_task: None,
                 user_at: None,
                 grants: HashMap::new(),
                 generation: 0,
@@ -578,9 +581,9 @@ pub(super) async fn create_tab(
             },
         );
     }
-    // One more tab may be one too many: put the task back under its live cap
+    // One more tab may be one too many: put the group back under its live cap
     // before telling anyone the new tab exists.
-    remember::enforce_cap(app, state, &tab.task_id, &tab.id);
+    remember::enforce_cap(app, state, &tab.group_id, &tab.id);
     emit_changed(app, state);
     remember::remember(app, state, &tab.task_id);
     Ok(tab)
@@ -1142,7 +1145,8 @@ pub async fn browser_tab_poster(
 
 pub use agent::{
     agent_invoke, browser_capture_image, close_for_agent, cookies_for_agent, focus_for_agent,
-    grant_for_agent, navigate_for_agent, open_for_agent, screenshot_for_agent, tabs_for_caller,
+    grant_for_agent, navigate_for_agent, open_for_agent, row_for_agent, screenshot_for_agent,
+    set_popped_out_for_agent, tabs_for_caller,
 };
 pub use vault::{
     browser_allow_agent_sign_in, browser_fill_login, browser_forget_all_logins,

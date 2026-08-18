@@ -223,8 +223,7 @@ export function BrowserSurface({
   const popped = tab.poppedOut;
   const hostedHere = popped === poppedOutHost;
   const blank = !tab.url || tab.url === "about:blank";
-  const canUseNativeMenu =
-    !blank && hostedHere && typeof bridge.browser?.showMenu === "function";
+  const canUseNativeMenu = !blank && hostedHere && typeof bridge.browser?.showMenu === "function";
 
   // The overflow menu's entries, in one place, so the HTML menu and the OS
   // menu offer the same things in the same order.
@@ -387,12 +386,7 @@ export function BrowserSurface({
         onBounds(null);
         return;
       }
-      const placed = new DOMRect(
-        rect.x,
-        rect.y,
-        Math.max(1, rect.width),
-        Math.max(1, rect.height),
-      );
+      const placed = new DOMRect(rect.x, rect.y, Math.max(1, rect.width), Math.max(1, rect.height));
       const ratio = window.devicePixelRatio || 1;
       const key = [placed.left, placed.top, placed.right, placed.bottom]
         .map((edge) => Math.round(edge * ratio))
@@ -554,8 +548,14 @@ export function BrowserSurface({
               <Circle aria-hidden="true" />
             </button>
           </Tooltip>
+          {/* Popping out is a sharing action: every task in the group can drive
+              a popped-out tab. The label says so once, in the same breath. */}
           <Tooltip
-            label={popped ? "Dock back into the pane" : "Pop out into its own window"}
+            label={
+              popped
+                ? "Dock back into the pane — private to this chat again"
+                : `Pop out into its own window — shared with ${tab.groupName}`
+            }
             placement="bottom"
             renderBubble={blank}
             onOpenChange={reportToolbarTooltip}

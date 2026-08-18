@@ -1450,7 +1450,11 @@ export type BrowserIdentityScope = "task" | "shared";
 export interface BrowserIdentityBucket {
   id: string;
   label: string;
-  kind: "task" | "chat" | "shared" | "orphan";
+  /** Group name: project display name, folder name, `Chat`, `Shared`; a legacy jar's task title. */
+  name: string;
+  kind: "project" | "path" | "chat" | "shared" | "task" | "orphan";
+  /** A per-task jar new tabs no longer use, or a leftover; shown collapsed. */
+  legacy: boolean;
   taskId?: string;
   archived: boolean;
   updatedAt: string;

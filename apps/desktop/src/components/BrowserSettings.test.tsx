@@ -29,10 +29,11 @@ const overview: BrowserIdentityOverview = {
   restartRequired: false,
   buckets: [
     {
-      id: "task:task-1",
+      id: "project:019cbe6a-5fd4-7ca1-9dd4-b51fe78b50b5",
       label: "Build API",
-      kind: "task",
-      taskId: "task-1",
+      name: "Build API",
+      kind: "project",
+      legacy: false,
       archived: false,
       updatedAt: "2026-08-17T12:00:00Z",
       profilePresent: true,
@@ -41,8 +42,10 @@ const overview: BrowserIdentityOverview = {
     },
     {
       id: "chat-main",
-      label: "Chat/Main Browser",
+      label: "Chat",
+      name: "Chat",
       kind: "chat",
+      legacy: false,
       archived: false,
       updatedAt: "2026-08-17T11:00:00Z",
       profilePresent: false,
@@ -51,16 +54,32 @@ const overview: BrowserIdentityOverview = {
     },
     {
       id: "shared",
-      label: "Shared Browser",
+      label: "Shared",
+      name: "Shared",
       kind: "shared",
+      legacy: false,
       archived: false,
       updatedAt: "",
       profilePresent: false,
       savedLogins: 0,
       active: false,
     },
+    {
+      id: "task:task-1",
+      label: "Old task",
+      name: "Old task",
+      kind: "task",
+      legacy: true,
+      taskId: "task-1",
+      archived: true,
+      updatedAt: "2026-08-10T12:00:00Z",
+      profilePresent: true,
+      savedLogins: 0,
+      active: false,
+    },
   ],
 };
+const PROJECT_BUCKET = "project:019cbe6a-5fd4-7ca1-9dd4-b51fe78b50b5";
 
 afterEach(() => {
   window.localStorage.clear();
@@ -72,7 +91,7 @@ beforeEach(() => {
   browserMock.identityOverview.mockResolvedValue(overview);
   browserMock.savedLogins.mockResolvedValue([
     {
-      bucketId: "task:task-1",
+      bucketId: PROJECT_BUCKET,
       origin: "https://example.com",
       username: "ana",
       savedAt: "2026-08-17T10:00:00Z",
@@ -115,7 +134,9 @@ describe("BrowserSettings", () => {
     });
 
     expect(toggle).toHaveAttribute("aria-checked", "false");
-    expect(screen.getByText(/lets them keep working in that same tab alongside you/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/lets them keep working in that same tab alongside you/),
+    ).toBeInTheDocument();
     fireEvent.click(toggle);
     expect(setSetting).toHaveBeenCalledWith(BROWSER_SETTINGS.lockActiveTab, true);
 
@@ -136,7 +157,9 @@ describe("BrowserSettings", () => {
     });
 
     expect(toggle).toHaveAttribute("aria-checked", "false");
-    expect(screen.getByText(/Off keeps every browser handoff inside Integrator/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Off keeps every browser handoff inside Integrator/),
+    ).toBeInTheDocument();
     expect(
       screen.getByText(/tells agents to use only Integrator browser tools/),
     ).toBeInTheDocument();
@@ -152,18 +175,56 @@ describe("BrowserSettings", () => {
     expect(toggle).toHaveAttribute("aria-checked", "true");
   });
 
-  it("groups metadata by task, then Chat/Main Browser, and loads cookies lazily", async () => {
+  it("lists project groups by name, then Chat, and loads cookies lazily", async () => {
     render(<BrowserSettings settings={{}} setSetting={vi.fn()} />);
 
-    const task = await screen.findByRole("button", { name: /Build API/ });
-    const chat = screen.getByRole("button", { name: /Chat\/Main Browser/ });
-    expect(task.compareDocumentPosition(chat) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const project = await screen.findByRole("button", { name: /Build API/ });
+    const chat = screen.getByRole("button", { name: /^Chat/ });
+    expect(project.compareDocumentPosition(chat) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByText(/Project · every task in it/)).toBeInTheDocument();
     expect(browserMock.bucketSites).not.toHaveBeenCalled();
 
-    fireEvent.click(task);
-    await waitFor(() => expect(browserMock.bucketSites).toHaveBeenCalledWith("task:task-1"));
+    fireEvent.click(project);
+    await waitFor(() => expect(browserMock.bucketSites).toHaveBeenCalledWith(PROJECT_BUCKET));
     expect(await screen.findByText("example.com")).toBeInTheDocument();
     expect(screen.getByText("ana · never used")).toBeInTheDocument();
+  });
+
+  it("describes the per-project scope and folds older per-task identities away", async () => {
+    render(<BrowserSettings settings={{}} setSetting={vi.fn()} />);
+    expect(screen.getByRole("radio", { name: /Per project \(recommended\)/ })).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /every task in a project shares one signed-in identity; standalone chats share the Chat identity/i,
+      ),
+    ).toBeInTheDocument();
+
+    const older = await screen.findByRole("button", { name: /Older per-task identities \(1\)/ });
+    expect(older).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("Old task")).not.toBeInTheDocument();
+
+    fireEvent.click(older);
+    expect(screen.getByText("Old task")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Clear Old task" }));
+    await waitFor(() => expect(browserMock.clearBucket).toHaveBeenCalledWith("task:task-1"));
+    expect(browserMock.forgetBucketLogins).not.toHaveBeenCalled();
+    expect(await screen.findByText(/Old task cleared/)).toBeInTheDocument();
+  });
+
+  it("shows the per-group notice once and records its dismissal", () => {
+    const setSetting = vi.fn();
+    const view = render(<BrowserSettings settings={{}} setSetting={setSetting} />);
+    expect(screen.getByText(/Browser identities are now per project/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Got it" }));
+    expect(setSetting).toHaveBeenCalledWith(BROWSER_SETTINGS.identityPerGroupNoticeSeen, true);
+
+    view.rerender(
+      <BrowserSettings
+        settings={{ [BROWSER_SETTINGS.identityPerGroupNoticeSeen]: true }}
+        setSetting={setSetting}
+      />,
+    );
+    expect(screen.queryByText(/Browser identities are now per project/)).not.toBeInTheDocument();
   });
 
   it("cancels the Shared merge without changing anything", async () => {
@@ -174,7 +235,7 @@ describe("BrowserSettings", () => {
     const dialog = await screen.findByRole("dialog", {
       name: "Switch to one Shared browser identity?",
     });
-    expect(within(dialog).getByText(/most recently active task wins/i)).toBeInTheDocument();
+    expect(within(dialog).getByText(/most recently active identity wins/i)).toBeInTheDocument();
     expect(within(dialog).getByText(/sign-in errors/i)).toBeInTheDocument();
     expect(within(dialog).getByRole("button", { name: "Cancel" })).toHaveFocus();
 

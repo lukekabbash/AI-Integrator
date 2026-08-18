@@ -7,7 +7,7 @@
   "exceptions": [
     {
       "path": "apps/desktop/src/styles.css",
-      "maxLines": 17201
+      "maxLines": 17221
     },
     {
       "path": "apps/desktop/src-tauri/src/commands.rs",
@@ -19,7 +19,7 @@
     },
     {
       "path": "apps/desktop/src/bridge.ts",
-      "maxLines": 7682
+      "maxLines": 7686
     },
     {
       "path": "apps/desktop/src/components/SettingsView.tsx",
@@ -27,7 +27,7 @@
     },
     {
       "path": "apps/desktop/src-tauri/src/delegation.rs",
-      "maxLines": 4919
+      "maxLines": 4964
     },
     {
       "path": "apps/desktop/src/bridge.test.ts",
@@ -123,11 +123,11 @@
     },
     {
       "path": "apps/desktop/src-tauri/src/browser/mod.rs",
-      "maxLines": 1154
+      "maxLines": 1158
     },
     {
       "path": "apps/desktop/src-tauri/src/browser/vault.rs",
-      "maxLines": 1148
+      "maxLines": 1158
     },
     {
       "path": "apps/desktop/src-tauri/src/antigravity_hooks.rs",
@@ -147,7 +147,7 @@
     },
     {
       "path": "apps/desktop/src-tauri/src/browser/sites.rs",
-      "maxLines": 1042
+      "maxLines": 1163
     },
     {
       "path": "apps/desktop/src-tauri/src/dev_server/mod.rs",

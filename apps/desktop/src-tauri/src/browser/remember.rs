@@ -90,12 +90,16 @@ pub fn restore(app: &AppHandle, tabs: &Arc<BrowserTabs>, task_id: &str) -> usize
     added
 }
 
-/// How many tabs one task keeps loaded at once. Each live tab is a WebView2
+/// How many tabs one group keeps loaded at once. Each live tab is a WebView2
 /// process holding a full-size page, so a run that opens twenty of them would
 /// cost more than the machine can spare. Past the cap the least-recently
 /// touched one goes back to sleep, keeping its place in the strip and its
-/// address; addressing it wakes it again.
-const LIVE_TAB_CAP: usize = 6;
+/// address; addressing it wakes it again. The cap is per group rather than per
+/// task so a project with many tasks does not multiply webviews.
+pub(crate) const LIVE_TAB_CAP_PER_GROUP: usize = 8;
+
+/// How many tabs the whole app keeps loaded, across every group.
+pub(crate) const LIVE_TAB_CAP_TOTAL: usize = 24;
 
 /// Puts a loaded tab back to sleep: the webview goes, the row stays.
 pub(super) fn sleep(app: &AppHandle, tabs: &Arc<BrowserTabs>, tab_id: &str) {
@@ -112,26 +116,27 @@ pub(super) fn sleep(app: &AppHandle, tabs: &Arc<BrowserTabs>, tab_id: &str) {
     });
 }
 
-/// Sleeps this task's oldest loaded tabs until it is back under the cap.
+/// Sleeps this group's oldest loaded tabs until it is back under its cap, then
+/// the oldest anywhere until the app is under the total.
 ///
-/// Only tabs nothing is looking at are candidates: whatever is on screen, in a
-/// pop-out window, or is the tab that just opened stays loaded however old it
-/// is — a cap that closed the page the user was reading would be worse than no
-/// cap at all.
-pub(super) fn enforce_cap(app: &AppHandle, tabs: &Arc<BrowserTabs>, task_id: &str, keep: &str) {
-    let live = tabs
-        .snapshot(Some(task_id))
-        .into_iter()
-        .filter(|tab| !tab.sleeping)
-        .count();
-    let over = live.saturating_sub(LIVE_TAB_CAP);
-    if over == 0 {
-        return;
-    }
+/// Only tabs nothing is looking at are candidates: whatever is on screen, was
+/// driven inside the hold window, or is the tab that just opened stays loaded
+/// however old it is — a cap that closed the page the user was reading would
+/// be worse than no cap at all. A parked popped-out tab is fair game.
+pub(super) fn enforce_cap(app: &AppHandle, tabs: &Arc<BrowserTabs>, group_id: &str, keep: &str) {
     let mut slept = 0;
-    for id in tabs.sleepable(task_id, keep).into_iter().take(over) {
-        sleep(app, tabs, &id);
-        slept += 1;
+    for (scope, cap) in [
+        (Some(group_id), LIVE_TAB_CAP_PER_GROUP),
+        (None, LIVE_TAB_CAP_TOTAL),
+    ] {
+        let over = tabs.live_count(scope).saturating_sub(cap);
+        if over == 0 {
+            continue;
+        }
+        for id in tabs.sleepable(scope, keep).into_iter().take(over) {
+            sleep(app, tabs, &id);
+            slept += 1;
+        }
     }
     if slept > 0 {
         emit_changed(app, tabs);
@@ -164,7 +169,11 @@ pub async fn wake(
             .ok_or_else(|| unavailable("that browser tab is no longer open"));
     };
     let target = Url::parse(&sleeping.url).map_err(|_| unavailable("that tab has no address"))?;
-    adopt_sleeping(app, tabs, tab_id, &target).await
+    let tab = adopt_sleeping(app, tabs, tab_id, &target).await?;
+    // One more live tab may be one too many: the woken tab is spared, an older
+    // parked one goes back to sleep in its place.
+    enforce_cap(app, tabs, &tab.group_id, tab_id);
+    Ok(tab)
 }
 
 impl BrowserTabs {
@@ -210,6 +219,7 @@ impl BrowserTabs {
                 label,
                 placement_slot: None,
                 held: None,
+                held_task: None,
                 user_at: None,
                 grants: HashMap::new(),
                 generation: 0,

@@ -28,8 +28,14 @@ use super::{BrowserTabs, KEEP_SIGNED_IN_SETTING, setting_enabled, unavailable, w
 pub struct BrowserIdentityBucket {
     pub id: String,
     pub label: String,
-    /// `task` | `chat` | `shared` | `orphan`.
+    /// The group's name: a project's display name, a folder's last component,
+    /// `Chat`, `Shared`; for a legacy per-task jar, the task's title.
+    pub name: String,
+    /// `project` | `path` | `chat` | `shared` | `task` | `orphan`.
     pub kind: String,
+    /// True for the per-task jars new tabs no longer use (`task:*`) and for
+    /// login-only leftovers. Settings folds them into one collapsed list.
+    pub legacy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     pub archived: bool,
@@ -211,11 +217,32 @@ fn scope_for_bucket(bucket_id: &str) -> super::BrowserIdentityScope {
     }
 }
 
+/// One row of the catalog before the disk and login counts are attached.
+struct CatalogSeed {
+    id: String,
+    name: String,
+    kind: &'static str,
+    legacy: bool,
+    task_id: Option<String>,
+    archived: bool,
+    updated_at: String,
+    recency: i64,
+    active: bool,
+}
+
+/// What Settings lists: `chat-main`, `shared`, every project/path group with
+/// a live or remembered tab, then every jar on disk and every jar a saved
+/// login still points at — so legacy per-task jars stay visible and clearable
+/// long after the tabs that used them are gone.
 fn bucket_catalog(app: &AppHandle, tabs: &BrowserTabs) -> Vec<BrowserIdentityBucket> {
+    use super::groups::{self, GroupKind};
+    use super::identity::{CHAT_BUCKET_ID, SHARED_BUCKET_ID, legacy_task_bucket_id};
+
     let Some(state) = app.try_state::<crate::state::AppState>() else {
         return Vec::new();
     };
     let active_scope = tabs.identity_scope();
+    let grouped_active = active_scope == super::BrowserIdentityScope::Task;
     let persistent = setting_enabled(app, KEEP_SIGNED_IN_SETTING);
     let logins = super::vault::all(app);
     let mut login_counts = HashMap::<String, usize>::new();
@@ -223,132 +250,222 @@ fn bucket_catalog(app: &AppHandle, tabs: &BrowserTabs) -> Vec<BrowserIdentityBuc
         *login_counts.entry(login.bucket_id.clone()).or_default() += 1;
     }
 
-    let mut buckets = Vec::new();
-    let mut known = HashSet::new();
+    // Names, kinds and recency per group id, from the store: projects by
+    // their root, every task by its path.
+    let projects: HashMap<String, integrator_core::TrustedProject> = state
+        .store
+        .list_trusted_projects()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|project| {
+            (
+                project.repository_root.to_string_lossy().into_owned(),
+                project,
+            )
+        })
+        .collect();
+    let mut group_names = HashMap::<String, (String, &'static str)>::new();
+    for project in projects.values() {
+        group_names.insert(
+            groups::project_group_id(project.id),
+            (project.display_name.clone(), "project"),
+        );
+    }
+    let mut group_recency = HashMap::<String, (String, i64)>::new();
+    let mut task_titles = HashMap::<String, (String, bool, String, i64)>::new();
     let mut chat_updated_at = String::new();
     let mut chat_recency = 0;
     for task in state.store.list_all_tasks().unwrap_or_default() {
+        let updated_at = task.updated_at.to_rfc3339();
+        let recency = task.updated_at.timestamp_millis();
         if task.kind == TaskKind::Chat {
-            chat_updated_at = chat_updated_at.max(task.updated_at.to_rfc3339());
-            chat_recency = chat_recency.max(task.updated_at.timestamp_millis());
+            chat_updated_at = chat_updated_at.max(updated_at);
+            chat_recency = chat_recency.max(recency);
             continue;
         }
-        let id = super::identity::task_bucket_id(task.id);
-        known.insert(id.clone());
-        buckets.push(BrowserIdentityBucket {
-            profile_present: profile_present(&state.data_directory, &id, persistent),
-            saved_logins: login_counts.get(&id).copied().unwrap_or_default(),
-            active: active_scope == super::BrowserIdentityScope::Task,
-            merge_recency: task
-                .updated_at
-                .timestamp_millis()
-                .max(profile_recency_millis(&state.data_directory, &id)),
+        if let Some(path) = task.repository_path.as_deref() {
+            let group_id = match projects.get(path.to_string_lossy().as_ref()) {
+                Some(project) => groups::project_group_id(project.id),
+                None => {
+                    let id = groups::path_group_id(path);
+                    group_names
+                        .entry(id.clone())
+                        .or_insert_with(|| (groups::path_group_name(path), "path"));
+                    id
+                }
+            };
+            let slot = group_recency
+                .entry(group_id)
+                .or_insert_with(|| (String::new(), 0));
+            slot.0 = std::mem::take(&mut slot.0).max(updated_at.clone());
+            slot.1 = slot.1.max(recency);
+        }
+        task_titles.insert(
+            legacy_task_bucket_id(task.id),
+            (task.title, task.archived, updated_at, recency),
+        );
+    }
+
+    let mut seeds = Vec::<CatalogSeed>::new();
+    let mut known = HashSet::<String>::new();
+
+    // Groups with a live or remembered tab, named as the strip names them.
+    let mut tab_groups = tabs
+        .snapshot(None)
+        .into_iter()
+        .filter(|tab| tab.group_kind != GroupKind::Chat)
+        .map(|tab| (tab.group_id, tab.group_name, tab.group_kind))
+        .collect::<Vec<_>>();
+    tab_groups.sort_by(|a, b| a.0.cmp(&b.0));
+    tab_groups.dedup_by(|a, b| a.0 == b.0);
+    for (id, name, kind) in tab_groups {
+        if !known.insert(id.clone()) {
+            continue;
+        }
+        let (updated_at, recency) = group_recency.get(&id).cloned().unwrap_or_default();
+        seeds.push(CatalogSeed {
             id,
-            label: task.title,
-            kind: "task".into(),
-            task_id: Some(task.id.to_string()),
-            archived: task.archived,
-            updated_at: task.updated_at.to_rfc3339(),
+            name,
+            kind: match kind {
+                GroupKind::Project => "project",
+                GroupKind::Path | GroupKind::Chat => "path",
+            },
+            legacy: false,
+            task_id: None,
+            archived: false,
+            updated_at,
+            recency,
+            active: grouped_active,
         });
     }
-    buckets.sort_by(|a, b| {
-        a.archived
-            .cmp(&b.archived)
-            .then_with(|| b.updated_at.cmp(&a.updated_at))
-            .then_with(|| a.label.cmp(&b.label))
+    seeds.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.name.cmp(&b.name))
     });
 
-    known.insert(super::identity::CHAT_BUCKET_ID.to_string());
-    buckets.push(BrowserIdentityBucket {
-        id: super::identity::CHAT_BUCKET_ID.into(),
-        label: "Chat/Main Browser".into(),
-        kind: "chat".into(),
+    known.insert(CHAT_BUCKET_ID.to_string());
+    seeds.push(CatalogSeed {
+        id: CHAT_BUCKET_ID.into(),
+        name: groups::CHAT_GROUP_NAME.into(),
+        kind: "chat",
+        legacy: false,
         task_id: None,
         archived: false,
         updated_at: chat_updated_at,
-        profile_present: profile_present(
-            &state.data_directory,
-            super::identity::CHAT_BUCKET_ID,
-            persistent,
-        ),
-        saved_logins: login_counts
-            .get(super::identity::CHAT_BUCKET_ID)
-            .copied()
-            .unwrap_or_default(),
-        active: active_scope == super::BrowserIdentityScope::Task,
-        merge_recency: chat_recency.max(profile_recency_millis(
-            &state.data_directory,
-            super::identity::CHAT_BUCKET_ID,
-        )),
+        recency: chat_recency,
+        active: grouped_active,
     });
-
-    known.insert(super::identity::SHARED_BUCKET_ID.to_string());
-    buckets.push(BrowserIdentityBucket {
-        id: super::identity::SHARED_BUCKET_ID.into(),
-        label: "Shared Browser".into(),
-        kind: "shared".into(),
+    known.insert(SHARED_BUCKET_ID.to_string());
+    seeds.push(CatalogSeed {
+        id: SHARED_BUCKET_ID.into(),
+        name: "Shared".into(),
+        kind: "shared",
+        legacy: false,
         task_id: None,
         archived: false,
         updated_at: String::new(),
-        profile_present: profile_present(
-            &state.data_directory,
-            super::identity::SHARED_BUCKET_ID,
-            persistent,
-        ),
-        saved_logins: login_counts
-            .get(super::identity::SHARED_BUCKET_ID)
-            .copied()
-            .unwrap_or_default(),
+        recency: 0,
         active: active_scope == super::BrowserIdentityScope::Shared,
-        merge_recency: profile_recency_millis(
-            &state.data_directory,
-            super::identity::SHARED_BUCKET_ID,
-        ),
     });
 
+    // Every jar on disk, then every jar a saved login still names. A group
+    // jar with no open tab is a group; a `task:` jar is legacy.
+    let mut leftovers = Vec::<String>::new();
     if let Ok(Some(root)) = super::identity::persistent_profiles_root(&state.data_directory)
         && let Ok(entries) = fs::read_dir(root)
     {
         for entry in entries.flatten() {
-            let Some(segment) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            let Some(id) = super::identity::bucket_id_from_profile_segment(&segment) else {
-                continue;
-            };
-            if known.insert(id.clone()) {
-                buckets.push(BrowserIdentityBucket {
-                    id: id.clone(),
-                    label: "Deleted task browser data".into(),
-                    kind: "orphan".into(),
-                    task_id: id.strip_prefix("task:").map(str::to_owned),
-                    archived: true,
-                    updated_at: String::new(),
-                    profile_present: true,
-                    saved_logins: login_counts.get(&id).copied().unwrap_or_default(),
-                    active: active_scope == super::BrowserIdentityScope::Task,
-                    merge_recency: profile_recency_millis(&state.data_directory, &id),
-                });
+            if let Some(id) = entry
+                .file_name()
+                .to_str()
+                .and_then(super::identity::bucket_id_from_profile_segment)
+            {
+                leftovers.push(id);
             }
         }
     }
-    for (id, count) in login_counts {
-        if known.insert(id.clone()) {
-            buckets.push(BrowserIdentityBucket {
+    let mut login_buckets: Vec<String> = login_counts.keys().cloned().collect();
+    login_buckets.sort();
+    leftovers.extend(login_buckets);
+    for id in leftovers {
+        if !known.insert(id.clone()) {
+            continue;
+        }
+        if super::identity::is_legacy_task_bucket(&id) {
+            let task_id = id.strip_prefix("task:").map(str::to_owned);
+            let (name, archived, updated_at, recency) = task_titles
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| ("Deleted task".into(), true, String::new(), 0));
+            seeds.push(CatalogSeed {
                 id,
-                label: "Legacy browser login data".into(),
-                kind: "orphan".into(),
+                name,
+                kind: "task",
+                legacy: true,
+                task_id,
+                archived,
+                updated_at,
+                recency,
+                active: false,
+            });
+        } else if let Some((name, kind)) = group_names.get(&id).cloned() {
+            let (updated_at, recency) = group_recency.get(&id).cloned().unwrap_or_default();
+            seeds.push(CatalogSeed {
+                id,
+                name,
+                kind,
+                legacy: false,
+                task_id: None,
+                archived: false,
+                updated_at,
+                recency,
+                active: grouped_active,
+            });
+        } else {
+            // A group jar whose project is gone or whose folder no task names
+            // any more: still listable and clearable, under the older list.
+            seeds.push(CatalogSeed {
+                name: if id.starts_with("project:") {
+                    "Deleted project".into()
+                } else {
+                    "Unknown folder".into()
+                },
+                kind: "orphan",
+                legacy: true,
                 task_id: None,
                 archived: true,
                 updated_at: String::new(),
-                profile_present: false,
-                saved_logins: count,
+                recency: 0,
                 active: false,
-                merge_recency: 0,
+                id,
             });
         }
     }
-    buckets
+
+    seeds
+        .into_iter()
+        .map(|seed| {
+            let profile_present = profile_present(&state.data_directory, &seed.id, persistent);
+            let merge_recency = seed
+                .recency
+                .max(profile_recency_millis(&state.data_directory, &seed.id));
+            BrowserIdentityBucket {
+                label: seed.name.clone(),
+                name: seed.name,
+                kind: seed.kind.into(),
+                legacy: seed.legacy,
+                task_id: seed.task_id,
+                archived: seed.archived,
+                updated_at: seed.updated_at,
+                profile_present,
+                saved_logins: login_counts.get(&seed.id).copied().unwrap_or_default(),
+                active: seed.active,
+                merge_recency,
+                id: seed.id,
+            }
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -375,13 +492,17 @@ pub(super) fn bucket_allowed(app: &AppHandle, tabs: &BrowserTabs, bucket_id: &st
 }
 
 fn live_profile_label(app: &AppHandle, tabs: &BrowserTabs, bucket_id: &str) -> Option<String> {
-    let app_state = app.try_state::<crate::state::AppState>()?;
+    app.try_state::<crate::state::AppState>()?;
     let scope = tabs.identity_scope();
     let guard = tabs.tabs.lock().unwrap_or_else(|error| error.into_inner());
     guard.values().find_map(|tab| {
-        (!tab.state.sleeping
-            && super::identity::bucket_for_task(&app_state.store, scope, &tab.state.task_id)
-                == bucket_id)
+        // The tab already carries its group; the bucket follows from it.
+        let group = super::Group {
+            id: tab.state.group_id.clone(),
+            name: tab.state.group_name.clone(),
+            kind: tab.state.group_kind,
+        };
+        (!tab.state.sleeping && super::identity::bucket_for_group(scope, &group) == bucket_id)
             .then(|| tab.label.clone())
     })
 }

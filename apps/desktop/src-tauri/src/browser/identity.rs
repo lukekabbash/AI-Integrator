@@ -7,10 +7,17 @@ use std::{
     sync::OnceLock,
 };
 
-use integrator_core::{TaskId, TaskKind};
+use integrator_core::TaskId;
 use serde::{Deserialize, Serialize};
 use session_store::LocalStore;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
+use tauri::{AppHandle, Runtime};
+
+use super::{
+    BrowserTabs,
+    groups::{self, Group, GroupKind},
+};
 
 pub const IDENTITY_SCOPE_SETTING: &str = "settings.browser.identityScope";
 pub const CHAT_BUCKET_ID: &str = "chat-main";
@@ -60,29 +67,81 @@ pub fn configured_scope(store: &LocalStore) -> BrowserIdentityScope {
     )
 }
 
-pub fn task_bucket_id(task_id: TaskId) -> String {
+/// Legacy per-task jar (`task:<uuid>`). New tabs never use it: the catalog
+/// lists it as an older identity and the vault migration re-keys away from it.
+pub fn legacy_task_bucket_id(task_id: TaskId) -> String {
     format!("task:{task_id}")
 }
 
-fn opaque_task_bucket_id(task_id: &str) -> String {
+/// Legacy jar for a task id the store could not parse (`task:opaque-<hex32>`).
+/// New tabs never use it; the migration recognises the form by prefix, so the
+/// constructor only survives to pin that form in tests.
+#[cfg(test)]
+pub fn legacy_opaque_task_bucket_id(task_id: &str) -> String {
     let digest = format!("{:x}", Sha256::digest(task_id.as_bytes()));
     format!("task:opaque-{}", &digest[..32])
 }
 
-/// Resolves a task to a browser identity. Standalone chats intentionally share
-/// one explicit bucket; an unknown task is isolated under a one-way identifier
-/// instead of falling into Chat/Main.
-pub fn bucket_for_task(store: &LocalStore, scope: BrowserIdentityScope, task_id: &str) -> String {
+/// Whether a bucket id is one of the legacy per-task forms.
+pub fn is_legacy_task_bucket(bucket_id: &str) -> bool {
+    bucket_id.starts_with("task:")
+}
+
+/// The bucket a group signs in under. Shared → one jar for everything; the
+/// Chat group → `chat-main`; a project or path group → its group id verbatim,
+/// so the cookie jar and the tab strip can never disagree about membership.
+pub fn bucket_for_group(scope: BrowserIdentityScope, group: &Group) -> String {
     if scope == BrowserIdentityScope::Shared {
         return SHARED_BUCKET_ID.to_string();
     }
-    let Ok(id) = task_id.parse::<TaskId>() else {
-        return opaque_task_bucket_id(task_id);
-    };
-    match store.get_task(id).ok().map(|task| task.kind) {
-        Some(TaskKind::Chat) => CHAT_BUCKET_ID.to_string(),
-        _ => task_bucket_id(id),
+    match group.kind {
+        GroupKind::Chat => CHAT_BUCKET_ID.to_string(),
+        GroupKind::Project | GroupKind::Path => group.id.clone(),
     }
+}
+
+/// [`bucket_for_group`] for a caller that only has a task id: the group comes
+/// from the registry's cache.
+pub fn bucket_for_task<R: Runtime>(
+    app: &AppHandle<R>,
+    tabs: &BrowserTabs,
+    scope: BrowserIdentityScope,
+    task_id: &str,
+) -> String {
+    bucket_for_group(scope, &groups::group_for_task(app, tabs, task_id))
+}
+
+/// [`bucket_for_task`] with no registry: reads the store directly. For startup
+/// paths that run before the browser state exists.
+pub fn bucket_for_task_in_store(
+    store: &LocalStore,
+    scope: BrowserIdentityScope,
+    task_id: &str,
+) -> String {
+    bucket_for_group(scope, &groups::resolve_group(store, task_id))
+}
+
+fn valid_task_suffix(suffix: &str) -> bool {
+    !suffix.is_empty()
+        && suffix.len() <= 80
+        && suffix
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+}
+
+fn valid_project_suffix(suffix: &str) -> bool {
+    suffix.len() == 36
+        && uuid::Uuid::try_parse(suffix).is_ok()
+        && suffix.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
+}
+
+fn valid_path_suffix(suffix: &str) -> bool {
+    suffix.len() == 32
+        && suffix
+            .chars()
+            .all(|character| character.is_ascii_digit() || matches!(character, 'a'..='f'))
 }
 
 /// Converts an opaque bucket id to a fixed single path component. Any renderer
@@ -92,16 +151,14 @@ pub fn profile_segment(bucket_id: &str) -> Option<String> {
         CHAT_BUCKET_ID => Some(CHAT_BUCKET_ID.to_string()),
         SHARED_BUCKET_ID => Some(SHARED_BUCKET_ID.to_string()),
         _ => {
-            let suffix = bucket_id.strip_prefix("task:")?;
-            if suffix.is_empty()
-                || suffix.len() > 80
-                || !suffix
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
-            {
-                return None;
-            }
-            Some(format!("task-{suffix}"))
+            let (prefix, suffix) = bucket_id.split_once(':')?;
+            let valid = match prefix {
+                "task" => valid_task_suffix(suffix),
+                "project" => valid_project_suffix(suffix),
+                "path" => valid_path_suffix(suffix),
+                _ => false,
+            };
+            valid.then(|| format!("{prefix}-{suffix}"))
         }
     }
 }
@@ -111,9 +168,9 @@ pub fn bucket_id_from_profile_segment(segment: &str) -> Option<String> {
         CHAT_BUCKET_ID => Some(CHAT_BUCKET_ID.to_string()),
         SHARED_BUCKET_ID => Some(SHARED_BUCKET_ID.to_string()),
         _ => {
-            let suffix = segment.strip_prefix("task-")?;
-            profile_segment(&format!("task:{suffix}"))?;
-            Some(format!("task:{suffix}"))
+            let (prefix, suffix) = segment.split_once('-')?;
+            let bucket_id = format!("{prefix}:{suffix}");
+            (profile_segment(&bucket_id)? == segment).then_some(bucket_id)
         }
     }
 }
@@ -342,6 +399,132 @@ mod tests {
         assert!(profile_segment("task:../shared").is_none());
         assert!(profile_segment("task:").is_none());
         assert!(profile_segment("unknown").is_none());
+    }
+
+    #[test]
+    fn group_buckets_are_declared_segments_and_round_trip() {
+        let project = "project:019cbe6a-5fd4-7ca1-9dd4-b51fe78b50b5";
+        let path = "path:0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            profile_segment(project).as_deref(),
+            Some("project-019cbe6a-5fd4-7ca1-9dd4-b51fe78b50b5")
+        );
+        assert_eq!(
+            profile_segment(path).as_deref(),
+            Some("path-0123456789abcdef0123456789abcdef")
+        );
+        for bucket in [
+            project,
+            path,
+            "task:019cbe6a-5fd4-7ca1-9dd4-b51fe78b50b5",
+            "task:opaque-0123456789abcdef0123456789abcdef",
+            CHAT_BUCKET_ID,
+            SHARED_BUCKET_ID,
+        ] {
+            let segment = profile_segment(bucket).expect("declared bucket");
+            assert_eq!(
+                bucket_id_from_profile_segment(&segment).as_deref(),
+                Some(bucket)
+            );
+        }
+        // Wrong shapes are refused before any I/O.
+        assert!(profile_segment("project:not-a-uuid").is_none());
+        assert!(profile_segment("project:").is_none());
+        assert!(profile_segment("project:019CBE6A-5FD4-7CA1-9DD4-B51FE78B50B5").is_none());
+        assert!(profile_segment("path:0123456789abcdef").is_none());
+        assert!(profile_segment("path:0123456789ABCDEF0123456789ABCDEF").is_none());
+        assert!(profile_segment("path:../0123456789abcdef0123456789abcd").is_none());
+        assert!(profile_segment("group:anything").is_none());
+        assert!(bucket_id_from_profile_segment("project-not-a-uuid").is_none());
+        assert!(bucket_id_from_profile_segment("stray").is_none());
+        assert!(bucket_id_from_profile_segment("path-0123").is_none());
+    }
+
+    #[test]
+    fn a_group_signs_in_under_its_own_id_and_shared_wins_over_everything() {
+        let project = Group {
+            id: "project:019cbe6a-5fd4-7ca1-9dd4-b51fe78b50b5".into(),
+            name: "My project".into(),
+            kind: GroupKind::Project,
+        };
+        let path = Group {
+            id: "path:0123456789abcdef0123456789abcdef".into(),
+            name: "repo".into(),
+            kind: GroupKind::Path,
+        };
+        for (group, expected) in [
+            (Group::chat(), CHAT_BUCKET_ID),
+            (project.clone(), project.id.as_str()),
+            (path.clone(), path.id.as_str()),
+        ] {
+            assert_eq!(
+                bucket_for_group(BrowserIdentityScope::Task, &group),
+                expected
+            );
+            assert_eq!(
+                bucket_for_group(BrowserIdentityScope::Shared, &group),
+                SHARED_BUCKET_ID
+            );
+            // Every group bucket is a declared profile segment.
+            assert!(
+                profile_segment(&bucket_for_group(BrowserIdentityScope::Task, &group)).is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn a_task_resolves_through_its_group_and_never_to_a_task_jar() {
+        use integrator_core::{NewTask, TaskKind};
+        let directory = tempfile::tempdir().expect("temp directory");
+        let repository = directory.path().join("repository");
+        fs::create_dir_all(&repository).expect("fixture");
+        let store = LocalStore::open_in_memory().expect("open store");
+        let project = store
+            .upsert_trusted_project("My project", &repository, None)
+            .expect("register project");
+        let new_task = |kind, path| {
+            store
+                .create_task(NewTask {
+                    kind,
+                    title: "t".into(),
+                    repository_path: path,
+                    worktree_path: None,
+                    runtime: None,
+                    model: None,
+                    effort: None,
+                    parent_task_id: None,
+                })
+                .expect("create task")
+                .id
+                .to_string()
+        };
+        let chat = new_task(TaskKind::Chat, None);
+        let code = new_task(TaskKind::Code, Some(repository.clone()));
+        let sibling = new_task(TaskKind::Code, Some(repository));
+        let scope = BrowserIdentityScope::Task;
+        assert_eq!(
+            bucket_for_task_in_store(&store, scope, &chat),
+            CHAT_BUCKET_ID
+        );
+        assert_eq!(
+            bucket_for_task_in_store(&store, scope, &code),
+            groups::project_group_id(project.id)
+        );
+        assert_eq!(
+            bucket_for_task_in_store(&store, scope, &code),
+            bucket_for_task_in_store(&store, scope, &sibling)
+        );
+        assert!(!is_legacy_task_bucket(&bucket_for_task_in_store(
+            &store, scope, &code
+        )));
+        assert!(is_legacy_task_bucket(&legacy_task_bucket_id(TaskId::new())));
+        assert!(is_legacy_task_bucket(&legacy_opaque_task_bucket_id(
+            "stray"
+        )));
+        assert_eq!(
+            bucket_for_task_in_store(&store, BrowserIdentityScope::Shared, &code),
+            SHARED_BUCKET_ID
+        );
     }
 
     #[test]

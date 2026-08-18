@@ -156,6 +156,16 @@ pub fn run() {
             {
                 eprintln!("browser profile migration deferred: {error}");
             }
+            match browser::migrate_task_buckets_to_groups(&state.store) {
+                Ok(report) if report.moved + report.merged > 0 => eprintln!(
+                    "browser logins re-keyed to groups: {} moved, {} merged",
+                    report.moved, report.merged
+                ),
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("browser login group migration deferred: {}", error.message)
+                }
+            }
             if let Err(error) = browser::prune_ephemeral_profiles(&state.data_directory) {
                 eprintln!("ephemeral browser profile cleanup deferred: {error}");
             }

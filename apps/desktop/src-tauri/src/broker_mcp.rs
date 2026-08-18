@@ -208,21 +208,22 @@ fn browser_tools(role: &str) -> Vec<Value> {
     let mut tools = vec![
         json!({
             "name": "browser_open",
-            "description": "Open a browser tab the user can see and drive too. Pass a url, or omit it for a blank tab. Returns a tabId to pass to the other browser tools. Prefer reusing an existing tab from browser_list over opening more.",
+            "description": "Open a browser tab the user can see and drive too. Pass a url, or omit it for a blank tab. Returns a tabId to pass to the other browser tools. Prefer reusing an existing tab from browser_list over opening more. A tab opened in your pane is private to this task; poppedOut opens it in the shared pop-out window instead, where every task in your project (or every standalone chat) can see and drive it.",
             "annotations": tool_annotations(false, false),
             "inputSchema": text_schema(json!({
-                "url": { "type": "string", "description": "Address to open. A bare host resolves to https, loopback to http." }
+                "url": { "type": "string", "description": "Address to open. A bare host resolves to https, loopback to http." },
+                "poppedOut": { "type": "boolean", "default": false, "description": "Open in the shared pop-out window rather than your private pane." }
             }), &[]),
         }),
         json!({
             "name": "browser_list",
-            "description": "List the browser tabs you can reach, with their id, url, title, loading state, and who is currently working in each. Use it to keep track when you are working across several pages at once.",
+            "description": "List the browser tabs you can reach, with their id, url, title, loading state, group, whether they are popped out or sleeping, and who is currently working in each. Your pane tabs are private. Popped-out tabs are shared with every task in your project (or with every standalone chat); other tasks' shared tabs appear with sharedFrom. Check heldBy before driving. Use it to keep track when you are working across several pages at once.",
             "annotations": tool_annotations(true, false),
             "inputSchema": text_schema(json!({}), &[]),
         }),
         json!({
             "name": "browser_close",
-            "description": "Close one of your own browser tabs when you are done with it. A tab someone shared with you is theirs to close. The user can also close tabs themselves; leaving a page open is fine if they will want to look at it.",
+            "description": "Close one of your own browser tabs when you are done with it. A tab someone shared with you, or another task popped out, is theirs to close. The user can also close tabs themselves; leaving a page open is fine if they will want to look at it.",
             "annotations": tool_annotations(false, true),
             "inputSchema": text_schema(json!({
                 "tabId": { "type": "string" }
@@ -244,7 +245,23 @@ fn browser_tools(role: &str) -> Vec<Value> {
     tools.extend([
         json!({
             "name": "browser_focus",
-            "description": "Ask for one of your tabs to be brought to the front so the user can watch it. Use it before a step you want them to see, or when you need them to sign in or answer a challenge. Returns focused:false if the pane is closed or they are looking at another chat — the tab still works either way.",
+            "description": "Ask for one of your tabs to be brought to the front so the user can watch it. Use it before a step you want them to see, or when you need them to sign in or answer a challenge. A popped-out tab's window is raised too. Returns focused:false if the pane is closed or they are looking at another chat — the tab still works either way.",
+            "annotations": tool_annotations(false, false),
+            "inputSchema": text_schema(json!({
+                "tabId": { "type": "string" }
+            }), &["tabId"]),
+        }),
+        json!({
+            "name": "browser_pop_out",
+            "description": "Move one of your own tabs into the shared pop-out window. This shares it on purpose: every task in your project (or every standalone chat) can then see and drive it, and it appears in their browser_list with sharedFrom. Only the task that opened a tab can pop it out.",
+            "annotations": tool_annotations(false, false),
+            "inputSchema": text_schema(json!({
+                "tabId": { "type": "string" }
+            }), &["tabId"]),
+        }),
+        json!({
+            "name": "browser_dock",
+            "description": "Move one of your own popped-out tabs back into your pane, making it private to this task again. Only the task that opened a tab can dock it.",
             "annotations": tool_annotations(false, false),
             "inputSchema": text_schema(json!({
                 "tabId": { "type": "string" }
@@ -774,6 +791,8 @@ mod tests {
                 "browser_close",
                 "browser_grant",
                 "browser_focus",
+                "browser_pop_out",
+                "browser_dock",
                 "browser_fill_login",
                 "browser_cookies",
                 "browser_navigate",
@@ -805,6 +824,8 @@ mod tests {
                 "browser_list",
                 "browser_close",
                 "browser_focus",
+                "browser_pop_out",
+                "browser_dock",
                 "browser_fill_login",
                 "browser_cookies",
                 "browser_navigate",
@@ -836,6 +857,8 @@ mod tests {
                 "browser_list",
                 "browser_close",
                 "browser_focus",
+                "browser_pop_out",
+                "browser_dock",
                 "browser_fill_login",
                 "browser_cookies",
                 "browser_navigate",

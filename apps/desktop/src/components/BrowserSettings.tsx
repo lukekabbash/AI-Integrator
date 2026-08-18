@@ -4,17 +4,14 @@ import { createPortal } from "react-dom";
 
 import {
   bridge,
+  type BrowserIdentityBucket,
   type BrowserIdentityOverview,
   type BrowserIdentityScope,
   type BrowserIdentitySwitchResult,
   type BrowserSite,
   type SavedLogin,
 } from "../bridge";
-import {
-  isSearchEngineId,
-  writeSearchEngine,
-  type SearchEngineId,
-} from "../browserOmnibox";
+import { isSearchEngineId, writeSearchEngine, type SearchEngineId } from "../browserOmnibox";
 import { Dropdown } from "./Dropdown";
 import { SettingRow, Switch } from "./SettingControls";
 import { readSetting, type SettingsMap } from "./settingsModel";
@@ -27,6 +24,8 @@ export const BROWSER_SETTINGS = {
   externalOpen: "browser.externalOpen",
   dismissConsent: "browser.dismissConsent",
   identityScope: "browser.identityScope",
+  /** Set once the one-time "identities are now per project" line is dismissed. */
+  identityPerGroupNoticeSeen: "browser.identityPerGroupNoticeSeen",
   searchEngine: "browser.searchEngine",
 } as const;
 
@@ -103,15 +102,15 @@ function SharedScopeWarning({
           <AlertTriangle aria-hidden="true" />
           <div>
             <p>
-              Cookies and saved logins from every task will be merged into Shared. For conflicting
-              entries, the bucket from the most recently active task wins.
+              Cookies and saved logins from every project and from Chat will be merged into Shared.
+              For conflicting entries, the most recently active identity wins.
             </p>
             <ul>
               <li>
                 This can combine parts of different account sessions and cause sign-in errors.
               </li>
-              <li>If a site breaks, clear its Shared Browser data and sign in again.</li>
-              <li>Task and Chat/Main Browser source buckets stay intact.</li>
+              <li>If a site breaks, clear its Shared data and sign in again.</li>
+              <li>Project and Chat source identities stay intact.</li>
               <li>The new scope applies after Integrator restarts.</li>
             </ul>
           </div>
@@ -149,15 +148,15 @@ function SharedScopeWarning({
 function switchSummary(result: BrowserIdentitySwitchResult): string {
   if (result.configuredScope === "task") {
     return result.restartRequired
-      ? "Task-scoped browser identity will apply after restart."
-      : "Browser identity is scoped by task.";
+      ? "Per-project browser identity will apply after restart."
+      : "Browser identity is scoped per project.";
   }
   const conflicts = result.cookieConflicts + result.loginConflicts;
   const merged = result.mergedCookies + result.mergedLogins;
   const partitioned = result.skippedPartitionedCookies
     ? `, ${result.skippedPartitionedCookies} partitioned ${
         result.skippedPartitionedCookies === 1 ? "cookie" : "cookies"
-      } kept task-scoped`
+      } kept per project`
     : "";
   return `Shared browser prepared: ${merged} ${merged === 1 ? "entry" : "entries"} merged${
     conflicts ? `, ${conflicts} ${conflicts === 1 ? "conflict" : "conflicts"} resolved` : ""
@@ -183,6 +182,7 @@ export function BrowserSettings({
   >({});
   const [siteErrors, setSiteErrors] = useState<Record<string, string>>({});
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const [legacyOpen, setLegacyOpen] = useState(false);
   const [message, setMessage] = useState("");
   const [generation, setGeneration] = useState(0);
   const [loadedGeneration, setLoadedGeneration] = useState<number | null>(available ? null : 0);
@@ -295,6 +295,26 @@ export function BrowserSettings({
     }
   };
 
+  /** Clears an older per-task identity in one go: its site data and its saved logins. */
+  const clearLegacy = async (bucket: BrowserIdentityBucket) => {
+    if (!api) return;
+    setBusyBucket(bucket.id);
+    setMessage("");
+    try {
+      if (bucket.profilePresent) await api.clearBucket(bucket.id);
+      if (logins.some((login) => login.bucketId === bucket.id)) {
+        setLogins(await api.forgetBucketLogins(bucket.id));
+      }
+      setSitesByBucket((current) => ({ ...current, [bucket.id]: [] }));
+      await reloadOverview();
+      setMessage(`${bucket.name} cleared: site data and saved logins removed.`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : `Could not clear ${bucket.name}.`);
+    } finally {
+      setBusyBucket("");
+    }
+  };
+
   const setIdentityScope = async (scope: BrowserIdentityScope) => {
     if (!api) return;
     setScopeBusy(true);
@@ -330,6 +350,10 @@ export function BrowserSettings({
     overview?.configuredScope ??
     readSetting<BrowserIdentityScope>(settings, BROWSER_SETTINGS.identityScope, "task");
   const loading = available && loadedGeneration !== generation;
+  const noticeSeen =
+    readSetting<boolean>(settings, BROWSER_SETTINGS.identityPerGroupNoticeSeen, false) === true;
+  const currentBuckets = overview?.buckets.filter((bucket) => !bucket.legacy) ?? [];
+  const legacyBuckets = overview?.buckets.filter((bucket) => bucket.legacy) ?? [];
 
   return (
     <>
@@ -363,9 +387,10 @@ export function BrowserSettings({
             disabled={!available || scopeBusy}
             onClick={() => void setIdentityScope("task")}
           >
-            <strong>By task</strong>
+            <strong>Per project (recommended)</strong>
             <small>
-              Default. Each code task is isolated; standalone chats use Chat/Main Browser.
+              Every task in a project shares one signed-in identity; standalone chats share the Chat
+              identity.
             </small>
           </button>
           <button
@@ -382,16 +407,29 @@ export function BrowserSettings({
             }}
           >
             <strong>Shared</strong>
-            <small>Every task uses one browser identity after restart.</small>
+            <small>Every project and chat uses one browser identity after restart.</small>
           </button>
         </div>
         {overview?.restartRequired ? (
           <p className="browser-restart-note" role="status">
             Restart Integrator to apply{" "}
-            {overview.configuredScope === "shared" ? "Shared" : "By task"}. Open tabs keep their
+            {overview.configuredScope === "shared" ? "Shared" : "Per project"}. Open tabs keep their
             current identity until then.
           </p>
         ) : null}
+        {noticeSeen ? null : (
+          <p className="browser-restart-note browser-identity-notice" role="status">
+            Browser identities are now per project: tasks in the same project share cookies and
+            saved logins, and earlier per-task identities are listed below under older identities.
+            <button
+              className="secondary-button small"
+              type="button"
+              onClick={() => setSetting(BROWSER_SETTINGS.identityPerGroupNoticeSeen, true)}
+            >
+              Got it
+            </button>
+          </p>
+        )}
       </section>
 
       <section className="settings-section">
@@ -495,7 +533,7 @@ export function BrowserSettings({
           />
         </SettingRow>
         <div className="browser-sites-header">
-          <span className="settings-eyebrow">Tasks, then Chat/Main Browser</span>
+          <span className="settings-eyebrow">Projects, then Chat and Shared</span>
           <button
             className="icon-button subtle tiny"
             type="button"
@@ -514,7 +552,7 @@ export function BrowserSettings({
           <div className="settings-empty">No browser identities are available.</div>
         ) : (
           <div className="browser-buckets">
-            {overview.buckets.map((bucket) => {
+            {currentBuckets.map((bucket) => {
               const isOpen = expanded.has(bucket.id);
               const sites = sitesByBucket[bucket.id];
               const bucketLogins = logins.filter((login) => login.bucketId === bucket.id);
@@ -532,17 +570,17 @@ export function BrowserSettings({
                     onClick={() => toggleBucket(bucket.id)}
                   >
                     <span>
-                      <strong>{bucket.label}</strong>
+                      <strong>{bucket.name}</strong>
                       <small>
-                        {bucket.kind === "task"
-                          ? bucket.archived
-                            ? `Archived task · ${storedSummary}`
-                            : `Task · ${storedSummary}`
-                          : bucket.kind === "chat"
-                            ? `Standalone chats and main browser · ${storedSummary}`
-                            : bucket.kind === "shared"
-                              ? `Shared scope · ${storedSummary}`
-                              : `Deleted or legacy task · ${storedSummary}`}
+                        {bucket.kind === "project"
+                          ? `Project · every task in it · ${storedSummary}`
+                          : bucket.kind === "path"
+                            ? `Folder without a project · ${storedSummary}`
+                            : bucket.kind === "chat"
+                              ? `Standalone chats · ${storedSummary}`
+                              : bucket.kind === "shared"
+                                ? `Shared scope · ${storedSummary}`
+                                : `Older per-task identity · ${storedSummary}`}
                       </small>
                     </span>
                     <ChevronDown aria-hidden="true" />
@@ -623,7 +661,7 @@ export function BrowserSettings({
                           className="secondary-button small"
                           type="button"
                           disabled={busy || !bucket.profilePresent}
-                          onClick={() => void clearBucket(bucket.id, bucket.label)}
+                          onClick={() => void clearBucket(bucket.id, bucket.name)}
                         >
                           <Trash2 aria-hidden="true" />
                           Clear site data
@@ -632,7 +670,7 @@ export function BrowserSettings({
                           className="secondary-button small"
                           type="button"
                           disabled={busy || bucketLogins.length === 0}
-                          onClick={() => void forgetBucket(bucket.id, bucket.label)}
+                          onClick={() => void forgetBucket(bucket.id, bucket.name)}
                         >
                           <KeyRound aria-hidden="true" />
                           Forget saved logins
@@ -645,6 +683,64 @@ export function BrowserSettings({
             })}
           </div>
         )}
+        {legacyBuckets.length ? (
+          <div className="browser-legacy-buckets">
+            <button
+              className="browser-bucket-toggle"
+              type="button"
+              aria-expanded={legacyOpen}
+              onClick={() => setLegacyOpen((open) => !open)}
+            >
+              <span>
+                <strong>Older per-task identities ({legacyBuckets.length})</strong>
+                <small>
+                  Cookies and logins from before identities were per project. New tabs never use
+                  them; clear each once you no longer need it.
+                </small>
+              </span>
+              <ChevronDown aria-hidden="true" />
+            </button>
+            {legacyOpen ? (
+              <ul className="browser-sites-list browser-legacy-list">
+                {legacyBuckets.map((bucket) => {
+                  const bucketLogins = logins.filter((login) => login.bucketId === bucket.id);
+                  const busy = busyBucket === bucket.id;
+                  const empty = !bucket.profilePresent && bucketLogins.length === 0;
+                  return (
+                    <li key={bucket.id} data-kind={bucket.kind}>
+                      <span>
+                        <strong>{bucket.name}</strong>
+                        <small>
+                          {[
+                            bucket.kind === "orphan"
+                              ? "no longer belongs to anything"
+                              : bucket.archived
+                                ? "archived or deleted task"
+                                : "task",
+                            bucket.profilePresent ? "browser data" : "no browser data",
+                            `${bucketLogins.length} saved ${
+                              bucketLogins.length === 1 ? "login" : "logins"
+                            }`,
+                          ].join(" · ")}
+                        </small>
+                      </span>
+                      <button
+                        className="secondary-button small"
+                        type="button"
+                        aria-label={`Clear ${bucket.name}`}
+                        disabled={busy || empty}
+                        onClick={() => void clearLegacy(bucket)}
+                      >
+                        <Trash2 aria-hidden="true" />
+                        Clear
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            ) : null}
+          </div>
+        ) : null}
         {message ? (
           <p className="settings-action-message" role="status">
             {message}

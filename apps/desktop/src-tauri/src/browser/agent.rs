@@ -8,7 +8,9 @@
 //! Reach has three layers, from durable to momentary:
 //!
 //! - **Task** — a tab belongs to one task, and nothing outside it can see the
-//!   tab at all. This boundary is not negotiable and has no grant.
+//!   tab at all — unless it is popped out, which shares it with every task in
+//!   the same group (the project, or the one Chat group). Only its owner can
+//!   close, grant, or dock it.
 //! - **Owner** — inside a task, a tab opened by a delegated child belongs to
 //!   that child. Siblings cannot see it; the orchestrator can. The
 //!   orchestrator may hand a tab to a child, read-only or to drive.
@@ -31,14 +33,14 @@ use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use url::Url;
 
-use integrator_core::IntegratorError;
+use integrator_core::{IntegratorError, TaskId};
 
 use crate::command_api::CommandError;
 
 use super::{
     AGENT_ACCESS_SETTING, BrowserTab, BrowserTabs, Caller, GrantMode, close_tab, create_tab,
-    emit_changed, eval_json, invalid, is_blank, lock_active_tab, normalize_url, setting_enabled,
-    unavailable, webview_of,
+    emit_changed, eval_json, invalid, is_blank, lock_active_tab, normalize_url, registry::HOLD_TTL,
+    setting_enabled, unavailable, webview_of,
 };
 
 /// Guest actions that change the page rather than read it. `guest.js` keeps
@@ -128,7 +130,10 @@ pub async fn agent_invoke(
     // is only an exclusive holder when they asked for that lock.
     let user_hold = lock_active_tab(app);
     if writing && let Some(holder) = tabs.held_by_other(tab_id, &who, user_hold) {
-        return Err(unavailable(stood_off(&holder)));
+        return Err(unavailable(stood_off(
+            &holder,
+            holder_task_title(app, tabs, tab_id).as_deref(),
+        )));
     }
     super::remember::ensure_awake(app, tabs, tab_id).await;
     if CURSOR_METHODS.contains(&method) {
@@ -137,7 +142,7 @@ pub async fn agent_invoke(
     let label = tabs
         .label_for(tab_id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
-    tabs.mark_held(tab_id, &who);
+    tabs.mark_held_by(tab_id, caller);
     let args = serde_json::to_string(&args).map_err(|error| invalid(error.to_string()))?;
     // The guest gets the last word on whether this lands. Only the page can see
     // the person's own clicks and keys, so the veto has to be asked there —
@@ -158,22 +163,47 @@ pub async fn agent_invoke(
 
 /// How a refusal reads depends on who is holding the tab: another agent can be
 /// waited out or worked around, the person at the keyboard is simply first.
-fn stood_off(holder: &str) -> String {
+/// A shared tab may be held from another task, so the holder is named with
+/// its task when that is known.
+pub(super) fn stood_off(holder: &str, holder_task_title: Option<&str>) -> String {
     if holder == super::USER_HOLDER {
         return "the person is working in that tab right now — wait for them to finish, or open your own with browser_open".into();
     }
+    let of_task = holder_task_title
+        .map(|title| format!(" of task \"{title}\""))
+        .unwrap_or_default();
     format!(
-        "{holder} is working in that tab right now — open your own with browser_open, or wait for it to finish"
+        "{holder}{of_task} is working in that tab right now — open your own with browser_open, or wait; holds expire {} s after the last action",
+        HOLD_TTL.as_secs()
     )
 }
 
+/// The title of a task, for messages that name one. Absent when the store
+/// cannot describe it, in which case the message goes without.
+fn task_title<R: Runtime>(app: &AppHandle<R>, task_id: &str) -> Option<String> {
+    let state = app.try_state::<crate::state::AppState>()?;
+    let id = task_id.parse::<TaskId>().ok()?;
+    state.store.get_task(id).ok().map(|task| task.title)
+}
+
+/// The title of the task whose agent holds this tab — the tab's owner when
+/// the hold did not record one.
+fn holder_task_title(app: &AppHandle, tabs: &BrowserTabs, tab_id: &str) -> Option<String> {
+    let (_, held_from) = tabs.holder(tab_id, false)?;
+    let task = held_from.or_else(|| tabs.task_of(tab_id))?;
+    task_title(app, &task)
+}
+
 /// Opens a tab for this caller. A child's tab belongs to the child, so its
-/// siblings never see it and never drive it by accident.
+/// siblings never see it and never drive it by accident. `popped_out` opens
+/// it straight into the group's pop-out window, which shares it with every
+/// task in the group.
 pub async fn open_for_agent(
     app: &AppHandle,
     tabs: &Arc<BrowserTabs>,
     caller: &Caller,
     url: Option<String>,
+    popped_out: bool,
 ) -> Result<BrowserTab, IntegratorError> {
     ensure_agent_access(app).map_err(|error| IntegratorError::Unauthorized(error.message))?;
     let target = match url.as_deref() {
@@ -185,15 +215,40 @@ pub async fn open_for_agent(
     let tab = create_tab(app, tabs, caller.task_id.clone(), target)
         .await
         .map_err(|error| IntegratorError::Unavailable(error.message))?;
-    tabs.mark_held(&tab.id, &caller.label());
+    tabs.mark_held_by(&tab.id, caller);
     if let Some(delegation) = caller.delegation_id.clone() {
         tabs.update(&tab.id, |state| state.delegation_id = Some(delegation));
     }
+    if popped_out {
+        super::popout::move_tab(app, tabs, &tab.id, true, false)
+            .map_err(|error| IntegratorError::Unavailable(error.message))?;
+    }
     emit_changed(app, tabs);
-    tabs.snapshot(Some(&caller.task_id))
-        .into_iter()
-        .find(|candidate| candidate.id == tab.id)
+    tabs.tab(&tab.id)
         .ok_or_else(|| IntegratorError::NotFound("that browser tab is no longer open".into()))
+}
+
+/// Pops one of the caller's own tabs out into the group's window, or docks it
+/// back into the pane. Popping out shares the tab with every task in the
+/// group; docking makes it private again. Only the owner may do either.
+pub async fn set_popped_out_for_agent(
+    app: &AppHandle,
+    tabs: &Arc<BrowserTabs>,
+    caller: &Caller,
+    tab_id: &str,
+    popped_out: bool,
+) -> Result<BrowserTab, IntegratorError> {
+    ensure_agent_access(app).map_err(|error| IntegratorError::Unauthorized(error.message))?;
+    if !tabs.owns(tab_id, caller) {
+        return Err(IntegratorError::Unauthorized(match tabs.task_of(tab_id) {
+            Some(_) if popped_out => "that tab is not yours to pop out".into(),
+            Some(_) => "that tab is not yours to dock — only the task that opened it can".into(),
+            None => "that browser tab is no longer open".into(),
+        }));
+    }
+    super::remember::ensure_awake(app, tabs, tab_id).await;
+    super::popout::move_tab(app, tabs, tab_id, popped_out, false)
+        .map_err(|error| IntegratorError::Unavailable(error.message))
 }
 
 /// Points one reachable tab at a URL.
@@ -211,9 +266,12 @@ pub async fn navigate_for_agent(
     })?;
     let who = caller.label();
     if let Some(holder) = tabs.held_by_other(tab_id, &who, lock_active_tab(app)) {
-        return Err(IntegratorError::Unavailable(stood_off(&holder)));
+        return Err(IntegratorError::Unavailable(stood_off(
+            &holder,
+            holder_task_title(app, tabs, tab_id).as_deref(),
+        )));
     }
-    tabs.mark_held(tab_id, &who);
+    tabs.mark_held_by(tab_id, caller);
     let target =
         normalize_url(url).map_err(|error| IntegratorError::InvalidInput(error.message))?;
     super::remember::ensure_awake(app, tabs, tab_id).await;
@@ -243,9 +301,18 @@ pub async fn close_for_agent(
 ) -> Result<(), IntegratorError> {
     ensure_agent_access(app).map_err(|error| IntegratorError::Unauthorized(error.message))?;
     if !tabs.owns(tab_id, caller) {
-        return Err(IntegratorError::Unauthorized(
-            "that tab belongs to another agent — it is not yours to close".into(),
-        ));
+        // A shared tab is reachable but still someone else's: say whose, and
+        // what they can do about it, rather than "another agent".
+        let owner = tabs
+            .task_of(tab_id)
+            .filter(|task| *task != caller.task_id && tabs.reach(tab_id, caller).is_some());
+        return Err(IntegratorError::Unauthorized(match owner {
+            Some(task) => format!(
+                "that tab belongs to task \"{}\"; dock or close it from there",
+                task_title(app, &task).unwrap_or(task)
+            ),
+            None => "that tab belongs to another agent — it is not yours to close".into(),
+        }));
     }
     close_tab(app, tabs, tab_id).map_err(|error| IntegratorError::Unavailable(error.message))
 }
@@ -301,6 +368,11 @@ pub async fn focus_for_agent(
         .label_for(tab_id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
     if bring_on_screen(app, tabs, caller, tab_id).await {
+        // A popped-out tab lives in its own window, which may sit behind the
+        // app: showing it means bringing that window forward too.
+        if tabs.tab(tab_id).is_some_and(|tab| tab.popped_out) {
+            raise_host_window(app, &label).await;
+        }
         let viewport = eval_json(app, &label, VIEWPORT.into()).await.ok();
         return Ok(json!({ "focused": true, "viewport": viewport }));
     }
@@ -572,13 +644,92 @@ pub async fn cookies_for_agent(
     }))
 }
 
-/// Every tab this caller may address.
+/// Every tab this caller may address, as the rows `browser_list` returns.
 pub fn tabs_for_caller<R: Runtime>(
     app: &AppHandle<R>,
     tabs: &BrowserTabs,
     caller: &Caller,
-) -> Vec<BrowserTab> {
+) -> Vec<Value> {
     tabs.visible_to(caller, lock_active_tab(app))
+        .into_iter()
+        .map(|tab| agent_row(app, tabs, caller, &tab))
+        .collect()
+}
+
+/// One tab as an agent sees it. The renderer's `BrowserTab` is the base; on
+/// top of it the group is one object, `heldBy` names the holder's task, and a
+/// tab another task shared says so with `sharedFrom`. `heldByLabel` keeps the
+/// old string for one release.
+pub fn agent_row<R: Runtime>(
+    app: &AppHandle<R>,
+    tabs: &BrowserTabs,
+    caller: &Caller,
+    tab: &BrowserTab,
+) -> Value {
+    let held_from = tabs
+        .holder(&tab.id, lock_active_tab(app))
+        .and_then(|(_, task)| task);
+    decorate_row(tab, caller, held_from.as_deref(), |task| {
+        task_title(app, task)
+    })
+}
+
+/// The row shape itself, with the store abstracted to `title_of` so the shape
+/// can be checked without an app. `held_from` is the task the holder drove
+/// from, when the hold is an agent's.
+pub(super) fn decorate_row(
+    tab: &BrowserTab,
+    caller: &Caller,
+    held_from: Option<&str>,
+    title_of: impl Fn(&str) -> Option<String>,
+) -> Value {
+    let mut row = serde_json::to_value(tab).unwrap_or_else(|_| json!({}));
+    let Some(fields) = row.as_object_mut() else {
+        return row;
+    };
+    fields.remove("groupId");
+    fields.remove("groupName");
+    fields.remove("groupKind");
+    fields.insert(
+        "group".into(),
+        json!({ "id": tab.group_id, "name": tab.group_name, "kind": tab.group_kind }),
+    );
+    fields.remove("heldBy");
+    if let Some(label) = tab.held_by.as_deref() {
+        let mut held_by = json!({ "label": label });
+        if let Some(task) = held_from {
+            held_by["taskId"] = json!(task);
+            if let Some(title) = title_of(task) {
+                held_by["taskTitle"] = json!(title);
+            }
+        }
+        fields.insert("heldBy".into(), held_by);
+        fields.insert("heldByLabel".into(), json!(label));
+    }
+    if tab.task_id != caller.task_id {
+        let mut shared_from = json!({ "taskId": tab.task_id });
+        if let Some(title) = title_of(&tab.task_id) {
+            shared_from["taskTitle"] = json!(title);
+        }
+        fields.insert("sharedFrom".into(), shared_from);
+    }
+    row
+}
+
+/// `agent_row` for the tab a verb just touched, read fresh so the hold it
+/// took shows. Falls back to the state the verb returned if the tab has gone.
+pub fn row_for_agent<R: Runtime>(
+    app: &AppHandle<R>,
+    tabs: &BrowserTabs,
+    caller: &Caller,
+    tab: &BrowserTab,
+) -> Value {
+    let current = tabs
+        .snapshot_held(None, lock_active_tab(app))
+        .into_iter()
+        .find(|candidate| candidate.id == tab.id)
+        .unwrap_or_else(|| tab.clone());
+    agent_row(app, tabs, caller, &current)
 }
 
 #[cfg(test)]

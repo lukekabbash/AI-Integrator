@@ -64,9 +64,11 @@ Rules:
 4. The broker is the sole writer for shared task state; agents own only their run scratch/results.
 5. Credentials remain in vendor/OS stores and never cross into the renderer or coordination ledger.
 6. Local IPC is process-bound or authenticated. v1 exposes no unauthenticated TCP/LAN listener.
-7. In-app browser profiles are native-owned and task-scoped by default. Standalone chat uses the
-   dedicated `Chat/Main Browser` identity; Shared identity is an explicit, restart-bound choice.
-   The renderer receives cookie and saved-login metadata, never cookie values or passwords.
+7. In-app browser profiles are native-owned and group-scoped: one identity per project (every
+   task in a project shares it); standalone chats share the `Chat` identity; Shared is an
+   explicit, restart-bound choice. Older per-task jars stay listable and clearable but new tabs
+   never use them. The renderer receives cookie and saved-login metadata, never cookie values or
+   passwords.
 
 ## 4. Shared and platform-specific implementation
 

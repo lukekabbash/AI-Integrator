@@ -17117,6 +17117,26 @@ button.explain-fallback-step:hover .explain-fallback-role {
 .browser-sites-list li:last-child {
   border-bottom: 0;
 }
+.browser-legacy-buckets {
+  margin-top: 8px;
+}
+.browser-legacy-list li {
+  justify-content: space-between;
+  gap: 12px;
+}
+.browser-legacy-list li > span {
+  flex: 1;
+}
+.browser-identity-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  background: color-mix(in srgb, var(--color-accent) 8%, transparent);
+}
+.browser-identity-notice > button {
+  flex: none;
+}
 .browser-sites-list span {
   min-width: 0;
   display: flex;

@@ -628,6 +628,8 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_list",
             "browser_close",
             "browser_focus",
+            "browser_pop_out",
+            "browser_dock",
             "browser_fill_login",
             "browser_cookies",
             "browser_navigate",
@@ -651,6 +653,8 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_list",
             "browser_close",
             "browser_focus",
+            "browser_pop_out",
+            "browser_dock",
             "browser_fill_login",
             "browser_cookies",
             "browser_navigate",
@@ -675,6 +679,8 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_list",
             "browser_close",
             "browser_focus",
+            "browser_pop_out",
+            "browser_dock",
             "browser_fill_login",
             "browser_cookies",
             "browser_navigate",
@@ -700,6 +706,8 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_close",
             "browser_grant",
             "browser_focus",
+            "browser_pop_out",
+            "browser_dock",
             "browser_fill_login",
             "browser_cookies",
             "browser_navigate",
@@ -732,6 +740,8 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_close",
             "browser_grant",
             "browser_focus",
+            "browser_pop_out",
+            "browser_dock",
             "browser_fill_login",
             "browser_cookies",
             "browser_navigate",
@@ -1143,18 +1153,18 @@ async fn dispatch_tool(
             // A delegated child browses too, inside its parent's task and owning
             // whatever it opens. Its scope is its delegation id, so the parent
             // task comes from the delegation record rather than from the child.
-            let caller = match session.role.as_str() {
+            let (task_id, delegation_id) = match session.role.as_str() {
                 "child" => {
                     let delegation_id = child_scope(session)?;
                     let state = app.state::<AppState>();
                     let delegation = state.store.get_delegation(delegation_id)?;
-                    crate::browser::Caller {
-                        task_id: delegation.parent_task_id.to_string(),
-                        delegation_id: Some(delegation_id.to_string()),
-                    }
+                    (
+                        delegation.parent_task_id.to_string(),
+                        Some(delegation_id.to_string()),
+                    )
                 }
-                _ => crate::browser::Caller {
-                    task_id: session
+                _ => (
+                    session
                         .scope
                         .parse::<TaskId>()
                         .map_err(|_| {
@@ -1163,8 +1173,17 @@ async fn dispatch_tool(
                             )
                         })?
                         .to_string(),
-                    delegation_id: None,
-                },
+                    None,
+                ),
+            };
+            // The group is the task's, so a child inherits its parent's shared
+            // tabs along with its task.
+            let tabs = app.state::<std::sync::Arc<crate::browser::BrowserTabs>>();
+            let group_id = crate::browser::groups::group_for_task(app, &tabs, &task_id).id;
+            let caller = crate::browser::Caller {
+                task_id,
+                delegation_id,
+                group_id,
             };
             browser_tool(app, caller, method, params).await
         }
@@ -1545,9 +1564,11 @@ async fn browser_tool(
     method: &str,
     params: &Value,
 ) -> Result<Value> {
-    use crate::browser::{BrowserTabs, agent_invoke, tabs_for_caller};
+    use crate::browser::{BrowserTabs, agent_invoke, row_for_agent, tabs_for_caller};
 
     let tabs = app.state::<std::sync::Arc<BrowserTabs>>();
+    // Every verb that hands back a tab uses the `browser_list` row shape.
+    let row = |tab: &crate::browser::BrowserTab| row_for_agent(app, &tabs, &caller, tab);
     let text = |key: &str| -> Option<String> {
         params
             .get(key)
@@ -1577,8 +1598,12 @@ async fn browser_tool(
     match method {
         "browser_open" => {
             let url = text("url");
-            let tab = crate::browser::open_for_agent(app, &tabs, &caller, url).await?;
-            Ok(json!({ "tab": tab }))
+            let popped_out = params
+                .get("poppedOut")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let tab = crate::browser::open_for_agent(app, &tabs, &caller, url, popped_out).await?;
+            Ok(json!({ "tab": row(&tab) }))
         }
         "browser_list" => Ok(json!({ "tabs": tabs_for_caller(app, &tabs, &caller) })),
         "browser_close" => {
@@ -1586,12 +1611,24 @@ async fn browser_tool(
             crate::browser::close_for_agent(app, &tabs, &caller, &id).await?;
             Ok(json!({ "closed": id, "tabs": tabs_for_caller(app, &tabs, &caller) }))
         }
+        "browser_pop_out" | "browser_dock" => {
+            let id = tab_id()?;
+            let tab = crate::browser::set_popped_out_for_agent(
+                app,
+                &tabs,
+                &caller,
+                &id,
+                method == "browser_pop_out",
+            )
+            .await?;
+            Ok(json!({ "tab": row(&tab) }))
+        }
         "browser_navigate" => {
             let id = tab_id()?;
             let url = text("url")
                 .ok_or_else(|| IntegratorError::InvalidInput("url is required".into()))?;
             let tab = crate::browser::navigate_for_agent(app, &tabs, &caller, &id, &url).await?;
-            Ok(json!({ "tab": tab }))
+            Ok(json!({ "tab": row(&tab) }))
         }
         "browser_grant" => {
             let id = tab_id()?;
@@ -1618,7 +1655,7 @@ async fn browser_tool(
                 ));
             }
             let tab = crate::browser::grant_for_agent(app, &tabs, &caller, &id, &delegation, mode)?;
-            Ok(json!({ "tab": tab }))
+            Ok(json!({ "tab": row(&tab) }))
         }
         "browser_focus" => {
             let id = tab_id()?;
@@ -4324,6 +4361,8 @@ mod tests {
                 "browser_close",
                 "browser_grant",
                 "browser_focus",
+                "browser_pop_out",
+                "browser_dock",
                 "browser_fill_login",
                 "browser_cookies",
                 "browser_navigate",
@@ -4391,6 +4430,8 @@ mod tests {
                 "browser_close",
                 "browser_grant",
                 "browser_focus",
+                "browser_pop_out",
+                "browser_dock",
                 "browser_fill_login",
                 "browser_cookies",
                 "browser_navigate",
@@ -4423,6 +4464,8 @@ mod tests {
                 "browser_list",
                 "browser_close",
                 "browser_focus",
+                "browser_pop_out",
+                "browser_dock",
                 "browser_fill_login",
                 "browser_cookies",
                 "browser_navigate",
@@ -4453,6 +4496,8 @@ mod tests {
                 "browser_list",
                 "browser_close",
                 "browser_focus",
+                "browser_pop_out",
+                "browser_dock",
                 "browser_fill_login",
                 "browser_cookies",
                 "browser_navigate",

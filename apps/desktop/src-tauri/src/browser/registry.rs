@@ -76,6 +76,10 @@ pub(crate) struct Tab {
     /// be in one state at a time, so two agents taking turns on one tab undo
     /// each other's work; this is what lets the second one notice.
     pub(crate) held: Option<(String, std::time::Instant)>,
+    /// The task whose agent last held this tab. A shared tab may be driven
+    /// from another task in the group, so the label alone does not say whose
+    /// "main agent" it was.
+    pub(crate) held_task: Option<String>,
     /// When a real hand last touched the page. Input inside a child webview
     /// never reaches the app, so this arrives on the back of whatever the guest
     /// last answered — see `userIdleMs` in `guest.js`.
@@ -145,12 +149,16 @@ pub enum GrantMode {
 }
 
 /// Who is asking. A tab is reachable when the task matches and either the
-/// caller owns it or has been granted it.
+/// caller owns it or has been granted it — or when it is popped out inside the
+/// caller's own group.
 #[derive(Clone, Debug)]
 pub struct Caller {
     pub task_id: String,
     /// Set when the caller is a delegated child rather than the orchestrator.
     pub delegation_id: Option<String>,
+    /// The task's group (its project, or the one Chat group). Children carry
+    /// the parent task's group, so they inherit its shared tabs.
+    pub group_id: String,
 }
 
 impl Caller {
@@ -278,9 +286,10 @@ impl BrowserTabs {
     }
 
     /// Every tab this caller may address: the task's own, minus the ones a
-    /// sibling child opened, plus anything granted to it.
+    /// sibling child opened, plus anything granted to it, plus the tabs other
+    /// tasks in the same group have popped out.
     pub(crate) fn visible_to(&self, caller: &Caller, user_hold: bool) -> Vec<BrowserTab> {
-        self.snapshot_held(Some(&caller.task_id), user_hold)
+        self.snapshot_held(None, user_hold)
             .into_iter()
             .filter(|tab| self.reach(&tab.id, caller).is_some())
             .collect()
@@ -291,7 +300,10 @@ impl BrowserTabs {
         let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
         let tab = tabs.get(id)?;
         if tab.state.task_id != caller.task_id {
-            return None;
+            // Popping out shares a tab with the whole group; anything else in
+            // another task is invisible.
+            return (tab.state.popped_out && tab.state.group_id == caller.group_id)
+                .then_some(GrantMode::Drive);
         }
         match (&tab.state.delegation_id, &caller.delegation_id) {
             // The orchestrator reaches its own tabs and any child's.
@@ -344,6 +356,26 @@ impl BrowserTabs {
             tab.held = Some((holder.to_string(), now));
             tab.touched = now;
         }
+    }
+
+    /// `mark_held` for a broker caller, remembering which task it drove from.
+    pub(crate) fn mark_held_by(&self, id: &str, caller: &Caller) {
+        self.mark_held(id, &caller.label());
+        let mut tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(tab) = tabs.get_mut(id) {
+            tab.held_task = Some(caller.task_id.clone());
+        }
+    }
+
+    /// Who is driving this tab right now and from which task, if anyone.
+    pub(crate) fn holder(&self, id: &str, user_hold: bool) -> Option<(String, Option<String>)> {
+        let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        let tab = tabs.get(id)?;
+        let who = holder_of(tab, user_hold)?;
+        let task = (who != USER_HOLDER)
+            .then(|| tab.held_task.clone())
+            .flatten();
+        Some((who, task))
     }
 
     /// Records that the person touched this page `idle_ms` ago, as the guest
@@ -422,23 +454,41 @@ impl BrowserTabs {
         }
     }
 
-    /// This task's loaded tabs that nothing is looking at, oldest touch first —
-    /// the order the cap puts them back to sleep in.
-    pub(crate) fn sleepable(&self, task_id: &str, keep: &str) -> Vec<String> {
+    /// This group's loaded tabs that nothing is looking at, oldest touch first —
+    /// the order the cap puts them back to sleep in. `None` spans every group,
+    /// for the total cap. A parked popped-out tab is as invisible as a parked
+    /// pane tab, so it is a candidate; a tab someone drove inside the hold
+    /// window is not.
+    pub(crate) fn sleepable(&self, group_id: Option<&str>, keep: &str) -> Vec<String> {
         let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
         let mut candidates: Vec<(std::time::Instant, String)> = tabs
             .values()
             .filter(|tab| {
-                tab.state.task_id == task_id
+                group_id.is_none_or(|group| tab.state.group_id == group)
                     && tab.state.id != keep
+                    // `hidden && !sleeping` is exactly `!on_screen`: the
+                    // renderer's placement is the only honest read of that.
                     && !tab.state.sleeping
                     && tab.state.hidden
-                    && !tab.state.popped_out
+                    && tab
+                        .held
+                        .as_ref()
+                        .is_none_or(|(_, at)| at.elapsed() > HOLD_TTL)
             })
             .map(|tab| (tab.touched, tab.state.id.clone()))
             .collect();
         candidates.sort_by_key(|(touched, _)| *touched);
         candidates.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// How many loaded tabs this group holds, or every group when `None`.
+    pub(crate) fn live_count(&self, group_id: Option<&str>) -> usize {
+        let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        tabs.values()
+            .filter(|tab| {
+                !tab.state.sleeping && group_id.is_none_or(|group| tab.state.group_id == group)
+            })
+            .count()
     }
 
     /// Whether the renderer is currently giving this tab a rectangle. A parked
@@ -611,6 +661,12 @@ impl BrowserTabs {
     pub(crate) fn label_for(&self, id: &str) -> Option<String> {
         let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
         tabs.get(id).map(|tab| tab.label.clone())
+    }
+
+    /// One tab's state as the renderer would see it, if it is still open.
+    pub(crate) fn tab(&self, id: &str) -> Option<BrowserTab> {
+        let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        tabs.get(id).map(|tab| tab.state.clone())
     }
 
     pub(crate) fn task_of(&self, id: &str) -> Option<String> {

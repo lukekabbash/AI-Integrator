@@ -32,7 +32,7 @@ use session_store::LocalStore;
 use super::{invalid, unavailable};
 
 /// Where saved logins live in the OS credential store.
-const SERVICE: &str = "dev.aiintegrator.browser-login";
+pub(super) const SERVICE: &str = "dev.aiintegrator.browser-login";
 /// The manifest of what is saved, kept in the app's own settings.
 pub const SAVED_LOGINS_SETTING: &str = "settings.browser.savedLogins";
 /// Per-origin permission for an agent to sign in without asking. Suffixed with
@@ -81,7 +81,7 @@ impl SavedLogin {
 
 /// The account a secret is filed under. Bucket first, so one origin can hold a
 /// different login per task without either shadowing the other.
-fn account_key(bucket_id: &str, origin: &str, username: &str) -> String {
+pub(super) fn account_key(bucket_id: &str, origin: &str, username: &str) -> String {
     format!("{bucket_id} {origin} {username}")
 }
 
@@ -141,7 +141,7 @@ fn valid_login_fields(entry: &SavedLogin) -> bool {
         && entry.last_used_at.as_deref().is_none_or(valid_timestamp)
 }
 
-fn manifest_at(store: &LocalStore) -> Vec<SavedLogin> {
+pub(super) fn manifest_at(store: &LocalStore) -> Vec<SavedLogin> {
     raw_manifest_at(store)
         .into_iter()
         .take(MAX_SAVED_LOGINS)
@@ -158,7 +158,10 @@ fn manifest<R: Runtime>(app: &AppHandle<R>) -> Vec<SavedLogin> {
         .unwrap_or_default()
 }
 
-fn write_manifest_at(store: &LocalStore, entries: &[SavedLogin]) -> Result<(), CommandError> {
+pub(super) fn write_manifest_at(
+    store: &LocalStore,
+    entries: &[SavedLogin],
+) -> Result<(), CommandError> {
     if entries.len() > MAX_SAVED_LOGINS
         || entries.iter().any(|entry| {
             !valid_login_fields(entry)
@@ -200,13 +203,19 @@ fn legacy_destination(store: &LocalStore, legacy: &str) -> String {
                 .is_some_and(|path| path.to_string_lossy() == legacy)
         })
         .max_by_key(|task| task.updated_at)
-        .map(|task| super::identity::task_bucket_id(task.id))
+        .map(|task| {
+            super::identity::bucket_for_task_in_store(
+                store,
+                super::BrowserIdentityScope::Task,
+                &task.id.to_string(),
+            )
+        })
         // Unknown legacy project entries stay recoverable in Shared instead of
-        // being silently made available to an arbitrary task.
+        // being silently made available to an arbitrary group.
         .unwrap_or_else(|| super::identity::SHARED_BUCKET_ID.to_string())
 }
 
-fn login_recency(entry: &SavedLogin) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+pub(super) fn login_recency(entry: &SavedLogin) -> Option<chrono::DateTime<chrono::FixedOffset>> {
     chrono::DateTime::parse_from_rfc3339(entry.last_used_at.as_deref().unwrap_or(&entry.saved_at))
         .ok()
 }
@@ -725,11 +734,12 @@ fn login_bucket<R: Runtime>(
     tabs: &super::BrowserTabs,
     task_id: &str,
 ) -> Result<String, CommandError> {
-    let state = app
-        .try_state::<crate::state::AppState>()
-        .ok_or_else(|| unavailable("the app is not ready"))?;
+    if app.try_state::<crate::state::AppState>().is_none() {
+        return Err(unavailable("the app is not ready"));
+    }
     Ok(super::identity::bucket_for_task(
-        &state.store,
+        app,
+        tabs,
         tabs.identity_scope(),
         task_id,
     ))
