@@ -461,3 +461,66 @@
   font-size: 11px;
   line-height: 1.45;
 }
+
+/* Chromeless at the OS level, so the window edges are drawn by us: a thin
+   invisible frame that starts a native resize drag. */
+.browser-window-resize {
+  position: fixed;
+  z-index: 40;
+}
+.browser-window-resize[data-edge="North"],
+.browser-window-resize[data-edge="South"] {
+  left: 6px;
+  right: 6px;
+  height: 5px;
+  cursor: ns-resize;
+}
+.browser-window-resize[data-edge="East"],
+.browser-window-resize[data-edge="West"] {
+  top: 6px;
+  bottom: 6px;
+  width: 5px;
+  cursor: ew-resize;
+}
+.browser-window-resize[data-edge="North"] {
+  top: 0;
+}
+.browser-window-resize[data-edge="South"] {
+  bottom: 0;
+}
+.browser-window-resize[data-edge="East"] {
+  right: 0;
+}
+.browser-window-resize[data-edge="West"] {
+  left: 0;
+}
+.browser-window-resize[data-edge$="East"],
+.browser-window-resize[data-edge$="West"] {
+  width: 8px;
+  height: 8px;
+}
+.browser-window-resize[data-edge="NorthEast"] {
+  top: 0;
+  right: 0;
+  cursor: nesw-resize;
+}
+.browser-window-resize[data-edge="NorthWest"] {
+  top: 0;
+  left: 0;
+  cursor: nwse-resize;
+}
+.browser-window-resize[data-edge="SouthEast"] {
+  bottom: 0;
+  right: 0;
+  cursor: nwse-resize;
+}
+.browser-window-resize[data-edge="SouthWest"] {
+  bottom: 0;
+  left: 0;
+  cursor: nesw-resize;
+}
+
+/* A tab dragged from another window is over this one: the strip says so. */
+.browser-window-tabs[data-drop-target="true"] {
+  box-shadow: inset 0 -2px 0 var(--color-accent);
+}

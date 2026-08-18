@@ -1493,6 +1493,23 @@ export interface BrowserContextAction {
   text?: string;
 }
 
+/**
+ * Where a tab is being moved: back to the main window (its task's pane), or
+ * into a browser window — a named one, or a new one when `label` is absent.
+ * `index` is the strip position (appended when absent); `at` is where a new
+ * window opens, in logical screen pixels.
+ */
+export type BrowserMoveTarget =
+  | { kind: "main" }
+  | { kind: "window"; label?: string; index?: number; at?: { x: number; y: number } };
+
+/** What is under a dragged tab: `"main"`, a browser window's label, or nothing. */
+export interface BrowserDragHit {
+  target: string | null;
+  /** Over the top band of a browser window, where its strip is. */
+  strip: boolean;
+}
+
 export interface BrowserBridge {
   localServers(refresh?: boolean): Promise<LocalServer[]>;
   identityOverview(): Promise<BrowserIdentityOverview>;
@@ -1505,8 +1522,7 @@ export interface BrowserBridge {
   list(taskId: string): Promise<BrowserTab[]>;
   /** Brings back the tabs this chat had open, asleep until one is shown. */
   restore(taskId: string): Promise<BrowserTab[]>;
-  /** The popped-out tabs that belong to the calling window: a task window's
-   *  own, or every chat's for the shared chat window. */
+  /** The tabs that live in the calling browser window, in strip order. */
   poppedOutTabs(): Promise<BrowserTab[]>;
   /** True when closed; false when recent agent work kept it alive. */
   close(taskId: string, tabId: string): Promise<boolean>;
@@ -1532,6 +1548,21 @@ export interface BrowserBridge {
    *  rather than a field on the tab: the snapshot streams on every change. */
   poster(taskId: string, tabId: string): Promise<string | null>;
   setPoppedOut(taskId: string, tabId: string, poppedOut: boolean): Promise<BrowserTab>;
+  /** Moves a tab into a browser window, a new one, or back to its pane; the page survives. */
+  moveTab(taskId: string, tabId: string, target: BrowserMoveTarget): Promise<BrowserTab>;
+  /** Rewrites the calling browser window's strip order. */
+  reorderWindow(tabIds: string[]): Promise<void>;
+  /**
+   * Which window is under a dragged tab. `x`, `y` are physical screen pixels
+   * (`screenX * devicePixelRatio`). Also tells the window under the pointer
+   * (`onDragOver`) and the one just left (`onDragLeave`).
+   */
+  dragHitTest(x: number, y: number): Promise<BrowserDragHit>;
+  /** The drag ended: whatever window was under it hears `onDragLeave`. */
+  dragEnd(): Promise<void>;
+  /** A tab is being dragged over this window; `x` in this window's logical px. */
+  onDragOver(listener: (event: { label: string; x: number }) => void): Promise<() => void>;
+  onDragLeave(listener: () => void): Promise<() => void>;
   subscribe(listener: () => void): Promise<() => void>;
   /** An agent asking that a tab be brought to the front for the user to watch. */
   onFocusRequest(
@@ -4829,6 +4860,21 @@ function nativeBrowserBridge(): BrowserBridge | undefined {
     poster: (taskId, tabId) => nativeInvoke<string | null>("browser_tab_poster", { taskId, tabId }),
     setPoppedOut: (taskId, tabId, poppedOut) =>
       nativeInvoke<BrowserTab>("browser_tab_set_popped_out", { taskId, tabId, poppedOut }),
+    moveTab: (taskId, tabId, target) =>
+      nativeInvoke<BrowserTab>("browser_tab_move", { taskId, tabId, target }),
+    reorderWindow: (tabIds) => nativeInvoke<void>("browser_window_reorder", { tabIds }),
+    dragHitTest: (x, y) => nativeInvoke<BrowserDragHit>("browser_drag_hit_test", { x, y }),
+    dragEnd: () => nativeInvoke<void>("browser_drag_end"),
+    onDragOver: async (listener) => {
+      const { listen } = await import("@tauri-apps/api/event");
+      return listen<{ label: string; x: number }>("browser://drag-over", (event) =>
+        listener(event.payload),
+      );
+    },
+    onDragLeave: async (listener) => {
+      const { listen } = await import("@tauri-apps/api/event");
+      return listen("browser://drag-leave", () => listener());
+    },
     subscribe: async (listener) => {
       const { listen } = await import("@tauri-apps/api/event");
       return listen("browser://changed", () => listener());

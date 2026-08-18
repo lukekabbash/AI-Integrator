@@ -137,7 +137,7 @@ fn context_actions_are_authenticated_task_scoped_and_web_only() {
 }
 
 /// The group a test task belongs to, without a store: task ids starting with
-/// `chat` are chats (mirroring `popout::task_is_chat` for the fixtures here),
+/// `chat` are chats (mirroring `groups::resolve_group` for the fixtures here),
 /// everything else is a path group over the task string.
 fn test_group(task: &str) -> Group {
     if task.starts_with("chat") {
@@ -151,6 +151,42 @@ fn test_group(task: &str) -> Group {
     }
 }
 
+/// One registry entry, visible in the pane, for `(id, task, owner)`.
+pub(super) fn fixture_tab(id: &str, task: &str, owner: Option<&str>) -> Tab {
+    let group = test_group(task);
+    Tab {
+        state: BrowserTab {
+            id: id.to_string(),
+            task_id: task.to_string(),
+            group_id: group.id,
+            group_name: group.name,
+            group_kind: group.kind,
+            url: "about:blank".into(),
+            title: String::new(),
+            favicon: None,
+            loading: false,
+            popped_out: false,
+            hidden: false,
+            held_by: None,
+            agent_protected_until: None,
+            sleeping: false,
+            delegation_id: owner.map(str::to_owned),
+        },
+        label: format!("browser-{id}"),
+        window: None,
+        order: 0,
+        placement_slot: Some(PlacementSlot::Pane),
+        held: None,
+        held_task: None,
+        user_at: None,
+        grants: HashMap::new(),
+        generation: 0,
+        touched: std::time::Instant::now(),
+        credential_at: None,
+        poster: None,
+    }
+}
+
 /// A registry holding one tab per `(id, task, owner)`, where `owner` is the
 /// delegated child that opened it, or `None` for the orchestrator's own.
 fn registry(rows: &[(&str, &str, Option<&str>)]) -> BrowserTabs {
@@ -158,39 +194,7 @@ fn registry(rows: &[(&str, &str, Option<&str>)]) -> BrowserTabs {
     {
         let mut guard = tabs.tabs.lock().unwrap();
         for (id, task, owner) in rows {
-            let group = test_group(task);
-            guard.insert(
-                (*id).to_string(),
-                Tab {
-                    state: BrowserTab {
-                        id: (*id).to_string(),
-                        task_id: (*task).to_string(),
-                        group_id: group.id,
-                        group_name: group.name,
-                        group_kind: group.kind,
-                        url: "about:blank".into(),
-                        title: String::new(),
-                        favicon: None,
-                        loading: false,
-                        popped_out: false,
-                        hidden: false,
-                        held_by: None,
-                        agent_protected_until: None,
-                        sleeping: false,
-                        delegation_id: owner.map(str::to_owned),
-                    },
-                    label: format!("browser-{id}"),
-                    placement_slot: Some(PlacementSlot::Pane),
-                    held: None,
-                    held_task: None,
-                    user_at: None,
-                    grants: HashMap::new(),
-                    generation: 0,
-                    touched: std::time::Instant::now(),
-                    credential_at: None,
-                    poster: None,
-                },
-            );
+            guard.insert((*id).to_string(), fixture_tab(id, task, *owner));
         }
     }
     tabs
@@ -199,7 +203,7 @@ fn registry(rows: &[(&str, &str, Option<&str>)]) -> BrowserTabs {
 #[test]
 fn registry_fixture_groups_match_the_chat_rule() {
     // The fixture's Chat kind is decided by the task string the way
-    // `popout::task_is_chat` decides it from the store: chats and only chats
+    // `groups::resolve_group` decides it from the store: chats and only chats
     // land in the Chat group. Everything else keeps a group of its own.
     let tabs = registry(&[
         ("tab-1", "chat-a", None),
@@ -256,7 +260,7 @@ fn snapshots_take_the_cached_group_name() {
 
 #[test]
 fn store_backed_groups_agree_with_task_kind() {
-    // Same rule `popout::task_is_chat` applies from the store: a task is in
+    // Same rule `groups::resolve_group` applies from the store: a task is in
     // the Chat group exactly when its kind is Chat.
     let store = session_store::LocalStore::open_in_memory().expect("open store");
     let make = |kind, path: Option<std::path::PathBuf>| {
@@ -318,22 +322,217 @@ fn visible_peers_stay_inside_one_host_slot() {
         ("popout-peer", "task-a", None),
         ("other-task", "task-b", None),
     ]);
-    tabs.update("popout-peer", |tab| tab.popped_out = true);
-    tabs.update("other-task", |tab| tab.popped_out = false);
+    tabs.set_window("popout-peer", Some("browser-window-1"), None);
 
     assert_eq!(
         tabs.visible_peers("task-a", "keep", false, PlacementSlot::Pane),
         ["main-peer", "other-task"]
     );
-    assert_eq!(
-        tabs.visible_peers("task-a", "keep", true, PlacementSlot::Pane),
-        ["popout-peer"]
+    // `keep` is in main, so its popped-out peers are those of no window at
+    // all: a pop-out window's peers are asked for from inside it.
+    assert!(
+        tabs.visible_peers("task-a", "keep", true, PlacementSlot::Pane)
+            .is_empty()
     );
     tabs.set_placement("main-peer", Some(PlacementSlot::Deck));
     assert_eq!(
         tabs.visible_peers("task-a", "keep", false, PlacementSlot::Pane),
         ["other-task"]
     );
+}
+
+#[test]
+fn peers_in_a_popout_span_tasks_but_never_windows() {
+    // A window is a bag of tabs from any task; the one rectangle they compete
+    // for is the window's, so the peers of a popped tab are its window-mates
+    // whatever their task, and never a tab in another window.
+    let tabs = registry(&[
+        ("keep", "task-a", None),
+        ("mate-other-task", "task-b", None),
+        ("mate-same-task", "task-a", None),
+        ("elsewhere", "task-a", None),
+        ("in-main", "task-a", None),
+    ]);
+    for id in ["keep", "mate-other-task", "mate-same-task"] {
+        tabs.set_window(id, Some("browser-window-1"), None);
+    }
+    tabs.set_window("elsewhere", Some("browser-window-2"), None);
+    assert_eq!(
+        tabs.visible_peers("task-a", "keep", true, PlacementSlot::Pane),
+        ["mate-other-task", "mate-same-task"]
+    );
+    assert_eq!(
+        tabs.visible_peers("task-a", "elsewhere", true, PlacementSlot::Pane),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn snapshots_by_window_order() {
+    let tabs = registry(&[
+        ("tab-10", "task-a", None),
+        ("tab-2", "task-b", None),
+        ("tab-9", "task-a", None),
+        ("tab-3", "task-a", None),
+    ]);
+    // Appended one at a time: each takes the next order.
+    tabs.set_window("tab-10", Some("browser-window-1"), None);
+    tabs.set_window("tab-2", Some("browser-window-1"), None);
+    tabs.set_window("tab-9", Some("browser-window-1"), None);
+    tabs.set_window("tab-3", Some("browser-window-2"), None);
+    let ids = |label: &str| -> Vec<String> {
+        tabs.snapshot_window(label)
+            .into_iter()
+            .map(|tab| tab.id)
+            .collect()
+    };
+    assert_eq!(ids("browser-window-1"), ["tab-10", "tab-2", "tab-9"]);
+    assert_eq!(ids("browser-window-2"), ["tab-3"]);
+    assert!(ids("browser-window-3").is_empty());
+    assert_eq!(tabs.next_order("browser-window-1"), 3);
+    assert_eq!(tabs.next_order("browser-window-3"), 0);
+    // An explicit order wins; ties break by creation, not by string.
+    tabs.set_window("tab-9", Some("browser-window-1"), Some(0));
+    tabs.set_window("tab-2", Some("browser-window-1"), Some(0));
+    assert_eq!(ids("browser-window-1"), ["tab-2", "tab-9", "tab-10"]);
+    // Every popped tab reads as popped, and docking clears both.
+    assert!(tabs.tab("tab-2").unwrap().popped_out);
+    tabs.set_window("tab-2", None, None);
+    let docked = tabs.tab("tab-2").unwrap();
+    assert!(!docked.popped_out);
+    assert_eq!(tabs.window_of("tab-2"), None);
+    assert_eq!(ids("browser-window-1"), ["tab-9", "tab-10"]);
+}
+
+#[test]
+fn reorder_renumbers_densely() {
+    let tabs = registry(&[
+        ("tab-1", "task-a", None),
+        ("tab-2", "task-a", None),
+        ("tab-3", "task-b", None),
+        ("tab-4", "task-b", None),
+    ]);
+    for id in ["tab-1", "tab-2", "tab-3"] {
+        tabs.set_window(id, Some("browser-window-1"), None);
+    }
+    tabs.set_window("tab-4", Some("browser-window-2"), None);
+    let orders = || -> Vec<(String, u32)> {
+        // Snapshot before taking the lock: `snapshot_window` locks too.
+        let in_window = tabs.snapshot_window("browser-window-1");
+        let guard = tabs.tabs.lock().unwrap();
+        let mut list: Vec<(String, u32)> = in_window
+            .into_iter()
+            .map(|tab| (tab.id.clone(), guard[&tab.id].order))
+            .collect();
+        list.sort();
+        list
+    };
+    assert!(tabs.reorder_window(
+        "browser-window-1",
+        &[
+            "tab-3".to_string(),
+            "tab-1".to_string(),
+            "tab-2".to_string()
+        ]
+    ));
+    assert_eq!(
+        orders(),
+        [
+            ("tab-1".to_string(), 1),
+            ("tab-2".to_string(), 2),
+            ("tab-3".to_string(), 0)
+        ]
+    );
+    // A partial list leads; the rest follow in their old order.
+    assert!(tabs.reorder_window("browser-window-1", &["tab-2".to_string()]));
+    assert_eq!(
+        orders(),
+        [
+            ("tab-1".to_string(), 2),
+            ("tab-2".to_string(), 0),
+            ("tab-3".to_string(), 1)
+        ]
+    );
+    // A tab from another window, or none, refuses the whole reorder.
+    assert!(!tabs.reorder_window("browser-window-1", &["tab-4".to_string()]));
+    assert!(!tabs.reorder_window("browser-window-1", &["tab-9".to_string()]));
+    assert_eq!(
+        orders(),
+        [
+            ("tab-1".to_string(), 2),
+            ("tab-2".to_string(), 0),
+            ("tab-3".to_string(), 1)
+        ]
+    );
+}
+
+#[test]
+fn preferred_window_prefers_same_group_then_mru() {
+    let tabs = registry(&[
+        ("tab-a", "task-a", None),
+        ("tab-b", "task-b", None),
+        ("tab-c", "chat-1", None),
+    ]);
+    let group_a = test_group("task-a").id;
+    let group_b = test_group("task-b").id;
+    // No window yet: open one.
+    assert_eq!(tabs.preferred_window_for(&group_a), None);
+    tabs.set_window("tab-a", Some("browser-window-1"), None);
+    tabs.set_window("tab-b", Some("browser-window-2"), None);
+    tabs.note_window_focus("browser-window-1");
+    tabs.note_window_focus("browser-window-2");
+    // The window holding the group wins even when another is in front.
+    assert_eq!(
+        tabs.preferred_window_for(&group_a).as_deref(),
+        Some("browser-window-1")
+    );
+    assert_eq!(
+        tabs.preferred_window_for(&group_b).as_deref(),
+        Some("browser-window-2")
+    );
+    // A group in no window goes to the one most recently in front.
+    assert_eq!(
+        tabs.preferred_window_for(groups::CHAT_GROUP_ID).as_deref(),
+        Some("browser-window-2")
+    );
+    tabs.note_window_focus("browser-window-1");
+    assert_eq!(
+        tabs.preferred_window_for(groups::CHAT_GROUP_ID).as_deref(),
+        Some("browser-window-1")
+    );
+    // A window that closed drops out of the running.
+    tabs.forget_window("browser-window-1");
+    assert_eq!(
+        tabs.preferred_window_for(&group_a).as_deref(),
+        Some("browser-window-2")
+    );
+    assert_eq!(tabs.windows_by_focus(), ["browser-window-2"]);
+}
+
+#[test]
+fn moving_between_windows_keeps_group_and_task() {
+    // The registry half of `move_tab`: the window changes, nothing about
+    // whose tab it is does — the reach rules keep reading the same answer.
+    let tabs = registry(&[("tab-a", "task-a", None), ("tab-b", "task-b", None)]);
+    let before = tabs.tab("tab-a").unwrap();
+    tabs.set_window("tab-a", Some("browser-window-1"), None);
+    tabs.set_window("tab-a", Some("browser-window-2"), Some(0));
+    let after = tabs.tab("tab-a").unwrap();
+    assert_eq!(after.task_id, before.task_id);
+    assert_eq!(after.group_id, before.group_id);
+    assert_eq!(after.id, before.id);
+    assert!(after.popped_out);
+    assert_eq!(tabs.window_of("tab-a").as_deref(), Some("browser-window-2"));
+    assert!(tabs.window_is_empty("browser-window-1"));
+    assert!(tabs.window_holds_task("browser-window-2", "task-a"));
+    assert!(!tabs.window_holds_task("browser-window-2", "task-b"));
+    // What a close does to a window: every tab back to main, none left.
+    tabs.set_window("tab-b", Some("browser-window-2"), None);
+    for tab in tabs.snapshot_window("browser-window-2") {
+        tabs.set_window(&tab.id, None, None);
+    }
+    assert!(tabs.window_is_empty("browser-window-2"));
+    assert!(tabs.snapshot(None).iter().all(|tab| !tab.popped_out));
 }
 
 #[test]
@@ -376,14 +575,28 @@ fn newer_main_window_claim_prevents_an_old_chat_from_returning() {
 }
 
 #[test]
-fn placement_claims_keep_slots_and_popout_tasks_independent() {
-    let tabs = registry(&[("tab-a", "task-a", None), ("tab-b", "task-b", None)]);
+fn placement_claims_keep_slots_and_popout_windows_independent() {
+    let tabs = registry(&[
+        ("tab-a", "task-a", None),
+        ("tab-b", "task-b", None),
+        ("tab-c", "task-a", None),
+    ]);
+    tabs.set_window("tab-a", Some("browser-window-1"), None);
+    tabs.set_window("tab-b", Some("browser-window-2"), None);
+    tabs.set_window("tab-c", Some("browser-window-2"), None);
 
     assert!(tabs.claim_placement("task-a", "tab-a", false, PlacementSlot::Pane, 10, 8));
     assert!(tabs.claim_placement("task-a", "tab-a", false, PlacementSlot::Deck, 10, 1));
+    // Lanes are per window: a lower revision in another window still wins
+    // its own lane, and one window's claim never invalidates the other's.
     assert!(tabs.claim_placement("task-a", "tab-a", true, PlacementSlot::Popout, 10, 4));
     assert!(tabs.claim_placement("task-b", "tab-b", true, PlacementSlot::Popout, 10, 1));
+    assert!(tabs.placement_is_current("task-a", "tab-a", true, PlacementSlot::Popout, 10, 4));
     assert!(tabs.placement_is_current("task-b", "tab-b", true, PlacementSlot::Popout, 10, 1));
+    // Two tabs of one window, whatever their tasks, share that window's lane.
+    assert!(tabs.claim_placement("task-a", "tab-c", true, PlacementSlot::Popout, 10, 2));
+    assert!(!tabs.placement_is_current("task-b", "tab-b", true, PlacementSlot::Popout, 10, 1));
+    assert!(tabs.placement_is_current("task-a", "tab-a", true, PlacementSlot::Popout, 10, 4));
 
     // A renderer reload starts a newer session even when its local revision
     // starts over, and a late call from the retired session cannot take back.
@@ -449,39 +662,44 @@ fn renderer_tab_commands_refuse_another_task() {
 }
 
 #[test]
-fn secondary_renderers_are_bound_to_their_native_task_label() {
-    assert!(renderer_may_address_task("main", "task-a", false));
-    assert!(renderer_may_address_task("task-task-a", "task-a", false));
-    assert!(!renderer_may_address_task("task-task-b", "task-a", false));
-    assert!(renderer_may_address_task(
-        &popout::window_label("task-a"),
-        "task-a",
-        false
-    ));
-    assert!(!renderer_may_address_task(
-        &popout::window_label("task-b"),
-        "task-a",
-        false
-    ));
-    // The shared chat window reaches chats only.
-    assert!(renderer_may_address_task(
-        popout::CHAT_WINDOW_LABEL,
-        "task-a",
-        true
-    ));
-    assert!(!renderer_may_address_task(
-        popout::CHAT_WINDOW_LABEL,
-        "task-a",
-        false
-    ));
+fn secondary_renderers_are_bound_to_their_native_label() {
+    let tabs = registry(&[("tab-a", "task-a", None), ("tab-b", "task-b", None)]);
+    let holding = popout::new_window_label();
+    let other = popout::new_window_label();
+    tabs.set_window("tab-a", Some(&holding), None);
+    tabs.set_window("tab-b", Some(&other), None);
+
+    assert!(renderer_may_address_task(&tabs, "main", "task-a"));
+    assert!(renderer_may_address_task(&tabs, "task-task-a", "task-a"));
+    assert!(!renderer_may_address_task(&tabs, "task-task-b", "task-a"));
+    // A browser window reaches the tasks of the tabs it holds, and no other.
+    assert!(renderer_may_address_task(&tabs, &holding, "task-a"));
+    assert!(!renderer_may_address_task(&tabs, &holding, "task-b"));
+    assert!(!renderer_may_address_task(&tabs, &other, "task-a"));
+    // Docking the tab takes the reach with it.
+    tabs.set_window("tab-a", None, None);
+    assert!(!renderer_may_address_task(&tabs, &holding, "task-a"));
 }
 
 #[test]
-fn popout_window_identity_is_task_scoped_and_stable() {
-    let first = popout::window_label("task-a");
-    assert_eq!(first, popout::window_label("task-a"));
-    assert_ne!(first, popout::window_label("task-b"));
-    assert!(first.starts_with(popout::POPOUT_WINDOW_PREFIX));
+fn dock_all_on_close() {
+    // A window's close request docks everything it holds before the OS
+    // window goes, and only then destroys it — closing first would take the
+    // child webviews with it. Destroy, not close: close would ask again.
+    let popout = include_str!("popout.rs");
+    let closing = source_between(
+        popout,
+        "tauri::WindowEvent::CloseRequested",
+        "tauri::WindowEvent::Focused(true)",
+    );
+    assert!(closing.contains("api.prevent_close()"));
+    assert!(closing.contains("dock_all_in_window(&app, &label)"));
+    assert!(closing.contains("state.window_is_empty(&label)"));
+    assert!(closing.contains("window.destroy()"));
+    assert!(!closing.contains("window.close()"));
+    let docking = source_between(popout, "pub fn dock_all_in_window", "/// Hides a window");
+    assert!(docking.contains("snapshot_window(label)"));
+    assert!(docking.contains("MoveTarget::Main"));
 }
 
 #[test]
@@ -1057,14 +1275,17 @@ fn agent_tools_open_popped_out_and_move_tabs_only_for_the_owner() {
         "pub async fn set_popped_out_for_agent(",
     );
     assert!(open.contains("popped_out: bool"));
-    assert!(open.contains("super::popout::move_tab(app, tabs, &tab.id, true, false)"));
+    assert!(open.contains("super::popout::preferred_target(tabs, &tab.id)"));
+    assert!(open.contains("super::popout::move_tab(app, tabs, &tab.id, target, false)"));
     let moved = source_between(
         agent,
         "pub async fn set_popped_out_for_agent(",
         "/// Points one reachable tab",
     );
     assert!(moved.contains("if !tabs.owns(tab_id, caller)"));
-    assert!(moved.contains("super::popout::move_tab(app, tabs, tab_id, popped_out, false)"));
+    assert!(moved.contains("super::popout::preferred_target(tabs, tab_id)"));
+    assert!(moved.contains("super::popout::MoveTarget::Main"));
+    assert!(moved.contains("super::popout::move_tab(app, tabs, tab_id, target, false)"));
     let focus = source_between(
         agent,
         "pub async fn focus_for_agent(",

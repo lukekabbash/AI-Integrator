@@ -42,13 +42,16 @@ mod remember;
 mod servers;
 pub(crate) mod sites;
 mod vault;
+mod windows;
 
 pub use groups::Group;
 pub use identity::BrowserIdentityScope;
 pub(crate) use identity::{configured_scope, prepare_profile_layout, prune_ephemeral_profiles};
 pub(crate) use identity_migration::migrate_task_buckets_to_groups;
 pub use menu::browser_tab_menu;
-pub use popout::{browser_popout_tabs, browser_tab_set_popped_out};
+pub use popout::{
+    browser_popout_tabs, browser_tab_move, browser_tab_set_popped_out, browser_window_reorder,
+};
 pub use registry::{BrowserTab, BrowserTabs, Caller, GrantMode};
 pub(crate) use registry::{PlacementSlot, Tab, USER_HOLDER, note_user_activity};
 pub use servers::browser_local_servers;
@@ -57,6 +60,7 @@ pub use sites::{
     browser_set_identity_scope, browser_sites,
 };
 pub(crate) use vault::migrate_legacy_logins;
+pub use windows::{browser_drag_end, browser_drag_hit_test};
 
 pub const BROWSER_EVENT: &str = "browser://changed";
 /// An agent asking the renderer to bring one tab to the front. The renderer
@@ -165,25 +169,26 @@ pub(super) fn require_task(
     Err(unavailable("that browser tab is no longer open"))
 }
 
-/// `task_is_chat` is the store's answer for `task_id`; the shared chat browser
-/// window may address any chat, and nothing else.
-fn renderer_may_address_task(label: &str, task_id: &str, task_is_chat: bool) -> bool {
+/// Main may address every task; a task window the task in its label; a
+/// browser window any task it holds a tab of.
+fn renderer_may_address_task(tabs: &BrowserTabs, label: &str, task_id: &str) -> bool {
     label == "main"
         || label == format!("task-{task_id}")
-        || popout::window_may_address_task(label, task_id, task_is_chat)
+        || popout::window_holds_task(tabs, label, task_id)
 }
 
 /// Main may coordinate every task; a secondary task or browser window may
-/// address only the task encoded in its own trusted native label (or, for the
-/// shared chat browser window, any chat).
+/// address only the tasks its own trusted native label reaches.
 pub(super) fn require_renderer_task<R: Runtime>(
     webview: &tauri::Webview<R>,
     task_id: &str,
 ) -> Result<(), CommandError> {
     let label = webview.label();
-    let is_chat =
-        label == popout::CHAT_WINDOW_LABEL && popout::task_is_chat(webview.app_handle(), task_id);
-    if renderer_may_address_task(label, task_id, is_chat) {
+    let holds = webview
+        .app_handle()
+        .try_state::<Arc<BrowserTabs>>()
+        .is_some_and(|tabs| renderer_may_address_task(&tabs, label, task_id));
+    if holds {
         Ok(())
     } else {
         Err(unavailable("that browser tab is no longer open"))
@@ -569,6 +574,8 @@ pub(super) async fn create_tab(
             Tab {
                 state: tab.clone(),
                 label,
+                window: None,
+                order: 0,
                 placement_slot: None,
                 held: None,
                 held_task: None,
@@ -717,6 +724,7 @@ pub(super) fn close_tab(
     let label = state
         .label_for(tab_id)
         .ok_or_else(|| unavailable("that browser tab is already closed"))?;
+    let window = state.window_of(tab_id);
     if let Ok(webview) = webview_of(app, &label) {
         let _ = webview.close();
     }
@@ -729,8 +737,8 @@ pub(super) fn close_tab(
     }
     emit_changed(app, state);
     remember::remember(app, state, &closing.task_id);
-    if closing.popped_out {
-        popout::hide_window_if_empty(app, state, &closing.task_id);
+    if let Some(window) = window {
+        popout::hide_window_if_empty(app, state, &window);
     }
     Ok(())
 }

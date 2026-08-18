@@ -1,86 +1,51 @@
-//! The pop-out browser window.
+//! Pop-out browser windows.
 //!
 //! A tab that leaves the pane does not become a bare OS window showing a page.
-//! It moves into one window that runs Integrator's own renderer — the same
+//! It moves into a window that runs Integrator's own renderer — the same
 //! chrome, the same theme, the same address field and annotate control — and
 //! keeps its webview, its profile and its guest runtime. Several tabs can live
 //! there at once, which is what makes it read as a browser window rather than
 //! a detached page.
 //!
-//! Chats share one window: their tabs already share a cookie profile and a
-//! person browsing from several chats wants one strip, not one window per
-//! conversation. Every other task keeps a window of its own so two runs never
-//! see each other's tabs.
-//!
-//! Closing a window sends every tab it holds back to the pane. Nothing about
-//! popping out changes what an agent may do: the tabs keep their ids and their
-//! task, so a run in flight carries on across the move.
+//! A window is a bag: it is not bound to a task or a chat. Each tab records
+//! the window it lives in (`Tab.window`), there may be any number of windows,
+//! and a tab moves between them — or back to the pane — without losing its
+//! page. Closing a window sends every tab it holds back to the pane. Nothing
+//! about popping out changes what an agent may do: the tabs keep their ids and
+//! their task, so a run in flight carries on across the move.
 
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-    sync::Arc,
-};
+use std::sync::Arc;
 
-use integrator_core::{TaskId, TaskKind};
-use tauri::{AppHandle, Manager, Runtime, WebviewUrl};
+use serde::Deserialize;
+use tauri::{AppHandle, Manager, WebviewUrl};
 use url::form_urlencoded;
 
 use crate::command_api::{CommandError, CommandResult};
 
-use super::{BrowserTab, BrowserTabs, emit_changed, parked, require_task, unavailable, webview_of};
+use super::{
+    BrowserTab, BrowserTabs, emit_changed, invalid, parked, require_task, unavailable, webview_of,
+};
 
-/// Label of the window that hosts popped-out tabs. Scoped in
+/// Every pop-out window label starts with this. Scoped in
 /// `capabilities/default.json` so its renderer reaches the app commands.
 pub const POPOUT_WINDOW_PREFIX: &str = "browser-window-";
-/// The one window every chat's popped tabs share.
-pub const CHAT_WINDOW_LABEL: &str = "browser-window-chat";
 
-/// The window a non-chat task's popped tabs live in. One window per task
-/// prevents two runs from sharing a tab strip.
-pub(crate) fn window_label(task_id: &str) -> String {
-    let mut hash = DefaultHasher::new();
-    task_id.hash(&mut hash);
-    format!("{POPOUT_WINDOW_PREFIX}{:016x}", hash.finish())
+/// How long an emptied window is kept, hidden, before it is closed. Long
+/// enough for a tab that is on its way (a tear-off target, a move that is
+/// mid-flight) to land; short enough that labels do not pile up.
+const EMPTY_WINDOW_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A fresh label for a new window. Random rather than derived from anything,
+/// because a window is not tied to a task any more.
+pub(crate) fn new_window_label() -> String {
+    format!("{POPOUT_WINDOW_PREFIX}{}", uuid::Uuid::new_v4().simple())
 }
 
-/// Whether the task is a chat, per the store. Unknown tasks are not.
-pub(crate) fn task_is_chat<R: Runtime>(app: &AppHandle<R>, task_id: &str) -> bool {
-    let Ok(id) = task_id.parse::<TaskId>() else {
-        return false;
-    };
-    let Some(state) = app.try_state::<crate::state::AppState>() else {
-        return false;
-    };
-    matches!(
-        state.store.get_task(id).ok().map(|task| task.kind),
-        Some(TaskKind::Chat)
-    )
-}
-
-/// The label of the window this task's popped tabs go to: the shared chat
-/// window for a chat, a window of its own for anything else.
-pub(crate) fn window_label_for<R: Runtime>(app: &AppHandle<R>, task_id: &str) -> String {
-    label_for(task_id, task_is_chat(app, task_id))
-}
-
-/// Pure form of [`window_label_for`], with the chat lookup already done.
-pub(crate) fn label_for(task_id: &str, is_chat: bool) -> String {
-    if is_chat {
-        CHAT_WINDOW_LABEL.to_string()
-    } else {
-        window_label(task_id)
-    }
-}
-
-/// Whether a renderer running under this native label may address the task.
-/// The chat window may address any chat; a hashed window only its own task.
-pub(crate) fn window_may_address_task(label: &str, task_id: &str, task_is_chat: bool) -> bool {
-    if label == CHAT_WINDOW_LABEL {
-        task_is_chat
-    } else {
-        label == window_label(task_id)
-    }
+/// Whether a renderer running under this native label may address the task:
+/// a pop-out window may, when it holds at least one of the task's tabs. Any
+/// other label may not.
+pub(crate) fn window_holds_task(tabs: &BrowserTabs, label: &str, task_id: &str) -> bool {
+    label.starts_with(POPOUT_WINDOW_PREFIX) && tabs.window_holds_task(label, task_id)
 }
 
 fn focus_window(window: &tauri::Window) -> Result<(), CommandError> {
@@ -102,24 +67,28 @@ fn focus_window(window: &tauri::Window) -> Result<(), CommandError> {
         .map_err(|error| unavailable(format!("could not focus the browser window: {error}")))
 }
 
-/// Creates this task's window on first use and brings an existing one forward.
-pub fn ensure_window(app: &AppHandle, task_id: &str) -> Result<tauri::Window, CommandError> {
-    let label = window_label_for(app, task_id);
-    if let Some(window) = app.get_window(&label) {
+/// Brings the window with this label forward, creating it if it does not
+/// exist. `None` always creates a fresh window. `at` is a screen point in
+/// logical pixels for a new window — a tear-off lands under the pointer.
+pub fn ensure_window(
+    app: &AppHandle,
+    label: Option<&str>,
+    at: Option<(f64, f64)>,
+) -> Result<tauri::Window, CommandError> {
+    if let Some(label) = label
+        && let Some(window) = app.get_window(label)
+    {
         focus_window(&window)?;
         return Ok(window);
     }
-    // The query tells the renderer which surface to draw before React runs.
-    // The chat window is not bound to one task, so it carries a scope instead.
-    let mut query = form_urlencoded::Serializer::new(String::new());
-    query.append_pair("surface", "browser");
-    if label == CHAT_WINDOW_LABEL {
-        query.append_pair("scope", "chat");
-    } else {
-        query.append_pair("taskId", task_id);
-    }
-    let query = query.finish();
-    let window = tauri::WebviewWindowBuilder::new(
+    let label = label.map_or_else(new_window_label, str::to_owned);
+    // The query tells the renderer which surface to draw before React runs,
+    // and which window it is; nothing about a task.
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair("surface", "browser")
+        .append_pair("window", &label)
+        .finish();
+    let mut builder = tauri::WebviewWindowBuilder::new(
         app,
         &label,
         WebviewUrl::App(format!("index.html?{query}").into()),
@@ -127,99 +96,180 @@ pub fn ensure_window(app: &AppHandle, task_id: &str) -> Result<tauri::Window, Co
     .title("Integrator Browser")
     .inner_size(1180.0, 820.0)
     .min_inner_size(520.0, 360.0)
-    .decorations(false)
-    .build()
-    .map_err(|error| unavailable(format!("could not open the browser window: {error}")))?;
+    .decorations(false);
+    if let Some((x, y)) = at {
+        // The pointer ends up over the strip, roughly where the dragged tab
+        // would sit, rather than at the window's corner.
+        builder = builder.position(x - 200.0, y - 20.0);
+    }
+    let window = builder
+        .build()
+        .map_err(|error| unavailable(format!("could not open the browser window: {error}")))?;
 
-    let close_app = app.clone();
-    let close_label = label.clone();
-    window.on_window_event(move |event| {
-        let tauri::WindowEvent::CloseRequested { api, .. } = event else {
-            return;
-        };
-        // Reparent while the source HWND/NSWindow still exists. Destroying the
-        // host first also destroys its children and makes docking impossible.
-        api.prevent_close();
-        let app = close_app.clone();
-        let label = close_label.clone();
-        tauri::async_runtime::spawn(async move {
-            dock_popped_out_in_window(&app, &label);
-        });
+    let event_app = app.clone();
+    let event_label = label.clone();
+    window.on_window_event(move |event| match event {
+        tauri::WindowEvent::CloseRequested { api, .. } => {
+            // Reparent while the source HWND/NSWindow still exists. Destroying
+            // the host first also destroys its children and makes docking
+            // impossible.
+            api.prevent_close();
+            let app = event_app.clone();
+            let label = event_label.clone();
+            tauri::async_runtime::spawn(async move {
+                dock_all_in_window(&app, &label);
+                let Some(state) = app.try_state::<Arc<BrowserTabs>>() else {
+                    return;
+                };
+                if state.window_is_empty(&label)
+                    && let Some(window) = app.get_window(&label)
+                {
+                    let _ = window.destroy();
+                }
+            });
+        }
+        tauri::WindowEvent::Focused(true) => {
+            if let Some(state) = event_app.try_state::<Arc<BrowserTabs>>() {
+                state.note_window_focus(&event_label);
+            }
+        }
+        tauri::WindowEvent::Destroyed => {
+            if let Some(state) = event_app.try_state::<Arc<BrowserTabs>>() {
+                state.forget_window(&event_label);
+            }
+        }
+        _ => {}
     });
     let window = window.as_ref().window();
+    if let Some(state) = app.try_state::<Arc<BrowserTabs>>() {
+        // A window that has just been made is the one the next pop-out should
+        // use, whether or not the OS delivers a focus event for it.
+        state.note_window_focus(&label);
+    }
     focus_window(&window)?;
     Ok(window)
 }
 
-/// The popped tabs that live in the window with this label.
-fn popped_tabs_in_window(app: &AppHandle, tabs: &BrowserTabs, label: &str) -> Vec<BrowserTab> {
-    tabs.snapshot(None)
-        .into_iter()
-        .filter(|tab| tab.popped_out && window_label_for(app, &tab.task_id) == label)
-        .collect()
-}
-
-/// Sends every popped tab in a browser window back when that window closes.
-pub fn dock_popped_out_in_window(app: &AppHandle, label: &str) {
+/// Sends every tab in a browser window back to the pane, as when that window
+/// closes.
+pub fn dock_all_in_window(app: &AppHandle, label: &str) {
     let Some(state) = app.try_state::<Arc<BrowserTabs>>() else {
         return;
     };
     let tabs = Arc::clone(&state);
-    for tab in popped_tabs_in_window(app, &tabs, label) {
-        let _ = move_tab(app, &tabs, &tab.id, false, false);
+    for tab in tabs.snapshot_window(label) {
+        let _ = move_tab(app, &tabs, &tab.id, MoveTarget::Main, false);
     }
 }
 
-/// Hides the window a task's popped tabs would live in once nothing is left
-/// in it. Judged per window: a chat window with another chat's tabs still open
-/// stays up.
-pub(super) fn hide_window_if_empty(app: &AppHandle, tabs: &BrowserTabs, task_id: &str) {
-    let label = window_label_for(app, task_id);
-    if popped_tabs_in_window(app, tabs, &label).is_empty()
-        && let Some(window) = app.get_window(&label)
-    {
-        let _ = window.hide();
+/// Hides a window once nothing is left in it, and closes it a little later if
+/// it is still empty then. Hidden rather than closed straight away because a
+/// tab may be on its way — a tear-off creates the window before the move
+/// lands — and closing under it would lose the drop.
+pub(super) fn hide_window_if_empty(app: &AppHandle, tabs: &BrowserTabs, label: &str) {
+    if !tabs.window_is_empty(label) {
+        return;
     }
+    let Some(window) = app.get_window(label) else {
+        return;
+    };
+    let _ = window.hide();
+    let app = app.clone();
+    let label = label.to_string();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(EMPTY_WINDOW_TTL).await;
+        let Some(state) = app.try_state::<Arc<BrowserTabs>>() else {
+            return;
+        };
+        if state.window_is_empty(&label)
+            && let Some(window) = app.get_window(&label)
+            && !window.is_visible().unwrap_or(true)
+        {
+            let _ = window.destroy();
+        }
+    });
 }
 
-/// Moves one live child webview without navigating or rebuilding it. If
-/// parking fails after reparenting, it is returned to its original host.
+/// Where a tab is being moved to.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum MoveTarget {
+    /// Back to the main window, into its task's pane.
+    Main,
+    /// Into a pop-out window: the named one, or a new one when `label` is
+    /// `None`. `index` is the strip position (appended when absent); `at` is
+    /// where a new window opens, in logical screen pixels.
+    Window {
+        label: Option<String>,
+        index: Option<u32>,
+        at: Option<(f64, f64)>,
+    },
+}
+
+/// The window a tab currently lives in, if it still exists.
+fn host_window(
+    app: &AppHandle,
+    tabs: &BrowserTabs,
+    id: &str,
+) -> Result<tauri::Window, CommandError> {
+    let label = tabs.window_of(id).unwrap_or_else(|| "main".to_string());
+    app.get_window(&label)
+        .ok_or_else(|| unavailable("the browser tab's current window is not available"))
+}
+
+/// Moves one live child webview into another window without navigating or
+/// rebuilding it. Moving inside its own window only reorders it. If parking
+/// fails after reparenting, it is returned to its original host.
 pub(super) fn move_tab(
     app: &AppHandle,
     state: &Arc<BrowserTabs>,
     id: &str,
-    popped_out: bool,
+    target: MoveTarget,
     focus: bool,
 ) -> Result<BrowserTab, CommandError> {
     let current = state
-        .snapshot(None)
-        .into_iter()
-        .find(|tab| tab.id == id)
+        .tab(id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
-    if current.popped_out == popped_out {
-        if popped_out && focus {
-            let _ = ensure_window(app, &current.task_id)?;
+    let source_label = state.window_of(id);
+    let (target_label, index, at) = match target {
+        MoveTarget::Main => {
+            if source_label.is_none() {
+                return Ok(current);
+            }
+            (None, None, None)
         }
-        return Ok(current);
+        MoveTarget::Window { label, index, at } => {
+            (Some(label.unwrap_or_else(new_window_label)), index, at)
+        }
+    };
+    if source_label == target_label {
+        // Same window: a reorder at most.
+        let Some(label) = target_label else {
+            return Ok(current);
+        };
+        if let Some(index) = index {
+            place_at(state, &label, id, index);
+            emit_changed(app, state);
+        }
+        if focus {
+            let _ = ensure_window(app, Some(&label), None)?;
+        }
+        return state
+            .tab(id)
+            .ok_or_else(|| unavailable("that browser tab is no longer open"));
     }
-    let label = state
+    let webview_label = state
         .label_for(id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
-    let source = if current.popped_out {
-        app.get_window(&window_label_for(app, &current.task_id))
-    } else {
-        app.get_window("main")
-    }
-    .ok_or_else(|| unavailable("the browser tab's current window is not available"))?;
-    let target = if popped_out {
-        ensure_window(app, &current.task_id)?
-    } else {
-        app.get_window("main")
-            .ok_or_else(|| unavailable("the main window is not available"))?
+    let source = host_window(app, state, id)?;
+    let target_window = match &target_label {
+        Some(label) => ensure_window(app, Some(label), at)?,
+        None => app
+            .get_window("main")
+            .ok_or_else(|| unavailable("the main window is not available"))?,
     };
-    let webview = webview_of(app, &label)?;
+    let webview = webview_of(app, &webview_label)?;
     webview
-        .reparent(&target)
+        .reparent(&target_window)
         .map_err(|error| unavailable(format!("could not move the tab: {error}")))?;
     let (position, size) = parked();
     if let Err(error) = webview.set_bounds(tauri::Rect {
@@ -240,21 +290,56 @@ pub(super) fn move_tab(
             "could not hide the moved tab: {error}"
         )));
     }
+    state.set_placement(id, None);
     let tab = state
-        .update(id, |tab| {
-            tab.popped_out = popped_out;
-            tab.hidden = true;
-        })
+        .set_window(id, target_label.as_deref(), None)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
+    let tab = match (&target_label, index) {
+        (Some(label), Some(index)) => {
+            place_at(state, label, id, index);
+            state.tab(id).unwrap_or(tab)
+        }
+        _ => tab,
+    };
     emit_changed(app, state);
-    if !popped_out {
-        hide_window_if_empty(app, state, &current.task_id);
+    if let Some(source_label) = source_label {
+        hide_window_if_empty(app, state, &source_label);
     }
     Ok(tab)
 }
 
+/// Puts a tab of this window at a strip position, shifting the rest.
+fn place_at(state: &BrowserTabs, label: &str, id: &str, index: u32) {
+    let mut ids: Vec<String> = state
+        .snapshot_window(label)
+        .into_iter()
+        .map(|tab| tab.id)
+        .filter(|candidate| candidate != id)
+        .collect();
+    let at = (index as usize).min(ids.len());
+    ids.insert(at, id.to_string());
+    state.reorder_window(label, &ids);
+}
+
+/// Where a tab goes when it is popped out without a named window: where it
+/// already is, if it is out; else the window most recently in front that
+/// already holds one of its group's tabs; else the window most recently in
+/// front; else a new one.
+pub(crate) fn preferred_target(tabs: &BrowserTabs, tab_id: &str) -> MoveTarget {
+    let label = tabs.window_of(tab_id).or_else(|| {
+        tabs.tab(tab_id)
+            .and_then(|tab| tabs.preferred_window_for(&tab.group_id))
+    });
+    MoveTarget::Window {
+        label,
+        index: None,
+        at: None,
+    }
+}
+
 /// Moves a tab without losing history, scroll position, form state, or an
-/// in-flight agent interaction.
+/// in-flight agent interaction. Sugar over `browser_tab_move`: out goes to
+/// the preferred window, in goes home.
 #[tauri::command]
 pub async fn browser_tab_set_popped_out(
     app: AppHandle,
@@ -265,21 +350,93 @@ pub async fn browser_tab_set_popped_out(
 ) -> CommandResult<BrowserTab> {
     require_task(&state, &task_id, &tab_id)?;
     super::remember::ensure_awake(&app, &state, &tab_id).await;
-    move_tab(&app, &state, &tab_id, popped_out, true)
+    let target = if popped_out {
+        preferred_target(&state, &tab_id)
+    } else {
+        MoveTarget::Main
+    };
+    move_tab(&app, &state, &tab_id, target, true)
 }
 
-/// The numeric part of a `tab-N` id, so a strip orders by creation and not by
-/// string (`tab-10` after `tab-9`).
-fn tab_sequence(id: &str) -> u64 {
-    id.rsplit('-')
-        .next()
-        .and_then(|part| part.parse().ok())
-        .unwrap_or(u64::MAX)
+/// A screen point in logical pixels, as the renderer sends it.
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct ScreenPoint {
+    pub x: f64,
+    pub y: f64,
 }
 
-/// The popped-out tabs that belong to the calling window, judged by its
-/// trusted native label: the chat window sees every chat's popped tabs, a
-/// task window its own task's, and anything else sees none.
+/// The wire form of [`MoveTarget`]: `{kind:"main"}` or
+/// `{kind:"window", label?, index?, at?}`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveTargetArg {
+    pub kind: String,
+    pub label: Option<String>,
+    pub index: Option<u32>,
+    pub at: Option<ScreenPoint>,
+}
+
+impl MoveTargetArg {
+    fn into_target(self, app: &AppHandle) -> Result<MoveTarget, CommandError> {
+        match self.kind.as_str() {
+            "main" => Ok(MoveTarget::Main),
+            "window" => {
+                if let Some(label) = &self.label {
+                    if !label.starts_with(POPOUT_WINDOW_PREFIX) {
+                        return Err(invalid("that is not a browser window"));
+                    }
+                    if app.get_window(label).is_none() {
+                        return Err(unavailable("that browser window is no longer open"));
+                    }
+                }
+                Ok(MoveTarget::Window {
+                    label: self.label,
+                    index: self.index,
+                    at: self.at.map(|point| (point.x, point.y)),
+                })
+            }
+            other => Err(invalid(format!("unknown move target '{other}'"))),
+        }
+    }
+}
+
+/// Moves a tab into a window (an existing one, or a new one at a point), or
+/// back to the pane. The tab keeps its page either way.
+#[tauri::command]
+pub async fn browser_tab_move(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<BrowserTabs>>,
+    task_id: String,
+    tab_id: String,
+    target: MoveTargetArg,
+) -> CommandResult<BrowserTab> {
+    require_task(&state, &task_id, &tab_id)?;
+    let target = target.into_target(&app)?;
+    super::remember::ensure_awake(&app, &state, &tab_id).await;
+    move_tab(&app, &state, &tab_id, target, true)
+}
+
+/// Rewrites the strip order of the calling window. The window is the
+/// caller's trusted native label, so one window cannot reorder another's.
+#[tauri::command]
+pub fn browser_window_reorder(
+    webview: tauri::Webview,
+    state: tauri::State<'_, Arc<BrowserTabs>>,
+    tab_ids: Vec<String>,
+) -> CommandResult<()> {
+    let label = webview.label();
+    if !label.starts_with(POPOUT_WINDOW_PREFIX) {
+        return Err(unavailable("only a browser window orders its own strip"));
+    }
+    if !state.reorder_window(label, &tab_ids) {
+        return Err(unavailable("one of those tabs is not in this window"));
+    }
+    emit_changed(webview.app_handle(), &state);
+    Ok(())
+}
+
+/// The tabs that live in the calling window, judged by its trusted native
+/// label, in strip order. Anything that is not a browser window sees none.
 #[tauri::command]
 pub fn browser_popout_tabs(
     webview: tauri::Webview,
@@ -289,21 +446,7 @@ pub fn browser_popout_tabs(
     if !label.starts_with(POPOUT_WINDOW_PREFIX) {
         return Ok(Vec::new());
     }
-    let app = webview.app_handle();
-    let mut tabs: Vec<BrowserTab> = state
-        .snapshot(None)
-        .into_iter()
-        .filter(|tab| tab.popped_out)
-        .filter(|tab| {
-            if label == CHAT_WINDOW_LABEL {
-                task_is_chat(app, &tab.task_id)
-            } else {
-                window_label(&tab.task_id) == label
-            }
-        })
-        .collect();
-    tabs.sort_by_key(|tab| tab_sequence(&tab.id));
-    Ok(tabs)
+    Ok(state.snapshot_window(label))
 }
 
 #[cfg(test)]
@@ -311,35 +454,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chats_share_one_window_and_other_tasks_get_their_own() {
-        assert_eq!(label_for("task-a", true), CHAT_WINDOW_LABEL);
-        assert_eq!(label_for("task-b", true), CHAT_WINDOW_LABEL);
-        assert_eq!(label_for("task-a", false), window_label("task-a"));
-        assert_ne!(label_for("task-a", false), label_for("task-b", false));
-        assert!(CHAT_WINDOW_LABEL.starts_with(POPOUT_WINDOW_PREFIX));
+    fn new_window_labels_carry_the_prefix_and_never_repeat() {
+        let first = new_window_label();
+        let second = new_window_label();
+        assert!(first.starts_with(POPOUT_WINDOW_PREFIX));
+        assert!(second.starts_with(POPOUT_WINDOW_PREFIX));
+        assert_ne!(first, second);
+        assert!(first.len() > POPOUT_WINDOW_PREFIX.len() + 16);
     }
 
     #[test]
-    fn the_chat_window_addresses_chats_and_a_task_window_only_its_task() {
-        assert!(window_may_address_task(CHAT_WINDOW_LABEL, "task-a", true));
-        assert!(!window_may_address_task(CHAT_WINDOW_LABEL, "task-a", false));
-        assert!(window_may_address_task(
-            &window_label("task-a"),
-            "task-a",
-            false
-        ));
-        assert!(!window_may_address_task(
-            &window_label("task-b"),
-            "task-a",
-            false
-        ));
-        assert!(!window_may_address_task("main", "task-a", true));
-    }
-
-    #[test]
-    fn popped_tabs_order_by_creation_sequence() {
-        let mut ids = vec!["tab-10", "tab-2", "tab-9"];
-        ids.sort_by_key(|id| tab_sequence(id));
-        assert_eq!(ids, vec!["tab-2", "tab-9", "tab-10"]);
+    fn a_window_addresses_the_tasks_of_the_tabs_it_holds() {
+        let tabs = BrowserTabs::new();
+        let label = new_window_label();
+        assert!(!window_holds_task(&tabs, &label, "task-a"));
+        // The registry helper lives in the parent's tests; a bare insert here
+        // says exactly what is being asked of the registry.
+        tabs.tabs.lock().unwrap().insert(
+            "tab-1".into(),
+            super::super::tests::fixture_tab("tab-1", "task-a", None),
+        );
+        assert!(!window_holds_task(&tabs, &label, "task-a"));
+        tabs.set_window("tab-1", Some(&label), None);
+        assert!(window_holds_task(&tabs, &label, "task-a"));
+        assert!(!window_holds_task(&tabs, &label, "task-b"));
+        assert!(!window_holds_task(&tabs, &new_window_label(), "task-a"));
+        // The prefix is part of the test: a `main` that somehow held a tab
+        // is not a browser window.
+        assert!(!window_holds_task(&tabs, "main", "task-a"));
     }
 }

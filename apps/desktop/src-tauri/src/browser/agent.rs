@@ -220,7 +220,10 @@ pub async fn open_for_agent(
         tabs.update(&tab.id, |state| state.delegation_id = Some(delegation));
     }
     if popped_out {
-        super::popout::move_tab(app, tabs, &tab.id, true, false)
+        // Into the window the group is already using, or the one in front;
+        // an agent never opens a second window while one exists.
+        let target = super::popout::preferred_target(tabs, &tab.id);
+        super::popout::move_tab(app, tabs, &tab.id, target, false)
             .map_err(|error| IntegratorError::Unavailable(error.message))?;
     }
     emit_changed(app, tabs);
@@ -247,7 +250,12 @@ pub async fn set_popped_out_for_agent(
         }));
     }
     super::remember::ensure_awake(app, tabs, tab_id).await;
-    super::popout::move_tab(app, tabs, tab_id, popped_out, false)
+    let target = if popped_out {
+        super::popout::preferred_target(tabs, tab_id)
+    } else {
+        super::popout::MoveTarget::Main
+    };
+    super::popout::move_tab(app, tabs, tab_id, target, false)
         .map_err(|error| IntegratorError::Unavailable(error.message))
 }
 
@@ -652,7 +660,15 @@ pub fn tabs_for_caller<R: Runtime>(
 ) -> Vec<Value> {
     tabs.visible_to(caller, lock_active_tab(app))
         .into_iter()
-        .map(|tab| agent_row(app, tabs, caller, &tab))
+        .map(|tab| {
+            let mut row = agent_row(app, tabs, caller, &tab);
+            // Which browser window a popped-out tab is in, so an agent can
+            // say "the tab in the second window" if asked.
+            if let (Some(fields), Some(window)) = (row.as_object_mut(), tabs.window_of(&tab.id)) {
+                fields.insert("window".into(), json!(window));
+            }
+            row
+        })
         .collect()
 }
 

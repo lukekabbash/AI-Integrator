@@ -217,6 +217,8 @@ impl BrowserTabs {
                     delegation_id: None,
                 },
                 label,
+                window: None,
+                order: 0,
                 placement_slot: None,
                 held: None,
                 held_task: None,
@@ -252,9 +254,15 @@ pub(super) async fn adopt_sleeping(
     let label = state
         .label_for(tab_id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
-    let window = app
-        .get_window("main")
-        .ok_or_else(|| unavailable("the main window is not available"))?;
+    // A tab that sleeps in a pop-out window wakes there, not in main: the
+    // window's renderer is the one about to place it, and a bounce through
+    // main would need a reparent on the way.
+    let window = match state.window_of(tab_id) {
+        Some(label) => super::popout::ensure_window(app, Some(&label), None)?,
+        None => app
+            .get_window("main")
+            .ok_or_else(|| unavailable("the main window is not available"))?,
+    };
     let task_id = state
         .task_of(tab_id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;

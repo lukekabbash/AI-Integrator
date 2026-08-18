@@ -7556,6 +7556,7 @@ export default function App() {
                               ]),
                             )}
                             onBrowserClose={requestBrowserTabClose}
+                            browserTaskId={browser.taskId}
                             renderBrowser={renderWorkPaneBrowser}
                             onLaunch={openWorkPaneLaunch}
                             browserOnly={activeTask?.kind === "chat"}

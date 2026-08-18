@@ -11,8 +11,10 @@ import {
   type ReactNode,
 } from "react";
 
-import { bridge, type BrowserTab } from "../bridge";
+import { bridge, type BrowserDragHit, type BrowserTab } from "../bridge";
 import { browserTabNeedsAgentProtection } from "../browserClosePolicy";
+import type { HitTarget } from "../browserTabDrag";
+import { useTabDrag, type TabDragHandlers } from "../useTabDrag";
 import { poppedOutComposerHost } from "../composerCapture";
 import { initializeTheme, normalizeThemePreferences, setThemePreferences } from "../theme";
 import { type BrowserHost, useBrowserTabs } from "../useBrowserTabs";
@@ -159,7 +161,10 @@ export function BrowserWindowShell() {
   );
   const urlTaskId = query.get("taskId");
   const chatScope = query.get("scope") === "chat";
-  const storageScope = chatScope ? "chat" : (urlTaskId ?? "task");
+  // A window is a bag of tabs from any groups; its label is its identity.
+  // The older `taskId`/`scope` queries still boot the shell for the fallback list.
+  const windowLabel = query.get("window");
+  const storageScope = windowLabel ?? (chatScope ? "chat" : (urlTaskId ?? "task"));
   const host = useMemo<BrowserHost>(
     () =>
       poppedOutComposerHost(async (file, name, chatTaskId) =>
@@ -363,11 +368,12 @@ export function BrowserWindowShell() {
 
   // A task window is named for its task; the chat window, holding several
   // chats' pages, is named for whichever page is in front.
-  const windowTitle = chatScope
-    ? active
-      ? `${tabLabel(active)} — Integrator Browser`
-      : "Integrator Browser"
-    : `${taskTitle} — Integrator Browser`;
+  const windowTitle =
+    chatScope || windowLabel
+      ? active
+        ? `${tabLabel(active)} — Integrator Browser`
+        : "Integrator Browser"
+      : `${taskTitle} — Integrator Browser`;
   useEffect(() => {
     document.title = windowTitle;
     void getCurrentWindow()
@@ -396,8 +402,9 @@ export function BrowserWindowShell() {
     const taskId = taskIdForNewTab(activeTaskId, lastTaskId.current, urlTaskId);
     if (!api || !taskId) return;
     const tab = await api.open(taskId);
-    await api.setPoppedOut(taskId, tab.id, true);
-  }, [activeTaskId, urlTaskId]);
+    if (windowLabel) await api.moveTab(taskId, tab.id, { kind: "window", label: windowLabel });
+    else await api.setPoppedOut(taskId, tab.id, true);
+  }, [activeTaskId, urlTaskId, windowLabel]);
   const reopenClosed = useCallback(async () => {
     const api = bridge.browser;
     if (!api) return;
@@ -406,13 +413,17 @@ export function BrowserWindowShell() {
       closedRing.current = closedRing.current.slice(0, -1);
       try {
         const tab = await api.open(last.taskId, last.url);
-        await api.setPoppedOut(last.taskId, tab.id, true);
+        if (windowLabel) {
+          await api.moveTab(last.taskId, tab.id, { kind: "window", label: windowLabel });
+        } else {
+          await api.setPoppedOut(last.taskId, tab.id, true);
+        }
         return;
       } catch {
         // The task may be gone; try the one before it.
       }
     }
-  }, []);
+  }, [windowLabel]);
 
   // Browser shortcuts: the strip is keyboard-driven the way any browser's is,
   // as long as the keys are not on their way into a text field. Cycling and
@@ -451,6 +462,101 @@ export function BrowserWindowShell() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [visible, activeId, active, addTab, closeTab, reopenClosed]);
 
+  // Dragging: reorder inside a group, tear off into a new window, or carry a
+  // tab to another window or back to the pane. The machine lives in
+  // useTabDrag; this window only says what each drop means.
+  const stripRef = useRef<HTMLDivElement>(null);
+  const [dropOver, setDropOver] = useState(false);
+  useEffect(() => {
+    const api = bridge.browser;
+    if (!api?.onDragOver || !api.onDragLeave) return;
+    let active = true;
+    const stops: (() => void)[] = [];
+    void api
+      .onDragOver(() => {
+        if (active) setDropOver(true);
+      })
+      .then((stop) => (active ? stops.push(stop) : stop()))
+      .catch(() => undefined);
+    void api
+      .onDragLeave(() => {
+        if (active) setDropOver(false);
+      })
+      .then((stop) => (active ? stops.push(stop) : stop()))
+      .catch(() => undefined);
+    return () => {
+      active = false;
+      for (const stop of stops) stop();
+    };
+  }, []);
+  const groupSpanFor = useCallback(
+    (tabId: string): [number, number] => {
+      let start = 0;
+      for (const group of groups) {
+        if (group.collapsed) continue;
+        const end = start + group.tabs.length - 1;
+        if (group.tabs.some((tab) => tab.id === tabId)) return [start, end];
+        start = end + 1;
+      }
+      return [0, Math.max(0, visible.length - 1)];
+    },
+    [groups, visible],
+  );
+  const dragApi = bridge.browser;
+  const drag = useTabDrag({
+    origin: { kind: "popout", label: windowLabel ?? storageScope },
+    tabs: visible.map((tab) => ({
+      id: tab.id,
+      taskId: tab.taskId,
+      groupId: tab.groupId,
+      title: tabLabel(tab),
+      favicon: tab.favicon,
+    })),
+    stripRef,
+    groupSpanFor,
+    hitTest: dragApi?.dragHitTest
+      ? async (x, y): Promise<HitTarget> => {
+          const hit: BrowserDragHit = await dragApi.dragHitTest(x, y);
+          if (!hit.target) return null;
+          if (hit.target === "main") return { kind: "main" };
+          if (hit.target === windowLabel) return null;
+          return { kind: "popout", label: hit.target, strip: hit.strip };
+        }
+      : undefined,
+    dragEnd: dragApi?.dragEnd ? () => dragApi.dragEnd() : undefined,
+    onReorder: (from, to) => {
+      if (!dragApi?.reorderWindow || from === to) return;
+      // Move within the visible list, then hand native the whole window
+      // group by group, so a folded group keeps its place in the strip.
+      const moved = [...visible];
+      const [item] = moved.splice(from, 1);
+      moved.splice(to, 0, item);
+      const order: string[] = [];
+      let cursor = 0;
+      for (const group of groups) {
+        if (group.collapsed) {
+          order.push(...group.tabs.map((tab) => tab.id));
+          continue;
+        }
+        order.push(...moved.slice(cursor, cursor + group.tabs.length).map((tab) => tab.id));
+        cursor += group.tabs.length;
+      }
+      void dragApi.reorderWindow(order).catch(() => undefined);
+    },
+    onMove: (tabId, taskId, label, index) => {
+      void dragApi?.moveTab(taskId, tabId, { kind: "window", label, index }).catch(() => undefined);
+    },
+    onDock: (tabId, taskId) => {
+      void dragApi?.moveTab(taskId, tabId, { kind: "main" }).catch(() => undefined);
+    },
+    onTearOff: (tabId, taskId, at) => {
+      // The last tab in a window has nowhere better to be.
+      if (visible.length < 2) return;
+      void dragApi?.moveTab(taskId, tabId, { kind: "window", at }).catch(() => undefined);
+    },
+  });
+  const visibleIndex = new Map(visible.map((tab, index) => [tab.id, index]));
+
   const windowHandle = getCurrentWindow();
   const layoutKey = groups
     .map(
@@ -461,7 +567,13 @@ export function BrowserWindowShell() {
   return (
     <div className="browser-window" data-tauri-drag-region>
       <header className="browser-window-strip" data-tauri-drag-region>
-        <div className="browser-window-tabs" role="tablist" aria-label="Popped out browser tabs">
+        <div
+          className="browser-window-tabs"
+          role="tablist"
+          aria-label="Popped out browser tabs"
+          ref={stripRef}
+          data-drop-target={dropOver ? "true" : undefined}
+        >
           {/* The work pane's strip and this one are the same object in two
               frames, so the selection reads the same way here: outlines on
               every tab, one travelling fill in the sidebar's colour. */}
@@ -499,6 +611,8 @@ export function BrowserWindowShell() {
                       }
                       tooltipHost={tooltipHost}
                       reduceMotion={reduceMotion}
+                      dragHandlers={drag.handlersFor(tab.id, visibleIndex.get(tab.id) ?? 0)}
+                      dragGap={drag.dragging && drag.hoverIndex === visibleIndex.get(tab.id)}
                       onSelect={() => setActiveId(tab.id)}
                       onDock={() => dock(tab)}
                       onClose={() => void closeTab(tab)}
@@ -517,7 +631,11 @@ export function BrowserWindowShell() {
             <Plus aria-hidden="true" />
           </button>
         </StripTooltip>
-        <div className="browser-window-strip-spacer" data-tauri-drag-region />
+        <div
+          className="browser-window-strip-spacer"
+          data-tauri-drag-region
+          onDoubleClick={() => void windowHandle.toggleMaximize()}
+        />
         <div className="browser-window-controls">
           <button
             type="button"
@@ -563,9 +681,35 @@ export function BrowserWindowShell() {
           </div>
         )}
       </div>
+      {drag.ghost}
+      {/* Chromeless at the OS level, so the edges are ours to grab. */}
+      {RESIZE_EDGES.map((edge) => (
+        <div
+          key={edge}
+          className="browser-window-resize"
+          data-edge={edge}
+          aria-hidden="true"
+          onPointerDown={(event) => {
+            if (event.button !== 0) return;
+            event.preventDefault();
+            void windowHandle.startResizeDragging(edge).catch(() => undefined);
+          }}
+        />
+      ))}
     </div>
   );
 }
+
+const RESIZE_EDGES = [
+  "North",
+  "South",
+  "East",
+  "West",
+  "NorthEast",
+  "NorthWest",
+  "SouthEast",
+  "SouthWest",
+] as const;
 
 interface GroupPillProps {
   group: StripGroup<BrowserTab>;
@@ -619,6 +763,9 @@ interface StripTabProps {
   driver: string | null;
   tooltipHost: TooltipHost | null;
   reduceMotion: boolean;
+  dragHandlers: TabDragHandlers;
+  /** A dragged tab is about to land in front of this one. */
+  dragGap: boolean;
   onSelect: () => void;
   onDock: () => void;
   onClose: () => void;
@@ -632,6 +779,8 @@ function StripTab({
   driver,
   tooltipHost,
   reduceMotion,
+  dragHandlers,
+  dragGap,
   onSelect,
   onDock,
   onClose,
@@ -647,6 +796,8 @@ function StripTab({
       data-group-id={group.id}
       data-color={group.colorIndex}
       data-busy={driver ? "true" : undefined}
+      data-drag-gap={dragGap ? "before" : undefined}
+      {...dragHandlers}
       initial={reduceMotion ? false : { opacity: 0, scaleX: 0.6, flexGrow: 0, minWidth: 0 }}
       animate={{ opacity: 1, scaleX: 1, flexGrow: 1, minWidth: 96 }}
       exit={reduceMotion ? { opacity: 0 } : { opacity: 0, scaleX: 0.6, flexGrow: 0, minWidth: 0 }}

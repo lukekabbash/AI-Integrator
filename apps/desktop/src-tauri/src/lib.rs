@@ -54,13 +54,14 @@ use automations::{
 };
 use browser::{
     BrowserTabs, browser_allow_agent_sign_in, browser_bucket_sites, browser_capture_image,
-    browser_clear_bucket, browser_clear_data, browser_fill_login, browser_forget_all_logins,
-    browser_forget_bucket_logins, browser_forget_login, browser_identity_overview,
-    browser_local_servers, browser_popout_tabs, browser_save_login, browser_saved_logins,
-    browser_set_identity_scope, browser_sites, browser_tab_close, browser_tab_history,
-    browser_tab_invoke, browser_tab_list, browser_tab_menu, browser_tab_navigate, browser_tab_open,
-    browser_tab_poster, browser_tab_screenshot, browser_tab_set_bounds, browser_tab_set_popped_out,
-    browser_tabs_restore,
+    browser_clear_bucket, browser_clear_data, browser_drag_end, browser_drag_hit_test,
+    browser_fill_login, browser_forget_all_logins, browser_forget_bucket_logins,
+    browser_forget_login, browser_identity_overview, browser_local_servers, browser_popout_tabs,
+    browser_save_login, browser_saved_logins, browser_set_identity_scope, browser_sites,
+    browser_tab_close, browser_tab_history, browser_tab_invoke, browser_tab_list, browser_tab_menu,
+    browser_tab_move, browser_tab_navigate, browser_tab_open, browser_tab_poster,
+    browser_tab_screenshot, browser_tab_set_bounds, browser_tab_set_popped_out,
+    browser_tabs_restore, browser_window_reorder,
 };
 use chat_title::task_generate_title;
 use code_explain::{selection_explain, selection_explain_preview};
@@ -278,6 +279,10 @@ pub fn run() {
             browser_tab_poster,
             browser_tab_set_popped_out,
             browser_popout_tabs,
+            browser_tab_move,
+            browser_window_reorder,
+            browser_drag_hit_test,
+            browser_drag_end,
             browser_tab_menu,
             browser_capture_image,
             browser_saved_logins,

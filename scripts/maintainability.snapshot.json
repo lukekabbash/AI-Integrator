@@ -15,11 +15,11 @@
     },
     {
       "path": "apps/desktop/src/App.tsx",
-      "maxLines": 7796
+      "maxLines": 7797
     },
     {
       "path": "apps/desktop/src/bridge.ts",
-      "maxLines": 7686
+      "maxLines": 7732
     },
     {
       "path": "apps/desktop/src/components/SettingsView.tsx",
@@ -123,7 +123,7 @@
     },
     {
       "path": "apps/desktop/src-tauri/src/browser/mod.rs",
-      "maxLines": 1158
+      "maxLines": 1166
     },
     {
       "path": "apps/desktop/src-tauri/src/browser/vault.rs",

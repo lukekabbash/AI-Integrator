@@ -66,8 +66,15 @@ pub struct BrowserTab {
 
 pub(crate) struct Tab {
     pub(crate) state: BrowserTab,
-    /// Label of the webview; also the pop-out window label when popped out.
+    /// Label of the webview.
     pub(crate) label: String,
+    /// The pop-out window this tab lives in, by label; `None` while it is in
+    /// the main window. `state.popped_out` is kept equal to `window.is_some()`
+    /// by `set_window`, the one place either changes.
+    pub(crate) window: Option<String>,
+    /// Position in its pop-out window's strip. Meaningless in the main window,
+    /// where the pane orders its own surfaces.
+    pub(crate) order: u32,
     /// Which intentional rectangle in that native host currently owns it.
     /// The pane and compact deck may both be visible without evicting each
     /// other; two tabs claiming the same slot may not.
@@ -124,8 +131,9 @@ pub(crate) enum PlacementSlot {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct PlacementLaneKey {
-    /// Main-window lanes are shared across chats; each popout has one task.
-    popout_task: Option<String>,
+    /// Main-window lanes are shared across chats; each popout window has its
+    /// own, whatever tasks it holds.
+    popout_window: Option<String>,
     slot: PlacementSlot,
     /// The deck shows every card's page at once, so each card is its own lane
     /// rather than competing for one rectangle. Pane and popout are `None`.
@@ -224,6 +232,10 @@ pub struct BrowserTabs {
     /// Each task's group, resolved once from the store. Cleared by
     /// `groups::invalidate_groups` when a project changes.
     pub(crate) groups: GroupCache,
+    /// Pop-out window labels, most recently focused first. Decides where a tab
+    /// goes when it is popped out without a named window, and the order the
+    /// drag hit-test tries windows in (Tauri has no z-order to ask for).
+    popout_focus: Mutex<Vec<String>>,
 }
 
 impl Default for BrowserTabs {
@@ -237,6 +249,7 @@ impl Default for BrowserTabs {
             identity_scope: super::BrowserIdentityScope::Task,
             identity_change: Mutex::default(),
             groups: Mutex::default(),
+            popout_focus: Mutex::default(),
         }
     }
 }
@@ -269,20 +282,168 @@ impl BrowserTabs {
         let mut list: Vec<BrowserTab> = tabs
             .values()
             .filter(|tab| task_id.is_none_or(|task| tab.state.task_id == task))
-            .map(|tab| {
-                let mut state = tab.state.clone();
-                state.held_by = holder_of(tab, user_hold);
-                state.agent_protected_until = agent_protected_until(tab);
-                // A re-registered project renames its pill without touching
-                // each tab: the cached name wins over the one recorded at open.
-                if let Some(name) = self.cached_group_name(&state.task_id) {
-                    state.group_name = name;
-                }
-                state
-            })
+            .map(|tab| self.decorated(tab, user_hold))
             .collect();
         list.sort_by(|a, b| a.id.cmp(&b.id));
         list
+    }
+
+    /// One tab as a snapshot reports it: hold and protection read fresh, and
+    /// the group name taken from the cache.
+    fn decorated(&self, tab: &Tab, user_hold: bool) -> BrowserTab {
+        let mut state = tab.state.clone();
+        state.held_by = holder_of(tab, user_hold);
+        state.agent_protected_until = agent_protected_until(tab);
+        // A re-registered project renames its pill without touching each
+        // tab: the cached name wins over the one recorded at open.
+        if let Some(name) = self.cached_group_name(&state.task_id) {
+            state.group_name = name;
+        }
+        state
+    }
+
+    /// The tabs in one pop-out window, in strip order: by `order`, then by
+    /// creation for tabs that share one (`tab-10` after `tab-9`).
+    pub(crate) fn snapshot_window(&self, label: &str) -> Vec<BrowserTab> {
+        let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        let mut list: Vec<(u32, u64, BrowserTab)> = tabs
+            .values()
+            .filter(|tab| tab.window.as_deref() == Some(label))
+            .map(|tab| {
+                (
+                    tab.order,
+                    tab_sequence(&tab.state.id),
+                    self.decorated(tab, false),
+                )
+            })
+            .collect();
+        list.sort_by_key(|(order, sequence, _)| (*order, *sequence));
+        list.into_iter().map(|(_, _, tab)| tab).collect()
+    }
+
+    /// The pop-out window this tab is in, if it is popped out.
+    pub(crate) fn window_of(&self, id: &str) -> Option<String> {
+        let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        tabs.get(id).and_then(|tab| tab.window.clone())
+    }
+
+    /// Whether any tab of this task lives in that window — what lets the
+    /// window's renderer address the task.
+    pub(crate) fn window_holds_task(&self, label: &str, task_id: &str) -> bool {
+        let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        tabs.values()
+            .any(|tab| tab.window.as_deref() == Some(label) && tab.state.task_id == task_id)
+    }
+
+    /// Whether the window holds anything at all.
+    pub(crate) fn window_is_empty(&self, label: &str) -> bool {
+        let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        !tabs
+            .values()
+            .any(|tab| tab.window.as_deref() == Some(label))
+    }
+
+    /// Puts a tab in a pop-out window (or back in main with `None`), keeping
+    /// `popped_out` in step. `order` places it in the window's strip; absent,
+    /// it goes on the end. Docking clears the order.
+    pub(crate) fn set_window(
+        &self,
+        id: &str,
+        window: Option<&str>,
+        order: Option<u32>,
+    ) -> Option<BrowserTab> {
+        let mut tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        let order = match window {
+            Some(label) => order.unwrap_or_else(|| next_order_in(&tabs, label)),
+            None => 0,
+        };
+        let tab = tabs.get_mut(id)?;
+        tab.window = window.map(str::to_owned);
+        tab.order = order;
+        tab.state.popped_out = window.is_some();
+        Some(tab.state.clone())
+    }
+
+    /// The order a tab appended to this window would take — what
+    /// `set_window` gives one when no order is asked for.
+    #[cfg(test)]
+    pub(crate) fn next_order(&self, label: &str) -> u32 {
+        let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        next_order_in(&tabs, label)
+    }
+
+    /// Rewrites the strip order of one window: the listed tabs take 0, 1, 2…
+    /// in the order given, and any tab of the window not listed follows them
+    /// in its old order. False, and nothing changes, if a listed tab is not in
+    /// that window.
+    pub(crate) fn reorder_window(&self, label: &str, ids: &[String]) -> bool {
+        let mut tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        if ids.iter().any(|id| {
+            tabs.get(id)
+                .is_none_or(|tab| tab.window.as_deref() != Some(label))
+        }) {
+            return false;
+        }
+        let mut rest: Vec<(u32, u64, String)> = tabs
+            .values()
+            .filter(|tab| tab.window.as_deref() == Some(label) && !ids.contains(&tab.state.id))
+            .map(|tab| (tab.order, tab_sequence(&tab.state.id), tab.state.id.clone()))
+            .collect();
+        rest.sort();
+        let ordered = ids
+            .iter()
+            .cloned()
+            .chain(rest.into_iter().map(|(_, _, id)| id));
+        for (index, id) in ordered.enumerate() {
+            if let Some(tab) = tabs.get_mut(&id) {
+                tab.order = u32::try_from(index).unwrap_or(u32::MAX);
+            }
+        }
+        true
+    }
+
+    /// Records that a pop-out window just came to the front.
+    pub(crate) fn note_window_focus(&self, label: &str) {
+        let mut focus = self
+            .popout_focus
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        focus.retain(|known| known != label);
+        focus.insert(0, label.to_string());
+    }
+
+    /// Drops a window that no longer exists from the focus order.
+    pub(crate) fn forget_window(&self, label: &str) {
+        let mut focus = self
+            .popout_focus
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        focus.retain(|known| known != label);
+    }
+
+    /// Pop-out window labels, most recently focused first.
+    pub(crate) fn windows_by_focus(&self) -> Vec<String> {
+        self.popout_focus
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// Where a tab of this group goes when popped out without a named window:
+    /// the most recently focused window already holding one of the group's
+    /// tabs, else the most recently focused window, else nowhere (open one).
+    pub(crate) fn preferred_window_for(&self, group_id: &str) -> Option<String> {
+        let focus = self.windows_by_focus();
+        let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        focus
+            .iter()
+            .find(|label| {
+                tabs.values().any(|tab| {
+                    tab.window.as_deref() == Some(label.as_str()) && tab.state.group_id == group_id
+                })
+            })
+            .or_else(|| focus.first())
+            .cloned()
     }
 
     /// Every tab this caller may address: the task's own, minus the ones a
@@ -500,21 +661,24 @@ impl BrowserTabs {
     }
 
     /// The visible siblings competing for one rectangle in the same native
-    /// host. A pane and compact deck are separate slots and may coexist.
+    /// host. A pane and compact deck are separate slots and may coexist. In a
+    /// pop-out window the peers are the tabs of that same window, whatever
+    /// task they belong to; `task_id` only matters in the main window.
     pub(crate) fn visible_peers(
         &self,
-        task_id: &str,
+        _task_id: &str,
         keep: &str,
         popped_out: bool,
         placement_slot: PlacementSlot,
     ) -> Vec<String> {
         let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        let window = tabs.get(keep).and_then(|tab| tab.window.clone());
         let mut peers: Vec<String> = tabs
             .values()
             .filter(|tab| {
                 tab.state.id != keep
                     && tab.state.popped_out == popped_out
-                    && (!popped_out || tab.state.task_id == task_id)
+                    && (!popped_out || tab.window == window)
                     && !tab.state.sleeping
                     && !tab.state.hidden
                     && tab.placement_slot == Some(placement_slot)
@@ -547,14 +711,18 @@ impl BrowserTabs {
         self.visible_peers(task_id, "", false, slot)
     }
 
+    /// The lane a placement request competes in. In a pop-out window it is
+    /// the tab's window, so two windows never invalidate each other; a
+    /// popped-out request for a tab the registry does not have in a window
+    /// gets a lane of its own rather than the main one.
     fn placement_lane(
-        task_id: &str,
+        &self,
         tab_id: &str,
         popped_out: bool,
         slot: PlacementSlot,
     ) -> PlacementLaneKey {
         PlacementLaneKey {
-            popout_task: popped_out.then(|| task_id.to_string()),
+            popout_window: popped_out.then(|| self.window_of(tab_id).unwrap_or_default()),
             slot,
             deck_tab: (slot == PlacementSlot::Deck).then(|| tab_id.to_string()),
         }
@@ -566,14 +734,14 @@ impl BrowserTabs {
     /// per tab: every card is on screen together.
     pub(crate) fn claim_placement(
         &self,
-        task_id: &str,
+        _task_id: &str,
         tab_id: &str,
         popped_out: bool,
         slot: PlacementSlot,
         session: u64,
         revision: u64,
     ) -> bool {
-        let key = Self::placement_lane(task_id, tab_id, popped_out, slot);
+        let key = self.placement_lane(tab_id, popped_out, slot);
         let incoming = PlacementOrder { session, revision };
         let mut orders = self
             .placement_orders
@@ -589,14 +757,14 @@ impl BrowserTabs {
     /// Re-checks ownership after an await such as waking a sleeping webview.
     pub(crate) fn placement_is_current(
         &self,
-        task_id: &str,
+        _task_id: &str,
         tab_id: &str,
         popped_out: bool,
         slot: PlacementSlot,
         session: u64,
         revision: u64,
     ) -> bool {
-        let key = Self::placement_lane(task_id, tab_id, popped_out, slot);
+        let key = self.placement_lane(tab_id, popped_out, slot);
         let expected = PlacementOrder { session, revision };
         let orders = self
             .placement_orders
@@ -684,6 +852,23 @@ impl BrowserTabs {
         apply(&mut tab.state);
         Some(tab.state.clone())
     }
+}
+
+/// The numeric part of a `tab-N` id, so a strip orders by creation and not by
+/// string (`tab-10` after `tab-9`).
+pub(crate) fn tab_sequence(id: &str) -> u64 {
+    id.rsplit('-')
+        .next()
+        .and_then(|part| part.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+fn next_order_in(tabs: &HashMap<String, Tab>, label: &str) -> u32 {
+    tabs.values()
+        .filter(|tab| tab.window.as_deref() == Some(label))
+        .map(|tab| tab.order.saturating_add(1))
+        .max()
+        .unwrap_or(0)
 }
 
 /// Who has this tab right now, if anyone. A hold is reported only while it is

@@ -1,0 +1,58 @@
+/* The dragged tab's stand-in. The real tab stays in the strip (Motion keeps
+   the layout honest); this is what follows the pointer, drawn by the window
+   the drag started in and clipped to it. */
+.browser-tab-ghost {
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  padding: 5px 10px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-row);
+  background: var(--color-surface-raised);
+  box-shadow: var(--shadow-elevated);
+  color: var(--color-text-primary);
+  font-size: 11px;
+  line-height: 1;
+  /* Held under the cursor rather than snapped to its corner, so the tab reads
+     as picked up from where it was grabbed. */
+  transform: translate(-28px, -50%) rotate(-1.5deg);
+  opacity: 0.94;
+}
+.browser-tab-ghost svg,
+.browser-tab-ghost .tab-favicon {
+  flex: none;
+  width: 13px;
+  height: 13px;
+}
+.browser-tab-ghost-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The gap the tab would drop into. `margin-left` rather than a transform so
+   the strip's own layout animation carries the neighbours along. */
+[data-drag-gap="before"] {
+  margin-left: 28px;
+  transition: margin-left var(--motion-fast) var(--ease-emphasized);
+}
+
+/* No text selection or hover flicker anywhere while a tab is in the air. */
+body[data-tab-dragging="true"] {
+  cursor: grabbing;
+  user-select: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .browser-tab-ghost {
+    transform: translate(-28px, -50%);
+  }
+  [data-drag-gap="before"] {
+    transition: none;
+  }
+}
+[data-motion="none"] [data-drag-gap="before"] {
+  transition: none;
+}

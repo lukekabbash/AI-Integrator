@@ -14,7 +14,8 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 
-import type { DelegationView } from "../bridge";
+import { bridge, type DelegationView } from "../bridge";
+import { useTabDrag } from "../useTabDrag";
 import type { WorkPaneController } from "../useWorkPane";
 import { surfaceFileName, WORK_PANE_MIN_WIDTH, type WorkSurface } from "../workPaneModel";
 import { AgentGlyph } from "./AgentGlyph";
@@ -53,6 +54,8 @@ export interface WorkPaneProps {
   browserProtected?: Record<string, boolean>;
   /** Resolves the browser X through the native recent-agent guard. */
   onBrowserClose?: (tabId: string) => void;
+  /** The task whose browser tabs this pane shows; a dragged tab carries it. */
+  browserTaskId?: string | null;
   renderFile: (surface: Extract<WorkSurface, { kind: "file" }>) => ReactNode;
   renderReview: () => ReactNode;
   renderSubagent: (delegationId: string, headerHost: HTMLElement | null) => ReactNode;
@@ -85,6 +88,7 @@ export function WorkPane({
   browserBusy,
   browserProtected,
   onBrowserClose,
+  browserTaskId = null,
   renderFile,
   renderReview,
   renderSubagent,
@@ -97,6 +101,45 @@ export function WorkPane({
 }: WorkPaneProps) {
   const { state, active } = controller;
   const stripRef = useRef<HTMLDivElement>(null);
+  // Browser tabs drag: along the strip to reorder, out of it to tear off
+  // into a browser window, or onto an open browser window to join it. Files
+  // and reviews stay put — they have nowhere else to live.
+  const dragApi = bridge.browser;
+  const tabDrag = useTabDrag({
+    origin: { kind: "pane" },
+    tabs: state.surfaces.map((surface) => ({
+      id: surface.id,
+      taskId: browserTaskId ?? "",
+      groupId: surface.kind === "browser" ? "pane" : "fixed",
+      title: surfaceLabel(surface, delegations, browserTitles),
+      favicon: surface.kind === "browser" ? browserIcons?.[surface.tabId] : undefined,
+    })),
+    stripRef,
+    // Reordering runs the whole strip; only browser tabs may leave it.
+    groupSpanFor: () => [0, Math.max(0, state.surfaces.length - 1)],
+    hitTest: dragApi?.dragHitTest
+      ? async (x, y) => {
+          const hit = await dragApi.dragHitTest(x, y);
+          if (!hit.target || hit.target === "main") return null;
+          return { kind: "popout", label: hit.target, strip: hit.strip };
+        }
+      : undefined,
+    dragEnd: dragApi?.dragEnd ? () => dragApi.dragEnd() : undefined,
+    onReorder: (from, to) => controller.reorder(from, to),
+    onMove: (surfaceId, taskId, label, index) => {
+      const surface = state.surfaces.find((candidate) => candidate.id === surfaceId);
+      if (!surface || surface.kind !== "browser" || !taskId) return;
+      void dragApi
+        ?.moveTab(taskId, surface.tabId, { kind: "window", label, index })
+        .catch(() => undefined);
+    },
+    onDock: () => undefined,
+    onTearOff: (surfaceId, taskId, at) => {
+      const surface = state.surfaces.find((candidate) => candidate.id === surfaceId);
+      if (!surface || surface.kind !== "browser" || !taskId) return;
+      void dragApi?.moveTab(taskId, surface.tabId, { kind: "window", at }).catch(() => undefined);
+    },
+  });
   // The strip is this pane's bezel row: Left and Right walk the open surfaces.
   const onStripKeyDown = useRailCursor(stripRef, {
     enabled: arrowNavigation,
@@ -200,6 +243,12 @@ export function WorkPane({
               // A tab an agent is working in says so, so the user can watch
               // that one rather than wonder which page is moving.
               data-busy={agentAt ? "true" : undefined}
+              data-drag-gap={
+                tabDrag.dragging && tabDrag.hoverIndex === index ? "before" : undefined
+              }
+              {...(surface.kind === "browser" || tabDrag.dragging
+                ? tabDrag.handlersFor(surface.id, index)
+                : {})}
               title={agentAt ? `${agentAt} is working in this tab` : undefined}
               initial={reduceMotion ? false : { opacity: 0, y: 3 }}
               animate={{ opacity: 1, y: 0 }}
@@ -283,6 +332,7 @@ export function WorkPane({
           </button>
         </Tooltip>
       </div>
+      {tabDrag.ghost}
     </div>
   ) : null;
 
