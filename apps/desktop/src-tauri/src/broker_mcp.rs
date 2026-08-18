@@ -301,11 +301,11 @@ fn browser_tools(role: &str) -> Vec<Value> {
         }),
         json!({
             "name": "browser_press",
-            "description": "Press one key in a browser tab, for example Enter or Escape. Modifiers are any of Control, Shift, Alt, Meta.",
+            "description": "Press one key in a browser tab, for example Enter, Escape, or Space. Use the word Space for the space bar — a literal space character is trimmed from the argument and rejected. Modifiers are any of Control, Shift, Alt, Meta.",
             "annotations": tool_annotations(false, true),
             "inputSchema": text_schema(json!({
                 "tabId": { "type": "string" },
-                "key": { "type": "string" },
+                "key": { "type": "string", "description": "Key name such as Enter, Escape, or Space. A bare space is rejected." },
                 "modifiers": { "type": "array", "items": { "type": "string" } }
             }), &["tabId", "key"]),
         }),
@@ -360,7 +360,14 @@ fn tool_definitions(role: &str, mode: &str, harness_instructions: Option<&str>) 
     match role {
         "chat" => {
             let mut tools = tool_definitions("orchestrator", "off", harness_instructions);
-            tools.retain(|tool| tool["name"] != "skill_data_request");
+            // Chat browses, but it has no subagent to hand a tab to and no
+            // project to scope a saved login by, so those two stay out.
+            tools.retain(|tool| {
+                !matches!(
+                    tool["name"].as_str(),
+                    Some("skill_data_request" | "browser_grant" | "browser_fill_login")
+                )
+            });
             if mode == "memory-on" {
                 tools.insert(0, json!({
                     "name": "memory_save",
@@ -686,6 +693,18 @@ mod tests {
         assert!(child.contains(&"skill_data_request".to_owned()));
         assert!(!child.contains(&"delegate_start".to_owned()));
 
+        // Chat browses, but it has nobody to hand a tab to and no project to
+        // scope a saved login by. The runtime config in delegation.rs agrees;
+        // these two lists are the pair that must not drift.
+        let chat: Vec<String> = tool_definitions("chat", "off", None)
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        assert!(chat.contains(&"browser_open".to_owned()));
+        assert!(chat.contains(&"browser_snapshot".to_owned()));
+        assert!(!chat.contains(&"browser_grant".to_owned()));
+        assert!(!chat.contains(&"browser_fill_login".to_owned()));
+
         let delegation_off: Vec<String> = tool_definitions("orchestrator", "off", None)
             .iter()
             .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned))
@@ -734,9 +753,7 @@ mod tests {
                 "browser_open",
                 "browser_list",
                 "browser_close",
-                "browser_grant",
                 "browser_focus",
-                "browser_fill_login",
                 "browser_cookies",
                 "browser_navigate",
                 "browser_snapshot",
@@ -766,9 +783,7 @@ mod tests {
                 "browser_open",
                 "browser_list",
                 "browser_close",
-                "browser_grant",
                 "browser_focus",
-                "browser_fill_login",
                 "browser_cookies",
                 "browser_navigate",
                 "browser_snapshot",
