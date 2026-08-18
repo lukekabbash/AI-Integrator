@@ -165,9 +165,37 @@ impl GitService {
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect();
-        let mut args = vec!["add", "--"];
-        args.extend(strings.iter().map(String::as_str));
-        self.required(repository, &args)?;
+        // Tracked files that live under an ignored directory (rule added after
+        // the files were committed) make plain `git add <path>` fail with
+        // "paths are ignored". `add --update` walks the index instead of the
+        // working tree, so it stages those without `--force`. Untracked paths
+        // still go through plain `add`, which keeps ignored files out.
+        let mut ls_args = vec!["ls-files", "-z", "--"];
+        ls_args.extend(strings.iter().map(String::as_str));
+        let tracked_listing = self.required(repository, &ls_args)?;
+        let tracked: std::collections::HashSet<&str> = tracked_listing
+            .split('\0')
+            .filter(|entry| !entry.is_empty())
+            .collect();
+        let (tracked_paths, other_paths): (Vec<&str>, Vec<&str>) =
+            strings.iter().map(String::as_str).partition(|path| {
+                let path = path.replace('\\', "/");
+                let path = path.trim_end_matches('/');
+                tracked.contains(path)
+                    || tracked
+                        .iter()
+                        .any(|entry| entry.strip_prefix(path).is_some_and(|rest| rest.starts_with('/')))
+            });
+        if !tracked_paths.is_empty() {
+            let mut args = vec!["add", "--update", "--"];
+            args.extend(tracked_paths.iter().copied());
+            self.required(repository, &args)?;
+        }
+        if !other_paths.is_empty() {
+            let mut args = vec!["add", "--"];
+            args.extend(other_paths.iter().copied());
+            self.required(repository, &args)?;
+        }
         let mut files = self.status(repository)?;
         self.annotate_line_stats(repository, &mut files);
         Ok(files)

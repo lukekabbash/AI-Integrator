@@ -58,6 +58,7 @@ import {
   type ComposerDraftValue,
   type CloneProjectInput,
   type ComposerDraftAttachment,
+  type TaskPermission,
   type DelegationView,
   type DelegationRouting,
   type DiffFile,
@@ -85,6 +86,7 @@ import {
   type SearchOutcome,
 } from "./bridge";
 import { browserContextComposerText } from "./browserContext";
+import { browserTabNeedsAgentProtection } from "./browserClosePolicy";
 import { mergeSchedulingTranscript } from "./automationTranscript";
 import { automationTurnPrompt } from "./automationTurnPrompt";
 import {
@@ -173,6 +175,7 @@ import {
 } from "./appTurnState";
 import { SlidingPanelSlot } from "./components/SlidingPanelSlot";
 import { Tooltip } from "./components/Tooltip";
+import { normalizeRuntimeTurnControls } from "./runtimeTurnControls";
 import "./styles.css";
 
 const RightRail = lazy(() =>
@@ -215,7 +218,7 @@ type ComposerTurnInput = {
   runtime: RuntimeId;
   model: string;
   effort?: string;
-  permission: "read-only" | "project-write" | "ask" | "full-access";
+  permission: TaskPermission;
   delegation: "off" | "manual" | "balanced" | "budget-first";
   nativeActionId?: string;
   nativeAction?: NativeActionReference;
@@ -223,11 +226,14 @@ type ComposerTurnInput = {
 };
 
 type SendTurnOutcome = "started" | "turn-active" | "failed";
-type TaskPermission = ComposerTurnInput["permission"];
 
 function isTaskPermission(value: unknown): value is TaskPermission {
   return (
-    value === "read-only" || value === "project-write" || value === "ask" || value === "full-access"
+    value === "read-only" ||
+    value === "project-write" ||
+    value === "ask" ||
+    value === "auto" ||
+    value === "full-access"
   );
 }
 
@@ -1577,6 +1583,50 @@ export default function App() {
       allowExternalOpen: localSettings[BROWSER_SETTINGS.externalOpen] === true,
     },
   );
+  // The native deadline is authoritative. Timers only keep the close labels
+  // and compact-deck affordances current when no browser event happens at the
+  // exact moment recent agent protection expires.
+  const [browserProtectionNow, setBrowserProtectionNow] = useState(() => Date.now());
+  useEffect(() => {
+    const now = Date.now();
+    const needsCatchUp = browser.tabs.some((tab) => {
+      const deadline = tab.agentProtectedUntil ?? 0;
+      return deadline > browserProtectionNow && deadline <= now;
+    });
+    const nextDeadline = browser.tabs.reduce<number | undefined>((earliest, tab) => {
+      const deadline = tab.agentProtectedUntil ?? 0;
+      if (deadline <= now) return earliest;
+      return earliest === undefined ? deadline : Math.min(earliest, deadline);
+    }, undefined);
+    if (!needsCatchUp && nextDeadline === undefined) return;
+    const timer = window.setTimeout(
+      () => setBrowserProtectionNow(Date.now()),
+      needsCatchUp ? 0 : Math.min(2_147_483_647, (nextDeadline ?? now) - now + 20),
+    );
+    return () => window.clearTimeout(timer);
+  }, [browser.tabs, browserProtectionNow]);
+  const browserProtectedTabIds = useMemo(
+    () =>
+      new Set(
+        browser.tabs
+          .filter((tab) => browserTabNeedsAgentProtection(tab, browserProtectionNow))
+          .map((tab) => tab.id),
+      ),
+    [browser.tabs, browserProtectionNow],
+  );
+  const requestBrowserTabClose = useCallback(
+    (tabId: string) => {
+      const surfaceId = `browser:${tabId}`;
+      const expectedToPreserve = browserProtectedTabIds.has(tabId);
+      if (expectedToPreserve) workPane.close(surfaceId);
+      void browser.close(tabId).then((closed) => {
+        // If native state became protected after this render, false is the
+        // correction: move it to the deck instead of destroying it.
+        if (!closed || !expectedToPreserve) workPane.close(surfaceId);
+      });
+    },
+    [browser, browserProtectedTabIds, workPane],
+  );
   // A tab an agent opened gets a pane tab of its own, so its browsing is
   // something the user watches rather than something happening off screen.
   // It does not steal the foreground: whatever surface is active stays active.
@@ -2401,9 +2451,11 @@ export default function App() {
         if (nativeHost) {
           const theme = persisted.find((setting) => setting.key === "appearance.theme")?.value;
           if (theme && typeof theme === "object") {
+            // Native SQLite remains authoritative; mirror it into the shared
+            // first-paint cache so detached browser windows start in-theme.
             setPreferences(
               setThemePreferences(normalizeThemePreferences(theme), {
-                persist: false,
+                persist: true,
               }),
             );
           }
@@ -3561,7 +3613,7 @@ export default function App() {
           nativeAction: undefined,
           nativeActionId: undefined,
         }
-      : input;
+      : normalizeRuntimeTurnControls(input);
     const submittedAt = new Date().toISOString();
     setOperationError("");
     setComposerError(null);
@@ -4800,9 +4852,12 @@ export default function App() {
   };
 
   /** A transcript file action opens the file as a first-class canvas tab. */
-  const openTranscriptFile = (location: ProjectFileLocation) => {
+  // Memoized because the sidebar takes it as a prop, and that surface is held
+  // to no prop changes on token-only frames. A plain arrow here re-rendered the
+  // whole rail on every streamed token.
+  const openTranscriptFile = useCallback((location: ProjectFileLocation) => {
     setOpenProjectFileRequest({ ...location, id: Date.now() });
-  };
+  }, []);
 
   /** Tabs belong to the active task, or to the project while drafting a new
    * chat, matching how centerView is remembered per task. */
@@ -6003,7 +6058,7 @@ export default function App() {
       effort: activeTask.effort,
       permission:
         (taskPermissions[activeTask.id] as
-          "read-only" | "project-write" | "ask" | "full-access" | undefined) ?? "project-write",
+          TaskPermission | undefined) ?? "project-write",
       delegation: "off" as const,
     };
     const timer = window.setTimeout(() => void sendTurn(build), 0);
@@ -6509,6 +6564,7 @@ export default function App() {
       <BrowserSurface
         key={tab.id}
         tab={tab}
+        poster={browser.posters[tabId]}
         message={browser.message}
         recording={browser.recordingTabId === tabId}
         annotating={browser.annotatingTabId === tabId}
@@ -6530,10 +6586,8 @@ export default function App() {
         onOpenExternally={() => browser.openExternally(tabId)}
         onSaveLogin={() => browser.saveLogin(tabId, tab.taskId)}
         onFillLogin={() => browser.fillLogin(tabId, tab.taskId)}
-        onClose={() => {
-          workPane.close(`browser:${tabId}`);
-          void browser.close(tabId);
-        }}
+        onToolbarTooltip={(tooltip) => browser.setToolbarTooltip(tabId, tooltip)}
+        onClose={() => requestBrowserTabClose(tabId)}
       />
     );
   };
@@ -6754,6 +6808,9 @@ export default function App() {
           (screen === "workspace" && showRightRail) || (screen === "scheduled" && scheduledRailOpen)
         }
         data-subagent-visible={screen === "workspace" && subagentOpen}
+        data-browser-pane-visible={
+          screen === "workspace" && subagentOpen && workPane.active?.kind === "browser"
+        }
         data-file-active={screen === "workspace" && Boolean(activeFileTab)}
         style={
           {
@@ -7461,11 +7518,23 @@ export default function App() {
                                 tab.title || tab.url.replace(/^https?:\/\//, ""),
                               ]),
                             )}
+                            browserIcons={Object.fromEntries(
+                              browser.tabs
+                                .filter((tab) => tab.favicon)
+                                .map((tab) => [tab.id, tab.favicon as string]),
+                            )}
                             browserBusy={Object.fromEntries(
                               browser.tabs
                                 .filter((tab) => tab.heldBy)
                                 .map((tab) => [tab.id, tab.heldBy as string]),
                             )}
+                            browserProtected={Object.fromEntries(
+                              browser.tabs.map((tab) => [
+                                tab.id,
+                                browserProtectedTabIds.has(tab.id),
+                              ]),
+                            )}
+                            onBrowserClose={requestBrowserTabClose}
                             renderBrowser={renderWorkPaneBrowser}
                             onLaunch={openWorkPaneLaunch}
                             browserOnly={activeTask?.kind === "chat"}
@@ -7504,6 +7573,8 @@ export default function App() {
                     <Suspense fallback={null}>
                       <BrowserDeck
                         tabs={deckTabs}
+                        posters={browser.posters}
+                        protectedTabIds={browserProtectedTabIds}
                         preferredTabId={
                           workPane.active?.kind === "browser" ? workPane.active.tabId : null
                         }
@@ -7537,6 +7608,7 @@ export default function App() {
                   </div>
                   <SlidingPanelSlot
                     open={showRightRail}
+                    width={rightRailWidth}
                     motionScale={motionScale}
                     slotKey="task-tools"
                   >

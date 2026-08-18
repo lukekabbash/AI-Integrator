@@ -328,6 +328,7 @@ async fn generate_codex_title(
     let executable = executable_for(ProviderKind::Codex).await?;
     let client = adapter_codex::CodexClient::spawn(CodexLaunchOptions {
         executable,
+        environment: crate::native_process::runtime_launch_environment(),
         working_directory: Some(cwd.to_path_buf()),
         client_version: env!("CARGO_PKG_VERSION").into(),
     })

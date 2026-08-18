@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -100,6 +101,8 @@ pub enum CodexEvent {
 #[derive(Clone, Debug)]
 pub struct CodexLaunchOptions {
     pub executable: PathBuf,
+    /// Narrow process-local overrides supplied by the native host.
+    pub environment: Vec<(OsString, OsString)>,
     pub working_directory: Option<PathBuf>,
     pub client_version: String,
 }
@@ -154,6 +157,7 @@ impl CodexClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        command.envs(options.environment);
         if let Some(cwd) = options.working_directory.as_deref() {
             command.current_dir(cwd);
         }

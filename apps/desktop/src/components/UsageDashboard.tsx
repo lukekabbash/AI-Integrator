@@ -89,8 +89,9 @@ export function UsageDashboard({ loadHistory, refreshToken = 0 }: UsageDashboard
     setDays(next);
     setWindow(makeUsageWindow(next));
     setFocusStart(null);
-    // A year of days is a calendar, not a ribbon.
-    if (next === 365) setView((current) => (current === "ribbon" ? "heatmap" : current));
+    // Long daily histories read as a calendar, not a ribbon.
+    if (next === 365 || next === "all")
+      setView((current) => (current === "ribbon" ? "heatmap" : current));
   }, []);
   const toggleRuntime = useCallback((provider: UsageHistoryProvider) => {
     setOpenRuntimes((previous) => {
@@ -149,7 +150,9 @@ export function UsageDashboard({ loadHistory, refreshToken = 0 }: UsageDashboard
           <h2>What your CLIs recorded</h2>
           <p>
             Read from the Codex and Claude Code transcripts on this computer ·{" "}
-            {model ? formatWindowRange(window) : "scanning local history"}
+            {model
+              ? `${days === "all" ? "All local history · " : ""}${formatWindowRange(window)}`
+              : "scanning local history"}
           </p>
         </div>
         <div className="usage-dashboard-controls">

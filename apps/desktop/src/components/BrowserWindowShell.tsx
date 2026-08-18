@@ -1,10 +1,15 @@
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { Maximize2, Minus, Plus, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { bridge } from "../bridge";
+import { initializeTheme, normalizeThemePreferences, setThemePreferences } from "../theme";
 import { useBrowserTabs } from "../useBrowserTabs";
 import { BROWSER_SETTINGS } from "./BrowserSettings";
 import { BrowserSurface } from "./BrowserSurface";
 import { nextPoppedTabId } from "./browserWindowTabs";
+import { TabFavicon } from "./TabFavicon";
+import { TravelingSelection } from "./TravelingSelection";
 import "./browserWindow.css";
 
 /**
@@ -21,6 +26,7 @@ import "./browserWindow.css";
  */
 export function BrowserWindowShell() {
   const [allowExternalOpen, setAllowExternalOpen] = useState(false);
+  const [taskTitle, setTaskTitle] = useState("Browser");
   const taskId =
     typeof window === "undefined"
       ? null
@@ -45,6 +51,15 @@ export function BrowserWindowShell() {
         .listSettings()
         .then((settings) => {
           if (!active) return;
+          const savedTheme = settings.find(
+            (setting) =>
+              setting.key === "appearance.theme" || setting.key === "settings.appearance.theme",
+          )?.value;
+          if (savedTheme && typeof savedTheme === "object") {
+            setThemePreferences(normalizeThemePreferences(savedTheme), { persist: false });
+          } else {
+            initializeTheme();
+          }
           setAllowExternalOpen(
             settings.find(
               (setting) =>
@@ -55,13 +70,42 @@ export function BrowserWindowShell() {
         })
         .catch(() => undefined);
     };
+    const refreshCachedTheme = () => initializeTheme();
+    refresh();
+    window.addEventListener("focus", refresh);
+    window.addEventListener("storage", refreshCachedTheme);
+    return () => {
+      active = false;
+      window.removeEventListener("focus", refresh);
+      window.removeEventListener("storage", refreshCachedTheme);
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    const refresh = () => {
+      if (!taskId) return;
+      void bridge
+        .loadWorkspace()
+        .then((workspace) => {
+          if (!active) return;
+          const title = workspace.tasks.find((task) => task.id === taskId)?.title || "Browser";
+          setTaskTitle(title);
+          const windowTitle = `${title} — Integrator Browser`;
+          document.title = windowTitle;
+          void getCurrentWindow()
+            .setTitle(windowTitle)
+            .catch(() => undefined);
+        })
+        .catch(() => undefined);
+    };
     refresh();
     window.addEventListener("focus", refresh);
     return () => {
       active = false;
       window.removeEventListener("focus", refresh);
     };
-  }, []);
+  }, [taskId]);
 
   useEffect(() => {
     const previous = previousTabIds.current;
@@ -71,21 +115,40 @@ export function BrowserWindowShell() {
 
   const active = tabs.find((tab) => tab.id === activeId) ?? null;
   const dock = useCallback((tabId: string) => void browser.setPoppedOut(tabId, false), [browser]);
+  const addTab = useCallback(async () => {
+    const tab = await browser.open();
+    if (tab) await browser.setPoppedOut(tab.id, true);
+  }, [browser]);
+  const windowHandle = getCurrentWindow();
 
   return (
     <div className="browser-window" data-tauri-drag-region>
       <header className="browser-window-strip" data-tauri-drag-region>
+        <span className="browser-window-title" title={taskTitle} data-tauri-drag-region>
+          {taskTitle}
+        </span>
         <div
           className="browser-window-tabs"
           role="tablist"
           aria-label="Popped out browser tabs"
           data-tauri-drag-region
         >
+          {/* The work pane's strip and this one are the same object in two
+              frames, so the selection reads the same way here: outlines on
+              every tab, one travelling fill in the sidebar's colour. */}
+          <TravelingSelection
+            activeKey={activeId ?? ""}
+            className="tab-strip-selection"
+            clampWidth={false}
+            pace="quick"
+            layoutKey={tabs.map((tab) => tab.id).join("|")}
+          />
           {tabs.map((tab) => (
             <div
               key={tab.id}
               className="file-reader-tab browser-window-tab"
               data-active={tab.id === activeId ? "true" : undefined}
+              data-traveling-selection={tab.id}
             >
               <button
                 type="button"
@@ -93,19 +156,53 @@ export function BrowserWindowShell() {
                 aria-selected={tab.id === activeId}
                 onClick={() => setActiveId(tab.id)}
               >
+                <TabFavicon src={tab.favicon} />
                 <span>{tab.title || tab.url.replace(/^https?:\/\//, "") || "New tab"}</span>
               </button>
               <button
                 type="button"
                 className="file-reader-tab-close"
-                aria-label={`Dock ${tab.title || tab.url}`}
-                title="Send back to the pane"
+                aria-label={`Return ${tab.title || tab.url} to the app`}
+                title="Return to the app"
                 onClick={() => dock(tab.id)}
               >
-                ⤓
+                <X aria-hidden="true" />
               </button>
             </div>
           ))}
+        </div>
+        <button
+          type="button"
+          className="browser-window-new-tab"
+          aria-label="New browser tab"
+          title="New tab"
+          onClick={() => void addTab()}
+        >
+          <Plus aria-hidden="true" />
+        </button>
+        <div className="browser-window-controls">
+          <button
+            type="button"
+            aria-label="Minimize browser window"
+            onClick={() => void windowHandle.minimize()}
+          >
+            <Minus aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            aria-label="Maximize or restore browser window"
+            onClick={() => void windowHandle.toggleMaximize()}
+          >
+            <Maximize2 aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            className="browser-window-close"
+            aria-label="Close browser window"
+            onClick={() => void windowHandle.close()}
+          >
+            <X aria-hidden="true" />
+          </button>
         </div>
       </header>
       <div className="browser-window-body">
@@ -113,6 +210,7 @@ export function BrowserWindowShell() {
           <BrowserSurface
             key={active.id}
             tab={active}
+            poster={browser.posters[active.id]}
             message={browser.message}
             recording={browser.recordingTabId === active.id}
             annotating={browser.annotatingTabId === active.id}
@@ -128,6 +226,7 @@ export function BrowserWindowShell() {
             onOpenExternally={() => browser.openExternally(active.id)}
             onSaveLogin={() => browser.saveLogin(active.id, active.taskId)}
             onFillLogin={() => browser.fillLogin(active.id, active.taskId)}
+            onToolbarTooltip={(tooltip) => browser.setToolbarTooltip(active.id, tooltip)}
             onClose={() => browser.close(active.id)}
           />
         ) : (

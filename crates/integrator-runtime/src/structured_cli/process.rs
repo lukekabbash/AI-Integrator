@@ -27,6 +27,11 @@ pub(super) fn spawn_structured_child(options: &StructuredCliLaunchOptions) -> Re
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some(path) = crate::runtime_search_path() {
+        // Native desktop launches on macOS do not inherit ~/.zshrc. Keep
+        // wrapper shebangs (`/usr/bin/env node`) on the same PATH discovery used.
+        command.env("PATH", path);
+    }
     if matches!(options.provider, StructuredCliProvider::Antigravity) {
         // Agy must stay on its subscription/keyring path. Remove selector
         // names without reading or logging their values.

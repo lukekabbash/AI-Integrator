@@ -178,10 +178,12 @@ impl BrowserTabs {
                     task_id: task_id.to_string(),
                     url: url.to_string(),
                     title: title.to_string(),
+                    favicon: None,
                     loading: false,
                     popped_out: false,
                     hidden: true,
                     held_by: None,
+                    agent_protected_until: None,
                     sleeping: true,
                     delegation_id: None,
                 },
@@ -193,6 +195,7 @@ impl BrowserTabs {
                 generation: 0,
                 touched: std::time::Instant::now(),
                 credential_at: None,
+                poster: None,
             },
         );
         true
@@ -225,13 +228,21 @@ pub(super) async fn adopt_sleeping(
     let task_id = state
         .task_of(tab_id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
-    window
+    let webview = window
         .add_child(
             tab_webview_builder(app, state, tab_id, &label, target, &task_id),
             super::parked().0,
             super::parked().1,
         )
         .map_err(|error| unavailable(format!("could not open that tab: {error}")))?;
+    // A sleeping tab may be woken by an agent while another chat is visible.
+    // Keep the live document hidden until its owning renderer claims a slot.
+    if let Err(error) = webview.hide() {
+        let _ = webview.close();
+        return Err(unavailable(format!(
+            "could not hide the restored browser tab: {error}"
+        )));
+    }
     let tab = state
         .update(tab_id, |tab| {
             tab.sleeping = false;

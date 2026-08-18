@@ -4,6 +4,13 @@
 
 use super::*;
 
+fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    source
+        .split_once(start)
+        .and_then(|(_, rest)| rest.split_once(end).map(|(section, _)| section))
+        .expect("browser lifecycle section should remain identifiable")
+}
+
 #[test]
 fn normalizes_bare_hosts_by_reachability() {
     assert_eq!(normalize_url("example.com").unwrap().scheme(), "https");
@@ -23,6 +30,39 @@ fn a_blank_tab_is_never_loading() {
     assert!(is_blank(&Url::parse("about:srcdoc").unwrap()));
     assert!(!is_blank(&Url::parse("https://example.com").unwrap()));
     assert!(!is_blank(&Url::parse("http://localhost:5173/").unwrap()));
+}
+
+#[test]
+fn every_parked_webview_is_hidden_from_the_host_chat() {
+    // Off-screen bounds preserve desktop layout for background agent work but
+    // do not remove a child page from Windows UI Automation. Every lifecycle
+    // that creates, parks, wakes, or reparents one must also hide it.
+    let module = include_str!("mod.rs");
+    let create = source_between(
+        module,
+        "pub(super) async fn create_tab",
+        concat!("#[tauri::", "command]"),
+    );
+    let park = source_between(module, "fn park_tab", "/// Positions the tab");
+    assert!(create.contains("webview.hide()"));
+    assert!(park.contains(".hide()"));
+    assert!(!park.contains(".show()"));
+
+    let remember = include_str!("remember.rs");
+    let wake = source_between(
+        remember,
+        "pub(super) async fn adopt_sleeping",
+        "emit_changed",
+    );
+    assert!(wake.contains("webview.hide()"));
+
+    let popout = include_str!("popout.rs");
+    let moved = source_between(
+        popout,
+        "fn move_tab",
+        "/// Moves a tab without losing history",
+    );
+    assert!(moved.contains("webview.hide()"));
 }
 
 #[test]
@@ -103,10 +143,12 @@ fn registry(rows: &[(&str, &str, Option<&str>)]) -> BrowserTabs {
                         task_id: (*task).to_string(),
                         url: "about:blank".into(),
                         title: String::new(),
+                        favicon: None,
                         loading: false,
                         popped_out: false,
                         hidden: false,
                         held_by: None,
+                        agent_protected_until: None,
                         sleeping: false,
                         delegation_id: owner.map(str::to_owned),
                     },
@@ -118,6 +160,7 @@ fn registry(rows: &[(&str, &str, Option<&str>)]) -> BrowserTabs {
                     generation: 0,
                     touched: std::time::Instant::now(),
                     credential_at: None,
+                    poster: None,
                 },
             );
         }
@@ -172,6 +215,109 @@ fn visible_peers_stay_inside_one_host_slot() {
         tabs.visible_peers("task-a", "keep", false, PlacementSlot::Pane),
         ["other-task"]
     );
+}
+
+#[test]
+fn raising_the_deck_includes_the_card_that_just_arrived() {
+    // `visible_peers` answers for everyone but one tab, which is the wrong
+    // question when the tab being placed is the deck card itself.
+    let tabs = registry(&[("pane", "task-a", None), ("card", "task-a", None)]);
+    tabs.set_placement("card", Some(PlacementSlot::Deck));
+    assert_eq!(
+        tabs.visible_in_slot("task-a", PlacementSlot::Deck),
+        ["card"]
+    );
+    assert_eq!(
+        tabs.visible_in_slot("task-a", PlacementSlot::Pane),
+        ["pane"]
+    );
+}
+
+#[test]
+fn placement_reports_only_a_real_slot_change() {
+    // A pane drag sends a rectangle a frame; only the moves between slots may
+    // cost a reparent, so the same slot twice has to read as no change.
+    let tabs = registry(&[("tab-1", "task-a", None)]);
+    assert!(!tabs.set_placement("tab-1", Some(PlacementSlot::Pane)));
+    assert!(tabs.set_placement("tab-1", Some(PlacementSlot::Deck)));
+    assert!(!tabs.set_placement("tab-1", Some(PlacementSlot::Deck)));
+    assert!(tabs.set_placement("tab-1", None));
+    assert!(!tabs.set_placement("missing", Some(PlacementSlot::Pane)));
+}
+
+#[test]
+fn newer_main_window_claim_prevents_an_old_chat_from_returning() {
+    let tabs = registry(&[("tab-a", "task-a", None), ("tab-b", "task-b", None)]);
+
+    assert!(tabs.claim_placement("task-a", "tab-a", false, PlacementSlot::Pane, 10, 1));
+    assert!(tabs.claim_placement("task-b", "tab-b", false, PlacementSlot::Pane, 10, 2));
+    assert!(!tabs.claim_placement("task-a", "tab-a", false, PlacementSlot::Pane, 10, 1));
+    assert!(!tabs.placement_is_current("task-a", "tab-a", false, PlacementSlot::Pane, 10, 1));
+    assert!(tabs.placement_is_current("task-b", "tab-b", false, PlacementSlot::Pane, 10, 2));
+}
+
+#[test]
+fn placement_claims_keep_slots_and_popout_tasks_independent() {
+    let tabs = registry(&[("tab-a", "task-a", None), ("tab-b", "task-b", None)]);
+
+    assert!(tabs.claim_placement("task-a", "tab-a", false, PlacementSlot::Pane, 10, 8));
+    assert!(tabs.claim_placement("task-a", "tab-a", false, PlacementSlot::Deck, 10, 1));
+    assert!(tabs.claim_placement("task-a", "tab-a", true, PlacementSlot::Popout, 10, 4));
+    assert!(tabs.claim_placement("task-b", "tab-b", true, PlacementSlot::Popout, 10, 1));
+    assert!(tabs.placement_is_current("task-b", "tab-b", true, PlacementSlot::Popout, 10, 1));
+
+    // A renderer reload starts a newer session even when its local revision
+    // starts over, and a late call from the retired session cannot take back.
+    assert!(tabs.claim_placement("task-a", "tab-a", false, PlacementSlot::Pane, 11, 1));
+    assert!(!tabs.claim_placement("task-a", "tab-a", false, PlacementSlot::Pane, 10, 99));
+}
+
+#[test]
+fn deck_claims_are_one_lane_per_card() {
+    // Every deck card is on screen at once, so a newer claim from one card must
+    // not invalidate a wake in flight for another. Pane claims stay one lane.
+    let tabs = registry(&[("tab-a", "task-a", None), ("tab-b", "task-a", None)]);
+
+    assert!(tabs.claim_placement("task-a", "tab-a", false, PlacementSlot::Deck, 10, 1));
+    assert!(tabs.claim_placement("task-a", "tab-b", false, PlacementSlot::Deck, 10, 2));
+    assert!(tabs.placement_is_current("task-a", "tab-a", false, PlacementSlot::Deck, 10, 1));
+    assert!(tabs.placement_is_current("task-a", "tab-b", false, PlacementSlot::Deck, 10, 2));
+
+    assert!(tabs.claim_placement("task-a", "tab-a", false, PlacementSlot::Pane, 10, 3));
+    assert!(tabs.claim_placement("task-a", "tab-b", false, PlacementSlot::Pane, 10, 4));
+    assert!(!tabs.placement_is_current("task-a", "tab-a", false, PlacementSlot::Pane, 10, 3));
+}
+
+#[test]
+fn the_poster_cache_keeps_the_newest_and_refuses_the_huge() {
+    let limit = registry::POSTER_LIMIT;
+    let ids: Vec<String> = (0..limit + 3).map(|index| format!("tab-{index}")).collect();
+    let rows: Vec<(&str, &str, Option<&str>)> =
+        ids.iter().map(|id| (id.as_str(), "task-a", None)).collect();
+    let tabs = registry(&rows);
+    for id in &ids {
+        assert!(tabs.set_poster(id, format!("png-for-{id}")));
+    }
+
+    let held = ids.iter().filter(|id| tabs.poster(id).is_some()).count();
+    assert_eq!(held, limit, "the cache has to stop somewhere");
+    // The three oldest went and the rest stayed, each still its own picture.
+    for (index, id) in ids.iter().enumerate() {
+        assert_eq!(
+            tabs.poster(id).is_some(),
+            index >= ids.len() - limit,
+            "{id}"
+        );
+    }
+    let newest = ids.last().expect("the run is not empty");
+    assert_eq!(tabs.poster(newest), Some(format!("png-for-{newest}")));
+
+    // One pathological capture may not spend the whole budget, and a refused
+    // one never displaces the poster a card is already showing.
+    assert!(!tabs.set_poster(newest, "x".repeat(registry::MAX_POSTER_BYTES + 1)));
+    assert_eq!(tabs.poster(newest), Some(format!("png-for-{newest}")));
+    assert!(!tabs.set_poster(newest, String::new()));
+    assert!(!tabs.set_poster("no-such-tab", "png".into()));
 }
 
 #[test]
@@ -269,6 +415,43 @@ fn the_person_outranks_whatever_agent_was_mid_flow() {
     let fresh = registry(&[("tab-2", "task-a", None)]);
     fresh.mark_user_active("tab-2", stale);
     assert_eq!(fresh.held_by_other("tab-2", "the main agent"), None);
+}
+
+#[test]
+fn recent_agent_work_outlives_the_live_hold_but_eventually_becomes_closable() {
+    let tabs = registry(&[("tab-1", "task-a", None)]);
+    tabs.mark_held("tab-1", "the main agent");
+    let live = tabs.snapshot(Some("task-a"));
+    assert!(tabs.agent_recently_used("tab-1"));
+    assert!(live[0].agent_protected_until.is_some());
+
+    {
+        let mut entries = tabs.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        entries.get_mut("tab-1").unwrap().held = Some((
+            "the main agent".into(),
+            std::time::Instant::now()
+                .checked_sub(registry::HOLD_TTL + std::time::Duration::from_secs(1))
+                .unwrap(),
+        ));
+    }
+    let recently_idle = tabs.snapshot(Some("task-a"));
+    assert_eq!(recently_idle[0].held_by, None);
+    assert!(recently_idle[0].agent_protected_until.is_some());
+    assert!(tabs.agent_recently_used("tab-1"));
+
+    {
+        let mut entries = tabs.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        entries.get_mut("tab-1").unwrap().held = Some((
+            "the main agent".into(),
+            std::time::Instant::now()
+                .checked_sub(
+                    registry::AGENT_CLOSE_PROTECTION_TTL + std::time::Duration::from_secs(1),
+                )
+                .unwrap(),
+        ));
+    }
+    assert!(!tabs.agent_recently_used("tab-1"));
+    assert_eq!(tabs.snapshot(Some("task-a"))[0].agent_protected_until, None);
 }
 
 #[test]

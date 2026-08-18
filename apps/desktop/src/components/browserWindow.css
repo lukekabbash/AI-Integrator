@@ -13,19 +13,33 @@
 
 .browser-window-strip {
   flex: none;
-  height: 38px;
-  padding: 0 10px;
+  height: 40px;
+  padding: 0 0 0 10px;
   display: flex;
   align-items: center;
   gap: 6px;
-  border-bottom: 1px solid var(--color-border-subtle);
+  /* No line under the strip: the selected tab has to run into the chrome
+     below it, the way it does in the pane. */
   background: var(--color-chrome-background, var(--color-canvas));
 }
 
+.browser-window-title {
+  max-width: 190px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  font-weight: 620;
+}
+
 .browser-window-tabs {
+  position: relative;
+  flex: 1 1 auto;
   min-width: 0;
+  height: 100%;
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   gap: 4px;
   overflow-x: auto;
   scrollbar-width: none;
@@ -34,16 +48,119 @@
   display: none;
 }
 
+/* Same strip as the work pane: every tab outlined, the selected one filled by
+   the travelling layer underneath, in the sidebar's selection colour. */
 .browser-window-tab {
+  position: relative;
+  z-index: 1;
   max-width: 220px;
-  border-color: var(--color-border-subtle);
 }
-.browser-window-tab[data-active="true"] {
-  border-color: var(--color-border-strong);
+.browser-window-tabs .browser-window-tab,
+.browser-window-tabs .browser-window-tab[data-active="true"] {
+  border-color: color-mix(in srgb, var(--color-border-strong) 55%, transparent);
+  border-bottom: 0;
+  background: transparent;
+}
+.browser-window-tabs .browser-window-tab[data-active="true"] > button[role="tab"] {
+  color: var(--color-selection-text);
 }
 .browser-window-tab .file-reader-tab-close {
-  font-size: 13px;
-  line-height: 1;
+  display: grid;
+  place-items: center;
+}
+.browser-window-tab .file-reader-tab-close svg {
+  width: 11px;
+  height: 11px;
+}
+/* The close button keeps out of the way until the tab is hovered, focused or
+   selected, so a resting strip shows titles — the work pane behaves the same. */
+.browser-window-tabs .browser-window-tab > .file-reader-tab-close {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  opacity: 0;
+  transform: translateY(-1px) scale(0.88);
+  pointer-events: none;
+  background: transparent;
+  transition:
+    opacity var(--motion-fast) var(--ease-standard),
+    transform var(--motion-fast) var(--ease-emphasized),
+    color var(--motion-fast) var(--ease-standard);
+}
+.browser-window-tabs .browser-window-tab > button[role="tab"] {
+  transition: padding-right var(--motion-fast) var(--ease-standard);
+}
+.browser-window-tab:hover > button[role="tab"],
+.browser-window-tab:focus-within > button[role="tab"],
+.browser-window-tab[data-active="true"] > button[role="tab"] {
+  padding-right: 24px;
+}
+.browser-window-tab:hover > .file-reader-tab-close,
+.browser-window-tab:focus-within > .file-reader-tab-close,
+.browser-window-tab[data-active="true"] > .file-reader-tab-close {
+  opacity: 1;
+  transform: scale(1);
+  pointer-events: auto;
+}
+.browser-window-tab[data-active="true"] > .file-reader-tab-close {
+  color: var(--color-selection-text);
+}
+@media (prefers-reduced-motion: reduce) {
+  .browser-window-tabs .browser-window-tab > .file-reader-tab-close {
+    transition: none;
+    transform: none;
+  }
+}
+
+.browser-window-new-tab {
+  width: 28px;
+  height: 28px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+.browser-window-new-tab:hover {
+  background: var(--color-layer-1);
+  color: var(--color-text-primary);
+}
+.browser-window-new-tab svg {
+  width: 14px;
+  height: 14px;
+}
+
+.browser-window-controls {
+  height: 100%;
+  flex: none;
+  display: flex;
+  margin-left: 4px;
+}
+.browser-window-controls button {
+  width: 44px;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  border: 0;
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+.browser-window-controls button:hover {
+  background: var(--color-layer-1);
+  color: var(--color-text-primary);
+}
+.browser-window-controls .browser-window-close:hover {
+  background: var(--color-status-danger);
+  color: var(--color-accent-contrast);
+}
+.browser-window-controls svg {
+  width: 13px;
+  height: 13px;
 }
 
 .browser-window-body {

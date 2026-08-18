@@ -13,6 +13,11 @@ interface TravelingSelectionProps {
   className: string;
   layoutKey: string;
   visible?: boolean;
+  /** Vertical lists clip the pill at the container's right edge so a wide row
+      cannot spill out. A horizontal strip scrolls instead, where that clamp
+      would shrink every tab past the fold to nothing. */
+  clampWidth?: boolean;
+  pace?: "settled" | "quick";
 }
 
 const selectionSpring = {
@@ -20,6 +25,14 @@ const selectionSpring = {
   stiffness: 460,
   damping: 38,
   mass: 0.7,
+};
+/** A tab strip is short and the tabs are small, so the same travel reads as
+ *  sluggish at the list's pace. Same shape, stiffer and lighter. */
+const quickSelectionSpring = {
+  type: "spring" as const,
+  stiffness: 900,
+  damping: 44,
+  mass: 0.45,
 };
 
 function sameBounds(left: SelectionBounds | null, right: SelectionBounds): boolean {
@@ -31,7 +44,11 @@ function sameBounds(left: SelectionBounds | null, right: SelectionBounds): boole
   );
 }
 
-function measureTarget(target: HTMLElement, container: HTMLElement): SelectionBounds {
+function measureTarget(
+  target: HTMLElement,
+  container: HTMLElement,
+  clampWidth: boolean,
+): SelectionBounds {
   let x = 0;
   let y = 0;
   let current: HTMLElement | null = target;
@@ -49,9 +66,8 @@ function measureTarget(target: HTMLElement, container: HTMLElement): SelectionBo
   }
 
   const targetWidth = target.offsetWidth || target.getBoundingClientRect().width;
-  const availableWidth = container.clientWidth
-    ? Math.max(0, container.clientWidth - x)
-    : targetWidth;
+  const availableWidth =
+    clampWidth && container.clientWidth ? Math.max(0, container.clientWidth - x) : targetWidth;
   return {
     x: Math.max(0, x),
     y,
@@ -65,6 +81,8 @@ export function TravelingSelection({
   className,
   layoutKey,
   visible = true,
+  clampWidth = true,
+  pace = "settled",
 }: TravelingSelectionProps) {
   const reduceMotion =
     Boolean(useReducedMotion()) ||
@@ -100,7 +118,7 @@ export function TravelingSelection({
       // While fading out (e.g. its folder is sliding shut) the pill stays
       // frozen in place instead of chasing the moving rows.
       if (!visibleRef.current) return;
-      const next = measureTarget(target, container);
+      const next = measureTarget(target, container, clampWidth);
       setBounds((current) => (sameBounds(current, next) ? current : next));
     };
     const scheduleMeasure = () => {
@@ -123,10 +141,11 @@ export function TravelingSelection({
       mutationObserver.disconnect();
       window.removeEventListener("resize", scheduleMeasure);
     };
-  }, [activeKey, layoutKey, reduceMotion]);
+  }, [activeKey, layoutKey, reduceMotion, clampWidth]);
 
   if (!bounds) return <span ref={markerRef} hidden aria-hidden="true" />;
 
+  const spring = pace === "quick" ? quickSelectionSpring : selectionSpring;
   return (
     <motion.span
       ref={markerRef}
@@ -143,10 +162,10 @@ export function TravelingSelection({
         reduceMotion
           ? { duration: 0 }
           : {
-              x: selectionSpring,
-              y: selectionSpring,
-              width: selectionSpring,
-              height: selectionSpring,
+              x: spring,
+              y: spring,
+              width: spring,
+              height: spring,
               opacity: { duration: visible ? 0.08 : 0.07, ease: "easeOut" },
             }
       }

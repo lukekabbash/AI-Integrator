@@ -322,7 +322,6 @@ fn runtime_home() -> CommandResult<PathBuf> {
 
 fn apply_runtime_environment(command: &mut CommandBuilder) {
     const KEYS: &[&str] = &[
-        "PATH",
         "HOME",
         "USER",
         "LOGNAME",
@@ -351,6 +350,9 @@ fn apply_runtime_environment(command: &mut CommandBuilder) {
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);
         }
+    }
+    if let Some(path) = integrator_runtime::runtime_search_path() {
+        command.env("PATH", path);
     }
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
@@ -519,7 +521,7 @@ fn install_plans(provider: ProviderKind) -> Vec<ResolvedPlan> {
         plans.push(direct_install_plan(
             provider,
             "npm",
-            which::which("npm").ok(),
+            find_runtime_command("npm"),
             vec!["install".into(), "-g".into(), package.into()],
             format!("npm install -g {package}"),
             provider_source(provider),
@@ -530,7 +532,7 @@ fn install_plans(provider: ProviderKind) -> Vec<ResolvedPlan> {
         plans.push(direct_install_plan(
             provider,
             "Homebrew",
-            which::which("brew").ok(),
+            find_runtime_command("brew"),
             vec!["install".into(), "--cask".into(), "codex".into()],
             "brew install --cask codex".into(),
             provider_source(provider),
@@ -541,7 +543,7 @@ fn install_plans(provider: ProviderKind) -> Vec<ResolvedPlan> {
         plans.push(direct_install_plan(
             provider,
             "Homebrew",
-            which::which("brew").ok(),
+            find_runtime_command("brew"),
             vec!["install".into(), "kimi-code".into()],
             "brew install kimi-code".into(),
             provider_source(provider),
@@ -577,7 +579,7 @@ fn shell_install_plan(
     };
     #[cfg(not(windows))]
     let (program, args, available, reason) = {
-        let shell = which::which("sh").ok();
+        let shell = find_runtime_command("sh");
         (
             shell.clone().unwrap_or_else(|| PathBuf::from("/bin/sh")),
             vec!["-lc".into(), script.into()],
@@ -719,6 +721,12 @@ fn safe_environment_note() -> &'static str {
     "Runs locally with a reduced environment. Integrator does not inherit API-key variables or record terminal input/output."
 }
 
+fn find_runtime_command(executable: &str) -> Option<PathBuf> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let search_path = integrator_runtime::runtime_search_path();
+    which::which_in(executable, search_path.as_deref(), cwd).ok()
+}
+
 fn display_command(program: &Path, args: &[OsString]) -> String {
     std::iter::once(program.as_os_str())
         .chain(args.iter().map(OsString::as_os_str))
@@ -792,12 +800,30 @@ mod tests {
 
     #[test]
     fn provider_login_commands_are_explicit() {
+        let codex = installed_action(
+            ProviderKind::Codex,
+            RuntimeActionKind::Login,
+            PathBuf::from("codex"),
+        );
+        assert_eq!(codex.public.command, "codex login");
+        let cursor = installed_action(
+            ProviderKind::Cursor,
+            RuntimeActionKind::Login,
+            PathBuf::from("cursor-agent"),
+        );
+        assert_eq!(cursor.public.command, "cursor-agent login");
         let claude = installed_action(
             ProviderKind::Claude,
             RuntimeActionKind::Login,
             PathBuf::from("claude"),
         );
         assert_eq!(claude.public.command, "claude auth login");
+        let grok = installed_action(
+            ProviderKind::Grok,
+            RuntimeActionKind::Login,
+            PathBuf::from("grok"),
+        );
+        assert_eq!(grok.public.command, "grok login");
         let kimi = installed_action(
             ProviderKind::Kimi,
             RuntimeActionKind::Login,

@@ -10,9 +10,18 @@ import {
   RotateCw,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
 
 import type { BrowserTab } from "../bridge";
+import { useModalOpen } from "../useModalOpen";
 import { BrowserStart } from "./BrowserStart";
 import { rememberBrowserVisit } from "./browserRecents";
 import { Tooltip } from "./Tooltip";
@@ -22,8 +31,6 @@ import "./browserSurface.css";
  *  the menu: every item added has to be counted here, because the tab gives up
  *  exactly this much of its top and a native surface would paint over the rest. */
 const MENU_CLEARANCE = 250;
-/** Room for a downward toolbar tooltip before the native page begins. */
-const TOOLTIP_CLEARANCE = 44;
 /** The couple of pixels the pane's hairline and drag pill occupy at the seam.
  *  A native surface would paint over them, so the tab starts just inside. */
 const SEAM_CLEARANCE = 3;
@@ -51,6 +58,10 @@ export interface BrowserSurfaceProps {
   onSaveLogin?: () => Promise<void>;
   /** Types a login already saved for this site. */
   onFillLogin?: () => Promise<void>;
+  /** Draws toolbar hover copy inside the native page so it never moves it. */
+  onToolbarTooltip?: (tooltip: { label: string; x: number } | null) => Promise<void>;
+  /** Data URL of the last still taken of this tab, if there is one. */
+  poster?: string;
   message?: string | null;
 }
 
@@ -77,18 +88,23 @@ export function BrowserSurface({
   onClose,
   onSaveLogin,
   onFillLogin,
+  onToolbarTooltip,
+  poster,
   message,
 }: BrowserSurfaceProps) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const [draft, setDraft] = useState(tab.url);
   const [focused, setFocused] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
-  const [toolbarTooltipOpen, setToolbarTooltipOpen] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
+  const modalOpen = useModalOpen();
   const popped = tab.poppedOut;
   const hostedHere = popped === poppedOutHost;
   const blank = !tab.url || tab.url === "about:blank";
+  // Only the in-app pane has a divider hanging over its left edge. Applying
+  // that inset in the independent window made its page look three pixels off.
+  const seamClearance = poppedOutHost ? 0 : SEAM_CLEARANCE;
   // The caller passes a fresh arrow every render. Reach it through a ref so
   // the placement effect below survives its parent re-rendering: keyed on the
   // callback it tore the tab off screen and put it back several times a
@@ -103,9 +119,27 @@ export function BrowserSurface({
   // the tab gives up this much of its top and the menu sits in real space. Held
   // as a constant rather than measured, so opening the menu is one placement
   // instead of a render, a measure and a second placement.
-  const overlayInset = Math.max(
-    menuOpen ? MENU_CLEARANCE : 0,
-    toolbarTooltipOpen ? TOOLTIP_CLEARANCE : 0,
+  const overlayInset = menuOpen ? MENU_CLEARANCE : 0;
+
+  const tooltipRef = useRef(onToolbarTooltip);
+  useEffect(() => {
+    tooltipRef.current = onToolbarTooltip;
+  }, [onToolbarTooltip]);
+  const reportToolbarTooltip = useCallback(
+    (open: boolean, anchor?: DOMRect, label?: ReactNode) => {
+      if (blank || !tooltipRef.current) return;
+      if (!open || !anchor || typeof label !== "string") {
+        void tooltipRef.current(null);
+        return;
+      }
+      const viewport = viewportRef.current?.getBoundingClientRect();
+      if (!viewport) return;
+      void tooltipRef.current({
+        label,
+        x: anchor.left + anchor.width / 2 - viewport.left - seamClearance,
+      });
+    },
+    [blank, seamClearance],
   );
 
   // Keep the native tab glued to this slot: observe the box, the scroll
@@ -113,10 +147,16 @@ export function BrowserSurface({
   useLayoutEffect(() => {
     const node = viewportRef.current;
     const onBounds = (rect: DOMRect | null) => boundsRef.current(rect);
-    // A blank or remotely hosted tab has nothing worth showing here. Popped
-    // tabs are remote in the main window but local in the pop-out renderer.
-    if (!node || blank || !hostedHere) {
-      boundsRef.current(null);
+    // A blank or remotely hosted tab has nothing worth showing here. Do not
+    // emit a second null placement for it: React retires the formerly visible
+    // surface in the same commit, and that surface's cleanup is the request
+    // that must park the native page. Replacing it with `new blank -> null`
+    // would park the blank tab instead and leave the old page over this slot.
+    // Popped tabs are remote in the main window but local in the pop-out.
+    // A dialog is the other reason to stand down: the page would paint over it
+    // and ignore its backdrop, so it parks until the dialog closes and the
+    // poster underneath takes the blur in its place.
+    if (!node || blank || !hostedHere || modalOpen) {
       return;
     }
     let frame = 0;
@@ -136,9 +176,9 @@ export function BrowserSurface({
         return;
       }
       const placed = new DOMRect(
-        rect.x + SEAM_CLEARANCE,
+        rect.x + seamClearance,
         rect.y + overlayInset,
-        Math.max(1, rect.width - SEAM_CLEARANCE),
+        Math.max(1, rect.width - seamClearance),
         Math.max(1, rect.height - overlayInset),
       );
       const ratio = window.devicePixelRatio || 1;
@@ -165,7 +205,7 @@ export function BrowserSurface({
       window.removeEventListener("scroll", report, true);
       onBounds(null);
     };
-  }, [blank, hostedHere, overlayInset]);
+  }, [blank, hostedHere, modalOpen, overlayInset, seamClearance]);
 
   const submit = useCallback(
     (event: React.FormEvent) => {
@@ -181,10 +221,22 @@ export function BrowserSurface({
   }, [blank, tab.loading, tab.url, tab.title]);
 
   return (
-    <div className="browser-surface" data-popped={popped ? "true" : undefined}>
+    <div
+      className="browser-surface"
+      data-popped={popped ? "true" : undefined}
+      // The strip the native page leaves free at the seam. Painting it in the
+      // chrome's colour makes it the browser's own edge rather than a stray
+      // line between the transcript and the page.
+      style={{ "--browser-seam": `${seamClearance}px` } as CSSProperties}
+    >
       <form className="browser-chrome" onSubmit={submit}>
         <div className="browser-chrome-history">
-          <Tooltip label="Back" placement="bottom" onOpenChange={setToolbarTooltipOpen}>
+          <Tooltip
+            label="Back"
+            placement="bottom"
+            renderBubble={blank}
+            onOpenChange={reportToolbarTooltip}
+          >
             <button
               type="button"
               className="icon-button subtle tiny"
@@ -194,7 +246,12 @@ export function BrowserSurface({
               <ArrowLeft aria-hidden="true" />
             </button>
           </Tooltip>
-          <Tooltip label="Forward" placement="bottom" onOpenChange={setToolbarTooltipOpen}>
+          <Tooltip
+            label="Forward"
+            placement="bottom"
+            renderBubble={blank}
+            onOpenChange={reportToolbarTooltip}
+          >
             <button
               type="button"
               className="icon-button subtle tiny"
@@ -207,7 +264,8 @@ export function BrowserSurface({
           <Tooltip
             label={tab.loading ? "Stop loading" : "Reload"}
             placement="bottom"
-            onOpenChange={setToolbarTooltipOpen}
+            renderBubble={blank}
+            onOpenChange={reportToolbarTooltip}
           >
             <button
               type="button"
@@ -245,7 +303,8 @@ export function BrowserSurface({
             <Tooltip
               label="Open in your system browser"
               placement="bottom"
-              onOpenChange={setToolbarTooltipOpen}
+              renderBubble={blank}
+              onOpenChange={reportToolbarTooltip}
             >
               <button
                 type="button"
@@ -263,7 +322,8 @@ export function BrowserSurface({
             label={annotating ? "Cancel annotation" : "Annotate this page"}
             hint={annotating ? "Esc" : "Pick an element to send to the chat"}
             placement="bottom"
-            onOpenChange={setToolbarTooltipOpen}
+            renderBubble={blank}
+            onOpenChange={reportToolbarTooltip}
           >
             <button
               type="button"
@@ -279,7 +339,8 @@ export function BrowserSurface({
             label="Screenshot"
             hint="Attaches to the composer"
             placement="bottom"
-            onOpenChange={setToolbarTooltipOpen}
+            renderBubble={blank}
+            onOpenChange={reportToolbarTooltip}
           >
             <button
               type="button"
@@ -294,7 +355,8 @@ export function BrowserSurface({
             label={recording ? "Stop recording" : "Record"}
             hint={recording ? undefined : "Frames are captured locally"}
             placement="bottom"
-            onOpenChange={setToolbarTooltipOpen}
+            renderBubble={blank}
+            onOpenChange={reportToolbarTooltip}
           >
             <button
               type="button"
@@ -310,7 +372,8 @@ export function BrowserSurface({
           <Tooltip
             label={popped ? "Dock back into the pane" : "Pop out into its own window"}
             placement="bottom"
-            onOpenChange={setToolbarTooltipOpen}
+            renderBubble={blank}
+            onOpenChange={reportToolbarTooltip}
           >
             <button
               type="button"
@@ -323,7 +386,12 @@ export function BrowserSurface({
             </button>
           </Tooltip>
           <div className="browser-more">
-            <Tooltip label="More" placement="bottom" onOpenChange={setToolbarTooltipOpen}>
+            <Tooltip
+              label="More"
+              placement="bottom"
+              renderBubble={blank}
+              onOpenChange={reportToolbarTooltip}
+            >
               <button
                 type="button"
                 className="icon-button subtle tiny"
@@ -430,6 +498,14 @@ export function BrowserSurface({
         ref={viewportRef}
         data-native={!blank && hostedHere ? "true" : undefined}
       >
+        {/* The tab's own last still, painted *under* the native page rather
+            than over it. Switching tabs mounts this slot, measures it and
+            waits on a round trip before the webview moves, and the pane was
+            blank for all of it; now it shows the page you asked for and the
+            live one lands on top of its own picture. */}
+        {!blank && hostedHere && poster ? (
+          <img className="browser-viewport-poster" src={poster} alt="" />
+        ) : null}
         {blank && hostedHere ? <BrowserStart onOpen={(url) => void onNavigate(url)} /> : null}
         {!hostedHere ? (
           <div className="browser-viewport-note">

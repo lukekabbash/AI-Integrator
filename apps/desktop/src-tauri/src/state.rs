@@ -551,6 +551,9 @@ impl AppState {
         if let Some(statuses) = reusable_provider_statuses(&cached, force) {
             return Ok(statuses);
         }
+        if force {
+            integrator_runtime::invalidate_runtime_search_path();
+        }
         let statuses = tokio::task::spawn_blocking(discover_providers)
             .await
             .map_err(|_| IntegratorError::Unavailable("provider discovery worker failed".into()))?;

@@ -28,6 +28,7 @@ import {
   PROVIDER_DEFAULT_MODEL,
   resolveModelEffort,
   type ComposerDraftAttachment,
+  type TaskPermission,
   type ComposerDraftValue,
   type ChatContextReference,
   type ModeProjection,
@@ -84,7 +85,7 @@ interface ComposerProps {
   /** Preferred model and effort recalled when the user switches runtimes. */
   runtimeDefaults?: RuntimeRouteDefaults;
   /** Settings-provided permission profile preselected for new chats. */
-  defaultPermission?: "read-only" | "project-write" | "ask" | "full-access";
+  defaultPermission?: TaskPermission;
   /** Settings-provided delegation mode preselected for new chats. */
   defaultDelegation?: "off" | "manual" | "balanced" | "budget-first";
   /** When false, plain Enter inserts a newline and Ctrl/Cmd+Enter sends. */
@@ -103,7 +104,7 @@ interface ComposerProps {
     runtime: RuntimeId;
     model: string;
     effort?: string;
-    permission: "read-only" | "project-write" | "ask" | "full-access";
+    permission: TaskPermission;
     delegation: "off" | "manual" | "balanced" | "budget-first";
     nativeActionId?: string;
     nativeAction?: NativeActionReference;
@@ -114,7 +115,7 @@ interface ComposerProps {
   /** Persist provider/model/effort for an existing chat as soon as the user changes them. */
   onRoutingChange?: (value: { runtime: RuntimeId; model: string; effort?: string }) => void;
   /** Fires immediately when the user switches the permission profile, even mid-run. */
-  onPermissionChange?: (permission: "read-only" | "project-write" | "ask" | "full-access") => void;
+  onPermissionChange?: (permission: TaskPermission) => void;
   /** Live session mode state for providers that advertise modes (e.g. Cursor
    * Agent/Plan/Ask). Absent hides the mode picker. */
   sessionModes?: ModeProjection;
@@ -124,7 +125,7 @@ interface ComposerProps {
    * id applies `value` to the permission picker, mirroring the session. */
   permissionRequest?: {
     id: string;
-    value: "read-only" | "project-write" | "ask" | "full-access";
+    value: TaskPermission;
   } | null;
   /** Project-relative file paths offered by the @-mention autocomplete. */
   contextFiles?: string[];
@@ -238,7 +239,7 @@ export function Composer({
   const [model, setModel] = useState(initialDraft?.model ?? defaultModel);
   const [effort, setEffort] = useState<string | undefined>(initialDraft?.effort ?? defaultEffort);
   const [permission, setPermission] = useState<
-    "read-only" | "project-write" | "ask" | "full-access"
+    TaskPermission
   >(initialDraft?.permission ?? defaultPermission ?? "project-write");
   // Agent-driven permission changes (e.g. an approved plan exit) override
   // the picker even after the user touched it — the session already moved.
@@ -1332,6 +1333,7 @@ export function Composer({
       label: "Ask as needed",
       disabled: antigravityPromptUnsupported,
     },
+    { value: "auto", label: "Auto" },
     { value: "full-access", label: "Full access" },
   ];
   const delegationOptions = [

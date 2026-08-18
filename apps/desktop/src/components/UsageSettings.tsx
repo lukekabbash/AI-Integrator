@@ -212,7 +212,7 @@ export function UsageSettings({
   const codexUsage = summaryByProvider.get("codex");
   const codexBuckets = subscriptionBuckets(codexUsage?.subscription);
   const accountUsage = codexUsage?.accountUsage;
-  const dailyUsage = accountUsage?.dailyUsageBuckets.slice(-28) ?? [];
+  const dailyUsage = accountUsage?.dailyUsageBuckets ?? [];
   const dailyMaximum = Math.max(1, ...dailyUsage.map((bucket) => bucket.tokens));
 
   return (

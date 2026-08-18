@@ -226,6 +226,47 @@ fn git_status_diff_stage_commit_and_preview() {
 }
 
 #[test]
+fn stage_reaches_tracked_files_under_a_later_ignored_directory_without_force() {
+    let directory = tempfile::tempdir().expect("temp repo");
+    let root = directory.path();
+    initialize_repository(root);
+    configure_identity(root);
+    fs::create_dir_all(root.join("temp/docs")).expect("fixture dir");
+    fs::write(root.join("temp/docs/notes.md"), "v1\n").expect("tracked fixture");
+    let git = GitService::discover().expect("discover git");
+    git.stage(root, &[PathBuf::from("temp/docs/notes.md")])
+        .expect("stage before ignore rule");
+    git.commit(root, "Track notes").expect("commit");
+    // The ignore rule arrives after the file was committed, which is exactly
+    // the layout that makes plain `git add <path>` refuse the path.
+    fs::write(root.join(".gitignore"), "/temp/\n").expect("ignore rule");
+    fs::write(root.join("temp/docs/notes.md"), "v2\n").expect("modify tracked");
+    fs::write(root.join("temp/scratch.md"), "never staged\n").expect("ignored untracked");
+
+    let files = git
+        .stage(root, &[PathBuf::from("temp/docs/notes.md")])
+        .expect("stage tracked file under ignored directory");
+    let notes = files
+        .iter()
+        .find(|file| file.path == PathBuf::from("temp/docs/notes.md"))
+        .expect("notes row");
+    assert_eq!(notes.index_status, 'M');
+    assert!(
+        files.iter().all(|file| file.path != PathBuf::from("temp/scratch.md")),
+        "ignored untracked file must never be staged: {files:?}"
+    );
+
+    // Selecting the directory itself also stages only what is tracked.
+    fs::write(root.join("temp/docs/notes.md"), "v3\n").expect("modify again");
+    let files = git
+        .stage(root, &[PathBuf::from("temp")])
+        .expect("stage ignored directory containing tracked files");
+    assert!(files.iter().all(|file| file.path != PathBuf::from("temp/scratch.md")));
+    let staged = git.diff(root, DiffScope::Staged, None).expect("staged diff");
+    assert!(staged.patch.contains("+v3"));
+}
+
+#[test]
 fn confirmed_push_updates_only_the_previewed_branch_and_head() {
     if which::which("git").is_err() {
         return;

@@ -1,7 +1,13 @@
-import type { BrowserContextAction } from "./bridge";
+/** The bounded page data the native browser has already authenticated. */
+export interface BrowserContextPayload {
+  pageTitle?: string;
+  pageUrl: string;
+  targetUrl?: string;
+  text?: string;
+}
 
 /** Untrusted page context stays visibly data, never executable prompt markup. */
-export function browserContextComposerText(request: BrowserContextAction): string {
+export function browserContextComposerText(request: BrowserContextPayload): string {
   const payload = JSON.stringify(
     {
       pageTitle: request.pageTitle || undefined,

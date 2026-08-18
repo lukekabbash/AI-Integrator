@@ -51,6 +51,18 @@ const itemVariants = {
   animate: { opacity: 1, y: 0, transition: stepTransition },
 };
 
+const LOGIN_REVIEW_DETAILS = new Set([
+  "auth-probe-requires-acp",
+  "auth-not-probed",
+  "auth-probe-failed",
+  "auth-probe-timeout",
+  "auth-status-unknown",
+]);
+
+function degradedRuntimeAction(runtime: RuntimeConnection): RuntimeActionKind {
+  return LOGIN_REVIEW_DETAILS.has(runtime.detail) ? "login" : "update";
+}
+
 export function SetupView({
   runtimes,
   onBack,
@@ -173,9 +185,10 @@ export function SetupView({
                       <button
                         className="secondary-button"
                         type="button"
-                        onClick={() => onRuntimeAction(runtime.id, "update")}
+                        onClick={() => onRuntimeAction(runtime.id, degradedRuntimeAction(runtime))}
                       >
-                        <RefreshCw /> Review
+                        <RefreshCw />
+                        {degradedRuntimeAction(runtime) === "login" ? "Sign in" : "Review"}
                       </button>
                     ) : null}
                     {runtime.status === "login_required" ? (

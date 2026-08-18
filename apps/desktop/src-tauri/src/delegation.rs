@@ -633,6 +633,7 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_cookies",
             "browser_navigate",
             "browser_snapshot",
+            "browser_screenshot",
             "browser_click",
             "browser_hover",
             "browser_type",
@@ -656,6 +657,7 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_cookies",
             "browser_navigate",
             "browser_snapshot",
+            "browser_screenshot",
             "browser_click",
             "browser_hover",
             "browser_type",
@@ -680,6 +682,7 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_cookies",
             "browser_navigate",
             "browser_snapshot",
+            "browser_screenshot",
             "browser_click",
             "browser_hover",
             "browser_type",
@@ -705,6 +708,7 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_cookies",
             "browser_navigate",
             "browser_snapshot",
+            "browser_screenshot",
             "browser_click",
             "browser_hover",
             "browser_type",
@@ -737,6 +741,7 @@ pub fn codex_mcp_config(info: &BrokerInfo, role: &str, scope: &str, mode: &str) 
             "browser_cookies",
             "browser_navigate",
             "browser_snapshot",
+            "browser_screenshot",
             "browser_click",
             "browser_hover",
             "browser_type",
@@ -1590,6 +1595,15 @@ async fn browser_tool(
         "browser_snapshot" => {
             let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(200);
             call("snapshot", vec![json!({ "limit": limit })]).await
+        }
+        "browser_screenshot" => {
+            let id = tab_id()?;
+            crate::browser::screenshot_for_agent(app, &tabs, &caller, &id)
+                .await
+                .map_err(|error| match error.code {
+                    "unauthorized" => IntegratorError::Unauthorized(error.message),
+                    _ => IntegratorError::Unavailable(error.message),
+                })
         }
         "browser_click" => call("click", vec![target(), json!({})]).await,
         "browser_hover" => call("hover", vec![target()]).await,
@@ -2729,6 +2743,7 @@ async fn spawn_codex_child(
     let state = app.state::<AppState>();
     let client = adapter_codex::CodexClient::spawn(adapter_codex::CodexLaunchOptions {
         executable,
+        environment: crate::native_process::runtime_launch_environment(),
         working_directory: Some(cwd.clone()),
         client_version: env!("CARGO_PKG_VERSION").into(),
     })
@@ -4224,6 +4239,7 @@ mod tests {
                 "browser_cookies",
                 "browser_navigate",
                 "browser_snapshot",
+                "browser_screenshot",
                 "browser_click",
                 "browser_hover",
                 "browser_type",
@@ -4291,6 +4307,7 @@ mod tests {
                 "browser_cookies",
                 "browser_navigate",
                 "browser_snapshot",
+                "browser_screenshot",
                 "browser_click",
                 "browser_hover",
                 "browser_type",
@@ -4323,6 +4340,7 @@ mod tests {
                 "browser_cookies",
                 "browser_navigate",
                 "browser_snapshot",
+                "browser_screenshot",
                 "browser_click",
                 "browser_hover",
                 "browser_type",
@@ -4353,6 +4371,7 @@ mod tests {
                 "browser_cookies",
                 "browser_navigate",
                 "browser_snapshot",
+                "browser_screenshot",
                 "browser_click",
                 "browser_hover",
                 "browser_type",

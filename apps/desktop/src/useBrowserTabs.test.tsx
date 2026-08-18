@@ -117,7 +117,7 @@ describe("useBrowserTabs task isolation", () => {
     mocks.browser.list.mockResolvedValue(taskTabs);
     mocks.browser.subscribe.mockResolvedValue(() => undefined);
     mocks.browser.invoke.mockResolvedValue(null);
-    mocks.browser.close.mockResolvedValue(undefined);
+    mocks.browser.close.mockResolvedValue(true);
     let controller: BrowserController | undefined;
 
     render(

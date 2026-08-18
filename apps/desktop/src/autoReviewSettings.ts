@@ -8,6 +8,7 @@ export const AUTO_REVIEW_PROFILE = "auto";
 /** Stored auto-review keys. Like every other setting these live in an untyped
  * bag, so nothing reads them without going through the normalizers below. */
 export const AUTO_REVIEW_SETTING = "permissions.autoReviewByRuntime";
+export const AUTO_REVIEW_REVIEWERS = "permissions.autoReviewReviewers";
 export const AUTO_REVIEW_POLICY = "permissions.autoReviewPolicy";
 export const AUTO_REVIEW_FALLBACK = "permissions.autoReviewFallback";
 export const AUTO_REVIEW_TIMEOUT = "permissions.autoReviewTimeoutMs";
@@ -71,6 +72,35 @@ export interface ResolvedAutoReviewRoute {
 }
 
 export type AutoReviewByRuntime = Partial<Record<RuntimeId, AutoReviewRoute>>;
+
+/** One entry in the shared reviewer order. The same order is used regardless
+ * of which runtime raised the permission request. */
+export interface AutoReviewReviewer {
+  runtime: RuntimeId;
+  model?: string;
+  effort?: string;
+}
+
+export function normalizeAutoReviewReviewers(value: unknown): AutoReviewReviewer[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return [];
+    const entry = candidate as Record<string, unknown>;
+    const runtime = readRuntimeId(entry.runtime);
+    if (!runtime) return [];
+    return [
+      {
+        runtime,
+        model: readNonEmptyString(entry.model),
+        effort: readNonEmptyString(entry.effort),
+      },
+    ];
+  });
+}
+
+export function readAutoReviewReviewers(settings: Record<string, unknown>): AutoReviewReviewer[] {
+  return normalizeAutoReviewReviewers(settings[AUTO_REVIEW_REVIEWERS]);
+}
 
 /**
  * Which runtimes can review inside themselves, and — by being exhaustive — which

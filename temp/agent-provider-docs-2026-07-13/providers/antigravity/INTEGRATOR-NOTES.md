@@ -19,12 +19,12 @@ TUI. Antigravity has no certified ACP launch command in the current code.
 ## Authentication and updates
 
 The CLI uses the OS secure keyring and falls back to Google browser sign-in,
-including a URL/code flow for SSH sessions. `/logout` is vendor-owned. The
-current native discovery code probes `~/.gemini/oauth_creds.json` only to derive
-a sanitized authenticated/logged-out state; the credential contents never cross
-the renderer or enter the corpus. Setup and update commands are vendor-owned;
-Integrator may offer the official installer and version probe but must not copy
-or manage Google tokens.
+including a URL/code flow for SSH sessions. `/logout` is vendor-owned. Native
+discovery runs the documented read-only `agy models` inventory to verify that
+the CLI can actually reuse its vendor-owned login; it never infers readiness
+from a credential filename or reads credential contents. Setup and update
+commands are vendor-owned; Integrator may offer the official installer and
+version probe but must not copy or manage Google tokens.
 
 ## Adapter methodology
 
@@ -55,12 +55,13 @@ or manage Google tokens.
 
 ## Current gaps
 
-No certified ACP route, no typed bidirectional permission protocol, no programmatic
-model list, and no streaming event contract are currently implemented for this
-provider. The route is therefore structured/Preview even though the CLI itself
-has a richer TUI. Conformance must cover final JSON, error JSON, malformed output,
-resume, permission modes, MCP failure, cancellation races, credentials missing,
-Windows PowerShell/CMD installation, and model-effort composition.
+No certified ACP route, no typed bidirectional permission protocol, and no
+streaming event contract are currently implemented for this provider. The route
+is therefore structured/Preview even though the CLI itself has a richer TUI.
+The read-only `agy models` subcommand supplies the live model inventory.
+Conformance must cover final JSON, error JSON, malformed output, resume,
+permission modes, MCP failure, cancellation races, credentials missing, Windows
+PowerShell/CMD installation, and model-effort composition.
 
 ## Evidence classification
 

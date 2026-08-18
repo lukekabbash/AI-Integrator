@@ -84,6 +84,13 @@ describe("usage windows", () => {
     expect(enumeratePeriods(window)).toHaveLength(7);
     expect(periodStart(NOW, "day")).toBe(new Date(2026, 7, 16).getTime());
   });
+
+  it("starts all history at local midnight on January 1, 2024", () => {
+    const requested = makeUsageWindow("all", NOW);
+    expect(requested.days).toBe("all");
+    expect(requested.sinceMs).toBe(new Date(2024, 0, 1).getTime());
+    expect(enumeratePeriods(requested).length).toBeLessThan(1_000);
+  });
 });
 
 describe("pricing", () => {

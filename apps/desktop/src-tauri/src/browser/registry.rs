@@ -8,8 +8,11 @@
 
 use std::{
     collections::HashMap,
-    sync::{Mutex, atomic::AtomicU64},
-    time::Duration,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +28,10 @@ pub struct BrowserTab {
     pub task_id: String,
     pub url: String,
     pub title: String,
+    /// The site's own icon as a `data:` URL, once the page has been asked for
+    /// it. Absent until then, and absent for any page that has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub favicon: Option<String>,
     pub loading: bool,
     pub popped_out: bool,
     /// True while the tab has no visible host (pane closed); it keeps running.
@@ -33,6 +40,11 @@ pub struct BrowserTab {
     /// someone is mid-flow here and open its own rather than take the wheel.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub held_by: Option<String>,
+    /// Wall-clock deadline through which the UI must preserve this tab when
+    /// its close button is pressed. Agent work gets a short safety tail after
+    /// the live hold expires; user-only tabs never receive one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_protected_until: Option<u64>,
     /// The delegated child that owns this tab, when a child opened it. Tabs
     /// the orchestrator opened have none, and siblings never see each other's.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -73,14 +85,45 @@ pub(crate) struct Tab {
     /// When the app typed a saved password into this page. While it is set,
     /// reading the page back is refused; see `vault`.
     pub(crate) credential_at: Option<std::time::Instant>,
+    /// The last still taken of this page, if one is still held. A tab that has
+    /// never been on screen has none, and a card with none reads exactly as it
+    /// did before there were any.
+    pub(crate) poster: Option<Poster>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+/// A still of one page, base64 PNG, with the tick it was taken on. The tick is
+/// a counter rather than a clock so two captures in the same instant still
+/// evict in the order they arrived.
+pub(crate) struct Poster {
+    pub(crate) png: String,
+    pub(crate) tick: u64,
+    /// A still is page data: never hand it out after this tab navigates.
+    pub(crate) url: String,
+    pub(crate) generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum PlacementSlot {
     Pane,
     Deck,
     Popout,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct PlacementLaneKey {
+    /// Main-window lanes are shared across chats; each popout has one task.
+    popout_task: Option<String>,
+    slot: PlacementSlot,
+    /// The deck shows every card's page at once, so each card is its own lane
+    /// rather than competing for one rectangle. Pane and popout are `None`.
+    deck_tab: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PlacementOrder {
+    session: u64,
+    revision: u64,
 }
 
 /// What a child may do with a tab it was handed.
@@ -117,6 +160,11 @@ impl Caller {
 /// thing whoever the someone is.
 pub(crate) const HOLD_TTL: Duration = Duration::from_secs(45);
 
+/// A close click shortly after an agent action minimizes the tab instead of
+/// destroying work the person may still want to inspect. This is deliberately
+/// longer than the collision-prevention hold, but remains a recent-use window.
+pub(crate) const AGENT_CLOSE_PROTECTION_TTL: Duration = Duration::from_secs(5 * 60);
+
 /// The holder a tab reports while the person is working in it.
 pub(crate) const USER_HOLDER: &str = "you";
 
@@ -124,6 +172,18 @@ pub(crate) const USER_HOLDER: &str = "you";
 /// navigates. Long enough for a slow sign-in, short enough that a tab left on a
 /// form does not stay unreadable for the session.
 pub(crate) const CREDENTIAL_TTL: Duration = Duration::from_secs(300);
+
+/// How many tabs keep a still at once. The deck draws four cards and the pane
+/// one, so this is more than is ever painted together; past it the oldest
+/// capture is dropped, because a long chat can hold dozens of tabs and a PNG
+/// per tab is memory spent on pictures nothing is going to show.
+pub(crate) const POSTER_LIMIT: usize = 8;
+
+/// The largest still worth keeping, in base64 characters. Captures are scaled
+/// down before they are encoded, so anything past this is a pathological page
+/// rather than a card-sized picture — and a poster is a nicety, never worth
+/// that much resident memory.
+pub(crate) const MAX_POSTER_BYTES: usize = 512 * 1024;
 
 pub struct BrowserTabs {
     pub(crate) tabs: Mutex<HashMap<String, Tab>>,
@@ -133,6 +193,13 @@ pub struct BrowserTabs {
     /// so neither a page nor an agent's `evaluate` can reach the entry points
     /// that touch a saved password. Fresh every launch.
     host_key: String,
+    /// Orders stills against each other, so eviction goes by arrival rather
+    /// than by a clock two captures in the same instant would share.
+    poster_clock: AtomicU64,
+    /// Latest renderer owner of each native rectangle. A slow wake from the
+    /// chat being left may finish after the next chat has claimed that slot;
+    /// the older request must then stay parked rather than leak across chats.
+    placement_orders: Mutex<HashMap<PlacementLaneKey, PlacementOrder>>,
 }
 
 impl Default for BrowserTabs {
@@ -141,6 +208,8 @@ impl Default for BrowserTabs {
             tabs: Mutex::default(),
             sequence: AtomicU64::default(),
             host_key: uuid::Uuid::new_v4().to_string(),
+            poster_clock: AtomicU64::default(),
+            placement_orders: Mutex::default(),
         }
     }
 }
@@ -158,6 +227,7 @@ impl BrowserTabs {
             .map(|tab| {
                 let mut state = tab.state.clone();
                 state.held_by = holder_of(tab);
+                state.agent_protected_until = agent_protected_until(tab);
                 state
             })
             .collect();
@@ -256,6 +326,18 @@ impl BrowserTabs {
         holder_of(tabs.get(id)?).filter(|who| who != asker)
     }
 
+    /// Whether a renderer close request must preserve this tab in the compact
+    /// deck. Only broker-driven agent activity sets `held`; a person's own tab
+    /// remains immediately closable.
+    pub(crate) fn agent_recently_used(&self, id: &str) -> bool {
+        let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        tabs.get(id).is_some_and(|tab| {
+            tab.held
+                .as_ref()
+                .is_some_and(|(_, at)| at.elapsed() < AGENT_CLOSE_PROTECTION_TTL)
+        })
+    }
+
     /// The key that proves a guest call came from the app.
     pub(crate) fn host_key(&self) -> String {
         self.host_key.clone()
@@ -349,12 +431,137 @@ impl BrowserTabs {
         peers
     }
 
-    pub(crate) fn set_placement(&self, id: &str, placement_slot: Option<PlacementSlot>) {
+    /// Reports whether this actually moved the tab, so a caller can tell a slot
+    /// change from the stream of geometry updates a pane drag produces.
+    pub(crate) fn set_placement(&self, id: &str, placement_slot: Option<PlacementSlot>) -> bool {
         let mut tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(tab) = tabs.get_mut(id) {
-            tab.state.hidden = placement_slot.is_none();
-            tab.placement_slot = placement_slot;
+        match tabs.get_mut(id) {
+            Some(tab) => {
+                let moved = tab.placement_slot != placement_slot;
+                tab.state.hidden = placement_slot.is_none();
+                tab.placement_slot = placement_slot;
+                moved
+            }
+            None => false,
         }
+    }
+
+    /// The visible tabs holding one slot of the main window. `visible_peers`
+    /// answers the same question for everyone *but* one tab; this one includes
+    /// it, because raising the deck has to raise the card that just arrived.
+    pub(crate) fn visible_in_slot(&self, task_id: &str, slot: PlacementSlot) -> Vec<String> {
+        self.visible_peers(task_id, "", false, slot)
+    }
+
+    fn placement_lane(
+        task_id: &str,
+        tab_id: &str,
+        popped_out: bool,
+        slot: PlacementSlot,
+    ) -> PlacementLaneKey {
+        PlacementLaneKey {
+            popout_task: popped_out.then(|| task_id.to_string()),
+            slot,
+            deck_tab: (slot == PlacementSlot::Deck).then(|| tab_id.to_string()),
+        }
+    }
+
+    /// Claims one native host slot if this renderer request is newer. Main
+    /// window claims deliberately span tasks; that is the isolation boundary
+    /// that prevents an old chat's pane from reappearing late. Deck lanes are
+    /// per tab: every card is on screen together.
+    pub(crate) fn claim_placement(
+        &self,
+        task_id: &str,
+        tab_id: &str,
+        popped_out: bool,
+        slot: PlacementSlot,
+        session: u64,
+        revision: u64,
+    ) -> bool {
+        let key = Self::placement_lane(task_id, tab_id, popped_out, slot);
+        let incoming = PlacementOrder { session, revision };
+        let mut orders = self
+            .placement_orders
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if orders.get(&key).is_some_and(|current| *current >= incoming) {
+            return false;
+        }
+        orders.insert(key, incoming);
+        true
+    }
+
+    /// Re-checks ownership after an await such as waking a sleeping webview.
+    pub(crate) fn placement_is_current(
+        &self,
+        task_id: &str,
+        tab_id: &str,
+        popped_out: bool,
+        slot: PlacementSlot,
+        session: u64,
+        revision: u64,
+    ) -> bool {
+        let key = Self::placement_lane(task_id, tab_id, popped_out, slot);
+        let expected = PlacementOrder { session, revision };
+        let orders = self
+            .placement_orders
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        orders.get(&key).is_some_and(|current| *current == expected)
+    }
+
+    /// Remembers a still of this page and evicts the oldest once the cache is
+    /// over its limit. Nothing here is written to disk: a poster is a paint,
+    /// not a record, and it dies with the session.
+    pub(crate) fn set_poster(&self, id: &str, png: String) -> bool {
+        if png.is_empty() || png.len() > MAX_POSTER_BYTES {
+            return false;
+        }
+        let tick = self.poster_clock.fetch_add(1, Ordering::Relaxed);
+        let mut tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(tab) = tabs.get_mut(id) else {
+            return false;
+        };
+        tab.poster = Some(Poster {
+            png,
+            tick,
+            url: tab.state.url.clone(),
+            generation: tab.generation,
+        });
+        let mut held: Vec<(u64, String)> = tabs
+            .values()
+            .filter_map(|tab| {
+                tab.poster
+                    .as_ref()
+                    .map(|poster| (poster.tick, tab.state.id.clone()))
+            })
+            .collect();
+        if held.len() > POSTER_LIMIT {
+            held.sort_by_key(|(tick, _)| *tick);
+            let stale = held.len() - POSTER_LIMIT;
+            for (_, evicted) in held.iter().take(stale) {
+                if let Some(tab) = tabs.get_mut(evicted) {
+                    tab.poster = None;
+                }
+            }
+        }
+        true
+    }
+
+    /// This tab's last still, if one was taken and has not been evicted.
+    pub(crate) fn poster(&self, id: &str) -> Option<String> {
+        let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        tabs.get(id).and_then(|tab| {
+            tab.poster
+                .as_ref()
+                .filter(|poster| {
+                    !tab.state.loading
+                        && poster.url == tab.state.url
+                        && poster.generation == tab.generation
+                })
+                .map(|poster| poster.png.clone())
+        })
     }
 
     pub(crate) fn label_for(&self, id: &str) -> Option<String> {
@@ -391,6 +598,13 @@ pub(crate) fn holder_of(tab: &Tab) -> Option<String> {
         .as_ref()
         .filter(|(_, at)| at.elapsed() < HOLD_TTL)
         .map(|(who, _)| who.clone())
+}
+
+fn agent_protected_until(tab: &Tab) -> Option<u64> {
+    let (_, at) = tab.held.as_ref()?;
+    let remaining = AGENT_CLOSE_PROTECTION_TTL.checked_sub(at.elapsed())?;
+    let deadline = SystemTime::now().checked_add(remaining)?;
+    u64::try_from(deadline.duration_since(UNIX_EPOCH).ok()?.as_millis()).ok()
 }
 
 /// Notes the person's last touch from a guest reply, so a tab an agent is

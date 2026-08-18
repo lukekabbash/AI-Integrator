@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashSet},
+    ffi::OsString,
     fs,
     io::{Read, Write},
     net::SocketAddr,
@@ -74,7 +75,7 @@ use crate::native_actions::{
 };
 #[cfg(target_os = "windows")]
 use crate::native_process::CREATE_NO_WINDOW;
-use crate::native_process::spawn_quiet;
+use crate::native_process::{runtime_launch_environment, spawn_quiet};
 use crate::provider_model_catalog::{
     ClaudeModelEntry, parse_antigravity_models, parse_claude_models, parse_grok_models,
 };
@@ -236,6 +237,7 @@ async fn codex_native_actions(
                 })?;
             let client = adapter_codex::CodexClient::spawn(CodexLaunchOptions {
                 executable,
+                environment: runtime_launch_environment(),
                 working_directory: Some(repository.to_path_buf()),
                 client_version: env!("CARGO_PKG_VERSION").into(),
             })
@@ -361,7 +363,7 @@ async fn probe_acp_actions(
     let client = adapter_acp::AcpClient::spawn(adapter_acp::AcpLaunchOptions {
         executable,
         arguments: acp_launch_arguments(provider, &AcpLaunchProfile::Default)?,
-        environment: Vec::new(),
+        environment: acp_launch_environment(provider, &AcpLaunchProfile::Default),
         working_directory: Some(repository.to_path_buf()),
         client_version: env!("CARGO_PKG_VERSION").into(),
         skip_initialized_notification: *provider == ProviderKind::Grok,
@@ -809,6 +811,7 @@ async fn refresh_codex_usage(state: &State<'_, AppState>) {
                 Duration::from_secs(10),
                 adapter_codex::CodexClient::spawn(CodexLaunchOptions {
                     executable,
+                    environment: runtime_launch_environment(),
                     working_directory: None,
                     client_version: env!("CARGO_PKG_VERSION").into(),
                 }),
@@ -3098,6 +3101,7 @@ pub async fn codex_connect(
         })?;
     let client = adapter_codex::CodexClient::spawn(CodexLaunchOptions {
         executable,
+        environment: runtime_launch_environment(),
         working_directory,
         client_version: env!("CARGO_PKG_VERSION").into(),
     })
@@ -3564,6 +3568,7 @@ pub async fn grok_list_models(state: State<'_, AppState>) -> CommandResult<Vec<S
             message: "Grok Build CLI is not installed".into(),
         })?;
     let mut command = tokio::process::Command::new(executable);
+    apply_runtime_search_path(&mut command);
     command
         .args(["--no-auto-update", "models"])
         .kill_on_drop(true);
@@ -3610,7 +3615,10 @@ pub async fn antigravity_list_models(state: State<'_, AppState>) -> CommandResul
             message: "Antigravity CLI is not installed".into(),
         })?;
     let mut command = tokio::process::Command::new(executable);
-    command.arg("models").kill_on_drop(true);
+    apply_runtime_search_path(&mut command);
+    command
+        .args(["--output-format", "json", "models"])
+        .kill_on_drop(true);
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW);
     let output = timeout(Duration::from_secs(15), command.output())
@@ -3658,6 +3666,7 @@ pub async fn claude_list_models(
             message: "Claude Code CLI is not installed".into(),
         })?;
     let mut command = tokio::process::Command::new(executable);
+    apply_runtime_search_path(&mut command);
     command
         .args([
             "-p",
@@ -3859,10 +3868,10 @@ pub async fn codex_start_thread(
     if !is_chat
         && permission.as_deref() == Some(AUTO_PERMISSION_PROFILE)
         && let Some(plan) = auto_review_plan(&state.store, ProviderKind::Codex)
-        && plan.mode == ReviewerMode::Native
         && let Some(config) = codex_config.as_mut()
     {
-        merge_codex_auto_review(config, &plan.config);
+        let reviewer = codex_auto_review_config(&plan);
+        merge_codex_auto_review(config, &reviewer);
     }
     let response = runtime
         .client
@@ -5181,35 +5190,44 @@ pub(crate) fn acp_launch_arguments_with_route(
 pub(crate) fn acp_launch_environment(
     provider: &ProviderKind,
     profile: &AcpLaunchProfile,
-) -> Vec<(String, String)> {
+) -> Vec<(OsString, OsString)> {
+    let mut environment = runtime_launch_environment();
     if *provider != ProviderKind::Grok || !matches!(profile, AcpLaunchProfile::Chat { .. }) {
-        return Vec::new();
+        return environment;
     }
     // Grok otherwise imports user-level Cursor and Claude instructions,
     // skills, agents, hooks, and MCPs. Chat owns a deliberately tiny surface,
     // so disable every compatibility scanner for this process only while
     // leaving the user's normal Grok configuration untouched.
-    [
-        "GROK_CURSOR_SKILLS_ENABLED",
-        "GROK_CURSOR_RULES_ENABLED",
-        "GROK_CURSOR_AGENTS_ENABLED",
-        "GROK_CURSOR_MCPS_ENABLED",
-        "GROK_CURSOR_HOOKS_ENABLED",
-        "GROK_CLAUDE_SKILLS_ENABLED",
-        "GROK_CLAUDE_RULES_ENABLED",
-        "GROK_CLAUDE_AGENTS_ENABLED",
-        "GROK_CLAUDE_MCPS_ENABLED",
-        "GROK_CLAUDE_HOOKS_ENABLED",
-        "GROK_MEMORY",
-        "GROK_SUBAGENTS",
-        "GROK_WRITE_FILE",
-        "GROK_TOOL_SEARCH",
-        "GROK_WEB_FETCH",
-        "GROK_SANDBOX_AUTO_ALLOW_BASH",
-    ]
-    .into_iter()
-    .map(|name| (name.to_owned(), "0".to_owned()))
-    .collect()
+    environment.extend(
+        [
+            "GROK_CURSOR_SKILLS_ENABLED",
+            "GROK_CURSOR_RULES_ENABLED",
+            "GROK_CURSOR_AGENTS_ENABLED",
+            "GROK_CURSOR_MCPS_ENABLED",
+            "GROK_CURSOR_HOOKS_ENABLED",
+            "GROK_CLAUDE_SKILLS_ENABLED",
+            "GROK_CLAUDE_RULES_ENABLED",
+            "GROK_CLAUDE_AGENTS_ENABLED",
+            "GROK_CLAUDE_MCPS_ENABLED",
+            "GROK_CLAUDE_HOOKS_ENABLED",
+            "GROK_MEMORY",
+            "GROK_SUBAGENTS",
+            "GROK_WRITE_FILE",
+            "GROK_TOOL_SEARCH",
+            "GROK_WEB_FETCH",
+            "GROK_SANDBOX_AUTO_ALLOW_BASH",
+        ]
+        .into_iter()
+        .map(|name| (OsString::from(name), OsString::from("0"))),
+    );
+    environment
+}
+
+fn apply_runtime_search_path(command: &mut tokio::process::Command) {
+    if let Some(path) = integrator_runtime::runtime_search_path() {
+        command.env("PATH", path);
+    }
 }
 
 #[tauri::command]
@@ -6020,9 +6038,10 @@ pub async fn acp_list_cursor_models(
 #[tauri::command]
 pub async fn acp_session_capabilities(
     state: State<'_, AppState>,
-    task_id: TaskId,
+    task_id: Option<TaskId>,
+    provider: Option<ProviderKind>,
 ) -> CommandResult<adapter_acp::AcpSessionCapabilities> {
-    let runtime = acp_runtime(&state, Some(task_id), None).await?;
+    let runtime = acp_runtime(&state, task_id, provider).await?;
     Ok(runtime.client.session_capabilities().await)
 }
 
@@ -6691,6 +6710,7 @@ pub(crate) fn spawn_structured_cli_pump(
     store: Arc<LocalStore>,
     runtime: StructuredRuntime,
 ) {
+    let started_with_resume = runtime.session_ref.lock().expect("session lock").is_some();
     let mut receiver = runtime.client.subscribe();
     tauri::async_runtime::spawn(async move {
         // Claude can emit text -> tool -> text within one turn. Keep each
@@ -6871,6 +6891,23 @@ pub(crate) fn spawn_structured_cli_pump(
                     message,
                     usage,
                 } => {
+                    if !success {
+                        if clear_rejected_structured_resume(
+                            &store,
+                            binding.task_id,
+                            binding.provider,
+                            started_with_resume,
+                            Some(1),
+                            false,
+                            message.as_deref(),
+                        ) {
+                            *runtime.session_ref.lock().expect("session lock") = None;
+                        }
+                        if let Some(message) = message.as_ref() {
+                            *runtime.last_diagnostic.lock().expect("diagnostic lock") =
+                                Some(message.clone());
+                        }
+                    }
                     // Per-turn usage accumulates onto the task projection so
                     // the per-provider summary reflects vendor-reported
                     // numbers instead of staying "unavailable".
@@ -7054,6 +7091,20 @@ pub(crate) fn spawn_structured_cli_pump(
                         .lock()
                         .expect("diagnostic lock")
                         .take();
+                    if clear_rejected_structured_resume(
+                        &store,
+                        binding.task_id,
+                        binding.provider,
+                        started_with_resume,
+                        code,
+                        cancelled,
+                        diagnostic.as_deref(),
+                    ) {
+                        // The provider has forgotten this conversation. Drop
+                        // only the stale reference; the user's next retry
+                        // starts fresh without replaying an uncertain turn.
+                        *runtime.session_ref.lock().expect("session lock") = None;
+                    }
                     if let Ok(documents) = app.path().document_dir() {
                         let detailed = detailed_logging_enabled(&store);
                         let mut record = serde_json::json!({
@@ -7118,6 +7169,45 @@ pub(crate) fn spawn_structured_cli_pump(
         }
         runtime.alive.store(false, Ordering::Release);
     });
+}
+
+pub(crate) fn structured_resume_rejected(
+    provider: ProviderKind,
+    started_with_resume: bool,
+    code: Option<i32>,
+    cancelled: bool,
+    diagnostic: Option<&str>,
+) -> bool {
+    if !started_with_resume || cancelled || code == Some(0) {
+        return false;
+    }
+    let Some(message) = diagnostic.map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    let missing = message.contains("not found")
+        || message.contains("does not exist")
+        || message.contains("unknown session");
+    missing
+        && match provider {
+            ProviderKind::Claude => message.contains("conversation") || message.contains("session"),
+            ProviderKind::Antigravity => {
+                message.contains("conversation") || message.contains("session")
+            }
+            _ => false,
+        }
+}
+
+pub(crate) fn clear_rejected_structured_resume(
+    store: &LocalStore,
+    task_id: TaskId,
+    provider: ProviderKind,
+    started_with_resume: bool,
+    code: Option<i32>,
+    cancelled: bool,
+    diagnostic: Option<&str>,
+) -> bool {
+    structured_resume_rejected(provider, started_with_resume, code, cancelled, diagnostic)
+        && store.clear_provider_resume_state(task_id).is_ok()
 }
 
 fn structured_connection_event(
@@ -7755,6 +7845,7 @@ const AUTO_PERMISSION_PROFILE: &str = "auto";
 /// permission decision must not be steerable by whatever the last `invoke`
 /// happened to carry.
 const AUTO_REVIEW_SETTING: &str = "permissions.autoReviewByRuntime";
+const AUTO_REVIEW_REVIEWERS_SETTING: &str = "permissions.autoReviewReviewers";
 const AUTO_REVIEW_POLICY_SETTING: &str = "permissions.autoReviewPolicy";
 const AUTO_REVIEW_FALLBACK_SETTING: &str = "permissions.autoReviewFallback";
 const AUTO_REVIEW_TIMEOUT_SETTING: &str = "permissions.autoReviewTimeoutMs";
@@ -7776,20 +7867,17 @@ pub fn auto_review_default_policy() -> String {
 /// many rows leave SQLite while a turn is parked on the answer.
 const AUTO_REVIEW_TRANSCRIPT_ITEMS: usize = 30;
 
-/// The stored auto-review settings for one task runtime, with every inheritance
-/// already applied. Mirrors `readAutoReviewRoute` in `autoReviewSettings.ts`.
+/// The shared reviewer order with policy, timeout, and final fallback resolved.
+/// `config` is primary; `fallback_configs` are tried in order.
 struct AutoReviewPlan {
-    mode: ReviewerMode,
     config: ReviewerConfig,
+    fallback_configs: Vec<ReviewerConfig>,
     fallback: Fallback,
 }
 
-/// Resolve the reviewer configured for one task runtime.
-///
-/// `None` means the user has not switched the reviewer on for this runtime, and
-/// the caller then behaves as though the profile were ordinary interactive
-/// approvals. That is the direction to be wrong in: an unconfigured `auto` asks
-/// the user rather than proceeding on its own.
+/// Resolve the shared reviewer order. The older per-runtime map remains readable
+/// for existing installs; without either setting, Auto uses the task runtime.
+/// `None` only represents an explicitly disabled legacy route.
 fn auto_review_plan(store: &LocalStore, task_runtime: ProviderKind) -> Option<AutoReviewPlan> {
     let read = |key: &str| {
         store
@@ -7798,8 +7886,65 @@ fn auto_review_plan(store: &LocalStore, task_runtime: ProviderKind) -> Option<Au
             .flatten()
             .map(|setting| setting.value)
     };
-    let by_runtime = read(AUTO_REVIEW_SETTING)?;
-    let stored = by_runtime.get(auto_review_runtime_key(task_runtime))?;
+    let policy = auto_review_text(read(AUTO_REVIEW_POLICY_SETTING).as_ref());
+    let timeout_ms = read(AUTO_REVIEW_TIMEOUT_SETTING)
+        .as_ref()
+        .and_then(Value::as_u64);
+    let fallback = match read(AUTO_REVIEW_FALLBACK_SETTING)
+        .as_ref()
+        .and_then(Value::as_str)
+    {
+        Some("deny") => Fallback::Deny,
+        _ => Fallback::Ask,
+    };
+
+    if let Some(Value::Array(stored_reviewers)) = read(AUTO_REVIEW_REVIEWERS_SETTING) {
+        let mut configs = stored_reviewers
+            .iter()
+            .filter_map(|stored| {
+                let runtime = stored
+                    .get("runtime")
+                    .and_then(Value::as_str)
+                    .and_then(auto_review_runtime_id)?;
+                Some(
+                    ReviewerConfig::new(ReviewerRoute {
+                        runtime,
+                        model: auto_review_text(stored.get("model")),
+                        effort: auto_review_text(stored.get("effort")),
+                    })
+                    .with_policy(policy.as_deref())
+                    .with_timeout_ms(timeout_ms),
+                )
+            })
+            .collect::<Vec<_>>();
+        if !configs.is_empty() {
+            let config = configs.remove(0);
+            return Some(AutoReviewPlan {
+                config,
+                fallback_configs: configs,
+                fallback,
+            });
+        }
+    }
+
+    let Some(by_runtime) = read(AUTO_REVIEW_SETTING) else {
+        return Some(AutoReviewPlan {
+            config: ReviewerConfig::new(ReviewerRoute::new(task_runtime))
+                .with_policy(policy.as_deref())
+                .with_timeout_ms(timeout_ms),
+            fallback_configs: Vec::new(),
+            fallback,
+        });
+    };
+    let Some(stored) = by_runtime.get(auto_review_runtime_key(task_runtime)) else {
+        return Some(AutoReviewPlan {
+            config: ReviewerConfig::new(ReviewerRoute::new(task_runtime))
+                .with_policy(policy.as_deref())
+                .with_timeout_ms(timeout_ms),
+            fallback_configs: Vec::new(),
+            fallback,
+        });
+    };
     // Anything other than a literal `true` is off, matching the normalizer on
     // the renderer side: an imported setting reading `"enabled": "yes"` must not
     // switch a reviewer on by accident.
@@ -7833,27 +7978,13 @@ fn auto_review_plan(store: &LocalStore, task_runtime: ProviderKind) -> Option<Au
     };
     // Route policy, then the global one, then the shipped default that
     // `ReviewerConfig` falls back to on its own.
-    let policy = auto_review_text(stored.get("policy"))
-        .or_else(|| auto_review_text(read(AUTO_REVIEW_POLICY_SETTING).as_ref()));
+    let policy = auto_review_text(stored.get("policy")).or(policy);
     Some(AutoReviewPlan {
-        mode,
         config: ReviewerConfig::new(route)
             .with_policy(policy.as_deref())
-            .with_timeout_ms(
-                read(AUTO_REVIEW_TIMEOUT_SETTING)
-                    .as_ref()
-                    .and_then(Value::as_u64),
-            ),
-        fallback: match read(AUTO_REVIEW_FALLBACK_SETTING)
-            .as_ref()
-            .and_then(Value::as_str)
-        {
-            Some("deny") => Fallback::Deny,
-            // Anything unreadable resolves to the default rather than to the
-            // stricter option, so a corrupt settings row cannot quietly start
-            // denying work the user expected to be asked about.
-            _ => Fallback::Ask,
-        },
+            .with_timeout_ms(timeout_ms),
+        fallback_configs: Vec::new(),
+        fallback,
     })
 }
 
@@ -7898,6 +8029,20 @@ fn merge_codex_auto_review(config: &mut Value, reviewer: &ReviewerConfig) {
         return;
     };
     target.extend(fields);
+}
+
+/// Codex owns its permission-review transport, so it uses the first Codex
+/// entry in the shared order. If there is none, its built-in defaults apply.
+fn codex_auto_review_config(plan: &AutoReviewPlan) -> ReviewerConfig {
+    std::iter::once(&plan.config)
+        .chain(&plan.fallback_configs)
+        .find(|config| config.route.runtime == ProviderKind::Codex)
+        .cloned()
+        .unwrap_or_else(|| {
+            ReviewerConfig::new(ReviewerRoute::new(ProviderKind::Codex))
+                .with_policy(Some(&plan.config.policy))
+                .with_timeout_ms(Some(plan.config.timeout.as_millis() as u64))
+        })
 }
 
 /// The app's own one-shot generation path, wearing the module's seam.
@@ -7946,10 +8091,17 @@ async fn auto_review_outcome(
     request: &BoundaryRequest,
     transcript: &[TranscriptLine],
 ) -> Outcome {
-    auto_review::resolve(
-        auto_review::review(reviewer, &plan.config, request, transcript).await,
-        plan.fallback,
-    )
+    let mut unavailable = auto_review::Verdict::Unavailable {
+        reason: "no reviewer is configured".into(),
+    };
+    for config in std::iter::once(&plan.config).chain(&plan.fallback_configs) {
+        let verdict = auto_review::review(reviewer, config, request, transcript).await;
+        if !matches!(verdict, auto_review::Verdict::Unavailable { .. }) {
+            return auto_review::resolve(verdict, plan.fallback);
+        }
+        unavailable = verdict;
+    }
+    auto_review::resolve(unavailable, plan.fallback)
 }
 
 /// Describe one `can_use_tool` request in the terms the reviewer reads.

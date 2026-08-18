@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { domAnimation, LazyMotion } from "motion/react";
 import { useEffect, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bridge, type Automation, type TaskSummary } from "../bridge";
@@ -65,7 +66,11 @@ const runtimes = [
   },
 ];
 
-function renderScheduled(createRequest = 0, onTaskCreated?: (task: TaskSummary) => void) {
+function renderScheduled(
+  createRequest = 0,
+  onTaskCreated?: (task: TaskSummary) => void,
+  options: { motionScale?: number; railToggle?: boolean } = {},
+) {
   function Harness() {
     const [railOpen, setRailOpen] = useState(false);
     // The titlebar "New" button only exists while this screen is mounted, so a
@@ -75,24 +80,34 @@ function renderScheduled(createRequest = 0, onTaskCreated?: (task: TaskSummary) 
       if (createRequest > 0) setRequest(createRequest);
     }, []);
     return (
-      <ScheduledView
-        createRequest={request}
-        railOpen={railOpen}
-        onRailOpenChange={setRailOpen}
-        rightRailWidth={356}
-        onResizeRail={() => undefined}
-        motionScale={0}
-        projects={projects}
-        tasks={tasks}
-        runtimes={runtimes}
-        activeTaskId="task-1"
-        defaultRoute={{ runtime: "codex", model: "gpt-5.6-sol", effort: "medium" }}
-        onOpenTask={() => undefined}
-        onTaskCreated={onTaskCreated}
-      />
+      <>
+        {options.railToggle ? (
+          <button type="button" onClick={() => setRailOpen((open) => !open)}>
+            {railOpen ? "Close scheduled rail" : "Open scheduled rail"}
+          </button>
+        ) : null}
+        <ScheduledView
+          createRequest={request}
+          railOpen={railOpen}
+          onRailOpenChange={setRailOpen}
+          rightRailWidth={356}
+          onResizeRail={() => undefined}
+          motionScale={options.motionScale ?? 0}
+          projects={projects}
+          tasks={tasks}
+          runtimes={runtimes}
+          activeTaskId="task-1"
+          defaultRoute={{ runtime: "codex", model: "gpt-5.6-sol", effort: "medium" }}
+          onOpenTask={() => undefined}
+          onTaskCreated={onTaskCreated}
+        />
+      </>
     );
   }
-  return render(<Harness />);
+  const view = <Harness />;
+  return render(
+    options.motionScale ? <LazyMotion features={domAnimation}>{view}</LazyMotion> : view,
+  );
 }
 
 beforeEach(() => {
@@ -150,6 +165,31 @@ describe("ScheduledView", () => {
     expect(screen.getByRole("complementary", { name: "Scheduled task" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "Setup" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByLabelText("Primary runtime")).toBeInTheDocument();
+  });
+
+  it("keeps the scheduled rail mounted through its reduced-motion close and reopen glide", async () => {
+    const { container } = renderScheduled(0, undefined, { motionScale: 0.35, railToggle: true });
+    fireEvent.click(await screen.findByRole("button", { name: /Dependency audit/ }));
+    await waitFor(
+      () => expect(container.querySelector(".panel-slot--right")).toHaveStyle({ width: "356px" }),
+      { timeout: 1_500 },
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Close scheduled rail" }));
+    expect(screen.getByRole("complementary", { name: "Scheduled task" })).toBeInTheDocument();
+    await new Promise((resolve) => window.setTimeout(resolve, 40));
+    expect(screen.getByRole("complementary", { name: "Scheduled task" })).toBeInTheDocument();
+    await waitFor(
+      () => expect(screen.queryByRole("complementary", { name: "Scheduled task" })).toBeNull(),
+      { timeout: 1_500 },
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Open scheduled rail" }));
+    expect(container.querySelector(".panel-slot--right")).toHaveStyle({ width: "0px" });
+    await waitFor(
+      () => expect(container.querySelector(".panel-slot--right")).toHaveStyle({ width: "356px" }),
+      { timeout: 1_500 },
+    );
   });
 
   it("adds and removes a fully specified fallback slot", async () => {

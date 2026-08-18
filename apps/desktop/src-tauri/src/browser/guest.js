@@ -851,6 +851,14 @@
       .context-menu button:active{background:color-mix(in srgb,var(--ink,#e7ebf0) 13%,transparent)}
       .context-menu button small{flex:none;color:var(--muted,#96a0ab);font-size:10px}
       .context-menu hr{height:1px;margin:5px 6px;border:0;background:var(--line,rgba(255,255,255,.14))}
+      .host-tooltip{position:fixed;z-index:5;top:8px;max-width:min(280px,calc(100vw - 16px));
+                    padding:5px 8px;box-sizing:border-box;pointer-events:none;
+                    border:1px solid var(--line,rgba(255,255,255,.14));
+                    border-radius:calc(var(--radius,12px) - 4px);
+                    background:var(--surface,#16191d);color:var(--ink,#e7ebf0);
+                    box-shadow:0 8px 24px rgba(0,0,0,.24);
+                    font:11px/1.35 var(--font,ui-sans-serif,system-ui,sans-serif);
+                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
       /* The agent's own cursor. A page driven from the outside otherwise moves
          by itself with nothing to watch; this shows where the work is landing,
          the way a person's pointer would. It never takes pointer events and it
@@ -1096,18 +1104,14 @@
   const PAGE_CHROME_ID = "__integrator_page_chrome";
 
   /**
-   * Dresses the page's own chrome to match the app: a thin scrollbar in the
-   * user's palette instead of the platform's wide default, and a colour scheme
-   * so form controls and any site that honours `color-scheme` come up in the
-   * same mode Integrator is in.
-   *
-   * This is the honest limit of what a guest script can do: it cannot fake
-   * `prefers-color-scheme`, so a site that only reads that media query still
-   * decides for itself. Everything the user agent draws follows along.
+   * Dresses only the page chrome Integrator owns: a thin scrollbar in the
+   * user's palette. Never force the document's `color-scheme`. Sites commonly
+   * combine a fixed light background with the browser's default CanvasText;
+   * forcing dark controls makes that text white on white. Page appearance is
+   * the site's decision; Integrator's overlays still use the supplied theme.
    */
   function applyPageChrome(theme) {
-    const scheme = theme?.scheme === "dark" || theme?.scheme === "light" ? theme.scheme : null;
-    if (scheme) document.documentElement.style.colorScheme = scheme;
+    document.documentElement.style.removeProperty("color-scheme");
     const thumb = theme?.scrollThumb || theme?.muted;
     if (!thumb) return;
     let style = document.getElementById(PAGE_CHROME_ID);
@@ -1125,6 +1129,30 @@
       ::-webkit-scrollbar-thumb:hover{background:${theme?.scrollThumbHover || thumb};
         border:2px solid transparent;background-clip:content-box}
       ::-webkit-scrollbar-corner{background:transparent}`;
+  }
+
+  /** A toolbar tooltip must share the native page's layer. Moving the webview
+   *  to reveal an HTML bubble made every hover look like a miniature resize. */
+  function hostTooltip(value) {
+    const root = ensureOverlay();
+    let bubble = root.getElementById("host-tooltip");
+    if (!value || typeof value.label !== "string") {
+      bubble?.remove();
+      return ok({ visible: false });
+    }
+    if (!bubble) {
+      bubble = document.createElement("div");
+      bubble.id = "host-tooltip";
+      bubble.className = "host-tooltip";
+      bubble.setAttribute("role", "tooltip");
+      root.appendChild(bubble);
+    }
+    bubble.textContent = value.label.slice(0, 120);
+    bubble.style.left = "8px";
+    const width = bubble.getBoundingClientRect().width;
+    const wanted = Number.isFinite(Number(value.x)) ? Number(value.x) - width / 2 : 8;
+    bubble.style.left = `${Math.max(8, Math.min(wanted, window.innerWidth - width - 8))}px`;
+    return ok({ visible: true });
   }
 
   /* --------------------------------------------------------- context menu */
@@ -1377,6 +1405,8 @@
       applyTheme(theme);
       return ok({ themed: true });
     },
+
+    hostTooltip,
 
     /**
      * The host's document counter for this tab. A fresh document gets a fresh

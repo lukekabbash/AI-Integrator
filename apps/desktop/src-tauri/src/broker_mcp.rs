@@ -264,6 +264,14 @@ fn browser_tools(role: &str) -> Vec<Value> {
             }), &["tabId"]),
         }),
         json!({
+            "name": "browser_screenshot",
+            "description": "Take a picture of a browser tab's viewport and receive it as an image. Use it when layout, a chart, a canvas, or a visual state matters and browser_snapshot's text is not enough. The picture is taken from the user's screen, so the tab is brought on screen first — if the pane cannot be shown, this says so; browser_snapshot works either way. Refused while a saved password is filled in.",
+            "annotations": tool_annotations(true, false),
+            "inputSchema": text_schema(json!({
+                "tabId": { "type": "string" }
+            }), &["tabId"]),
+        }),
+        json!({
             "name": "browser_click",
             "description": "Click one element in a browser tab. Target it by ref from browser_snapshot, or by selector, or by text plus optional role.",
             "annotations": tool_annotations(false, true),
@@ -636,18 +644,7 @@ pub fn run() -> i32 {
                     .expect("link connected above")
                     .request(&name, arguments);
                 match outcome {
-                    Ok(result) => respond(
-                        &mut stdout,
-                        id,
-                        json!({
-                            "content": [{
-                                "type": "text",
-                                "text": serde_json::to_string_pretty(&result)
-                                    .unwrap_or_else(|_| result.to_string()),
-                            }],
-                            "isError": false,
-                        }),
-                    ),
+                    Ok(result) => respond(&mut stdout, id, tool_result(result)),
                     Err(error) => {
                         // A failed request can leave the link desynchronized;
                         // reconnect lazily on the next call.
@@ -660,6 +657,24 @@ pub fn run() -> i32 {
         }
     }
     0
+}
+
+/// A successful tool reply. The JSON is sent as text; any extra MCP blocks the
+/// app tucked under `MCP_CONTENT_KEY` — a screenshot's image — travel beside
+/// it as their own content items, and are taken out of the text so the model
+/// is not also handed the base64 as characters.
+fn tool_result(mut result: Value) -> Value {
+    let extra = result
+        .as_object_mut()
+        .and_then(|map| map.remove(crate::browser::MCP_CONTENT_KEY))
+        .and_then(|blocks| blocks.as_array().cloned())
+        .unwrap_or_default();
+    let mut content = vec![json!({
+        "type": "text",
+        "text": serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()),
+    })];
+    content.extend(extra);
+    json!({ "content": content, "isError": false })
 }
 
 fn tool_error(message: &str) -> Value {
@@ -727,6 +742,7 @@ mod tests {
                 "browser_cookies",
                 "browser_navigate",
                 "browser_snapshot",
+                "browser_screenshot",
                 "browser_click",
                 "browser_hover",
                 "browser_type",
@@ -758,6 +774,7 @@ mod tests {
                 "browser_cookies",
                 "browser_navigate",
                 "browser_snapshot",
+                "browser_screenshot",
                 "browser_click",
                 "browser_hover",
                 "browser_type",
@@ -789,6 +806,7 @@ mod tests {
                 "browser_cookies",
                 "browser_navigate",
                 "browser_snapshot",
+                "browser_screenshot",
                 "browser_click",
                 "browser_hover",
                 "browser_type",

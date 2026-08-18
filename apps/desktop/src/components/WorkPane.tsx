@@ -1,4 +1,4 @@
-import { Bot, FileDiff, Globe, Plus, X } from "lucide-react";
+import { Bot, FileDiff, Globe, Minus, Plus, X } from "lucide-react";
 import { m as motion, usePresence, useReducedMotion } from "motion/react";
 import {
   Suspense,
@@ -20,7 +20,9 @@ import { surfaceFileName, WORK_PANE_MIN_WIDTH, type WorkSurface } from "../workP
 import { AgentGlyph } from "./AgentGlyph";
 import { FileIcon } from "./FileIcon";
 import { ResizeHandle } from "./ResizeHandle";
+import { TabFavicon } from "./TabFavicon";
 import { Tooltip } from "./Tooltip";
+import { TravelingSelection } from "./TravelingSelection";
 import type { WorkPaneLaunchKind } from "./WorkPaneToggle";
 import { useRailCursor } from "../useRailCursor";
 import "./workPane.css";
@@ -40,8 +42,14 @@ export interface WorkPaneProps {
   panelTransition: object;
   delegations: DelegationView[];
   browserTitles?: Record<string, string>;
+  /** Each tab's site icon as a `data:` URL, keyed by tab id. */
+  browserIcons?: Record<string, string>;
   /** Tabs an agent is driving right now, keyed by tab id. */
   browserBusy?: Record<string, string>;
+  /** Tabs whose recent agent work turns X into minimize instead of destroy. */
+  browserProtected?: Record<string, boolean>;
+  /** Resolves the browser X through the native recent-agent guard. */
+  onBrowserClose?: (tabId: string) => void;
   renderFile: (surface: Extract<WorkSurface, { kind: "file" }>) => ReactNode;
   renderReview: () => ReactNode;
   renderSubagent: (delegationId: string, headerHost: HTMLElement | null) => ReactNode;
@@ -70,7 +78,10 @@ export function WorkPane({
   panelTransition,
   delegations,
   browserTitles,
+  browserIcons,
   browserBusy,
+  browserProtected,
+  onBrowserClose,
   renderFile,
   renderReview,
   renderSubagent,
@@ -150,10 +161,26 @@ export function WorkPane({
       data-tauri-drag-region
     >
       <div className="work-pane-strip-tabs" data-tauri-drag-region>
+        {/* One selection layer for the whole strip, so switching tabs slides the
+            colour across rather than snapping it — the same pill the sidebar's
+            chat list uses, in the same colour. */}
+        <TravelingSelection
+          activeKey={state.activeId ?? ""}
+          className="tab-strip-selection"
+          clampWidth={false}
+          pace="quick"
+          layoutKey={`${state.surfaces.map((surface) => surface.id).join("|")}:${width}`}
+        />
         {state.surfaces.map((surface, index) => {
           const label = surfaceLabel(surface, delegations, browserTitles);
           // Files close by path so two same-named files stay distinguishable.
           const closeLabel = surface.kind === "file" ? surface.path : label;
+          const preservesAgentWork =
+            surface.kind === "browser" && browserProtected?.[surface.tabId] === true;
+          const closeAction =
+            surface.kind === "browser" && preservesAgentWork
+              ? `Minimize ${label}`
+              : `Close ${closeLabel}`;
           const activeTab = surface.id === state.activeId;
           // A tab reports whoever has it, and that includes the user when they
           // are the one typing in the page. Only an agent's turn is worth a
@@ -165,6 +192,7 @@ export function WorkPane({
               key={surface.id}
               className="file-reader-tab work-pane-tab"
               data-active={activeTab ? "true" : undefined}
+              data-traveling-selection={surface.id}
               data-kind={surface.kind}
               // A tab an agent is working in says so, so the user can watch
               // that one rather than wonder which page is moving.
@@ -188,16 +216,48 @@ export function WorkPane({
                 onClick={() => controller.activate(surface.id)}
                 onAuxClick={(event) => onTabAuxClick(event, surface.id)}
               >
-                <SurfaceGlyph surface={surface} delegations={delegations} />
+                <SurfaceGlyph
+                  surface={surface}
+                  delegations={delegations}
+                  browserIcons={browserIcons}
+                />
                 <span>{label}</span>
               </button>
+              {/* Two verbs, not one overloaded X. Minus sends the page to the
+                  compact browser with everything still running; X ends it. Both
+                  stay out of the way until the tab is hovered, focused or
+                  active, so a resting strip shows titles rather than controls —
+                  the sidebar's rows behave the same way. */}
+              {surface.kind === "browser" ? (
+                <button
+                  type="button"
+                  className="file-reader-tab-close work-pane-tab-minimize"
+                  aria-label={`Minimize ${label}`}
+                  title="Minimize to the compact browser"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    controller.close(surface.id);
+                  }}
+                >
+                  <Minus aria-hidden="true" />
+                </button>
+              ) : null}
               <button
                 type="button"
                 className="file-reader-tab-close"
-                aria-label={`Close ${closeLabel}`}
+                aria-label={closeAction}
+                title={
+                  surface.kind === "browser" && preservesAgentWork
+                    ? "Keep recent agent work in the compact browser"
+                    : undefined
+                }
                 onClick={(event) => {
                   event.stopPropagation();
-                  controller.close(surface.id);
+                  if (surface.kind === "browser" && onBrowserClose) {
+                    onBrowserClose(surface.tabId);
+                  } else {
+                    controller.close(surface.id);
+                  }
                 }}
               >
                 <X aria-hidden="true" />
@@ -228,6 +288,9 @@ export function WorkPane({
         ref={paneRef}
         className="work-pane subagent-workspace-pane"
         data-empty={state.surfaces.length === 0 ? "true" : undefined}
+        // The seam takes its colour from whatever is open, so a browser tab
+        // carries its chrome fill all the way to the edge of the pane.
+        data-kind={active?.kind ?? "launcher"}
         style={style}
         // The pane opens and closes by width, the way the rail beside it does,
         // so it slides rather than appearing at full size and fading. Once it
@@ -388,9 +451,11 @@ ${detail}`
 function SurfaceGlyph({
   surface,
   delegations,
+  browserIcons,
 }: {
   surface: WorkSurface;
   delegations: DelegationView[];
+  browserIcons?: Record<string, string>;
 }) {
   switch (surface.kind) {
     case "file":
@@ -420,7 +485,7 @@ function SurfaceGlyph({
       );
     }
     case "browser":
-      return <Globe aria-hidden="true" />;
+      return <TabFavicon src={browserIcons?.[surface.tabId]} />;
   }
 }
 

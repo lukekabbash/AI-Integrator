@@ -1353,7 +1353,12 @@ export function ScheduledView({
         </AnimatePresence>
       </section>
 
-      <SlidingPanelSlot open={railOpen} motionScale={motionScale} slotKey="scheduled-tools">
+      <SlidingPanelSlot
+        open={railOpen}
+        width={rightRailWidth}
+        motionScale={motionScale}
+        slotKey="scheduled-tools"
+      >
         <RightRailShell
           tabs={[
             { id: "scheduled-setup", label: "Setup", icon: Settings2, panel: setupPanel },

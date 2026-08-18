@@ -504,6 +504,7 @@ const INTEGRATOR_TOOL_COPY: Readonly<Record<string, readonly [string, string]>> 
   browser_drag: ["Dragging on the page", "Dragged on the page"],
   browser_navigate: ["Opening a page", "Opened a page"],
   browser_snapshot: ["Reading the page", "Read the page"],
+  browser_screenshot: ["Photographing the page", "Photographed the page"],
   browser_click: ["Clicking on the page", "Clicked on the page"],
   browser_type: ["Typing on the page", "Typed on the page"],
   browser_press: ["Pressing a key on the page", "Pressed a key on the page"],

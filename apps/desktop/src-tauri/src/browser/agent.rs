@@ -149,10 +149,11 @@ pub async fn open_for_agent(
     let tab = create_tab(app, tabs, caller.task_id.clone(), target)
         .await
         .map_err(|error| IntegratorError::Unavailable(error.message))?;
+    tabs.mark_held(&tab.id, &caller.label());
     if let Some(delegation) = caller.delegation_id.clone() {
         tabs.update(&tab.id, |state| state.delegation_id = Some(delegation));
-        emit_changed(app, tabs);
     }
+    emit_changed(app, tabs);
     tabs.snapshot(Some(&caller.task_id))
         .into_iter()
         .find(|candidate| candidate.id == tab.id)
@@ -263,28 +264,96 @@ pub async fn focus_for_agent(
     let label = tabs
         .label_for(tab_id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
-    let _ = app.emit(
-        super::BROWSER_FOCUS_EVENT,
-        json!({ "taskId": caller.task_id.as_str(), "tabId": tab_id }),
-    );
-    // A tab parked off screen still measures 1280×800, so its own geometry
-    // cannot answer this. What can is the renderer's placement: it reports a
-    // rectangle when a tab is on screen and hides it when it is not. Wait
-    // briefly for the pane to open and that placement to arrive.
-    for attempt in 0..FOCUS_TRIES {
-        if attempt > 0 {
-            tokio::time::sleep(FOCUS_POLL).await;
-        }
-        if tabs.on_screen(tab_id) {
-            let viewport = eval_json(app, &label, VIEWPORT.into()).await.ok();
-            return Ok(json!({ "focused": true, "viewport": viewport }));
-        }
+    if bring_on_screen(app, tabs, caller, tab_id).await {
+        let viewport = eval_json(app, &label, VIEWPORT.into()).await.ok();
+        return Ok(json!({ "focused": true, "viewport": viewport }));
     }
     Ok(json!({
         "focused": false,
         "note": "the tab is running but not on screen — the browser pane may be closed, \
                  or the user may be looking at another chat. It is still yours to drive.",
     }))
+}
+
+/// Asks the renderer to show the tab and waits briefly to see whether it did.
+///
+/// A tab parked off screen still measures 1280×800, so its own geometry
+/// cannot answer this. What can is the renderer's placement: it reports a
+/// rectangle when a tab is on screen and hides it when it is not. Wait
+/// briefly for the pane to open and that placement to arrive.
+async fn bring_on_screen(
+    app: &AppHandle,
+    tabs: &Arc<BrowserTabs>,
+    caller: &Caller,
+    tab_id: &str,
+) -> bool {
+    let _ = app.emit(
+        super::BROWSER_FOCUS_EVENT,
+        json!({ "taskId": caller.task_id.as_str(), "tabId": tab_id }),
+    );
+    for attempt in 0..FOCUS_TRIES {
+        if attempt > 0 {
+            tokio::time::sleep(FOCUS_POLL).await;
+        }
+        if tabs.on_screen(tab_id) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Takes a picture of the tab's viewport for an agent.
+///
+/// The picture is a crop of the screen (see `capture.rs`), so the tab has to
+/// be on screen to be captured. A tab that is parked is brought forward first,
+/// exactly as `browser_focus` would, and one that still cannot be shown is
+/// refused with the reason instead of a blank or a neighbour's pixels. Reading
+/// the page is reading, so a read-only grant is enough — the same lockout that
+/// guards the user's screenshot button guards this one: no capture while a
+/// saved password is filled in.
+pub async fn screenshot_for_agent(
+    app: &AppHandle,
+    tabs: &Arc<BrowserTabs>,
+    caller: &Caller,
+    tab_id: &str,
+) -> Result<Value, CommandError> {
+    ensure_agent_access(app)?;
+    reach_for(tabs, caller, tab_id, false)?;
+    super::remember::ensure_awake(app, tabs, tab_id).await;
+    if tabs.credential_in_flight(tab_id) {
+        return Err(unavailable(
+            "a saved password is filled in on this page — capture is refused until it \
+             navigates or the form is submitted",
+        ));
+    }
+    let label = tabs
+        .label_for(tab_id)
+        .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
+    if !tabs.on_screen(tab_id) && !bring_on_screen(app, tabs, caller, tab_id).await {
+        return Err(unavailable(
+            "that tab is not on screen, so there is nothing to photograph — the browser pane \
+             may be closed or the user may be looking at another chat. browser_snapshot reads \
+             the page without needing it on screen.",
+        ));
+    }
+    let webview = webview_of(app, &label)?;
+    let shot = super::capture::capture_full(&webview).await?;
+    let viewport = eval_json(app, &label, VIEWPORT.into()).await.ok();
+    let mut reply = json!({
+        "width": shot.width,
+        "height": shot.height,
+        "viewport": viewport,
+        "note": "a picture of the tab as it is on the user's screen. Anything covering the \
+                 browser pane appears in it too. Coordinates in the image are device pixels; \
+                 divide by width/viewport.width to get CSS pixels for browser_drag.",
+    });
+    // The broker turns this into an MCP image block alongside the text.
+    reply[super::MCP_CONTENT_KEY] = json!([{
+        "type": "image",
+        "data": shot.png_base64,
+        "mimeType": "image/png",
+    }]);
+    Ok(reply)
 }
 
 /// How long `browser_focus` gives the renderer to actually show the tab.

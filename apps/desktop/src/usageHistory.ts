@@ -48,7 +48,7 @@ export interface UsageHistoryReport {
   sources: UsageHistorySource[];
 }
 
-export type UsageWindowDays = 1 | 7 | 30 | 90 | 365;
+export type UsageWindowDays = 1 | 7 | 30 | 90 | 365 | "all";
 export type UsageResolution = "hour" | "day";
 export type UsageMetric = "cost" | "tokens";
 
@@ -65,13 +65,23 @@ export const USAGE_WINDOW_OPTIONS: ReadonlyArray<{ days: UsageWindowDays; label:
   { days: 30, label: "30d" },
   { days: 90, label: "90d" },
   { days: 365, label: "1y" },
+  { days: "all", label: "All" },
 ];
 
 const HOUR_MS = 3_600_000;
 const DAY_MS = 24 * HOUR_MS;
+const ALL_USAGE_START_YEAR = 2024;
 
 /** A window ends now and starts on a local day boundary (or an hour boundary for 24h). */
 export function makeUsageWindow(days: UsageWindowDays, now = Date.now()): UsageWindow {
+  if (days === "all") {
+    return {
+      days,
+      resolution: "day",
+      sinceMs: new Date(ALL_USAGE_START_YEAR, 0, 1).getTime(),
+      untilMs: now,
+    };
+  }
   if (days === 1) {
     const untilMs = Math.ceil(now / HOUR_MS) * HOUR_MS;
     return { days, resolution: "hour", sinceMs: untilMs - DAY_MS, untilMs };

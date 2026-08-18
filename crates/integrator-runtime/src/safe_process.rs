@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsStr,
     io::Read,
     path::Path,
     process::{Command, Stdio},
@@ -25,12 +26,22 @@ pub(crate) enum ProcessRunOutcome {
     TimedOut,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn run_bounded(
     executable: &Path,
     args: &[&str],
     cwd: Option<&Path>,
 ) -> Result<ProcessOutput> {
-    run_bounded_with_limits(executable, args, cwd, MAX_PROBE_BYTES, PROBE_TIMEOUT)
+    run_bounded_with_path(executable, args, cwd, None)
+}
+
+pub(crate) fn run_bounded_with_path(
+    executable: &Path,
+    args: &[&str],
+    cwd: Option<&Path>,
+    path: Option<&OsStr>,
+) -> Result<ProcessOutput> {
+    run_bounded_with_limits_and_path(executable, args, cwd, MAX_PROBE_BYTES, PROBE_TIMEOUT, path)
 }
 
 pub(crate) fn run_bounded_with_limits(
@@ -48,6 +59,23 @@ pub(crate) fn run_bounded_with_limits(
     }
 }
 
+pub(crate) fn run_bounded_with_limits_and_path(
+    executable: &Path,
+    args: &[&str],
+    cwd: Option<&Path>,
+    max_output_bytes: u64,
+    timeout: Duration,
+    path: Option<&OsStr>,
+) -> Result<ProcessOutput> {
+    match run_bounded_with_outcome_and_path(executable, args, cwd, max_output_bytes, timeout, path)?
+    {
+        ProcessRunOutcome::Completed(output) => Ok(output),
+        ProcessRunOutcome::TimedOut => Err(IntegratorError::Unavailable(
+            "local process probe timed out".into(),
+        )),
+    }
+}
+
 pub(crate) fn run_bounded_with_outcome(
     executable: &Path,
     args: &[&str],
@@ -55,12 +83,26 @@ pub(crate) fn run_bounded_with_outcome(
     max_output_bytes: u64,
     timeout: Duration,
 ) -> Result<ProcessRunOutcome> {
+    run_bounded_with_outcome_and_path(executable, args, cwd, max_output_bytes, timeout, None)
+}
+
+fn run_bounded_with_outcome_and_path(
+    executable: &Path,
+    args: &[&str],
+    cwd: Option<&Path>,
+    max_output_bytes: u64,
+    timeout: Duration,
+    path: Option<&OsStr>,
+) -> Result<ProcessRunOutcome> {
     let mut command = probe_command(executable, args);
     suppress_windows_console(&mut command);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -258,6 +300,37 @@ mod tests {
         let (output, truncated) = read_limited(input, 100).expect("bounded read");
         assert_eq!(output.len(), 100);
         assert!(truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_path_is_propagated_to_probe_children() {
+        let path = std::env::join_paths([Path::new("/runtime/bin"), Path::new("/usr/bin")])
+            .expect("test PATH");
+        let output = run_bounded_with_path(
+            Path::new("/bin/sh"),
+            &["-c", "printf %s \"$PATH\""],
+            None,
+            Some(&path),
+        )
+        .expect("probe run");
+        assert!(output.success);
+        assert_eq!(output.stdout, path.to_string_lossy());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_path_is_propagated_to_probe_children() {
+        let path = std::env::join_paths([Path::new(r"C:\runtime\bin"), Path::new(r"C:\Windows")])
+            .expect("test PATH");
+        let executable = std::env::var_os("COMSPEC")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("C:\\Windows\\System32\\cmd.exe"));
+        let output =
+            run_bounded_with_path(&executable, &["/d", "/c", "echo %PATH%"], None, Some(&path))
+                .expect("probe run");
+        assert!(output.success);
+        assert_eq!(output.stdout.trim(), path.to_string_lossy());
     }
 
     #[cfg(unix)]

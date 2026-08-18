@@ -1,6 +1,7 @@
 import { StrictMode, lazy, Suspense } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
+import { initializeTheme } from "./theme";
 
 const root = document.getElementById("root");
 
@@ -21,6 +22,10 @@ const BrowserWindowShell = lazy(() =>
     default: module.BrowserWindowShell,
   })),
 );
+
+// The detached browser does not mount App, so apply the saved theme before
+// its first frame rather than flashing the default palette.
+if (isBrowserWindow) initializeTheme();
 
 createRoot(root).render(
   <StrictMode>

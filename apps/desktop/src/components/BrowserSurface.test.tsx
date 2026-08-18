@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { BrowserTab } from "../bridge";
@@ -67,22 +67,84 @@ describe("BrowserSurface native hosting", () => {
 
     expect(document.querySelector(".browser-viewport")).toHaveAttribute("data-native", "true");
     expect(onBoundsChange).toHaveBeenCalledWith(
-      expect.objectContaining({ x: 103, y: 80, width: 637, height: 420 }),
+      expect.objectContaining({ x: 100, y: 80, width: 640, height: 420 }),
     );
     expect(screen.queryByText("This tab is in its own window")).not.toBeInTheDocument();
   });
 
-  it("parks the same tab in the main renderer and hides external actions by default", () => {
+  it("leaves a remotely hosted tab to its owning renderer and hides external actions by default", () => {
     const onBoundsChange = vi.fn();
     render(<BrowserSurface {...props({ onBoundsChange })} />);
 
-    expect(onBoundsChange).toHaveBeenCalledWith(null);
+    expect(onBoundsChange).not.toHaveBeenCalled();
     expect(screen.getByText("This tab is in its own window")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Open in your system browser" })).toBeNull();
   });
 
-  it("opens toolbar tooltips below the top controls", async () => {
-    render(<BrowserSurface {...props({ tab: { ...POPPED_TAB, poppedOut: false } })} />);
+  it("lets the outgoing page park itself when the selected replacement is blank", () => {
+    const outgoingBounds = vi.fn();
+    const blankBounds = vi.fn();
+    const { rerender } = render(
+      <BrowserSurface
+        key="loaded"
+        {...props({
+          tab: { ...POPPED_TAB, poppedOut: false },
+          onBoundsChange: outgoingBounds,
+        })}
+      />,
+    );
+
+    rerender(
+      <BrowserSurface
+        key="blank"
+        {...props({
+          tab: {
+            ...POPPED_TAB,
+            id: "tab-blank",
+            url: "about:blank",
+            title: "",
+            poppedOut: false,
+          },
+          onBoundsChange: blankBounds,
+        })}
+      />,
+    );
+
+    expect(outgoingBounds).toHaveBeenLastCalledWith(null);
+    expect(blankBounds).not.toHaveBeenCalled();
+    expect(screen.getByText("Local servers")).toBeInTheDocument();
+  });
+
+  it("draws native-page tooltips without moving the browser bounds", async () => {
+    const onBoundsChange = vi.fn();
+    const onToolbarTooltip = vi.fn(async () => undefined);
+    render(
+      <BrowserSurface
+        {...props({
+          tab: { ...POPPED_TAB, poppedOut: false },
+          onBoundsChange,
+          onToolbarTooltip,
+        })}
+      />,
+    );
+
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "Back" }));
+
+    await waitFor(() => expect(onToolbarTooltip).toHaveBeenCalledWith({ label: "Back", x: 317 }), {
+      timeout: 1_000,
+    });
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    expect(onBoundsChange).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the ordinary downward tooltip on a blank HTML start page", async () => {
+    render(
+      <BrowserSurface
+        {...props({
+          tab: { ...POPPED_TAB, url: "about:blank", title: "", poppedOut: false },
+        })}
+      />,
+    );
 
     fireEvent.mouseEnter(screen.getByRole("button", { name: "Back" }));
 

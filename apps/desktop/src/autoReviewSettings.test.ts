@@ -3,14 +3,17 @@ import type { ModelCatalogEntry } from "./bridge";
 import {
   AUTO_REVIEW_FALLBACK,
   AUTO_REVIEW_POLICY,
+  AUTO_REVIEW_REVIEWERS,
   AUTO_REVIEW_SETTING,
   AUTO_REVIEW_TIMEOUT,
   DEFAULT_AUTO_REVIEW_TIMEOUT_MS,
   defaultReviewerEffort,
   defaultReviewerMode,
   normalizeAutoReview,
+  normalizeAutoReviewReviewers,
   readAutoReviewFallback,
   readAutoReviewPolicy,
+  readAutoReviewReviewers,
   readAutoReviewRoute,
   readAutoReviewTimeoutMs,
   resolveAutoReviewPolicy,
@@ -26,6 +29,23 @@ const model = (id: string, efforts?: string[], defaultEffort?: string): ModelCat
 });
 
 describe("auto-review routes", () => {
+  it("keeps one shared ordered reviewer list", () => {
+    const stored = [
+      { runtime: "claude", model: "claude-haiku-4-5", effort: "low" },
+      { runtime: "codex", model: "gpt-5.6-luna" },
+      { runtime: "unknown", model: "nope" },
+      null,
+    ];
+
+    expect(normalizeAutoReviewReviewers(stored)).toEqual([
+      { runtime: "claude", model: "claude-haiku-4-5", effort: "low" },
+      { runtime: "codex", model: "gpt-5.6-luna", effort: undefined },
+    ]);
+    expect(readAutoReviewReviewers({ [AUTO_REVIEW_REVIEWERS]: stored })).toEqual(
+      normalizeAutoReviewReviewers(stored),
+    );
+  });
+
   it("keeps configured runtimes and drops everything it cannot vouch for", () => {
     const stored = {
       claude: { enabled: true, model: "claude-haiku-4-5", effort: "low" },

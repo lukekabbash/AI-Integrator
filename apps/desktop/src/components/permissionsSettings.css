@@ -1,20 +1,10 @@
-/*
- * Auto review. One quiet disclosure per installed runtime: the runtime, what it
- * currently does, and a switch. Everything else waits behind the chevron so a
- * page about one dropdown does not open as four pickers per runtime. Nothing
- * here carries the gel stack — these are reading rows, not chips.
- */
-
-.auto-review-caveat {
-  margin-top: 6px;
-  max-width: 620px;
-}
+/* Shared auto-review order. The task runtime is intentionally absent here:
+   every task uses this same list. */
 
 .auto-review-empty {
   margin: 0;
   padding: 14px 3px;
-  border-top: 1px solid var(--color-border-subtle);
-  border-bottom: 1px solid var(--color-border-subtle);
+  border-block: 1px solid var(--color-border-subtle);
   color: var(--color-text-tertiary);
   font-size: 10.5px;
   line-height: 1.5;
@@ -23,130 +13,89 @@
 .auto-review-list {
   display: flex;
   flex-direction: column;
-}
-
-.auto-review-row {
   border-top: 1px solid var(--color-border-subtle);
 }
-.auto-review-row:last-child {
+
+.auto-review-route {
+  min-height: 58px;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 3px;
   border-bottom: 1px solid var(--color-border-subtle);
 }
 
-.auto-review-head {
-  min-height: 56px;
+.auto-review-order {
+  width: 20px;
+  height: 20px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 18px;
+  place-items: center;
+  border: 1px solid var(--color-border-base);
+  border-radius: 50%;
+  color: var(--color-text-secondary);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
 }
 
-.auto-review-summary {
+.auto-review-route-fields {
   min-width: 0;
-  padding: 8px 8px 8px 3px;
+  display: grid;
+  grid-template-columns: minmax(112px, 0.65fr) minmax(150px, 1fr) minmax(88px, 0.45fr);
+  gap: 8px;
+}
+
+.auto-review-route-fields .dropdown {
+  min-width: 0;
+}
+
+.auto-review-route-actions {
   display: flex;
   align-items: center;
-  gap: 9px;
-  border: 0;
-  border-radius: var(--radius-row);
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
-  transition: background var(--duration-fast) var(--ease-standard);
-}
-.auto-review-summary:hover {
-  background: color-mix(in srgb, var(--color-layer-2) 60%, transparent);
-}
-.auto-review-summary:focus-visible {
-  outline: 2px solid var(--color-focus-ring);
-  outline-offset: 2px;
+  gap: 2px;
 }
 
-/* One chevron, rotated. Never two marks swapped for each other. */
-.auto-review-chevron {
+.auto-review-route-actions .icon-button {
+  width: 26px;
+  height: 26px;
+}
+
+.auto-review-route-actions svg,
+.auto-review-add svg,
+.auto-review-policy-actions svg {
   width: 13px;
   height: 13px;
-  flex: none;
-  color: var(--color-text-tertiary);
-  transition: transform var(--duration-fast) var(--ease-emphasized);
-}
-.auto-review-row[data-open] .auto-review-chevron,
-.auto-review-policy[data-open] .auto-review-chevron {
-  transform: rotate(90deg);
 }
 
-.auto-review-identity {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-.auto-review-identity strong {
-  font-size: 12.5px;
-  font-weight: 600;
-  color: var(--color-text-primary);
-}
-.auto-review-identity small {
-  overflow: hidden;
-  color: var(--color-text-tertiary);
-  font-size: 10.5px;
-  line-height: 1.4;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* The panel is owned by the row above it, so it sits inside the chevron's
-   indent and drops the hairline the last setting row would otherwise draw. */
-.auto-review-panel {
-  padding: 0 0 10px 22px;
-}
-.auto-review-panel .setting-row:last-child {
-  border-bottom: 0;
-}
-
-.auto-review-policy-toggle {
-  width: 100%;
-  min-height: 48px;
-  padding: 8px 8px 8px 3px;
-  display: flex;
+.auto-review-add {
+  align-self: flex-start;
+  margin: 9px 3px 12px 34px;
+  padding: 5px 8px;
+  display: inline-flex;
   align-items: center;
-  gap: 9px;
+  gap: 6px;
   border: 0;
-  border-top: 1px solid var(--color-border-subtle);
-  border-radius: 0;
+  border-radius: var(--radius-control);
   background: transparent;
-  color: inherit;
+  color: var(--color-text-secondary);
   font: inherit;
-  text-align: left;
+  font-size: 10.5px;
   cursor: pointer;
 }
-.auto-review-policy-toggle:focus-visible {
-  outline: 2px solid var(--color-focus-ring);
-  outline-offset: -2px;
-}
-.auto-review-policy-toggle > span {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-.auto-review-policy-toggle strong {
-  font-size: 11.5px;
-  font-weight: 600;
-}
-.auto-review-policy-toggle small {
-  color: var(--color-text-tertiary);
-  font-size: 9.5px;
+
+.auto-review-add:hover {
+  background: var(--color-layer-hover);
+  color: var(--color-text-primary);
 }
 
 .auto-review-policy-body {
-  padding: 2px 0 14px 22px;
   display: grid;
   gap: 8px;
 }
+
 .auto-review-policy-body textarea {
   width: 100%;
-  min-height: 200px;
+  min-height: 240px;
   padding: 10px;
   resize: vertical;
   border: 1px solid var(--color-border-base);
@@ -155,6 +104,7 @@
   background: var(--color-layer-1);
   font: 10.5px/1.55 var(--font-ui);
 }
+
 .auto-review-policy-body textarea:focus {
   outline: 1px solid var(--color-focus);
   outline-offset: 1px;
@@ -162,20 +112,19 @@
 
 .auto-review-policy-actions {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  flex-wrap: wrap;
-}
-.auto-review-policy-actions small {
-  color: var(--color-text-tertiary);
-  font-size: 9.5px;
-  line-height: 1.45;
+  justify-content: flex-end;
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .auto-review-summary,
-  .auto-review-chevron {
-    transition: none;
+@media (max-width: 760px) {
+  .auto-review-route {
+    grid-template-columns: 24px minmax(0, 1fr);
+  }
+
+  .auto-review-route-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .auto-review-route-actions {
+    grid-column: 2;
   }
 }

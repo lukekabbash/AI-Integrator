@@ -24,8 +24,10 @@ interface TooltipProps {
   /** Delay before showing, in ms. Hiding is immediate. */
   delay?: number;
   disabled?: boolean;
-  /** Reports the real bubble, after its hover/focus delay, opening or closing. */
-  onOpenChange?: (open: boolean) => void;
+  /** Keep hover timing/callbacks but let another native layer draw the bubble. */
+  renderBubble?: boolean;
+  /** Reports the real bubble, its anchor, and label after the hover/focus delay. */
+  onOpenChange?: (open: boolean, anchor?: DOMRect, label?: ReactNode) => void;
   children: ReactElement;
 }
 
@@ -71,6 +73,7 @@ export function Tooltip({
   placement = "top",
   delay = 420,
   disabled = false,
+  renderBubble = true,
   onOpenChange,
   children,
 }: TooltipProps) {
@@ -104,11 +107,11 @@ export function Tooltip({
 
   useEffect(() => {
     const open = Boolean(anchor);
-    onOpenChange?.(open);
+    onOpenChange?.(open, anchor ?? undefined, label);
     return () => {
-      if (open) onOpenChange?.(false);
+      if (open) onOpenChange?.(false, undefined, label);
     };
-  }, [anchor, onOpenChange]);
+  }, [anchor, label, onOpenChange]);
 
   useEffect(() => {
     if (disabled || !pendingTarget) return;
@@ -143,6 +146,8 @@ export function Tooltip({
   if (!isValidElement(children)) return children;
   const childProps = children.props as Record<string, unknown>;
 
+  // cloneElement forwards the child's ref; this code never reads it during render.
+  // eslint-disable-next-line react-hooks/refs
   const trigger = cloneElement(children, {
     onMouseEnter: (event: React.MouseEvent) => {
       if (typeof childProps.onMouseEnter === "function") childProps.onMouseEnter(event);
@@ -180,7 +185,7 @@ export function Tooltip({
         ? null
         : createPortal(
             <AnimatePresence>
-              {anchor ? (
+              {anchor && renderBubble ? (
                 <TooltipBubble
                   key="tooltip"
                   anchor={anchor}

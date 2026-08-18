@@ -4,6 +4,7 @@ import {
   formatBridgeError,
   isAcpConnectionError,
   isCodexConnectionError,
+  isDefinitivePreSubmitDisconnect,
   isMissingCodexThreadError,
   isStaleProviderResumeError,
 } from "./bridgeErrors";
@@ -17,6 +18,7 @@ import {
 import { prettyModelLabel, resolveModelLabel } from "./modelLabel";
 import type { SpecialistSetting } from "./subagentSettings";
 import { createDemoUsageHistoryReport, type UsageHistoryReport } from "./usageHistory";
+import { normalizeRuntimeTurnControls } from "./runtimeTurnControls";
 
 export { formatBridgeError };
 
@@ -682,6 +684,11 @@ export interface TaskContextReference {
   createdAt: string;
 }
 
+/** The five permission profiles. `auto` is the auto-review profile from
+ * `autoReviewSettings.ts`: routine work proceeds and a reviewer model answers
+ * boundary questions. Mirrors the profile strings the Rust side accepts. */
+export type TaskPermission = "read-only" | "project-write" | "ask" | "auto" | "full-access";
+
 export interface ComposerDraftValue {
   prompt: string;
   attachments: ComposerDraftAttachment[];
@@ -689,7 +696,7 @@ export interface ComposerDraftValue {
   runtime: RuntimeId;
   model: string;
   effort?: string;
-  permission: "read-only" | "project-write" | "ask" | "full-access";
+  permission: TaskPermission;
   delegation: "off" | "manual" | "balanced" | "budget-first";
   selectionStart: number;
   selectionEnd: number;
@@ -889,7 +896,7 @@ export interface StartTaskInput {
   model: string;
   /** Reasoning-effort level id from the model's catalog entry; omitted for the provider default. */
   effort?: string;
-  permission: "read-only" | "project-write" | "ask" | "full-access";
+  permission: TaskPermission;
   delegation: "off" | "manual" | "balanced" | "budget-first";
   /** Project-level new-chat draft promoted atomically with native task creation. */
   draft?: ComposerDraft;
@@ -1353,12 +1360,16 @@ export interface BrowserTab {
   taskId: string;
   url: string;
   title: string;
+  /** The site's own icon as a `data:` URL, once the page has reported one. */
+  favicon?: string;
   loading: boolean;
   /** Live in its own window; it keeps running and stays agent-addressable. */
   poppedOut: boolean;
   hidden: boolean;
   /** Set while an agent is driving this tab; clears itself when it goes quiet. */
   heldBy?: string;
+  /** Epoch milliseconds until a close click must preserve recent agent work. */
+  agentProtectedUntil?: number;
   /** Delegated child that owns the tab; absent for the task's lead agent. */
   delegationId?: string;
   /** Remembered for this task but not loaded until it is shown or addressed. */
@@ -1401,7 +1412,8 @@ export interface BrowserBridge {
   list(taskId: string): Promise<BrowserTab[]>;
   /** Brings back the tabs this chat had open, asleep until one is shown. */
   restore(taskId: string): Promise<BrowserTab[]>;
-  close(taskId: string, tabId: string): Promise<void>;
+  /** True when closed; false when recent agent work kept it alive. */
+  close(taskId: string, tabId: string): Promise<boolean>;
   /** Physical-pixel rectangle for the tab, or null to hide it. */
   setBounds(
     taskId: string,
@@ -1409,6 +1421,8 @@ export interface BrowserBridge {
     bounds: { x: number; y: number; width: number; height: number } | null,
     placementSlot: "pane" | "deck" | "popout",
     poppedOutHost: boolean,
+    placementSession: number,
+    placementRevision: number,
   ): Promise<void>;
   navigate(taskId: string, tabId: string, url: string): Promise<BrowserTab>;
   history(
@@ -1418,6 +1432,9 @@ export interface BrowserBridge {
   ): Promise<void>;
   invoke(taskId: string, tabId: string, method: string, args?: unknown[]): Promise<unknown>;
   screenshot(taskId: string, tabId: string): Promise<string>;
+  /** The tab's last still, base64 PNG, or null if none was kept. Its own call
+   *  rather than a field on the tab: the snapshot streams on every change. */
+  poster(taskId: string, tabId: string): Promise<string | null>;
   setPoppedOut(taskId: string, tabId: string, poppedOut: boolean): Promise<BrowserTab>;
   subscribe(listener: () => void): Promise<() => void>;
   /** An agent asking that a tab be brought to the front for the user to watch. */
@@ -2209,6 +2226,7 @@ function cacheModelCatalog(runtime: RuntimeId, catalog: ModelCatalogEntry[]): Mo
 }
 
 function invalidateModelCatalog(runtime: RuntimeId): void {
+  if (runtime === "codex") codexCatalogConnected = false;
   modelCatalogEpochs.set(runtime, (modelCatalogEpochs.get(runtime) ?? 0) + 1);
   modelCatalogLoads.delete(runtime);
   if (modelCatalogCache.delete(runtime)) emitModelCatalogChange();
@@ -2906,7 +2924,15 @@ function wireProvider(runtime: RuntimeId): NativeProviderStatus["provider"] {
   return runtime === "custom" ? "custom-acp" : runtime;
 }
 
-function mapRuntime(status: NativeProviderStatus): RuntimeConnection {
+interface RuntimeProbeOverride {
+  loginRequired?: boolean;
+  detail?: string;
+}
+
+function mapRuntime(
+  status: NativeProviderStatus,
+  probeOverride?: RuntimeProbeOverride,
+): RuntimeConnection {
   const id = runtimeId(status.provider);
   const acpSession = acpSessionCertification.get(id);
   const acpProbeEligible = status.certification === "sessionProbeRequired";
@@ -2920,8 +2946,22 @@ function mapRuntime(status: NativeProviderStatus): RuntimeConnection {
     custom: "Custom ACP",
   };
   const updateRequired = status.diagnosticCode === "runtime-update-required";
+  const capabilityMismatch = status.diagnosticCode === "capability-mismatch";
+  const routeUncertified =
+    status.certification === "uncertified" ||
+    (acpProbeEligible && acpSession !== undefined && !acpSession.load);
+  const deferredAcpAuthenticationVerified =
+    id === "kimi" &&
+    status.authentication === "unknown" &&
+    status.diagnosticCode === "auth-probe-requires-acp" &&
+    acpSession !== undefined;
   const connected =
-    status.installed && status.authentication === "authenticated" && !updateRequired;
+    status.installed &&
+    (status.authentication === "authenticated" || deferredAcpAuthenticationVerified) &&
+    !updateRequired &&
+    !capabilityMismatch &&
+    !routeUncertified;
+  const loginRequired = status.authentication === "loggedOut" || probeOverride?.loginRequired;
   return {
     id,
     name: names[id],
@@ -2935,7 +2975,7 @@ function mapRuntime(status: NativeProviderStatus): RuntimeConnection {
     account: connected ? "Vendor CLI session" : undefined,
     status: !status.installed
       ? "not_installed"
-      : status.authentication === "loggedOut"
+      : loginRequired
         ? "login_required"
         : connected
           ? "connected"
@@ -2966,20 +3006,22 @@ function mapRuntime(status: NativeProviderStatus): RuntimeConnection {
           authoritativeHistory: acpSession?.load ?? status.capabilities.authoritativeHistory,
         }
       : undefined,
-    detail: updateRequired
-      ? "This CLI is authenticated but older than Integrator's certified protocol floor."
-      : status.diagnosticCode === "capability-mismatch"
-        ? "This installed CLI is missing a capability required by Integrator's certified route."
-        : status.diagnosticCode === "capability-probe-failed"
-          ? "Integrator could not verify this CLI's installed capabilities."
-          : acpSession?.load && acpProbeEligible
-            ? "Installed CLI and ACP session recovery verified."
-            : acpSession && acpProbeEligible
-              ? "ACP connected, but session/load is unavailable; interrupted history cannot be reconciled authoritatively."
-              : status.certification === "sessionProbeRequired" && connected
-                ? "Installed CLI verified; session capabilities are checked during the ACP handshake."
-                : (status.diagnosticCode ??
-                  (connected ? "Authenticated local CLI" : "Status unavailable")),
+    detail: probeOverride?.detail
+      ? probeOverride.detail
+      : updateRequired
+        ? "This CLI is authenticated but older than Integrator's certified protocol floor."
+        : status.diagnosticCode === "capability-mismatch"
+          ? "This installed CLI is missing a capability required by Integrator's certified route."
+          : status.diagnosticCode === "capability-probe-failed"
+            ? "Integrator could not verify this CLI's installed capabilities."
+            : acpSession?.load && acpProbeEligible
+              ? "Installed CLI and ACP session recovery verified."
+              : acpSession && acpProbeEligible
+                ? "ACP connected, but session/load is unavailable; interrupted history cannot be reconciled authoritatively."
+                : status.certification === "sessionProbeRequired" && connected
+                  ? "Installed CLI verified; session capabilities are checked during the ACP handshake."
+                  : (status.diagnosticCode ??
+                    (connected ? "Authenticated local CLI" : "Status unavailable")),
   };
 }
 
@@ -3331,9 +3373,11 @@ function resetCursorConnectionState(taskId?: string): void {
     cursorConnectedTasks.delete(taskId);
     if (activeAcpProviderByTask.get(taskId) === "cursor") activeAcpProviderByTask.delete(taskId);
     clearCursorSessionCaches(taskId);
+    if (cursorConnectedTasks.size === 0) acpSessionCertification.delete("cursor");
     return;
   }
   cursorConnectedTasks.clear();
+  acpSessionCertification.delete("cursor");
   for (const [task, provider] of activeAcpProviderByTask) {
     if (provider === "cursor") activeAcpProviderByTask.delete(task);
   }
@@ -3348,12 +3392,14 @@ function resetStandardAcpConnectionState(runtime: StandardAcpRuntimeId, taskId?:
     state.delegations.delete(taskId);
     state.selections.delete(taskId);
     if (activeAcpProviderByTask.get(taskId) === runtime) activeAcpProviderByTask.delete(taskId);
+    if (state.connections.size === 0) acpSessionCertification.delete(runtime);
     return;
   }
   state.connections.clear();
   state.sessions.clear();
   state.delegations.clear();
   state.selections.clear();
+  acpSessionCertification.delete(runtime);
   for (const [task, provider] of activeAcpProviderByTask) {
     if (provider === runtime) activeAcpProviderByTask.delete(task);
   }
@@ -3422,7 +3468,32 @@ async function certifyAcpSession(taskId: string, runtime: AcpRuntimeId): Promise
   }
 }
 
-async function cachedAcpIsLive(taskId: string, runtime: StandardAcpRuntimeId): Promise<boolean> {
+async function probeTasklessAcpAuthentication(
+  runtime: StandardAcpRuntimeId,
+): Promise<RuntimeProbeOverride | undefined> {
+  try {
+    await nativeInvoke("acp_connect", { provider: runtime });
+    const capabilities = await nativeInvoke<NativeAcpSessionCapabilities>(
+      "acp_session_capabilities",
+      { provider: runtime },
+    );
+    acpSessionCertification.set(runtime, capabilities);
+    return undefined;
+  } catch (error) {
+    acpSessionCertification.delete(runtime);
+    const message = formatBridgeError(error, "").toLowerCase();
+    const loginRequired =
+      message.includes("provider-login-required") || message.includes(`${runtime} login`);
+    return {
+      loginRequired,
+      detail: loginRequired
+        ? `${runtime === "kimi" ? "Kimi Code" : runtime} could not reuse its vendor login. Sign in with the installed CLI.`
+        : `${runtime === "kimi" ? "Kimi Code" : runtime} ACP login verification could not complete.`,
+    };
+  }
+}
+
+async function cachedAcpIsLive(taskId: string, runtime: AcpRuntimeId): Promise<boolean> {
   try {
     const capabilities = await nativeInvoke<NativeAcpSessionCapabilities>(
       "acp_session_capabilities",
@@ -3513,7 +3584,9 @@ async function ensureCursorConnectionUnlocked(nativeTaskId: string, cwd: string)
     cursorConnectedTasks.has(nativeTaskId) &&
     activeAcpProviderByTask.get(nativeTaskId) === "cursor"
   ) {
-    return;
+    if (await cachedAcpIsLive(nativeTaskId, "cursor")) return;
+    // Renderer hints cannot outlive the task-scoped native ACP process.
+    resetCursorConnectionState(nativeTaskId);
   }
   await nativeInvoke("acp_connect", {
     provider: "cursor",
@@ -3639,10 +3712,15 @@ function resetStandardAcpAfterFailure(input: SendTurnInput, runtime: StandardAcp
   invalidateModelCatalog(runtime);
 }
 
-/// A model id from the picker that can be forwarded to a provider verbatim.
-/// UI placeholders ("Provider default") are intentionally spaced and skipped.
+/// A slug model id from the picker that can be forwarded verbatim. Structured
+/// providers with documented display-name ids handle those separately.
 function realModelId(model: string): string | undefined {
   return model && model !== PROVIDER_DEFAULT_MODEL && !model.includes(" ") ? model : undefined;
+}
+
+function structuredModelId(runtime: "claude" | "antigravity", model: string): string | undefined {
+  if (!model || model === PROVIDER_DEFAULT_MODEL) return undefined;
+  return runtime === "antigravity" ? model : realModelId(model);
 }
 
 /// Apply the composer's model and reasoning-effort selection to the task's
@@ -3746,10 +3824,10 @@ const CLAUDE_DEFAULT_EFFORT = "high";
 
 /**
  * Degraded fallback only: a successfully probed `agy models` catalog replaces
- * this list with live effort-suffixed slugs (`gemini-3.6-flash-high`), split
- * into base model + effort by antigravityCatalog(). These static ids are the
- * display names agy also accepts; the native adapter composes the selected
- * effort back into the `--model` value in either form.
+ * this list with exact live display names (`Gemini 3.5 Flash (High)`) or
+ * effort-suffixed slugs from older builds. antigravityCatalog() splits either
+ * form into base model + effort, and the native adapter composes the selected
+ * effort back into the exact `--model` shape.
  */
 const ANTIGRAVITY_CATALOG: ModelCatalogEntry[] = [
   {
@@ -3820,23 +3898,26 @@ const GROK_DOCUMENTED_EFFORTS: Record<
 const AGY_EFFORT_ORDER = ["low", "medium", "high"] as const;
 
 /**
- * Groups live `agy models` slugs (`gemini-3.6-flash-high`) into base-model
- * entries with an effort picker. Ids without a trailing effort level
- * (`claude-opus-4-6-thinking`) pass through as plain entries. The default
- * effort prefers medium, then high, matching agy's own picker defaults.
+ * Groups live `agy models` display names (`Gemini 3.5 Flash (High)`) and
+ * legacy slugs (`gemini-3.6-flash-high`) into base-model entries with an
+ * effort picker. Other parentheticals such as `(Thinking)` remain literal.
+ * The default effort prefers medium, then high, matching agy's own picker.
  */
 function antigravityCatalog(ids: string[]): ModelCatalogEntry[] {
   const effortsByBase = new Map<string, Set<string>>();
   const order: { base: string; leveled: boolean }[] = [];
   for (const id of ids) {
-    const match = /^(.*)-(low|medium|high)$/.exec(id);
+    const slugMatch = /^(.*)-(low|medium|high)$/i.exec(id);
+    const displayMatch = /^(.*) \((low|medium|high)\)$/i.exec(id);
+    const match = displayMatch ?? slugMatch;
     const base = match?.[1] ?? id;
-    const leveled = Boolean(match);
+    const level = match?.[2]?.toLowerCase();
+    const leveled = level !== undefined;
     if (!effortsByBase.has(base)) {
       effortsByBase.set(base, new Set());
       order.push({ base, leveled });
     }
-    if (match) effortsByBase.get(base)!.add(match[2]!);
+    if (level) effortsByBase.get(base)!.add(level);
   }
   return order.map(({ base, leveled }) => {
     if (!leveled) return { id: base, label: resolveModelLabel(base) };
@@ -3932,6 +4013,7 @@ async function discoverModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEnt
       const catalog = extractCodexCatalog(response);
       if (catalog.length > 0) return catalog;
     } catch {
+      codexCatalogConnected = false;
       // Codex unavailable right now; fall through to the static catalog.
     }
   }
@@ -3977,7 +4059,7 @@ async function discoverModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEnt
             runtime: "kimi",
             model: activeTask.model,
             effort: activeTask.effort,
-            permission: "project-write",
+            permission: activeTask.kind === "chat" ? "read-only" : "project-write",
             delegation: "off",
           },
           "kimi",
@@ -4067,7 +4149,9 @@ async function loadModelCatalog(runtime: RuntimeId): Promise<ModelCatalogEntry[]
         if (modelCatalogLoads.get(runtime) === request) modelCatalogLoads.delete(runtime);
         return loadModelCatalog(runtime);
       }
-      return cacheModelCatalog(runtime, catalog);
+      // An empty live catalog is a transient degraded result, not durable
+      // knowledge. Let the next ordinary picker read reconnect and retry.
+      return catalog.length > 0 ? cacheModelCatalog(runtime, catalog) : catalog;
     })
     .finally(() => {
       if (modelCatalogLoads.get(runtime) === request) modelCatalogLoads.delete(runtime);
@@ -4445,14 +4529,24 @@ function nativeBrowserBridge(): BrowserBridge | undefined {
     open: (taskId, url) => nativeInvoke<BrowserTab>("browser_tab_open", { taskId, url }),
     list: (taskId) => nativeInvoke<BrowserTab[]>("browser_tab_list", { taskId }),
     restore: (taskId) => nativeInvoke<BrowserTab[]>("browser_tabs_restore", { taskId }),
-    close: (taskId, tabId) => nativeInvoke<void>("browser_tab_close", { taskId, tabId }),
-    setBounds: (taskId, tabId, bounds, placementSlot, poppedOutHost) =>
+    close: (taskId, tabId) => nativeInvoke<boolean>("browser_tab_close", { taskId, tabId }),
+    setBounds: (
+      taskId,
+      tabId,
+      bounds,
+      placementSlot,
+      poppedOutHost,
+      placementSession,
+      placementRevision,
+    ) =>
       nativeInvoke<void>("browser_tab_set_bounds", {
         taskId,
         tabId,
         bounds,
         placementSlot,
         poppedOutHost,
+        placementSession,
+        placementRevision,
       }),
     navigate: (taskId, tabId, url) =>
       nativeInvoke<BrowserTab>("browser_tab_navigate", { taskId, tabId, url }),
@@ -4462,6 +4556,7 @@ function nativeBrowserBridge(): BrowserBridge | undefined {
       nativeInvoke<unknown>("browser_tab_invoke", { taskId, tabId, method, args }),
     screenshot: (taskId, tabId) =>
       nativeInvoke<string>("browser_tab_screenshot", { taskId, tabId }),
+    poster: (taskId, tabId) => nativeInvoke<string | null>("browser_tab_poster", { taskId, tabId }),
     setPoppedOut: (taskId, tabId, poppedOut) =>
       nativeInvoke<BrowserTab>("browser_tab_set_popped_out", { taskId, tabId, poppedOut }),
     subscribe: async (listener) => {
@@ -5068,16 +5163,37 @@ export const bridge: AppBridge = {
     return nativeInvoke<string | null>("attachment_preview", { path }).catch(() => null);
   },
 
-  probeRuntimes: (options) =>
-    invokeOrDemo<NativeProviderStatus[]>(
+  probeRuntimes: async (options) => {
+    const statuses = await invokeOrDemo<NativeProviderStatus[]>(
       "provider_discover",
       { force: options?.force ?? false },
       () => [],
-    ).then((statuses) => {
-      if (!isTauri()) return readDemoSnapshot().runtimes;
-      reconcileRuntimeFingerprints(statuses);
-      return statuses.map(mapRuntime);
-    }),
+    );
+    if (!isTauri()) return readDemoSnapshot().runtimes;
+    reconcileRuntimeFingerprints(statuses);
+
+    let kimiOverride: RuntimeProbeOverride | undefined;
+    if (options?.force) {
+      // A force refresh means the user explicitly asked for current truth.
+      // Drop session-derived claims, then verify Kimi's cached vendor login
+      // over a taskless ACP process because its CLI has no status subcommand.
+      acpSessionCertification.clear();
+    }
+    const kimi = statuses.find((status) => status.provider === "kimi" && status.installed);
+    if (
+      kimi?.diagnosticCode === "auth-probe-requires-acp" &&
+      !acpSessionCertification.has("kimi")
+    ) {
+      // Kimi has no noninteractive status subcommand. Its headless ACP auth
+      // handshake is the only credential-free way to avoid falsely showing a
+      // valid cached login as degraded on first app startup.
+      kimiOverride = await probeTasklessAcpAuthentication("kimi");
+    }
+
+    return statuses.map((status) =>
+      status.provider === "kimi" ? mapRuntime(status, kimiOverride) : mapRuntime(status),
+    );
+  },
 
   listModels: async (runtime) => (await loadModelCatalog(runtime)).map((entry) => entry.id),
 
@@ -6636,6 +6752,7 @@ export const bridge: AppBridge = {
 
   sendTurn: async (input) => {
     if (isTauri()) {
+      input = normalizeRuntimeTurnControls(input);
       await pendingMcpConfiguration;
       const resumeTaskId = nativeTaskIds.get(input.taskId) ?? input.taskId;
       const savedResume = input.resumeInterrupted
@@ -6670,7 +6787,12 @@ export const bridge: AppBridge = {
             toolScope: routedInput.toolScope,
             ...attachmentArgs,
           });
-        try {
+        const resetConnection = () => {
+          codexConnectedTasks.delete(nativeTaskId);
+          if (threadId) activeCodexThreads.delete(threadId);
+          invalidateModelCatalog("codex");
+        };
+        const submit = async () => {
           threadId = await ensureCodexThread(routedInput);
           try {
             await startTurn(threadId);
@@ -6680,40 +6802,52 @@ export const bridge: AppBridge = {
             threadId = await ensureCodexThread(routedInput);
             await startTurn(threadId);
           }
+        };
+        try {
+          try {
+            await submit();
+          } catch (error) {
+            if (!isDefinitivePreSubmitDisconnect(error)) throw error;
+            resetConnection();
+            await submit();
+          }
         } catch (error) {
           if (isCodexConnectionError(error)) {
-            codexConnectedTasks.delete(nativeTaskId);
-            if (threadId) activeCodexThreads.delete(threadId);
-            invalidateModelCatalog("codex");
+            resetConnection();
           }
           throw error;
         }
       } else if (routedInput.runtime === "cursor") {
-        await queueAcpTaskTransition(routedInput.taskId, async () => {
-          try {
-            const taskId = await ensureCursorSessionForTaskUnlocked(
-              routedInput.taskId,
-              routedInput.delegation,
-              routedInput.permission,
-              routedInput.toolScope,
-            );
-            await applyCursorSelection(taskId, routedInput);
-            await nativeInvoke("acp_send_turn", {
-              taskId,
-              prompt: routedInput.prompt,
-              delegation: routedInput.delegation,
-              nativeActionId: routedInput.nativeActionId,
-              contextReferences: routedInput.contextReferences,
-              resumeInterrupted: routedInput.resumeInterrupted,
-              toolScope: routedInput.toolScope,
-              ...attachmentArgs,
-            });
-          } catch (error) {
-            resetCursorConnectionState(routedInput.taskId);
-            invalidateModelCatalog("cursor");
-            throw error;
-          }
-        });
+        await queueAcpTaskTransition(routedInput.taskId, () =>
+          runAcpTurnWithRecovery({
+            setup: () =>
+              ensureCursorSessionForTaskUnlocked(
+                routedInput.taskId,
+                routedInput.delegation,
+                routedInput.permission,
+                routedInput.toolScope,
+              ),
+            submit: async (taskId) => {
+              await applyCursorSelection(taskId, routedInput);
+              await nativeInvoke("acp_send_turn", {
+                taskId,
+                prompt: routedInput.prompt,
+                delegation: routedInput.delegation,
+                nativeActionId: routedInput.nativeActionId,
+                contextReferences: routedInput.contextReferences,
+                resumeInterrupted: routedInput.resumeInterrupted,
+                toolScope: routedInput.toolScope,
+                ...attachmentArgs,
+              });
+            },
+            reset: () => {
+              resetCursorConnectionState(
+                nativeTaskIds.get(routedInput.taskId) ?? routedInput.taskId,
+              );
+              invalidateModelCatalog("cursor");
+            },
+          }),
+        );
       } else if (routedInput.runtime === "grok" || routedInput.runtime === "kimi") {
         const runtime = routedInput.runtime;
         await queueAcpTaskTransition(routedInput.taskId, () =>
@@ -6743,7 +6877,7 @@ export const bridge: AppBridge = {
           taskId,
           provider: routedInput.runtime,
           cwd: repositoryForTask(routedInput.taskId),
-          model: realModelId(routedInput.model),
+          model: structuredModelId(routedInput.runtime, routedInput.model),
           effort: routedInput.effort,
           permission: routedInput.permission,
           prompt: routedInput.prompt,

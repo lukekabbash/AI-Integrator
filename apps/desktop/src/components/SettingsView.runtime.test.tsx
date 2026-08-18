@@ -25,6 +25,7 @@ const { bridgeMock } = vi.hoisted(() => ({
     updateMemory: vi.fn(),
     setMemoryEnabled: vi.fn(),
     deleteMemory: vi.fn(),
+    defaultAutoReviewPolicy: vi.fn(),
     setSetting: vi.fn(),
     getStorageTotals: vi.fn(),
   },
@@ -139,6 +140,7 @@ describe("Runtime Settings command disclosure", () => {
     bridgeMock.updateMemory.mockRejectedValue(new Error("not used"));
     bridgeMock.setMemoryEnabled.mockRejectedValue(new Error("not used"));
     bridgeMock.deleteMemory.mockRejectedValue(new Error("not used"));
+    bridgeMock.defaultAutoReviewPolicy.mockResolvedValue("");
     bridgeMock.setSetting.mockResolvedValue(undefined);
     bridgeMock.getStorageTotals.mockResolvedValue({
       totalBytes: 0,
@@ -210,7 +212,7 @@ describe("Runtime Settings command disclosure", () => {
     fireEvent.click(screen.getByRole("button", { name: "Permissions" }));
     await screen.findByRole("heading", { name: "Permissions" });
     fireEvent.click(screen.getByRole("button", { name: "Default profile" }));
-    fireEvent.click(await screen.findByRole("option", { name: "Full access · explicit" }));
+    fireEvent.click(await screen.findByRole("option", { name: "Full access" }));
     await waitFor(() =>
       expect(bridgeMock.setSetting).toHaveBeenCalledWith(
         "settings.permissions.defaultProfile",

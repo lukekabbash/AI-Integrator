@@ -1787,11 +1787,6 @@ kbd {
   text-align: right;
 }
 
-.scheduled-workspace > .panel-slot--right {
-  flex: 0 0 var(--right-rail-width, 356px);
-  width: var(--right-rail-width, 356px);
-}
-
 .scheduled-rail-panel {
   height: 100%;
   min-height: 0;
@@ -6635,9 +6630,6 @@ kbd {
     var(--color-rail) 150px
   );
   box-shadow: inset 0 1px 0 color-mix(in srgb, var(--color-text-primary) 4%, transparent);
-  transition:
-    width var(--motion-normal),
-    min-width var(--motion-normal);
 }
 .right-rail > [role="tabpanel"] {
   min-height: 0;
@@ -6783,6 +6775,15 @@ kbd {
 .file-reader-tab > button[role="tab"] svg {
   width: 12px;
   flex: none;
+}
+/* A site's own icon, wherever a tab is drawn: the pane's strip, the pop-out
+   window and the compact deck all read the same field. */
+.tab-favicon {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  border-radius: 2px;
+  object-fit: contain;
 }
 .file-reader-tab-close {
   width: 22px;
@@ -10732,6 +10733,7 @@ body[data-resizing="true"] .git-workspace > .resize-handle--vertical {
   display: flex;
   align-items: end;
   gap: 3px;
+  overflow-x: auto;
 }
 .usage-activity-chart > i {
   min-width: 2px;
@@ -13695,6 +13697,18 @@ button.explain-fallback-step:hover .explain-fallback-role {
 .git-file-active {
   border-radius: var(--radius-row);
   background: var(--color-selection-active);
+  box-shadow: none;
+}
+/* The same selection, wearing a tab. Every tab strip in the app — the work
+   pane's and the pop-out browser window's — shares this one skin, and the fill
+   is clipped to the padding box so it stops at the tab's outline instead of
+   showing through it. */
+.tab-strip-selection {
+  border: 1px solid transparent;
+  border-bottom: 0;
+  border-radius: 7px 7px 0 0;
+  background-color: var(--color-selection-active);
+  background-clip: padding-box;
   box-shadow: none;
 }
 .chat-row-shell[data-active="true"] {

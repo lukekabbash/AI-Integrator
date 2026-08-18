@@ -488,6 +488,21 @@ fn antigravity_effort_composes_into_the_model_name() {
         ))),
         Some("gemini-3.6-flash-low".into())
     );
+    // Persisted exact display variants never receive a second effort suffix.
+    assert_eq!(
+        model_arg(provider_args(&options(
+            Some("Gemini 3.5 Flash (High)"),
+            Some("low")
+        ))),
+        Some("Gemini 3.5 Flash (High)".into())
+    );
+    assert_eq!(
+        model_arg(provider_args(&options(
+            Some("Claude Sonnet 4.6 (Thinking)"),
+            Some("high")
+        ))),
+        Some("Claude Sonnet 4.6 (Thinking)".into())
+    );
     // Slugs without effort support pass through untouched.
     assert_eq!(
         model_arg(provider_args(&options(

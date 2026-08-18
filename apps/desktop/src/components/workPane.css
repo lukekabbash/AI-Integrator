@@ -31,6 +31,10 @@
   width: 10px;
   z-index: 13;
 }
+/* No seam at rest — the pane meets the transcript with nothing drawn between
+   them. The hairline fades in under the pointer to say where the drag is, and
+   while a browser is open it comes up in the selection colour so the seam, the
+   selected tab and the browser's chrome are one piece. */
 .work-pane-grip::before {
   content: "";
   position: absolute;
@@ -38,7 +42,18 @@
   right: 2px;
   bottom: 0;
   width: 1px;
-  background: var(--color-border-subtle);
+  background: transparent;
+  transition: background-color var(--motion-fast) var(--ease-standard);
+}
+.work-pane-grip:hover::before,
+.work-pane-grip:focus-within::before,
+body[data-resizing="true"] .work-pane-grip::before {
+  background: var(--color-border-strong);
+}
+.work-pane[data-kind="browser"] .work-pane-grip:hover::before,
+.work-pane[data-kind="browser"] .work-pane-grip:focus-within::before,
+body[data-resizing="true"] .work-pane[data-kind="browser"] .work-pane-grip::before {
+  background: var(--color-selection-active);
 }
 .work-pane-grip > .resize-handle--horizontal {
   right: 0;
@@ -134,6 +149,7 @@
   gap: 6px;
 }
 .work-pane-strip-tabs {
+  position: relative;
   min-width: 0;
   flex: 1 1 auto;
   height: 100%;
@@ -146,13 +162,28 @@
 .work-pane-strip-tabs::-webkit-scrollbar {
   display: none;
 }
+/* Every tab is outlined so the strip reads as a row of tabs at rest; only the
+   selected one is filled, and that fill is a single travelling layer shared by
+   the strip — the same one the sidebar's chat list uses, so the colour slides
+   from tab to tab instead of blinking off one and on another. */
 .work-pane-tab {
+  position: relative;
+  z-index: 1;
   flex: 0 1 160px;
   max-width: 180px;
-  border-color: var(--color-border-subtle);
 }
-.work-pane-tab[data-active="true"] {
-  border-color: var(--color-border-strong);
+/* styles.css owns `.file-reader-tab` and loads after this file, so anything the
+   file tabs already set — the transparent outline, the active fill — needs the
+   strip prefix to win the tie. Every tab keeps its outline; only the fill moves,
+   and it moves on the travelling layer underneath. */
+.work-pane-strip-tabs .work-pane-tab,
+.work-pane-strip-tabs .work-pane-tab[data-active="true"] {
+  border-color: color-mix(in srgb, var(--color-border-strong) 55%, transparent);
+  border-bottom: 0;
+  background: transparent;
+}
+.work-pane-strip-tabs .work-pane-tab[data-active="true"] > button[role="tab"] {
+  color: var(--color-selection-text);
 }
 .work-pane-tab[data-kind="subagent"] > button[role="tab"] svg,
 .work-pane-tab[data-kind="review"] > button[role="tab"] svg,
@@ -162,8 +193,77 @@
   stroke-width: 1.8;
   color: var(--color-text-tertiary);
 }
-.work-pane-tab[data-active="true"] > button[role="tab"] svg {
+.work-pane-strip-tabs .work-pane-tab[data-active="true"] > button[role="tab"] svg,
+.work-pane-strip-tabs .work-pane-tab[data-active="true"] .file-reader-tab-close {
+  color: var(--color-selection-text);
+}
+
+/* Tab controls keep out of the way until you go for them, the way the sidebar's
+   row actions do: a resting strip is titles, not buttons. Hover, keyboard focus
+   inside the tab, and the active tab all bring them up. They keep their space
+   the whole time — a control that appears and shoves the title sideways is
+   worse than one that is simply always there. */
+.work-pane-strip-tabs .work-pane-tab > .file-reader-tab-close {
+  /* Out of flow, so the title has the whole tab to itself at rest and the
+     controls do not reserve a gap that is empty most of the time. The tab's
+     own background sits behind them — no veil, no gradient. */
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  opacity: 0;
+  transform: translateY(-1px) scale(0.88);
+  pointer-events: none;
+  background: transparent;
+  transition:
+    opacity var(--motion-fast) var(--ease-standard),
+    transform var(--motion-fast) var(--ease-emphasized),
+    color var(--motion-fast) var(--ease-standard);
+}
+/* Close sits at the end; minimize tucks in beside it. */
+.work-pane-strip-tabs .work-pane-tab > .file-reader-tab-close:last-of-type {
+  right: 0;
+}
+.work-pane-strip-tabs .work-pane-tab > .work-pane-tab-minimize {
+  right: 20px;
+}
+/* The title makes room only while the controls are up, so nothing is hidden
+   behind them and nothing shifts when they are away. */
+.work-pane-strip-tabs .work-pane-tab > button[role="tab"] {
+  transition: padding-right var(--motion-fast) var(--ease-standard);
+}
+.work-pane-tab:hover > button[role="tab"],
+.work-pane-tab:focus-within > button[role="tab"],
+.work-pane-tab[data-active="true"] > button[role="tab"] {
+  padding-right: 42px;
+}
+.work-pane-tab[data-kind="browser"]:hover > button[role="tab"],
+.work-pane-tab[data-kind="browser"]:focus-within > button[role="tab"],
+.work-pane-tab[data-kind="browser"][data-active="true"] > button[role="tab"] {
+  padding-right: 42px;
+}
+.work-pane-tab:hover .file-reader-tab-close,
+.work-pane-tab:focus-within .file-reader-tab-close,
+.work-pane-tab[data-active="true"] .file-reader-tab-close {
+  opacity: 1;
+  transform: scale(1);
+  pointer-events: auto;
+}
+/* Minus is the quieter of the two: the page carries on either way, so it should
+   not compete with the control that ends it. */
+.work-pane-tab-minimize {
+  color: var(--color-text-tertiary);
+}
+.work-pane-tab-minimize:hover {
   color: var(--color-text-secondary);
+}
+@media (prefers-reduced-motion: reduce) {
+  .work-pane-tab .file-reader-tab-close,
+  .work-pane-tab:hover .file-reader-tab-close,
+  .work-pane-tab:focus-within .file-reader-tab-close,
+  .work-pane-tab[data-active="true"] .file-reader-tab-close {
+    transition: none;
+    transform: none;
+  }
 }
 /* The rail's sigil with a bot face in its corner, inside the footprint of an
    ordinary tab glyph so the strip keeps its rhythm. The sigil scales itself

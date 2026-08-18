@@ -1,78 +1,117 @@
-/* The card deck: browser tabs the work pane is not showing, stacked in the
-   bottom-right corner of the main window.
+/* The card deck: browser tabs the work pane is not showing, as a column of
+   live cards in the bottom-right corner of the main window — or wherever the
+   grip was last dragged to.
 
-   One rule shapes all of this — a native webview always paints above HTML — so
-   the raised card's page rectangle is left completely clear and every control
-   lives outside it: the title strip above, the count below, the cards behind
-   peeking out from under. Nothing is ever drawn on top of a card. */
+   One rule shapes all of this — a native webview always paints above HTML —
+   so every card's page rectangle is left completely clear and every control
+   lives outside it: the title strip above each page, the grip and the named
+   strips above the column. Cards never overlap: two native pages cannot
+   stack, so they sit one above another and every one of them shows. */
 
 .browser-deck {
+  /* One height for every card; the column shortens each page as it grows so
+     four live pages still fit under the title bar. */
+  --deck-page-height: clamp(
+    88px,
+    calc((100vh - 140px) / var(--deck-live, 1) - 40px),
+    200px
+  );
   position: fixed;
-  top: 50px;
+  /* right/bottom come from the element style: the remembered drag offset. */
   right: 18px;
   bottom: 18px;
   z-index: 40;
   display: flex;
   flex-direction: column;
-  justify-content: flex-end;
-  align-items: flex-end;
+  align-items: stretch;
   gap: 6px;
+  width: 320px;
   pointer-events: none;
 }
 .browser-deck > * {
   pointer-events: auto;
 }
+.browser-deck[data-live="1"] { --deck-live: 1; }
+.browser-deck[data-live="2"] { --deck-live: 2; }
+.browser-deck[data-live="3"] { --deck-live: 3; }
+.browser-deck[data-live="4"] { --deck-live: 4; }
 
-.browser-deck-stack {
-  position: relative;
-  width: 338px;
-  padding: 18px 0 0 18px;
-  box-sizing: border-box;
+/* The handle. Dragging anywhere else would fight the page underneath. */
+.browser-deck-grip {
+  align-self: flex-end;
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 18px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 99px;
+  background: var(--color-elevated, var(--color-layer-1));
+  color: var(--color-text-muted);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  transition: color var(--duration-fast, 120ms) var(--ease-emphasized);
+}
+.browser-deck-grip:hover,
+.browser-deck-grip:focus-visible {
+  color: var(--color-text-primary);
+}
+.browser-deck-grip:active {
+  cursor: grabbing;
+}
+.browser-deck-grip svg {
+  width: 14px;
+  height: 14px;
 }
 
-.browser-deck-card {
-  width: 320px;
+/* Tabs past the column's limit: named strips, oldest at the top. A click
+   makes one a live card again and retires the oldest live card to a strip. */
+.browser-deck-strips {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.browser-deck-strip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
   border: 1px solid var(--color-border-subtle);
   border-radius: var(--radius-row, 10px);
   background: var(--color-elevated, var(--color-layer-1));
-  box-shadow: var(--shadow-elevated, 0 10px 30px rgb(0 0 0 / 0.28));
-  overflow: hidden;
-}
-
-/* The cards under the raised one: chrome only, offset up and to the left so
-   the deck reads as a deck rather than one card. */
-.browser-deck-card.behind {
-  position: absolute;
-  z-index: var(--card-layer);
-  top: calc(18px - var(--depth) * 6px);
-  left: calc(18px - var(--depth) * 6px);
-  height: 36px;
-  padding: 0 10px;
-  display: flex;
-  align-items: center;
-  text-align: left;
   color: var(--color-text-muted);
   font-size: 12px;
+  text-align: left;
   cursor: pointer;
   transition:
     translate var(--duration-fast, 120ms) var(--ease-emphasized),
     color var(--duration-fast, 120ms) var(--ease-emphasized);
 }
-.browser-deck-card.behind:hover {
+.browser-deck-strip:hover {
   color: var(--color-text-primary);
-  translate: 0 -2px;
+  translate: 0 -1px;
 }
-.browser-deck-behind-label {
+.browser-deck-strip-label {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
 }
 
-.browser-deck-card.raised {
-  position: relative;
-  z-index: 5;
+.browser-deck-column {
   display: flex;
   flex-direction: column;
+  gap: 6px;
+}
+
+.browser-deck-card {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-row, 10px);
+  background: var(--color-elevated, var(--color-layer-1));
+  box-shadow: var(--shadow-elevated, 0 10px 30px rgb(0 0 0 / 0.28));
+  overflow: hidden;
 }
 
 .browser-deck-bar {
@@ -128,11 +167,21 @@
   gap: 2px;
 }
 
-/* The page's rectangle. Kept empty on purpose: the webview is placed over it. */
+/* The page's rectangle. Nothing is drawn *over* it: the webview is placed on
+   top, and the still below is only what shows until it arrives. */
 .browser-deck-page {
   position: relative;
-  height: clamp(96px, calc(100vh - 180px), 200px);
+  height: var(--deck-page-height);
   background: var(--color-canvas);
+  overflow: hidden;
+}
+.browser-deck-poster {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: top center;
 }
 .browser-deck-empty {
   position: absolute;
@@ -143,21 +192,9 @@
   color: var(--color-text-muted);
 }
 
-.browser-deck-more {
-  padding: 2px 8px;
-  border: 1px solid var(--color-border-subtle);
-  border-radius: 99px;
-  background: var(--color-elevated, var(--color-layer-1));
-  color: var(--color-text-muted);
-  font-size: 11px;
-  cursor: pointer;
-}
-.browser-deck-more:hover {
-  color: var(--color-text-primary);
-}
-
 @media (prefers-reduced-motion: reduce) {
-  .browser-deck-card.behind,
+  .browser-deck-strip,
+  .browser-deck-grip,
   .browser-deck-who > i {
     transition: none;
     animation: none;

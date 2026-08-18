@@ -2,6 +2,87 @@ use super::*;
 use integrator_core::{NewTask, TaskContextReference};
 
 #[test]
+fn stale_structured_resume_is_cleared_only_for_provider_rejection() {
+    for (provider, diagnostic) in [
+        (
+            ProviderKind::Claude,
+            "No conversation found with session ID: 018f-dead",
+        ),
+        (ProviderKind::Claude, "Session 018f-dead was not found."),
+        (
+            ProviderKind::Antigravity,
+            "Conversation 018f-dead does not exist.",
+        ),
+    ] {
+        assert!(structured_resume_rejected(
+            provider,
+            true,
+            Some(1),
+            false,
+            Some(diagnostic),
+        ));
+    }
+
+    for (started_with_resume, code, cancelled, diagnostic) in [
+        (false, Some(1), false, "Session missing was not found."),
+        (true, Some(0), false, "Session missing was not found."),
+        (true, Some(1), true, "Session missing was not found."),
+        (true, Some(1), false, "Network unavailable"),
+    ] {
+        assert!(!structured_resume_rejected(
+            ProviderKind::Claude,
+            started_with_resume,
+            code,
+            cancelled,
+            Some(diagnostic),
+        ));
+    }
+}
+
+#[test]
+fn stale_structured_resume_rejection_clears_the_durable_reference() {
+    let store = LocalStore::open_in_memory().expect("open store");
+    let task = store
+        .create_task(NewTask {
+            kind: TaskKind::Code,
+            title: "Stale structured resume".into(),
+            repository_path: None,
+            worktree_path: None,
+            runtime: None,
+            model: None,
+            effort: None,
+            parent_task_id: None,
+        })
+        .expect("create task");
+    persist_provider_resume_state(
+        &store,
+        task.id,
+        ProviderKind::Claude,
+        "stale-session",
+        Path::new("/fixture/repository"),
+        "project-write",
+        "off",
+    )
+    .expect("persist resume");
+
+    assert!(clear_rejected_structured_resume(
+        &store,
+        task.id,
+        ProviderKind::Claude,
+        true,
+        Some(1),
+        false,
+        Some("No conversation found with session ID: stale-session"),
+    ));
+    assert_eq!(
+        store
+            .provider_resume_state(task.id)
+            .expect("read resume state"),
+        None
+    );
+}
+
+#[test]
 fn chat_codex_policy_disables_every_command_capable_feature() {
     let mut config = serde_json::json!({"mcp_servers": {"integrator": {}}});
     let effective = serde_json::json!({
@@ -555,6 +636,7 @@ fn acp_launch_is_provider_aware_and_rejects_non_acp_routes() {
             .any(|argument| argument == "--always-approve")
     );
     let grok_environment = acp_launch_environment(&ProviderKind::Grok, &chat);
+    assert!(grok_environment.iter().any(|(name, _)| name == "PATH"));
     assert!(grok_environment.contains(&("GROK_CURSOR_MCPS_ENABLED".into(), "0".into())));
     assert!(grok_environment.contains(&("GROK_CLAUDE_MCPS_ENABLED".into(), "0".into())));
     assert_eq!(
@@ -633,14 +715,36 @@ fn grok_model_output_parser_falls_back_to_default_model_line() {
 }
 
 #[test]
-fn antigravity_model_output_parser_accepts_only_bounded_model_ids() {
-    let output = "gemini-3.6-flash-high\ngemini-3.6-flash-low\nclaude-opus-4-6-thinking\n../not-a-model\ngemini-3.6-flash-high\n\n";
+fn antigravity_model_output_parser_preserves_display_names_and_legacy_slugs() {
+    let output = "Update available\nGemini 3.5 Flash (High)\nClaude Sonnet 4.6 (Thinking)\nGPT-OSS   120B (Medium)\ngemini-3.6-flash-low\nAvailable models:\n../not-a-model\nGemini 3.5 Flash (High)\n\n";
     assert_eq!(
         parse_antigravity_models(output),
         [
-            "gemini-3.6-flash-high",
-            "gemini-3.6-flash-low",
-            "claude-opus-4-6-thinking"
+            "Gemini 3.5 Flash (High)",
+            "Claude Sonnet 4.6 (Thinking)",
+            "GPT-OSS 120B (Medium)",
+            "gemini-3.6-flash-low"
+        ]
+    );
+}
+
+#[test]
+fn antigravity_model_output_parser_accepts_machine_readable_inventory() {
+    let output = serde_json::json!({
+        "models": [
+            { "name": "Gemini 3.5 Flash (High)" },
+            { "displayName": "Claude Sonnet 4.6 (Thinking)" },
+            { "slug": "flash" },
+            { "name": "Update available" }
+        ]
+    })
+    .to_string();
+    assert_eq!(
+        parse_antigravity_models(&output),
+        [
+            "Gemini 3.5 Flash (High)",
+            "Claude Sonnet 4.6 (Thinking)",
+            "flash"
         ]
     );
 }
@@ -1333,13 +1437,31 @@ impl auto_review::Reviewer for CannedReviewer {
     }
 }
 
+struct RoutedReviewer;
+
+impl auto_review::Reviewer for RoutedReviewer {
+    fn ask<'a>(
+        &'a self,
+        route: &'a ReviewerRoute,
+        _message: &'a str,
+    ) -> auto_review::ReviewerAnswer<'a> {
+        Box::pin(async move {
+            if route.runtime == ProviderKind::Claude {
+                Err("Claude is unavailable".into())
+            } else {
+                Ok(r#"{"verdict":"allow","reason":"fallback answered"}"#.into())
+            }
+        })
+    }
+}
+
 fn auto_review_test_plan(fallback: Fallback) -> AutoReviewPlan {
     AutoReviewPlan {
-        mode: ReviewerMode::Delegated,
         config: ReviewerConfig::new(ReviewerRoute::new(ProviderKind::Claude))
             // The floor the stored value is clamped to, so the hang case
             // settles in a second rather than in the default ten.
             .with_timeout_ms(Some(0)),
+        fallback_configs: Vec::new(),
         fallback,
     }
 }
@@ -1397,6 +1519,22 @@ async fn no_reviewer_failure_can_produce_an_approval() {
             "a reviewer failure resolved to {denied:?} under the deny fallback"
         );
     }
+}
+
+#[tokio::test]
+async fn auto_review_tries_the_next_configured_reviewer() {
+    let mut plan = auto_review_test_plan(Fallback::Ask);
+    plan.fallback_configs
+        .push(ReviewerConfig::new(ReviewerRoute::new(ProviderKind::Codex)));
+
+    let outcome =
+        auto_review_outcome(&RoutedReviewer, &plan, &auto_review_test_request(), &[]).await;
+    assert_eq!(
+        outcome,
+        Outcome::Approve {
+            reason: "fallback answered".into()
+        }
+    );
 }
 
 #[tokio::test]
@@ -1660,9 +1798,10 @@ fn the_reviewers_transcript_separates_what_a_tool_did_from_what_it_returned() {
 }
 
 #[test]
-fn a_runtime_the_user_never_switched_on_has_no_reviewer() {
+fn auto_review_has_a_safe_runtime_local_default() {
     let store = LocalStore::open_in_memory().expect("open store");
-    assert!(auto_review_plan(&store, ProviderKind::Claude).is_none());
+    let plan = auto_review_plan(&store, ProviderKind::Claude).expect("default reviewer");
+    assert_eq!(plan.config.route.runtime, ProviderKind::Claude);
 
     // Present but off, and present but off written as a string, are both off.
     store
@@ -1676,6 +1815,32 @@ fn a_runtime_the_user_never_switched_on_has_no_reviewer() {
         .expect("save routes");
     assert!(auto_review_plan(&store, ProviderKind::Claude).is_none());
     assert!(auto_review_plan(&store, ProviderKind::Codex).is_none());
+}
+
+#[test]
+fn the_shared_reviewer_order_applies_to_every_task_runtime() {
+    let store = LocalStore::open_in_memory().expect("open store");
+    store
+        .set_setting(
+            "permissions.autoReviewReviewers",
+            serde_json::json!([
+                { "runtime": "claude", "model": "claude-haiku-4-5", "effort": "low" },
+                { "runtime": "codex", "model": "gpt-5.6-luna", "effort": "medium" }
+            ]),
+        )
+        .expect("save reviewers");
+
+    for task_runtime in [
+        ProviderKind::Claude,
+        ProviderKind::Grok,
+        ProviderKind::Cursor,
+    ] {
+        let plan = auto_review_plan(&store, task_runtime).expect("shared reviewers");
+        assert_eq!(plan.config.route.runtime, ProviderKind::Claude);
+        assert_eq!(plan.config.route.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(plan.fallback_configs.len(), 1);
+        assert_eq!(plan.fallback_configs[0].route.runtime, ProviderKind::Codex);
+    }
 }
 
 #[test]
@@ -1710,7 +1875,6 @@ fn a_stored_route_reviews_on_its_own_runtime_never_the_tasks() {
         .expect("save timeout");
 
     let claude = auto_review_plan(&store, ProviderKind::Claude).expect("claude route");
-    assert_eq!(claude.mode, ReviewerMode::Delegated);
     assert_eq!(claude.config.route.runtime, ProviderKind::Codex);
     assert_eq!(claude.config.route.model.as_deref(), Some("gpt-5.6-luna"));
     assert_eq!(claude.config.route.effort.as_deref(), Some("low"));
@@ -1721,12 +1885,10 @@ fn a_stored_route_reviews_on_its_own_runtime_never_the_tasks() {
     // Codex reviews inside itself by default, and a native reviewer is always
     // the task's own runtime.
     let codex = auto_review_plan(&store, ProviderKind::Codex).expect("codex route");
-    assert_eq!(codex.mode, ReviewerMode::Native);
     assert_eq!(codex.config.route.runtime, ProviderKind::Codex);
 
     // `custom` is the renderer's id for the runtime Rust calls `custom-acp`,
     // and it has no native reviewer to degrade into.
     let custom = auto_review_plan(&store, ProviderKind::CustomAcp).expect("custom route");
-    assert_eq!(custom.mode, ReviewerMode::Delegated);
     assert_eq!(custom.config.route.runtime, ProviderKind::CustomAcp);
 }

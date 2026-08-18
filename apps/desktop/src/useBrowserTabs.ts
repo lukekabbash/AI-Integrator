@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
 import { bridge, openExternalLink, type BrowserTab } from "./bridge";
 import { annotationAttachmentName } from "./browserAnnotation";
@@ -6,7 +6,9 @@ import {
   BrowserBoundsCoordinator,
   toNativeBrowserBounds,
   type BrowserPlacementSlot,
+  type BrowserBoundsWriter,
 } from "./browserBounds";
+import { browserPosters } from "./browserPosters";
 
 /** A picked element, as the guest runtime describes it. */
 export interface PickedElement {
@@ -25,11 +27,16 @@ export interface BrowserController {
   allowExternalOpen: boolean;
   tabs: BrowserTab[];
   byId: Record<string, BrowserTab>;
+  /** Data URL of the last still taken of each tab, for the tabs that have one.
+   *  A slot paints it under the native page so a switch shows the page rather
+   *  than the app's own background while the webview is on its way. */
+  posters: Readonly<Record<string, string>>;
   message: string | null;
   recordingTabId: string | null;
   annotatingTabId: string | null;
   open: (url?: string) => Promise<BrowserTab | null>;
-  close: (tabId: string) => Promise<void>;
+  /** Closes an idle/user tab; false means recent agent work was preserved. */
+  close: (tabId: string) => Promise<boolean>;
   navigate: (tabId: string, url: string) => Promise<void>;
   history: (tabId: string, action: "back" | "forward" | "reload" | "stop") => Promise<void>;
   setBounds: (tabId: string, rect: DOMRect | null, placementSlot: BrowserPlacementSlot) => void;
@@ -42,6 +49,7 @@ export interface BrowserController {
   screenshot: (tabId: string) => Promise<void>;
   toggleRecording: (tabId: string) => Promise<void>;
   toggleAnnotate: (tabId: string) => Promise<void>;
+  setToolbarTooltip: (tabId: string, tooltip: { label: string; x: number } | null) => Promise<void>;
 }
 
 export interface BrowserHost {
@@ -186,8 +194,24 @@ export function useBrowserTabs(
     tabId: string;
   } | null>(null);
   const boundsCoordinator = useMemo(
-    () => (api ? new BrowserBoundsCoordinator(api, poppedOutHost) : null),
-    [api, poppedOutHost],
+    () => {
+      if (!api || !taskId) return null;
+      const writer: BrowserBoundsWriter = {
+        setBounds: async (...placement) => {
+          await api.setBounds(...placement);
+          // Only when a tab leaves a slot. The native side takes its still
+          // while it is on screen, so parking is the moment this window's copy
+          // of it went stale — and it is rare, unlike the rectangles a pane
+          // drag sends, none of which change the picture.
+          const [writeTaskId, tabId, bounds] = placement;
+          if (bounds === null) browserPosters.refresh(api, writeTaskId, tabId);
+        },
+      };
+      return new BrowserBoundsCoordinator(writer, poppedOutHost);
+    },
+    // A different chat gets a fresh lane immediately; a slow placement from
+    // the previous chat must never hold up the browser the user just opened.
+    [api, poppedOutHost, taskId],
   );
   const recorder = useRef<ActiveRecording | null>(null);
   const picker = useRef<ActivePicker | null>(null);
@@ -221,6 +245,14 @@ export function useBrowserTabs(
   const message = messageSnapshot?.taskId === taskId ? messageSnapshot.text : null;
   const activeRecordingTabId = recordingState?.taskId === taskId ? recordingState.tabId : null;
   const activeAnnotatingTabId = annotatingState?.taskId === taskId ? annotatingState.tabId : null;
+
+  // One still per open tab, kept for the slots that paint under a native page.
+  // A tab that has moved on to another address is asked again; a tab that has
+  // closed is forgotten, which is what keeps this window's copy bounded.
+  const posters = useSyncExternalStore(browserPosters.subscribe, browserPosters.snapshot);
+  useEffect(() => {
+    browserPosters.sync(api ?? null, taskId, tabs);
+  }, [api, tabs, taskId]);
 
   // A capture belongs to the task that started it. Stop its timers when that
   // task leaves this renderer so an old page can never write into the next
@@ -445,6 +477,7 @@ export function useBrowserTabs(
       allowExternalOpen,
       tabs,
       byId,
+      posters,
       message,
       recordingTabId: activeRecordingTabId,
       annotatingTabId: activeAnnotatingTabId,
@@ -459,10 +492,13 @@ export function useBrowserTabs(
         }
       },
       close: async (tabId) => {
-        if (!api || !taskId || !byId[tabId]) return;
-        await api
-          .close(taskId, tabId)
-          .catch((error) => report(taskId, error, "Could not close that tab."));
+        if (!api || !taskId || !byId[tabId]) return false;
+        try {
+          return await api.close(taskId, tabId);
+        } catch (error) {
+          report(taskId, error, "Could not close that tab.");
+          return false;
+        }
       },
       navigate: async (tabId, url) => {
         if (!api || !taskId || !byId[tabId]) return;
@@ -477,7 +513,9 @@ export function useBrowserTabs(
       },
       setBounds,
       setPoppedOut: async (tabId, popped) => {
-        if (!api || !taskId || !byId[tabId]) return;
+        // A just-created tab can be moved before the changed event has put it
+        // in `byId`; native task scoping remains the source of truth.
+        if (!api || !taskId) return;
         await api
           .setPoppedOut(taskId, tabId, popped)
           .catch((error) => report(taskId, error, "Could not move that tab."));
@@ -522,6 +560,10 @@ export function useBrowserTabs(
       screenshot,
       toggleRecording,
       toggleAnnotate,
+      setToolbarTooltip: async (tabId, tooltip) => {
+        if (!api || !taskId || !byId[tabId]) return;
+        await api.invoke(taskId, tabId, "hostTooltip", [tooltip]).catch(() => undefined);
+      },
     };
   }, [
     api,
@@ -529,6 +571,7 @@ export function useBrowserTabs(
     taskId,
     allowExternalOpen,
     tabs,
+    posters,
     message,
     activeRecordingTabId,
     activeAnnotatingTabId,

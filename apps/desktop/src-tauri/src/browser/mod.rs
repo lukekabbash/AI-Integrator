@@ -30,6 +30,7 @@ use crate::command_api::{CommandError, CommandResult};
 
 mod agent;
 mod capture;
+mod favicon;
 mod popout;
 mod registry;
 mod remember;
@@ -48,6 +49,11 @@ pub const BROWSER_EVENT: &str = "browser://changed";
 /// owns layout, so this is a request, and `browser_focus` reports what came of
 /// it rather than pretending it landed.
 pub const BROWSER_FOCUS_EVENT: &str = "browser://focus";
+/// A tool reply may carry extra MCP content blocks — an image, say — under
+/// this key. The broker lifts them out and sends them beside the JSON text,
+/// which is the only way a picture reaches a model through MCP; left in the
+/// text they would be a base64 blob the model reads as characters.
+pub const MCP_CONTENT_KEY: &str = "$mcpContent";
 /// An agent asking to sign in on a site the user has not allowed it to. The
 /// app asks; the agent is told to try again rather than being made to wait.
 pub const BROWSER_FILL_REQUEST_EVENT: &str = "browser://fill-request";
@@ -297,6 +303,7 @@ pub(super) fn tab_webview_builder(
     let title_tabs = Arc::clone(state);
     let title_app = app.clone();
     let title_id = id.to_string();
+    let load_label = label.to_string();
     let context_tabs = Arc::clone(state);
     let context_app = app.clone();
     let context_id = id.to_string();
@@ -330,6 +337,10 @@ pub(super) fn tab_webview_builder(
                 if !loading && let Some(task) = tabs.task_of(&load_id) {
                     remember::remember(&load_app, &tabs, &task);
                 }
+            }
+            if !loading {
+                poster_when_settled(&load_app, &tabs, &load_id);
+                favicon::refresh(&load_app, &tabs, &load_id, &load_label);
             }
         })
         .on_document_title_changed(move |_, title| {
@@ -376,15 +387,26 @@ pub(super) async fn create_tab(
 
     let builder = tab_webview_builder(app, state, &id, &label, &target, &task_id);
 
-    window
+    let webview = window
         .add_child(builder, parked().0, parked().1)
         .map_err(|error| unavailable(format!("could not open a browser tab: {error}")))?;
+    // Off-screen geometry preserves a useful desktop viewport for an agent,
+    // but geometry alone still exposes this page to Windows accessibility in
+    // whichever chat owns the host window. Keep it genuinely hidden until a
+    // pane, deck, or popout claims it.
+    if let Err(error) = webview.hide() {
+        let _ = webview.close();
+        return Err(unavailable(format!(
+            "could not hide the new browser tab: {error}"
+        )));
+    }
 
     let tab = BrowserTab {
         id: id.clone(),
         task_id,
         url: target.to_string(),
         title: String::new(),
+        favicon: None,
         // about:blank has nothing to fetch and never reports a page load, so
         // calling it "loading" leaves the reload control spinning forever on
         // a tab that is simply waiting for an address.
@@ -392,6 +414,7 @@ pub(super) async fn create_tab(
         popped_out: false,
         hidden: true,
         held_by: None,
+        agent_protected_until: None,
         sleeping: false,
         delegation_id: None,
     };
@@ -409,6 +432,7 @@ pub(super) async fn create_tab(
                 generation: 0,
                 touched: std::time::Instant::now(),
                 credential_at: None,
+                poster: None,
             },
         );
     }
@@ -523,9 +547,13 @@ pub async fn browser_tab_close(
     state: tauri::State<'_, Arc<BrowserTabs>>,
     task_id: String,
     tab_id: String,
-) -> CommandResult<()> {
+) -> CommandResult<bool> {
     require_task(&state, &task_id, &tab_id)?;
-    close_tab(&app, &state, &tab_id)
+    if state.agent_recently_used(&tab_id) {
+        return Ok(false);
+    }
+    close_tab(&app, &state, &tab_id)?;
+    Ok(true)
 }
 
 /// Tears down a tab's webview (or its pop-out window) and forgets it. Shared
@@ -567,11 +595,89 @@ pub(super) fn close_tab(
     Ok(())
 }
 
+/// Keeps a still of a page that is on screen right now.
+///
+/// Silent on every failure: the window can be covered, minimised or on another
+/// desktop, and a missing poster costs a card its picture rather than the user
+/// an error. A filled password is on the page as pixels, so the refusal that
+/// guards `browser_tab_screenshot` guards what is cached here too.
+async fn capture_poster<R: Runtime>(
+    state: &BrowserTabs,
+    webview: &tauri::Webview<R>,
+    tab_id: &str,
+) {
+    if !state.on_screen(tab_id) || state.credential_in_flight(tab_id) {
+        return;
+    }
+    if let Ok(png) = capture::capture_poster_png(webview).await {
+        state.set_poster(tab_id, png);
+    }
+}
+
+/// How long after a page settles its still is taken. Long enough for the first
+/// paint and the layout that follows it, short enough that the picture is of
+/// the page the person is actually looking at.
+///
+/// Two moments qualify, and neither is a timer: a load finishing, and a tab
+/// arriving in a slot. Not parking — parking is the tab-switch path, and
+/// waiting on a desktop grab before exposing the replacement would be exactly
+/// the hitch the still exists to hide. By the time a tab is parked its picture
+/// has already been taken.
+const POSTER_SETTLE: Duration = Duration::from_millis(700);
+
+/// Queues that one capture. The caller may be the webview's own load handler,
+/// which must not wait for a window grab, so this leaves with the tab id and
+/// looks the webview up again when it comes back.
+fn poster_when_settled(app: &AppHandle, state: &Arc<BrowserTabs>, tab_id: &str) {
+    let app = app.clone();
+    let state = Arc::clone(state);
+    let tab_id = tab_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(POSTER_SETTLE).await;
+        let Some(label) = state.label_for(&tab_id) else {
+            return;
+        };
+        let Ok(webview) = webview_of(&app, &label) else {
+            return;
+        };
+        capture_poster(&state, &webview, &tab_id).await;
+    });
+}
+
+/// Puts the corner deck's page back on top of its siblings.
+///
+/// Sibling child webviews order by creation, not by CSS, so the pane's larger
+/// page paints over a deck card whenever the pane's tab was opened later.
+/// Nothing in Tauri reorders a child webview directly, but reparenting one to
+/// the window it is already in does: that is a `SetParent` call, and `SetParent`
+/// moves a child to the head of its parent's z-order. Hiding and re-showing
+/// does not — `ShowWindow` leaves the order alone, so it would only flicker.
+///
+/// Called when a tab enters a slot, never on the geometry updates a pane drag
+/// produces: the order changes when a page moves hosts, not when it resizes.
+fn raise_deck(app: &AppHandle, state: &BrowserTabs, task_id: &str) {
+    let Some(window) = app.get_window("main") else {
+        return;
+    };
+    for deck_id in state.visible_in_slot(task_id, PlacementSlot::Deck) {
+        let Some(label) = state.label_for(&deck_id) else {
+            continue;
+        };
+        if let Ok(webview) = webview_of(app, &label) {
+            let _ = webview.reparent(&window);
+        }
+    }
+}
+
 fn park_tab(app: &AppHandle, state: &BrowserTabs, tab_id: &str) -> Result<(), CommandError> {
     let label = state
         .label_for(tab_id)
         .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
     let webview = webview_of(app, &label)?;
+    // Never capture here. Parking is on the tab-switch path, and waiting for a
+    // desktop grab before exposing the replacement is exactly the kind of
+    // avoidable hitch the cached poster is meant to hide. Loads refresh the
+    // poster independently after first paint.
     let (position, size) = parked();
     webview
         .set_bounds(tauri::Rect {
@@ -579,7 +685,12 @@ fn park_tab(app: &AppHandle, state: &BrowserTabs, tab_id: &str) -> Result<(), Co
             size: size.into(),
         })
         .map_err(|error| unavailable(error.to_string()))?;
-    let _ = webview.show();
+    // A shown child remains in UI Automation even outside the client area.
+    // Hiding it prevents another chat (and its screen reader) from inheriting
+    // this page while WebView2 keeps the document and full-size layout alive.
+    webview
+        .hide()
+        .map_err(|error| unavailable(format!("could not hide that browser tab: {error}")))?;
     state.set_placement(tab_id, None);
     Ok(())
 }
@@ -595,8 +706,20 @@ pub async fn browser_tab_set_bounds(
     bounds: Option<TabBounds>,
     placement_slot: PlacementSlot,
     popped_out_host: bool,
+    placement_session: u64,
+    placement_revision: u64,
 ) -> CommandResult<()> {
     require_task(&state, &task_id, &tab_id)?;
+    if !state.claim_placement(
+        &task_id,
+        &tab_id,
+        popped_out_host,
+        placement_slot,
+        placement_session,
+        placement_revision,
+    ) {
+        return Ok(());
+    }
     if state.sleeping_target(&tab_id).is_some() {
         // The renderer only reports a rectangle for a tab it is showing, so this
         // is the moment a remembered tab is actually wanted.
@@ -605,6 +728,19 @@ pub async fn browser_tab_set_bounds(
         } else {
             return Ok(());
         }
+    }
+    // Waking yields to every newer tab/chat switch. The claim made above is
+    // what lets the winner invalidate this request before it can resurface an
+    // old chat after the await completes.
+    if !state.placement_is_current(
+        &task_id,
+        &tab_id,
+        popped_out_host,
+        placement_slot,
+        placement_session,
+        placement_revision,
+    ) {
+        return Ok(());
     }
     let popped_out = state
         .tabs
@@ -625,9 +761,14 @@ pub async fn browser_tab_set_bounds(
         Some(bounds) if bounds.width >= 1.0 && bounds.height >= 1.0 => {
             // React can retire one surface while mounting the next. Park the
             // old visible sibling natively before exposing the new one, even
-            // if an earlier renderer promise completed late.
-            for peer_id in state.visible_peers(&task_id, &tab_id, popped_out_host, placement_slot) {
-                park_tab(&app, &state, &peer_id)?;
+            // if an earlier renderer promise completed late. The deck is the
+            // exception: its cards each have their own rectangle and all show.
+            if placement_slot != PlacementSlot::Deck {
+                for peer_id in
+                    state.visible_peers(&task_id, &tab_id, popped_out_host, placement_slot)
+                {
+                    park_tab(&app, &state, &peer_id)?;
+                }
             }
             // One call, not a move followed by a resize: two dispatches per
             // frame let the tab paint at a half-applied geometry, which is
@@ -642,11 +783,25 @@ pub async fn browser_tab_set_bounds(
                     .into(),
                 })
                 .map_err(|error| unavailable(error.to_string()))?;
-            let _ = webview.show();
+            webview.show().map_err(|error| {
+                unavailable(format!("could not show that browser tab: {error}"))
+            })?;
             // Being on screen counts as being reached for: the cap must never
             // sleep the page the user is looking at.
             state.touch(&tab_id);
-            state.set_placement(&tab_id, Some(placement_slot));
+            if state.set_placement(&tab_id, Some(placement_slot)) {
+                // A pane page opened after the deck's would otherwise paint
+                // over the corner card, and a card that has just arrived may
+                // itself be the older of the two. Either way the deck goes
+                // back on top.
+                if !popped_out_host {
+                    raise_deck(&app, &state, &task_id);
+                }
+                // A tab that has just been given a rectangle is about to be
+                // worth a picture. Taking it now rather than on the way out
+                // keeps the capture off the switch the picture is for.
+                poster_when_settled(&app, &state, &tab_id);
+            }
         }
         _ => {
             // Parked, not shrunk. A tab the pane is not showing used to be left
@@ -797,9 +952,26 @@ pub async fn browser_tab_screenshot(
     capture::capture_png(&webview).await
 }
 
+/// This tab's last still, base64 PNG, or nothing if none is held.
+///
+/// Deliberately its own call rather than a field on the tab snapshot: that
+/// snapshot streams on every tab event, and a PNG per tab inside it would put
+/// megabytes through IPC every time a title changed. The renderer asks once
+/// and keeps what it gets. Never wakes a sleeping tab — a still is what it has
+/// instead of a page, not a reason to fetch one.
+#[tauri::command]
+pub async fn browser_tab_poster(
+    state: tauri::State<'_, Arc<BrowserTabs>>,
+    task_id: String,
+    tab_id: String,
+) -> CommandResult<Option<String>> {
+    require_task(&state, &task_id, &tab_id)?;
+    Ok(state.poster(&tab_id))
+}
+
 pub use agent::{
     agent_invoke, close_for_agent, cookies_for_agent, focus_for_agent, grant_for_agent,
-    navigate_for_agent, open_for_agent, tabs_for_caller,
+    navigate_for_agent, open_for_agent, screenshot_for_agent, tabs_for_caller,
 };
 pub use vault::{
     browser_allow_agent_sign_in, browser_fill_login, browser_forget_all_logins,

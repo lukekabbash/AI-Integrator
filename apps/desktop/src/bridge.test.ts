@@ -480,6 +480,206 @@ describe("native trusted-project bridge", () => {
     ]);
   });
 
+  it("keeps an authenticated CLI degraded when its required route capability is missing", async () => {
+    invokeMock.mockResolvedValue([
+      {
+        provider: "cursor",
+        installed: true,
+        executable: "/Users/test/.local/bin/cursor-agent",
+        version: "cursor-agent 1.0.0",
+        authentication: "authenticated",
+        transport: "acpStdio",
+        diagnosticCode: "capability-mismatch",
+        certification: "uncertified",
+        capabilities: { sessionResume: false },
+      },
+    ]);
+
+    await expect(bridge.probeRuntimes()).resolves.toEqual([
+      expect.objectContaining({
+        id: "cursor",
+        status: "degraded",
+        certification: "uncertified",
+        detail:
+          "This installed CLI is missing a capability required by Integrator's certified route.",
+      }),
+    ]);
+  });
+
+  it("does not promote an authenticated but uncertified route", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "provider_discover") {
+        return [
+          {
+            provider: "codex",
+            installed: true,
+            executable: "/Users/test/.local/bin/codex",
+            version: "codex-cli 1.0.0",
+            authentication: "authenticated",
+            transport: "jsonlStdio",
+            diagnosticCode: "capability-probe-failed",
+            certification: "uncertified",
+            capabilities: { structuredToolEvents: false },
+          },
+        ];
+      }
+      return undefined;
+    });
+
+    await expect(bridge.probeRuntimes()).resolves.toEqual([
+      expect.objectContaining({
+        id: "codex",
+        status: "degraded",
+        certification: "uncertified",
+      }),
+    ]);
+  });
+
+  it("verifies Kimi's cached vendor login on initial discovery", async () => {
+    invokeMock.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "provider_discover") {
+        return [
+          {
+            provider: "kimi",
+            installed: true,
+            executable: "/Users/test/.local/bin/kimi",
+            version: "kimi 1.0.0",
+            authentication: "unknown",
+            transport: "acpStdio",
+            diagnosticCode: "auth-probe-requires-acp",
+            certification: "sessionProbeRequired",
+            capabilities: {},
+          },
+        ];
+      }
+      if (command === "acp_connect") return undefined;
+      if (command === "acp_session_capabilities") {
+        return { load: true, resume: true, mcpHttp: true, mcpSse: true };
+      }
+      throw new Error(`Unexpected command ${command} ${JSON.stringify(args)}`);
+    });
+
+    await expect(bridge.probeRuntimes()).resolves.toEqual([
+      expect.objectContaining({ id: "kimi", status: "connected" }),
+    ]);
+    expect(invokeMock.mock.calls).toEqual([
+      ["provider_discover", { force: false }],
+      ["acp_connect", { provider: "kimi" }],
+      ["acp_session_capabilities", { provider: "kimi" }],
+    ]);
+  });
+
+  it("verifies Kimi's cached vendor login over taskless ACP on explicit refresh", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "provider_discover") {
+        return [
+          {
+            provider: "kimi",
+            installed: true,
+            executable: "/Users/test/.local/bin/kimi",
+            version: "1.2.3",
+            authentication: "unknown",
+            transport: "acpStdio",
+            diagnosticCode: "auth-probe-requires-acp",
+            certification: "sessionProbeRequired",
+          },
+        ];
+      }
+      if (command === "acp_connect") return undefined;
+      if (command === "acp_session_capabilities") {
+        return { load: true, resume: true, mcpHttp: true, mcpSse: true };
+      }
+      return undefined;
+    });
+
+    await expect(bridge.probeRuntimes({ force: true })).resolves.toEqual([
+      expect.objectContaining({
+        id: "kimi",
+        status: "connected",
+        detail: "Installed CLI and ACP session recovery verified.",
+      }),
+    ]);
+    expect(invokeMock).toHaveBeenCalledWith("acp_connect", { provider: "kimi" });
+    expect(invokeMock).toHaveBeenCalledWith("acp_session_capabilities", {
+      provider: "kimi",
+    });
+  });
+
+  it("keeps Kimi degraded when the ACP handshake cannot load sessions", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "provider_discover") {
+        return [
+          {
+            provider: "kimi",
+            installed: true,
+            executable: "/Users/test/.local/bin/kimi",
+            version: "1.2.3",
+            authentication: "unknown",
+            transport: "acpStdio",
+            diagnosticCode: "auth-probe-requires-acp",
+            certification: "sessionProbeRequired",
+          },
+        ];
+      }
+      if (command === "acp_connect") return undefined;
+      if (command === "acp_session_capabilities") {
+        return { load: false, resume: true, mcpHttp: true, mcpSse: true };
+      }
+      return undefined;
+    });
+
+    await expect(bridge.probeRuntimes({ force: true })).resolves.toEqual([
+      expect.objectContaining({
+        id: "kimi",
+        status: "degraded",
+        certification: "uncertified",
+      }),
+    ]);
+  });
+
+  it("shows Kimi login required when explicit ACP verification rejects cached auth", async () => {
+    let loginAvailable = true;
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "provider_discover") {
+        return [
+          {
+            provider: "kimi",
+            installed: true,
+            executable: "/Users/test/.local/bin/kimi",
+            version: "1.2.3",
+            authentication: "unknown",
+            transport: "acpStdio",
+            diagnosticCode: "auth-probe-requires-acp",
+            certification: "sessionProbeRequired",
+          },
+        ];
+      }
+      if (command === "acp_connect") {
+        if (loginAvailable) return undefined;
+        throw {
+          code: "provider-login-required",
+          message: "Kimi Code has no cached login; run `kimi login` first",
+        };
+      }
+      if (command === "acp_session_capabilities") {
+        return { load: true, resume: true, mcpHttp: true, mcpSse: true };
+      }
+      return undefined;
+    });
+
+    await expect(bridge.probeRuntimes({ force: true })).resolves.toEqual([
+      expect.objectContaining({ id: "kimi", status: "connected" }),
+    ]);
+    loginAvailable = false;
+    await expect(bridge.probeRuntimes({ force: true })).resolves.toEqual([
+      expect.objectContaining({
+        id: "kimi",
+        status: "login_required",
+        detail: "Kimi Code could not reuse its vendor login. Sign in with the installed CLI.",
+      }),
+    ]);
+  });
+
   it("shares one in-flight model lookup and exposes the warmed catalog synchronously", async () => {
     bridge.invalidateModelCatalog("codex");
     let resolveModels: ((value: unknown) => void) | undefined;
@@ -509,6 +709,101 @@ describe("native trusted-project bridge", () => {
       { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
     ]);
     bridge.invalidateModelCatalog("codex");
+  });
+
+  it("retries an ordinary Codex catalog read after a transient process exit", async () => {
+    let nativeAlive = false;
+    let listAttempts = 0;
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "codex_connect") {
+        nativeAlive = true;
+        return undefined;
+      }
+      if (command === "codex_list_models") {
+        listAttempts += 1;
+        if (listAttempts === 1) {
+          nativeAlive = false;
+          throw new Error("Codex app-server exited");
+        }
+        if (!nativeAlive) throw new Error("Codex app-server exited");
+        return { data: [{ id: "gpt-5.6-sol", displayName: "GPT-5.6 Sol" }] };
+      }
+      return undefined;
+    });
+
+    await expect(bridge.listModelCatalog("codex")).resolves.toEqual([]);
+    await expect(bridge.listModelCatalog("codex")).resolves.toEqual([
+      { id: "gpt-5.6-sol", label: "GPT-5.6 Sol" },
+    ]);
+    expect(invokeMock.mock.calls.filter(([command]) => command === "codex_connect")).toHaveLength(
+      2,
+    );
+  });
+
+  it("uses read-only permission when Kimi discovers models for projectless Chat", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "local_export") {
+        return {
+          projects: [],
+          tasks: [
+            {
+              id: "chat-kimi-catalog",
+              kind: "chat",
+              title: "Kimi chat catalog",
+              state: "ready",
+              pinned: false,
+              archived: false,
+              runtime: "kimi",
+              model: "kimi-code/kimi-for-coding",
+              effort: "on",
+              createdAt: "2026-08-17T00:00:00Z",
+              updatedAt: "2026-08-17T00:00:00Z",
+            },
+          ],
+          settings: [],
+          providerSessions: [
+            {
+              taskId: "chat-kimi-catalog",
+              provider: "kimi",
+              providerThreadId: "kimi-chat-session",
+            },
+          ],
+          providerResumeStates: [],
+          runtimeSessions: [],
+        };
+      }
+      if (command === "acp_connect") return undefined;
+      if (command === "acp_session_capabilities") {
+        return { load: true, resume: true, mcpHttp: true, mcpSse: true };
+      }
+      if (command === "acp_start_session") {
+        return {
+          sessionId: "kimi-chat-session",
+          configOptions: [
+            {
+              id: "model",
+              category: "model",
+              currentValue: "kimi-code/kimi-for-coding",
+              options: [{ value: "kimi-code/kimi-for-coding", name: "Kimi for coding" }],
+            },
+          ],
+        };
+      }
+      return undefined;
+    });
+
+    await bridge.loadWorkspace();
+    await expect(bridge.listModelCatalog("kimi")).resolves.toEqual([
+      { id: "kimi-code/kimi-for-coding", label: "Kimi for coding" },
+    ]);
+    expect(invokeMock).toHaveBeenCalledWith(
+      "acp_start_session",
+      expect.objectContaining({
+        taskId: "chat-kimi-catalog",
+        cwd: "",
+        permission: "read-only",
+      }),
+    );
   });
 
   it("uses Claude Code's live catalog and exposes only model-supported efforts", async () => {
@@ -685,17 +980,18 @@ describe("native trusted-project bridge", () => {
     expect(catalog[1]?.efforts?.map((effort) => effort.id)).toEqual(["low", "medium", "high"]);
   });
 
-  it("groups Antigravity's live slug catalog into base models with effort pickers", async () => {
+  it("groups Antigravity display names and legacy slugs into effort pickers", async () => {
     invokeMock.mockImplementation(async (command: string) => {
       if (command === "antigravity_list_models") {
         return [
-          "gemini-3.6-flash-high",
-          "gemini-3.6-flash-medium",
+          "Gemini 3.5 Flash (High)",
+          "Gemini 3.5 Flash (Medium)",
+          "Gemini 3.5 Flash (Low)",
+          "Gemini 3.1 Pro (Low)",
+          "Gemini 3.1 Pro (High)",
+          "Claude Sonnet 4.6 (Thinking)",
+          "GPT-OSS 120B (Medium)",
           "gemini-3.6-flash-low",
-          "gemini-3.1-pro-low",
-          "gemini-3.1-pro-high",
-          "claude-opus-4-6-thinking",
-          "gpt-oss-120b-medium",
         ];
       }
       return undefined;
@@ -703,8 +999,8 @@ describe("native trusted-project bridge", () => {
 
     await expect(bridge.listModelCatalog("antigravity")).resolves.toEqual([
       {
-        id: "gemini-3.6-flash",
-        label: "Gemini 3.6 Flash",
+        id: "Gemini 3.5 Flash",
+        label: "Gemini 3.5 Flash",
         efforts: [
           { id: "low", label: "Low" },
           { id: "medium", label: "Medium" },
@@ -713,7 +1009,7 @@ describe("native trusted-project bridge", () => {
         defaultEffort: "medium",
       },
       {
-        id: "gemini-3.1-pro",
+        id: "Gemini 3.1 Pro",
         label: "Gemini 3.1 Pro",
         efforts: [
           { id: "low", label: "Low" },
@@ -721,12 +1017,18 @@ describe("native trusted-project bridge", () => {
         ],
         defaultEffort: "high",
       },
-      { id: "claude-opus-4-6-thinking", label: "Claude Opus 4.6 Thinking" },
+      { id: "Claude Sonnet 4.6 (Thinking)", label: "Claude Sonnet 4.6 (Thinking)" },
       {
-        id: "gpt-oss-120b",
+        id: "GPT-OSS 120B",
         label: "GPT-OSS 120B",
         efforts: [{ id: "medium", label: "Medium" }],
         defaultEffort: "medium",
+      },
+      {
+        id: "gemini-3.6-flash",
+        label: "Gemini 3.6 Flash",
+        efforts: [{ id: "low", label: "Low" }],
+        defaultEffort: "low",
       },
     ]);
     expect(invokeMock).toHaveBeenCalledWith("antigravity_list_models", undefined);
@@ -2057,7 +2359,7 @@ describe("native trusted-project bridge", () => {
             pinned: false,
             archived: false,
             runtime,
-            model: "Provider default",
+            model: runtime === "antigravity" ? "Gemini 3.1 Pro" : "Provider default",
             createdAt: "2026-07-19T00:00:00Z",
             updatedAt: "2026-07-19T00:00:00Z",
           })),
@@ -2093,7 +2395,7 @@ describe("native trusted-project bridge", () => {
           },
         ],
         runtime,
-        model: "Provider default",
+        model: runtime === "antigravity" ? "Gemini 3.1 Pro" : "Provider default",
         permission: "read-only",
         delegation: "off",
         contextReferences: [
@@ -2133,6 +2435,13 @@ describe("native trusted-project bridge", () => {
         }),
       );
     }
+    expect(invokeMock).toHaveBeenCalledWith(
+      "structured_cli_start_turn",
+      expect.objectContaining({
+        provider: "antigravity",
+        model: "Gemini 3.1 Pro",
+      }),
+    );
   });
 
   it("applies Kimi's negotiated model and Thinking controls before prompting", async () => {
@@ -2196,6 +2505,20 @@ describe("native trusted-project bridge", () => {
       if (command === "acp_session_capabilities") {
         return { load: true, resume: true, mcpHttp: true, mcpSse: true };
       }
+      if (command === "provider_discover") {
+        return [
+          {
+            provider: "kimi",
+            installed: true,
+            executable: "/Users/test/.local/bin/kimi",
+            version: "test",
+            authentication: "unknown",
+            transport: "acpStdio",
+            diagnosticCode: "auth-probe-requires-acp",
+            certification: "sessionProbeRequired",
+          },
+        ];
+      }
       if (command === "acp_start_session") return kimiConfig("kimi-code/k3");
       if (command === "acp_set_config_option") {
         return kimiConfig(
@@ -2231,6 +2554,13 @@ describe("native trusted-project bridge", () => {
       "acp_send_turn",
       expect.objectContaining({ taskId: "task-kimi-routing", prompt: "Use Kimi" }),
     );
+    await expect(bridge.probeRuntimes({ force: true })).resolves.toEqual([
+      expect.objectContaining({
+        id: "kimi",
+        status: "connected",
+        detail: "Installed CLI and ACP session recovery verified.",
+      }),
+    ]);
   });
 
   it("replaces a persisted Codex thread that the provider no longer recognizes", async () => {

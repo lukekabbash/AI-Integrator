@@ -44,6 +44,8 @@ fn focus_window(window: &tauri::Window) -> Result<(), CommandError> {
             unavailable(format!("could not restore the browser window: {error}"))
         })?;
     }
+    // An ordinary top-level window: its tabs are child webviews clipped to it,
+    // so it may sit behind the app like any other window. Never always-on-top.
     window
         .show()
         .map_err(|error| unavailable(format!("could not show the browser window: {error}")))?;
@@ -159,6 +161,15 @@ fn move_tab(
         let _ = webview.reparent(&source);
         return Err(unavailable(format!(
             "could not park the moved tab: {error}"
+        )));
+    }
+    if let Err(error) = webview.hide() {
+        let _ = webview.reparent(&source);
+        if !current.hidden {
+            let _ = webview.show();
+        }
+        return Err(unavailable(format!(
+            "could not hide the moved tab: {error}"
         )));
     }
     let tab = state

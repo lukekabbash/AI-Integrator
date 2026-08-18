@@ -21,15 +21,18 @@ fn antigravity_effort_suffix(effort: &Option<String>) -> Option<&'static str> {
     }
 }
 
-/// Composes the selected effort into an agy `--model` value. Live-discovered
-/// ids are bare slugs with the reasoning level baked in
-/// (`gemini-3.6-flash-low`), so a slug base gets `-{effort}` appended; legacy
-/// display-name ids ("Gemini 3.1 Pro", still valid to agy and present in
-/// persisted tasks and the static fallback catalog) keep the "(High)"-style
-/// suffix compose. A slug that already ends in an effort level passes through
-/// unchanged so a doubly-composed id can never reach agy.
+/// Composes the selected effort into an agy `--model` value. Current live
+/// catalogs use display names ("Gemini 3.5 Flash (High)"), while older builds
+/// emitted effort-suffixed slugs (`gemini-3.6-flash-low`). An exact display
+/// variant or slug that already carries a suffix passes through unchanged.
 fn antigravity_model_arg(model: &str, effort: &Option<String>) -> String {
     if model.contains(' ') {
+        // Persisted routes from older app builds may still contain the full
+        // catalog value. Parenthetical variants such as `(Thinking)` are also
+        // exact names, so neither should receive a second suffix.
+        if model.ends_with(')') && model.contains(" (") {
+            return model.to_owned();
+        }
         return match antigravity_effort_suffix(effort) {
             Some(suffix) => format!("{model} ({suffix})"),
             None => model.to_owned(),

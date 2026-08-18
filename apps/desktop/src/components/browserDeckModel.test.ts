@@ -1,33 +1,42 @@
 import { describe, expect, it } from "vitest";
 
 import type { BrowserTab } from "../bridge";
-import { adjacentDeckTabId, resolveDeckRaisedId } from "./browserDeckModel";
+import { promoteDeckTab, resolveDeckOrder, splitDeck } from "./browserDeckModel";
 
-function tab(id: string, url = `https://example.com/${id}`): BrowserTab {
-  return { id, url } as BrowserTab;
+function tab(id: string): BrowserTab {
+  return {
+    id,
+    taskId: "task-1",
+    url: `https://example.com/${id}`,
+    title: id,
+    loading: false,
+    poppedOut: false,
+    hidden: true,
+    sleeping: false,
+  } as BrowserTab;
 }
 
-describe("browser deck selection", () => {
-  it("raises the exact tab newly removed from the pane", () => {
-    expect(
-      resolveDeckRaisedId([tab("already"), tab("closed")], new Set(["already"]), "already", null),
-    ).toBe("closed");
+describe("browserDeckModel", () => {
+  it("appends new tabs, drops departed ones, and keeps the rest in place", () => {
+    const first = resolveDeckOrder([tab("a"), tab("b")], [], null);
+    expect(first).toEqual(["a", "b"]);
+    const promoted = promoteDeckTab(first, "a");
+    expect(promoted).toEqual(["b", "a"]);
+    // A title update rerenders with the same tabs: nothing moves.
+    expect(resolveDeckOrder([tab("a"), tab("b")], promoted, null)).toEqual(["b", "a"]);
+    // A new arrival lands last; a departure just disappears.
+    expect(resolveDeckOrder([tab("a"), tab("c")], promoted, null)).toEqual(["a", "c"]);
   });
 
-  it("raises the active browser when closing the whole pane adds several cards", () => {
-    expect(resolveDeckRaisedId([tab("one"), tab("two")], new Set(), null, "one")).toBe("one");
+  it("puts the pane's active browser nearest the corner when several arrive", () => {
+    const order = resolveDeckOrder([tab("a"), tab("b"), tab("c")], [], "b");
+    expect(order).toEqual(["a", "c", "b"]);
   });
 
-  it("keeps an explicit card choice and avoids a blank fallback", () => {
-    const tabs = [tab("page"), tab("blank", "about:blank")];
-    expect(resolveDeckRaisedId(tabs, new Set(["page", "blank"]), "page", null)).toBe("page");
-    expect(resolveDeckRaisedId(tabs, new Set(["page", "blank"]), null, null)).toBe("page");
-    expect(resolveDeckRaisedId(tabs, new Set(), null, null)).toBe("page");
-  });
-
-  it("cycles in both directions and wraps", () => {
-    const tabs = [tab("one"), tab("two"), tab("three")];
-    expect(adjacentDeckTabId(tabs, "one", -1)).toBe("three");
-    expect(adjacentDeckTabId(tabs, "three", 1)).toBe("one");
+  it("splits the order into live cards and strips", () => {
+    const tabs = ["a", "b", "c", "d", "e", "f"].map(tab);
+    const { live, strips } = splitDeck(tabs, ["a", "b", "c", "d", "e", "f"]);
+    expect(live.map((item) => item.id)).toEqual(["c", "d", "e", "f"]);
+    expect(strips.map((item) => item.id)).toEqual(["a", "b"]);
   });
 });

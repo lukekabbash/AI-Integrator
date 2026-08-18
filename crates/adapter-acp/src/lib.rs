@@ -9,6 +9,7 @@
 
 use std::{
     collections::HashMap,
+    ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -128,7 +129,7 @@ pub struct AcpLaunchOptions {
     pub arguments: Vec<String>,
     /// Narrow process-local overrides supplied by the native host. Values are
     /// never persisted or included in diagnostics.
-    pub environment: Vec<(String, String)>,
+    pub environment: Vec<(OsString, OsString)>,
     pub working_directory: Option<PathBuf>,
     pub client_version: String,
     /// Grok Build 1.0.3 rejects ACP's `initialized` notification (`Method not

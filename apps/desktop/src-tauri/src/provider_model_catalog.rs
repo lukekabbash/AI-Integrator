@@ -50,15 +50,86 @@ pub(crate) fn parse_grok_models(output: &str) -> Vec<String> {
     models
 }
 
-/// `agy models` prints one bare slug per line (`gemini-3.6-flash-high`),
-/// with the reasoning level baked into the id.
+fn normalized_antigravity_model(line: &str) -> Option<String> {
+    let model = line.trim();
+    if model.is_empty()
+        || model.len() > 256
+        || model.starts_with('/')
+        || model.contains("..")
+        || model.ends_with(':')
+        || !model.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || byte.is_ascii_whitespace()
+                || b"-._/:()+[]".contains(&byte)
+        })
+    {
+        return None;
+    }
+    let normalized = model.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = normalized.to_ascii_lowercase();
+    let single_token = !normalized.contains(' ')
+        && (normalized.bytes().any(|byte| byte.is_ascii_digit())
+            || normalized.contains('-')
+            || matches!(lower.as_str(), "auto" | "flash" | "pro"));
+    let branded_display_name = ["gemini ", "claude ", "gpt-", "gpt "]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+        && normalized.bytes().any(|byte| byte.is_ascii_digit());
+    (single_token || branded_display_name).then_some(normalized)
+}
+
+fn push_antigravity_model(models: &mut Vec<String>, value: &str) {
+    let Some(model) = normalized_antigravity_model(value) else {
+        return;
+    };
+    if !models.contains(&model) {
+        models.push(model);
+    }
+}
+
+fn collect_antigravity_json_models(value: &Value, models: &mut Vec<String>) {
+    match value {
+        Value::String(model) => push_antigravity_model(models, model),
+        Value::Array(entries) => {
+            for entry in entries {
+                match entry {
+                    Value::String(model) => push_antigravity_model(models, model),
+                    Value::Object(object) => {
+                        for key in ["id", "slug", "model", "name", "displayName", "display_name"] {
+                            if let Some(Value::String(model)) = object.get(key) {
+                                push_antigravity_model(models, model);
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Value::Object(object) => {
+            for key in ["models", "data", "items"] {
+                if let Some(nested) = object.get(key) {
+                    collect_antigravity_json_models(nested, models);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Current `agy --output-format json models` builds return a machine-readable
+/// inventory. The line parser remains as a bounded compatibility fallback for
+/// older builds, accepting only model-shaped slugs or branded display names.
 pub(crate) fn parse_antigravity_models(output: &str) -> Vec<String> {
     let mut models = Vec::new();
+    if let Ok(value) = serde_json::from_str::<Value>(output.trim()) {
+        collect_antigravity_json_models(&value, &mut models);
+        if !models.is_empty() {
+            return models;
+        }
+    }
     for line in output.lines() {
-        let Some(model) = line.split_whitespace().next() else {
-            continue;
-        };
-        push_model_id(&mut models, model);
+        push_antigravity_model(&mut models, line);
     }
     models
 }
