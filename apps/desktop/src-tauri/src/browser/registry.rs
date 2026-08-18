@@ -7,7 +7,7 @@
 //! renderer and for an agent.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
@@ -101,6 +101,10 @@ pub(crate) struct Tab {
     /// Last time anything reached for this tab — an agent, the person, or the
     /// renderer placing it. What the live-tab cap sleeps first.
     pub(crate) touched: std::time::Instant,
+    /// The same moment on the wall clock, which is what the store keeps as
+    /// `last_touched_at`: an `Instant` means nothing after a restart, and
+    /// stale-tab cleanup is measured in days.
+    pub(crate) touched_at: chrono::DateTime<chrono::Utc>,
     /// When the app typed a saved password into this page. While it is set,
     /// reading the page back is refused; see `vault`.
     pub(crate) credential_at: Option<std::time::Instant>,
@@ -236,6 +240,13 @@ pub struct BrowserTabs {
     /// goes when it is popped out without a named window, and the order the
     /// drag hit-test tries windows in (Tauri has no z-order to ask for).
     popout_focus: Mutex<Vec<String>>,
+    /// Tasks whose tabs were touched since the last time their touch times
+    /// were written. A touch is a click; the store hears about it from the
+    /// flush in `persist`, not from here.
+    pub(crate) dirty_touch: Mutex<HashSet<String>>,
+    /// The `touched_at` last written for each tab, so the flush can skip a
+    /// tab whose stored time is still close enough.
+    pub(crate) last_written_touch: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
 }
 
 impl Default for BrowserTabs {
@@ -250,6 +261,8 @@ impl Default for BrowserTabs {
             identity_change: Mutex::default(),
             groups: Mutex::default(),
             popout_focus: Mutex::default(),
+            dirty_touch: Mutex::default(),
+            last_written_touch: Mutex::default(),
         }
     }
 }
@@ -516,7 +529,29 @@ impl BrowserTabs {
             let now = std::time::Instant::now();
             tab.held = Some((holder.to_string(), now));
             tab.touched = now;
+            tab.touched_at = chrono::Utc::now();
+            let task = tab.state.task_id.clone();
+            drop(tabs);
+            self.note_touched(&task);
         }
+    }
+
+    /// Queues a task for the next touch flush. Called under no lock: the
+    /// touch itself is recorded on the tab, this only says whose changed.
+    pub(crate) fn note_touched(&self, task_id: &str) {
+        self.dirty_touch
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(task_id.to_string());
+    }
+
+    /// The tasks touched since the last flush, and clears the list.
+    pub(crate) fn take_dirty_touch(&self) -> Vec<String> {
+        let mut dirty = self
+            .dirty_touch
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        dirty.drain().collect()
     }
 
     /// `mark_held` for a broker caller, remembering which task it drove from.
@@ -612,7 +647,34 @@ impl BrowserTabs {
         let mut tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(tab) = tabs.get_mut(id) {
             tab.touched = std::time::Instant::now();
+            tab.touched_at = chrono::Utc::now();
+            let task = tab.state.task_id.clone();
+            drop(tabs);
+            self.note_touched(&task);
         }
+    }
+
+    /// Whether the tab is asleep, or parked with no one driving it: what
+    /// cleanup may retire. A tab on screen, or one an agent drove inside the
+    /// hold window, is never a candidate. Unknown tabs are not either.
+    pub(crate) fn retirable(&self, id: &str) -> bool {
+        let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        tabs.get(id).is_some_and(|tab| {
+            tab.state.sleeping
+                || (tab.state.hidden
+                    && tab
+                        .held
+                        .as_ref()
+                        .is_none_or(|(_, at)| at.elapsed() > HOLD_TTL))
+        })
+    }
+
+    /// The tab of this task at this address, if one is open.
+    pub(crate) fn find_by_url(&self, task_id: &str, url: &str) -> Option<String> {
+        let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        tabs.values()
+            .find(|tab| tab.state.task_id == task_id && tab.state.url == url)
+            .map(|tab| tab.state.id.clone())
     }
 
     /// This group's loaded tabs that nothing is looking at, oldest touch first —

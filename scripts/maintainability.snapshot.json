@@ -19,7 +19,7 @@
     },
     {
       "path": "apps/desktop/src/bridge.ts",
-      "maxLines": 7732
+      "maxLines": 7760
     },
     {
       "path": "apps/desktop/src/components/SettingsView.tsx",
@@ -27,7 +27,7 @@
     },
     {
       "path": "apps/desktop/src-tauri/src/delegation.rs",
-      "maxLines": 4964
+      "maxLines": 4970
     },
     {
       "path": "apps/desktop/src/bridge.test.ts",
@@ -47,7 +47,7 @@
     },
     {
       "path": "crates/session-store/src/tests.rs",
-      "maxLines": 2590
+      "maxLines": 3050
     },
     {
       "path": "apps/desktop/src/runtimeProjection.test.ts",
@@ -123,7 +123,7 @@
     },
     {
       "path": "apps/desktop/src-tauri/src/browser/mod.rs",
-      "maxLines": 1166
+      "maxLines": 1206
     },
     {
       "path": "apps/desktop/src-tauri/src/browser/vault.rs",
@@ -168,6 +168,7 @@
     "apps/desktop/src/components/BrowserStart.tsx",
     "apps/desktop/src/components/BrowserSurface.tsx",
     "apps/desktop/src/components/BrowserWindowShell.tsx",
+    "apps/desktop/src/components/BrowserWindowStrip.tsx",
     "apps/desktop/src/components/Composer.tsx",
     "apps/desktop/src/components/DeleteArchivedChatsModal.tsx",
     "apps/desktop/src/components/DeleteChatModal.tsx",

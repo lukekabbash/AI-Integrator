@@ -182,6 +182,7 @@ pub(super) fn fixture_tab(id: &str, task: &str, owner: Option<&str>) -> Tab {
         grants: HashMap::new(),
         generation: 0,
         touched: std::time::Instant::now(),
+        touched_at: chrono::Utc::now(),
         credential_at: None,
         poster: None,
     }
@@ -1341,4 +1342,157 @@ fn a_browser_list_row_names_its_group_holder_and_sharer() {
     assert!(row.get("heldBy").is_none() && row.get("heldByLabel").is_none());
     assert!(row.get("sharedFrom").is_none());
     assert_eq!(row["group"]["kind"], "chat");
+}
+
+// ---- stage D: persistence and cleanup
+
+fn recent(task: &str, url: &str) -> session_store::StoredRecentTab {
+    session_store::StoredRecentTab {
+        task_id: task.parse().unwrap(),
+        group_id: groups::CHAT_GROUP_ID.into(),
+        url: url.into(),
+        title: url.into(),
+        favicon: None,
+        closed_at: chrono::Utc::now(),
+        reason: "stale".into(),
+    }
+}
+
+#[test]
+fn cleanup_never_closes_a_tab_on_screen_or_held() {
+    let task_a = integrator_core::TaskId::new().to_string();
+    let task_b = integrator_core::TaskId::new().to_string();
+    let tabs = registry(&[
+        ("tab-1", &task_a, None),
+        ("tab-2", &task_a, None),
+        ("tab-3", &task_a, None),
+        ("tab-4", &task_b, None),
+    ]);
+    for (id, url) in [
+        ("tab-1", "one"),
+        ("tab-2", "two"),
+        ("tab-3", "three"),
+        ("tab-4", "four"),
+    ] {
+        tabs.update(id, |tab| tab.url = format!("https://{url}.example/"));
+    }
+    // tab-1 on screen; tab-2 parked and idle; tab-3 asleep; tab-4 parked but
+    // driven by an agent inside the hold window.
+    tabs.update("tab-2", |tab| tab.hidden = true);
+    tabs.update("tab-3", |tab| {
+        tab.hidden = true;
+        tab.sleeping = true;
+    });
+    tabs.update("tab-4", |tab| tab.hidden = true);
+    tabs.mark_held("tab-4", "the main agent");
+    assert!(!tabs.retirable("tab-1"));
+    assert!(tabs.retirable("tab-2"));
+    assert!(tabs.retirable("tab-3"));
+    assert!(!tabs.retirable("tab-4"));
+    assert!(!tabs.retirable("tab-none"));
+
+    let retired = [
+        recent(&task_a, "https://one.example/"),
+        recent(&task_a, "https://two.example/"),
+        recent(&task_a, "https://three.example/"),
+        recent(&task_b, "https://four.example/"),
+        recent(&task_b, "https://gone.example/"),
+    ];
+    let plan = cleanup::plan(&tabs, &retired);
+    assert_eq!(plan.close, vec!["tab-2".to_string(), "tab-3".to_string()]);
+    // The on-screen and held tabs stay, and their rows are written back.
+    assert_eq!(plan.rewrite, vec![task_a.clone(), task_b.clone()]);
+}
+
+#[test]
+fn stored_rows_carry_window_order_and_touch() {
+    let tabs = registry(&[("tab-1", "task-a", None), ("tab-2", "task-a", None)]);
+    tabs.set_window("tab-2", Some("browser-window-x"), Some(3));
+    let (rows, touched) = tabs.stored_rows("task-a");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].window_id, None);
+    assert_eq!(rows[0].window_order, None);
+    assert!(rows[0].last_touched_at.is_some());
+    assert_eq!(rows[1].window_id.as_deref(), Some("browser-window-x"));
+    assert_eq!(rows[1].window_order, Some(3));
+    assert_eq!(touched.len(), 2);
+    assert_eq!(touched[1].0, "tab-2");
+    // A touch moves the wall-clock time and queues the task for the flush.
+    let before = touched[1].1;
+    std::thread::sleep(Duration::from_millis(5));
+    tabs.touch("tab-2");
+    let (rows, _) = tabs.stored_rows("task-a");
+    assert!(rows[1].last_touched_at.unwrap() > before);
+    assert_eq!(tabs.take_dirty_touch(), vec!["task-a".to_string()]);
+    assert!(tabs.take_dirty_touch().is_empty());
+}
+
+#[test]
+fn every_change_to_a_strip_is_written() {
+    // Moves, reorders and title changes each write the affected tasks; the
+    // touch flush writes only what drifted; a closed popped-out tab is
+    // recorded for "Recently closed".
+    let popout = include_str!("popout.rs");
+    let moved = source_between(popout, "pub(super) fn move_tab(", "fn place_at(");
+    assert!(moved.contains("super::remember::remember(app, state, &tab.task_id)"));
+    assert!(moved.contains("super::remember::remember_window(app, state, label)"));
+    let reorder = source_between(
+        popout,
+        "pub fn browser_window_reorder(",
+        "pub fn browser_popout_tabs(",
+    );
+    assert!(reorder.contains("remember_window(webview.app_handle(), &state, label)"));
+    let events = source_between(popout, "window.on_window_event(move |event|", "Ok(window)");
+    assert!(events.contains("note_window_geometry(&event_app, &event_label, true)"));
+    assert!(events.contains("tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)"));
+    assert!(events.contains("persist::forget_window(&event_app, &event_label)"));
+
+    let module = include_str!("mod.rs");
+    let title = source_between(module, ".on_document_title_changed(", ".on_new_window(");
+    assert!(title.contains("remember::remember(&title_app, &title_tabs, &task)"));
+    let close = source_between(module, "pub(super) fn close_tab_with(", "/// Keeps a still");
+    assert!(close.contains("remember::note_closed(app, &closing)"));
+
+    let remember = include_str!("remember.rs");
+    let pane = source_between(
+        remember,
+        "pub fn restore(",
+        "pub(crate) const LIVE_TAB_CAP_PER_GROUP",
+    );
+    assert!(pane.contains("stored.window_id.is_some()"));
+    let noted = source_between(remember, "pub(super) fn note_closed(", "pub fn restore(");
+    assert!(noted.contains("!closing.popped_out || closing.url.starts_with(\"about:\")"));
+    assert!(noted.contains("reason: \"closed\""));
+
+    // Restore is armed on the main window's first focus, never at boot.
+    let persist = include_str!("persist.rs");
+    let armed = source_between(persist, "pub fn start_background_tasks(", "#[cfg(test)]");
+    assert!(armed.contains("tauri::WindowEvent::Focused(true)) && once.claim()"));
+    assert!(armed.contains("restore::restore_windows(&app)"));
+}
+
+#[test]
+fn recent_rows_take_the_agent_shape() {
+    let task = integrator_core::TaskId::new();
+    let mut row = recent(&task.to_string(), "https://docs.example/page");
+    row.title = "Docs".into();
+    row.reason = "over-cap".into();
+    let rows = agent::recent_rows(&[row.clone()], &Group::chat());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["url"], "https://docs.example/page");
+    assert_eq!(rows[0]["title"], "Docs");
+    assert_eq!(rows[0]["reason"], "over-cap");
+    assert_eq!(rows[0]["closedAt"], row.closed_at.to_rfc3339());
+    assert_eq!(
+        rows[0]["group"],
+        serde_json::json!({ "id": groups::CHAT_GROUP_ID, "name": groups::CHAT_GROUP_NAME, "kind": "chat" })
+    );
+    assert!(rows[0].get("taskId").is_none() && rows[0].get("favicon").is_none());
+    // The tool declaration and dispatch both know the flag.
+    let broker = include_str!("../broker_mcp.rs");
+    assert!(broker.contains("\"includeRecent\": { \"type\": \"boolean\""));
+    let delegation = include_str!("../delegation.rs");
+    assert!(
+        delegation.contains("params.get(\"includeRecent\").and_then(Value::as_bool) == Some(true)")
+    );
 }

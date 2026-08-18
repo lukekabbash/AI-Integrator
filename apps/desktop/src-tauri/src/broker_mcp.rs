@@ -217,9 +217,11 @@ fn browser_tools(role: &str) -> Vec<Value> {
         }),
         json!({
             "name": "browser_list",
-            "description": "List the browser tabs you can reach, with their id, url, title, loading state, group, whether they are popped out or sleeping, and who is currently working in each. Your pane tabs are private. Popped-out tabs are shared with every task in your project (or with every standalone chat); other tasks' shared tabs appear with sharedFrom. Check heldBy before driving. Use it to keep track when you are working across several pages at once.",
+            "description": "List the browser tabs you can reach, with their id, url, title, loading state, group, whether they are popped out or sleeping, and who is currently working in each. Your pane tabs are private. Popped-out tabs are shared with every task in your project (or with every standalone chat); other tasks' shared tabs appear with sharedFrom. Check heldBy before driving. Use it to keep track when you are working across several pages at once. Pass includeRecent to also get recent: the popped-out tabs your group closed or that cleanup retired (url, title, group, closedAt, reason), newest first — browser_open with one of those urls reopens it.",
             "annotations": tool_annotations(true, false),
-            "inputSchema": text_schema(json!({}), &[]),
+            "inputSchema": text_schema(json!({
+                "includeRecent": { "type": "boolean", "default": false, "description": "Also list your group's recently closed popped-out tabs under recent." }
+            }), &[]),
         }),
         json!({
             "name": "browser_close",

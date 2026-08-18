@@ -31,14 +31,17 @@ use crate::command_api::{CommandError, CommandResult};
 
 mod agent;
 mod capture;
+mod cleanup;
 mod favicon;
 pub mod groups;
 mod identity;
 mod identity_migration;
 mod menu;
+mod persist;
 mod popout;
 mod registry;
 mod remember;
+mod restore;
 mod servers;
 pub(crate) mod sites;
 mod vault;
@@ -49,6 +52,10 @@ pub use identity::BrowserIdentityScope;
 pub(crate) use identity::{configured_scope, prepare_profile_layout, prune_ephemeral_profiles};
 pub(crate) use identity_migration::migrate_task_buckets_to_groups;
 pub use menu::browser_tab_menu;
+pub use persist::{
+    browser_recent_tabs, browser_recent_tabs_clear, browser_window_set_collapsed,
+    browser_window_state, start_background_tasks,
+};
 pub use popout::{
     browser_popout_tabs, browser_tab_move, browser_tab_set_popped_out, browser_window_reorder,
 };
@@ -370,6 +377,20 @@ pub(super) fn setting_is<R: Runtime>(app: &AppHandle<R>, key: &str, default: boo
         .unwrap_or(default)
 }
 
+/// One whole-number setting, with the default for when it is unset or not a
+/// number. Negative values read as the default.
+pub(super) fn setting_u64<R: Runtime>(app: &AppHandle<R>, key: &str, default: u64) -> u64 {
+    app.try_state::<crate::state::AppState>()
+        .and_then(|state| state.store.get_setting(key).ok().flatten())
+        .and_then(|setting| {
+            setting
+                .value
+                .as_u64()
+                .or_else(|| setting.value.as_str()?.trim().parse().ok())
+        })
+        .unwrap_or(default)
+}
+
 pub(super) fn setting_enabled<R: Runtime>(app: &AppHandle<R>, key: &str) -> bool {
     app.try_state::<crate::state::AppState>()
         .and_then(|state| state.store.get_setting(key).ok().flatten())
@@ -487,6 +508,9 @@ pub(super) fn tab_webview_builder(
                 .is_some()
             {
                 emit_changed(&title_app, &title_tabs);
+                if let Some(task) = title_tabs.task_of(&title_id) {
+                    remember::remember(&title_app, &title_tabs, &task);
+                }
                 // A single-page app changes title and icon together without a
                 // load event in sight, so a new title is a cue to look again.
                 favicon::refresh_gently(&title_app, &title_tabs, &title_id, webview.label());
@@ -583,6 +607,7 @@ pub(super) async fn create_tab(
                 grants: HashMap::new(),
                 generation: 0,
                 touched: std::time::Instant::now(),
+                touched_at: chrono::Utc::now(),
                 credential_at: None,
                 poster: None,
             },
@@ -716,6 +741,18 @@ pub(super) fn close_tab(
     state: &Arc<BrowserTabs>,
     tab_id: &str,
 ) -> Result<(), CommandError> {
+    close_tab_with(app, state, tab_id, true)
+}
+
+/// `close_tab`, choosing whether a popped-out tab goes on the "Recently
+/// closed" list. Cleanup passes false: the store has already recorded why
+/// the row went, and one entry per tab is enough.
+pub(super) fn close_tab_with(
+    app: &AppHandle,
+    state: &Arc<BrowserTabs>,
+    tab_id: &str,
+    note_recent: bool,
+) -> Result<(), CommandError> {
     let closing = state
         .snapshot(None)
         .into_iter()
@@ -737,6 +774,9 @@ pub(super) fn close_tab(
     }
     emit_changed(app, state);
     remember::remember(app, state, &closing.task_id);
+    if note_recent {
+        remember::note_closed(app, &closing);
+    }
     if let Some(window) = window {
         popout::hide_window_if_empty(app, state, &window);
     }
@@ -1153,8 +1193,8 @@ pub async fn browser_tab_poster(
 
 pub use agent::{
     agent_invoke, browser_capture_image, close_for_agent, cookies_for_agent, focus_for_agent,
-    grant_for_agent, navigate_for_agent, open_for_agent, row_for_agent, screenshot_for_agent,
-    set_popped_out_for_agent, tabs_for_caller,
+    grant_for_agent, navigate_for_agent, open_for_agent, recent_for_caller, row_for_agent,
+    screenshot_for_agent, set_popped_out_for_agent, tabs_for_caller,
 };
 pub use vault::{
     browser_allow_agent_sign_in, browser_fill_login, browser_forget_all_logins,

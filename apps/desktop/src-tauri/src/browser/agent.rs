@@ -672,6 +672,47 @@ pub fn tabs_for_caller<R: Runtime>(
         .collect()
 }
 
+/// How many recently closed tabs `browser_list` hands back when asked.
+const RECENT_LIMIT: usize = 20;
+
+/// The caller's group's recently closed popped-out tabs, newest first, as
+/// `browser_list` returns them under `recent`.
+pub fn recent_for_caller<R: Runtime>(
+    app: &AppHandle<R>,
+    tabs: &BrowserTabs,
+    caller: &Caller,
+) -> Vec<Value> {
+    let Some(state) = app.try_state::<crate::state::AppState>() else {
+        return Vec::new();
+    };
+    let group = super::groups::group_for_task(app, tabs, &caller.task_id);
+    let recents = state
+        .store
+        .recent_tabs(&caller.group_id, RECENT_LIMIT)
+        .unwrap_or_default();
+    recent_rows(&recents, &group)
+}
+
+/// The `recent` row shape: address, title, the group as one object, when it
+/// closed and why (`stale`, `over-cap` or `closed`).
+pub(super) fn recent_rows(
+    recents: &[session_store::StoredRecentTab],
+    group: &super::groups::Group,
+) -> Vec<Value> {
+    recents
+        .iter()
+        .map(|recent| {
+            json!({
+                "url": recent.url,
+                "title": recent.title,
+                "group": { "id": group.id, "name": group.name, "kind": group.kind },
+                "closedAt": recent.closed_at.to_rfc3339(),
+                "reason": recent.reason,
+            })
+        })
+        .collect()
+}
+
 /// One tab as an agent sees it. The renderer's `BrowserTab` is the base; on
 /// top of it the group is one object, `heldBy` names the holder's task, and a
 /// tab another task shared says so with `sharedFrom`. `heldByLabel` keeps the

@@ -175,6 +175,21 @@ describe("BrowserSettings", () => {
     expect(toggle).toHaveAttribute("aria-checked", "true");
   });
 
+  it("bounds the pop-out cleanup thresholds and writes them as whole numbers", () => {
+    const setSetting = vi.fn();
+    render(<BrowserSettings settings={{}} setSetting={setSetting} />);
+    const days = screen.getByLabelText("Move untouched tabs after (days)");
+    expect(days).toHaveValue(7);
+    fireEvent.change(days, { target: { value: "0" } });
+    expect(setSetting).toHaveBeenCalledWith("browser.popoutStaleDays", 1);
+    fireEvent.change(days, { target: { value: "14.6" } });
+    expect(setSetting).toHaveBeenCalledWith("browser.popoutStaleDays", 15);
+    const cap = screen.getByLabelText("Keep at most this many popped-out tabs");
+    expect(cap).toHaveValue(100);
+    fireEvent.change(cap, { target: { value: "5000" } });
+    expect(setSetting).toHaveBeenCalledWith("browser.popoutMaxTabs", 1000);
+  });
+
   it("lists project groups by name, then Chat, and loads cookies lazily", async () => {
     render(<BrowserSettings settings={{}} setSetting={vi.fn()} />);
 

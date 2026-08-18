@@ -1510,6 +1510,21 @@ export interface BrowserDragHit {
   strip: boolean;
 }
 
+/** What a browser window remembers about its own strip across restarts. */
+/** A tab cleanup retired or the person closed; reopening is an open at its address. */
+export interface BrowserRecentTab {
+  taskId: string;
+  url: string;
+  title: string;
+  favicon?: string;
+  closedAt: string;
+  reason: string;
+}
+
+export interface BrowserWindowState {
+  collapsedGroups: string[];
+}
+
 export interface BrowserBridge {
   localServers(refresh?: boolean): Promise<LocalServer[]>;
   identityOverview(): Promise<BrowserIdentityOverview>;
@@ -1552,6 +1567,13 @@ export interface BrowserBridge {
   moveTab(taskId: string, tabId: string, target: BrowserMoveTarget): Promise<BrowserTab>;
   /** Rewrites the calling browser window's strip order. */
   reorderWindow(tabIds: string[]): Promise<void>;
+  /** Remembers which groups the calling browser window's strip has folded. */
+  setWindowCollapsed(groupIds: string[]): Promise<void>;
+  /** The calling browser window's remembered strip state. */
+  windowState(): Promise<BrowserWindowState>;
+  /** The newest recently closed tabs of one group, for a browser window's strip. */
+  recentTabs(groupId: string, limit?: number): Promise<BrowserRecentTab[]>;
+  clearRecentTabs(groupId: string): Promise<void>;
   /**
    * Which window is under a dragged tab. `x`, `y` are physical screen pixels
    * (`screenX * devicePixelRatio`). Also tells the window under the pointer
@@ -4863,6 +4885,12 @@ function nativeBrowserBridge(): BrowserBridge | undefined {
     moveTab: (taskId, tabId, target) =>
       nativeInvoke<BrowserTab>("browser_tab_move", { taskId, tabId, target }),
     reorderWindow: (tabIds) => nativeInvoke<void>("browser_window_reorder", { tabIds }),
+    setWindowCollapsed: (groupIds) =>
+      nativeInvoke<void>("browser_window_set_collapsed", { groupIds }),
+    windowState: () => nativeInvoke<BrowserWindowState>("browser_window_state"),
+    recentTabs: (groupId, limit) =>
+      nativeInvoke<BrowserRecentTab[]>("browser_recent_tabs", { groupId, limit }),
+    clearRecentTabs: (groupId) => nativeInvoke<void>("browser_recent_tabs_clear", { groupId }),
     dragHitTest: (x, y) => nativeInvoke<BrowserDragHit>("browser_drag_hit_test", { x, y }),
     dragEnd: () => nativeInvoke<void>("browser_drag_end"),
     onDragOver: async (listener) => {

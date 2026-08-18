@@ -1605,7 +1605,13 @@ async fn browser_tool(
             let tab = crate::browser::open_for_agent(app, &tabs, &caller, url, popped_out).await?;
             Ok(json!({ "tab": row(&tab) }))
         }
-        "browser_list" => Ok(json!({ "tabs": tabs_for_caller(app, &tabs, &caller) })),
+        "browser_list" => {
+            let mut reply = json!({ "tabs": tabs_for_caller(app, &tabs, &caller) });
+            if params.get("includeRecent").and_then(Value::as_bool) == Some(true) {
+                reply["recent"] = json!(crate::browser::recent_for_caller(app, &tabs, &caller));
+            }
+            Ok(reply)
+        }
         "browser_close" => {
             let id = tab_id()?;
             crate::browser::close_for_agent(app, &tabs, &caller, &id).await?;

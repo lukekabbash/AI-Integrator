@@ -19,6 +19,13 @@ const mocks = vi.hoisted(() => ({
   close: vi.fn(),
   setPoppedOut: vi.fn(),
   invoke: vi.fn(async () => undefined),
+  windowState: vi.fn(async () => ({ collapsedGroups: [] as string[] })),
+  setWindowCollapsed: vi.fn(async () => undefined),
+  recentTabs: vi.fn(
+    async () =>
+      [] as { taskId: string; url: string; title: string; closedAt: string; reason: string }[],
+  ),
+  moveTab: vi.fn(async () => undefined),
   onFocusRequest: vi.fn(),
   focusListener: null as null | ((request: { taskId: string; tabId: string }) => void),
   setFocus: vi.fn(async () => undefined),
@@ -97,6 +104,10 @@ vi.mock("../bridge", () => ({
       close: mocks.close,
       setPoppedOut: mocks.setPoppedOut,
       invoke: mocks.invoke,
+      windowState: mocks.windowState,
+      setWindowCollapsed: mocks.setWindowCollapsed,
+      recentTabs: mocks.recentTabs,
+      moveTab: mocks.moveTab,
       onFocusRequest: mocks.onFocusRequest,
     },
   },
@@ -358,6 +369,66 @@ describe("BrowserWindowShell chrome", () => {
     expect(screen.getByRole("button", { name: "Test project, 2 tabs, expanded" })).toHaveAttribute(
       "data-live",
       "true",
+    );
+  });
+});
+
+describe("BrowserWindowShell as a window", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.listener = null;
+    window.history.replaceState({}, "", "/?surface=browser&window=browser-window-abc");
+    mocks.listSettings.mockResolvedValue([]);
+    mocks.loadWorkspace.mockResolvedValue({ tasks: [{ id: "task-a", title: "Alpha task" }] });
+    mocks.poppedOutTabs.mockResolvedValue(TABS);
+    mocks.subscribe.mockImplementation(async (listener: () => void) => {
+      mocks.listener = listener;
+      return () => undefined;
+    });
+    mocks.open.mockResolvedValue({ ...TABS[0], id: "tab-new", title: "", url: "about:blank" });
+    mocks.setPoppedOut.mockResolvedValue(undefined);
+    mocks.close.mockResolvedValue(true);
+    mocks.onFocusRequest.mockResolvedValue(() => undefined);
+    mocks.windowState.mockResolvedValue({ collapsedGroups: ["project:test"] });
+    mocks.recentTabs.mockResolvedValue([
+      {
+        taskId: "task-a",
+        url: "https://example.com/gone",
+        title: "Gone",
+        closedAt: "2026-08-18T00:00:00Z",
+        reason: "stale",
+      },
+    ]);
+    window.sessionStorage.clear();
+    document.documentElement.dataset.motion = "none";
+    mocks.useBrowserTabs.mockImplementation(
+      (_host: unknown, options?: { taskId?: string | null }) => controllerFor(options?.taskId),
+    );
+  });
+
+  it("restores the folded groups native remembered, writes toggles back, and reopens from recents", async () => {
+    renderShell();
+    // The remembered fold lands before the strip is used.
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Test project, 2 tabs, collapsed" }),
+      ).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Test project, 2 tabs, collapsed" }));
+    await waitFor(() => expect(mocks.setWindowCollapsed).toHaveBeenCalledWith([]));
+    // A new tab lands in this window, not "wherever the task's tabs go".
+    fireEvent.click(screen.getByRole("button", { name: "New browser tab" }));
+    await waitFor(() =>
+      expect(mocks.moveTab).toHaveBeenCalledWith("task-a", "tab-new", {
+        kind: "window",
+        label: "browser-window-abc",
+      }),
+    );
+    // Ctrl+Shift+T reaches for the group's durable recently-closed list first.
+    mocks.open.mockClear();
+    fireEvent.keyDown(window, { key: "T", ctrlKey: true, shiftKey: true });
+    await waitFor(() =>
+      expect(mocks.open).toHaveBeenCalledWith("task-a", "https://example.com/gone"),
     );
   });
 });

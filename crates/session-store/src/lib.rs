@@ -35,7 +35,7 @@ mod settings_store;
 mod task_store;
 mod usage_store;
 pub use automation_store::{NewAutomation, UpdateAutomation};
-pub use browser_store::StoredBrowserTab;
+pub use browser_store::{StoredBrowserTab, StoredBrowserWindow, StoredRecentTab};
 pub use delegation_store::NewDelegation;
 pub use projection_store::{
     HANDOFF_CHILD_MAX_TOKENS, HANDOFF_DEFAULT_MAX_IMAGES, HANDOFF_DEFAULT_MAX_TOKENS,
@@ -141,6 +141,9 @@ impl LocalStore {
             .execute_batch(
                 "DELETE FROM automation_runs;
                  DELETE FROM automations;
+                 DELETE FROM browser_recent_tabs;
+                 DELETE FROM browser_tabs;
+                 DELETE FROM browser_windows;
                  DELETE FROM task_context_references;
                  DELETE FROM memories;
                  DELETE FROM queued_messages;

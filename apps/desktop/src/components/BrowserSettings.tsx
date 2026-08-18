@@ -27,7 +27,18 @@ export const BROWSER_SETTINGS = {
   /** Set once the one-time "identities are now per project" line is dismissed. */
   identityPerGroupNoticeSeen: "browser.identityPerGroupNoticeSeen",
   searchEngine: "browser.searchEngine",
+  /** Popped-out tabs untouched this many days move to Recently closed. */
+  popoutStaleDays: "browser.popoutStaleDays",
+  /** Popped-out tabs beyond this many (oldest first) move to Recently closed. */
+  popoutMaxTabs: "browser.popoutMaxTabs",
 } as const;
+
+/** A whole number setting from a text field, kept inside its bounds. */
+function clampInt(value: string, min: number, max: number, fallback: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(parsed)));
+}
 
 function SharedScopeWarning({
   open,
@@ -453,6 +464,52 @@ export function BrowserSettings({
               { value: "google", label: "Google" },
               { value: "ddg", label: "DuckDuckGo" },
             ]}
+          />
+        </SettingRow>
+      </section>
+
+      <section className="settings-section">
+        <header>
+          <h2>Browser windows</h2>
+          <p>
+            Popped-out windows come back after a restart, with their tabs asleep until you click
+            them. Tabs you have not touched for a while, or beyond a limit, move to Recently closed
+            in their group menu.
+          </p>
+        </header>
+        <SettingRow
+          label="Move untouched tabs after"
+          description="Days since a popped-out tab was last used. Recently closed keeps its address."
+        >
+          <input
+            className="subagent-number"
+            type="number"
+            aria-label="Move untouched tabs after (days)"
+            min={1}
+            max={365}
+            value={readSetting<number>(settings, BROWSER_SETTINGS.popoutStaleDays, 7)}
+            onChange={(event) =>
+              setSetting(BROWSER_SETTINGS.popoutStaleDays, clampInt(event.target.value, 1, 365, 7))
+            }
+          />
+        </SettingRow>
+        <SettingRow
+          label="Keep at most this many popped-out tabs"
+          description="Beyond it, the oldest move to Recently closed so windows stay light."
+        >
+          <input
+            className="subagent-number"
+            type="number"
+            aria-label="Keep at most this many popped-out tabs"
+            min={10}
+            max={1000}
+            value={readSetting<number>(settings, BROWSER_SETTINGS.popoutMaxTabs, 100)}
+            onChange={(event) =>
+              setSetting(
+                BROWSER_SETTINGS.popoutMaxTabs,
+                clampInt(event.target.value, 10, 1000, 100),
+              )
+            }
           />
         </SettingRow>
       </section>

@@ -2506,6 +2506,62 @@ fn memory_enforces_twenty_active_entry_limit() {
         .expect("reuse capacity");
 }
 
+/// A tab in the pane: no window, no order, never touched.
+fn pane_tab(url: &str, title: &str, favicon: Option<&str>) -> StoredBrowserTab {
+    StoredBrowserTab {
+        url: url.into(),
+        title: title.into(),
+        favicon: favicon.map(str::to_owned),
+        window_id: None,
+        window_order: None,
+        last_touched_at: None,
+    }
+}
+
+/// A tab in a popout window, last touched at a known time.
+fn popped_tab(url: &str, window: &str, order: u32, touched: DateTime<Utc>) -> StoredBrowserTab {
+    StoredBrowserTab {
+        url: url.into(),
+        title: url.into(),
+        favicon: None,
+        window_id: Some(window.into()),
+        window_order: Some(order),
+        last_touched_at: Some(touched),
+    }
+}
+
+fn browser_window(id: &str, focused: DateTime<Utc>) -> StoredBrowserWindow {
+    StoredBrowserWindow {
+        id: id.into(),
+        x: Some(120),
+        y: Some(-40),
+        width: Some(1280),
+        height: Some(800),
+        maximized: false,
+        monitor: Some("DELL U2720Q".into()),
+        collapsed_groups: vec!["chat".into(), "project:alpha".into()],
+        last_focused_at: focused,
+        updated_at: focused,
+    }
+}
+
+fn recent_tab(
+    task_id: TaskId,
+    group: &str,
+    url: &str,
+    closed_at: DateTime<Utc>,
+) -> StoredRecentTab {
+    StoredRecentTab {
+        task_id,
+        group_id: group.into(),
+        url: url.into(),
+        title: url.into(),
+        favicon: None,
+        closed_at,
+        reason: "closed".into(),
+    }
+}
+
 #[test]
 fn browser_tabs_are_remembered_per_task_and_die_with_it() {
     let store = LocalStore::open_in_memory().expect("open store");
@@ -2527,28 +2583,20 @@ fn browser_tabs_are_remembered_per_task_and_die_with_it() {
         .set_browser_tabs(
             task.id,
             &[
-                StoredBrowserTab {
-                    url: "https://example.com/docs".into(),
-                    title: "Docs".into(),
-                    favicon: None,
-                },
+                pane_tab("https://example.com/docs", "Docs", None),
                 // Nothing to reopen: a blank tab and an oversized address are
                 // dropped rather than stored.
-                StoredBrowserTab {
-                    url: "about:blank".into(),
-                    title: String::new(),
-                    favicon: None,
-                },
-                StoredBrowserTab {
-                    url: format!("https://example.com/{}", "x".repeat(2100)),
-                    title: "Too long".into(),
-                    favicon: None,
-                },
-                StoredBrowserTab {
-                    url: "http://localhost:5173/".into(),
-                    title: "Vite".into(),
-                    favicon: Some("data:image/png;base64,AAAA".into()),
-                },
+                pane_tab("about:blank", "", None),
+                pane_tab(
+                    &format!("https://example.com/{}", "x".repeat(2100)),
+                    "Too long",
+                    None,
+                ),
+                pane_tab(
+                    "http://localhost:5173/",
+                    "Vite",
+                    Some("data:image/png;base64,AAAA"),
+                ),
             ],
         )
         .expect("remember tabs");
@@ -2557,16 +2605,12 @@ fn browser_tabs_are_remembered_per_task_and_die_with_it() {
     assert_eq!(
         store.browser_tabs(task.id).expect("read tabs"),
         vec![
-            StoredBrowserTab {
-                url: "https://example.com/docs".into(),
-                title: "Docs".into(),
-                favicon: None,
-            },
-            StoredBrowserTab {
-                url: "http://localhost:5173/".into(),
-                title: "Vite".into(),
-                favicon: Some("data:image/png;base64,AAAA".into()),
-            },
+            pane_tab("https://example.com/docs", "Docs", None),
+            pane_tab(
+                "http://localhost:5173/",
+                "Vite",
+                Some("data:image/png;base64,AAAA"),
+            ),
         ]
     );
     assert!(store.browser_tabs(other.id).expect("read tabs").is_empty());
@@ -2575,11 +2619,7 @@ fn browser_tabs_are_remembered_per_task_and_die_with_it() {
     store
         .set_browser_tabs(
             task.id,
-            &[StoredBrowserTab {
-                url: "https://example.com/other".into(),
-                title: "Other".into(),
-                favicon: None,
-            }],
+            &[pane_tab("https://example.com/other", "Other", None)],
         )
         .expect("replace tabs");
     assert_eq!(store.browser_tabs(task.id).expect("read tabs").len(), 1);
@@ -2587,4 +2627,424 @@ fn browser_tabs_are_remembered_per_task_and_die_with_it() {
     // A deleted chat takes its remembered tabs with it.
     store.remove_task(task.id).expect("remove task");
     assert!(store.browser_tabs(task.id).expect("read tabs").is_empty());
+}
+
+#[test]
+fn popout_schema_lands_on_top_of_a_v26_database() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    let path = directory.path().join("legacy-browser.sqlite3");
+    let task_id = TaskId::new();
+    let now = Utc::now().to_rfc3339();
+    {
+        let connection = legacy_database_before(&path, 27);
+        connection
+            .execute(
+                "INSERT INTO tasks(id,title,state,created_at,updated_at) VALUES (?1,'Legacy chat','ready',?2,?2)",
+                params![task_id.to_string(), now],
+            )
+            .expect("insert legacy task");
+        // A v26 row has no window columns at all; migrating must keep it.
+        connection
+            .execute(
+                "INSERT INTO browser_tabs(task_id,ordinal,url,title,updated_at) \
+                 VALUES (?1,0,'https://example.com/','Example',?2)",
+                params![task_id.to_string(), now],
+            )
+            .expect("insert legacy tab");
+    }
+
+    let store = LocalStore::open(&path).expect("migrate to 27");
+    assert_eq!(
+        store.browser_tabs(task_id).expect("read migrated tabs"),
+        vec![pane_tab("https://example.com/", "Example", None)]
+    );
+    assert!(store.browser_windows().expect("read windows").is_empty());
+    assert!(
+        store
+            .recent_tabs("chat", 10)
+            .expect("read recents")
+            .is_empty()
+    );
+}
+
+#[test]
+fn browser_windows_round_trip_with_their_collapsed_groups() {
+    let store = LocalStore::open_in_memory().expect("open store");
+    let older = Utc::now() - chrono::Duration::hours(2);
+    let newer = Utc::now();
+    store
+        .set_browser_windows(&[
+            browser_window("browser-window-aa", older),
+            browser_window("browser-window-bb", newer),
+        ])
+        .expect("write windows");
+
+    // Most recently focused first: that is the order a restore rebuilds in.
+    let windows = store.browser_windows().expect("read windows");
+    assert_eq!(
+        windows.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(),
+        vec!["browser-window-bb", "browser-window-aa"]
+    );
+    assert_eq!(
+        windows[0].collapsed_groups,
+        vec!["chat".to_string(), "project:alpha".to_string()]
+    );
+    assert_eq!(windows[0].x, Some(120));
+    assert_eq!(windows[0].y, Some(-40));
+    assert_eq!(windows[0].width, Some(1280));
+    assert_eq!(windows[0].height, Some(800));
+    assert_eq!(windows[0].monitor.as_deref(), Some("DELL U2720Q"));
+    assert!(!windows[0].maximized);
+
+    // One window changing does not disturb the other.
+    let mut maximized = browser_window("browser-window-bb", newer);
+    maximized.maximized = true;
+    maximized.collapsed_groups.clear();
+    store
+        .upsert_browser_window(&maximized)
+        .expect("upsert window");
+    let windows = store.browser_windows().expect("read windows");
+    assert!(windows[0].maximized);
+    assert!(windows[0].collapsed_groups.is_empty());
+    assert_eq!(windows.len(), 2);
+
+    // Writing the whole set again drops the ones left out of it.
+    store
+        .set_browser_windows(&[browser_window("browser-window-aa", older)])
+        .expect("replace windows");
+    assert_eq!(
+        store
+            .browser_windows()
+            .expect("read windows")
+            .iter()
+            .map(|w| w.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["browser-window-aa"]
+    );
+    store
+        .remove_browser_window("browser-window-aa")
+        .expect("remove window");
+    assert!(store.browser_windows().expect("read windows").is_empty());
+}
+
+#[test]
+fn tab_rows_carry_their_window_order_and_touch() {
+    let store = LocalStore::open_in_memory().expect("open store");
+    let task = fork_source(&store);
+    let touched = Utc::now() - chrono::Duration::minutes(5);
+    store
+        .set_browser_tabs(
+            task.id,
+            &[
+                pane_tab("https://example.com/pane", "Pane", None),
+                popped_tab(
+                    "https://example.com/popped",
+                    "browser-window-aa",
+                    3,
+                    touched,
+                ),
+            ],
+        )
+        .expect("remember tabs");
+
+    let tabs = store.browser_tabs(task.id).expect("read tabs");
+    assert_eq!(tabs[0].window_id, None);
+    assert_eq!(tabs[0].window_order, None);
+    assert_eq!(tabs[0].last_touched_at, None);
+    assert_eq!(tabs[1].window_id.as_deref(), Some("browser-window-aa"));
+    assert_eq!(tabs[1].window_order, Some(3));
+    assert_eq!(tabs[1].last_touched_at, Some(touched));
+
+    // The restore path sees popped rows without walking task by task.
+    let popped = store.browser_tabs_all_popped().expect("read popped");
+    assert_eq!(popped.len(), 1);
+    assert_eq!(popped[0].0, task.id);
+    assert_eq!(popped[0].1.url, "https://example.com/popped");
+
+    // A tab may be written before its window's geometry is; the reference has
+    // to hold either way, and the geometry write finds the row waiting.
+    let window = store.browser_windows().expect("read windows");
+    assert_eq!(window.len(), 1);
+    assert_eq!(window[0].id, "browser-window-aa");
+    assert_eq!(window[0].width, None);
+}
+
+#[test]
+fn deleting_a_task_takes_its_windowed_tabs_and_recents() {
+    let store = LocalStore::open_in_memory().expect("open store");
+    let task = fork_source(&store);
+    store
+        .set_browser_tabs(
+            task.id,
+            &[popped_tab(
+                "https://example.com/one",
+                "browser-window-aa",
+                0,
+                Utc::now(),
+            )],
+        )
+        .expect("remember tabs");
+    store
+        .push_recent_tabs(&[recent_tab(
+            task.id,
+            "chat",
+            "https://example.com/gone",
+            Utc::now(),
+        )])
+        .expect("push recent");
+
+    store.remove_task(task.id).expect("remove task");
+    assert!(store.browser_tabs_all_popped().expect("popped").is_empty());
+    assert!(store.recent_tabs("chat", 10).expect("recents").is_empty());
+    // The window outlives its tabs; restore skips a window with none left.
+    assert_eq!(store.browser_windows().expect("windows").len(), 1);
+}
+
+#[test]
+fn removing_a_project_takes_its_browser_rows() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    let database = directory.path().join("integrator.sqlite3");
+    let repository = directory.path().join("repository");
+    std::fs::create_dir_all(&repository).expect("fixture directory");
+    let store = LocalStore::open(&database).expect("open store");
+    let project = store
+        .upsert_trusted_project("Repository", &repository, None)
+        .expect("register project");
+    let task = store
+        .create_task(NewTask {
+            kind: TaskKind::Code,
+            title: "Project chat".into(),
+            repository_path: Some(repository.clone()),
+            worktree_path: None,
+            runtime: None,
+            model: None,
+            effort: None,
+            parent_task_id: None,
+        })
+        .expect("create project task");
+    store
+        .set_browser_tabs(
+            task.id,
+            &[popped_tab(
+                "https://example.com/project",
+                "browser-window-aa",
+                0,
+                Utc::now(),
+            )],
+        )
+        .expect("remember tabs");
+    store
+        .push_recent_tabs(&[recent_tab(
+            task.id,
+            "project:alpha",
+            "https://example.com/old",
+            Utc::now(),
+        )])
+        .expect("push recent");
+
+    store
+        .remove_trusted_project(project.id)
+        .expect("remove project");
+    assert!(store.browser_tabs_all_popped().expect("popped").is_empty());
+    assert!(
+        store
+            .recent_tabs("project:alpha", 10)
+            .expect("recents")
+            .is_empty()
+    );
+}
+
+#[test]
+fn retiring_picks_stale_tabs_first_then_the_ones_over_the_cap() {
+    let store = LocalStore::open_in_memory().expect("open store");
+    let task = fork_source(&store);
+    let now = Utc::now();
+    let fresh = now - chrono::Duration::minutes(1);
+    let recent_enough = now - chrono::Duration::hours(1);
+    let ancient = now - chrono::Duration::days(30);
+    store
+        .set_browser_tabs(
+            task.id,
+            &[
+                // Kept: a pane tab is never retired, however old.
+                pane_tab("https://example.com/pane", "Pane", None),
+                popped_tab("https://example.com/fresh", "browser-window-aa", 0, fresh),
+                popped_tab(
+                    "https://example.com/hour",
+                    "browser-window-aa",
+                    1,
+                    recent_enough,
+                ),
+                popped_tab(
+                    "https://example.com/ancient",
+                    "browser-window-aa",
+                    2,
+                    ancient,
+                ),
+                StoredBrowserTab {
+                    // Never touched at all: not stale, but first over the cap.
+                    last_touched_at: None,
+                    ..popped_tab("https://example.com/untouched", "browser-window-aa", 3, now)
+                },
+            ],
+        )
+        .expect("remember tabs");
+
+    // Cap of two: the ancient tab goes as stale, the untouched one as the
+    // oldest of what remains.
+    let retired = store
+        .retire_stale_browser_tabs(now - chrono::Duration::days(7), 2, now, &|_| {
+            "chat".to_string()
+        })
+        .expect("retire");
+    assert_eq!(
+        retired
+            .iter()
+            .map(|tab| (tab.url.as_str(), tab.reason.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("https://example.com/ancient", "stale"),
+            ("https://example.com/untouched", "over-cap"),
+        ]
+    );
+    assert!(retired.iter().all(|tab| tab.group_id == "chat"));
+
+    // The retired rows are gone from the strip and readable as recents.
+    assert_eq!(
+        store
+            .browser_tabs(task.id)
+            .expect("read tabs")
+            .iter()
+            .map(|tab| tab.url.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "https://example.com/pane",
+            "https://example.com/fresh",
+            "https://example.com/hour",
+        ]
+    );
+    let recents = store.recent_tabs("chat", 10).expect("recents");
+    assert_eq!(recents.len(), 2);
+    assert!(recents.iter().all(|tab| tab.task_id == task.id));
+
+    // Nothing stale and nothing over the cap: a no-op that writes no recents.
+    let again = store
+        .retire_stale_browser_tabs(now - chrono::Duration::days(7), 10, now, &|_| {
+            "chat".to_string()
+        })
+        .expect("retire again");
+    assert!(again.is_empty());
+    assert_eq!(store.recent_tabs("chat", 10).expect("recents").len(), 2);
+}
+
+#[test]
+fn recently_closed_tabs_stop_at_two_hundred() {
+    let store = LocalStore::open_in_memory().expect("open store");
+    let task = fork_source(&store);
+    let base = Utc::now() - chrono::Duration::days(1);
+    let pushes: Vec<StoredRecentTab> = (0..250)
+        .map(|index| {
+            recent_tab(
+                task.id,
+                "chat",
+                &format!("https://example.com/{index}"),
+                base + chrono::Duration::seconds(index),
+            )
+        })
+        .collect();
+    store.push_recent_tabs(&pushes).expect("push recents");
+
+    let recents = store.recent_tabs("chat", 500).expect("recents");
+    assert_eq!(recents.len(), 200);
+    // Newest first, and the oldest fifty fell off the end.
+    assert_eq!(recents[0].url, "https://example.com/249");
+    assert_eq!(recents[199].url, "https://example.com/50");
+
+    store.clear_recent_tabs(Some("other")).expect("clear other");
+    assert_eq!(store.recent_tabs("chat", 500).expect("recents").len(), 200);
+    store.clear_recent_tabs(None).expect("clear all");
+    assert!(store.recent_tabs("chat", 500).expect("recents").is_empty());
+}
+
+#[test]
+fn purging_recents_keeps_chat_and_path_groups() {
+    let store = LocalStore::open_in_memory().expect("open store");
+    let task = fork_source(&store);
+    let now = Utc::now();
+    store
+        .push_recent_tabs(&[
+            recent_tab(task.id, "chat", "https://example.com/chat", now),
+            recent_tab(
+                task.id,
+                "path:/tmp/scratch",
+                "https://example.com/path",
+                now,
+            ),
+            recent_tab(task.id, "project:alpha", "https://example.com/alpha", now),
+            recent_tab(task.id, "project:beta", "https://example.com/beta", now),
+        ])
+        .expect("push recents");
+
+    store
+        .purge_recent_tabs_for_groups_not_in(&["project:alpha".to_string()])
+        .expect("purge");
+    assert_eq!(store.recent_tabs("chat", 10).expect("chat").len(), 1);
+    assert_eq!(
+        store
+            .recent_tabs("path:/tmp/scratch", 10)
+            .expect("path")
+            .len(),
+        1
+    );
+    assert_eq!(
+        store.recent_tabs("project:alpha", 10).expect("kept").len(),
+        1
+    );
+    assert!(
+        store
+            .recent_tabs("project:beta", 10)
+            .expect("purged")
+            .is_empty()
+    );
+
+    // No projects left: every project group goes, the rest stay.
+    store
+        .purge_recent_tabs_for_groups_not_in(&[])
+        .expect("purge all projects");
+    assert!(
+        store
+            .recent_tabs("project:alpha", 10)
+            .expect("purged")
+            .is_empty()
+    );
+    assert_eq!(store.recent_tabs("chat", 10).expect("chat").len(), 1);
+}
+
+#[test]
+fn clearing_local_data_empties_the_browser_tables() {
+    let store = LocalStore::open_in_memory().expect("open store");
+    let task = fork_source(&store);
+    let now = Utc::now();
+    store
+        .set_browser_windows(&[browser_window("browser-window-aa", now)])
+        .expect("write window");
+    store
+        .set_browser_tabs(
+            task.id,
+            &[popped_tab(
+                "https://example.com/one",
+                "browser-window-aa",
+                0,
+                now,
+            )],
+        )
+        .expect("remember tabs");
+    store
+        .push_recent_tabs(&[recent_tab(task.id, "chat", "https://example.com/gone", now)])
+        .expect("push recent");
+
+    store.clear_all_data().expect("clear all data");
+    assert!(store.browser_windows().expect("windows").is_empty());
+    assert!(store.browser_tabs_all_popped().expect("popped").is_empty());
+    assert!(store.recent_tabs("chat", 10).expect("recents").is_empty());
 }

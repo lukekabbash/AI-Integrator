@@ -81,6 +81,48 @@ pub fn ensure_window(
         focus_window(&window)?;
         return Ok(window);
     }
+    let window = open_window(app, label, WindowPlacement::Pointer(at))?;
+    focus_window(&window)?;
+    Ok(window)
+}
+
+/// Where a new pop-out window goes: under the pointer (or wherever the OS
+/// puts it), or at a remembered rectangle in physical screen pixels.
+pub(super) enum WindowPlacement {
+    Pointer(Option<(f64, f64)>),
+    Restored {
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        maximized: bool,
+    },
+}
+
+/// Brings back a remembered window at its old place, shown but not focused:
+/// restore runs behind whatever the person is looking at. An existing window
+/// with the label is returned as it is.
+pub(super) fn restore_window(
+    app: &AppHandle,
+    label: &str,
+    placement: WindowPlacement,
+) -> Result<tauri::Window, CommandError> {
+    if let Some(window) = app.get_window(label) {
+        return Ok(window);
+    }
+    let window = open_window(app, Some(label), placement)?;
+    let _ = window.show();
+    Ok(window)
+}
+
+/// Builds a pop-out window with the app's own renderer in it and wires its
+/// lifetime: docking on close, focus order, and geometry persistence. The
+/// window comes back hidden; callers show or focus it.
+fn open_window(
+    app: &AppHandle,
+    label: Option<&str>,
+    placement: WindowPlacement,
+) -> Result<tauri::Window, CommandError> {
     let label = label.map_or_else(new_window_label, str::to_owned);
     // The query tells the renderer which surface to draw before React runs,
     // and which window it is; nothing about a task.
@@ -96,8 +138,9 @@ pub fn ensure_window(
     .title("Integrator Browser")
     .inner_size(1180.0, 820.0)
     .min_inner_size(520.0, 360.0)
-    .decorations(false);
-    if let Some((x, y)) = at {
+    .decorations(false)
+    .visible(false);
+    if let WindowPlacement::Pointer(Some((x, y))) = placement {
         // The pointer ends up over the strip, roughly where the dragged tab
         // would sit, rather than at the window's corner.
         builder = builder.position(x - 200.0, y - 20.0);
@@ -105,6 +148,21 @@ pub fn ensure_window(
     let window = builder
         .build()
         .map_err(|error| unavailable(format!("could not open the browser window: {error}")))?;
+    let window = window.as_ref().window();
+    if let WindowPlacement::Restored {
+        x,
+        y,
+        width,
+        height,
+        maximized,
+    } = placement
+    {
+        let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+        let _ = window.set_size(tauri::PhysicalSize::new(width, height));
+        if maximized {
+            let _ = window.maximize();
+        }
+    }
 
     let event_app = app.clone();
     let event_label = label.clone();
@@ -132,21 +190,29 @@ pub fn ensure_window(
             if let Some(state) = event_app.try_state::<Arc<BrowserTabs>>() {
                 state.note_window_focus(&event_label);
             }
+            super::persist::note_window_geometry(&event_app, &event_label, true);
+        }
+        tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => {
+            super::persist::note_window_geometry(&event_app, &event_label, false);
         }
         tauri::WindowEvent::Destroyed => {
             if let Some(state) = event_app.try_state::<Arc<BrowserTabs>>() {
                 state.forget_window(&event_label);
+                // A window that still holds tabs in memory is being torn
+                // down with the app, not closed by the person: its row is
+                // what brings it back next launch, so it stays.
+                if state.window_is_empty(&event_label) {
+                    super::persist::forget_window(&event_app, &event_label);
+                }
             }
         }
         _ => {}
     });
-    let window = window.as_ref().window();
     if let Some(state) = app.try_state::<Arc<BrowserTabs>>() {
         // A window that has just been made is the one the next pop-out should
         // use, whether or not the OS delivers a focus event for it.
         state.note_window_focus(&label);
     }
-    focus_window(&window)?;
     Ok(window)
 }
 
@@ -249,6 +315,7 @@ pub(super) fn move_tab(
         if let Some(index) = index {
             place_at(state, &label, id, index);
             emit_changed(app, state);
+            super::remember::remember_window(app, state, &label);
         }
         if focus {
             let _ = ensure_window(app, Some(&label), None)?;
@@ -302,6 +369,12 @@ pub(super) fn move_tab(
         _ => tab,
     };
     emit_changed(app, state);
+    // The moved tab's task, plus every task whose strip position shifted in
+    // the window it landed in. Docking writes the tab's own task only.
+    super::remember::remember(app, state, &tab.task_id);
+    if let Some(label) = &target_label {
+        super::remember::remember_window(app, state, label);
+    }
     if let Some(source_label) = source_label {
         hide_window_if_empty(app, state, &source_label);
     }
@@ -432,6 +505,8 @@ pub fn browser_window_reorder(
         return Err(unavailable("one of those tabs is not in this window"));
     }
     emit_changed(webview.app_handle(), &state);
+    // One write per drop, for every task in the strip.
+    super::remember::remember_window(webview.app_handle(), &state, label);
     Ok(())
 }
 

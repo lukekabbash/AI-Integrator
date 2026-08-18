@@ -948,4 +948,53 @@ pub(super) const MIGRATIONS: &[(i64, &str)] = &[
         ALTER TABLE browser_tabs ADD COLUMN favicon TEXT;
         "#,
     ),
+    (
+        27,
+        r#"
+        -- Popped-out browser windows outlive the app: closing Integrator with
+        -- three windows on screen and getting one back is a loss nobody asked
+        -- for. A window row is the frame — where it was, how big, which groups
+        -- were collapsed inside it — while the tabs that lived in it stay in
+        -- `browser_tabs`, now tagged with their window, their order within it,
+        -- and when they were last touched (cleanup needs an age). A tab whose
+        -- window row goes away falls back to the pane rather than vanishing:
+        -- hence SET NULL rather than a cascade.
+        CREATE TABLE browser_windows (
+            id TEXT PRIMARY KEY,
+            x INTEGER,
+            y INTEGER,
+            width INTEGER,
+            height INTEGER,
+            maximized INTEGER NOT NULL DEFAULT 0,
+            monitor TEXT,
+            collapsed_groups TEXT NOT NULL DEFAULT '[]',
+            last_focused_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        ALTER TABLE browser_tabs ADD COLUMN window_id TEXT
+            REFERENCES browser_windows(id) ON DELETE SET NULL;
+        ALTER TABLE browser_tabs ADD COLUMN window_order INTEGER;
+        ALTER TABLE browser_tabs ADD COLUMN last_touched_at TEXT;
+
+        -- Cleanup retires tabs nobody has touched in days, and tabs past the
+        -- cap. Retiring is not deleting: the address lands here so "recently
+        -- closed" can bring it back. Capped globally, indexed by the group
+        -- that asks for it, and dying with its task like the tab it came from.
+        CREATE TABLE browser_recent_tabs (
+            id INTEGER PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            group_id TEXT NOT NULL,
+            url TEXT NOT NULL,
+            title TEXT NOT NULL,
+            favicon TEXT,
+            closed_at TEXT NOT NULL,
+            reason TEXT NOT NULL
+        );
+        CREATE INDEX browser_recent_tabs_group
+            ON browser_recent_tabs(group_id, closed_at);
+
+        -- To reverse: drop the two tables and the three added `browser_tabs`
+        -- columns. All of it is additive, so an older build still reads them.
+        "#,
+    ),
 ];
