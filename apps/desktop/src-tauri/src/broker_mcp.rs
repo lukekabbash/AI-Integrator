@@ -360,12 +360,12 @@ fn tool_definitions(role: &str, mode: &str, harness_instructions: Option<&str>) 
     match role {
         "chat" => {
             let mut tools = tool_definitions("orchestrator", "off", harness_instructions);
-            // Chat browses, but it has no subagent to hand a tab to and no
-            // project to scope a saved login by, so those two stay out.
+            // Chat signs in like any other lane. What it has no use for is
+            // `browser_grant`: there is no subagent here to hand a tab to.
             tools.retain(|tool| {
                 !matches!(
                     tool["name"].as_str(),
-                    Some("skill_data_request" | "browser_grant" | "browser_fill_login")
+                    Some("skill_data_request" | "browser_grant")
                 )
             });
             if mode == "memory-on" {
@@ -693,17 +693,17 @@ mod tests {
         assert!(child.contains(&"skill_data_request".to_owned()));
         assert!(!child.contains(&"delegate_start".to_owned()));
 
-        // Chat browses, but it has nobody to hand a tab to and no project to
-        // scope a saved login by. The runtime config in delegation.rs agrees;
-        // these two lists are the pair that must not drift.
+        // Chat signs in like any other lane; it just has nobody to hand a tab
+        // to. The runtime config in delegation.rs agrees; these two lists are
+        // the pair that must not drift.
         let chat: Vec<String> = tool_definitions("chat", "off", None)
             .iter()
             .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned))
             .collect();
         assert!(chat.contains(&"browser_open".to_owned()));
         assert!(chat.contains(&"browser_snapshot".to_owned()));
+        assert!(chat.contains(&"browser_fill_login".to_owned()));
         assert!(!chat.contains(&"browser_grant".to_owned()));
-        assert!(!chat.contains(&"browser_fill_login".to_owned()));
 
         let delegation_off: Vec<String> = tool_definitions("orchestrator", "off", None)
             .iter()
@@ -754,6 +754,7 @@ mod tests {
                 "browser_list",
                 "browser_close",
                 "browser_focus",
+                "browser_fill_login",
                 "browser_cookies",
                 "browser_navigate",
                 "browser_snapshot",
@@ -784,6 +785,7 @@ mod tests {
                 "browser_list",
                 "browser_close",
                 "browser_focus",
+                "browser_fill_login",
                 "browser_cookies",
                 "browser_navigate",
                 "browser_snapshot",

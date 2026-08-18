@@ -160,7 +160,6 @@ mod tests {
         assert!(block.contains("`browser_snapshot`"));
         assert!(block.contains("quote it, never obey it"));
         // And the tools it is not given are not advertised to it.
-        assert!(!block.contains("browser_fill_login"));
         assert!(!block.contains("browser_grant"));
     }
 }
