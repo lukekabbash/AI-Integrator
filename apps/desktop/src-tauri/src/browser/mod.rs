@@ -1303,6 +1303,43 @@ pub async fn browser_tab_poster(
     Ok(state.poster(&tab_id))
 }
 
+/// Takes a fresh still of a tab now — parked or not — and hands it back.
+///
+/// The still under a parked page is what the person sees while an overlay
+/// (the compact deck, the address field's suggestions, a dialog) has to be
+/// drawn over that slot; the load-time picture goes stale as they browse.
+/// The tab's own camera captures a hidden webview, so this can run while the
+/// page is parked; where only the screen crop exists it answers with the
+/// cached picture instead. Never a still of a filled password.
+#[tauri::command]
+pub async fn browser_tab_poster_refresh(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<BrowserTabs>>,
+    task_id: String,
+    tab_id: String,
+) -> CommandResult<Option<String>> {
+    require_task(&state, &task_id, &tab_id)?;
+    if state.credential_in_flight(&tab_id) {
+        return Ok(state.poster(&tab_id));
+    }
+    let sleeping = state
+        .snapshot(None)
+        .into_iter()
+        .find(|tab| tab.id == tab_id)
+        .is_some_and(|tab| tab.sleeping);
+    if sleeping {
+        return Ok(state.poster(&tab_id));
+    }
+    let label = state
+        .label_for(&tab_id)
+        .ok_or_else(|| unavailable("that browser tab is no longer open"))?;
+    let webview = webview_of(&app, &label)?;
+    if let Ok(png) = capture::capture_poster_png(&webview).await {
+        state.set_poster(&tab_id, png);
+    }
+    Ok(state.poster(&tab_id))
+}
+
 pub use agent::{
     agent_invoke, browser_capture_image, close_for_agent, cookies_for_agent, focus_for_agent,
     grant_for_agent, navigate_for_agent, open_for_agent, recent_for_caller, row_for_agent,

@@ -22,6 +22,8 @@ import {
   DECK_PEEK_Y,
   promoteDeckTab,
   resolveDeckOrder,
+  deckRect,
+  overlapsAny,
   settleDeckOffset,
   stackDeck,
   type DeckOffset,
@@ -186,19 +188,16 @@ export function BrowserDeck({
   // still until the timer runs out, then its page is placed where it landed.
   // The pane's page, parked for the drag, stays parked until then too, so the
   // glide off it is not swallowed by the page coming back underneath.
-  const land = useCallback(
-    (delay: number) => {
-      if (settleTimer.current) clearTimeout(settleTimer.current);
-      setPhase("settling");
-      settleTimer.current = setTimeout(() => {
-        settleTimer.current = null;
-        setNativePageDeckOccluding(false);
-        setPhase("rest");
-        setLanding((count) => count + 1);
-      }, delay);
-    },
-    [],
-  );
+  const land = useCallback((delay: number) => {
+    if (settleTimer.current) clearTimeout(settleTimer.current);
+    setPhase("settling");
+    settleTimer.current = setTimeout(() => {
+      settleTimer.current = null;
+      setNativePageDeckOccluding(false);
+      setPhase("rest");
+      setLanding((count) => count + 1);
+    }, delay);
+  }, []);
   useEffect(
     () => () => {
       if (settleTimer.current) clearTimeout(settleTimer.current);
@@ -253,25 +252,37 @@ export function BrowserDeck({
       if (!active.moved) return;
       const box = measure();
       const settled = box
-        ? settleDeckOffset(offsetRef.current, box.deck, box.viewport, pageRects)
+        ? settleDeckOffset(offsetRef.current, box.deck, box.viewport, [])
         : offsetRef.current;
       setOffset(settled);
       storeOffset(settled);
       land(reduceMotion ? 0 : SETTLE_MS);
     },
-    [land, measure, pageRects, reduceMotion],
+    [land, measure, reduceMotion],
   );
 
   useEffect(() => () => setNativePageDeckOccluding(false), []);
 
-  // At rest the deck keeps clear of live pages on its own: the pane opening
-  // under it, a rail folding away so the page grows into the corner, or the
-  // window shrinking all move the deck to the nearest clear spot.
+  // The deck may rest anywhere, the pane's page included. It cannot be drawn
+  // over a live page — the page is a native webview and paints above HTML —
+  // so while the deck sits on the slot the page stands down and its still,
+  // refreshed every couple of seconds by the surface, shows under the cards.
+  // Move the deck off and the page is live again.
   useEffect(() => {
     if (phase !== "rest" || typeof window === "undefined") return;
     const box = measure();
     if (!box) return;
-    const settled = settleDeckOffset(offsetRef.current, box.deck, box.viewport, pageRects);
+    const resting = deckRect(offsetRef.current, box.deck, box.viewport);
+    setNativePageDeckOccluding(overlapsAny(resting, pageRects));
+  }, [measure, pageRects, phase, offset]);
+
+  // At rest the deck stays inside the window: a shrink or a rail folding
+  // away pulls it back to the nearest spot that fits.
+  useEffect(() => {
+    if (phase !== "rest" || typeof window === "undefined") return;
+    const box = measure();
+    if (!box) return;
+    const settled = settleDeckOffset(offsetRef.current, box.deck, box.viewport, []);
     if (sameOffset(settled, offsetRef.current)) return;
     setOffset(settled);
     storeOffset(settled);
@@ -283,7 +294,7 @@ export function BrowserDeck({
     const onResize = () => {
       const box = measure();
       if (!box) return;
-      setOffset((previous) => settleDeckOffset(previous, box.deck, box.viewport, pageRects));
+      setOffset((previous) => settleDeckOffset(previous, box.deck, box.viewport, []));
     };
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);

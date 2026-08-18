@@ -101,7 +101,7 @@ function overlaps(a: ScreenRect, b: ScreenRect): boolean {
   return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
 }
 
-function overlapsAny(rect: ScreenRect, obstacles: readonly ScreenRect[]): boolean {
+export function overlapsAny(rect: ScreenRect, obstacles: readonly ScreenRect[]): boolean {
   return obstacles.some((obstacle) => overlaps(rect, obstacle));
 }
 
@@ -125,9 +125,7 @@ export function settleDeckOffset(
   obstacles: readonly ScreenRect[],
 ): DeckOffset {
   const clamped = clampDeckOffset(offset, deckSize, viewport);
-  const live = obstacles.filter(
-    (rect) => rect.right > rect.left && rect.bottom > rect.top,
-  );
+  const live = obstacles.filter((rect) => rect.right > rect.left && rect.bottom > rect.top);
   if (!live.length || !overlapsAny(deckRect(clamped, deckSize, viewport), live)) {
     return clamped;
   }

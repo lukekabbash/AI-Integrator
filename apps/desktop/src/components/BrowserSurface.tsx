@@ -56,6 +56,8 @@ export interface BrowserSurfaceProps {
   onFillLogin?: () => Promise<void>;
   /** Draws toolbar hover copy inside the native page so it never moves it. */
   onToolbarTooltip?: (tooltip: { label: string; x: number } | null) => Promise<void>;
+  /** Asks for a fresh still of the page, ahead of and during a park. */
+  onWarmPoster?: () => void;
   /** Data URL of the last still taken of this tab, if there is one. */
   poster?: string;
   message?: string | null;
@@ -209,6 +211,7 @@ export function BrowserSurface({
   onSaveLogin,
   onFillLogin,
   onToolbarTooltip,
+  onWarmPoster,
   poster,
   message,
 }: BrowserSurfaceProps) {
@@ -415,6 +418,22 @@ export function BrowserSurface({
     };
   }, [blank, hostedHere, menuOpen, nativeParked, suggestOpen]);
 
+  // While the page stands down for something drawn over it — the deck at rest
+  // on this slot, a dialog, the suggestions — its still is refreshed every
+  // couple of seconds, so a page that keeps moving (a build log, a chat) reads
+  // as near-live rather than frozen at the moment it parked.
+  const parkedForOverlay = !blank && hostedHere && (nativeParked || suggestOpen || menuOpen);
+  const warmRef = useRef(onWarmPoster);
+  useEffect(() => {
+    warmRef.current = onWarmPoster;
+  }, [onWarmPoster]);
+  useEffect(() => {
+    if (!parkedForOverlay) return;
+    warmRef.current?.();
+    const timer = window.setInterval(() => warmRef.current?.(), 2000);
+    return () => window.clearInterval(timer);
+  }, [parkedForOverlay]);
+
   const go = useCallback(
     (input: string) => {
       const resolved = resolveOmniboxInput(input, readSearchEngine());
@@ -468,6 +487,9 @@ export function BrowserSurface({
             }))}
             onSuggestOpenChange={setSuggestOpen}
             onFocus={() => {
+              // Suggestions will open over the page and park it; take the
+              // still now so what shows under them is the page as it is.
+              onWarmPoster?.();
               setFocused(true);
               setDraft(blank ? "" : tab.url);
               queueMicrotask(() => inputRef.current?.select());

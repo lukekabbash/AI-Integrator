@@ -54,6 +54,7 @@
     "browser_tab_navigate(taskId:String,tabId:String,url:String)->CommandResult<BrowserTab>",
     "browser_tab_open(taskId:String,url?:Option<String>)->CommandResult<BrowserTab>",
     "browser_tab_poster(taskId:String,tabId:String)->CommandResult<Option<String>>",
+    "browser_tab_poster_refresh(taskId:String,tabId:String)->CommandResult<Option<String>>",
     "browser_tab_screenshot(taskId:String,tabId:String)->CommandResult<String>",
     "browser_tab_set_bounds(taskId:String,tabId:String,bounds?:Option<TabBounds>,placementSlot:PlacementSlot,poppedOutHost:bool,placementSession:u64,placementRevision:u64)->CommandResult<()>",
     "browser_tab_set_popped_out(taskId:String,tabId:String,poppedOut:bool)->CommandResult<BrowserTab>",

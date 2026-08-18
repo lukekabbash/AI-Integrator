@@ -60,9 +60,9 @@ use browser::{
     browser_recent_tabs, browser_recent_tabs_clear, browser_save_login, browser_saved_logins,
     browser_set_identity_scope, browser_sites, browser_tab_close, browser_tab_history,
     browser_tab_invoke, browser_tab_list, browser_tab_menu, browser_tab_move, browser_tab_navigate,
-    browser_tab_open, browser_tab_poster, browser_tab_screenshot, browser_tab_set_bounds,
-    browser_tab_set_popped_out, browser_tabs_restore, browser_window_reorder,
-    browser_window_set_collapsed, browser_window_state,
+    browser_tab_open, browser_tab_poster, browser_tab_poster_refresh, browser_tab_screenshot,
+    browser_tab_set_bounds, browser_tab_set_popped_out, browser_tabs_restore,
+    browser_window_reorder, browser_window_set_collapsed, browser_window_state,
 };
 use chat_title::task_generate_title;
 use code_explain::{selection_explain, selection_explain_preview};
@@ -281,6 +281,7 @@ pub fn run() {
             browser_tab_invoke,
             browser_tab_screenshot,
             browser_tab_poster,
+            browser_tab_poster_refresh,
             browser_tab_set_popped_out,
             browser_popout_tabs,
             browser_tab_move,

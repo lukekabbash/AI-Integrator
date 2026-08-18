@@ -96,6 +96,7 @@
     "allow-browser-tab-invoke",
     "allow-browser-tab-screenshot",
     "allow-browser-tab-poster",
+    "allow-browser-tab-poster-refresh",
     "allow-browser-tab-set-popped-out",
     "allow-browser-popout-tabs",
     "allow-browser-tab-move",

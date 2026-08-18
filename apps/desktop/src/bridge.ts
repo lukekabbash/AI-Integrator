@@ -1565,6 +1565,8 @@ export interface BrowserBridge {
   /** The tab's last still, base64 PNG, or null if none was kept. Its own call
    *  rather than a field on the tab: the snapshot streams on every change. */
   poster(taskId: string, tabId: string): Promise<string | null>;
+  /** Takes a fresh still now, parked or not, and returns it. */
+  refreshPoster(taskId: string, tabId: string): Promise<string | null>;
   setPoppedOut(taskId: string, tabId: string, poppedOut: boolean): Promise<BrowserTab>;
   /** Moves a tab into a browser window, a new one, or back to its pane; the page survives. */
   moveTab(taskId: string, tabId: string, target: BrowserMoveTarget): Promise<BrowserTab>;
@@ -4884,6 +4886,8 @@ function nativeBrowserBridge(): BrowserBridge | undefined {
     screenshot: (taskId, tabId) =>
       nativeInvoke<string>("browser_tab_screenshot", { taskId, tabId }),
     poster: (taskId, tabId) => nativeInvoke<string | null>("browser_tab_poster", { taskId, tabId }),
+    refreshPoster: (taskId, tabId) =>
+      nativeInvoke<string | null>("browser_tab_poster_refresh", { taskId, tabId }),
     setPoppedOut: (taskId, tabId, poppedOut) =>
       nativeInvoke<BrowserTab>("browser_tab_set_popped_out", { taskId, tabId, poppedOut }),
     moveTab: (taskId, tabId, target) =>

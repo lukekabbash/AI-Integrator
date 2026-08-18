@@ -819,6 +819,7 @@ function PoppedTabSurface({ tab, host, allowExternalOpen }: PoppedTabSurfaceProp
       onSaveLogin={() => browser.saveLogin(live.id, live.taskId)}
       onFillLogin={() => browser.fillLogin(live.id, live.taskId)}
       onToolbarTooltip={(tooltip) => browser.setToolbarTooltip(live.id, tooltip)}
+      onWarmPoster={() => browser.warmPoster(live.id)}
       onClose={() => browser.close(live.id)}
     />
   );

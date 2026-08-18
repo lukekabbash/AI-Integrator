@@ -69,6 +69,7 @@ const APP_COMMANDS: &[&str] = &[
     "browser_tab_invoke",
     "browser_tab_screenshot",
     "browser_tab_poster",
+    "browser_tab_poster_refresh",
     "browser_tab_set_popped_out",
     "browser_popout_tabs",
     "browser_tab_move",

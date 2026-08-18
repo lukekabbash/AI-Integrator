@@ -51,6 +51,8 @@ export interface BrowserController {
   toggleRecording: (tabId: string) => Promise<void>;
   toggleAnnotate: (tabId: string) => Promise<void>;
   setToolbarTooltip: (tabId: string, tooltip: { label: string; x: number } | null) => Promise<void>;
+  /** Takes a fresh still of the tab now, for the slot to show while it parks. */
+  warmPoster: (tabId: string) => void;
 }
 
 export interface BrowserHost {
@@ -581,6 +583,10 @@ export function useBrowserTabs(
       screenshot,
       toggleRecording,
       toggleAnnotate,
+      warmPoster: (tabId) => {
+        if (!api || !taskId || !byId[tabId]) return;
+        browserPosters.warm(api, taskId, tabId);
+      },
       setToolbarTooltip: async (tabId, tooltip) => {
         if (!api || !taskId || !byId[tabId]) return;
         await api.invoke(taskId, tabId, "hostTooltip", [tooltip]).catch(() => undefined);

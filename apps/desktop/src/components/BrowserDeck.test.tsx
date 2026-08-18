@@ -245,9 +245,11 @@ describe("BrowserDeck", () => {
     );
   });
 
-  it("slides clear of a live page when dropped on it, and stays put elsewhere", async () => {
-    // A pane page is a native webview: the deck cannot paint over it, so it
-    // comes to rest beside it instead of under it.
+  it("rests where it is dropped, and parks the page while it sits on it", async () => {
+    // A pane page is a native webview: the deck cannot paint over a live one,
+    // so when it rests on the slot the page stands down (its still shows
+    // under the cards, refreshed by the surface) and comes back when the deck
+    // moves off. The deck itself goes wherever it is put.
     const pane = document.createElement("div");
     pane.className = "browser-viewport";
     pane.dataset.native = "true";
@@ -264,30 +266,36 @@ describe("BrowserDeck", () => {
       const bar = view.container.querySelector<HTMLElement>(".browser-deck-bar")!;
       bar.setPointerCapture = vi.fn();
 
-      // Dropped over the transcript, right of nothing: it stays exactly there.
+      // Dropped over the transcript, right of nothing: it stays exactly there
+      // and the page is left alone.
       fireEvent.pointerDown(bar, { button: 0, pointerId: 1, clientX: 900, clientY: 700 });
       fireEvent.pointerMove(bar, { pointerId: 1, clientX: 900, clientY: 640 });
       fireEvent.pointerUp(bar, { pointerId: 1, clientX: 900, clientY: 640 });
       expect(root.style.right).toBe("18px");
       expect(root.style.bottom).toBe("78px");
       await waitFor(() => expect(root).toHaveAttribute("data-phase", "rest"));
+      await waitFor(() =>
+        expect(document.documentElement).not.toHaveAttribute("data-browser-deck-occluding"),
+      );
 
-      // Dropped on the page (deck left edge would be at 1000-500-336 = 164,
-      // overlapping x 200..600): it glides right until it clears the page.
+      // Dropped on the page (deck left edge at 1000-500-336 = 164, over
+      // x 200..600): it stays there, and the page parks under it.
       fireEvent.pointerDown(bar, { button: 0, pointerId: 2, clientX: 900, clientY: 640 });
       fireEvent.pointerMove(bar, { pointerId: 2, clientX: 418, clientY: 640 });
       fireEvent.pointerUp(bar, { pointerId: 2, clientX: 418, clientY: 640 });
-      expect(root).toHaveAttribute("data-phase", "settling");
-      // Nearest clear spot: right of the page with a 12px gap → deck.left = 612.
-      expect(root.style.right).toBe(`${1000 - 612 - 336}px`);
+      expect(root.style.right).toBe("500px");
       expect(root.style.bottom).toBe("78px");
       await waitFor(() => expect(root).toHaveAttribute("data-phase", "rest"));
+      await waitFor(() =>
+        expect(document.documentElement).toHaveAttribute("data-browser-deck-occluding"),
+      );
       expect(JSON.parse(localStorage.getItem("integrator.browserDeck.offset") ?? "{}")).toEqual({
-        right: 1000 - 612 - 336,
+        right: 500,
         bottom: 78,
       });
     } finally {
       pane.remove();
+      document.documentElement.removeAttribute("data-browser-deck-occluding");
     }
   });
 

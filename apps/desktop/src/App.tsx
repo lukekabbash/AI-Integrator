@@ -6637,6 +6637,7 @@ export default function App() {
         onSaveLogin={() => browser.saveLogin(tabId, tab.taskId)}
         onFillLogin={() => browser.fillLogin(tabId, tab.taskId)}
         onToolbarTooltip={(tooltip) => browser.setToolbarTooltip(tabId, tooltip)}
+        onWarmPoster={() => browser.warmPoster(tabId)}
         onClose={() => requestBrowserTabClose(tabId)}
       />
     );

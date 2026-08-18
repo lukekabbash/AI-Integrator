@@ -15,6 +15,8 @@
 /** The one native call this needs; `null` when there are no native tabs. */
 export interface BrowserPosterSource {
   poster(taskId: string, tabId: string): Promise<string | null>;
+  /** A fresh capture rather than the cached still; absent on older natives. */
+  refreshPoster?(taskId: string, tabId: string): Promise<string | null>;
 }
 
 /** The parts of a tab that decide whether its still is still the right one. */
@@ -98,6 +100,29 @@ export class BrowserPosterCache {
     // address; asking here would record the wrong one and fetch twice.
     if (!source || !entry || entry.pending) return;
     this.fetch(source, taskId, { id: tabId, url: entry.forUrl });
+  }
+
+  /**
+   * Takes a new still now and paints it. For the moments a page must stand
+   * down while it is still the page the person is looking at — the address
+   * field's suggestions opening over it, the compact deck resting on it — so
+   * what shows underneath is the page as it is, not as it loaded.
+   */
+  warm(source: BrowserPosterSource | null, taskId: string, tabId: string): void {
+    const entry = this.entries.get(tabId);
+    if (!source?.refreshPoster || !entry) return;
+    const request = ++this.requestSequence;
+    const forUrl = entry.forUrl;
+    void Promise.resolve()
+      .then(() => source.refreshPoster?.(taskId, tabId) ?? null)
+      .then((base64) => {
+        const current = this.entries.get(tabId);
+        // A page that moved on, or a newer read, wins.
+        if (!base64 || !current || current.forUrl !== forUrl || current.request > request) return;
+        this.entries.set(tabId, { ...current, url: `data:image/png;base64,${base64}`, request });
+        this.publish();
+      })
+      .catch(() => undefined);
   }
 
   private fetch(source: BrowserPosterSource, taskId: string, tab: PosterTab): void {
