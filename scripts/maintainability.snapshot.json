@@ -91,7 +91,7 @@
     },
     {
       "path": "crates/integrator-runtime/src/providers.rs",
-      "maxLines": 1493
+      "maxLines": 1497
     },
     {
       "path": "apps/desktop/src-tauri/src/mcp_oauth.rs",

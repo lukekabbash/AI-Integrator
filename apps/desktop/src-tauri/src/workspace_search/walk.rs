@@ -202,7 +202,14 @@ fn builder(root: &Path) -> WalkBuilder {
 /// every query against a repository, and a glob from one content search must
 /// not decide what a later path search can find.
 pub(crate) fn glob_filter(root: &Path, globs: &[String]) -> Result<Option<Override>> {
-    let mut builder = OverrideBuilder::new(root);
+    // The index walks the canonical root and stores canonical paths, so the
+    // override has to be anchored there too. Anchored at the root as spelled,
+    // it strips nothing — every path stays absolute, matches no glob, and a
+    // scoped search finds nothing at all. That is invisible wherever the two
+    // spellings agree, and certain wherever they do not: `/var` behind
+    // `/private/var` on macOS, an 8.3 short name in a Windows temp path.
+    let root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut builder = OverrideBuilder::new(&root);
     let mut added = false;
     for glob in globs {
         let glob = glob.trim();

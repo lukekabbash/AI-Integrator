@@ -605,6 +605,37 @@ mod tests {
         assert_eq!(found.scanned, 3);
     }
 
+    /// A root spelled differently from its canonical form — a symlinked
+    /// `/var` on macOS, an 8.3 short name in a Windows temp path — used to
+    /// make every scoped search come back empty, because the index walked the
+    /// canonical root while the glob filter was anchored at the spelling it
+    /// was handed. This asks for the same search through a second spelling of
+    /// the same directory and expects the same answer.
+    #[test]
+    fn a_scoped_search_is_the_same_through_any_spelling_of_the_root() {
+        let dir = sample_tree();
+        let cache = cache();
+        let scoped = |root: &Path| {
+            search_contents_in(
+                &cache,
+                root,
+                "focusRegion",
+                &ContentOptions {
+                    globs: vec!["*/components/*".into()],
+                    ..ContentOptions::default()
+                },
+                &limits(20),
+            )
+            .expect("scoped")
+        };
+        let canonical = dunce::canonicalize(dir.path()).expect("canonical root");
+        assert_eq!(scoped(dir.path()).hits.len(), 1);
+        assert_eq!(scoped(&canonical).hits.len(), 1);
+        // The same directory reached through a parent-relative detour.
+        let detour = dir.path().join("src").join("..");
+        assert_eq!(scoped(&detour).hits.len(), 1);
+    }
+
     #[test]
     fn content_search_honours_case_globs_and_the_size_ceiling() {
         let dir = sample_tree();
